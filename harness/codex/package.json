@@ -1,0 +1,11 @@
+{
+  "name": "@agents-io/harness-codex",
+  "version": "0.1.0",
+  "description": "agents-io harness adapter for Codex: drives `codex app-server` over JSON-RPC on stdio",
+  "type": "module",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist"],
+  "scripts": { "gen-types": "scripts/gen-types.sh" },
+  "dependencies": { "@agents-io/protocol": "workspace:*" },
+  "devDependencies": { "@agents-io/testkit": "workspace:*" }
+}
