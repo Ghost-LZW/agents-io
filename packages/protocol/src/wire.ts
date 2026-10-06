@@ -136,6 +136,27 @@ export type HarnessAdapterFrame = Static<typeof HarnessAdapterFrame>;
 
 export const ProbeResult = Type.Object({ version: Type.String(), caps: HarnessCaps });
 
+/** Frame types each side may send. Anything else must be ignored by the receiver. */
+export const CHANNEL_HOST_FRAME_TYPES = ['hello', 'send', 'edit', 'finalize', 'retract', 'speak', 'typing', 'reconcile', 'result', 'shutdown'] as const;
+export const CHANNEL_ADAPTER_FRAME_TYPES = ['result', 'inbound', 'log'] as const;
+export const HARNESS_HOST_FRAME_TYPES = ['probe', 'open', 'startTurn', 'steer', 'cancelQueued', 'interrupt', 'respond', 'close', 'shutdown'] as const;
+export const HARNESS_ADAPTER_FRAME_TYPES = ['result', 'event', 'nativeId', 'log'] as const;
+
+/**
+ * Error thrown by adapter methods. `code` and `retryable` travel through
+ * `ResultFrame.error` unchanged when the adapter runs out of process.
+ */
+export class AdapterError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly retryable = false,
+  ) {
+    super(message);
+    this.name = 'AdapterError';
+  }
+}
+
 // ---- JSONL codec ----------------------------------------------------------
 
 export function encodeFrame(frame: unknown): string {
@@ -150,10 +171,12 @@ export function encodeFrame(frame: unknown): string {
  */
 export class FrameDecoder {
   private buf = '';
+  // One decoder for the whole stream, so multi-byte characters split across chunks survive.
+  private readonly text = new TextDecoder();
   constructor(private readonly onError: (line: string, err: unknown) => void = () => {}) {}
 
   push(chunk: string | Uint8Array): unknown[] {
-    this.buf += typeof chunk === 'string' ? chunk : new TextDecoder().decode(chunk, { stream: true });
+    this.buf += typeof chunk === 'string' ? chunk : this.text.decode(chunk, { stream: true });
     const out: unknown[] = [];
     let nl: number;
     while ((nl = this.buf.indexOf('\n')) >= 0) {

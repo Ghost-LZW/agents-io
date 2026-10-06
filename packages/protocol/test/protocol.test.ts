@@ -61,3 +61,12 @@ describe('wire', () => {
     expect(routeKey({ channel: 'c', account: 'a', conversationId: 'x', threadId: 't', replyToMessageId: 'm' })).toBe('c:a:x:t');
   });
 });
+
+describe('FrameDecoder bytes', () => {
+  it('keeps multi-byte characters split across chunks', () => {
+    const bytes = new TextEncoder().encode(encodeFrame({ t: '飞书' }));
+    const d = new FrameDecoder();
+    const out = [...d.push(bytes.slice(0, 9)), ...d.push(bytes.slice(9))];
+    expect(out).toEqual([{ t: '飞书' }]);
+  });
+});
