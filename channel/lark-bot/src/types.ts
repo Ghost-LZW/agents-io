@@ -35,6 +35,8 @@ export interface LarkWsLike {
   /** Resolves once the first connection attempt is made; the SDK reconnects on its own afterwards. */
   start(params: { eventDispatcher: LarkDispatcherLike }): Promise<void>;
   close(params?: { force?: boolean }): void;
+  /** Present on the SDK's WSClient; used by the setup probe to confirm a live connection. */
+  getConnectionStatus?(): { state: 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'failed' };
 }
 
 export type LarkEventHandler = (data: any) => unknown;
