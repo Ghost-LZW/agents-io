@@ -53,7 +53,7 @@ export const defaultChannelCaps: ChannelCaps = {
   text: { maxChars: 4000, markdown: 'basic' },
   edit: true,
   buttons: true,
-  media: ['image', 'file'],
+  media: { in: ['image', 'file'], out: ['image', 'file'] },
   voiceOut: 'none',
   threads: true,
   approvals: 'buttons',
@@ -170,6 +170,7 @@ export const fakeHarnessCaps: HarnessCaps = {
   injectWithoutTurn: false,
   resume: false,
   switchModelMidSession: true,
+  switchProfileMidSession: true,
 };
 
 /** Scripted harness for testing the session layer. */
@@ -251,7 +252,7 @@ export class FakeHarnessSession implements HarnessSession {
     })();
   }
 
-  async steer(): Promise<SteerResult> {
+  async steer(_inputs: InputRecord[], _expectedTurnId: string): Promise<SteerResult> {
     return 'unsupported';
   }
 

@@ -79,22 +79,50 @@
           "type": "boolean"
         },
         "media": {
-          "type": "array",
-          "items": {
-            "anyOf": [
-              {
-                "const": "image",
-                "type": "string"
-              },
-              {
-                "const": "file",
-                "type": "string"
-              },
-              {
-                "const": "audio",
-                "type": "string"
+          "type": "object",
+          "required": [
+            "in",
+            "out"
+          ],
+          "properties": {
+            "in": {
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "const": "image",
+                    "type": "string"
+                  },
+                  {
+                    "const": "file",
+                    "type": "string"
+                  },
+                  {
+                    "const": "audio",
+                    "type": "string"
+                  }
+                ]
               }
-            ]
+            },
+            "out": {
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "const": "image",
+                    "type": "string"
+                  },
+                  {
+                    "const": "file",
+                    "type": "string"
+                  },
+                  {
+                    "const": "audio",
+                    "type": "string"
+                  }
+                ]
+              }
+            }
           }
         },
         "voiceOut": {

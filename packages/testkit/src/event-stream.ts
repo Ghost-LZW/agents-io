@@ -24,7 +24,7 @@ export interface CheckOptions {
  *  - every started item completes, unless its turn ended other than `completed`;
  *  - every opened request resolves, unless its turn ended other than `completed`;
  *  - `input.consumed` names only inputs given to that turn;
- *  - ephemeral events are only deltas, progress or headlines.
+ *  - ephemeral events are only deltas, progress, headlines, snapshots or native passthrough.
  */
 export function checkEventStream(events: readonly unknown[], opts: CheckOptions = {}): StreamViolation[] {
   const out: StreamViolation[] = [];
@@ -48,7 +48,7 @@ export function checkEventStream(events: readonly unknown[], opts: CheckOptions 
     const e = raw as HarnessEvent;
     const b = e.body;
 
-    if (e.durability === 'ephemeral' && !['text.delta', 'item.progress', 'headline', 'text.snapshot'].includes(b.t)) {
+    if (e.durability === 'ephemeral' && !['text.delta', 'item.progress', 'headline', 'text.snapshot', 'native'].includes(b.t)) {
       v(i, 'ephemeral', `${b.t} must be durable`);
     }
 

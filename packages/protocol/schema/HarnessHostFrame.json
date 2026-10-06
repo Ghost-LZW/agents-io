@@ -310,6 +310,9 @@
                         },
                         "fromMessageId": {
                           "type": "string"
+                        },
+                        "declared": {
+                          "type": "string"
                         }
                       }
                     },
@@ -382,6 +385,9 @@
                           "type": "string"
                         },
                         "title": {
+                          "type": "string"
+                        },
+                        "mime": {
                           "type": "string"
                         }
                       }
@@ -670,6 +676,9 @@
                         },
                         "fromMessageId": {
                           "type": "string"
+                        },
+                        "declared": {
+                          "type": "string"
                         }
                       }
                     },
@@ -742,6 +751,9 @@
                           "type": "string"
                         },
                         "title": {
+                          "type": "string"
+                        },
+                        "mime": {
                           "type": "string"
                         }
                       }

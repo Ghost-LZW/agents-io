@@ -26,6 +26,8 @@ export const HarnessCaps = Type.Object({
   injectWithoutTurn: Type.Boolean(),
   resume: Type.Boolean(),
   switchModelMidSession: Type.Boolean(),
+  /** false: a profile change needs the session reopened (new generation). */
+  switchProfileMidSession: Type.Boolean(),
   models: Type.Optional(Type.Array(Type.String())),
 });
 export type HarnessCaps = Static<typeof HarnessCaps>;

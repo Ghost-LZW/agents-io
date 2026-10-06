@@ -41,6 +41,12 @@ export const InboundEnvelope = Type.Object({
     declared: Type.Optional(Type.String()),
   }),
   content: Type.Array(ContentBlock),
+  /** People and bots @-mentioned in the message, in platform ids. */
+  mentions: Type.Optional(
+    Type.Array(Type.Object({ id: Type.String(), name: Type.Optional(Type.String()), isBot: Type.Optional(Type.Boolean()) })),
+  ),
+  /** Small scalar facts (subject, chat name…); becomes InputRecord.channelContext. */
+  context: Type.Optional(Type.Record(Type.String(), Type.Union([Type.String(), Type.Number(), Type.Boolean()]))),
   /** null = do not reply (e.g. observe-only meeting transcript). */
   replyRoute: Type.Union([ReplyRoute, Type.Null()]),
   /** Adapter's hint; the host's `Policy.admit` decides. */

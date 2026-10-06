@@ -251,6 +251,9 @@
                       },
                       "fromMessageId": {
                         "type": "string"
+                      },
+                      "declared": {
+                        "type": "string"
                       }
                     }
                   },
@@ -324,10 +327,51 @@
                       },
                       "title": {
                         "type": "string"
+                      },
+                      "mime": {
+                        "type": "string"
                       }
                     }
                   }
                 ]
+              }
+            },
+            "mentions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "id"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "isBot": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
+            "context": {
+              "type": "object",
+              "patternProperties": {
+                "^(.*)$": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "boolean"
+                    }
+                  ]
+                }
               }
             },
             "replyRoute": {
@@ -438,6 +482,10 @@
             },
             {
               "const": "error",
+              "type": "string"
+            },
+            {
+              "const": "fatal",
               "type": "string"
             }
           ]

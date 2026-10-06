@@ -1,7 +1,8 @@
 import { Type, type Static, type TSchema } from '@sinclair/typebox';
 import { ReplyRoute, V } from './common.js';
 import { RunSpec } from './run.js';
-import { Decision, ResolvedBy, Resolver } from './requests.js';
+import { Decision, RequestQuestion, ResolvedBy, Resolver } from './requests.js';
+import { InputRecord } from './inbound.js';
 
 export const Tier = Type.Union([Type.Literal('full'), Type.Literal('card'), Type.Literal('headline'), Type.Literal('final')]);
 export type Tier = Static<typeof Tier>;
@@ -70,6 +71,8 @@ export const Body = Type.Union([
       Type.Literal('observe_only'),
     ]),
     principalId: Type.Optional(Type.String()),
+    /** The admitted input itself, so a log replay can rebuild the queue. */
+    input: Type.Optional(InputRecord),
   }),
   /** Reconciled from the harness (Claude user_message_uuids / Codex userMessage.clientId). */
   T('input.consumed', { inputIds: Type.Array(Type.String()), turnId: Type.String() }),
@@ -79,7 +82,14 @@ export const Body = Type.Union([
     turnId: Type.String(),
     inputIds: Type.Array(Type.String()),
     replyRoute: Type.Union([ReplyRoute, Type.Null()]),
-    run: RunSpec,
+    /**
+     * host: started by startTurn. harness: the harness started it by itself (e.g. a
+     * background task finished). foreign: another client of the same native thread.
+     * For non-host turns the adapter mints turnId, inputIds may be empty and run may be absent.
+     */
+    initiator: Type.Optional(Type.Union([Type.Literal('host'), Type.Literal('harness'), Type.Literal('foreign')])),
+    nativeTurnId: Type.Optional(Type.String()),
+    run: Type.Optional(RunSpec),
     owner: Type.Optional(Type.String()),
   }),
   T('turn.delivery_added', {
@@ -113,6 +123,13 @@ export const Body = Type.Union([
   T('diff.updated', {
     files: Type.Array(Type.Object({ path: Type.String(), added: Type.Number(), removed: Type.Number() })),
   }),
+  /** The harness's own session/thread id became known (persist it for resume). */
+  T('session.bound', { nativeId: Type.String() }),
+  /**
+   * Folded state for late joiners; sent before live events when the requested
+   * fromSeq is no longer retained. `seq` on this event is the last folded seq.
+   */
+  T('session.snapshot', { snapshot: Type.Unknown() }),
   /** One-line status for low-bandwidth ends (speaker, watch, meeting screen). */
   T('headline', { text: Type.String() }),
   T('request.opened', {
@@ -131,6 +148,11 @@ export const Body = Type.Union([
       elevated: Type.Optional(Type.Boolean()),
     }),
     detailRef: Type.Optional(Type.String()),
+    /** Short preview of the tool input (command line, file path…). */
+    inputPreview: Type.Optional(Type.String()),
+    questions: Type.Optional(Type.Array(RequestQuestion)),
+    /** Harness-native "always allow" / amendment suggestions, passed back via Decision. */
+    suggestions: Type.Optional(Type.Unknown()),
     allowedDecisions: Type.Array(Type.String()),
     allowAlways: Type.Boolean(),
     defaultDeny: Type.Boolean(),
@@ -199,7 +221,10 @@ export const SessionEvent = Type.Composite([
   Type.Object({
     v: V,
     sessionKey: Type.String(),
-    /** Assigned by the session log: per-session, monotonic, gapless over durable events. */
+    /**
+     * Assigned by the session log: per-session, monotonic, gapless over durable events.
+     * Ephemeral events carry the seq of the last durable event before them (not unique).
+     */
     seq: Type.Number(),
     harness: Type.String(),
     /** Harness binding generation; late events from an older generation are dropped. */

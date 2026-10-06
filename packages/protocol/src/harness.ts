@@ -11,7 +11,7 @@ export interface HarnessOpenArgs {
   resume?: string;
   run: RunSpec;
   /** Host MCP endpoint the harness should mount (outbound tools etc.). */
-  mcp?: { url: string; token: string };
+  mcp?: { url: string; token: string; transport?: 'http' | 'sse' };
   /** Harness-specific options from deployment config. */
   options?: Record<string, unknown>;
 }
@@ -36,7 +36,14 @@ export interface HarnessSession {
   startTurn(turnId: string, inputs: InputRecord[], run?: RunSpec): Promise<void>;
   steer(inputs: InputRecord[], expectedTurnId: string): Promise<SteerResult>;
   cancelQueued?(inputIds: string[]): Promise<void>;
+  /** Add context without starting a turn (caps.injectWithoutTurn). */
+  inject?(inputs: InputRecord[]): Promise<void>;
   interrupt(turnId: string): Promise<void>;
+  /**
+   * Answer a request. The session layer records `request.resolved` for answers it
+   * gives; adapters emit `request.resolved` only when the harness resolved it
+   * itself (other client, native reviewer) or cancelled it (`runtime_cancelled`).
+   */
   respond(requestId: string, decision: Decision): Promise<void>;
   /** Events in emission order. Ends when the session closes. */
   readonly events: AsyncIterable<HarnessEvent>;

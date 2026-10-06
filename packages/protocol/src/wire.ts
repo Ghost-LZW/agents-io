@@ -28,7 +28,8 @@ export type ResultFrame = Static<typeof ResultFrame>;
 export const LogFrame = Type.Object({
   v: V,
   type: Type.Literal('log'),
-  level: Type.Union([Type.Literal('debug'), Type.Literal('info'), Type.Literal('warn'), Type.Literal('error')]),
+  /** `fatal`: the adapter cannot continue (e.g. start failed); the host should restart or give up. */
+  level: Type.Union([Type.Literal('debug'), Type.Literal('info'), Type.Literal('warn'), Type.Literal('error'), Type.Literal('fatal')]),
   msg: Type.String(),
   data: Type.Optional(Type.Unknown()),
 });
@@ -71,6 +72,7 @@ export const ChannelAdapterFrame = Type.Union([
 ]);
 export type ChannelAdapterFrame = Static<typeof ChannelAdapterFrame>;
 
+/** Caps are fixed per connection; a restarted adapter process may announce new ones in its next hello. */
 export const ChannelHello = Type.Object({
   adapterId: Type.String(),
   caps: ChannelCaps,

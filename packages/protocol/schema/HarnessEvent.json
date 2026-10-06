@@ -150,6 +150,320 @@
             },
             "principalId": {
               "type": "string"
+            },
+            "input": {
+              "type": "object",
+              "required": [
+                "inputId",
+                "origin",
+                "content",
+                "replyRoute",
+                "channelContext"
+              ],
+              "properties": {
+                "inputId": {
+                  "type": "string"
+                },
+                "origin": {
+                  "type": "object",
+                  "required": [
+                    "kind",
+                    "principal",
+                    "evidence",
+                    "via",
+                    "adapter"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "anyOf": [
+                        {
+                          "const": "human",
+                          "type": "string"
+                        },
+                        {
+                          "const": "agent",
+                          "type": "string"
+                        },
+                        {
+                          "const": "channel_event",
+                          "type": "string"
+                        },
+                        {
+                          "const": "system",
+                          "type": "string"
+                        },
+                        {
+                          "const": "peer",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "principal": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "required": [
+                            "id",
+                            "labels"
+                          ],
+                          "properties": {
+                            "id": {
+                              "type": "string"
+                            },
+                            "labels": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "evidence": {
+                      "anyOf": [
+                        {
+                          "const": "platform_signed",
+                          "type": "string"
+                        },
+                        {
+                          "const": "dkim_pass",
+                          "type": "string"
+                        },
+                        {
+                          "const": "device_only",
+                          "type": "string"
+                        },
+                        {
+                          "const": "none",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "declared": {
+                      "type": "string"
+                    },
+                    "self": {
+                      "type": "boolean"
+                    },
+                    "via": {
+                      "type": "string"
+                    },
+                    "adapter": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "content": {
+                  "type": "array",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "text"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "text",
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "ref",
+                          "mime"
+                        ],
+                        "properties": {
+                          "type": {
+                            "anyOf": [
+                              {
+                                "const": "image",
+                                "type": "string"
+                              },
+                              {
+                                "const": "file",
+                                "type": "string"
+                              },
+                              {
+                                "const": "audio",
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          "ref": {
+                            "type": "string"
+                          },
+                          "mime": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "text"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "quote",
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          },
+                          "fromMessageId": {
+                            "type": "string"
+                          },
+                          "declared": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "text",
+                          "startMs",
+                          "endMs",
+                          "stable"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "transcript",
+                            "type": "string"
+                          },
+                          "speaker": {
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          },
+                          "startMs": {
+                            "type": "number"
+                          },
+                          "endMs": {
+                            "type": "number"
+                          },
+                          "stable": {
+                            "type": "boolean"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "name",
+                          "data"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "event",
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "data": {
+                            "type": "object",
+                            "patternProperties": {
+                              "^(.*)$": {}
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "uri"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "ref",
+                            "type": "string"
+                          },
+                          "uri": {
+                            "type": "string"
+                          },
+                          "title": {
+                            "type": "string"
+                          },
+                          "mime": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                },
+                "replyRoute": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "required": [
+                        "channel",
+                        "account",
+                        "conversationId"
+                      ],
+                      "properties": {
+                        "channel": {
+                          "type": "string"
+                        },
+                        "account": {
+                          "type": "string"
+                        },
+                        "conversationId": {
+                          "type": "string"
+                        },
+                        "threadId": {
+                          "type": "string"
+                        },
+                        "replyToMessageId": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "channelContext": {
+                  "type": "object",
+                  "patternProperties": {
+                    "^(.*)$": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "boolean"
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
             }
           }
         },
@@ -228,8 +542,7 @@
             "t",
             "turnId",
             "inputIds",
-            "replyRoute",
-            "run"
+            "replyRoute"
           ],
           "properties": {
             "t": {
@@ -276,6 +589,25 @@
                   "type": "null"
                 }
               ]
+            },
+            "initiator": {
+              "anyOf": [
+                {
+                  "const": "host",
+                  "type": "string"
+                },
+                {
+                  "const": "harness",
+                  "type": "string"
+                },
+                {
+                  "const": "foreign",
+                  "type": "string"
+                }
+              ]
+            },
+            "nativeTurnId": {
+              "type": "string"
             },
             "run": {
               "type": "object",
@@ -839,6 +1171,36 @@
           "type": "object",
           "required": [
             "t",
+            "nativeId"
+          ],
+          "properties": {
+            "t": {
+              "const": "session.bound",
+              "type": "string"
+            },
+            "nativeId": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "t",
+            "snapshot"
+          ],
+          "properties": {
+            "t": {
+              "const": "session.snapshot",
+              "type": "string"
+            },
+            "snapshot": {}
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "t",
             "text"
           ],
           "properties": {
@@ -915,6 +1277,54 @@
             "detailRef": {
               "type": "string"
             },
+            "inputPreview": {
+              "type": "string"
+            },
+            "questions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "id",
+                  "text"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "header": {
+                    "type": "string"
+                  },
+                  "options": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "label"
+                      ],
+                      "properties": {
+                        "label": {
+                          "type": "string"
+                        },
+                        "description": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
+                  "multiSelect": {
+                    "type": "boolean"
+                  },
+                  "secret": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
+            "suggestions": {},
             "allowedDecisions": {
               "type": "array",
               "items": {

@@ -33,7 +33,13 @@ export const ContentBlock = Type.Union([
     mime: Type.String(),
     name: Type.Optional(Type.String()),
   }),
-  Type.Object({ type: Type.Literal('quote'), text: Type.String(), fromMessageId: Type.Optional(Type.String()) }),
+  Type.Object({
+    type: Type.Literal('quote'),
+    text: Type.String(),
+    fromMessageId: Type.Optional(Type.String()),
+    /** Declared identity of the quoted message's author (same trust rules as sender.declared). */
+    declared: Type.Optional(Type.String()),
+  }),
   Type.Object({
     type: Type.Literal('transcript'),
     speaker: Type.Optional(Type.String()),
@@ -46,7 +52,12 @@ export const ContentBlock = Type.Union([
   /** Non-message events: meeting invite, card click, doc comment, webhook. */
   Type.Object({ type: Type.Literal('event'), name: Type.String(), data: Type.Record(Type.String(), Type.Unknown()) }),
   /** A pointer the agent can fetch on demand. */
-  Type.Object({ type: Type.Literal('ref'), uri: Type.String(), title: Type.Optional(Type.String()) }),
+  Type.Object({
+    type: Type.Literal('ref'),
+    uri: Type.String(),
+    title: Type.Optional(Type.String()),
+    mime: Type.Optional(Type.String()),
+  }),
 ]);
 export type ContentBlock = Static<typeof ContentBlock>;
 

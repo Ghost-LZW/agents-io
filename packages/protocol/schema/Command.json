@@ -195,6 +195,9 @@
                       },
                       "fromMessageId": {
                         "type": "string"
+                      },
+                      "declared": {
+                        "type": "string"
                       }
                     }
                   },
@@ -268,6 +271,9 @@
                       },
                       "title": {
                         "type": "string"
+                      },
+                      "mime": {
+                        "type": "string"
                       }
                     }
                   }
@@ -338,6 +344,10 @@
             },
             {
               "const": "interrupt",
+              "type": "string"
+            },
+            {
+              "const": "observe",
               "type": "string"
             }
           ]

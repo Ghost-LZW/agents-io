@@ -3,7 +3,13 @@ import { Origin, InputRecord } from './inbound.js';
 import { Decision } from './requests.js';
 import { Level, Tier } from './events.js';
 
-export const InputMode = Type.Union([Type.Literal('queue'), Type.Literal('steer'), Type.Literal('interrupt')]);
+/** `observe` records the input as context without starting a turn. */
+export const InputMode = Type.Union([
+  Type.Literal('queue'),
+  Type.Literal('steer'),
+  Type.Literal('interrupt'),
+  Type.Literal('observe'),
+]);
 export type InputMode = Static<typeof InputMode>;
 
 /**

@@ -50,4 +50,17 @@ export const ResolvedBy = Type.Union([
   Type.Literal('timeout'),
   Type.Literal('runtime_cancelled'),
 ]);
+// A harness-native reviewer (e.g. Codex auto review) is `{ kind: 'harness', id: 'auto_review' }`.
+
+/** Structured question carried by a `question` / `elicitation` request. */
+export const RequestQuestion = Type.Object({
+  id: Type.String(),
+  text: Type.String(),
+  header: Type.Optional(Type.String()),
+  options: Type.Optional(Type.Array(Type.Object({ label: Type.String(), description: Type.Optional(Type.String()) }))),
+  multiSelect: Type.Optional(Type.Boolean()),
+  /** Answer must not be echoed to other ends. */
+  secret: Type.Optional(Type.Boolean()),
+});
+export type RequestQuestion = Static<typeof RequestQuestion>;
 export type ResolvedBy = Static<typeof ResolvedBy>;

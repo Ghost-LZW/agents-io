@@ -3,6 +3,8 @@ import { Evidence, ReplyRoute } from './common.js';
 import { InboundEnvelope } from './inbound.js';
 import { Tier } from './events.js';
 
+const MediaKind = Type.Union([Type.Literal('image'), Type.Literal('file'), Type.Literal('audio')]);
+
 export const ChannelCaps = Type.Object({
   text: Type.Object({
     maxChars: Type.Number(),
@@ -15,7 +17,8 @@ export const ChannelCaps = Type.Object({
     Type.Object({ minIntervalMs: Type.Number(), maxBytes: Type.Number(), ttlMs: Type.Optional(Type.Number()) }),
   ),
   buttons: Type.Boolean(),
-  media: Type.Array(Type.Union([Type.Literal('image'), Type.Literal('file'), Type.Literal('audio')])),
+  /** Media kinds the adapter can receive (`in`) and send (`out`). */
+  media: Type.Object({ in: Type.Array(MediaKind), out: Type.Array(MediaKind) }),
   voiceOut: Type.Union([Type.Literal('none'), Type.Literal('tts'), Type.Literal('stream')]),
   threads: Type.Boolean(),
   approvals: Type.Union([Type.Literal('buttons'), Type.Literal('link'), Type.Literal('none')]),
@@ -68,16 +71,29 @@ export const SendOp = Type.Object({
 });
 export type SendOp = Static<typeof SendOp>;
 
-export const SendResult = Type.Object({ providerMessageId: Type.Optional(Type.String()) });
+export const SendResult = Type.Object({
+  /** The editable message (the last part when the adapter split a long message). */
+  providerMessageId: Type.Optional(Type.String()),
+  /** All platform messages produced, in order, when split. */
+  providerMessageIds: Type.Optional(Type.Array(Type.String())),
+});
 export type SendResult = Static<typeof SendResult>;
+
+/** Host-provided blob storage, so adapters never inline large payloads. */
+export interface BlobStore {
+  put(bytes: Uint8Array, meta: { mime: string; name?: string }): Promise<string>;
+  get(ref: string): Promise<{ bytes: Uint8Array; mime: string; name?: string }>;
+}
 
 export interface ChannelContext {
   account: string;
   config: unknown;
   signal: AbortSignal;
+  /** Absent when the host has no blob store; adapters then emit platform refs only. */
+  blobs?: BlobStore;
   /** Hand one inbound message to the host. Resolves once the host has durably accepted it. */
   emit(env: InboundEnvelope): Promise<{ accepted: boolean; inputId?: string }>;
-  log(level: 'debug' | 'info' | 'warn' | 'error', msg: string, data?: unknown): void;
+  log(level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown): void;
 }
 
 /**
