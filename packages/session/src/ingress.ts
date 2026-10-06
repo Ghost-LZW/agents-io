@@ -1,0 +1,168 @@
+import { randomUUID } from 'node:crypto';
+import {
+  InboundEnvelope,
+  errors,
+  routeKey,
+  type Command,
+  type DecisionKind,
+  type InputRecord,
+  type Origin,
+} from '@agents-io/protocol';
+import type { CommandResult, Lane } from './lane.js';
+import { conversationRouteKey, withDefaults, type FullPolicy, type SessionPolicy } from './policy.js';
+
+const ACTION_PREFIX = 'req:';
+
+/** Action id the compositor puts on approval buttons: `req:<requestId>:<decisionKind>`. */
+export function actionId(requestId: string, kind: DecisionKind): string {
+  return `${ACTION_PREFIX}${requestId}:${kind}`;
+}
+
+export function parseActionId(id: string): { requestId: string; kind: 'allow_once' | 'allow_session' | 'deny' } | undefined {
+  if (!id.startsWith(ACTION_PREFIX)) return undefined;
+  const cut = id.lastIndexOf(':');
+  const kind = id.slice(cut + 1);
+  const requestId = id.slice(ACTION_PREFIX.length, cut);
+  if (!requestId || (kind !== 'allow_once' && kind !== 'allow_session' && kind !== 'deny')) return undefined;
+  return { requestId, kind };
+}
+
+export interface IngressOptions {
+  policy?: SessionPolicy;
+  /** Lane for a session key; the host decides how lanes are created and kept. */
+  lanes: (sessionKey: string) => Lane | Promise<Lane>;
+  newId?: (prefix: string) => string;
+  /** How many envelope ids to remember for dedup (default 10 000). */
+  dedupWindow?: number;
+}
+
+export interface IngressResult {
+  /** The host durably took the envelope (also true for a deliberate drop). */
+  accepted: boolean;
+  action: 'dispatch' | 'observe' | 'drop' | 'resolve' | 'duplicate' | 'invalid';
+  inputId?: string;
+  sessionKey?: string;
+  origin?: Origin;
+  result?: CommandResult;
+  error?: string;
+}
+
+/**
+ * Turns adapter claims into stamped inputs. Identity is only ever concluded by
+ * `Policy.identify`; whatever the envelope says about the sender is evidence.
+ */
+export class Ingress {
+  private readonly policy: FullPolicy;
+  private readonly newId: (prefix: string) => string;
+  private seen = new Map<string, IngressResult>();
+  /** `${channel}:${envelopeId}` → inputId, so revisions keep the original input id. */
+  private inputIds = new Map<string, string>();
+
+  constructor(private readonly o: IngressOptions) {
+    this.policy = withDefaults(o.policy);
+    this.newId = o.newId ?? ((p) => `${p}_${randomUUID()}`);
+  }
+
+  /** A `ChannelContext.emit` implementation for one adapter. */
+  emitter(): (env: InboundEnvelope) => Promise<{ accepted: boolean; inputId?: string }> {
+    return async (env) => {
+      const r = await this.accept(env);
+      return { accepted: r.accepted, ...(r.inputId !== undefined ? { inputId: r.inputId } : {}) };
+    };
+  }
+
+  async accept(env: InboundEnvelope): Promise<IngressResult> {
+    const errs = errors(InboundEnvelope, env);
+    if (errs.length) return { accepted: false, action: 'invalid', error: errs.slice(0, 3).join('; ') };
+    const key = `${env.channel}:${env.id}`;
+    const prior = this.seen.get(key);
+    if (prior) return { ...prior, action: 'duplicate' };
+    const r = await this.process(env);
+    if (r.accepted) this.remember(key, r);
+    return r;
+  }
+
+  private remember(key: string, r: IngressResult): void {
+    this.seen.set(key, r);
+    const max = this.o.dedupWindow ?? 10_000;
+    for (const k of this.seen.keys()) {
+      if (this.seen.size <= max) break;
+      this.seen.delete(k);
+      this.inputIds.delete(k);
+    }
+  }
+
+  private async process(env: InboundEnvelope): Promise<IngressResult> {
+    const identity = await this.policy.identify({
+      channel: env.channel,
+      account: env.account,
+      channelUserId: env.sender.channelUserId,
+      evidence: env.sender.evidence,
+      ...(env.sender.isBot !== undefined ? { isBot: env.sender.isBot } : {}),
+      ...(env.sender.declared !== undefined ? { declared: env.sender.declared } : {}),
+    });
+    const origin: Origin = {
+      kind: identity.kind,
+      principal: identity.principal,
+      evidence: env.sender.evidence,
+      ...(identity.declared !== undefined ? { declared: identity.declared } : {}),
+      ...(identity.self ? { self: true } : {}),
+      via: env.replyRoute ? routeKey(env.replyRoute) : conversationRouteKey(env),
+      adapter: env.channel,
+    };
+
+    const admission = await this.policy.admit(env, origin);
+    if (admission.action === 'drop') return { accepted: true, action: 'drop', origin };
+    const sessionKey = admission.sessionKey ?? conversationRouteKey(env);
+
+    // A button click on an approval card becomes a resolve command; the lane re-checks eligibility.
+    const click = actionClick(env);
+    if (click) {
+      const lane = await this.o.lanes(sessionKey);
+      const cmd: Command = { type: 'resolve', sessionKey, requestId: click.requestId, decision: { kind: click.kind }, origin };
+      const result = await lane.command(cmd);
+      return { accepted: true, action: 'resolve', sessionKey, origin, result };
+    }
+
+    const revisionOf = env.revisionOf !== undefined ? this.inputIds.get(`${env.channel}:${env.revisionOf}`) : undefined;
+    const observe = admission.action === 'observe';
+    // Latest-wins revisions keep the original input id, but only for observe-only inputs:
+    // a dispatched input may already be running, so its revision is a new input.
+    const inputId = observe && revisionOf ? revisionOf : this.newId('in');
+    this.inputIds.set(`${env.channel}:${env.id}`, inputId);
+
+    const input: InputRecord = {
+      inputId,
+      origin,
+      content: env.content,
+      replyRoute: env.replyRoute,
+      channelContext: channelContext(env),
+    };
+    const lane = await this.o.lanes(sessionKey);
+    if (observe) {
+      const result = await lane.observe(input);
+      return { accepted: true, action: 'observe', inputId, sessionKey, origin, result };
+    }
+    const result = await lane.command({ type: 'input', sessionKey, input, mode: admission.mode ?? env.modeHint ?? 'queue' });
+    return { accepted: true, action: 'dispatch', inputId, sessionKey, origin, result };
+  }
+}
+
+function actionClick(env: InboundEnvelope) {
+  if (env.content.length !== 1) return undefined;
+  const c = env.content[0]!;
+  if (c.type !== 'event' || c.name !== 'action' || typeof c.data.actionId !== 'string') return undefined;
+  return parseActionId(c.data.actionId);
+}
+
+function channelContext(env: InboundEnvelope): InputRecord['channelContext'] {
+  const ctx: InputRecord['channelContext'] = {
+    channel: env.channel,
+    conversationKind: env.conversation.kind,
+    conversationId: env.conversation.id,
+  };
+  if (env.sender.displayName !== undefined) ctx.senderName = env.sender.displayName;
+  if (env.sender.isBot !== undefined) ctx.senderIsBot = env.sender.isBot;
+  if (env.sentAt !== undefined) ctx.sentAt = env.sentAt;
+  return ctx;
+}

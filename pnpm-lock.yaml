@@ -24,6 +24,16 @@ importers:
         specifier: ^0.34.0
         version: 0.34.52
 
+  packages/session:
+    dependencies:
+      '@agents-io/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+    devDependencies:
+      '@agents-io/testkit':
+        specifier: workspace:*
+        version: link:../testkit
+
   packages/testkit:
     dependencies:
       '@agents-io/protocol':

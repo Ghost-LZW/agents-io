@@ -1,0 +1,10 @@
+{
+  "name": "@agents-io/session",
+  "version": "0.1.0",
+  "description": "Session core for agents-io: lane, seq log, hub, approvals, ingress, outbox, compositor",
+  "type": "module",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist"],
+  "dependencies": { "@agents-io/protocol": "workspace:*" },
+  "devDependencies": { "@agents-io/testkit": "workspace:*" }
+}
