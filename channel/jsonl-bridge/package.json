@@ -1,0 +1,10 @@
+{
+  "name": "@agents-io/channel-jsonl-bridge",
+  "version": "0.1.0",
+  "description": "Attach out-of-process channel adapters (any language) over JSONL stdio or sockets",
+  "type": "module",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist", "examples"],
+  "dependencies": { "@agents-io/protocol": "workspace:*" },
+  "devDependencies": { "@agents-io/testkit": "workspace:*" }
+}
