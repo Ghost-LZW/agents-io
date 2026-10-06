@@ -1,0 +1,20 @@
+{
+  "name": "@agents-io/channel-mail",
+  "version": "0.1.0",
+  "description": "Email channel adapter for agents-io (IMAP in, SMTP out)",
+  "type": "module",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist"],
+  "dependencies": {
+    "@agents-io/protocol": "workspace:*",
+    "imapflow": "^1.0.0",
+    "mailauth": "^4.0.0",
+    "mailparser": "^3.7.0",
+    "nodemailer": "^7.0.0"
+  },
+  "devDependencies": {
+    "@agents-io/testkit": "workspace:*",
+    "@types/mailparser": "^3.4.0",
+    "@types/nodemailer": "^7.0.0"
+  }
+}
