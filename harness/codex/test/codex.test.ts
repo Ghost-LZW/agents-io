@@ -246,16 +246,41 @@ describe('turn mapping', () => {
     assertConformingStream(c.events);
   });
 
-  it('routes turns started by another client as native events only', async () => {
+  it('maps turns started by another client as foreign turns', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
     const c = collector(s);
-    fake.notify('turn/started', { threadId: 'thr-1', turn: { id: 'foreign', status: 'inProgress', items: [] } });
-    fake.notify('item/started', { threadId: 'thr-1', turnId: 'foreign', item: { type: 'reasoning', id: 'r', summary: [], content: [] } });
-    fake.notify('turn/completed', { threadId: 'thr-1', turn: { id: 'foreign', status: 'completed', items: [], error: null } });
-    await c.until((e) => e.body.t === 'native' && (e.body as any).name === 'turn/completed');
-    expect(c.events.every((e) => e.body.t === 'native' && e.turnId === undefined)).toBe(true);
-    assertConformingStream(c.events);
+    fake.notify('turn/started', { threadId: 'thr-1', turn: { id: 'tui-1', status: 'inProgress', items: [] } });
+    fake.echoUser('thr-1', 'tui-1', null, 'typed in the TUI', 'um-tui');
+    fake.notify('item/completed', { threadId: 'thr-1', turnId: 'tui-1', item: { type: 'agentMessage', id: 'm', text: 'ok', phase: 'final_answer', memoryCitation: null, delivery: null, questions: null } });
+    fake.notify('turn/completed', { threadId: 'thr-1', turn: { id: 'tui-1', status: 'completed', items: [], error: null } });
+    fake.notify('thread/tokenUsage/updated', { threadId: 'thr-1', turnId: 'tui-1', tokenUsage: {} }); // late: no new turn
+    await c.until(isCompleted);
+    await tick();
+    expect(c.of('session.bound')).toEqual([{ t: 'session.bound', nativeId: 'thr-1' }]);
+    expect(c.of('turn.started')).toEqual([{ t: 'turn.started', turnId: 'codex:tui-1', inputIds: [], replyRoute: null, initiator: 'foreign', nativeTurnId: 'tui-1' }]);
+    expect(c.of('item.completed').map((b) => b.item.type)).toEqual(['user_message', 'agent_message']);
+    expect(c.of('turn.completed')[0]).toMatchObject({ turnId: 'codex:tui-1', status: 'completed' });
+    // the host can start its own turn afterwards
+    fake.onTurnStart = (p, tid) => {
+      fake.echoUser(p.threadId, tid, p.clientUserMessageId);
+      fake.completeTurn(p.threadId, tid, 'completed');
+    };
+    await s.startTurn('T1', [input('i1', 'x')]);
+    await c.until((e) => isCompleted(e) && e.turnId === 'T1');
+    expect(c.of('turn.started')[1]).toMatchObject({ turnId: 'T1', initiator: 'host' });
+    assertConformingStream(c.events, { turnInputs: { 'codex:tui-1': [], T1: ['i1'] } });
+  });
+
+  it('injects context with thread/inject_items', async () => {
+    const { fake, harness } = setup();
+    fake.handlers['thread/inject_items'] = () => ({});
+    const s = await open(harness);
+    await s.inject!([input('i1', 'fyi: the build is green', { channelContext: {} })]);
+    expect(fake.sent('thread/inject_items')[0]!.params).toEqual({
+      threadId: 'thr-1',
+      items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: '[sender from=owner kind=human via=lark:a:c1]\nfyi: the build is green' }] }],
+    });
   });
 });
 
@@ -356,6 +381,9 @@ describe('approvals', () => {
     expect(opened.map((o) => o.kind)).toEqual(['tool_approval', 'file_change', 'question', 'permissions']);
     expect(opened[0]).toMatchObject({ requestId: '0', title: 'Run: rm -rf build', allowAlways: true, defaultDeny: true });
     expect(opened[2]!.title).toBe('Which color?');
+    expect(opened[0]!.inputPreview).toBe('rm -rf build (in /work)');
+    expect(opened[2]!.questions).toEqual([{ id: 'color', text: 'Which color?', header: 'Color' }]);
+    expect(opened[3]!.inputPreview).toBe('network');
     const ev = c.events.find((e) => e.body.t === 'request.opened')!;
     expect(ev).toMatchObject({ turnId: 'T1', itemId: 'c1', audience: 'approval' });
     // one resolution per request, even though Codex also sent serverRequest/resolved for #0
@@ -411,6 +439,53 @@ describe('approvals', () => {
     await c.until(isCompleted);
     expect(answer).toEqual(payload);
     expect(c.of('request.resolved')[1]).toMatchObject({ requestId: '1', by: 'runtime_cancelled' });
+    assertConformingStream(c.events);
+  });
+
+  it('offers Codex amendments as suggestions and maps them back from allow_session', async () => {
+    const { fake, harness } = setup();
+    const s = await open(harness);
+    const c = collector(s);
+    const answers: unknown[] = [];
+    const avail = ['accept', { acceptWithExecpolicyAmendment: { execpolicy_amendment: ['touch', 'x'] } }, 'cancel'];
+    fake.onTurnStart = async (p, tid) => {
+      fake.echoUser(p.threadId, tid, p.clientUserMessageId);
+      const params = cmdParams(p.threadId, tid, { command: "/bin/zsh -lc 'touch x'", proposedExecpolicyAmendment: ['touch', 'x'], availableDecisions: avail });
+      answers.push((await fake.request('item/commandExecution/requestApproval', params)).result);
+      answers.push((await fake.request('item/commandExecution/requestApproval', params)).result);
+      fake.completeTurn(p.threadId, tid, 'completed');
+    };
+    await s.startTurn('T1', [input('i1', 'x')]);
+    await c.until((e) => e.body.t === 'request.opened');
+    const o = c.of('request.opened')[0]!;
+    expect(o.allowedDecisions).toEqual(['allow_once', 'allow_session', 'deny', 'native']);
+    expect(o.allowAlways).toBe(true);
+    expect(o.suggestions).toEqual([{ execpolicyAmendment: ['touch', 'x'] }]);
+    await s.respond(o.requestId, { kind: 'allow_session' });
+    await c.until((e) => e.body.t === 'request.opened' && c.of('request.opened').length === 2);
+    await s.respond(c.of('request.opened')[1]!.requestId, { kind: 'allow_session', updatedPermissions: { execpolicyAmendment: ['touch'] } });
+    await c.until(isCompleted);
+    expect(answers).toEqual([
+      { decision: { acceptWithExecpolicyAmendment: { execpolicy_amendment: ['touch', 'x'] } } },
+      { decision: { acceptWithExecpolicyAmendment: { execpolicy_amendment: ['touch'] } } },
+    ]);
+  });
+
+  it('shows Codex auto reviews as requests resolved by the harness', async () => {
+    const { fake, harness } = setup();
+    const s = await open(harness);
+    const c = collector(s);
+    fake.onTurnStart = (p, tid) => {
+      fake.echoUser(p.threadId, tid, p.clientUserMessageId);
+      const base = { threadId: p.threadId, turnId: tid, reviewId: 'rv1', targetItemId: 'c1', action: { type: 'command', source: 'shell', command: 'curl example.com', cwd: '/work' } };
+      fake.notify('item/autoApprovalReview/started', { ...base, startedAtMs: 1, review: { status: 'inProgress', riskLevel: null, userAuthorization: null, rationale: null } });
+      fake.notify('item/autoApprovalReview/completed', { ...base, startedAtMs: 1, completedAtMs: 2, decisionSource: 'agent', review: { status: 'denied', riskLevel: 'high', userAuthorization: null, rationale: 'exfiltration' } });
+      fake.completeTurn(p.threadId, tid, 'completed');
+    };
+    await s.startTurn('T1', [input('i1', 'x')]);
+    await c.until(isCompleted);
+    expect(c.of('request.opened')[0]).toMatchObject({ requestId: 'auto_review:rv1', kind: 'tool_approval', title: 'Run: curl example.com', allowedDecisions: [] });
+    expect(c.of('request.resolved')[0]).toEqual({ t: 'request.resolved', requestId: 'auto_review:rv1', decision: { kind: 'deny', message: 'exfiltration' }, by: { kind: 'harness', id: 'auto_review' } });
     assertConformingStream(c.events);
   });
 

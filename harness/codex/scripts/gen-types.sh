@@ -26,7 +26,7 @@ mkdir -p "$out"
 ROOTS="
 InitializeParams InitializeResponse RequestId ReasoningEffort MessagePhase
 v2/ThreadStartParams v2/ThreadStartResponse v2/ThreadResumeParams v2/ThreadResumeResponse
-v2/ThreadUnsubscribeParams v2/ThreadUnsubscribeResponse
+v2/ThreadUnsubscribeParams v2/ThreadUnsubscribeResponse v2/ThreadTurnsListParams v2/ThreadTurnsListResponse
 v2/TurnStartParams v2/TurnStartResponse v2/TurnSteerParams v2/TurnSteerResponse
 v2/TurnInterruptParams v2/TurnInterruptResponse
 v2/ThreadItem v2/Turn v2/TurnError v2/CodexErrorInfo v2/UserInput v2/ThreadStatus
@@ -38,6 +38,7 @@ v2/ItemStartedNotification v2/ItemCompletedNotification v2/AgentMessageDeltaNoti
 v2/CommandExecutionOutputDeltaNotification v2/ReasoningSummaryTextDeltaNotification
 v2/ReasoningTextDeltaNotification v2/McpToolCallProgressNotification
 v2/ServerRequestResolvedNotification v2/WarningNotification v2/ModelReroutedNotification
+v2/ItemGuardianApprovalReviewStartedNotification v2/ItemGuardianApprovalReviewCompletedNotification v2/ThreadInjectItemsParams
 v2/CommandExecutionRequestApprovalParams v2/CommandExecutionRequestApprovalResponse
 v2/FileChangeRequestApprovalParams v2/FileChangeRequestApprovalResponse
 v2/PermissionsRequestApprovalParams v2/PermissionsRequestApprovalResponse

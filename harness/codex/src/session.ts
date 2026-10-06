@@ -7,6 +7,7 @@ import type {
   HarnessOpenArgs,
   HarnessSession,
   InputRecord,
+  ItemSummary,
   Level,
   RunSpec,
   SteerResult,
@@ -19,6 +20,10 @@ import type { TurnStartResponse } from './generated/v2/TurnStartResponse.js';
 import type { TurnSteerParams } from './generated/v2/TurnSteerParams.js';
 import type { TurnInterruptParams } from './generated/v2/TurnInterruptParams.js';
 import type { ThreadUnsubscribeParams } from './generated/v2/ThreadUnsubscribeParams.js';
+import type { ThreadResumeParams } from './generated/v2/ThreadResumeParams.js';
+import type { ThreadResumeResponse } from './generated/v2/ThreadResumeResponse.js';
+import type { ThreadTurnsListParams } from './generated/v2/ThreadTurnsListParams.js';
+import type { ThreadTurnsListResponse } from './generated/v2/ThreadTurnsListResponse.js';
 import type { ErrorNotification } from './generated/v2/ErrorNotification.js';
 import type { ThreadStatusChangedNotification } from './generated/v2/ThreadStatusChangedNotification.js';
 import type { ThreadTokenUsageUpdatedNotification } from './generated/v2/ThreadTokenUsageUpdatedNotification.js';
@@ -32,9 +37,14 @@ import type { AgentMessageDeltaNotification } from './generated/v2/AgentMessageD
 import type { McpToolCallProgressNotification } from './generated/v2/McpToolCallProgressNotification.js';
 import type { ServerRequestResolvedNotification } from './generated/v2/ServerRequestResolvedNotification.js';
 import type { ModelReroutedNotification } from './generated/v2/ModelReroutedNotification.js';
+import type { ItemGuardianApprovalReviewStartedNotification } from './generated/v2/ItemGuardianApprovalReviewStartedNotification.js';
+import type { ItemGuardianApprovalReviewCompletedNotification } from './generated/v2/ItemGuardianApprovalReviewCompletedNotification.js';
+import type { GuardianApprovalReviewAction } from './generated/v2/GuardianApprovalReviewAction.js';
+import type { ThreadInjectItemsParams } from './generated/v2/ThreadInjectItemsParams.js';
 import { isApprovalMethod, openedFor, responseFor, type ApprovalMethod } from './approvals.js';
 import {
   asCompleted,
+  displayCommand,
   asStarted,
   decodeClientId,
   diffStats,
@@ -71,19 +81,22 @@ export interface CodexOpenOptions {
 
 interface Turn {
   turnId: string;
-  run: RunSpec;
+  run?: RunSpec;
+  initiator: 'host' | 'foreign';
   codexTurnId?: string;
   bound: Promise<string | undefined>;
   bind(id: string | undefined): void;
   startInputs: string[];
   steerInputs: Set<string>;
   consumed: Set<string>;
-  openItems: Set<string>;
+  openItems: Map<string, ItemSummary>;
   itemAudience: Map<string, Audience>;
   usage?: unknown;
   error?: TurnError;
   lastAnswer?: { itemId: string; text: string };
   lastDiff?: string;
+  /** Events may have been missed (connection dropped, or adopted after a host restart). */
+  gap?: boolean;
   done: boolean;
   finished: Promise<void>;
   finish(): void;
@@ -94,6 +107,19 @@ interface PendingRequest {
   method: ApprovalMethod;
   params: unknown;
   turnId?: string;
+  /** Not yet re-sent by Codex since the last reconnect. */
+  unconfirmed?: boolean;
+}
+
+/** What survives a host restart for a turn still running in a detached app-server. */
+export interface TurnSnapshot {
+  turnId: string;
+  codexTurnId: string;
+  run?: RunSpec;
+  initiator?: 'host' | 'foreign';
+  startInputs: string[];
+  steerInputs: string[];
+  consumed: string[];
 }
 
 interface Applied {
@@ -104,8 +130,10 @@ interface Applied {
 
 /** Hooks into the shared app-server connection, implemented by CodexHarness. */
 export interface SessionHost {
-  rpc: RpcClient;
+  readonly rpc: RpcClient;
   detach(session: CodexSession): void;
+  /** Persist (or clear, with undefined) the running turn so a restarted host can adopt it. */
+  saveTurn?(threadId: string, snap: TurnSnapshot | undefined): void;
 }
 
 type Extra = Partial<Omit<HarnessEvent, 'body' | 'ts'>>;
@@ -120,6 +148,11 @@ export class CodexSession implements HarnessSession {
   private clientIds = new Map<string, string[]>();
   private state: BodyOf<'session.state'>['state'] | undefined;
   private closed = false;
+  private finishedCodexTurns = new Set<string>();
+  /** Codex auto reviews in flight (requests that never reach clients). */
+  private reviews = new Map<string, string | undefined>();
+  /** File paths of fileChange items, for approval previews. */
+  private fileItems = new Map<string, string[]>();
 
   constructor(
     private readonly host: SessionHost,
@@ -127,7 +160,24 @@ export class CodexSession implements HarnessSession {
     private readonly args: HarnessOpenArgs,
     private readonly opts: CodexOpenOptions,
     private applied: Applied,
-  ) {}
+    adopt?: TurnSnapshot,
+  ) {
+    this.emit({ t: 'session.bound', nativeId: threadId }, { level: 'detail' });
+    if (adopt) {
+      const t = this.newTurn(adopt.turnId, adopt.run, adopt.startInputs, adopt.initiator ?? 'host');
+      t.bind(adopt.codexTurnId);
+      for (const id of adopt.steerInputs) t.steerInputs.add(id);
+      for (const id of adopt.consumed) t.consumed.add(id);
+      for (const ids of [adopt.startInputs, ...adopt.steerInputs.map((i) => [i])]) this.clientIds.set(encodeClientId(ids), ids);
+      t.gap = true;
+      this.active = t;
+    }
+  }
+
+  /** Turn id of a turn adopted from a previous host process, if any. */
+  adoptedTurnId(): string | undefined {
+    return this.active?.gap ? this.active.turnId : undefined;
+  }
 
   nativeId(): string {
     return this.threadId;
@@ -141,7 +191,10 @@ export class CodexSession implements HarnessSession {
     const effective = run ?? this.args.run;
     const t = this.newTurn(turnId, effective, inputs.map((i) => i.inputId));
     this.active = t;
-    this.emit({ t: 'turn.started', turnId, inputIds: t.startInputs, replyRoute: inputs[0]?.replyRoute ?? null, run: effective }, { turnId });
+    this.emit(
+      { t: 'turn.started', turnId, inputIds: t.startInputs, replyRoute: inputs[0]?.replyRoute ?? null, run: effective, initiator: 'host' },
+      { turnId },
+    );
 
     const clientUserMessageId = encodeClientId(t.startInputs);
     this.clientIds.set(clientUserMessageId, t.startInputs);
@@ -151,6 +204,7 @@ export class CodexSession implements HarnessSession {
       const res = await this.host.rpc.request<TurnStartResponse>('turn/start', params);
       this.applied = { model: effective.model || this.applied.model, effort: effective.effort ?? this.applied.effort, profile: effective.profile };
       if (!t.codexTurnId) t.bind(res.turn.id);
+      this.saveTurn(t);
     } catch (e) {
       t.bind(undefined);
       if (t.done) return;
@@ -177,6 +231,7 @@ export class CodexSession implements HarnessSession {
       const input = await renderInputs(inputs, { resolveMedia: this.opts.resolveMedia, preface: this.opts.preface });
       const params: TurnSteerParams = { threadId: this.threadId, expectedTurnId: codexTurnId, clientUserMessageId, input };
       await this.host.rpc.request('turn/steer', params);
+      this.saveTurn(t);
       return 'steered';
     } catch (e) {
       for (const id of ids) t.steerInputs.delete(id);
@@ -227,6 +282,55 @@ export class CodexSession implements HarnessSession {
     this.queue.close();
   }
 
+  /**
+   * Leave without touching the running turn: no interrupt, no unsubscribe. Used
+   * when the host shuts down but the app-server (unix transport) keeps running;
+   * a later `open({ resume })` adopts the turn from the persisted snapshot.
+   */
+  detachFromServer(): void {
+    if (this.closed) return;
+    if (this.active && !this.active.done) this.saveTurn(this.active);
+    this.closed = true;
+    this.queue.close();
+  }
+
+  /**
+   * After a new connection to the same app-server: rejoin the thread (Codex
+   * replays requests still pending, with the same ids) and settle a turn that
+   * ended while we were away.
+   */
+  async reattach(): Promise<void> {
+    if (this.closed) return;
+    for (const r of this.requests.values()) r.unconfirmed = true;
+    if (this.active) this.active.gap = true;
+    const params: ThreadResumeParams = { threadId: this.threadId, excludeTurns: true };
+    const res = await this.host.rpc.request<ThreadResumeResponse>('thread/resume', params);
+    await this.afterResume(res.thread.status);
+    // Replays arrive right after the resume response; whatever is not replayed was answered elsewhere.
+    setTimeout(() => {
+      for (const [id, r] of this.requests) if (r.unconfirmed) this.cancelRequest(id, { kind: 'harness' });
+    }, 2000).unref();
+  }
+
+  /** Called once the thread is (re)joined. Settles an adopted or gapped turn if Codex no longer runs it. */
+  async afterResume(status: ThreadStatus): Promise<void> {
+    const t = this.active;
+    if (!t || t.done || !t.codexTurnId) return;
+    this.emit({ t: 'notice', code: 'continuity', message: `reattached to codex turn ${t.codexTurnId}; events during the gap were not replayed` }, { turnId: t.turnId, level: 'detail' });
+    if (status.type === 'active') return;
+    const list = await this.host.rpc
+      .request<ThreadTurnsListResponse>('thread/turns/list', { threadId: this.threadId, limit: 20, sortDirection: 'desc' } satisfies ThreadTurnsListParams)
+      .catch(() => undefined);
+    if (t.done) return;
+    const turn = list?.data.find((x) => x.id === t.codexTurnId);
+    if (turn && turn.status === 'inProgress') return;
+    if (!turn) return this.finishTurn(t, 'ambiguous', { code: 'turn_lost', retryable: false, message: 'codex no longer knows this turn' });
+    let st = turnStatus(turn.status);
+    if (st === 'completed' && turn.error) st = 'failed';
+    for (const item of turn.items) if (item.type === 'agentMessage' && item.phase !== 'commentary') t.lastAnswer = { itemId: item.id, text: item.text };
+    this.finishTurn(t, st, turn.error && st !== 'completed' ? turnError(turn.error) : undefined);
+  }
+
   /** The app-server went away. Whatever was running has an unknown outcome. */
   transportClosed(reason: string): void {
     if (this.closed) return;
@@ -244,7 +348,7 @@ export class CodexSession implements HarnessSession {
     switch (method) {
       case 'turn/started': {
         const p = params as TurnStartedNotification;
-        if (!this.turnFor(p.turn.id)) this.native(method, params);
+        if (!this.turnOrForeign(p.turn.id)) this.native(method, params);
         return;
       }
       case 'turn/completed': {
@@ -336,16 +440,8 @@ export class CodexSession implements HarnessSession {
         return;
       }
       case 'item/autoApprovalReview/started':
-      case 'item/autoApprovalReview/completed': {
-        const p = params as { turnId: string };
-        const t = this.turnFor(p.turnId);
-        const done = method.endsWith('completed');
-        this.emit(
-          { t: 'notice', code: 'auto_review', message: done ? 'auto review finished' : 'auto review started' },
-          { turnId: t?.turnId, level: 'detail', native: params },
-        );
-        return;
-      }
+      case 'item/autoApprovalReview/completed':
+        return this.onAutoReview(method, params as ItemGuardianApprovalReviewStartedNotification | ItemGuardianApprovalReviewCompletedNotification);
       case 'model/rerouted': {
         const p = params as ModelReroutedNotification;
         const t = this.turnFor(p.turnId);
@@ -365,21 +461,84 @@ export class CodexSession implements HarnessSession {
       return;
     }
     const p = params as { turnId?: string | null; itemId?: string };
-    const t = p.turnId ? this.turnFor(p.turnId) : this.active;
     const requestId = String(id);
+    const known = this.requests.get(requestId);
+    if (known) {
+      // Replayed to a new connection (same id): already open on our stream.
+      known.rpcId = id;
+      known.params = params;
+      known.unconfirmed = false;
+      return;
+    }
+    const t = p.turnId ? this.turnFor(p.turnId) : this.active;
     this.requests.set(requestId, { rpcId: id, method, params, turnId: t?.turnId });
     this.emit(
-      { t: 'request.opened', requestId, ...openedFor(method, params) },
+      { t: 'request.opened', requestId, ...openedFor(method, params, p.itemId ? this.fileItems.get(p.itemId) : undefined) },
       { turnId: t?.turnId, itemId: p.itemId, audience: 'approval', native: { method, params } },
     );
+  }
+
+  /**
+   * With `approvalsReviewer: auto_review` Codex decides by itself and the request
+   * never reaches clients. It is still shown as a request, opened and resolved
+   * `by: { kind: 'harness', id: 'auto_review' }`, so every end sees what was allowed.
+   */
+  private onAutoReview(
+    method: 'item/autoApprovalReview/started' | 'item/autoApprovalReview/completed',
+    p: ItemGuardianApprovalReviewStartedNotification | ItemGuardianApprovalReviewCompletedNotification,
+  ): void {
+    const t = this.turnFor(p.turnId);
+    const requestId = `auto_review:${p.reviewId}`;
+    if (!this.reviews.has(p.reviewId)) {
+      this.reviews.set(p.reviewId, t?.turnId);
+      const a = reviewAction(p.action);
+      this.emit(
+        {
+          t: 'request.opened',
+          requestId,
+          kind: a.kind,
+          title: a.title,
+          inputPreview: a.preview,
+          risk: { elevated: true, network: p.action.type === 'networkAccess' || undefined, writes: p.action.type === 'applyPatch' || undefined },
+          allowedDecisions: [],
+          allowAlways: false,
+          defaultDeny: true,
+        },
+        { turnId: t?.turnId, itemId: p.targetItemId ?? undefined, audience: 'approval', native: { method, params: p } },
+      );
+      this.emit({ t: 'notice', code: 'auto_review', message: `auto review: ${a.title}` }, { turnId: t?.turnId, level: 'detail' });
+    }
+    if (method === 'item/autoApprovalReview/completed') {
+      const turnId = this.reviews.get(p.reviewId);
+      this.reviews.delete(p.reviewId);
+      const s = p.review.status;
+      const decision: Decision | null =
+        s === 'approved' ? { kind: 'allow_once' } : s === 'denied' ? { kind: 'deny', message: p.review.rationale ?? undefined } : null;
+      this.emit(
+        { t: 'request.resolved', requestId, decision, by: { kind: 'harness', id: 'auto_review' } },
+        { turnId: this.liveTurnId(turnId), audience: 'approval', native: { method, params: p } },
+      );
+    }
+  }
+
+  /** Add context to the thread without starting a turn (`thread/inject_items`, raw Responses API items). */
+  async inject(inputs: InputRecord[]): Promise<void> {
+    if (this.closed) throw new Error('codex session is closed');
+    const rendered = await renderInputs(inputs, { resolveMedia: this.opts.resolveMedia, preface: this.opts.preface });
+    const content = rendered.map((u) =>
+      u.type === 'text' ? { type: 'input_text', text: u.text } : u.type === 'image' && 'url' in u ? { type: 'input_image', image_url: u.url } : { type: 'input_text', text: `[${u.type} not injectable]` },
+    );
+    const params: ThreadInjectItemsParams = { threadId: this.threadId, items: [{ type: 'message', role: 'user', content }] };
+    await this.host.rpc.request('thread/inject_items', params);
   }
 
   // ---- internals ----------------------------------------------------------------
 
   private onItem(method: 'item/started' | 'item/completed', p: ItemStartedNotification | ItemCompletedNotification): void {
-    const t = this.turnFor(p.turnId);
+    const t = method === 'item/started' ? this.turnOrForeign(p.turnId) : this.turnFor(p.turnId);
     if (!t) return this.native(method, p);
     const item = p.item;
+    if (item.type === 'fileChange') this.fileItems.set(item.id, item.changes.map((c) => c.path));
     const started = method === 'item/started';
 
     if (item.type === 'userMessage' && item.clientId) {
@@ -389,6 +548,7 @@ export class CodexSession implements HarnessSession {
         if (!started) {
           const fresh = ours.filter((id) => !t.consumed.has(id));
           for (const id of fresh) t.consumed.add(id);
+          if (fresh.length) this.saveTurn(t);
           if (fresh.length) this.emit({ t: 'input.consumed', inputIds: fresh, turnId: t.turnId }, { turnId: t.turnId, itemId: item.id, level: 'detail' });
         }
         return;
@@ -399,7 +559,7 @@ export class CodexSession implements HarnessSession {
     if (!m) return this.native(method, p, t.turnId);
     const extra = { turnId: t.turnId, itemId: item.id, audience: m.audience, level: m.level } satisfies Extra;
     if (started) {
-      t.openItems.add(item.id);
+      t.openItems.set(item.id, m.summary);
       t.itemAudience.set(item.id, m.audience);
       this.emit({ t: 'item.started', item: asStarted(m.summary) }, extra);
       if (item.type === 'contextCompaction') this.emit({ t: 'notice', code: 'compacting', message: 'compacting context' }, { turnId: t.turnId, level: 'detail' });
@@ -419,6 +579,16 @@ export class CodexSession implements HarnessSession {
   private finishTurn(t: Turn, status: BodyOf<'turn.completed'>['status'], error?: BodyOf<'turn.completed'>['error'], native?: unknown): void {
     if (t.done) return;
     for (const [id, r] of this.requests) if (r.turnId === t.turnId) this.cancelRequest(id);
+    if (t.gap) {
+      // Their item/completed may have been sent while we were disconnected.
+      for (const [itemId, item] of t.openItems) {
+        this.emit(
+          { t: 'item.completed', item: { ...item, status: 'skipped', result: { preview: 'completion not observed (reconnected)', truncated: null, isError: false } } },
+          { turnId: t.turnId, itemId, level: 'detail' },
+        );
+      }
+      t.openItems.clear();
+    }
     const missing = t.startInputs.filter((id) => !t.consumed.has(id));
     if (status === 'completed' && missing.length) {
       // admitted ≠ consumed: Codex did not echo these inputs' clientId, so we cannot claim the turn used them.
@@ -429,6 +599,10 @@ export class CodexSession implements HarnessSession {
       this.emit({ t: 'text.snapshot', text: t.lastAnswer.text, final: true }, { turnId: t.turnId, itemId: t.lastAnswer.itemId, audience: 'answer' });
     }
     t.done = true;
+    if (t.codexTurnId) {
+      this.finishedCodexTurns.add(t.codexTurnId);
+      if (this.finishedCodexTurns.size > 64) this.finishedCodexTurns.delete(this.finishedCodexTurns.values().next().value!);
+    }
     const body: BodyOf<'turn.completed'> = { t: 'turn.completed', turnId: t.turnId, status };
     if (t.usage !== undefined) body.usage = t.usage;
     if (error) body.error = error;
@@ -436,7 +610,22 @@ export class CodexSession implements HarnessSession {
     if (this.active === t) this.active = undefined;
     for (const [cid, ids] of this.clientIds) if (ids.every((id) => t.startInputs.includes(id) || t.steerInputs.has(id))) this.clientIds.delete(cid);
     t.bind(undefined);
+    this.host.saveTurn?.(this.threadId, undefined);
+    this.fileItems.clear();
     t.finish();
+  }
+
+  private saveTurn(t: Turn): void {
+    if (!this.host.saveTurn || t.done || !t.codexTurnId) return;
+    this.host.saveTurn(this.threadId, {
+      turnId: t.turnId,
+      codexTurnId: t.codexTurnId,
+      run: t.run,
+      initiator: t.initiator,
+      startInputs: t.startInputs,
+      steerInputs: [...t.steerInputs],
+      consumed: [...t.consumed],
+    });
   }
 
   private cancelRequest(requestId: string, by: BodyOf<'request.resolved'>['by'] = 'runtime_cancelled'): void {
@@ -455,14 +644,39 @@ export class CodexSession implements HarnessSession {
       t.bind(codexTurnId);
       return t;
     }
-    return undefined; // a turn some other client started on this thread
+    return undefined; // a turn some other client started while ours runs
+  }
+
+  /**
+   * A Codex turn we did not start (another client on the thread, e.g. a TUI, or
+   * one already running when we attached): `turn.started{initiator:'foreign'}`
+   * with a minted turnId, so its items, approvals and completion map normally.
+   */
+  private foreignTurn(codexTurnId: string): Turn {
+    const t = this.newTurn(`codex:${codexTurnId}`, undefined, [], 'foreign');
+    t.bind(codexTurnId);
+    this.active = t;
+    this.emit(
+      { t: 'turn.started', turnId: t.turnId, inputIds: [], replyRoute: null, initiator: 'foreign', nativeTurnId: codexTurnId },
+      { turnId: t.turnId },
+    );
+    return t;
+  }
+
+  /** turnFor, or a new foreign turn when nothing of ours is running. */
+  private turnOrForeign(codexTurnId: string | null | undefined): Turn | undefined {
+    const t = this.turnFor(codexTurnId);
+    if (t || !codexTurnId || this.closed) return t;
+    if (this.active && !this.active.done) return undefined;
+    if (this.finishedCodexTurns.has(codexTurnId)) return undefined; // late event for a turn that already ended
+    return this.foreignTurn(codexTurnId);
   }
 
   private liveTurnId(turnId: string | undefined): string | undefined {
     return turnId && this.active?.turnId === turnId && !this.active.done ? turnId : undefined;
   }
 
-  private newTurn(turnId: string, run: RunSpec, startInputs: string[]): Turn {
+  private newTurn(turnId: string, run: RunSpec | undefined, startInputs: string[], initiator: 'host' | 'foreign' = 'host'): Turn {
     let bindFn!: (id: string | undefined) => void;
     let finishFn!: () => void;
     const bound = new Promise<string | undefined>((r) => (bindFn = r));
@@ -470,6 +684,7 @@ export class CodexSession implements HarnessSession {
     const t: Turn = {
       turnId,
       run,
+      initiator,
       bound,
       bind: (id) => {
         if (id && !t.codexTurnId) t.codexTurnId = id;
@@ -478,7 +693,7 @@ export class CodexSession implements HarnessSession {
       startInputs,
       steerInputs: new Set(),
       consumed: new Set(),
-      openItems: new Set(),
+      openItems: new Map(),
       itemAudience: new Map(),
       done: false,
       finished,
@@ -525,6 +740,25 @@ export class CodexSession implements HarnessSession {
     if (extra.itemId) e.itemId = extra.itemId;
     if (extra.native !== undefined) e.native = extra.native;
     this.queue.push(e);
+  }
+}
+
+function reviewAction(a: GuardianApprovalReviewAction): { kind: BodyOf<'request.opened'>['kind']; title: string; preview?: string } {
+  switch (a.type) {
+    case 'command':
+      return { kind: 'tool_approval', title: `Run: ${displayCommand(a.command)}`, preview: `${displayCommand(a.command)} (in ${a.cwd})` };
+    case 'execve':
+      return { kind: 'tool_approval', title: `Run: ${a.argv.join(' ') || a.program}`, preview: `${a.program} (in ${a.cwd})` };
+    case 'writeStdin':
+      return { kind: 'tool_approval', title: 'Write to terminal', preview: a.stdin.slice(0, 300) };
+    case 'applyPatch':
+      return { kind: 'file_change', title: 'Apply file changes', preview: a.files.join(', ') };
+    case 'networkAccess':
+      return { kind: 'permissions', title: `Network access to ${a.host}`, preview: a.target };
+    case 'mcpToolCall':
+      return { kind: 'tool_approval', title: `${a.server}.${a.toolName}`, preview: a.toolTitle ?? undefined };
+    case 'requestPermissions':
+      return { kind: 'permissions', title: a.reason ?? 'Grant additional permissions' };
   }
 }
 

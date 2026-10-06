@@ -63,7 +63,7 @@ export async function renderInputs(
       if (lines.length) out.push(text(lines.splice(0).join('\n')));
     };
     for (const b of input.content) {
-      if ('mime' in b) {
+      if ('ref' in b) {
         const resolved = opts.resolveMedia ? await opts.resolveMedia(b) : null;
         if (resolved && b.type !== 'file') {
           flush();
