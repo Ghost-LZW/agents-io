@@ -5,9 +5,19 @@ import { describe, expect, it } from 'vitest';
 import { checkEventStream } from '@agents-io/testkit';
 import type { HarnessEvent } from '@agents-io/protocol';
 import { ClaudeCodeHarness } from '../src/index.js';
+import { loadEnvFile } from './env-file.js';
 import { input } from './fake-query.js';
 
-const live = process.env.AGENTS_IO_LIVE_CLAUDE === '1';
+/**
+ * Optional gitignored `<repo>/.env.live`: KEY=VALUE lines handed to the CLI via
+ * `options.env` (e.g. ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN for a gateway).
+ * Values are never printed.
+ */
+const fileEnv = loadEnvFile(new URL('../../../.env.live', import.meta.url));
+const setting = (k: string) => process.env[k] ?? fileEnv[k];
+const live = setting('AGENTS_IO_LIVE_CLAUDE') === '1';
+const model = setting('AGENTS_IO_LIVE_CLAUDE_MODEL') ?? 'haiku';
+const options = (extra: Record<string, unknown> = {}) => ({ env: fileEnv, ...extra });
 
 /** Runs the real local `claude` CLI. Costs a few cents; opt in with AGENTS_IO_LIVE_CLAUDE=1. */
 describe.skipIf(!live)('live Claude Code', () => {
@@ -17,8 +27,7 @@ describe.skipIf(!live)('live Claude Code', () => {
       const dir = mkdtempSync(join(tmpdir(), 'agents-io-cc-'));
       const h = new ClaudeCodeHarness();
       const probe = await h.probe();
-      const model = process.env.AGENTS_IO_LIVE_CLAUDE_MODEL ?? 'haiku';
-      const s = await h.open({ sessionKey: 'live', generation: 1, cwd: dir, run: { harness: 'claude-code', model, profile: 'bypass' } });
+      const s = await h.open({ sessionKey: 'live', generation: 1, cwd: dir, run: { harness: 'claude-code', model, profile: 'bypass' }, options: options() });
       const evs: HarnessEvent[] = [];
       try {
         await s.startTurn('t1', [
@@ -33,7 +42,7 @@ describe.skipIf(!live)('live Claude Code', () => {
         rmSync(dir, { recursive: true, force: true });
       }
       const types = evs.map((e) => e.body.t);
-      console.log(`[live] ${probe.version}; native id ${s.nativeId()}; ${evs.length} events: ${[...new Set(types)].join(', ')}`);
+      console.log(`[live] ${probe.version}; .env.live keys: ${Object.keys(fileEnv).length}; native id ${s.nativeId()}; ${evs.length} events: ${[...new Set(types)].join(', ')}`);
       expect(checkEventStream(evs, { turnInputs: { t1: ['live-input-1'] } })).toEqual([]);
       const done = evs.find((e) => e.body.t === 'turn.completed')!.body;
       expect(done).toMatchObject({ t: 'turn.completed', turnId: 't1', status: 'completed' });
@@ -53,13 +62,12 @@ describe.skipIf(!live)('live Claude Code', () => {
     async () => {
       const dir = mkdtempSync(join(tmpdir(), 'agents-io-cc-'));
       const h = new ClaudeCodeHarness();
-      const model = process.env.AGENTS_IO_LIVE_CLAUDE_MODEL ?? 'haiku';
       const s = await h.open({
         sessionKey: 'live2',
         generation: 1,
         cwd: dir,
         run: { harness: 'claude-code', model, profile: 'ask' },
-        options: { sdk: { settingSources: [] } },
+        options: options({ sdk: { settingSources: [] } }),
       });
       const evs: HarnessEvent[] = [];
       try {

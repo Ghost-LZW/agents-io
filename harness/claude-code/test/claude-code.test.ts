@@ -3,6 +3,7 @@ import { assertConformingStream } from '@agents-io/testkit';
 import type { HarnessEvent, HarnessOpenArgs, HarnessSession, RunSpec } from '@agents-io/protocol';
 import { ClaudeCodeHarness, convertBlock, inputUuid, mapAnswers, preface, riskOf } from '../src/index.js';
 import type { ClaudeCodeOptions, PermissionResult } from '../src/types.js';
+import { parseEnv } from './env-file.js';
 import { bodies, collectUntil, fakeQueryFn, input, isTurnCompleted, sdk, type FakeQuery } from './fake-query.js';
 
 const run: RunSpec = { harness: 'claude-code', model: 'haiku', profile: 'bypass' };
@@ -113,6 +114,54 @@ describe('open → SDK options', () => {
     expect(evs.find((e) => e.body.t === 'native' && e.body.name === 'session.native_id')?.native).toEqual({ sessionId: 'forked-id' });
     expect(s.nativeId()).toBe('forked-id');
     conform(evs);
+  });
+});
+
+describe('gateway / non-Claude models', () => {
+  it('options.env is merged over process.env; model ids are never validated', async () => {
+    process.env.AGENTS_IO_TEST_INHERITED = 'from-process';
+    process.env.ANTHROPIC_MODEL = 'overridden-below';
+    try {
+      const { q, s, it } = await setup(
+        { run: { ...run, model: 'gemini-3.8-flash-high' } },
+        {
+          env: {
+            ANTHROPIC_BASE_URL: 'http://gateway.local',
+            ANTHROPIC_AUTH_TOKEN: 'secret',
+            ANTHROPIC_MODEL: 'gemini-3.8-flash-high',
+            ANTHROPIC_SMALL_FAST_MODEL: 'gemini-3.8-flash-low',
+            CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1000000',
+            CLAUDE_CODE_RESUME_INTERRUPTED_TURN: '1',
+          },
+        },
+      );
+      expect(q.options.model).toBe('gemini-3.8-flash-high');
+      expect(q.options.env).toMatchObject({
+        AGENTS_IO_TEST_INHERITED: 'from-process',
+        ANTHROPIC_BASE_URL: 'http://gateway.local',
+        ANTHROPIC_AUTH_TOKEN: 'secret',
+        ANTHROPIC_MODEL: 'gemini-3.8-flash-high',
+        ANTHROPIC_SMALL_FAST_MODEL: 'gemini-3.8-flash-low',
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1000000',
+      });
+      // even an explicit request from deployment config cannot re-enable auto re-run
+      expect(q.options.env).not.toHaveProperty('CLAUDE_CODE_RESUME_INTERRUPTED_TURN');
+      await s.startTurn('t1', [input('a', 'x')], { ...run, model: 'gpt-7-mini' });
+      expect(q.calls).toEqual([{ method: 'setModel', arg: 'gpt-7-mini' }]);
+      await q.waitWritten(1);
+      q.push(sdk.init(), sdk.result({ uuids: [uuidOf(q, 0)] }));
+      const evs = await collectUntil(it, isTurnCompleted);
+      expect(bodies(evs, 'turn.started')[0]!.run.model).toBe('gpt-7-mini');
+    } finally {
+      delete process.env.AGENTS_IO_TEST_INHERITED;
+      delete process.env.ANTHROPIC_MODEL;
+    }
+  });
+
+  it('parses .env.live style files', () => {
+    expect(
+      parseEnv('# c\n\nexport A=1\nB = "two words"\nC=\'x#y\'\nD=val # note\nnot a line\nE=a=b'),
+    ).toEqual({ A: '1', B: 'two words', C: 'x#y', D: 'val', E: 'a=b' });
   });
 });
 
