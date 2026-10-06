@@ -1,0 +1,13 @@
+{
+  "name": "@agents-io/harness-claude-code",
+  "version": "0.1.0",
+  "description": "agents-io harness adapter for Claude Code, driven through the official Claude Agent SDK",
+  "type": "module",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist"],
+  "dependencies": {
+    "@agents-io/protocol": "workspace:*",
+    "@anthropic-ai/claude-agent-sdk": "0.3.291"
+  },
+  "devDependencies": { "@agents-io/testkit": "workspace:*" }
+}
