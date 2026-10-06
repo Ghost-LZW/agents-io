@@ -18,6 +18,16 @@ importers:
         specifier: ^3.2.0
         version: 3.2.7(@types/node@24.19.1)
 
+  channel/jsonl-bridge:
+    dependencies:
+      '@agents-io/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
+    devDependencies:
+      '@agents-io/testkit':
+        specifier: workspace:*
+        version: link:../../packages/testkit
+
   packages/protocol:
     dependencies:
       '@sinclair/typebox':

@@ -1,0 +1,378 @@
+import { spawn } from 'node:child_process';
+import { connect as netConnect } from 'node:net';
+import type { Readable, Writable } from 'node:stream';
+import {
+  ChannelAdapterFrame,
+  ChannelHello,
+  PROTOCOL_VERSION,
+  check,
+  errors,
+  type ChannelAdapter,
+  type ChannelCaps,
+  type ChannelContext,
+  type InboundEnvelope,
+} from '@agents-io/protocol';
+import { FrameLink, isObject, sleep } from './link.js';
+
+/** A failed bridge request. `retryable` is true for transport trouble (timeout, child exit). */
+export class ChannelBridgeError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly retryable: boolean,
+  ) {
+    super(message);
+    this.name = 'ChannelBridgeError';
+  }
+}
+
+export interface BridgeOptions {
+  account: string;
+  config?: unknown;
+  /** Per-request timeout. Default 30s. */
+  requestTimeoutMs?: number;
+  /** Time allowed for the `hello` handshake. Default 10s. */
+  helloTimeoutMs?: number;
+  /** Restart backoff (exponential, capped). Default 200ms .. 10s. */
+  backoff?: { minMs?: number; maxMs?: number };
+  /** How long to wait for the peer to exit after `shutdown` before killing it. Default 2s. */
+  shutdownGraceMs?: number;
+  /** Logger used until `start` supplies `ctx.log`. */
+  log?: ChannelContext['log'];
+}
+
+export interface SpawnChannelOptions extends BridgeOptions {
+  command: string;
+  args?: string[];
+  /** Merged over the parent environment. */
+  env?: Record<string, string>;
+  cwd?: string;
+}
+
+export type ConnectChannelOptions = BridgeOptions & ({ path: string } | { host: string; port: number });
+
+/** The adapter returned by the host side; `close` stops the peer without needing `start`. */
+export interface BridgedChannel extends ChannelAdapter {
+  close(): Promise<void>;
+}
+
+interface Transport {
+  input: Readable;
+  output: Writable;
+  stderr?: Readable;
+  /** Resolves (never rejects) with a reason once the connection is gone. */
+  closed: Promise<string>;
+  kill(): void;
+}
+
+const ADAPTER_FRAME_TYPES = new Set(['result', 'inbound', 'log']);
+
+/** Spawn a channel adapter process and attach to it over stdio. */
+export function spawnChannel(opts: SpawnChannelOptions): Promise<BridgedChannel> {
+  return Bridge.open(opts, () => {
+    const child = spawn(opts.command, opts.args ?? [], {
+      cwd: opts.cwd,
+      env: { ...process.env, ...opts.env },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    return new Promise<Transport>((resolve, reject) => {
+      const closed = new Promise<string>((done) => {
+        child.once('close', (code, sig) => done(`exited (${sig ?? code})`));
+      });
+      child.once('error', (err) => {
+        reject(err);
+        // `close` may never fire when spawn itself failed.
+        child.emit('close', null, 'spawn_error');
+      });
+      child.once('spawn', () =>
+        resolve({
+          input: child.stdout,
+          output: child.stdin,
+          stderr: child.stderr,
+          closed,
+          kill: () => child.kill('SIGKILL'),
+        }),
+      );
+    });
+  });
+}
+
+/** Attach to an already-running adapter listening on a unix socket (`path`) or TCP (`host`+`port`). */
+export function connectChannel(opts: ConnectChannelOptions): Promise<BridgedChannel> {
+  return Bridge.open(opts, () => {
+    const sock = 'path' in opts ? netConnect({ path: opts.path }) : netConnect({ host: opts.host, port: opts.port });
+    return new Promise<Transport>((resolve, reject) => {
+      const closed = new Promise<string>((done) => sock.once('close', () => done('socket closed')));
+      sock.once('error', reject);
+      sock.once('connect', () => {
+        sock.off('error', reject);
+        sock.on('error', () => {});
+        resolve({ input: sock, output: sock, closed, kill: () => sock.destroy() });
+      });
+    });
+  });
+}
+
+interface Pending {
+  resolve(v: unknown): void;
+  reject(e: Error): void;
+  timer: NodeJS.Timeout;
+}
+
+interface Conn {
+  transport: Transport;
+  link: FrameLink;
+  pending: Map<string, Pending>;
+  since: number;
+  gone: boolean;
+}
+
+class Bridge implements BridgedChannel {
+  private conn: Conn | undefined;
+  private hello!: ChannelHello;
+  private ctx: ChannelContext | undefined;
+  private ctxWaiters: (() => void)[] = [];
+  private nextId = 0;
+  private closing = false;
+  private log: ChannelContext['log'];
+  private readonly requestTimeoutMs: number;
+  private readonly helloTimeoutMs: number;
+  private readonly minBackoff: number;
+  private readonly maxBackoff: number;
+  private readonly grace: number;
+
+  // Optional methods are attached in `open` only when the peer declared them.
+  edit?: ChannelAdapter['edit'];
+  finalize?: ChannelAdapter['finalize'];
+  retract?: ChannelAdapter['retract'];
+  speak?: ChannelAdapter['speak'];
+  typing?: ChannelAdapter['typing'];
+  reconcile?: ChannelAdapter['reconcile'];
+
+  private constructor(
+    private readonly opts: BridgeOptions,
+    private readonly opener: () => Promise<Transport>,
+  ) {
+    this.log = opts.log ?? (() => {});
+    this.requestTimeoutMs = opts.requestTimeoutMs ?? 30_000;
+    this.helloTimeoutMs = opts.helloTimeoutMs ?? 10_000;
+    this.minBackoff = opts.backoff?.minMs ?? 200;
+    this.maxBackoff = opts.backoff?.maxMs ?? 10_000;
+    this.grace = opts.shutdownGraceMs ?? 2_000;
+  }
+
+  static async open(opts: BridgeOptions, opener: () => Promise<Transport>): Promise<BridgedChannel> {
+    const b = new Bridge(opts, opener);
+    await b.connect();
+    const has = new Set<string>(b.hello.methods);
+    if (has.has('edit'))
+      b.edit = async (route, providerMessageId, msg, op) => void (await b.request('edit', { route, providerMessageId, msg, op }));
+    if (has.has('finalize'))
+      b.finalize = async (route, providerMessageId, msg) => void (await b.request('finalize', { route, providerMessageId, msg }));
+    if (has.has('retract'))
+      b.retract = async (route, providerMessageId, outcome) => void (await b.request('retract', { route, providerMessageId, outcome }));
+    if (has.has('speak')) b.speak = async (route, utterance) => void (await b.request('speak', { route, utterance }));
+    if (has.has('typing')) b.typing = async (route, on) => void (await b.request('typing', { route, on }));
+    if (has.has('reconcile'))
+      b.reconcile = async (route, providerMessageId) => {
+        const v = await b.request('reconcile', { route, providerMessageId });
+        if (v !== 'alive' && v !== 'gone') throw new ChannelBridgeError('bad_result', `reconcile returned ${JSON.stringify(v)}`, false);
+        return v;
+      };
+    return b;
+  }
+
+  get id(): string {
+    return this.hello.adapterId;
+  }
+
+  caps(): ChannelCaps {
+    return this.hello.caps;
+  }
+
+  async send(route: Parameters<ChannelAdapter['send']>[0], msg: Parameters<ChannelAdapter['send']>[1], op: Parameters<ChannelAdapter['send']>[2]) {
+    const v = await this.request('send', { route, msg, op });
+    if (v === undefined || v === null) return {};
+    if (!isObject(v) || (v.providerMessageId !== undefined && typeof v.providerMessageId !== 'string'))
+      throw new ChannelBridgeError('bad_result', 'send returned a malformed SendResult', false);
+    return v.providerMessageId === undefined ? {} : { providerMessageId: v.providerMessageId as string };
+  }
+
+  async start(ctx: ChannelContext): Promise<void> {
+    this.ctx = ctx;
+    this.log = ctx.log;
+    for (const w of this.ctxWaiters.splice(0)) w();
+    let attempt = 0;
+    while (!ctx.signal.aborted) {
+      if (!this.conn) {
+        try {
+          await this.connect();
+        } catch (err) {
+          const wait = this.delay(attempt++);
+          this.log('warn', `channel connect failed: ${errMsg(err)}; retry in ${wait}ms`);
+          await sleep(wait, ctx.signal);
+          continue;
+        }
+      }
+      const conn = this.conn!;
+      const aborted = new Promise<'abort'>((r) => ctx.signal.addEventListener('abort', () => r('abort'), { once: true }));
+      const why = await Promise.race([conn.transport.closed, aborted]);
+      if (why === 'abort') break;
+      if (Date.now() - conn.since >= this.maxBackoff) attempt = 0;
+      const wait = this.delay(attempt++);
+      this.log('warn', `channel peer ${why}; restarting in ${wait}ms`);
+      await sleep(wait, ctx.signal);
+    }
+    await this.close();
+  }
+
+  /** Ask the peer to shut down, then kill it after the grace period. Safe to call twice. */
+  async close(): Promise<void> {
+    this.closing = true;
+    const conn = this.conn;
+    if (!conn) return;
+    conn.link.send({ v: PROTOCOL_VERSION, type: 'shutdown' });
+    const exited = await Promise.race([conn.transport.closed.then(() => true), sleep(this.grace).then(() => false)]);
+    if (!exited) conn.transport.kill();
+    await conn.transport.closed;
+  }
+
+  private delay(attempt: number): number {
+    return Math.min(this.maxBackoff, this.minBackoff * 2 ** attempt);
+  }
+
+  // ---- connection ---------------------------------------------------------
+
+  private async connect(): Promise<void> {
+    const transport = await this.opener();
+    const pending = new Map<string, Pending>();
+    const conn: Conn = { transport, pending, since: Date.now(), gone: false, link: undefined as never };
+    conn.link = new FrameLink(
+      transport.input,
+      transport.output,
+      (f) => this.onFrame(conn, f),
+      (line, err) => this.log('warn', 'dropping malformed line from channel peer', { line: line.slice(0, 200), error: errMsg(err) }),
+      () => {},
+    );
+    if (transport.stderr) {
+      transport.stderr.setEncoding('utf8');
+      let buf = '';
+      transport.stderr.on('data', (chunk: string) => {
+        buf += chunk;
+        let nl: number;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl).trimEnd();
+          buf = buf.slice(nl + 1);
+          if (line) this.log('info', line, { stream: 'stderr' });
+        }
+      });
+    }
+    void transport.closed.then((reason) => {
+      conn.gone = true;
+      if (this.conn === conn) this.conn = undefined;
+      for (const [id, p] of conn.pending) {
+        clearTimeout(p.timer);
+        p.reject(new ChannelBridgeError('peer_closed', `channel peer ${reason}`, true));
+        conn.pending.delete(id);
+      }
+    });
+    try {
+      const value = await this.call(conn, 'hello', { account: this.opts.account, config: this.opts.config }, this.helloTimeoutMs);
+      if (!check(ChannelHello, value)) throw new ChannelBridgeError('bad_hello', `invalid hello: ${errors(ChannelHello, value).slice(0, 3).join('; ')}`, false);
+      this.hello = value;
+    } catch (err) {
+      transport.kill();
+      throw err;
+    }
+    if (this.closing) {
+      transport.kill();
+      throw new ChannelBridgeError('closed', 'bridge is closing', false);
+    }
+    this.conn = conn;
+  }
+
+  private request(type: string, body: Record<string, unknown>): Promise<unknown> {
+    const conn = this.conn;
+    if (!conn) return Promise.reject(new ChannelBridgeError('unavailable', 'channel peer is not connected', true));
+    return this.call(conn, type, body, this.requestTimeoutMs);
+  }
+
+  private call(conn: Conn, type: string, body: Record<string, unknown>, timeoutMs: number): Promise<unknown> {
+    const id = `h${++this.nextId}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        conn.pending.delete(id);
+        reject(new ChannelBridgeError('timeout', `${type} timed out after ${timeoutMs}ms`, true));
+      }, timeoutMs);
+      conn.pending.set(id, { resolve, reject, timer });
+      if (!conn.link.send({ v: PROTOCOL_VERSION, type, id, ...body })) {
+        clearTimeout(timer);
+        conn.pending.delete(id);
+        reject(new ChannelBridgeError('peer_closed', 'channel peer is gone', true));
+      }
+    });
+  }
+
+  // ---- incoming frames ----------------------------------------------------
+
+  private onFrame(conn: Conn, raw: unknown): void {
+    if (!isObject(raw) || typeof raw.type !== 'string') {
+      this.log('warn', 'dropping frame without a type', { frame: preview(raw) });
+      return;
+    }
+    // Unknown types are ignored so either side can be newer.
+    if (!ADAPTER_FRAME_TYPES.has(raw.type)) {
+      this.log('debug', `ignoring unknown frame type ${raw.type}`);
+      return;
+    }
+    if (!check(ChannelAdapterFrame, raw)) {
+      this.log('warn', `dropping invalid ${raw.type} frame`, { errors: errors(ChannelAdapterFrame, raw).slice(0, 3), frame: preview(raw) });
+      // Don't leave the peer waiting on an inbound we refuse.
+      if (raw.type === 'inbound' && typeof raw.id === 'string')
+        conn.link.send({
+          v: PROTOCOL_VERSION,
+          type: 'result',
+          id: raw.id,
+          ok: false,
+          error: { code: 'invalid_frame', message: 'inbound frame failed validation', retryable: false },
+        });
+      return;
+    }
+    switch (raw.type) {
+      case 'result': {
+        const p = conn.pending.get(raw.id as string);
+        if (!p) return; // late answer after timeout
+        conn.pending.delete(raw.id as string);
+        clearTimeout(p.timer);
+        if (raw.ok) p.resolve(raw.value);
+        else {
+          const e = raw.error as { code: string; message: string; retryable?: boolean } | undefined;
+          p.reject(new ChannelBridgeError(e?.code ?? 'error', e?.message ?? 'channel request failed', e?.retryable ?? false));
+        }
+        return;
+      }
+      case 'log': {
+        const level = raw.level as 'debug' | 'info' | 'warn' | 'error';
+        this.log(level, String(raw.msg), raw.data);
+        return;
+      }
+      case 'inbound':
+        void this.onInbound(conn, raw.id as string, raw.envelope as InboundEnvelope);
+        return;
+    }
+  }
+
+  private async onInbound(conn: Conn, id: string, envelope: InboundEnvelope): Promise<void> {
+    // Messages that arrive before `start` wait for the context instead of being lost.
+    if (!this.ctx) await new Promise<void>((r) => this.ctxWaiters.push(r));
+    try {
+      const value = await this.ctx!.emit(envelope);
+      conn.link.send({ v: PROTOCOL_VERSION, type: 'result', id, ok: true, value });
+    } catch (err) {
+      conn.link.send({ v: PROTOCOL_VERSION, type: 'result', id, ok: false, error: { code: 'emit_failed', message: errMsg(err), retryable: true } });
+    }
+  }
+}
+
+const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+const preview = (v: unknown) => JSON.stringify(v)?.slice(0, 200);
