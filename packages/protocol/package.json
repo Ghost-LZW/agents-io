@@ -1,0 +1,9 @@
+{
+  "name": "@agents-io/protocol",
+  "version": "0.1.0",
+  "description": "Wire protocol for agents-io: inbound envelopes, session events, commands, adapter contracts",
+  "type": "module",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist"],
+  "dependencies": { "@sinclair/typebox": "^0.34.0" }
+}

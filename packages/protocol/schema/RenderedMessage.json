@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/RenderedMessage",
+  "type": "object",
+  "required": [
+    "text"
+  ],
+  "properties": {
+    "text": {
+      "type": "string"
+    },
+    "sections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "kind",
+          "text"
+        ],
+        "properties": {
+          "kind": {
+            "anyOf": [
+              {
+                "const": "body",
+                "type": "string"
+              },
+              {
+                "const": "details",
+                "type": "string"
+              },
+              {
+                "const": "status",
+                "type": "string"
+              },
+              {
+                "const": "footer",
+                "type": "string"
+              }
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "collapsed": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "label"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "style": {
+            "anyOf": [
+              {
+                "const": "primary",
+                "type": "string"
+              },
+              {
+                "const": "danger",
+                "type": "string"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "attachments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "ref",
+          "mime"
+        ],
+        "properties": {
+          "ref": {
+            "type": "string"
+          },
+          "mime": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "link": {
+      "type": "object",
+      "required": [
+        "label",
+        "url"
+      ],
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      }
+    },
+    "spokenText": {
+      "type": "string"
+    },
+    "channelData": {}
+  }
+}

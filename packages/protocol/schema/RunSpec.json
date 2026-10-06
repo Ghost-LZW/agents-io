@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/RunSpec",
+  "type": "object",
+  "required": [
+    "harness",
+    "model",
+    "profile"
+  ],
+  "properties": {
+    "harness": {
+      "type": "string"
+    },
+    "model": {
+      "type": "string"
+    },
+    "effort": {
+      "type": "string"
+    },
+    "profile": {
+      "type": "string"
+    }
+  }
+}

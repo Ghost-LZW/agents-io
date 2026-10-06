@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/ChannelCaps",
+  "type": "object",
+  "required": [
+    "text",
+    "edit",
+    "buttons",
+    "media",
+    "voiceOut",
+    "threads",
+    "approvals",
+    "defaultTier",
+    "evidence",
+    "declaresSender"
+  ],
+  "properties": {
+    "text": {
+      "type": "object",
+      "required": [
+        "maxChars",
+        "markdown"
+      ],
+      "properties": {
+        "maxChars": {
+          "type": "number"
+        },
+        "markdown": {
+          "anyOf": [
+            {
+              "const": "none",
+              "type": "string"
+            },
+            {
+              "const": "basic",
+              "type": "string"
+            },
+            {
+              "const": "full",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    "edit": {
+      "type": "boolean"
+    },
+    "nativeStream": {
+      "type": "object",
+      "required": [
+        "minIntervalMs",
+        "maxBytes"
+      ],
+      "properties": {
+        "minIntervalMs": {
+          "type": "number"
+        },
+        "maxBytes": {
+          "type": "number"
+        },
+        "ttlMs": {
+          "type": "number"
+        }
+      }
+    },
+    "buttons": {
+      "type": "boolean"
+    },
+    "media": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "const": "image",
+            "type": "string"
+          },
+          {
+            "const": "file",
+            "type": "string"
+          },
+          {
+            "const": "audio",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    "voiceOut": {
+      "anyOf": [
+        {
+          "const": "none",
+          "type": "string"
+        },
+        {
+          "const": "tts",
+          "type": "string"
+        },
+        {
+          "const": "stream",
+          "type": "string"
+        }
+      ]
+    },
+    "threads": {
+      "type": "boolean"
+    },
+    "approvals": {
+      "anyOf": [
+        {
+          "const": "buttons",
+          "type": "string"
+        },
+        {
+          "const": "link",
+          "type": "string"
+        },
+        {
+          "const": "none",
+          "type": "string"
+        }
+      ]
+    },
+    "defaultTier": {
+      "anyOf": [
+        {
+          "const": "full",
+          "type": "string"
+        },
+        {
+          "const": "card",
+          "type": "string"
+        },
+        {
+          "const": "headline",
+          "type": "string"
+        },
+        {
+          "const": "final",
+          "type": "string"
+        }
+      ]
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "const": "platform_signed",
+            "type": "string"
+          },
+          {
+            "const": "dkim_pass",
+            "type": "string"
+          },
+          {
+            "const": "device_only",
+            "type": "string"
+          },
+          {
+            "const": "none",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    "declaresSender": {
+      "type": "boolean"
+    }
+  }
+}

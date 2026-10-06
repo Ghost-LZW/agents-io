@@ -1,0 +1,856 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/ChannelHostFrame",
+  "anyOf": [
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "account"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "hello",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "account": {
+          "type": "string"
+        },
+        "config": {}
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "route",
+        "msg",
+        "op"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "send",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "route": {
+          "type": "object",
+          "required": [
+            "channel",
+            "account",
+            "conversationId"
+          ],
+          "properties": {
+            "channel": {
+              "type": "string"
+            },
+            "account": {
+              "type": "string"
+            },
+            "conversationId": {
+              "type": "string"
+            },
+            "threadId": {
+              "type": "string"
+            },
+            "replyToMessageId": {
+              "type": "string"
+            }
+          }
+        },
+        "msg": {
+          "type": "object",
+          "required": [
+            "text"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "sections": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "text"
+                ],
+                "properties": {
+                  "kind": {
+                    "anyOf": [
+                      {
+                        "const": "body",
+                        "type": "string"
+                      },
+                      {
+                        "const": "details",
+                        "type": "string"
+                      },
+                      {
+                        "const": "status",
+                        "type": "string"
+                      },
+                      {
+                        "const": "footer",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "collapsed": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
+            "actions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "id",
+                  "label"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "style": {
+                    "anyOf": [
+                      {
+                        "const": "primary",
+                        "type": "string"
+                      },
+                      {
+                        "const": "danger",
+                        "type": "string"
+                      }
+                    ]
+                  }
+                }
+              }
+            },
+            "attachments": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "ref",
+                  "mime"
+                ],
+                "properties": {
+                  "ref": {
+                    "type": "string"
+                  },
+                  "mime": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "link": {
+              "type": "object",
+              "required": [
+                "label",
+                "url"
+              ],
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string"
+                }
+              }
+            },
+            "spokenText": {
+              "type": "string"
+            },
+            "channelData": {}
+          }
+        },
+        "op": {
+          "type": "object",
+          "required": [
+            "operationId"
+          ],
+          "properties": {
+            "operationId": {
+              "type": "string"
+            },
+            "as": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "route",
+        "providerMessageId",
+        "msg",
+        "op"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "edit",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "route": {
+          "type": "object",
+          "required": [
+            "channel",
+            "account",
+            "conversationId"
+          ],
+          "properties": {
+            "channel": {
+              "type": "string"
+            },
+            "account": {
+              "type": "string"
+            },
+            "conversationId": {
+              "type": "string"
+            },
+            "threadId": {
+              "type": "string"
+            },
+            "replyToMessageId": {
+              "type": "string"
+            }
+          }
+        },
+        "providerMessageId": {
+          "type": "string"
+        },
+        "msg": {
+          "type": "object",
+          "required": [
+            "text"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "sections": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "text"
+                ],
+                "properties": {
+                  "kind": {
+                    "anyOf": [
+                      {
+                        "const": "body",
+                        "type": "string"
+                      },
+                      {
+                        "const": "details",
+                        "type": "string"
+                      },
+                      {
+                        "const": "status",
+                        "type": "string"
+                      },
+                      {
+                        "const": "footer",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "collapsed": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
+            "actions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "id",
+                  "label"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "style": {
+                    "anyOf": [
+                      {
+                        "const": "primary",
+                        "type": "string"
+                      },
+                      {
+                        "const": "danger",
+                        "type": "string"
+                      }
+                    ]
+                  }
+                }
+              }
+            },
+            "attachments": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "ref",
+                  "mime"
+                ],
+                "properties": {
+                  "ref": {
+                    "type": "string"
+                  },
+                  "mime": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "link": {
+              "type": "object",
+              "required": [
+                "label",
+                "url"
+              ],
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string"
+                }
+              }
+            },
+            "spokenText": {
+              "type": "string"
+            },
+            "channelData": {}
+          }
+        },
+        "op": {
+          "type": "object",
+          "required": [
+            "operationId",
+            "sequence"
+          ],
+          "properties": {
+            "operationId": {
+              "type": "string"
+            },
+            "as": {
+              "type": "string"
+            },
+            "sequence": {
+              "type": "number"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "route",
+        "providerMessageId",
+        "msg"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "finalize",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "route": {
+          "type": "object",
+          "required": [
+            "channel",
+            "account",
+            "conversationId"
+          ],
+          "properties": {
+            "channel": {
+              "type": "string"
+            },
+            "account": {
+              "type": "string"
+            },
+            "conversationId": {
+              "type": "string"
+            },
+            "threadId": {
+              "type": "string"
+            },
+            "replyToMessageId": {
+              "type": "string"
+            }
+          }
+        },
+        "providerMessageId": {
+          "type": "string"
+        },
+        "msg": {
+          "type": "object",
+          "required": [
+            "text"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "sections": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "text"
+                ],
+                "properties": {
+                  "kind": {
+                    "anyOf": [
+                      {
+                        "const": "body",
+                        "type": "string"
+                      },
+                      {
+                        "const": "details",
+                        "type": "string"
+                      },
+                      {
+                        "const": "status",
+                        "type": "string"
+                      },
+                      {
+                        "const": "footer",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "collapsed": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
+            "actions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "id",
+                  "label"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "style": {
+                    "anyOf": [
+                      {
+                        "const": "primary",
+                        "type": "string"
+                      },
+                      {
+                        "const": "danger",
+                        "type": "string"
+                      }
+                    ]
+                  }
+                }
+              }
+            },
+            "attachments": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "ref",
+                  "mime"
+                ],
+                "properties": {
+                  "ref": {
+                    "type": "string"
+                  },
+                  "mime": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "link": {
+              "type": "object",
+              "required": [
+                "label",
+                "url"
+              ],
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string"
+                }
+              }
+            },
+            "spokenText": {
+              "type": "string"
+            },
+            "channelData": {}
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "route",
+        "providerMessageId",
+        "outcome"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "retract",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "route": {
+          "type": "object",
+          "required": [
+            "channel",
+            "account",
+            "conversationId"
+          ],
+          "properties": {
+            "channel": {
+              "type": "string"
+            },
+            "account": {
+              "type": "string"
+            },
+            "conversationId": {
+              "type": "string"
+            },
+            "threadId": {
+              "type": "string"
+            },
+            "replyToMessageId": {
+              "type": "string"
+            }
+          }
+        },
+        "providerMessageId": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "route",
+        "utterance"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "speak",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "route": {
+          "type": "object",
+          "required": [
+            "channel",
+            "account",
+            "conversationId"
+          ],
+          "properties": {
+            "channel": {
+              "type": "string"
+            },
+            "account": {
+              "type": "string"
+            },
+            "conversationId": {
+              "type": "string"
+            },
+            "threadId": {
+              "type": "string"
+            },
+            "replyToMessageId": {
+              "type": "string"
+            }
+          }
+        },
+        "utterance": {
+          "type": "object",
+          "required": [
+            "text",
+            "interruptible"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "interruptible": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "route",
+        "on"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "typing",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "route": {
+          "type": "object",
+          "required": [
+            "channel",
+            "account",
+            "conversationId"
+          ],
+          "properties": {
+            "channel": {
+              "type": "string"
+            },
+            "account": {
+              "type": "string"
+            },
+            "conversationId": {
+              "type": "string"
+            },
+            "threadId": {
+              "type": "string"
+            },
+            "replyToMessageId": {
+              "type": "string"
+            }
+          }
+        },
+        "on": {
+          "type": "boolean"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "route",
+        "providerMessageId"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "reconcile",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "route": {
+          "type": "object",
+          "required": [
+            "channel",
+            "account",
+            "conversationId"
+          ],
+          "properties": {
+            "channel": {
+              "type": "string"
+            },
+            "account": {
+              "type": "string"
+            },
+            "conversationId": {
+              "type": "string"
+            },
+            "threadId": {
+              "type": "string"
+            },
+            "replyToMessageId": {
+              "type": "string"
+            }
+          }
+        },
+        "providerMessageId": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "ok"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "result",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "value": {},
+        "error": {
+          "type": "object",
+          "required": [
+            "code",
+            "message"
+          ],
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "retryable": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "shutdown",
+          "type": "string"
+        }
+      }
+    }
+  ]
+}

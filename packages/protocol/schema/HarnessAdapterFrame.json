@@ -1,0 +1,1601 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/HarnessAdapterFrame",
+  "anyOf": [
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "ok"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "result",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "value": {},
+        "error": {
+          "type": "object",
+          "required": [
+            "code",
+            "message"
+          ],
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "retryable": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "sessionKey",
+        "generation",
+        "event"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "event",
+          "type": "string"
+        },
+        "sessionKey": {
+          "type": "string"
+        },
+        "generation": {
+          "type": "number"
+        },
+        "event": {
+          "type": "object",
+          "required": [
+            "ts",
+            "level",
+            "audience",
+            "durability",
+            "body"
+          ],
+          "properties": {
+            "ts": {
+              "type": "number"
+            },
+            "turnId": {
+              "type": "string"
+            },
+            "itemId": {
+              "type": "string"
+            },
+            "parentItemId": {
+              "type": "string"
+            },
+            "level": {
+              "anyOf": [
+                {
+                  "const": "primary",
+                  "type": "string"
+                },
+                {
+                  "const": "detail",
+                  "type": "string"
+                },
+                {
+                  "const": "debug",
+                  "type": "string"
+                }
+              ]
+            },
+            "audience": {
+              "anyOf": [
+                {
+                  "const": "answer",
+                  "type": "string"
+                },
+                {
+                  "const": "commentary",
+                  "type": "string"
+                },
+                {
+                  "const": "status",
+                  "type": "string"
+                },
+                {
+                  "const": "approval",
+                  "type": "string"
+                },
+                {
+                  "const": "internal",
+                  "type": "string"
+                }
+              ]
+            },
+            "durability": {
+              "anyOf": [
+                {
+                  "const": "durable",
+                  "type": "string"
+                },
+                {
+                  "const": "ephemeral",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "state"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "session.state",
+                      "type": "string"
+                    },
+                    "state": {
+                      "anyOf": [
+                        {
+                          "const": "idle",
+                          "type": "string"
+                        },
+                        {
+                          "const": "running",
+                          "type": "string"
+                        },
+                        {
+                          "const": "requires_action",
+                          "type": "string"
+                        },
+                        {
+                          "const": "stalled",
+                          "type": "string"
+                        },
+                        {
+                          "const": "error",
+                          "type": "string"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "inputId",
+                    "disposition"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "input.admitted",
+                      "type": "string"
+                    },
+                    "inputId": {
+                      "type": "string"
+                    },
+                    "disposition": {
+                      "anyOf": [
+                        {
+                          "const": "new_turn",
+                          "type": "string"
+                        },
+                        {
+                          "const": "steer",
+                          "type": "string"
+                        },
+                        {
+                          "const": "queued",
+                          "type": "string"
+                        },
+                        {
+                          "const": "observe_only",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "principalId": {
+                      "type": "string"
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "inputIds",
+                    "turnId"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "input.consumed",
+                      "type": "string"
+                    },
+                    "inputIds": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "turnId": {
+                      "type": "string"
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "inputIds",
+                    "reason"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "input.cancelled",
+                      "type": "string"
+                    },
+                    "inputIds": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "reason": {
+                      "type": "string"
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "inputIds",
+                    "reason"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "input.rejected",
+                      "type": "string"
+                    },
+                    "inputIds": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "reason": {
+                      "type": "string"
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "turnId",
+                    "inputIds",
+                    "replyRoute",
+                    "run"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "turn.started",
+                      "type": "string"
+                    },
+                    "turnId": {
+                      "type": "string"
+                    },
+                    "inputIds": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "replyRoute": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "required": [
+                            "channel",
+                            "account",
+                            "conversationId"
+                          ],
+                          "properties": {
+                            "channel": {
+                              "type": "string"
+                            },
+                            "account": {
+                              "type": "string"
+                            },
+                            "conversationId": {
+                              "type": "string"
+                            },
+                            "threadId": {
+                              "type": "string"
+                            },
+                            "replyToMessageId": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "run": {
+                      "type": "object",
+                      "required": [
+                        "harness",
+                        "model",
+                        "profile"
+                      ],
+                      "properties": {
+                        "harness": {
+                          "type": "string"
+                        },
+                        "model": {
+                          "type": "string"
+                        },
+                        "effort": {
+                          "type": "string"
+                        },
+                        "profile": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "owner": {
+                      "type": "string"
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "turnId",
+                    "route",
+                    "reason"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "turn.delivery_added",
+                      "type": "string"
+                    },
+                    "turnId": {
+                      "type": "string"
+                    },
+                    "route": {
+                      "type": "object",
+                      "required": [
+                        "channel",
+                        "account",
+                        "conversationId"
+                      ],
+                      "properties": {
+                        "channel": {
+                          "type": "string"
+                        },
+                        "account": {
+                          "type": "string"
+                        },
+                        "conversationId": {
+                          "type": "string"
+                        },
+                        "threadId": {
+                          "type": "string"
+                        },
+                        "replyToMessageId": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "reason": {
+                      "anyOf": [
+                        {
+                          "const": "steer",
+                          "type": "string"
+                        },
+                        {
+                          "const": "handoff",
+                          "type": "string"
+                        },
+                        {
+                          "const": "mirror",
+                          "type": "string"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "turnId",
+                    "status"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "turn.completed",
+                      "type": "string"
+                    },
+                    "turnId": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "anyOf": [
+                        {
+                          "const": "completed",
+                          "type": "string"
+                        },
+                        {
+                          "const": "interrupted",
+                          "type": "string"
+                        },
+                        {
+                          "const": "failed",
+                          "type": "string"
+                        },
+                        {
+                          "const": "ambiguous",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "usage": {},
+                    "error": {
+                      "type": "object",
+                      "required": [
+                        "code",
+                        "retryable"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string"
+                        },
+                        "retryable": {
+                          "type": "boolean"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "delta",
+                    "stream"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "text.delta",
+                      "type": "string"
+                    },
+                    "delta": {
+                      "type": "string"
+                    },
+                    "stream": {
+                      "anyOf": [
+                        {
+                          "const": "answer",
+                          "type": "string"
+                        },
+                        {
+                          "const": "reasoning",
+                          "type": "string"
+                        },
+                        {
+                          "const": "command_output",
+                          "type": "string"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "text",
+                    "final"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "text.snapshot",
+                      "type": "string"
+                    },
+                    "text": {
+                      "type": "string"
+                    },
+                    "final": {
+                      "type": "boolean"
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "item"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "item.started",
+                      "type": "string"
+                    },
+                    "item": {
+                      "type": "object",
+                      "required": [
+                        "itemId",
+                        "type",
+                        "title",
+                        "status"
+                      ],
+                      "properties": {
+                        "itemId": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "anyOf": [
+                            {
+                              "const": "command",
+                              "type": "string"
+                            },
+                            {
+                              "const": "file_change",
+                              "type": "string"
+                            },
+                            {
+                              "const": "mcp_tool",
+                              "type": "string"
+                            },
+                            {
+                              "const": "tool",
+                              "type": "string"
+                            },
+                            {
+                              "const": "subagent",
+                              "type": "string"
+                            },
+                            {
+                              "const": "web_search",
+                              "type": "string"
+                            },
+                            {
+                              "const": "hook",
+                              "type": "string"
+                            },
+                            {
+                              "const": "compaction",
+                              "type": "string"
+                            },
+                            {
+                              "const": "user_message",
+                              "type": "string"
+                            },
+                            {
+                              "const": "agent_message",
+                              "type": "string"
+                            },
+                            {
+                              "const": "reasoning",
+                              "type": "string"
+                            }
+                          ]
+                        },
+                        "title": {
+                          "type": "string"
+                        },
+                        "status": {
+                          "anyOf": [
+                            {
+                              "const": "running",
+                              "type": "string"
+                            },
+                            {
+                              "const": "completed",
+                              "type": "string"
+                            },
+                            {
+                              "const": "failed",
+                              "type": "string"
+                            },
+                            {
+                              "const": "declined",
+                              "type": "string"
+                            },
+                            {
+                              "const": "skipped",
+                              "type": "string"
+                            }
+                          ]
+                        },
+                        "inputSummary": {
+                          "type": "string"
+                        },
+                        "result": {
+                          "type": "object",
+                          "required": [
+                            "preview",
+                            "truncated",
+                            "isError"
+                          ],
+                          "properties": {
+                            "preview": {
+                              "type": "string"
+                            },
+                            "truncated": {
+                              "anyOf": [
+                                {
+                                  "type": "boolean"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "isError": {
+                              "type": "boolean"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "item"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "item.completed",
+                      "type": "string"
+                    },
+                    "item": {
+                      "type": "object",
+                      "required": [
+                        "itemId",
+                        "type",
+                        "title",
+                        "status"
+                      ],
+                      "properties": {
+                        "itemId": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "anyOf": [
+                            {
+                              "const": "command",
+                              "type": "string"
+                            },
+                            {
+                              "const": "file_change",
+                              "type": "string"
+                            },
+                            {
+                              "const": "mcp_tool",
+                              "type": "string"
+                            },
+                            {
+                              "const": "tool",
+                              "type": "string"
+                            },
+                            {
+                              "const": "subagent",
+                              "type": "string"
+                            },
+                            {
+                              "const": "web_search",
+                              "type": "string"
+                            },
+                            {
+                              "const": "hook",
+                              "type": "string"
+                            },
+                            {
+                              "const": "compaction",
+                              "type": "string"
+                            },
+                            {
+                              "const": "user_message",
+                              "type": "string"
+                            },
+                            {
+                              "const": "agent_message",
+                              "type": "string"
+                            },
+                            {
+                              "const": "reasoning",
+                              "type": "string"
+                            }
+                          ]
+                        },
+                        "title": {
+                          "type": "string"
+                        },
+                        "status": {
+                          "anyOf": [
+                            {
+                              "const": "running",
+                              "type": "string"
+                            },
+                            {
+                              "const": "completed",
+                              "type": "string"
+                            },
+                            {
+                              "const": "failed",
+                              "type": "string"
+                            },
+                            {
+                              "const": "declined",
+                              "type": "string"
+                            },
+                            {
+                              "const": "skipped",
+                              "type": "string"
+                            }
+                          ]
+                        },
+                        "inputSummary": {
+                          "type": "string"
+                        },
+                        "result": {
+                          "type": "object",
+                          "required": [
+                            "preview",
+                            "truncated",
+                            "isError"
+                          ],
+                          "properties": {
+                            "preview": {
+                              "type": "string"
+                            },
+                            "truncated": {
+                              "anyOf": [
+                                {
+                                  "type": "boolean"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "isError": {
+                              "type": "boolean"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "itemId"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "item.progress",
+                      "type": "string"
+                    },
+                    "itemId": {
+                      "type": "string"
+                    },
+                    "text": {
+                      "type": "string"
+                    },
+                    "elapsedMs": {
+                      "type": "number"
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "steps"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "plan.updated",
+                      "type": "string"
+                    },
+                    "steps": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "text",
+                          "status"
+                        ],
+                        "properties": {
+                          "text": {
+                            "type": "string"
+                          },
+                          "status": {
+                            "anyOf": [
+                              {
+                                "const": "pending",
+                                "type": "string"
+                              },
+                              {
+                                "const": "in_progress",
+                                "type": "string"
+                              },
+                              {
+                                "const": "completed",
+                                "type": "string"
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "files"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "diff.updated",
+                      "type": "string"
+                    },
+                    "files": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "path",
+                          "added",
+                          "removed"
+                        ],
+                        "properties": {
+                          "path": {
+                            "type": "string"
+                          },
+                          "added": {
+                            "type": "number"
+                          },
+                          "removed": {
+                            "type": "number"
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "text"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "headline",
+                      "type": "string"
+                    },
+                    "text": {
+                      "type": "string"
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "requestId",
+                    "kind",
+                    "title",
+                    "risk",
+                    "allowedDecisions",
+                    "allowAlways",
+                    "defaultDeny"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "request.opened",
+                      "type": "string"
+                    },
+                    "requestId": {
+                      "type": "string"
+                    },
+                    "kind": {
+                      "anyOf": [
+                        {
+                          "const": "tool_approval",
+                          "type": "string"
+                        },
+                        {
+                          "const": "file_change",
+                          "type": "string"
+                        },
+                        {
+                          "const": "permissions",
+                          "type": "string"
+                        },
+                        {
+                          "const": "question",
+                          "type": "string"
+                        },
+                        {
+                          "const": "elicitation",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "title": {
+                      "type": "string"
+                    },
+                    "risk": {
+                      "type": "object",
+                      "properties": {
+                        "writes": {
+                          "type": "boolean"
+                        },
+                        "network": {
+                          "type": "boolean"
+                        },
+                        "elevated": {
+                          "type": "boolean"
+                        }
+                      }
+                    },
+                    "detailRef": {
+                      "type": "string"
+                    },
+                    "allowedDecisions": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "allowAlways": {
+                      "type": "boolean"
+                    },
+                    "defaultDeny": {
+                      "type": "boolean"
+                    },
+                    "expiresAt": {
+                      "type": "number"
+                    },
+                    "resolver": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "required": [
+                            "kind",
+                            "decision"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "auto",
+                              "type": "string"
+                            },
+                            "decision": {
+                              "anyOf": [
+                                {
+                                  "type": "object",
+                                  "required": [
+                                    "kind"
+                                  ],
+                                  "properties": {
+                                    "kind": {
+                                      "const": "allow_once",
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                {
+                                  "type": "object",
+                                  "required": [
+                                    "kind"
+                                  ],
+                                  "properties": {
+                                    "kind": {
+                                      "const": "allow_session",
+                                      "type": "string"
+                                    },
+                                    "updatedPermissions": {}
+                                  }
+                                },
+                                {
+                                  "type": "object",
+                                  "required": [
+                                    "kind"
+                                  ],
+                                  "properties": {
+                                    "kind": {
+                                      "const": "deny",
+                                      "type": "string"
+                                    },
+                                    "message": {
+                                      "type": "string"
+                                    },
+                                    "interruptTurn": {
+                                      "type": "boolean"
+                                    }
+                                  }
+                                },
+                                {
+                                  "type": "object",
+                                  "required": [
+                                    "kind",
+                                    "answers"
+                                  ],
+                                  "properties": {
+                                    "kind": {
+                                      "const": "answer",
+                                      "type": "string"
+                                    },
+                                    "answers": {
+                                      "type": "object",
+                                      "patternProperties": {
+                                        "^(.*)$": {
+                                          "anyOf": [
+                                            {
+                                              "type": "string"
+                                            },
+                                            {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          ]
+                                        }
+                                      }
+                                    }
+                                  }
+                                },
+                                {
+                                  "type": "object",
+                                  "required": [
+                                    "kind",
+                                    "payload"
+                                  ],
+                                  "properties": {
+                                    "kind": {
+                                      "const": "native",
+                                      "type": "string"
+                                    },
+                                    "payload": {}
+                                  }
+                                }
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "required": [
+                            "kind",
+                            "model"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "model",
+                              "type": "string"
+                            },
+                            "model": {
+                              "type": "string"
+                            },
+                            "prompt": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "required": [
+                            "kind",
+                            "principals",
+                            "routes"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "human",
+                              "type": "string"
+                            },
+                            "principals": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "routes": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "required": [
+                            "kind"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "host",
+                              "type": "string"
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "requestId",
+                    "decision",
+                    "by"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "request.resolved",
+                      "type": "string"
+                    },
+                    "requestId": {
+                      "type": "string"
+                    },
+                    "decision": {
+                      "anyOf": [
+                        {
+                          "anyOf": [
+                            {
+                              "type": "object",
+                              "required": [
+                                "kind"
+                              ],
+                              "properties": {
+                                "kind": {
+                                  "const": "allow_once",
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            {
+                              "type": "object",
+                              "required": [
+                                "kind"
+                              ],
+                              "properties": {
+                                "kind": {
+                                  "const": "allow_session",
+                                  "type": "string"
+                                },
+                                "updatedPermissions": {}
+                              }
+                            },
+                            {
+                              "type": "object",
+                              "required": [
+                                "kind"
+                              ],
+                              "properties": {
+                                "kind": {
+                                  "const": "deny",
+                                  "type": "string"
+                                },
+                                "message": {
+                                  "type": "string"
+                                },
+                                "interruptTurn": {
+                                  "type": "boolean"
+                                }
+                              }
+                            },
+                            {
+                              "type": "object",
+                              "required": [
+                                "kind",
+                                "answers"
+                              ],
+                              "properties": {
+                                "kind": {
+                                  "const": "answer",
+                                  "type": "string"
+                                },
+                                "answers": {
+                                  "type": "object",
+                                  "patternProperties": {
+                                    "^(.*)$": {
+                                      "anyOf": [
+                                        {
+                                          "type": "string"
+                                        },
+                                        {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "string"
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  }
+                                }
+                              }
+                            },
+                            {
+                              "type": "object",
+                              "required": [
+                                "kind",
+                                "payload"
+                              ],
+                              "properties": {
+                                "kind": {
+                                  "const": "native",
+                                  "type": "string"
+                                },
+                                "payload": {}
+                              }
+                            }
+                          ]
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "by": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "required": [
+                            "kind"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "anyOf": [
+                                {
+                                  "const": "auto",
+                                  "type": "string"
+                                },
+                                {
+                                  "const": "model",
+                                  "type": "string"
+                                },
+                                {
+                                  "const": "human",
+                                  "type": "string"
+                                },
+                                {
+                                  "const": "host",
+                                  "type": "string"
+                                },
+                                {
+                                  "const": "harness",
+                                  "type": "string"
+                                }
+                              ]
+                            },
+                            "id": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        {
+                          "const": "timeout",
+                          "type": "string"
+                        },
+                        {
+                          "const": "runtime_cancelled",
+                          "type": "string"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "usage"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "usage",
+                      "type": "string"
+                    },
+                    "usage": {}
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "code",
+                    "message"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "notice",
+                      "type": "string"
+                    },
+                    "code": {
+                      "anyOf": [
+                        {
+                          "const": "compacting",
+                          "type": "string"
+                        },
+                        {
+                          "const": "api_retry",
+                          "type": "string"
+                        },
+                        {
+                          "const": "rate_limited",
+                          "type": "string"
+                        },
+                        {
+                          "const": "runtime_restart",
+                          "type": "string"
+                        },
+                        {
+                          "const": "auto_review",
+                          "type": "string"
+                        },
+                        {
+                          "const": "continuity",
+                          "type": "string"
+                        },
+                        {
+                          "const": "other",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "operationId",
+                    "route",
+                    "result"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "delivery.settled",
+                      "type": "string"
+                    },
+                    "operationId": {
+                      "type": "string"
+                    },
+                    "route": {
+                      "type": "object",
+                      "required": [
+                        "channel",
+                        "account",
+                        "conversationId"
+                      ],
+                      "properties": {
+                        "channel": {
+                          "type": "string"
+                        },
+                        "account": {
+                          "type": "string"
+                        },
+                        "conversationId": {
+                          "type": "string"
+                        },
+                        "threadId": {
+                          "type": "string"
+                        },
+                        "replyToMessageId": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "result": {
+                      "anyOf": [
+                        {
+                          "const": "delivered",
+                          "type": "string"
+                        },
+                        {
+                          "const": "rejected",
+                          "type": "string"
+                        },
+                        {
+                          "const": "unknown",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "providerMessageId": {
+                      "type": "string"
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "route",
+                    "turnId",
+                    "providerMessageId"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "render.anchor",
+                      "type": "string"
+                    },
+                    "route": {
+                      "type": "object",
+                      "required": [
+                        "channel",
+                        "account",
+                        "conversationId"
+                      ],
+                      "properties": {
+                        "channel": {
+                          "type": "string"
+                        },
+                        "account": {
+                          "type": "string"
+                        },
+                        "conversationId": {
+                          "type": "string"
+                        },
+                        "threadId": {
+                          "type": "string"
+                        },
+                        "replyToMessageId": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "turnId": {
+                      "type": "string"
+                    },
+                    "providerMessageId": {
+                      "type": "string"
+                    },
+                    "leaseUntil": {
+                      "type": "number"
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "name"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "native",
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    }
+                  }
+                }
+              ]
+            },
+            "native": {}
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "sessionKey",
+        "nativeId"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "nativeId",
+          "type": "string"
+        },
+        "sessionKey": {
+          "type": "string"
+        },
+        "nativeId": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "level",
+        "msg"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "log",
+          "type": "string"
+        },
+        "level": {
+          "anyOf": [
+            {
+              "const": "debug",
+              "type": "string"
+            },
+            {
+              "const": "info",
+              "type": "string"
+            },
+            {
+              "const": "warn",
+              "type": "string"
+            },
+            {
+              "const": "error",
+              "type": "string"
+            }
+          ]
+        },
+        "msg": {
+          "type": "string"
+        },
+        "data": {}
+      }
+    }
+  ]
+}

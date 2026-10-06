@@ -1,0 +1,9 @@
+{
+  "name": "@agents-io/testkit",
+  "version": "0.1.0",
+  "description": "Conformance checks and fakes for agents-io channel and harness adapters",
+  "type": "module",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist"],
+  "dependencies": { "@agents-io/protocol": "workspace:*" }
+}

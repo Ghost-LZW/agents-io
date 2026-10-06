@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/Origin",
+  "type": "object",
+  "required": [
+    "kind",
+    "principal",
+    "evidence",
+    "via",
+    "adapter"
+  ],
+  "properties": {
+    "kind": {
+      "anyOf": [
+        {
+          "const": "human",
+          "type": "string"
+        },
+        {
+          "const": "agent",
+          "type": "string"
+        },
+        {
+          "const": "channel_event",
+          "type": "string"
+        },
+        {
+          "const": "system",
+          "type": "string"
+        },
+        {
+          "const": "peer",
+          "type": "string"
+        }
+      ]
+    },
+    "principal": {
+      "anyOf": [
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "labels"
+          ],
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "labels": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "evidence": {
+      "anyOf": [
+        {
+          "const": "platform_signed",
+          "type": "string"
+        },
+        {
+          "const": "dkim_pass",
+          "type": "string"
+        },
+        {
+          "const": "device_only",
+          "type": "string"
+        },
+        {
+          "const": "none",
+          "type": "string"
+        }
+      ]
+    },
+    "declared": {
+      "type": "string"
+    },
+    "self": {
+      "type": "boolean"
+    },
+    "via": {
+      "type": "string"
+    },
+    "adapter": {
+      "type": "string"
+    }
+  }
+}

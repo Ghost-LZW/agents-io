@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/HarnessCaps",
+  "type": "object",
+  "required": [
+    "steer",
+    "interrupt",
+    "approvals",
+    "questions",
+    "tokenDeltas",
+    "cancelQueued",
+    "injectWithoutTurn",
+    "resume",
+    "switchModelMidSession"
+  ],
+  "properties": {
+    "steer": {
+      "anyOf": [
+        {
+          "const": "native",
+          "type": "string"
+        },
+        {
+          "const": "tool_boundary",
+          "type": "string"
+        },
+        {
+          "const": "none",
+          "type": "string"
+        }
+      ]
+    },
+    "interrupt": {
+      "type": "boolean"
+    },
+    "approvals": {
+      "type": "boolean"
+    },
+    "questions": {
+      "type": "boolean"
+    },
+    "tokenDeltas": {
+      "type": "boolean"
+    },
+    "cancelQueued": {
+      "type": "boolean"
+    },
+    "injectWithoutTurn": {
+      "type": "boolean"
+    },
+    "resume": {
+      "type": "boolean"
+    },
+    "switchModelMidSession": {
+      "type": "boolean"
+    },
+    "models": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

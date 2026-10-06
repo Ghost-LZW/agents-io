@@ -1,0 +1,7 @@
+packages:
+  - packages/*
+  - harness/*
+  - channel/*
+  - examples/*
+allowBuilds:
+  esbuild: true

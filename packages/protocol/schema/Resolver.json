@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/Resolver",
+  "anyOf": [
+    {
+      "type": "object",
+      "required": [
+        "kind",
+        "decision"
+      ],
+      "properties": {
+        "kind": {
+          "const": "auto",
+          "type": "string"
+        },
+        "decision": {
+          "anyOf": [
+            {
+              "type": "object",
+              "required": [
+                "kind"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "allow_once",
+                  "type": "string"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "kind"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "allow_session",
+                  "type": "string"
+                },
+                "updatedPermissions": {}
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "kind"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "deny",
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "interruptTurn": {
+                  "type": "boolean"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "kind",
+                "answers"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "answer",
+                  "type": "string"
+                },
+                "answers": {
+                  "type": "object",
+                  "patternProperties": {
+                    "^(.*)$": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "kind",
+                "payload"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "native",
+                  "type": "string"
+                },
+                "payload": {}
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "kind",
+        "model"
+      ],
+      "properties": {
+        "kind": {
+          "const": "model",
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "prompt": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "kind",
+        "principals",
+        "routes"
+      ],
+      "properties": {
+        "kind": {
+          "const": "human",
+          "type": "string"
+        },
+        "principals": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "routes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "const": "host",
+          "type": "string"
+        }
+      }
+    }
+  ]
+}
