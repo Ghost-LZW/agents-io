@@ -1,0 +1,15 @@
+{
+  "name": "@agents-io/channel-lark-bot",
+  "version": "0.1.0",
+  "description": "agents-io channel adapter for the official Feishu/Lark bot platform (WebSocket long connection)",
+  "type": "module",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist"],
+  "dependencies": {
+    "@agents-io/protocol": "workspace:*",
+    "@larksuiteoapi/node-sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@agents-io/testkit": "workspace:*"
+  }
+}
