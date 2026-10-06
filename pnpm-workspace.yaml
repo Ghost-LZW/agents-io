@@ -5,3 +5,16 @@ packages:
   - examples/*
 allowBuilds:
   esbuild: true
+  protobufjs: true
+# Claude Agent SDK 0.3.291 matches the locally installed CLI 2.1.291 and was verified live;
+# exempt it from pnpm's 24h minimum release age. Drop these once the age gate has passed.
+minimumReleaseAgeExclude:
+  - '@anthropic-ai/claude-agent-sdk@0.3.291'
+  - '@anthropic-ai/claude-agent-sdk-darwin-arm64@0.3.291'
+  - '@anthropic-ai/claude-agent-sdk-darwin-x64@0.3.291'
+  - '@anthropic-ai/claude-agent-sdk-linux-arm64@0.3.291'
+  - '@anthropic-ai/claude-agent-sdk-linux-arm64-musl@0.3.291'
+  - '@anthropic-ai/claude-agent-sdk-linux-x64@0.3.291'
+  - '@anthropic-ai/claude-agent-sdk-linux-x64-musl@0.3.291'
+  - '@anthropic-ai/claude-agent-sdk-win32-arm64@0.3.291'
+  - '@anthropic-ai/claude-agent-sdk-win32-x64@0.3.291'
