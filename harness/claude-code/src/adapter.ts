@@ -24,6 +24,8 @@ export const claudeCodeCaps: HarnessCaps = {
   injectWithoutTurn: false,
   resume: true,
   switchModelMidSession: true,
+  // Tool-list changes need a new CLI process; permission-mode-only changes do not.
+  switchProfileMidSession: false,
 };
 
 export interface ClaudeCodeHarnessConfig {

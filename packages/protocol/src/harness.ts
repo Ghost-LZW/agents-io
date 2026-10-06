@@ -40,9 +40,10 @@ export interface HarnessSession {
   inject?(inputs: InputRecord[]): Promise<void>;
   interrupt(turnId: string): Promise<void>;
   /**
-   * Answer a request. The session layer records `request.resolved` for answers it
-   * gives; adapters emit `request.resolved` only when the harness resolved it
-   * itself (other client, native reviewer) or cancelled it (`runtime_cancelled`).
+   * Answer a request. Every opened request must be closed by a `request.resolved`
+   * in the adapter's own stream, so the stream is checkable on its own: after
+   * respond() emit `by: { kind: 'host' }`. The session layer records the real
+   * resolver (auto, model, human) and drops the adapter's echo.
    */
   respond(requestId: string, decision: Decision): Promise<void>;
   /** Events in emission order. Ends when the session closes. */

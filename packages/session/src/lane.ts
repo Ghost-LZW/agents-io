@@ -234,6 +234,8 @@ export class Lane {
       run: t?.run ?? this.lastRun ?? { harness: this.o.harness.id, model: 'default', profile: 'restricted' },
       inputs: t?.inputs ?? [],
       replyRoute: t?.replyRoute ?? null,
+      ...(t?.owner != null ? { owner: t.owner } : {}),
+      deliveries: t ? [...t.deliveries] : [],
     };
   }
 
@@ -266,7 +268,7 @@ export class Lane {
       if (r) return r;
     } else if (mode === 'interrupt' && this.turn) {
       const t = this.turn;
-      const allowed = (await this.policy.control({ op: 'interrupt', origin: input.origin, turn: this.context(), owner: t.owner })) === 'allow';
+      const allowed = (await this.policy.control({ sessionKey: this.sessionKey, op: 'interrupt', origin: input.origin, turn: this.context() })) === 'allow';
       if (allowed) {
         this.queue.unshift({ input, attempts: 0 });
         this.emit({ body: { t: 'input.admitted', inputId: input.inputId, disposition: 'queued', ...pid(input) } });
@@ -325,7 +327,7 @@ export class Lane {
     if (turnId && t?.turnId !== turnId) return { ok: false, reason: 'stale_turn' };
     const op = t ? 'interrupt' : 'cancel_queue';
     if (!t && !cancelQueue) return { ok: false, reason: 'no_active_turn' };
-    if ((await this.policy.control({ op, origin, turn: t ? this.context() : null, owner: t?.owner ?? null })) !== 'allow') {
+    if ((await this.policy.control({ sessionKey: this.sessionKey, op, origin, ...(t ? { turn: this.context() } : {}) })) !== 'allow') {
       return { ok: false, reason: 'forbidden' };
     }
     if (cancelQueue && this.queue.length) {
@@ -544,7 +546,7 @@ export class Lane {
     } catch (err) {
       resolver = { kind: 'auto', decision: { kind: 'deny', message: `policy error: ${errMsg(err)}` } };
     }
-    if (resolver.kind === 'model' && !this.o.modelReviewer) resolver = await this.policy.escalate(b, ctx, owner);
+    if (resolver.kind === 'model' && !this.o.modelReviewer) resolver = await this.policy.escalate(b, ctx);
 
     const p: PendingRequest = { body: b, resolver, turnId: e.turnId, audience: audienceFor(resolver, e.audience) };
     this.requests.set(b.requestId, p);
@@ -585,7 +587,7 @@ export class Lane {
           if (this.requests.get(id) !== p) return; // already settled (timeout, harness, turn end)
           if ('escalate' in out) {
             if (p.timer) clearTimeout(p.timer);
-            const next = await this.policy.escalate(p.body, ctx, owner);
+            const next = await this.policy.escalate(p.body, ctx);
             const q: PendingRequest = { body: p.body, resolver: next, turnId: p.turnId, audience: audienceFor(next, 'approval') };
             this.requests.set(id, q);
             // Re-open with the escalated resolver; subscribers upsert by requestId.

@@ -101,7 +101,7 @@ export class LarkBotAdapter implements ChannelAdapter {
       text: { maxChars: this.cfg.maxChars, markdown: 'basic' },
       edit: true,
       buttons: true,
-      media: ['image', 'file', 'audio'],
+      media: { in: ['image', 'file', 'audio'], out: ['image', 'file', 'audio'] },
       voiceOut: 'none',
       threads: true,
       approvals: 'buttons',

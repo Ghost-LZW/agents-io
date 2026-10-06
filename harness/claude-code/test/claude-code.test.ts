@@ -105,13 +105,13 @@ describe('open → SDK options', () => {
 
   it('emits nativeId at open and again when system/init reports another id', async () => {
     const { s, q, it, give, conform } = await setup({ resume: 'old' });
-    const first = await collectUntil(it, (e) => e.body.t === 'native');
-    expect(first[0]!.native).toEqual({ sessionId: 'old' });
+    const first = await collectUntil(it, (e) => e.body.t === 'session.bound');
+    expect(first[0]!.body).toMatchObject({ nativeId: 'old' });
     give('t1', 'i1');
     await s.startTurn('t1', [input('i1', 'hi')]);
     q.push(sdk.init('forked-id'), sdk.result({ uuids: [uuidOf(q, 0)] }));
     const evs = await collectUntil(it, isTurnCompleted);
-    expect(evs.find((e) => e.body.t === 'native' && e.body.name === 'session.native_id')?.native).toEqual({ sessionId: 'forked-id' });
+    expect(evs.find((e) => e.body.t === 'session.bound')?.body).toMatchObject({ nativeId: 'forked-id' });
     expect(s.nativeId()).toBe('forked-id');
     conform(evs);
   });

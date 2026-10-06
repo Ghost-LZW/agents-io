@@ -16,7 +16,7 @@ CAPS = {
     "text": {"maxChars": 2000, "markdown": "none"},
     "edit": False,
     "buttons": False,
-    "media": [],
+    "media": {"in": [], "out": []},
     "voiceOut": "none",
     "threads": False,
     "approvals": "none",

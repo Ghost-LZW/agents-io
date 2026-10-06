@@ -2,6 +2,11 @@
   "files": [],
   "references": [
     { "path": "packages/protocol" },
-    { "path": "packages/testkit" }
+    { "path": "packages/testkit" },
+    { "path": "packages/session" },
+    { "path": "channel/jsonl-bridge" },
+    { "path": "channel/lark-bot" },
+    { "path": "channel/mail" },
+    { "path": "harness/claude-code" }
   ]
 }

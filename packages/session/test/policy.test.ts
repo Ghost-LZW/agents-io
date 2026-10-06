@@ -91,9 +91,13 @@ describe('defaultPolicy.plan / resolve / outbound', () => {
   });
 
   it('control: owners and turn owners may interrupt', async () => {
-    expect(await p.control({ op: 'interrupt', origin: origin('fake:alice'), turn: null, owner: 'x' })).toBe('allow');
-    expect(await p.control({ op: 'interrupt', origin: origin('x', ['agent']), turn: null, owner: 'x' })).toBe('allow');
-    expect(await p.control({ op: 'interrupt', origin: origin('y', []), turn: null, owner: 'x' })).toBe('deny');
-    expect(await p.control({ op: 'interrupt', origin: origin(null), turn: null, owner: null })).toBe('deny');
+    expect(await p.control({ sessionKey: 's', op: 'interrupt', origin: origin('fake:alice'), turn: turnOwnedBy('x') })).toBe('allow');
+    expect(await p.control({ sessionKey: 's', op: 'interrupt', origin: origin('x', ['agent']), turn: turnOwnedBy('x') })).toBe('allow');
+    expect(await p.control({ sessionKey: 's', op: 'interrupt', origin: origin('y', []), turn: turnOwnedBy('x') })).toBe('deny');
+    expect(await p.control({ sessionKey: 's', op: 'interrupt', origin: origin(null), })).toBe('deny');
   });
 });
+
+function turnOwnedBy(owner: string) {
+  return { sessionKey: 's', turnId: 't', run: { harness: 'fake', model: 'm', profile: 'p' }, inputs: [], replyRoute: null, owner, deliveries: [] };
+}

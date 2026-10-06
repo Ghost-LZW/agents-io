@@ -12,27 +12,13 @@ import {
   type RunSpec,
   type TurnContext,
   type TurnDraft,
+  type ControlArgs,
 } from '@agents-io/protocol';
 
-export interface ControlArgs {
-  op: 'interrupt' | 'cancel_queue';
-  origin: Origin;
-  /** The active turn, if any. */
-  turn: TurnContext | null;
-  /** Principal id that owns the active turn. */
-  owner: string | null;
-}
+export type { ControlArgs };
 
-/**
- * `Policy` plus the hooks the session layer needs that the protocol does not have
- * yet. All optional.
- */
-export interface SessionPolicy extends Policy {
-  /** May `origin` interrupt the active turn / clear the queue? */
-  control?(args: ControlArgs): Promise<'allow' | 'deny'>;
-  /** Resolver to use when a `model` resolver cannot run (no reviewer) or escalates. */
-  escalate?(req: BodyOf<'request.opened'>, ctx: TurnContext, owner: string | null): Promise<Resolver>;
-}
+/** The protocol `Policy`; kept as an alias for existing imports. */
+export type SessionPolicy = Policy;
 
 export type FullPolicy = Required<SessionPolicy>;
 
@@ -132,13 +118,15 @@ export function defaultPolicy(o: DefaultPolicyOptions): FullPolicy {
       return own.some((r) => r && routeKey(r) === k) ? 'allow' : 'deny';
     },
 
-    async control({ origin, owner }: ControlArgs): Promise<'allow' | 'deny'> {
+    async control({ origin, turn }: ControlArgs): Promise<'allow' | 'deny'> {
+      const owner = turn?.owner ?? null;
       const p = origin.principal;
       if (!p) return 'deny';
       return isOwner(origin) || (owner !== null && p.id === owner) ? 'allow' : 'deny';
     },
 
-    async escalate(_req: BodyOf<'request.opened'>, ctx: TurnContext, owner: string | null): Promise<Resolver> {
+    async escalate(_req: BodyOf<'request.opened'>, ctx: TurnContext): Promise<Resolver> {
+      const owner = ctx.owner ?? null;
       return {
         kind: 'human',
         principals: owner ? [owner] : [],

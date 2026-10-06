@@ -44,7 +44,7 @@ export interface SessionSnapshot {
     turnId: string;
     inputIds: string[];
     replyRoute: ReplyRoute | null;
-    run: RunSpec;
+    run?: RunSpec;
     owner?: string;
     deliveries: ReplyRoute[];
   } | null;
@@ -99,7 +99,7 @@ export function foldSnapshot(s: SessionSnapshot, e: SessionEvent): void {
         turnId: b.turnId,
         inputIds: [...b.inputIds],
         replyRoute: b.replyRoute,
-        run: b.run,
+        ...(b.run ? { run: b.run } : {}),
         ...(b.owner !== undefined ? { owner: b.owner } : {}),
         deliveries: [],
       };

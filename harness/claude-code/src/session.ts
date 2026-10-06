@@ -156,7 +156,7 @@ export class ClaudeCodeSession implements HarnessSession {
   /** Called once by the adapter after `query()` returned. */
   attach(q: QueryLike): void {
     this.q = q;
-    this.emit({ t: 'native', name: 'session.native_id' }, { native: { sessionId: this.sessionId } });
+    this.emit({ t: 'session.bound', nativeId: this.sessionId });
     if (this.effort !== undefined && !isEffort(this.effort))
       this.emit({ t: 'notice', code: 'other', message: `effort "${this.effort}" is not supported by Claude Code; ignored` });
     this.pumpDone = this.pump();
@@ -478,7 +478,7 @@ export class ClaudeCodeSession implements HarnessSession {
       case 'init':
         if (m.session_id && m.session_id !== this.sessionId) {
           this.sessionId = m.session_id;
-          this.emit({ t: 'native', name: 'session.native_id' }, { native: { sessionId: m.session_id } });
+          this.emit({ t: 'session.bound', nativeId: m.session_id });
         }
         return this.native('system/init', m);
       case 'api_retry':

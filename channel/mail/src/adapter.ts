@@ -49,7 +49,8 @@ export class MailChannel implements ChannelAdapter {
       text: { maxChars: 100_000, markdown: 'none' },
       edit: false,
       buttons: false,
-      media: ['file', 'image'],
+      // Outbound attachments are not implemented yet.
+      media: { in: ['file', 'image'], out: [] },
       voiceOut: 'none',
       threads: true,
       approvals: 'link',
