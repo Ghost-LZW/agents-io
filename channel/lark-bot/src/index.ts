@@ -5,3 +5,7 @@ export { buildCard, fitCard, isLarkCard, splitText, uuidFor } from './render.js'
 export { DedupWindow, MemoryDeclaredSenderStore, type DeclaredSenderStore } from './store.js';
 export { defaultLarkDeps } from './sdk.js';
 export type * from './types.js';
+export { APP_CALLBACKS, APP_EVENTS, TENANT_SCOPES, consoleLinks, larkAddons, scopesJson, type Brand, type ScopeRequirement } from './setup/requirements.js';
+export { createLarkBot, updateLarkBot, LarkSetupError, type LarkBotCredentials } from './setup/create.js';
+export { resolveOwner, type OwnerResult } from './setup/owner.js';
+export { verifyLarkBot, type VerifyReport } from './setup/verify.js';
