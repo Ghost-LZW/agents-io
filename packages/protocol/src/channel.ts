@@ -168,4 +168,24 @@ export interface ChannelAdapter {
   typing?(route: ReplyRoute, on: boolean): Promise<void>;
   /** After restart: is a previously sent (streaming) message still editable? */
   reconcile?(route: ReplyRoute, providerMessageId: string): Promise<'alive' | 'gone'>;
+  /** Release resources (called once, at daemon shutdown, after `start`'s signal aborted). */
+  close?(): Promise<void>;
 }
+
+/** Passed to a channel plugin's factory. */
+export interface ChannelFactoryInit {
+  /** The config entry's `account` (default `default`). */
+  account: string;
+  /** The config entry's `config`, `env:NAME` values substituted; `undefined` when absent. */
+  config: unknown;
+  /** Daemon log, prefixed with the channel. */
+  log(level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown): void;
+}
+
+/**
+ * What a channel plugin module exports (as `createChannel`, or as default), for a
+ * `{ "type": "module" }` channel entry. Runs in the daemon's process; a rejection
+ * or a throw fails the daemon's start. The adapter then gets the usual
+ * `ChannelContext` (with the blob store) in `start`.
+ */
+export type ChannelFactory = (init: ChannelFactoryInit) => ChannelAdapter | Promise<ChannelAdapter>;
