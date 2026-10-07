@@ -8,4 +8,5 @@ export * from './channel.js';
 export * from './harness.js';
 export * from './policy.js';
 export * from './wire.js';
+export * from './client.js';
 export * from './validate.js';

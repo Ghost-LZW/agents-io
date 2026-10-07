@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/SessionInfo",
+  "type": "object",
+  "required": [
+    "sessionKey",
+    "harness",
+    "state",
+    "head",
+    "queued",
+    "pendingRequests",
+    "live"
+  ],
+  "properties": {
+    "sessionKey": {
+      "type": "string"
+    },
+    "harness": {
+      "type": "string"
+    },
+    "state": {
+      "type": "string"
+    },
+    "head": {
+      "type": "number"
+    },
+    "turnId": {
+      "type": "string"
+    },
+    "queued": {
+      "type": "number"
+    },
+    "pendingRequests": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "live": {
+      "type": "boolean"
+    }
+  }
+}
