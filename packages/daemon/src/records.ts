@@ -1,12 +1,13 @@
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
-import type { InboundEnvelope, InputVerifyResult, Origin, VerifiedInput } from '@agents-io/protocol';
+import type { InboundEnvelope, InputVerifyResult, Origin, SessionLaunch, VerifiedInput } from '@agents-io/protocol';
 import { channelRefOf, type DeliveryRecord, type OutboxStore } from '@agents-io/session';
 
 /*
  * Daemon-side records next to the session log (same SQLite file when the log is
  * SQLite): who sent each channel message as the channel reported it (for
- * `input.verify`), settled deliveries (outbox idempotency across restarts), and
- * which agent each session belongs to.
+ * `input.verify`), settled deliveries (outbox idempotency across restarts),
+ * which agent each session belongs to, and how a session is launched (decision 7:
+ * its cwd and env, kept in this 0600 database like the transcripts).
  */
 
 const DAY = 86_400_000;
@@ -20,7 +21,9 @@ export type VerifyResult = InputVerifyResult;
 export class DaemonRecords implements OutboxStore {
   readonly db: DatabaseSync;
   private readonly ownsDb: boolean;
-  private q: Record<'inPut' | 'inGet' | 'inPrune' | 'outGet' | 'outPut' | 'outPrune' | 'agentGet' | 'agentPut', StatementSync>;
+  private q: Record<'inPut' | 'inGet' | 'inPrune' | 'outGet' | 'outPut' | 'outPrune' | 'agentGet' | 'agentPut' | 'launchGet' | 'launchPut', StatementSync>;
+  /** Tests: called between the agent row and the launch row of `pin` (a throw rolls both back). */
+  betweenPinWrites?: () => void;
 
   constructor(o: { db?: DatabaseSync; path?: string; retainMs?: number } = {}) {
     this.ownsDb = !o.db;
@@ -30,6 +33,7 @@ export class DaemonRecords implements OutboxStore {
       CREATE INDEX IF NOT EXISTS daemon_inputs_ref ON daemon_inputs (channel_ref);
       CREATE TABLE IF NOT EXISTS daemon_outbox (operation_id TEXT PRIMARY KEY, at INTEGER NOT NULL, json TEXT NOT NULL) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS daemon_session_agents (session_key TEXT PRIMARY KEY, agent TEXT NOT NULL) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS daemon_session_launch (session_key TEXT PRIMARY KEY, cwd TEXT, env_json TEXT NOT NULL, at INTEGER NOT NULL) WITHOUT ROWID;
     `);
     const p = (sql: string) => this.db.prepare(sql);
     this.q = {
@@ -42,6 +46,8 @@ export class DaemonRecords implements OutboxStore {
       outPrune: p('DELETE FROM daemon_outbox WHERE at < ?'),
       agentGet: p('SELECT agent FROM daemon_session_agents WHERE session_key = ?'),
       agentPut: p('INSERT INTO daemon_session_agents (session_key, agent) VALUES (?, ?) ON CONFLICT DO NOTHING'),
+      launchGet: p('SELECT cwd, env_json FROM daemon_session_launch WHERE session_key = ?'),
+      launchPut: p('INSERT INTO daemon_session_launch (session_key, cwd, env_json, at) VALUES (?, ?, ?, ?)'),
     };
     const retain = o.retainMs ?? 30 * DAY;
     this.q.inPrune.run(Date.now() - retain);
@@ -98,6 +104,34 @@ export class DaemonRecords implements OutboxStore {
   /** The first agent recorded for a session stays its agent. */
   setAgent(sessionKey: string, agent: string): void {
     this.q.agentPut.run(sessionKey, agent);
+  }
+
+  // ---- session launch (decision 7) ---------------------------------------
+
+  /** The launch pinned to a session, if any. */
+  launchOf(sessionKey: string): SessionLaunch | undefined {
+    const r = this.q.launchGet.get(sessionKey) as { cwd: string | null; env_json: string } | undefined;
+    if (!r) return undefined;
+    const env = JSON.parse(r.env_json) as Record<string, string>;
+    return { ...(r.cwd !== null ? { cwd: r.cwd } : {}), ...(Object.keys(env).length ? { env } : {}) };
+  }
+
+  /**
+   * Pin a session's agent and launch in one transaction: never an agent row
+   * without its launch (a crash in between would leave a launch-less session).
+   * Fails if the session already has a launch.
+   */
+  pin(sessionKey: string, agent: string, launch: SessionLaunch): void {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.q.agentPut.run(sessionKey, agent);
+      this.betweenPinWrites?.();
+      this.q.launchPut.run(sessionKey, launch.cwd ?? null, JSON.stringify(launch.env ?? {}), Date.now());
+      this.db.exec('COMMIT');
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw e;
+    }
   }
 
   close(): void {

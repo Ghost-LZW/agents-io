@@ -36,6 +36,8 @@ export interface TopicChange {
   reason: TopicChangeReason;
   /** The turn that made the change (session_rotate / session_switch, or switching back after a failed one). */
   turn?: TurnRef;
+  /** `to` is a new topic (`create`), not a switch to an existing one. */
+  created?: true;
 }
 
 export interface TopicRegistryOptions {
@@ -241,7 +243,7 @@ export class TopicRegistry {
     if (previous) previous.state = 'parked';
     if (previous && summary) previous.summary = summary;
     this.remember(t);
-    this.changed({ conversation, agent, ...(previous ? { from: previous } : {}), to: t, reason, ...(opts.turn ? { turn: opts.turn } : {}) });
+    this.changed({ conversation, agent, ...(previous ? { from: previous } : {}), to: t, reason, ...(opts.turn ? { turn: opts.turn } : {}), created: true });
     return { topic: t, ...(previous ? { previous } : {}), created: true };
   }
 

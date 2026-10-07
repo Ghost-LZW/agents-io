@@ -22,6 +22,9 @@ import {
   type Policy,
   type ReplyRoute,
   type RunSpec,
+  type SessionLaunch,
+  type SessionPrepare,
+  type SessionPrepareResult,
   type Tier,
   type TopicSwitchFrame,
   type TurnContext,
@@ -72,6 +75,7 @@ import { LocalServer } from './local-server.js';
 import { privateDb, privateDir } from './private.js';
 import { blobResolvers, type MediaResolvers } from './media.js';
 import { DaemonRecords } from './records.js';
+import { checkLaunch, launchView, sameLaunch, type LaunchCheck } from './launch.js';
 import { Runs } from './runs.js';
 import { consoleUrlPath, removeTokenFile, tokenPath, writeTokenFile } from './token.js';
 
@@ -189,6 +193,8 @@ export class Gateway {
   private readonly lanes = new Map<string, Lane>();
   /** Agent and working directory of each live lane. */
   private readonly laneInfo = new Map<string, { agent: AgentConfig; cwd?: string }>();
+  /** Per-session adapters of launched sessions (decision 7), closed with their lane. */
+  private readonly launched = new Map<string, LaunchAdapters>();
   private readonly compositors: Compositor[] = [];
   private readonly sessionCompositors = new Map<string, Compositor[]>();
   private readonly channels: RunningChannel[] = [];
@@ -237,6 +243,11 @@ export class Gateway {
       agentAccounts: c.policy.agentAccounts,
       routeCallout: (bindingId, input, envelope) => this.host.routeCallout(bindingId, input, envelope),
       topics: this.topics,
+      // Decision 7: callout answers may launch the session they land in; pinned sessions may skip the callout.
+      launches: {
+        check: (a) => this.launchCheck(a.sessionKey, a.agent, a.launch),
+        pinned: (key) => this.records.launchOf(key) !== undefined,
+      },
       ...db,
       log: (level, msg) => this.log(level, `router: ${msg}`),
     });
@@ -273,7 +284,7 @@ export class Gateway {
       records: this.records,
       runs: this.runs,
       deliver: (name, f) => this.deliver(name, f),
-      prepareSession: () => fail('unsupported', 'session.prepare is not implemented yet'),
+      prepareSession: (f) => this.prepareSession(f),
       log: (level, msg, data) => this.log(level, msg, data),
       ...(o.hostPush?.timeoutMs !== undefined ? { pushTimeoutMs: o.hostPush.timeoutMs } : {}),
       ...(o.hostPush?.retryMs !== undefined ? { pushRetryMs: o.hostPush.retryMs } : {}),
@@ -323,7 +334,7 @@ export class Gateway {
     this.ingress = new Ingress({
       policy: this.policy,
       router: this.router,
-      lanes: (key, agent) => this.lane(key, agent),
+      lanes: (key, agent, launch) => this.lane(key, agent, launch),
       hub: this.hub,
       watches: this.watches,
       onWatchError: (err) => this.log('warn', `watch fan-out failed: ${(err as Error).message}`),
@@ -551,8 +562,17 @@ export class Gateway {
    * The lane of a session, created on first use with the session's agent (the
    * one recorded for it, else `agent`, else the agent whose prefix the key has,
    * else the default agent). Its harness session opens with the first turn.
+   * `launch` (decision 7) is pinned with a new session and must match an existing
+   * one's; a session pinned to a launch always opens with it.
    */
-  lane(sessionKey: string, agentName?: string): Lane {
+  lane(sessionKey: string, agentName?: string, launch?: SessionLaunch): Lane {
+    // Before the live-lane shortcut: a conflicting launch must not pass silently.
+    let fresh: SessionLaunch | undefined;
+    if (launch !== undefined) {
+      const c = this.launchCheck(sessionKey, agentName, launch);
+      if (!c.ok) throw new LaneUnavailableError(c.code, c.message);
+      if (c.outcome === 'applied') fresh = c.launch;
+    }
     let lane = this.lanes.get(sessionKey);
     if (lane) {
       const had = this.laneInfo.get(sessionKey)?.agent.name;
@@ -560,13 +580,20 @@ export class Gateway {
       return lane;
     }
     if (sessionKey.startsWith('run:')) throw new Error(`${sessionKey} is a task run session; it only exists while its run.start runs`);
-    const agent = this.agentFor(sessionKey, agentName);
+    const agent = this.agentFor(sessionKey, agentName, fresh);
     const c = this.o.config;
-    const cwd = agent.configured ? (agent.cwd ?? c.harnesses[agent.harness]?.cwd ?? c.cwd) : c.cwd;
+    const pinned = agent.configured ? this.records.launchOf(sessionKey) : undefined;
+    const launched = pinned ? this.launchAdapters(agent, pinned) : undefined;
+    const cwd = pinned?.cwd ?? (agent.configured ? (agent.cwd ?? c.harnesses[agent.harness]?.cwd ?? c.cwd) : c.cwd);
     lane = new Lane({
       sessionKey,
-      harness: this.agentHarness(agent),
-      ...(this.o.harness ? {} : { harnessFor: (name: string) => (name === agent.harness ? this.agentHarness(agent) : this.harness(name)) }),
+      // A launched session's adapters go through both: the lane uses `harnessFor` whenever it is set.
+      harness: launched ? launched.adapter(agent.harness) : this.agentHarness(agent),
+      ...(launched
+        ? { harnessFor: (name: string) => launched.adapter(name) }
+        : this.o.harness
+          ? {}
+          : { harnessFor: (name: string) => (name === agent.harness ? this.agentHarness(agent) : this.harness(name)) }),
       resumeFor: (id) => this.nativeIdOf(sessionKey, id),
       hub: this.hub,
       policy: this.agentPolicy(agent),
@@ -580,6 +607,7 @@ export class Gateway {
     });
     this.lanes.set(sessionKey, lane);
     this.laneInfo.set(sessionKey, { agent, ...(agent.configured ? { cwd } : {}) });
+    if (launched) this.launched.set(sessionKey, launched);
     for (const ch of this.channels) this.compose(sessionKey, ch.adapter, ch.tier);
     // A parked topic's lane opened again (an answer to a question it asked): it idles out like any parked one.
     if (this.topics.bySession(sessionKey)?.state === 'parked') this.idleOut(sessionKey);
@@ -592,7 +620,18 @@ export class Gateway {
    * session refuses with `agent_unavailable` instead of running the conversation
    * under another agent's cwd, profile and tools.
    */
-  private agentFor(sessionKey: string, wanted: string | undefined): AgentConfig {
+  private agentFor(sessionKey: string, wanted: string | undefined, launch?: SessionLaunch): AgentConfig {
+    const agent = this.pickAgent(sessionKey, wanted);
+    // The agent and a launch are pinned together (one transaction), or the agent alone.
+    if (agent.configured && this.records.agentOf(sessionKey) === undefined) {
+      if (launch) this.records.pin(sessionKey, agent.name, launch);
+      else this.records.setAgent(sessionKey, agent.name);
+    }
+    return agent;
+  }
+
+  /** `agentFor` without recording anything. */
+  private pickAgent(sessionKey: string, wanted: string | undefined): AgentConfig {
     const c = this.o.config;
     const usable = (n: string | undefined) => (n !== undefined && c.agents[n]?.mode === 'interactive' ? c.agents[n] : undefined);
     const pinned = this.records.agentOf(sessionKey);
@@ -605,8 +644,116 @@ export class Gateway {
     const byPrefix = Object.values(c.agents).find((a) => a.name !== c.defaultAgent && a.mode === 'interactive' && sessionKey.startsWith(`${a.name}:`));
     const agent = usable(wanted) ?? byPrefix ?? usable(c.defaultAgent);
     if (!agent) throw new Error(`no interactive agent for session ${sessionKey} (configure one, or a defaultAgent)`);
-    if (agent.configured) this.records.setAgent(sessionKey, agent.name);
     return agent;
+  }
+
+  // ---- session launch (decision 7) -----------------------------------------
+
+  /**
+   * Whether `launch` may apply to a session (records nothing): within its agent's
+   * `sessionParams`, and either the same as the launch the session is pinned to
+   * (`same`) or for a session that does not exist yet (`applied`). Anything else is
+   * `launch_conflict`: a session keeps the launch it started with (its harness
+   * resumes in that cwd and config dir); another launch needs another session key.
+   */
+  private launchCheck(sessionKey: string, agentName: string | undefined, launch: SessionLaunch): ({ ok: true; outcome: 'applied' | 'same'; launch: SessionLaunch }) | Extract<LaunchCheck, { ok: false }> {
+    if (sessionKey.startsWith('run:')) return { ok: false, code: 'launch_not_allowed', message: `${sessionKey} is a task run session; runs take their cwd and env from run.start` };
+    let agent: AgentConfig;
+    try {
+      agent = this.pickAgent(sessionKey, agentName);
+    } catch (e) {
+      return { ok: false, code: e instanceof LaneUnavailableError ? e.code : 'no_agent', message: (e as Error).message };
+    }
+    const checked = checkLaunch(agent, launch, this.o.config.harnesses[agent.harness]);
+    if (!checked.ok) return checked;
+    const pinned = this.records.launchOf(sessionKey);
+    if (pinned) {
+      if (sameLaunch(pinned, checked.launch)) return { ok: true, outcome: 'same', launch: pinned };
+      return { ok: false, code: 'launch_conflict', message: `session ${sessionKey} was launched otherwise; a session keeps its launch (use another session key)` };
+    }
+    if (this.sessionExists(sessionKey)) return { ok: false, code: 'launch_conflict', message: `session ${sessionKey} already exists without a launch (use another session key)` };
+    return { ok: true, outcome: 'applied', launch: checked.launch };
+  }
+
+  /**
+   * A session exists once it has an agent or launch row, a lane, or anything in its
+   * log but topic bookkeeping (a new topic's key gets `topic.changed` before its lane
+   * opens). The log counts for sessions of the unconfigured default agent, which never
+   * get an agent row.
+   */
+  private sessionExists(sessionKey: string): boolean {
+    if (this.records.agentOf(sessionKey) !== undefined || this.records.launchOf(sessionKey) || this.lanes.has(sessionKey)) return true;
+    for (const e of this.hub.log.read(sessionKey, 0)) if (e.body.t !== 'topic.changed') return true;
+    return false;
+  }
+
+  /** `session.prepare`: pin an agent and a launch to a key no input has opened yet (or the same ones again). */
+  prepareSession(f: SessionPrepare): Outcome {
+    if (this.stopped) return fail('stopped', 'daemon is stopping');
+    if (!f.sessionKey) return fail('invalid_frame', 'sessionKey is empty');
+    if (f.sessionKey.startsWith('run:')) return fail('invalid_frame', `${f.sessionKey} is a task run session key (task runs use run.start)`);
+    const agent = this.o.config.agents[f.agent];
+    if (!agent) return fail('unknown_agent', `unknown agent ${JSON.stringify(f.agent)} (agents: ${Object.keys(this.o.config.agents).join(', ')})`);
+    if (agent.mode !== 'interactive') return fail('not_interactive_agent', `agent ${f.agent} is a task agent (run.start runs it)`);
+    const had = this.records.agentOf(f.sessionKey);
+    if (had !== undefined && had !== f.agent) return fail('agent_conflict', `session ${f.sessionKey} belongs to agent ${had}`);
+    const c = this.launchCheck(f.sessionKey, f.agent, f.launch);
+    if (!c.ok) return fail(c.code, c.message);
+    if (c.outcome === 'applied') {
+      this.records.pin(f.sessionKey, f.agent, c.launch);
+      const v = launchView(c.launch);
+      this.log('info', `${f.sessionKey}: prepared for agent ${f.agent}${v.cwd ? ` in ${v.cwd}` : ''}${v.envKeys.length ? ` (env: ${v.envKeys.join(', ')})` : ''}`);
+    }
+    return { ok: true, value: { sessionKey: f.sessionKey, agent: f.agent, launch: launchView(c.launch), created: c.outcome === 'applied' } satisfies SessionPrepareResult };
+  }
+
+  /**
+   * The adapters one launched session opens, built lazily per instance and kept
+   * (the lane compares adapters by identity: a new object each time would restart
+   * the harness every turn). Claude takes the env per session; a Codex session with
+   * env gets its own stdio app-server (like a task run), closed with the lane.
+   */
+  private launchAdapters(agent: AgentConfig, launch: SessionLaunch): LaunchAdapters {
+    const c = this.o.config;
+    const env = launch.env ?? {};
+    const hasEnv = Object.keys(env).length > 0;
+    const cache = new Map<string, HarnessAdapter>();
+    const owned: HarnessAdapter[] = [];
+    const adapter = (name: string): HarnessAdapter => {
+      const key = this.o.harness ? '' : name;
+      let a = cache.get(key);
+      if (a) return a;
+      if (this.o.harness) a = withLaunch(this.o.harness, undefined, hasEnv ? env : undefined);
+      else {
+        const inst = c.harnesses[name];
+        if (!inst) throw new Error(`unknown harness instance ${JSON.stringify(name)}`);
+        let base: HarnessAdapter;
+        let perOpen: Record<string, string> | undefined = hasEnv ? env : undefined;
+        if (inst.kind === 'codex' && hasEnv) {
+          if (inst.codex.transport.kind === 'unix') throw new Error(`launch_unsupported: harness instance ${name} is a shared Codex app-server (unix transport); this session's env cannot apply there`);
+          // The env reaches only this session's app-server; its CODEX_HOME replaces the instance's.
+          const own = {
+            ...inst,
+            env: { ...inst.env, ...env },
+            codex: { ...inst.codex, transport: { kind: 'stdio' as const }, ...(env.CODEX_HOME !== undefined ? { codexHome: env.CODEX_HOME } : {}) },
+          } as HarnessInstance;
+          base = this.o.buildHarness?.(own) ?? buildHarness(own, blobResolvers(this.blobs));
+          owned.push(base);
+          perOpen = undefined;
+        } else base = this.harness(name);
+        const cwd = launch.cwd ?? (name === agent.harness ? agent.cwd : undefined);
+        a = withLaunch(name === agent.harness ? withAgent(base, agent, agent.cwd) : base, cwd, perOpen);
+      }
+      cache.set(key, a);
+      return a;
+    };
+    return {
+      adapter,
+      owns: () => owned.length > 0,
+      dispose: async () => {
+        await Promise.all(owned.map((a) => within(codexOf(a)?.dispose(), 3000)));
+      },
+    };
   }
 
   /** The adapter an agent's sessions open: its instance's, with the agent's cwd and instructions. */
@@ -724,7 +871,11 @@ export class Gateway {
     this.hub.append(sessionKey, { ...ev, body: { t: 'notice', code: 'other', message: `${code}: ${message}` } });
     this.hub.append(sessionKey, { ...ev, body: { t: 'input.rejected', inputIds: [inputId], reason: code } });
     if (route && route.channel !== 'local') {
-      await this.systemReply({ route, text: 'This conversation\'s agent is not available any more, so the message was not delivered. Ask the operator to restore it.', operationId: `${code}:${inputId}`, sessionKey });
+      const text =
+        code === 'agent_unavailable'
+          ? 'This conversation\'s agent is not available any more, so the message was not delivered. Ask the operator to restore it.'
+          : `This conversation could not be started (${code}), so the message was not delivered. Ask the operator.`;
+      await this.systemReply({ route, text, operationId: `${code}:${inputId}`, sessionKey });
     }
   }
 
@@ -818,6 +969,19 @@ ${a.summary}` }],
 
   /** A topic was parked: its lane idles out; the one now current keeps its lane. */
   private topicChanged(c: TopicChange): void {
+    // A new topic of a launched conversation keeps its launch. Synchronous on purpose:
+    // TopicRegistry.create calls this after its commit and before it returns, so the
+    // launch is pinned before the caller (handOver, `/new`) opens the new topic's lane.
+    if (c.created && c.from) {
+      const launch = this.records.launchOf(c.from.sessionKey);
+      if (launch && this.records.agentOf(c.to.sessionKey) === undefined && !this.records.launchOf(c.to.sessionKey)) {
+        try {
+          this.records.pin(c.to.sessionKey, c.to.agent, launch);
+        } catch (e) {
+          this.log('warn', `${c.to.sessionKey}: keeping the launch of ${c.from.sessionKey} failed: ${(e as Error).message}`);
+        }
+      }
+    }
     const t = this.parkedTimers.get(c.to.sessionKey);
     if (t) clearTimeout(t);
     this.parkedTimers.delete(c.to.sessionKey);
@@ -845,12 +1009,15 @@ ${a.summary}` }],
   private async closeLane(sessionKey: string, lane: Lane, reason: string): Promise<void> {
     this.lanes.delete(sessionKey);
     this.laneInfo.delete(sessionKey);
+    const launched = this.launched.get(sessionKey);
+    this.launched.delete(sessionKey);
     const comps = this.sessionCompositors.get(sessionKey) ?? [];
     this.sessionCompositors.delete(sessionKey);
     await within(lane.close(reason).catch(() => undefined), 8000);
     await within(lane.whenIdle(), 3000);
     await within(Promise.all(comps.map((x) => x.stop())), 5000);
     for (const x of comps) this.compositors.splice(this.compositors.indexOf(x), 1);
+    await launched?.dispose();
     this.log('info', `${sessionKey}: lane closed (${reason})`);
   }
 
@@ -1076,6 +1243,7 @@ ${a.summary}` }],
     const keys = new Set([...this.hub.log.sessions(), ...this.lanes.keys()]);
     return [...keys].sort().map((sessionKey) => {
       const s = this.hub.snapshot(sessionKey);
+      const launch = this.records.launchOf(sessionKey);
       return {
         sessionKey,
         harness: s.harness,
@@ -1085,6 +1253,7 @@ ${a.summary}` }],
         queued: s.queued.length,
         pendingRequests: s.pendingRequests.map((r) => r.requestId),
         live: this.lanes.has(sessionKey),
+        ...(launch ? { launch: launchView(launch) } : {}),
       };
     });
   }
@@ -1110,7 +1279,9 @@ ${a.summary}` }],
     this.watches.stop();
     for (const ch of this.channels) ch.ac.abort();
     await within(Promise.all(this.channels.map((c) => c.running)), 3000);
-    const codex = (l: Lane) => codexOf(this.o.harness ?? this.instances.get(l.harnessId));
+    // A launched session's own app-server (stdio) ends with it: its lane is closed, not detached.
+    const own = new Set([...this.launched].filter(([, x]) => x.owns()).map(([k]) => k));
+    const codex = (l: Lane) => !own.has(l.sessionKey) && codexOf(this.o.harness ?? this.instances.get(l.harnessId));
     const detached = [...this.lanes.values()].filter(codex);
     const closed = [...this.lanes.values()].filter((l) => !codex(l));
     for (const l of detached) l.detach();
@@ -1125,6 +1296,7 @@ ${a.summary}` }],
     );
     // Let the last events (interrupted turn, consumed inputs) reach the log before it closes.
     await within(Promise.all(closed.map((l) => l.whenIdle())), 3000);
+    await within(Promise.all([...this.launched.values()].map((x) => x.dispose())), 3000);
     await within(Promise.all(this.compositors.map((c) => c.stop())), 5000);
     for (const ch of this.channels) await within(ch.close?.().catch(() => undefined), 3000);
     await within(this.watches.idle(), 3000);
@@ -1172,9 +1344,45 @@ export function withAgent(a: HarnessAdapter, agent: AgentConfig, cwd: string | u
   return new InstanceHarness({ ...i, ...(cwd !== undefined ? { cwd } : {}), options } as HarnessInstance, a.inner);
 }
 
+/** Per-session adapters of a launched session (`Gateway.launchAdapters`). */
+interface LaunchAdapters {
+  adapter(name: string): HarnessAdapter;
+  /** Some adapter runs its own process (a Codex app-server with the session's env). */
+  owns(): boolean;
+  dispose(): Promise<void>;
+}
+
+/**
+ * An adapter as one launched session opens it: in `cwd` (when given) with `env`
+ * over the child's environment (`HarnessOpenArgs.env`). Other adapters (tests)
+ * get the env through their open args; their cwd is the lane's.
+ */
+export function withLaunch(a: HarnessAdapter, cwd: string | undefined, env: Record<string, string> | undefined): HarnessAdapter {
+  if (a instanceof InstanceHarness) return new InstanceHarness({ ...a.instance, ...(cwd !== undefined ? { cwd } : {}) } as HarnessInstance, a.inner, env);
+  return env ? new LaunchEnvHarness(a, env) : a;
+}
+
+class LaunchEnvHarness implements HarnessAdapter {
+  readonly id: string;
+  constructor(
+    readonly inner: HarnessAdapter,
+    private readonly env: Record<string, string>,
+  ) {
+    this.id = inner.id;
+  }
+
+  probe(): Promise<{ version: string; caps: HarnessCaps }> {
+    return this.inner.probe();
+  }
+
+  open(args: HarnessOpenArgs): Promise<HarnessSession> {
+    return this.inner.open({ ...args, env: { ...args.env, ...this.env } });
+  }
+}
+
 /** The Codex adapter behind an instance adapter, if it is one (Codex is detached at shutdown, not closed). */
 function codexOf(a: HarnessAdapter | undefined): CodexHarness | undefined {
-  if (a instanceof InstanceHarness) return codexOf(a.inner);
+  if (a instanceof InstanceHarness || a instanceof LaunchEnvHarness) return codexOf(a.inner);
   return a instanceof CodexHarness ? a : undefined;
 }
 
@@ -1188,6 +1396,8 @@ export class InstanceHarness implements HarnessAdapter {
   constructor(
     readonly instance: HarnessInstance,
     readonly inner: HarnessAdapter,
+    /** A launched session's env (decision 7), over the child's environment at open. */
+    readonly env?: Record<string, string>,
   ) {
     this.id = instance.name;
   }
@@ -1199,7 +1409,7 @@ export class InstanceHarness implements HarnessAdapter {
   open(args: HarnessOpenArgs): Promise<HarnessSession> {
     const i = this.instance;
     const options = i.kind === 'claude-code' ? { ...i.options, profiles: i.profiles } : i.options;
-    return this.inner.open({ ...args, ...(i.cwd ? { cwd: i.cwd } : {}), options: { ...options, ...args.options } });
+    return this.inner.open({ ...args, ...(i.cwd ? { cwd: i.cwd } : {}), options: { ...options, ...args.options }, ...(this.env ? { env: { ...args.env, ...this.env } } : {}) });
   }
 }
 

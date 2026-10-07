@@ -171,6 +171,29 @@ const AgentEntry = Type.Object(
     tools: Type.Optional(Type.Boolean()),
     /** Extra system instructions read from this file (Claude: appended to the preset prompt; Codex: developer instructions). */
     instructionsFile: Type.Optional(Type.String()),
+    /**
+     * Bounds within which a host may launch this agent's sessions with their own cwd and
+     * env (decision 7: callout answers' `launch`, `session.prepare`). Without it every
+     * launch is refused. Interactive agents only.
+     */
+    sessionParams: Type.Optional(
+      Type.Object(
+        {
+          /** `launch.cwd` must be under one of these (after realpath). Relative paths are relative to the config file. */
+          cwdRoots: Type.Array(Type.String()),
+          /** The only variables `launch.env` may set (never `AGENTS_IO_*`). */
+          envKeys: Type.Array(Type.String()),
+          /**
+           * Variables whose values are paths, checked like `cwd` against their own roots.
+           * Required for `CLAUDE_CONFIG_DIR` and `CODEX_HOME` when they are in `envKeys`;
+           * any other path-valued key left out here (`HOME`, `XDG_CONFIG_HOME`, `GIT_DIR`, …)
+           * lets the host name any path for it.
+           */
+          envPathRoots: Type.Optional(Type.Record(Type.String(), Type.Array(Type.String()))),
+        },
+        Closed,
+      ),
+    ),
   },
   Closed,
 );
@@ -367,9 +390,21 @@ export interface AgentConfig {
   tools: boolean;
   /** Contents of `instructionsFile`. */
   instructions?: string;
+  /** Session launch bounds (decision 7); roots are absolute. */
+  sessionParams?: SessionParams;
   /** From the config file's `agents` (false: the synthesized `default` agent of a config without agents). */
   configured: boolean;
 }
+
+/** Where a host may launch an agent's sessions (`agents.<name>.sessionParams`). */
+export interface SessionParams {
+  cwdRoots: string[];
+  envKeys: string[];
+  envPathRoots: Record<string, string[]>;
+}
+
+/** Variables naming a harness config dir: in `envKeys` only with roots in `envPathRoots`. */
+export const CONFIG_DIR_KEYS = ['CLAUDE_CONFIG_DIR', 'CODEX_HOME'];
 
 export interface Config {
   dataDir: string;
@@ -645,6 +680,7 @@ function resolveAgents(
         fail(`${where}.instructionsFile: cannot read ${file}: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`);
       }
     }
+    const sessionParams = a.sessionParams && resolveSessionParams(a.sessionParams, `${where}.sessionParams`, a.mode ?? 'interactive', path);
     agents[name] = {
       name,
       harness: a.harness,
@@ -655,6 +691,7 @@ function resolveAgents(
       mode: a.mode ?? 'interactive',
       tools: a.tools ?? outputTools,
       ...(instructions !== undefined ? { instructions } : {}),
+      ...(sessionParams ? { sessionParams } : {}),
       configured: true,
     };
   }
@@ -665,6 +702,26 @@ function resolveAgents(
   }
   return { agents, defaultAgent: c.defaultAgent ?? Object.values(agents).find((a) => a.mode === 'interactive')?.name };
 }
+
+function resolveSessionParams(p: NonNullable<AgentEntry['sessionParams']>, where: string, mode: 'interactive' | 'task', path: (p: string) => string): SessionParams {
+  if (mode === 'task') fail(`${where}: task agents take their cwd and env per run (run.start), not sessionParams`);
+  for (const k of p.envKeys) {
+    if (!VAR_NAME.test(k)) fail(`${where}.envKeys: ${JSON.stringify(k)} is not a variable name`);
+    if (k.startsWith('AGENTS_IO_')) fail(`${where}.envKeys: ${k}: AGENTS_IO_* variables are the daemon's own`);
+  }
+  const envPathRoots: Record<string, string[]> = {};
+  for (const [k, roots] of Object.entries(p.envPathRoots ?? {})) {
+    if (!p.envKeys.includes(k)) fail(`${where}.envPathRoots.${k}: not in envKeys`);
+    if (!roots.length) fail(`${where}.envPathRoots.${k}: needs at least one root`);
+    envPathRoots[k] = roots.map(path);
+  }
+  for (const k of CONFIG_DIR_KEYS) {
+    if (p.envKeys.includes(k) && !envPathRoots[k]) fail(`${where}: ${k} is in envKeys, so envPathRoots.${k} must say under which roots its value may point`);
+  }
+  return { cwdRoots: p.cwdRoots.map(path), envKeys: [...p.envKeys], envPathRoots };
+}
+
+type AgentEntry = Static<typeof AgentEntry>;
 
 /** Router view of an agent: the default agent keeps bare route-key sessions and the local session as `main`. */
 export function agentSpec(a: AgentConfig, c: Pick<Config, 'defaultAgent' | 'local'>): AgentSpec {
@@ -896,7 +953,7 @@ function resolveInstance(name: string, raw: unknown, env: Record<string, string 
   return { ...common, kind: 'claude-code', claude, ...(unavailable ? { unavailable } : {}) };
 }
 
-const VAR_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+export const VAR_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const envRef = (v: unknown): string | undefined => (typeof v === 'string' && v.startsWith('env:') ? v.slice(4) : undefined);
 
 /** How a harness instance hands "env:NAME" values to its child process. */

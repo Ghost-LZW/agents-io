@@ -11,6 +11,7 @@ import {
   type Origin,
   type ReplyRoute,
   type Tier,
+  type SessionLaunch,
 } from '@agents-io/protocol';
 import { channelRefOf, type HostQueue } from './host-queue.js';
 import type { Hub } from './hub.js';
@@ -71,9 +72,11 @@ export interface IngressOptions {
   /**
    * Lane for a session key; the host decides how lanes are created and kept.
    * `agent` is the binding's target agent (a named run configuration), absent for
-   * watch deliveries and legacy admits. Throws `LaneUnavailableError` to refuse.
+   * watch deliveries and legacy admits. `launch` is a callout answer's launch for
+   * the session (decision 7), already checked by the router's `launches`; the host
+   * pins it when the lane is created. Throws `LaneUnavailableError` to refuse.
    */
-  lanes: (sessionKey: string, agent?: string) => Lane | Promise<Lane>;
+  lanes: (sessionKey: string, agent?: string, launch?: SessionLaunch) => Lane | Promise<Lane>;
   /**
    * A table delivery was refused by `lanes` (`LaneUnavailableError`): tell the
    * session and, for a `dispatch` delivery, the route (a `context` delivery was never
@@ -394,7 +397,7 @@ export class Ingress {
     }
     let lane: Lane;
     try {
-      lane = await this.o.lanes(d.sessionKey, d.agent);
+      lane = await this.o.lanes(d.sessionKey, d.agent, d.launch);
     } catch (e) {
       if (!(e instanceof LaneUnavailableError)) throw e;
       try {

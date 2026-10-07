@@ -2,6 +2,7 @@ import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import {
   BindingAction,
   BindingTable,
+  SessionLaunch,
   SessionScope,
   errors,
   routeKey,
@@ -84,6 +85,20 @@ export interface RouteDelivery {
   mode?: InputMode;
   /** `session: "topic"`: the conversation's current topic this delivery resolved to. */
   topic?: { id: string; conversation: string; title?: string };
+  /** A callout answer's launch for this session, as checked (`RouterOptions.launches`). */
+  launch?: SessionLaunch;
+}
+
+/** The daemon's view of session launches (decision 7). */
+export interface RouterLaunches {
+  /**
+   * Whether `launch` may apply to `sessionKey` (read-only; the session is pinned
+   * when its lane opens): `applied` for a new session, `same` when it is already
+   * pinned to it, else a refusal code (`launch_conflict`, `launch_not_allowed`, …).
+   */
+  check(a: { sessionKey: string; agent: string | undefined; launch: SessionLaunch }): { ok: true; outcome: 'applied' | 'same'; launch: SessionLaunch } | { ok: false; code: string; message: string };
+  /** The session has a pinned launch (`callout.skipWhenPinned`). */
+  pinned(sessionKey: string): boolean;
 }
 
 /** `RouteExplanation` plus why nothing was delivered, and when (not in the protocol type yet). */
@@ -106,6 +121,8 @@ export interface CalloutAnswer {
   on: BindingAction;
   agent?: string;
   session?: SessionScope;
+  /** Feature `session.launch`: how the session the input lands in is launched. */
+  launch?: SessionLaunch;
 }
 
 export type RouteCallout = (bindingId: string, input: InputRecord, envelope: InboundEnvelope) => Promise<CalloutAnswer>;
@@ -148,6 +165,8 @@ export interface RouterOptions {
   /** How long explanations are kept (default 7 days). */
   explainTtlMs?: number;
   log?: (level: 'debug' | 'info' | 'warn', msg: string) => void;
+  /** Session launches (decision 7). Without it a callout answer with `launch` is an error. */
+  launches?: RouterLaunches;
 }
 
 const DAY = 86_400_000;
@@ -331,6 +350,7 @@ export class Router {
       if (actions.includes('digest') && !(b.digest && b.digest.everyMs > 0)) throw new RouterError('invalid', `${where}: digest needs digest.everyMs > 0`);
       if (b.digest?.maxItems !== undefined && !(b.digest.maxItems >= 1)) throw new RouterError('invalid', `${where}: digest.maxItems must be >= 1`);
       if (b.match.conversationKind !== undefined && !KINDS.has(b.match.conversationKind)) throw new RouterError('invalid', `${where}: unknown conversationKind`);
+      if (b.callout?.skipWhenPinned && !targets(b.on)) throw new RouterError('invalid', `${where}: callout.skipWhenPinned needs an on that targets a session (dispatch, context, digest)`);
     }
     try {
       checkIdentities(table.identities);
@@ -401,33 +421,30 @@ export class Router {
 
     const best = new Map<string, RouteDelivery>();
     let host: RouteDecision['host'];
-    for (const r of resolved) {
-      let on = r.on;
-      // Our own echoes are recorded at most, never start a turn: no rule can make the deployment loop on its output.
-      if (origin.self && on === 'dispatch') on = 'context';
-      const entry: RouteExplanation['matched'][number] = { bindingId: r.binding.id, source: r.source, on, ...(r.callout ? { callout: r.callout } : {}) };
-      if (targets(on)) {
-        const agent = r.watchId !== undefined || r.legacyKey !== undefined ? undefined : this.agents.get(r.agent ?? this.o.defaultAgent ?? '');
-        const scope = r.legacyKey !== undefined ? { sessionKey: r.legacyKey } : this.scope(r.session, agent, env, on);
-        const sessionKey = scope.sessionKey;
-        if (agent) entry.agent = agent.name;
-        entry.sessionKey = sessionKey;
-        const d: RouteDelivery = {
-          bindingId: r.binding.id,
-          source: r.source,
-          on,
-          sessionKey,
-          ...(agent ? { agent: agent.name } : {}),
-          ...(r.watchId !== undefined ? { watchId: r.watchId } : {}),
-          ...(on === 'digest' && r.binding.digest ? { digest: r.binding.digest } : {}),
-          ...(r.binding.note !== undefined ? { note: r.binding.note } : {}),
-          ...(r.source !== 'watch' ? { match: r.binding.match } : {}),
-          ...(r.mode ? { mode: r.mode } : {}),
-          ...(scope.topic ? { topic: { id: scope.topic.id, conversation: scope.topic.conversation, ...(scope.topic.title !== undefined ? { title: scope.topic.title } : {}) } } : {}),
-        };
-        const prior = best.get(sessionKey);
+    for (const answered of resolved) {
+      let r = answered;
+      let p = this.place(r, env, origin);
+      if (r.launch !== undefined && p.delivery) {
+        const c = this.o.launches
+          ? this.o.launches.check({ sessionKey: p.delivery.sessionKey, agent: p.delivery.agent, launch: r.launch })
+          : { ok: false as const, code: 'launch_unsupported', message: 'this router takes no session launches' };
+        const shown = { ...(r.launch.cwd !== undefined ? { cwd: r.launch.cwd } : {}), envKeys: Object.keys(r.launch.env ?? {}).sort(), outcome: c.ok ? c.outcome : c.code };
+        if (c.ok) p.delivery.launch = c.launch;
+        else {
+          // The answer counts as an error: the rule's failure mode applies, without the launch.
+          this.o.log?.('warn', `callout for binding ${r.binding.id}: launch for ${p.delivery.sessionKey} refused: ${c.code}: ${c.message}`);
+          r = r.failed!(c.code);
+          p = this.place(r, env, origin);
+        }
+        p.entry.launch = shown;
+      }
+      const { on, entry, delivery: d } = p;
+      if (d) {
+        const prior = best.get(d.sessionKey);
         // Same session: the strongest action wins; on a tie the earlier rule (config before host before watches).
-        if (!prior || STRENGTH[on] > STRENGTH[prior.on]) best.set(sessionKey, d);
+        // A launch rides along whichever delivery wins.
+        if (!prior || STRENGTH[on as Effective] > STRENGTH[prior.on]) best.set(d.sessionKey, prior?.launch && !d.launch ? { ...d, launch: prior.launch } : d);
+        else if (d.launch && !prior.launch) prior.launch = d.launch;
       } else if (on === 'host') host ??= { bindingId: r.binding.id, source: r.source };
       explanation.matched.push(entry);
     }
@@ -439,12 +456,45 @@ export class Router {
     return { deliveries, ...(host ? { host } : {}), explanation };
   }
 
+  /** Where one resolved rule puts the input: its explanation entry and, for an action that targets a session, the delivery. */
+  private place(r: Resolved, env: InboundEnvelope, origin: Origin): { on: BindingAction; entry: RouteExplanation['matched'][number]; delivery?: RouteDelivery } {
+    let on = r.on;
+    // Our own echoes are recorded at most, never start a turn: no rule can make the deployment loop on its output.
+    if (origin.self && on === 'dispatch') on = 'context';
+    const entry: RouteExplanation['matched'][number] = { bindingId: r.binding.id, source: r.source, on, ...(r.callout ? { callout: r.callout } : {}) };
+    if (!targets(on)) return { on, entry };
+    const agent = r.watchId !== undefined || r.legacyKey !== undefined ? undefined : this.agents.get(r.agent ?? this.o.defaultAgent ?? '');
+    const scope = r.legacyKey !== undefined ? { sessionKey: r.legacyKey } : this.scope(r.session, agent, env, on);
+    const sessionKey = scope.sessionKey;
+    if (agent) entry.agent = agent.name;
+    entry.sessionKey = sessionKey;
+    const delivery: RouteDelivery = {
+      bindingId: r.binding.id,
+      source: r.source,
+      on,
+      sessionKey,
+      ...(agent ? { agent: agent.name } : {}),
+      ...(r.watchId !== undefined ? { watchId: r.watchId } : {}),
+      ...(on === 'digest' && r.binding.digest ? { digest: r.binding.digest } : {}),
+      ...(r.binding.note !== undefined ? { note: r.binding.note } : {}),
+      ...(r.source !== 'watch' ? { match: r.binding.match } : {}),
+      ...(r.mode ? { mode: r.mode } : {}),
+      ...(scope.topic ? { topic: { id: scope.topic.id, conversation: scope.topic.conversation, ...(scope.topic.title !== undefined ? { title: scope.topic.title } : {}) } } : {}),
+    };
+    return { on, entry, delivery };
+  }
+
   private async resolve(r: Rule, env: InboundEnvelope, input: InputRecord): Promise<Resolved> {
     const b = r.binding;
     const base: Resolved = { ...r, on: b.on, ...(b.agent !== undefined ? { agent: b.agent } : {}), ...(b.session !== undefined ? { session: b.session } : {}) };
     if (!b.callout) return base;
     const onFailure = b.callout.onFailure ?? 'host';
-    const fail = (outcome: CalloutOutcome): Resolved => ({ ...base, on: onFailure, callout: { outcome, on: onFailure } });
+    const fail = (outcome: CalloutOutcome, reason?: string): Resolved => ({ ...base, on: onFailure, callout: { outcome, on: onFailure, ...(reason !== undefined ? { reason } : {}) } });
+    // Once the rule's own session is pinned (a launch recorded), the rule routes alone: the host is asked once per session key.
+    if (b.callout.skipWhenPinned && targets(b.on) && this.o.launches) {
+      const key = this.scope(b.session, this.agents.get(b.agent ?? this.o.defaultAgent ?? ''), env, b.on, true).sessionKey;
+      if (this.o.launches.pinned(key)) return { ...base, callout: { outcome: 'skipped_pinned', on: b.on } };
+    }
     const call = this.o.routeCallout;
     if (!call || !this.connected) return fail('no_host');
     const { raw: _raw, ...envelope } = env;
@@ -458,7 +508,7 @@ export class Router {
     const bad = this.badAnswer(answer, b);
     if (bad) {
       this.o.log?.('warn', `callout for binding ${b.id} answered badly: ${bad}`);
-      return fail('error');
+      return fail('error', answer && typeof answer === 'object' && answer.launch !== undefined ? 'bad_launch' : undefined);
     }
     return {
       ...base,
@@ -466,6 +516,7 @@ export class Router {
       ...(answer.agent !== undefined ? { agent: answer.agent } : {}),
       ...(answer.session !== undefined ? { session: answer.session } : {}),
       callout: { outcome: 'answered', on: answer.on },
+      ...(answer.launch !== undefined ? { launch: answer.launch, failed: (reason: string) => fail('error', reason) } : {}),
     };
   }
 
@@ -474,6 +525,10 @@ export class Router {
     if (errors(BindingAction, a.on).length) return `on ${JSON.stringify(a.on)}`;
     if (a.session !== undefined && errors(SessionScope, a.session).length) return `session ${JSON.stringify(a.session)}`;
     if (a.on === 'digest' && !b.digest) return 'digest, but the rule has no digest settings';
+    if (a.launch !== undefined) {
+      if (errors(SessionLaunch, a.launch).length) return `launch ${JSON.stringify(Object.keys(a.launch ?? {}))}`;
+      if (!targets(a.on)) return `launch with on ${JSON.stringify(a.on)} (only with an on that targets a session)`;
+    }
     if (targets(a.on) || a.agent !== undefined) {
       try {
         this.target(a.agent ?? b.agent ?? this.o.defaultAgent, `callout answer for ${b.id}`);
@@ -504,7 +559,7 @@ export class Router {
     return this.scope(scope, agent, env).sessionKey;
   }
 
-  private scope(scope: SessionScope | undefined, agent: AgentSpec | undefined, env: InboundEnvelope, on?: BindingAction): { sessionKey: string; topic?: TopicRecord } {
+  private scope(scope: SessionScope | undefined, agent: AgentSpec | undefined, env: InboundEnvelope, on?: BindingAction, peek = false): { sessionKey: string; topic?: TopicRecord } {
     const s = scope ?? 'per-conversation';
     if (typeof s === 'object') return { sessionKey: s.key };
     const name = agent?.name ?? this.o.defaultAgent ?? 'default';
@@ -519,6 +574,10 @@ export class Router {
     // Threaded conversations keep one session per thread; without a topic table a topic is the conversation.
     if (s === 'per-thread' || (s === 'topic' && (env.conversation.threadId !== undefined || !this.o.topics))) return { sessionKey: prefix + conversationRouteKey(env) };
     const conversation = topicConversation(env);
+    if (s === 'topic' && peek) {
+      // Without creating or touching the topic: the current one's key, else the first topic's (the conversation's own).
+      return { sessionKey: this.o.topics!.current(conversation, name)?.sessionKey ?? prefix + conversation };
+    }
     if (s === 'topic') {
       const title = titleFrom(contentText(env.content, 400));
       const { topic, created } = this.o.topics!.ensureCurrent(conversation, name, this.topicKey(name, conversation), title !== undefined ? { title } : {});
@@ -573,7 +632,10 @@ interface Resolved extends Rule {
   on: BindingAction;
   agent?: string;
   session?: SessionScope;
-  callout?: { outcome: CalloutOutcome; on: BindingAction };
+  callout?: { outcome: CalloutOutcome; on: BindingAction; reason?: string };
+  /** A callout answer's launch, and the rule's failure mode should it be refused. */
+  launch?: SessionLaunch;
+  failed?: (reason: string) => Resolved;
   /** Legacy admit: the session it named. */
   legacyKey?: string;
   mode?: InputMode;
