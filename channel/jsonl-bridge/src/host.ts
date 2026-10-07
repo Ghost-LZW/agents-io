@@ -31,6 +31,8 @@ export interface BridgeOptions {
   config?: unknown;
   /** Per-request timeout. Default 30s. */
   requestTimeoutMs?: number;
+  /** Consecutive request timeouts after which the peer counts as wedged and is killed (and restarted by `start`). Default 3. */
+  timeoutsBeforeRestart?: number;
   /** Time allowed for the `hello` handshake. Default 10s. */
   helloTimeoutMs?: number;
   /** Restart backoff (exponential, capped). Default 200ms .. 10s. */
@@ -125,6 +127,8 @@ interface Conn {
   pending: Map<string, Pending>;
   since: number;
   gone: boolean;
+  /** Requests that timed out since the peer last answered one. */
+  timeouts: number;
 }
 
 class Bridge implements BridgedChannel {
@@ -134,8 +138,13 @@ class Bridge implements BridgedChannel {
   private ctxWaiters: (() => void)[] = [];
   private nextId = 0;
   private closing = false;
+  /** Aborted by `close`, so a running `start` loop stops too. */
+  private readonly stopper = new AbortController();
+  /** The transport whose hello is in flight, so `close` can cut it short. */
+  private dialing: Transport | undefined;
   private log: ChannelContext['log'];
   private readonly requestTimeoutMs: number;
+  private readonly timeoutsBeforeRestart: number;
   private readonly helloTimeoutMs: number;
   private readonly minBackoff: number;
   private readonly maxBackoff: number;
@@ -155,6 +164,7 @@ class Bridge implements BridgedChannel {
   ) {
     this.log = opts.log ?? (() => {});
     this.requestTimeoutMs = opts.requestTimeoutMs ?? 30_000;
+    this.timeoutsBeforeRestart = opts.timeoutsBeforeRestart ?? 3;
     this.helloTimeoutMs = opts.helloTimeoutMs ?? 10_000;
     this.minBackoff = opts.backoff?.minMs ?? 200;
     this.maxBackoff = opts.backoff?.maxMs ?? 10_000;
@@ -202,26 +212,33 @@ class Bridge implements BridgedChannel {
     this.ctx = ctx;
     this.log = ctx.log;
     for (const w of this.ctxWaiters.splice(0)) w();
+    const signal = AbortSignal.any([ctx.signal, this.stopper.signal]);
+    const aborted = new Promise<'abort'>((r) => {
+      if (signal.aborted) r('abort');
+      else signal.addEventListener('abort', () => r('abort'), { once: true });
+    });
     let attempt = 0;
-    while (!ctx.signal.aborted) {
+    while (!signal.aborted) {
       if (!this.conn) {
         try {
           await this.connect();
         } catch (err) {
+          if (signal.aborted) break;
           const wait = this.delay(attempt++);
           this.log('warn', `channel connect failed: ${errMsg(err)}; retry in ${wait}ms`);
-          await sleep(wait, ctx.signal);
+          await sleep(wait, signal);
           continue;
         }
+        // Aborted while connecting: the fresh peer is shut down by `close` below.
+        if (signal.aborted) break;
       }
       const conn = this.conn!;
-      const aborted = new Promise<'abort'>((r) => ctx.signal.addEventListener('abort', () => r('abort'), { once: true }));
       const why = await Promise.race([conn.transport.closed, aborted]);
       if (why === 'abort') break;
       if (Date.now() - conn.since >= this.maxBackoff) attempt = 0;
       const wait = this.delay(attempt++);
       this.log('warn', `channel peer ${why}; restarting in ${wait}ms`);
-      await sleep(wait, ctx.signal);
+      await sleep(wait, signal);
     }
     await this.close();
   }
@@ -229,6 +246,12 @@ class Bridge implements BridgedChannel {
   /** Ask the peer to shut down, then kill it after the grace period. Safe to call twice. */
   async close(): Promise<void> {
     this.closing = true;
+    this.stopper.abort();
+    const dialing = this.dialing;
+    if (dialing) {
+      dialing.kill();
+      await dialing.closed;
+    }
     const conn = this.conn;
     if (!conn) return;
     conn.link.send({ v: PROTOCOL_VERSION, type: 'shutdown' });
@@ -244,9 +267,10 @@ class Bridge implements BridgedChannel {
   // ---- connection ---------------------------------------------------------
 
   private async connect(): Promise<void> {
+    if (this.closing) throw new ChannelBridgeError('closed', 'bridge is closing', false);
     const transport = await this.opener();
     const pending = new Map<string, Pending>();
-    const conn: Conn = { transport, pending, since: Date.now(), gone: false, link: undefined as never };
+    const conn: Conn = { transport, pending, since: Date.now(), gone: false, timeouts: 0, link: undefined as never };
     conn.link = new FrameLink(
       transport.input,
       transport.output,
@@ -276,6 +300,11 @@ class Bridge implements BridgedChannel {
         conn.pending.delete(id);
       }
     });
+    if (this.closing) {
+      transport.kill();
+      throw new ChannelBridgeError('closed', 'bridge is closing', false);
+    }
+    this.dialing = transport;
     try {
       const value = await this.call(conn, 'hello', { account: this.opts.account, config: this.opts.config }, this.helloTimeoutMs);
       if (!check(ChannelHello, value)) throw new ChannelBridgeError('bad_hello', `invalid hello: ${errors(ChannelHello, value).slice(0, 3).join('; ')}`, false);
@@ -283,6 +312,8 @@ class Bridge implements BridgedChannel {
     } catch (err) {
       transport.kill();
       throw err;
+    } finally {
+      this.dialing = undefined;
     }
     if (this.closing) {
       transport.kill();
@@ -303,11 +334,20 @@ class Bridge implements BridgedChannel {
       const timer = setTimeout(() => {
         conn.pending.delete(id);
         reject(new ChannelBridgeError('timeout', `${type} timed out after ${timeoutMs}ms`, true));
+        // Alive but not answering: kill it so `start` restarts it like a crashed peer.
+        if (++conn.timeouts >= this.timeoutsBeforeRestart && !conn.gone) {
+          this.log('warn', `channel peer not answering (${conn.timeouts} requests timed out); killing it`);
+          conn.transport.kill();
+        }
       }, timeoutMs);
       conn.pending.set(id, { resolve, reject, timer });
       if (!conn.link.send({ v: PROTOCOL_VERSION, type, id, ...body })) {
         clearTimeout(timer);
         conn.pending.delete(id);
+        if (conn.link.congested && !conn.gone) {
+          this.log('warn', 'channel peer stopped reading its input; killing it');
+          conn.transport.kill();
+        }
         reject(new ChannelBridgeError('peer_closed', 'channel peer is gone', true));
       }
     });
@@ -327,6 +367,18 @@ class Bridge implements BridgedChannel {
     }
     if (!check(ChannelAdapterFrame, raw)) {
       this.log('warn', `dropping invalid ${raw.type} frame`, { errors: errors(ChannelAdapterFrame, raw).slice(0, 3), frame: preview(raw) });
+      // A malformed answer still settles its request, with the peer's message if there is one.
+      if (raw.type === 'result' && typeof raw.id === 'string') {
+        const p = conn.pending.get(raw.id);
+        if (p) {
+          conn.pending.delete(raw.id);
+          clearTimeout(p.timer);
+          conn.timeouts = 0;
+          const e = raw.error;
+          const why = isObject(e) && typeof e.message === 'string' ? `: ${e.message}` : '';
+          p.reject(new ChannelBridgeError('bad_result', `malformed result frame${why}`, false));
+        }
+      }
       // Don't leave the peer waiting on an inbound we refuse.
       if (raw.type === 'inbound' && typeof raw.id === 'string')
         conn.link.send({
@@ -344,6 +396,7 @@ class Bridge implements BridgedChannel {
         if (!p) return; // late answer after timeout
         conn.pending.delete(raw.id as string);
         clearTimeout(p.timer);
+        conn.timeouts = 0;
         if (raw.ok) p.resolve(raw.value);
         else {
           const e = raw.error as { code: string; message: string; retryable?: boolean } | undefined;
@@ -352,8 +405,10 @@ class Bridge implements BridgedChannel {
         return;
       }
       case 'log': {
-        const level = raw.level as 'debug' | 'info' | 'warn' | 'error';
+        const level = raw.level as 'debug' | 'info' | 'warn' | 'error' | 'fatal';
         this.log(level, String(raw.msg), raw.data);
+        // `fatal`: the adapter gave up. Treat it as dead; `start` restarts it with backoff.
+        if (level === 'fatal' && !conn.gone) conn.transport.kill();
         return;
       }
       case 'inbound':

@@ -211,32 +211,7 @@
     "methods": {
       "type": "array",
       "items": {
-        "anyOf": [
-          {
-            "const": "edit",
-            "type": "string"
-          },
-          {
-            "const": "finalize",
-            "type": "string"
-          },
-          {
-            "const": "retract",
-            "type": "string"
-          },
-          {
-            "const": "speak",
-            "type": "string"
-          },
-          {
-            "const": "typing",
-            "type": "string"
-          },
-          {
-            "const": "reconcile",
-            "type": "string"
-          }
-        ]
+        "type": "string"
       }
     }
   }
