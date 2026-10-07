@@ -8,6 +8,7 @@
 //   fatal  answers hello, then logs `fatal` and keeps running
 //   badresult  answers send with an error that lacks `code`
 //   newer  declares an optional method this host does not know
+//   gated  exits before answering hello until GATE_FILE exists, then behaves normally
 // PIDS_FILE=<p> appends each launch's pid, one per line.
 import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
@@ -24,6 +25,10 @@ const env = {
 };
 
 if (process.env.PIDS_FILE) appendFileSync(process.env.PIDS_FILE, `${process.pid}\n`);
+if (mode === 'gated' && !existsSync(process.env.GATE_FILE)) {
+  process.stderr.write('gate closed\n');
+  process.exit(2);
+}
 let firstFlaky = false;
 if (mode === 'flaky') {
   firstFlaky = !existsSync(process.env.FLAKY_FILE);

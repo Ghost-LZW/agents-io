@@ -64,7 +64,7 @@ import { ClaudeCodeHarness, findOnPath, type ClaudeCodeHarnessConfig } from '@ag
 import { CodexHarness, type CodexProfile } from '@agents-io/harness-codex';
 import { LarkBotAdapter } from '@agents-io/channel-lark-bot';
 import { MailChannel, type MailChannelConfig } from '@agents-io/channel-mail';
-import { spawnChannel } from '@agents-io/channel-jsonl-bridge';
+import { spawnChannel, type BridgeState } from '@agents-io/channel-jsonl-bridge';
 import { agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ResolvedChannel } from './config.js';
 import { ConsoleServer } from './console.js';
 import { ConfigStore } from './console-config.js';
@@ -139,6 +139,8 @@ interface RunningChannel {
   close?: () => Promise<void>;
   state: 'running' | 'stopped' | 'failed';
   error?: string;
+  /** The config entry it was built from (configured channels only). */
+  source?: ResolvedChannel;
 }
 
 const DAEMON_VERSION: string = (() => {
@@ -1098,37 +1100,72 @@ ${a.summary}` }],
   }
 
   private async startChannels(): Promise<void> {
-    const all: { adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }[] = [];
-    for (const ch of this.o.config.channels) all.push(await buildChannel(ch));
-    for (const x of this.o.channels ?? []) all.push({ adapter: x.adapter, account: x.account ?? 'default', ...(x.tier ? { tier: x.tier } : {}) });
-    for (const ch of all) {
-      const ac = new AbortController();
-      const running = ch.adapter
-        .start({
-          account: ch.account,
-          config: ch.config,
-          signal: ac.signal,
-          blobs: this.blobs,
-          emit: async (env) => {
-            const r = await this.accept(env);
-            return { accepted: r.accepted, ...(r.inputId !== undefined ? { inputId: r.inputId } : {}) };
-          },
-          log: (level, msg) => this.log(level, `${ch.adapter.id}: ${msg}`),
-        })
-        .then(
-          () => {
-            entry.state = 'stopped';
-          },
-          (err: Error) => {
-            entry.state = 'failed';
-            entry.error = err.message;
-            this.log('error', `channel ${ch.adapter.id} stopped: ${err.message}`);
-          },
-        );
-      const entry: RunningChannel = { adapter: ch.adapter, account: ch.account, ...(ch.tier ? { tier: ch.tier } : {}), ac, running, state: 'running', ...(ch.close ? { close: ch.close } : {}) };
-      this.channels.push(entry);
-      this.log('info', `channel ${ch.adapter.id} (${ch.account}) started`);
+    for (const ch of this.o.config.channels) await this.startConfigChannel(ch);
+    for (const x of this.o.channels ?? []) this.startChannel({ adapter: x.adapter, account: x.account ?? 'default', ...(x.tier ? { tier: x.tier } : {}) });
+  }
+
+  /**
+   * Build and start one configured channel. A bridge whose first `hello` fails does
+   * not stop the daemon: it is listed `failed` with the reason and keeps being retried
+   * with the bridge's restart backoff; it turns `running` once a peer answers.
+   */
+  private async startConfigChannel(cfg: ResolvedChannel): Promise<RunningChannel> {
+    let entry: RunningChannel | undefined;
+    let early: BridgeState | undefined;
+    const onState = (st: BridgeState) => {
+      if (!entry) return void (early = st);
+      this.bridgeState(entry, st);
+    };
+    const built = await buildChannel(cfg, onState);
+    entry = this.startChannel(built);
+    entry.source = cfg;
+    if (early) this.bridgeState(entry, early);
+    return entry;
+  }
+
+  private bridgeState(entry: RunningChannel, st: BridgeState): void {
+    if (entry.ac.signal.aborted || entry.state === 'stopped') return;
+    const was = entry.state;
+    if (st.connected) {
+      entry.state = 'running';
+      delete entry.error;
+      if (was === 'failed') this.log('info', `channel ${entry.adapter.id} (${entry.account}) connected`);
+    } else {
+      entry.state = 'failed';
+      entry.error = `${st.error ?? 'not connected'}; retrying`;
+      if (was !== 'failed') this.log('warn', `channel ${entry.adapter.id} (${entry.account}): ${entry.error}`);
     }
+  }
+
+  private startChannel(ch: { adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }): RunningChannel {
+    const ac = new AbortController();
+    const running = ch.adapter
+      .start({
+        account: ch.account,
+        config: ch.config,
+        signal: ac.signal,
+        blobs: this.blobs,
+        emit: async (env) => {
+          const r = await this.accept(env);
+          return { accepted: r.accepted, ...(r.inputId !== undefined ? { inputId: r.inputId } : {}) };
+        },
+        log: (level, msg) => this.log(level, `${ch.adapter.id}: ${msg}`),
+      })
+      .then(
+        () => {
+          entry.state = 'stopped';
+          delete entry.error;
+        },
+        (err: Error) => {
+          entry.state = 'failed';
+          entry.error = err.message;
+          this.log('error', `channel ${ch.adapter.id} stopped: ${err.message}`);
+        },
+      );
+    const entry: RunningChannel = { adapter: ch.adapter, account: ch.account, ...(ch.tier ? { tier: ch.tier } : {}), ac, running, state: 'running', ...(ch.close ? { close: ch.close } : {}) };
+    this.channels.push(entry);
+    this.log('info', `channel ${ch.adapter.id} (${ch.account}) started`);
+    return entry;
   }
 
   /**
@@ -1485,7 +1522,7 @@ export function buildHarness(i: HarnessInstance, media?: MediaResolvers): Instan
   return new InstanceHarness(inst, new ClaudeCodeHarness(config));
 }
 
-async function buildChannel(ch: ResolvedChannel): Promise<{ adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }> {
+async function buildChannel(ch: ResolvedChannel, onState?: (s: BridgeState) => void): Promise<{ adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }> {
   const tier = ch.tier ? { tier: ch.tier } : {};
   switch (ch.type) {
     case 'lark-bot':
@@ -1500,6 +1537,10 @@ async function buildChannel(ch: ResolvedChannel): Promise<{ adapter: ChannelAdap
         ...(ch.env ? { env: ch.env } : {}),
         ...(ch.cwd ? { cwd: ch.cwd } : {}),
         ...(ch.config !== undefined ? { config: ch.config } : {}),
+        // A peer that fails its first hello is retried with the restart backoff instead of failing the daemon.
+        retryFirstConnect: true,
+        ...(ch.id !== undefined ? { id: ch.id } : {}),
+        ...(onState ? { onState } : {}),
       });
       return { adapter: b, account: ch.account, config: ch.config, close: () => b.close(), ...tier };
     }

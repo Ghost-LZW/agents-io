@@ -144,6 +144,8 @@ const ChannelEntry = Type.Union([
     {
       type: Type.Literal('bridge'),
       ...ChannelCommon,
+      /** The adapter id the peer declares in `hello`; shown (e.g. in status) while the peer has not connected yet. Default `bridge`. */
+      id: Type.Optional(Type.String()),
       command: Type.String(),
       args: Type.Optional(Type.Array(Type.String())),
       env: Type.Optional(Type.Record(Type.String(), Type.String())),

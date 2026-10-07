@@ -205,6 +205,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 - **agent 看到什么**：完全取决于私有适配器发出的入站信封，经过 §1 的同样转换。
 - **输出怎么处理**：适配器收到 `RenderedMessage`，其中包含 `progress`（结构化过程视图），以及它在 hello 里声明过的方法（edit、finalize 等）。能渲染到什么程度，由适配器自己决定。
 - **档位**：由配置决定。
+- **对端起不来**：首次 `hello` 失败不会让守护进程启动失败。通道显示为 `failed`（`GET /api/status` 给出原因，后缀 `; retrying`），按 `backoff` 重试，连上后变回 `running`；未连接时请求以 `unavailable`（可重试）失败。可选的 `id` 写对端 `hello` 会声明的 adapter id，用于未连接时的显示与路由（默认 `bridge`）。见 `docs/design/bridge-first-connect`。
 
 ## 6. 监听（watch）
 
