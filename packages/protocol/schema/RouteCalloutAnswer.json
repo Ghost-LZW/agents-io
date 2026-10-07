@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/RouteCalloutAnswer",
+  "type": "object",
+  "required": [
+    "on"
+  ],
+  "properties": {
+    "on": {
+      "anyOf": [
+        {
+          "const": "dispatch",
+          "type": "string"
+        },
+        {
+          "const": "context",
+          "type": "string"
+        },
+        {
+          "const": "digest",
+          "type": "string"
+        },
+        {
+          "const": "host",
+          "type": "string"
+        },
+        {
+          "const": "drop",
+          "type": "string"
+        }
+      ]
+    },
+    "agent": {
+      "type": "string"
+    },
+    "session": {
+      "anyOf": [
+        {
+          "const": "main",
+          "type": "string"
+        },
+        {
+          "const": "per-conversation",
+          "type": "string"
+        },
+        {
+          "const": "per-thread",
+          "type": "string"
+        },
+        {
+          "const": "topic",
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "required": [
+            "key"
+          ],
+          "properties": {
+            "key": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

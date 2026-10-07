@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/AdminQueue",
+  "type": "object",
+  "required": [
+    "head",
+    "consumers"
+  ],
+  "properties": {
+    "head": {
+      "type": "number"
+    },
+    "consumers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "consumer",
+          "acked",
+          "pending",
+          "push"
+        ],
+        "properties": {
+          "consumer": {
+            "type": "string"
+          },
+          "acked": {
+            "type": "number"
+          },
+          "pending": {
+            "type": "number"
+          },
+          "push": {
+            "type": "boolean"
+          },
+          "oldestPendingAt": {
+            "type": "number"
+          },
+          "lastAckAt": {
+            "type": "number"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1525,6 +1525,10 @@
             {
               "const": "ambiguous",
               "type": "string"
+            },
+            {
+              "const": "timeout",
+              "type": "string"
             }
           ]
         },
@@ -1544,7 +1548,11 @@
               "type": "string"
             }
           }
-        }
+        },
+        "durationMs": {
+          "type": "number"
+        },
+        "usage": {}
       }
     },
     {

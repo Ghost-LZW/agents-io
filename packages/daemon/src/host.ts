@@ -1,5 +1,5 @@
 import { timingSafeEqual } from 'node:crypto';
-import { PROTOCOL_VERSION, type HostRequestFrame, type InboundEnvelope, type InputRecord, type Origin } from '@agents-io/protocol';
+import { PROTOCOL_VERSION, type HostHelloResult, type HostRequestFrame, type InboundReadResult, type InboundEnvelope, type InputRecord, type Origin } from '@agents-io/protocol';
 import { RouterError, type CalloutAnswer, type HostQueue, type PushSubscription, type Router } from '@agents-io/session';
 import type { LogFn, Outcome } from './gateway.js';
 import type { HostFrames, Peer } from './local-server.js';
@@ -17,25 +17,11 @@ import type { Runs } from './runs.js';
  * it, and runs whose own connection is gone report `run.ended` to it.
  */
 
-/** `host.hello` answer. */
-export interface HelloResult {
-  name: string;
-  protocol: number;
-  /** This connection is the host (push consumer and/or callout answerer). */
-  host: boolean;
-  /** The host table as the router has it. */
-  bindings: { version: string | null; active: boolean; suspended?: string };
-  /** Push consumption: where the consumer's acked cursor is and the queue head. */
-  inbound?: { consumer: string; acked: number; head: number };
-}
+/** `host.hello` answer (protocol `HostHelloResult`). */
+export type HelloResult = HostHelloResult;
 
-/** `inbound.read` answer. */
-export interface InboundReadResult {
-  items: unknown[];
-  /** The consumer's acked cursor (reads never move it). */
-  acked: number;
-  head: number;
-}
+/** `inbound.read` answer (protocol `InboundReadResult`). */
+export type { InboundReadResult };
 
 export interface HostServiceDeps {
   token: string;

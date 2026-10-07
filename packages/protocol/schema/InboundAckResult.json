@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/InboundAckResult",
+  "type": "object",
+  "required": [
+    "consumer",
+    "acked"
+  ],
+  "properties": {
+    "consumer": {
+      "type": "string"
+    },
+    "acked": {
+      "type": "number"
+    }
+  }
+}

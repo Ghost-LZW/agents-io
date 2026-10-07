@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/HostHelloResult",
+  "type": "object",
+  "required": [
+    "name",
+    "protocol",
+    "host",
+    "bindings"
+  ],
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "protocol": {
+      "type": "number"
+    },
+    "host": {
+      "type": "boolean"
+    },
+    "bindings": {
+      "type": "object",
+      "required": [
+        "version",
+        "active"
+      ],
+      "properties": {
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "active": {
+          "type": "boolean"
+        },
+        "suspended": {
+          "anyOf": [
+            {
+              "const": "expired",
+              "type": "string"
+            },
+            {
+              "const": "host_down",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    "inbound": {
+      "type": "object",
+      "required": [
+        "consumer",
+        "acked",
+        "head"
+      ],
+      "properties": {
+        "consumer": {
+          "type": "string"
+        },
+        "acked": {
+          "type": "number"
+        },
+        "head": {
+          "type": "number"
+        }
+      }
+    },
+    "lease": {
+      "type": "object",
+      "required": [
+        "ttlMs",
+        "expiresAt"
+      ],
+      "properties": {
+        "ttlMs": {
+          "type": "number"
+        },
+        "expiresAt": {
+          "type": "number"
+        }
+      }
+    }
+  }
+}

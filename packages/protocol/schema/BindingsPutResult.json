@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/BindingsPutResult",
+  "type": "object",
+  "required": [
+    "version",
+    "changed",
+    "active"
+  ],
+  "properties": {
+    "version": {
+      "type": "string"
+    },
+    "previous": {
+      "type": "string"
+    },
+    "changed": {
+      "type": "boolean"
+    },
+    "active": {
+      "type": "boolean"
+    },
+    "suspended": {
+      "anyOf": [
+        {
+          "const": "expired",
+          "type": "string"
+        },
+        {
+          "const": "host_down",
+          "type": "string"
+        }
+      ]
+    }
+  }
+}

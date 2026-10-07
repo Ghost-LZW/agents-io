@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/AdminConfigDocument",
+  "type": "object",
+  "required": [
+    "path",
+    "revision",
+    "config",
+    "issues",
+    "env"
+  ],
+  "properties": {
+    "path": {
+      "type": "string"
+    },
+    "revision": {
+      "type": "string"
+    },
+    "config": {
+      "type": "object",
+      "patternProperties": {
+        "^(.*)$": {}
+      }
+    },
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "path",
+          "message"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "severity": {
+            "anyOf": [
+              {
+                "const": "error",
+                "type": "string"
+              },
+              {
+                "const": "warning",
+                "type": "string"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "env": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "set"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "set": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  }
+}

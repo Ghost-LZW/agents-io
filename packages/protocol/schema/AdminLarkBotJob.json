@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/AdminLarkBotJob",
+  "type": "object",
+  "required": [
+    "job",
+    "state",
+    "createdAt",
+    "updatedAt"
+  ],
+  "properties": {
+    "job": {
+      "type": "string"
+    },
+    "state": {
+      "anyOf": [
+        {
+          "const": "starting",
+          "type": "string"
+        },
+        {
+          "const": "waiting_scan",
+          "type": "string"
+        },
+        {
+          "const": "configuring",
+          "type": "string"
+        },
+        {
+          "const": "succeeded",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "type": "string"
+        }
+      ]
+    },
+    "qr": {
+      "type": "object",
+      "required": [
+        "payload"
+      ],
+      "properties": {
+        "payload": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "number"
+        }
+      }
+    },
+    "message": {
+      "type": "string"
+    },
+    "result": {
+      "type": "object",
+      "required": [
+        "appId",
+        "domain",
+        "account",
+        "env",
+        "channelAdded"
+      ],
+      "properties": {
+        "appId": {
+          "type": "string"
+        },
+        "domain": {
+          "anyOf": [
+            {
+              "const": "feishu",
+              "type": "string"
+            },
+            {
+              "const": "lark",
+              "type": "string"
+            }
+          ]
+        },
+        "botName": {
+          "type": "string"
+        },
+        "account": {
+          "type": "string"
+        },
+        "env": {
+          "type": "object",
+          "patternProperties": {
+            "^(.*)$": {
+              "type": "string"
+            }
+          }
+        },
+        "owner": {
+          "type": "string"
+        },
+        "channelAdded": {
+          "type": "boolean"
+        },
+        "consoleUrl": {
+          "type": "string"
+        }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "createdAt": {
+      "type": "number"
+    },
+    "updatedAt": {
+      "type": "number"
+    }
+  }
+}

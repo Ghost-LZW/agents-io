@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/AdminLarkBotRequest",
+  "type": "object",
+  "required": [
+    "name"
+  ],
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "avatar": {
+      "type": "string"
+    },
+    "domain": {
+      "anyOf": [
+        {
+          "const": "feishu",
+          "type": "string"
+        },
+        {
+          "const": "lark",
+          "type": "string"
+        }
+      ]
+    },
+    "presets": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "account": {
+      "type": "string"
+    },
+    "addChannel": {
+      "type": "boolean"
+    },
+    "owner": {
+      "type": "boolean"
+    }
+  }
+}

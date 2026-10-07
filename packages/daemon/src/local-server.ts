@@ -219,6 +219,8 @@ class Conn implements Peer {
     } catch (e) {
       return this.result(f.id, { ok: false, code: 'internal', message: (e as Error).message });
     }
+    // Topics (decision 6) are in the protocol; this daemon does not keep a topic table yet.
+    if (f.type === 'topic.list' || f.type === 'topic.switch') return this.result(f.id, { ok: false, code: 'unsupported', message: `${f.type} is not supported by this daemon yet` });
     const cmd = f.command;
     try {
       if (cmd.type === 'subscribe') return this.result(f.id, this.subscribe(cmd));

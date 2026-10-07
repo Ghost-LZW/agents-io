@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/InputVerifyResult",
+  "type": "object",
+  "required": [
+    "channelRef",
+    "found",
+    "records"
+  ],
+  "properties": {
+    "channelRef": {
+      "type": "string"
+    },
+    "found": {
+      "type": "boolean"
+    },
+    "records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "channelRef",
+          "channel",
+          "account",
+          "conversation",
+          "author",
+          "evidence",
+          "principal",
+          "labels",
+          "kind",
+          "receivedAt"
+        ],
+        "properties": {
+          "channelRef": {
+            "type": "string"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "account": {
+            "type": "string"
+          },
+          "conversation": {
+            "type": "object",
+            "required": [
+              "id",
+              "kind"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "anyOf": [
+                  {
+                    "const": "dm",
+                    "type": "string"
+                  },
+                  {
+                    "const": "group",
+                    "type": "string"
+                  },
+                  {
+                    "const": "thread",
+                    "type": "string"
+                  },
+                  {
+                    "const": "meeting",
+                    "type": "string"
+                  },
+                  {
+                    "const": "call",
+                    "type": "string"
+                  },
+                  {
+                    "const": "mail",
+                    "type": "string"
+                  },
+                  {
+                    "const": "other",
+                    "type": "string"
+                  }
+                ]
+              },
+              "threadId": {
+                "type": "string"
+              }
+            }
+          },
+          "author": {
+            "type": "object",
+            "required": [
+              "channelUserId"
+            ],
+            "properties": {
+              "channelUserId": {
+                "type": "string"
+              },
+              "displayName": {
+                "type": "string"
+              },
+              "isBot": {
+                "type": "boolean"
+              }
+            }
+          },
+          "evidence": {
+            "anyOf": [
+              {
+                "const": "platform_signed",
+                "type": "string"
+              },
+              {
+                "const": "dkim_pass",
+                "type": "string"
+              },
+              {
+                "const": "device_only",
+                "type": "string"
+              },
+              {
+                "const": "none",
+                "type": "string"
+              }
+            ]
+          },
+          "principal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "labels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "const": "human",
+                "type": "string"
+              },
+              {
+                "const": "agent",
+                "type": "string"
+              },
+              {
+                "const": "channel_event",
+                "type": "string"
+              },
+              {
+                "const": "system",
+                "type": "string"
+              },
+              {
+                "const": "peer",
+                "type": "string"
+              }
+            ]
+          },
+          "self": {
+            "type": "boolean"
+          },
+          "inputId": {
+            "type": "string"
+          },
+          "receivedAt": {
+            "type": "number"
+          },
+          "sentAt": {
+            "type": "number"
+          }
+        }
+      }
+    }
+  }
+}

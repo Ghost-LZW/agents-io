@@ -3,6 +3,7 @@ import { ReplyRoute, V } from './common.js';
 import { RunSpec } from './run.js';
 import { Decision, RequestQuestion, ResolvedBy, Resolver } from './requests.js';
 import { InputRecord } from './inbound.js';
+import { TopicChangeReason } from './topic.js';
 
 export const Tier = Type.Union([Type.Literal('full'), Type.Literal('card'), Type.Literal('headline'), Type.Literal('final')]);
 export type Tier = Static<typeof Tier>;
@@ -196,6 +197,20 @@ export const Body = Type.Union([
     turnId: Type.String(),
     providerMessageId: Type.String(),
     leaseUntil: Type.Optional(Type.Number()),
+  }),
+  /**
+   * The current topic of a flat conversation changed (decision 6). Appended to
+   * the session being left (when there is one) and to the one now current.
+   */
+  T('topic.changed', {
+    /** Route key of the conversation. */
+    conversation: Type.String(),
+    /** Topic id that was current; absent for the conversation's first topic. */
+    from: Type.Optional(Type.String()),
+    /** Topic id that is current now. */
+    to: Type.String(),
+    title: Type.Optional(Type.String()),
+    reason: TopicChangeReason,
   }),
   T('native', { name: Type.String() }),
 ]);

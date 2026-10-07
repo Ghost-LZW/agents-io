@@ -1,5 +1,5 @@
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
-import type { Evidence, InboundEnvelope, Origin } from '@agents-io/protocol';
+import type { InboundEnvelope, InputVerifyResult, Origin, VerifiedInput } from '@agents-io/protocol';
 import { channelRefOf, type DeliveryRecord, type OutboxStore } from '@agents-io/session';
 
 /*
@@ -11,37 +11,11 @@ import { channelRefOf, type DeliveryRecord, type OutboxStore } from '@agents-io/
 
 const DAY = 86_400_000;
 
-/** What `input.verify` answers for one channel message: what the channel reported and what the daemon concluded. Never a guess. */
-export interface VerifiedInput {
-  channelRef: string;
-  channel: string;
-  account: string;
-  conversation: { id: string; kind: InboundEnvelope['conversation']['kind']; threadId?: string };
-  /** The platform author as the channel adapter reported it. */
-  author: { channelUserId: string; displayName?: string; isBot?: boolean };
-  /** What the adapter could prove about the author (platform signature, DKIM, …). */
-  evidence: Evidence;
-  /** The principal the identity map stamped (null: unknown sender, or not enough evidence). */
-  principal: string | null;
-  labels: string[];
-  /** Origin kind the daemon concluded (human, agent, …). */
-  kind: Origin['kind'];
-  /** The deployment's own echo. */
-  self?: boolean;
-  /** Input id it became (absent for approval / stop clicks, which are commands). */
-  inputId?: string;
-  /** Unix ms the daemon received it. */
-  receivedAt: number;
-  /** Unix ms the platform says it was sent. */
-  sentAt?: number;
-}
+/** What `input.verify` answers for one channel message (protocol `VerifiedInput`). Never a guess. */
+export type { VerifiedInput };
 
-export interface VerifyResult {
-  channelRef: string;
-  found: boolean;
-  /** One per receiving account (a platform message id is shared by every bot account that receives it). */
-  records: VerifiedInput[];
-}
+/** `input.verify` answer (protocol `InputVerifyResult`). */
+export type VerifyResult = InputVerifyResult;
 
 export class DaemonRecords implements OutboxStore {
   readonly db: DatabaseSync;

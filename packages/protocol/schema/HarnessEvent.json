@@ -1898,6 +1898,49 @@
           "type": "object",
           "required": [
             "t",
+            "conversation",
+            "to",
+            "reason"
+          ],
+          "properties": {
+            "t": {
+              "const": "topic.changed",
+              "type": "string"
+            },
+            "conversation": {
+              "type": "string"
+            },
+            "from": {
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "const": "user",
+                  "type": "string"
+                },
+                {
+                  "const": "agent",
+                  "type": "string"
+                },
+                {
+                  "const": "system",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "t",
             "name"
           ],
           "properties": {

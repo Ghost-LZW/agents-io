@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/AdminConfigPutResult",
+  "type": "object",
+  "required": [
+    "revision",
+    "issues",
+    "applied"
+  ],
+  "properties": {
+    "revision": {
+      "type": "string"
+    },
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "path",
+          "message"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "severity": {
+            "anyOf": [
+              {
+                "const": "error",
+                "type": "string"
+              },
+              {
+                "const": "warning",
+                "type": "string"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "applied": {
+      "anyOf": [
+        {
+          "const": "live",
+          "type": "string"
+        },
+        {
+          "const": "restart",
+          "type": "string"
+        }
+      ]
+    }
+  }
+}

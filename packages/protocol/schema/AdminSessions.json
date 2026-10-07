@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/AdminSessions",
+  "type": "object",
+  "required": [
+    "sessions"
+  ],
+  "properties": {
+    "sessions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "sessionKey",
+          "harness",
+          "state",
+          "head",
+          "queued",
+          "pendingRequests",
+          "live"
+        ],
+        "properties": {
+          "sessionKey": {
+            "type": "string"
+          },
+          "harness": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "head": {
+            "type": "number"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "queued": {
+            "type": "number"
+          },
+          "pendingRequests": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "live": {
+            "type": "boolean"
+          },
+          "agent": {
+            "type": "string"
+          },
+          "conversation": {
+            "type": "string"
+          },
+          "topic": {
+            "type": "object",
+            "required": [
+              "id",
+              "conversation",
+              "sessionKey",
+              "state",
+              "createdAt",
+              "lastActiveAt"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "conversation": {
+                "type": "string"
+              },
+              "sessionKey": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "nativeId": {
+                "type": "string"
+              },
+              "state": {
+                "anyOf": [
+                  {
+                    "const": "current",
+                    "type": "string"
+                  },
+                  {
+                    "const": "parked",
+                    "type": "string"
+                  }
+                ]
+              },
+              "createdAt": {
+                "type": "number"
+              },
+              "lastActiveAt": {
+                "type": "number"
+              }
+            }
+          },
+          "runId": {
+            "type": "string"
+          },
+          "lastEventAt": {
+            "type": "number"
+          }
+        }
+      }
+    }
+  }
+}

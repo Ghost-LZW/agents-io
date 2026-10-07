@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/AdminStatus",
+  "type": "object",
+  "required": [
+    "version",
+    "protocol",
+    "pid",
+    "startedAt",
+    "now",
+    "dataDir",
+    "socket",
+    "host",
+    "channels",
+    "agents",
+    "sessions",
+    "runs",
+    "queue"
+  ],
+  "properties": {
+    "version": {
+      "type": "string"
+    },
+    "protocol": {
+      "type": "number"
+    },
+    "pid": {
+      "type": "number"
+    },
+    "startedAt": {
+      "type": "number"
+    },
+    "now": {
+      "type": "number"
+    },
+    "dataDir": {
+      "type": "string"
+    },
+    "socket": {
+      "type": "string"
+    },
+    "configPath": {
+      "type": "string"
+    },
+    "host": {
+      "type": "object",
+      "required": [
+        "connected"
+      ],
+      "properties": {
+        "connected": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "consumer": {
+          "type": "string"
+        },
+        "callouts": {
+          "type": "boolean"
+        },
+        "leaseExpiresAt": {
+          "type": "number"
+        },
+        "table": {
+          "type": "object",
+          "required": [
+            "version",
+            "active"
+          ],
+          "properties": {
+            "version": {
+              "type": "string"
+            },
+            "active": {
+              "type": "boolean"
+            },
+            "suspended": {
+              "anyOf": [
+                {
+                  "const": "expired",
+                  "type": "string"
+                },
+                {
+                  "const": "host_down",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "channels": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "account",
+          "state"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "account": {
+            "type": "string"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "const": "starting",
+                "type": "string"
+              },
+              {
+                "const": "running",
+                "type": "string"
+              },
+              {
+                "const": "failed",
+                "type": "string"
+              },
+              {
+                "const": "stopped",
+                "type": "string"
+              }
+            ]
+          },
+          "error": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "agents": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "harness",
+          "mode"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "harness": {
+            "type": "string"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "const": "interactive",
+                "type": "string"
+              },
+              {
+                "const": "task",
+                "type": "string"
+              }
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "effort": {
+            "type": "string"
+          },
+          "profile": {
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "default": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "sessions": {
+      "type": "object",
+      "required": [
+        "total",
+        "live",
+        "running"
+      ],
+      "properties": {
+        "total": {
+          "type": "number"
+        },
+        "live": {
+          "type": "number"
+        },
+        "running": {
+          "type": "number"
+        }
+      }
+    },
+    "runs": {
+      "type": "object",
+      "required": [
+        "running"
+      ],
+      "properties": {
+        "running": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "queue": {
+      "type": "object",
+      "required": [
+        "head"
+      ],
+      "properties": {
+        "head": {
+          "type": "number"
+        }
+      }
+    }
+  }
+}

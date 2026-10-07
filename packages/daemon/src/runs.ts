@@ -1,6 +1,6 @@
 import { statSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
-import { PROTOCOL_VERSION, type ContentBlock, type InputRecord, type Origin, type ReplyRoute, type RunEnded, type RunStart, type SessionEvent } from '@agents-io/protocol';
+import { PROTOCOL_VERSION, type ContentBlock, type InputRecord, type Origin, type ReplyRoute, type RunEnded, type RunStart, type RunStartResult, type SessionEvent } from '@agents-io/protocol';
 import type { Hub, Lane, Subscription } from '@agents-io/session';
 import type { AgentConfig } from './config.js';
 import type { LogFn, Outcome } from './gateway.js';
@@ -24,19 +24,15 @@ export function exitCodeOf(status: RunStatus, errorCode?: string): number {
       return 1;
     case 'ambiguous':
       return 3;
+    case 'timeout':
+      return 124;
     case 'interrupted':
       return errorCode === 'timeout' ? 124 : 130;
   }
 }
 
-/** `run.start` answer. */
-export interface RunStartResult {
-  runId: string;
-  sessionKey: string;
-  /** started: this request started it; running: it was already running (this connection now gets its run.ended too); ended: it ran before. */
-  state: 'started' | 'running' | 'ended';
-  ended?: RunEnded;
-}
+/** `run.start` answer (protocol `RunStartResult`). */
+export type { RunStartResult };
 
 /** What a run needs from the daemon. */
 export interface RunDeps {

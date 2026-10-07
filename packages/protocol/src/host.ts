@@ -1,6 +1,6 @@
-import { Type, type Static } from '@sinclair/typebox';
+import { Type, type Static, type TSchema } from '@sinclair/typebox';
 import { ContentBlock, Evidence, ReplyRoute, V } from './common.js';
-import { ConversationKind, InboundEnvelope, InputRecord } from './inbound.js';
+import { ConversationKind, InboundEnvelope, InputRecord, OriginKind } from './inbound.js';
 import { RenderedMessage } from './channel.js';
 import { ResultFrame } from './wire.js';
 
@@ -57,6 +57,8 @@ export const SessionScope = Type.Union([
   Type.Literal('main'),
   Type.Literal('per-conversation'),
   Type.Literal('per-thread'),
+  /** The current topic of a flat conversation (decision 6; `topic.ts`). Threaded conversations keep one session per thread. */
+  Type.Literal('topic'),
   Type.Object({ key: Type.String() }),
 ]);
 export type SessionScope = Static<typeof SessionScope>;
@@ -154,6 +156,15 @@ export const HostHello = Type.Object({
   consumer: Type.Optional(Type.String()),
   /** This host answers `route` callouts. */
   callouts: Type.Optional(Type.Boolean()),
+  /**
+   * Presence lease for a pull-only host (one with neither `consumer` nor
+   * `callouts`, e.g. a long-running `aio tail`): the host named `name` counts as
+   * connected, so its `onHostDown: "suspend"` table stays active, until `ttlMs`
+   * after its last frame on any authenticated connection of that name; every
+   * frame renews it. A lease for another name while a host is connected is
+   * refused with `host_connected`.
+   */
+  lease: Type.Optional(Type.Object({ ttlMs: Type.Number() })),
 });
 export type HostHello = Static<typeof HostHello>;
 
@@ -172,6 +183,10 @@ export const RunStart = Type.Object({
   /** Render the run's progress on these routes (observation only). */
   observe: Type.Optional(Type.Object({ routes: Type.Array(ReplyRoute) })),
   timeoutMs: Type.Optional(Type.Number()),
+  /** Replace the agent's run defaults for this run only. `profile` must be one the deployment config defines. */
+  overrides: Type.Optional(
+    Type.Object({ model: Type.Optional(Type.String()), effort: Type.Optional(Type.String()), profile: Type.Optional(Type.String()) }),
+  ),
 });
 export type RunStart = Static<typeof RunStart>;
 
@@ -227,15 +242,31 @@ export const RouteCallout = Type.Object({
   args: Type.Object({ bindingId: Type.String(), input: InputRecord, envelope: InboundEnvelope }),
 });
 
+export const RunStatus = Type.Union([
+  Type.Literal('completed'),
+  /** Cancelled (`run.cancel`, daemon stopping). */
+  Type.Literal('interrupted'),
+  Type.Literal('failed'),
+  /** Outcome unknown (e.g. the daemon stopped mid-run). */
+  Type.Literal('ambiguous'),
+  /** `timeoutMs` elapsed and the run was interrupted (older daemons said `interrupted` with `error.code: "timeout"`). */
+  Type.Literal('timeout'),
+]);
+export type RunStatus = Static<typeof RunStatus>;
+
 export const RunEnded = Type.Object({
   v: V,
   type: Type.Literal('run.ended'),
   runId: Type.String(),
   sessionKey: Type.String(),
-  status: Type.Union([Type.Literal('completed'), Type.Literal('interrupted'), Type.Literal('failed'), Type.Literal('ambiguous')]),
-  /** 0 for completed, non-zero otherwise. */
+  status: RunStatus,
+  /** 0 completed, 1 failed, 3 ambiguous, 124 timeout, 130 interrupted (cancelled). */
   exitCode: Type.Number(),
   error: Type.Optional(Type.Object({ code: Type.String(), message: Type.Optional(Type.String()) })),
+  /** Wall time from `run.start` to the end. */
+  durationMs: Type.Optional(Type.Number()),
+  /** The harness's usage report for the turn, passed through (as `turn.completed.usage`). */
+  usage: Type.Optional(Type.Unknown()),
 });
 export type RunEnded = Static<typeof RunEnded>;
 
@@ -244,3 +275,160 @@ export type HostEventFrame = Static<typeof HostEventFrame>;
 
 export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'input.verify', 'inbound.read', 'inbound.ack', 'explain'] as const;
 export const HOST_EVENT_FRAME_TYPES = ['inbound', 'policy', 'run.ended', 'result'] as const;
+
+// ---- result values --------------------------------------------------------
+// The `value` of the `result` frame that answers each host request, and of the
+// host's answers to daemon requests. Receivers ignore unknown fields.
+
+const Suspended = Type.Union([Type.Literal('expired'), Type.Literal('host_down')]);
+
+/** The host table as the router holds it. */
+export const HostTableState = Type.Object({
+  table: BindingTable,
+  /** Unix ms it was installed. */
+  putAt: Type.Number(),
+  active: Type.Boolean(),
+  /** Why it is not active. */
+  suspended: Type.Optional(Suspended),
+});
+export type HostTableState = Static<typeof HostTableState>;
+
+/** `host.hello`. */
+export const HostHelloResult = Type.Object({
+  name: Type.String(),
+  /** The daemon's PROTOCOL_VERSION. */
+  protocol: Type.Number(),
+  /** This connection is the host (push consumer and/or callout answerer). */
+  host: Type.Boolean(),
+  /** The host table as the router has it. */
+  bindings: Type.Object({ version: Type.Union([Type.String(), Type.Null()]), active: Type.Boolean(), suspended: Type.Optional(Suspended) }),
+  /** Push consumption: the consumer's acked cursor and the queue head. */
+  inbound: Type.Optional(Type.Object({ consumer: Type.String(), acked: Type.Number(), head: Type.Number() })),
+  /** The granted presence lease, when the hello asked for one. */
+  lease: Type.Optional(Type.Object({ ttlMs: Type.Number(), expiresAt: Type.Number() })),
+});
+export type HostHelloResult = Static<typeof HostHelloResult>;
+
+/** `bindings.put`. The same version and content again is a no-op (`changed: false`). */
+export const BindingsPutResult = Type.Object({
+  version: Type.String(),
+  previous: Type.Optional(Type.String()),
+  changed: Type.Boolean(),
+  active: Type.Boolean(),
+  suspended: Type.Optional(Suspended),
+});
+export type BindingsPutResult = Static<typeof BindingsPutResult>;
+
+/** `bindings.get`. */
+export const BindingsGetResult = Type.Object({
+  /** The local config table. */
+  config: Type.Union([BindingTable, Type.Null()]),
+  host: Type.Union([HostTableState, Type.Null()]),
+  hostConnected: Type.Boolean(),
+});
+export type BindingsGetResult = Static<typeof BindingsGetResult>;
+
+/** `run.start`. */
+export const RunStartResult = Type.Object({
+  runId: Type.String(),
+  sessionKey: Type.String(),
+  /** started: this request started it; running: already running (this connection now gets its run.ended too); ended: it ran before. */
+  state: Type.Union([Type.Literal('started'), Type.Literal('running'), Type.Literal('ended')]),
+  /** How it ended, for `state: "ended"` (its `run.ended` frame is sent again too). */
+  ended: Type.Optional(RunEnded),
+});
+export type RunStartResult = Static<typeof RunStartResult>;
+
+/** `run.cancel` (errors `unknown_run`, `run_ended`). */
+export const RunCancelResult = Type.Object({ runId: Type.String(), cancelled: Type.Boolean() });
+export type RunCancelResult = Static<typeof RunCancelResult>;
+
+/** `deliver`: the settled delivery record. */
+export const DeliverResult = Type.Object({
+  /** As the host sent it. */
+  operationId: Type.String(),
+  sessionKey: Type.String(),
+  route: ReplyRoute,
+  status: Type.Union([Type.Literal('delivered'), Type.Literal('rejected'), Type.Literal('unknown')]),
+  attempts: Type.Number(),
+  providerMessageId: Type.Optional(Type.String()),
+  error: Type.Optional(Type.String()),
+  /** An earlier `deliver` with this operationId settled it; nothing was sent now. */
+  duplicate: Type.Boolean(),
+});
+export type DeliverResult = Static<typeof DeliverResult>;
+
+/** What the daemon recorded about one channel message for one receiving account. Never a guess. */
+export const VerifiedInput = Type.Object({
+  channelRef: Type.String(),
+  channel: Type.String(),
+  account: Type.String(),
+  conversation: Type.Object({ id: Type.String(), kind: ConversationKind, threadId: Type.Optional(Type.String()) }),
+  /** The platform author as the channel adapter reported it. */
+  author: Type.Object({ channelUserId: Type.String(), displayName: Type.Optional(Type.String()), isBot: Type.Optional(Type.Boolean()) }),
+  /** What the adapter could prove about the author. */
+  evidence: Evidence,
+  /** The principal the identity map stamped (null: unknown sender, or not enough evidence). */
+  principal: Type.Union([Type.String(), Type.Null()]),
+  labels: Type.Array(Type.String()),
+  /** Origin kind the daemon concluded. */
+  kind: OriginKind,
+  /** The deployment's own echo. */
+  self: Type.Optional(Type.Boolean()),
+  /** Input id it became (absent for clicks that were commands). */
+  inputId: Type.Optional(Type.String()),
+  /** Unix ms the daemon received it. */
+  receivedAt: Type.Number(),
+  /** Unix ms the platform says it was sent. */
+  sentAt: Type.Optional(Type.Number()),
+});
+export type VerifiedInput = Static<typeof VerifiedInput>;
+
+/** `input.verify`. */
+export const InputVerifyResult = Type.Object({
+  channelRef: Type.String(),
+  /** false: the daemon never received it (or it is older than the retention). */
+  found: Type.Boolean(),
+  /** One per receiving account. */
+  records: Type.Array(VerifiedInput),
+});
+export type InputVerifyResult = Static<typeof InputVerifyResult>;
+
+/** `inbound.read`. Reads never move the cursor. */
+export const InboundReadResult = Type.Object({
+  items: Type.Array(InboundItem),
+  /** The consumer's acked cursor. */
+  acked: Type.Number(),
+  head: Type.Number(),
+});
+export type InboundReadResult = Static<typeof InboundReadResult>;
+
+/** `inbound.ack`: the consumer's cursor after the ack (it never moves back). */
+export const InboundAckResult = Type.Object({ consumer: Type.String(), acked: Type.Number() });
+export type InboundAckResult = Static<typeof InboundAckResult>;
+
+/** `explain`: the persisted routing record (error `unknown_input` when there is none). */
+export const ExplainResult = RouteExplanation;
+export type ExplainResult = RouteExplanation;
+
+/** The host's answer to an `inbound` push: `accepted: true` once durably taken; anything else is retried. */
+export const InboundAnswer = Type.Object({ accepted: Type.Boolean() });
+export type InboundAnswer = Static<typeof InboundAnswer>;
+
+/** The host's answer to a `route` callout: replaces the rule's `on` / `agent` / `session`. */
+export const RouteCalloutAnswer = Type.Object({ on: BindingAction, agent: Type.Optional(Type.String()), session: Type.Optional(SessionScope) });
+export type RouteCalloutAnswer = Static<typeof RouteCalloutAnswer>;
+
+/** Result value schema per host request type. */
+export const HOST_RESULT_VALUES = {
+  'host.hello': HostHelloResult,
+  'bindings.put': BindingsPutResult,
+  'bindings.get': BindingsGetResult,
+  'run.start': RunStartResult,
+  'run.cancel': RunCancelResult,
+  deliver: DeliverResult,
+  'input.verify': InputVerifyResult,
+  'inbound.read': InboundReadResult,
+  'inbound.ack': InboundAckResult,
+  explain: ExplainResult,
+} as const satisfies Record<(typeof HOST_REQUEST_FRAME_TYPES)[number], TSchema>;

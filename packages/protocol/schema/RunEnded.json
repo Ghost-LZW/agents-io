@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/RunEnded",
+  "type": "object",
+  "required": [
+    "v",
+    "type",
+    "runId",
+    "sessionKey",
+    "status",
+    "exitCode"
+  ],
+  "properties": {
+    "v": {
+      "const": 1,
+      "type": "number"
+    },
+    "type": {
+      "const": "run.ended",
+      "type": "string"
+    },
+    "runId": {
+      "type": "string"
+    },
+    "sessionKey": {
+      "type": "string"
+    },
+    "status": {
+      "anyOf": [
+        {
+          "const": "completed",
+          "type": "string"
+        },
+        {
+          "const": "interrupted",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "type": "string"
+        },
+        {
+          "const": "ambiguous",
+          "type": "string"
+        },
+        {
+          "const": "timeout",
+          "type": "string"
+        }
+      ]
+    },
+    "exitCode": {
+      "type": "number"
+    },
+    "error": {
+      "type": "object",
+      "required": [
+        "code"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "durationMs": {
+      "type": "number"
+    },
+    "usage": {}
+  }
+}

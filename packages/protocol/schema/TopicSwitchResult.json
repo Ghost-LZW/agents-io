@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/TopicSwitchResult",
+  "type": "object",
+  "required": [
+    "topic",
+    "created"
+  ],
+  "properties": {
+    "topic": {
+      "type": "object",
+      "required": [
+        "id",
+        "conversation",
+        "sessionKey",
+        "state",
+        "createdAt",
+        "lastActiveAt"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "conversation": {
+          "type": "string"
+        },
+        "sessionKey": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "nativeId": {
+          "type": "string"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "const": "current",
+              "type": "string"
+            },
+            {
+              "const": "parked",
+              "type": "string"
+            }
+          ]
+        },
+        "createdAt": {
+          "type": "number"
+        },
+        "lastActiveAt": {
+          "type": "number"
+        }
+      }
+    },
+    "previous": {
+      "type": "object",
+      "required": [
+        "id",
+        "conversation",
+        "sessionKey",
+        "state",
+        "createdAt",
+        "lastActiveAt"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "conversation": {
+          "type": "string"
+        },
+        "sessionKey": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "nativeId": {
+          "type": "string"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "const": "current",
+              "type": "string"
+            },
+            {
+              "const": "parked",
+              "type": "string"
+            }
+          ]
+        },
+        "createdAt": {
+          "type": "number"
+        },
+        "lastActiveAt": {
+          "type": "number"
+        }
+      }
+    },
+    "created": {
+      "type": "boolean"
+    }
+  }
+}

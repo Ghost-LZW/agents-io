@@ -70,6 +70,26 @@ export const WatchDraft = Type.Object({
 });
 export type WatchDraft = Static<typeof WatchDraft>;
 
+const TopicSwitchBase = {
+  v: V,
+  type: Type.Literal('topic.switch'),
+  id: Type.String(),
+  /** Route key of the conversation. */
+  conversation: Type.String(),
+};
+
+/**
+ * Make a topic current: an existing one (`topicId`, parked or current) or a new
+ * one (`new`); a frame naming both is refused (`invalid_frame`). Checked by
+ * `Policy.control` like `reset`. Host connections may send it too. Value:
+ * `TopicSwitchResult`; errors `unknown_topic`, `unknown_conversation`.
+ */
+export const TopicSwitchFrame = Type.Union([
+  Type.Object({ ...TopicSwitchBase, topicId: Type.String() }),
+  Type.Object({ ...TopicSwitchBase, new: Type.Object({ title: Type.Optional(Type.String()) }) }),
+]);
+export type TopicSwitchFrame = Static<typeof TopicSwitchFrame>;
+
 /** Client → server. Every request carries `id`; the server answers with a `result` frame of the same id. */
 export const ClientFrame = Type.Union([
   Type.Object({ v: V, type: Type.Literal('command'), id: Type.String(), command: ClientCommand }),
@@ -81,6 +101,13 @@ export const ClientFrame = Type.Union([
   Type.Object({ v: V, type: Type.Literal('watch.remove'), id: Type.String(), watchId: Type.String() }),
   /** Value: `Watch[]` (only those targeting `sessionKey` when given). */
   Type.Object({ v: V, type: Type.Literal('watch.list'), id: Type.String(), sessionKey: Type.Optional(Type.String()) }),
+  /**
+   * Topics of flat conversations (decision 6). Value: `Topic[]`, newest
+   * `lastActiveAt` first; only those of `conversation` (a route key) and/or
+   * `sessionKey` when given.
+   */
+  Type.Object({ v: V, type: Type.Literal('topic.list'), id: Type.String(), conversation: Type.Optional(Type.String()), sessionKey: Type.Optional(Type.String()) }),
+  TopicSwitchFrame,
 ]);
 export type ClientFrame = Static<typeof ClientFrame>;
 
@@ -102,7 +129,8 @@ export type SessionInfo = Static<typeof SessionInfo>;
 export const ServerFrame = Type.Union([
   /**
    * Answer to a request. Values: input → `{ inputId, disposition }`; subscribe →
-   * `{ head }`; sessions → `SessionInfo[]`; others → `{}`. Errors carry the lane's
+   * `{ head }`; sessions → `SessionInfo[]`; topic.list → `Topic[]`; topic.switch →
+   * `TopicSwitchResult`; others → `{}`. Errors carry the lane's
    * reason as `code` (`forbidden`, `not_eligible`, `no_active_turn`, …).
    */
   ResultFrame,
@@ -113,5 +141,5 @@ export const ServerFrame = Type.Union([
 ]);
 export type ServerFrame = Static<typeof ServerFrame>;
 
-export const CLIENT_FRAME_TYPES = ['command', 'sessions', 'watch.add', 'watch.remove', 'watch.list'] as const;
+export const CLIENT_FRAME_TYPES = ['command', 'sessions', 'watch.add', 'watch.remove', 'watch.list', 'topic.list', 'topic.switch'] as const;
 export const SERVER_FRAME_TYPES = ['result', 'event', 'closed'] as const;

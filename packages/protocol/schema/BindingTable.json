@@ -148,6 +148,10 @@
                 "type": "string"
               },
               {
+                "const": "topic",
+                "type": "string"
+              },
+              {
                 "type": "object",
                 "required": [
                   "key"

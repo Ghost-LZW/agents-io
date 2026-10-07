@@ -34,6 +34,17 @@
         },
         "callouts": {
           "type": "boolean"
+        },
+        "lease": {
+          "type": "object",
+          "required": [
+            "ttlMs"
+          ],
+          "properties": {
+            "ttlMs": {
+              "type": "number"
+            }
+          }
         }
       }
     },
@@ -202,6 +213,10 @@
                       },
                       {
                         "const": "per-thread",
+                        "type": "string"
+                      },
+                      {
+                        "const": "topic",
                         "type": "string"
                       },
                       {
@@ -594,6 +609,20 @@
         },
         "timeoutMs": {
           "type": "number"
+        },
+        "overrides": {
+          "type": "object",
+          "properties": {
+            "model": {
+              "type": "string"
+            },
+            "effort": {
+              "type": "string"
+            },
+            "profile": {
+              "type": "string"
+            }
+          }
         }
       }
     },

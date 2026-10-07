@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/AdminLoginRequest",
+  "type": "object",
+  "required": [
+    "loginToken"
+  ],
+  "properties": {
+    "loginToken": {
+      "type": "string"
+    }
+  }
+}
