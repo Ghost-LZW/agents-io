@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { assertConformingStream, checkEventStream, FakeChannel, FakeHarness, runChannelConformance } from '../src/index.js';
+import { assertConformingStream, checkEventStream, FakeChannel, FakeHarness, loadEnvFile, parseEnv, runChannelConformance } from '../src/index.js';
 import type { HarnessEvent, InputRecord } from '@agents-io/protocol';
 
 const input = (id: string, text: string): InputRecord => ({
@@ -56,6 +56,28 @@ describe('checkEventStream', () => {
     ];
     const rules = checkEventStream(evs, { turnInputs: { t1: ['a'] } }).map((v) => v.rule);
     expect(rules).toEqual(expect.arrayContaining(['turn.overlap', 'input.consumed', 'item.complete', 'turn.complete']));
+  });
+
+  it('accepts turn.adopted for the open turn (a log spanning a host restart), not for another one', () => {
+    const base = { ts: 1, level: 'primary', audience: 'status', durability: 'durable' } as const;
+    const started = { ...base, turnId: 't1', body: { t: 'turn.started', turnId: 't1', inputIds: ['a'], replyRoute: null } };
+    const adopted = (turnId: string) => ({ ...base, turnId, body: { t: 'turn.adopted', turnId, inputIds: ['a'] } });
+    const done = { ...base, turnId: 't1', body: { t: 'turn.completed', turnId: 't1', status: 'completed' } };
+    expect(checkEventStream([started, adopted('t1'), done])).toEqual([]);
+    expect(checkEventStream([adopted('t1'), done])).toEqual([]);
+    expect(checkEventStream([started, adopted('t2')]).map((v) => v.rule)).toContain('turn.overlap');
+  });
+});
+
+describe('parseEnv', () => {
+  it('parses .env.live style files', () => {
+    expect(
+      parseEnv('# c\n\nexport A=1\nB = "two words"\nC=\'x#y\'\nD=val # note\nnot a line\nE=a=b'),
+    ).toEqual({ A: '1', B: 'two words', C: 'x#y', D: 'val', E: 'a=b' });
+  });
+
+  it('loadEnvFile returns {} for a missing file', () => {
+    expect(loadEnvFile('/nonexistent/agents-io/.env.live')).toEqual({});
   });
 });
 

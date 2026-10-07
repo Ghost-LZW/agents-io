@@ -3,7 +3,6 @@ import { assertConformingStream } from '@agents-io/testkit';
 import type { HarnessEvent, HarnessOpenArgs, HarnessSession, RunSpec } from '@agents-io/protocol';
 import { ClaudeCodeHarness, convertBlock, inputUuid, mapAnswers, preface, riskOf } from '../src/index.js';
 import type { ClaudeCodeOptions, PermissionResult } from '../src/types.js';
-import { parseEnv } from './env-file.js';
 import { bodies, collectUntil, fakeQueryFn, input, isTurnCompleted, sdk, type FakeQuery } from './fake-query.js';
 
 const run: RunSpec = { harness: 'claude-code', model: 'haiku', profile: 'bypass' };
@@ -156,12 +155,6 @@ describe('gateway / non-Claude models', () => {
       delete process.env.AGENTS_IO_TEST_INHERITED;
       delete process.env.ANTHROPIC_MODEL;
     }
-  });
-
-  it('parses .env.live style files', () => {
-    expect(
-      parseEnv('# c\n\nexport A=1\nB = "two words"\nC=\'x#y\'\nD=val # note\nnot a line\nE=a=b'),
-    ).toEqual({ A: '1', B: 'two words', C: 'x#y', D: 'val', E: 'a=b' });
   });
 });
 

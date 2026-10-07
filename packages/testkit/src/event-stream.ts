@@ -52,6 +52,8 @@ export function checkEventStream(events: readonly unknown[], opts: CheckOptions 
       v(i, 'ephemeral', `${b.t} must be durable`);
     }
 
+    // In a session log that spans a host restart, the new host adopts the turn the old one left open.
+    if (b.t === 'turn.adopted' && active === b.turnId) return;
     if (b.t === 'turn.started' || b.t === 'turn.adopted') {
       if (started.has(b.turnId)) v(i, 'turn.once', `turn ${b.turnId} started twice`);
       if (active) v(i, 'turn.overlap', `turn ${b.turnId} started while ${active} is active`);

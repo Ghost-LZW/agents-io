@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { FakeHarness, assertConformingStream, fakeHarnessCaps } from '@agents-io/testkit';
 import type { BodyOf, Decision } from '@agents-io/protocol';
-import type { ModelReviewer } from '../src/index.js';
+import { Lane, type ModelReviewer } from '../src/index.js';
 import { ManualHarness, SteerableHarness, bodies, gate, input, origin, policy, route, setup, until } from './helpers.js';
 
 const turnsOf = (evs: ReturnType<ReturnType<typeof setup>['events']>) =>
@@ -340,5 +340,59 @@ describe('Lane: requests', () => {
     expect(kinds.indexOf('request.resolved')).toBeLessThan(kinds.indexOf('turn.completed'));
     expect(bodies(events(), 'request.resolved')[0]).toMatchObject({ by: 'runtime_cancelled', decision: null });
     assertConformingStream(events());
+  });
+});
+
+describe('Lane: host restart', () => {
+  /** First host: start a turn, then detach mid-turn. Returns the shared hub and the open turn. */
+  async function firstHost() {
+    const h1 = new ManualHarness();
+    const a = setup({ harness: h1 });
+    await a.lane.command({ type: 'input', sessionKey: 's1', input: input('long job', { id: 'x' }), mode: 'queue' });
+    await until(() => h1.session?.starts.length === 1);
+    const turnId = h1.session!.starts[0]!.turnId;
+    await until(() => bodies(a.events(), 'turn.started').length === 1);
+    a.lane.detach();
+    await h1.session!.close(); // the adapter's own detach ends the stream
+    await new Promise((r) => setTimeout(r, 10));
+    return { ...a, turnId };
+  }
+
+  const nextLane = (hub: ReturnType<typeof setup>['hub'], harness: ManualHarness) =>
+    new Lane({ sessionKey: 's1', harness, hub, policy: policy(), thinkingHeadline: null });
+
+  it('detach leaves the running turn open in the log', async () => {
+    const a = await firstHost();
+    expect(bodies(a.events(), 'turn.completed')).toEqual([]);
+    expect(a.hub.snapshot('s1').turn?.turnId).toBe(a.turnId);
+  });
+
+  it('a new lane adopts the turn (turn.adopted), keeps it as the active turn and queues behind it', async () => {
+    const a = await firstHost();
+    const h2 = new ManualHarness();
+    const lane2 = nextLane(a.hub, h2);
+    await lane2.open();
+    expect(h2.session!.args.generation).toBe(2);
+    h2.session!.push({ t: 'turn.adopted', turnId: a.turnId, nativeTurnId: 'n1', inputIds: ['x'] }, { turnId: a.turnId });
+    await until(() => lane2.activeTurn()?.turnId === a.turnId);
+    expect(lane2.activeTurn()).toMatchObject({ owner: 'fake:alice' });
+
+    expect(await lane2.command({ type: 'input', sessionKey: 's1', input: input('next', { id: 'y' }), mode: 'queue' })).toEqual({ ok: true, disposition: 'queued' });
+    expect(h2.session!.starts).toHaveLength(0);
+    h2.session!.complete(a.turnId, ['x']);
+    await until(() => h2.session!.starts.length === 1);
+    expect(bodies(a.events(), 'turn.completed')).toEqual([{ t: 'turn.completed', turnId: a.turnId, status: 'completed' }]);
+    expect(bodies(a.events(), 'input.rejected')).toEqual([]);
+    assertConformingStream(a.events(), { allowTrailing: true });
+  });
+
+  it('settles a turn nobody adopted as ambiguous before the next turn starts', async () => {
+    const a = await firstHost();
+    const h2 = new ManualHarness();
+    const lane2 = nextLane(a.hub, h2);
+    await lane2.command({ type: 'input', sessionKey: 's1', input: input('next', { id: 'y' }), mode: 'queue' });
+    await until(() => h2.session?.starts.length === 1);
+    expect(bodies(a.events(), 'turn.completed')[0]).toMatchObject({ turnId: a.turnId, status: 'ambiguous', error: { code: 'host_restarted' } });
+    expect(a.hub.snapshot('s1').turn?.turnId).toBe(h2.session!.starts[0]!.turnId);
   });
 });

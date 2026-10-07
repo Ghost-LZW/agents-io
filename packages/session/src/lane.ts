@@ -19,7 +19,7 @@ import {
   type TurnContext,
 } from '@agents-io/protocol';
 import type { Hub } from './hub.js';
-import type { EventDraft, SessionState, Visibility } from './log.js';
+import type { EventDraft, SessionSnapshot, SessionState, Visibility } from './log.js';
 import { withDefaults, type FullPolicy, type SessionPolicy } from './policy.js';
 
 export interface ModelReviewArgs {
@@ -79,7 +79,12 @@ interface ActiveTurn {
   consumed: Set<string>;
   /** The harness reported consuming inputs this turn was not given. */
   foreignConsumed: boolean;
+  /** Input ids of a turn adopted from a previous host; their records are not in memory. */
+  adopted?: Set<string>;
 }
+
+/** A turn the log shows open from a previous host process. */
+type Dangling = NonNullable<SessionSnapshot['turn']>;
 
 interface PendingRequest {
   body: BodyOf<'request.opened'>;
@@ -129,11 +134,19 @@ export class Lane {
   private chain: Promise<unknown> = Promise.resolve();
   private idleWaiters: (() => void)[] = [];
   private closed = false;
+  private detached = false;
+  private dangling: Dangling | undefined;
 
   constructor(private readonly o: LaneOptions) {
     this.sessionKey = o.sessionKey;
     this.policy = withDefaults(o.policy);
     this.newId = o.newId ?? ((p) => `${p}_${randomUUID()}`);
+    // A log written by an earlier host: continue its generations, and remember a turn it left open
+    // so the harness can adopt it (turn.adopted) or the next turn settles it as ambiguous.
+    const snap = o.hub.snapshot(o.sessionKey);
+    this.generation = snap.generation;
+    this.lastRun = snap.turn?.run;
+    this.dangling = snap.turn ?? undefined;
   }
 
   // ---- public API ---------------------------------------------------------
@@ -174,12 +187,38 @@ export class Lane {
   }
 
   async close(reason = 'lane closed'): Promise<void> {
+    this.stopTimers();
+    await this.session?.close(reason);
+  }
+
+  /**
+   * Open the harness now instead of on the first input, e.g. so a resumed session
+   * can adopt a turn that is still running natively. `run` defaults to the last turn's.
+   */
+  open(run?: RunSpec): Promise<void> {
+    return this.serial(async () => {
+      if (this.closed) return;
+      await this.ensureSession(run ?? this.lastRun ?? (await this.policy.plan({ sessionKey: this.sessionKey, inputs: [] })));
+    });
+  }
+
+  /**
+   * Stop without touching the harness session (no interrupt, no close) and without
+   * recording anything when its stream ends. For harnesses that outlive the host
+   * (Codex over a Unix socket): call the adapter's own detach afterwards, and the
+   * running turn stays open in the log for the next host to adopt.
+   */
+  detach(): void {
+    this.detached = true;
+    this.stopTimers();
+  }
+
+  private stopTimers(): void {
     this.closed = true;
     for (const p of this.requests.values()) {
       if (p.timer) clearTimeout(p.timer);
       p.abort?.abort();
     }
-    await this.session?.close(reason);
   }
 
   // ---- serialisation ------------------------------------------------------
@@ -380,8 +419,20 @@ export class Lane {
     return s;
   }
 
+  /** A turn left open by an earlier host that no harness adopted: its outcome is unknown. */
+  private settleDangling(): void {
+    const d = this.dangling;
+    if (!d) return;
+    this.dangling = undefined;
+    this.emit({
+      turnId: d.turnId,
+      body: { t: 'turn.completed', turnId: d.turnId, status: 'ambiguous', error: { code: 'host_restarted', retryable: false, message: 'turn was running when the previous host stopped' } },
+    });
+  }
+
   /** Start the next turn if idle. Loops past batches whose start fails. */
   private async pump(): Promise<void> {
+    if (!this.turn && this.queue.length && !this.closed) this.settleDangling();
     while (!this.turn && this.queue.length && !this.closed) {
       const batch = this.takeBatch();
       const inputs = batch.map((q) => q.input);
@@ -428,15 +479,17 @@ export class Lane {
   private async consume(s: HarnessSession, gen: number): Promise<void> {
     try {
       for await (const e of s.events) {
-        if (gen !== this.generation) continue; // late event from an older binding
+        if (gen !== this.generation || this.detached) continue; // late event from an older binding
         this.o.onHarnessEvent?.(e);
         await this.serial(() => this.onHarnessEvent(e, gen));
       }
     } catch (err) {
+      if (this.detached) return;
       await this.serial(async () => {
         this.emit({ level: 'detail', body: { t: 'notice', code: 'runtime_restart', message: `harness stream failed: ${errMsg(err)}` } });
       });
     }
+    if (this.detached) return; // the turn keeps running natively; the next host adopts it
     await this.serial(() => this.onHarnessClosed(s, gen));
   }
 
@@ -464,10 +517,34 @@ export class Lane {
         }
         return;
       }
+      case 'turn.adopted': {
+        // A turn still running natively from an earlier host; the lane owns it from here on.
+        const d = this.dangling?.turnId === b.turnId ? this.dangling : undefined;
+        if (d) this.dangling = undefined;
+        if (!t) {
+          this.turn = {
+            turnId: b.turnId,
+            inputs: [],
+            adopted: new Set(b.inputIds),
+            attempts: new Map(),
+            owner: d?.owner ?? null,
+            replyRoute: d?.replyRoute ?? null,
+            run: b.run ?? d?.run,
+            starting: false,
+            interruptRequested: false,
+            deliveries: d ? [...d.deliveries] : [],
+            consumed: new Set(),
+            foreignConsumed: false,
+          };
+        }
+        this.emitHarness(e, gen);
+        this.refreshState();
+        return;
+      }
       case 'input.consumed':
         if (t && t.turnId === b.turnId) {
           for (const id of b.inputIds) {
-            if (t.inputs.some((i) => i.inputId === id)) t.consumed.add(id);
+            if (t.inputs.some((i) => i.inputId === id) || t.adopted?.has(id)) t.consumed.add(id);
             else t.foreignConsumed = true;
           }
         }
