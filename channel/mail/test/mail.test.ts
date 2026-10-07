@@ -58,13 +58,13 @@ class FakeTransport implements MailTransport {
 
 const passVerifier: MailVerifier = async () => ({ evidence: 'dkim_pass' });
 
-async function harness(opts: { verify?: MailVerifier; store?: MemoryMailStore; hostBlobs?: BlobStore } = {}) {
+async function harness(opts: { verify?: MailVerifier; store?: MemoryMailStore; hostBlobs?: BlobStore; cfg?: Partial<MailChannelConfig> } = {}) {
   const source = new FakeSource();
   const transport = new FakeTransport();
   const store = opts.store ?? new MemoryMailStore();
   const blobs: AttachmentBlob[] = [];
   const sink = opts.hostBlobs ? {} : { blobs: { put: async (b: AttachmentBlob) => void blobs.push(b) } };
-  const adapter = new MailChannel(cfg, { source, transport, store, verify: opts.verify ?? passVerifier, ...sink });
+  const adapter = new MailChannel({ ...cfg, ...opts.cfg }, { source, transport, store, verify: opts.verify ?? passVerifier, ...sink });
   const envs: InboundEnvelope[] = [];
   const ctl = new AbortController();
   const done = adapter.start({
@@ -421,4 +421,35 @@ describe.skipIf(!process.env.MAIL_LIVE_IMAP_HOST)('live', () => {
     await p;
     expect(baseline).toBeDefined();
   }, 20000);
+});
+
+describe('internal delivery (opt-in provider evidence)', () => {
+  const noAuth: MailVerifier = async () => ({ evidence: 'none' });
+  const internal = { From: 'Owner <i@example.com>', 'Message-ID': '<int@x>', 'X-QQ-BUSINESS-ORIGIN': '2' };
+
+  it('mail from a listed domain without Received/Authentication-Results is platform_signed', async () => {
+    const h = await harness({ verify: noAuth, cfg: { internalDelivery: { domains: ['Example.com'] } } });
+    const e = await h.next({ uid: 1, raw: raw(internal, 'hi') });
+    expect(e.sender.evidence).toBe('platform_signed');
+    expect(h.adapter.caps('bot').evidence).toContain('platform_signed');
+    await h.stop();
+  });
+
+  it('a provider-added hop (mail from outside) never counts, even from a listed domain', async () => {
+    const h = await harness({ verify: noAuth, cfg: { internalDelivery: { domains: ['example.com'] } } });
+    const viaMx = await h.next({ uid: 1, raw: raw({ ...internal, Received: 'from evil.test by mx.example.net' }, 'hi') });
+    expect(viaMx.sender.evidence).toBe('none');
+    const withAuth = await h.next({ uid: 2, raw: raw({ ...internal, 'Message-ID': '<int2@x>', 'Authentication-Results': 'mx; spf=softfail' }, 'hi') });
+    expect(withAuth.sender.evidence).toBe('none');
+    await h.stop();
+  });
+
+  it('is off by default and limited to the listed domains', async () => {
+    const off = await harness({ verify: noAuth });
+    expect((await off.next({ uid: 1, raw: raw(internal, 'hi') })).sender.evidence).toBe('none');
+    await off.stop();
+    const other = await harness({ verify: noAuth, cfg: { internalDelivery: { domains: ['other.test'] } } });
+    expect((await other.next({ uid: 1, raw: raw(internal, 'hi') })).sender.evidence).toBe('none');
+    await other.stop();
+  });
 });

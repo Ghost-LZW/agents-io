@@ -61,7 +61,7 @@ export class MailChannel implements ChannelAdapter {
       threads: true,
       approvals: 'link',
       defaultTier: 'final',
-      evidence: ['dkim_pass', 'none'],
+      evidence: this.cfg.internalDelivery?.domains.length ? ['dkim_pass', 'platform_signed', 'none'] : ['dkim_pass', 'none'],
       declaresSender: true,
     };
   }
@@ -85,6 +85,7 @@ export class MailChannel implements ChannelAdapter {
           blobs: this.blobs,
           verify: this.verify,
           self: addressOf(this.cfg.from),
+          ...(this.cfg.internalDelivery ? { internalDomains: this.cfg.internalDelivery.domains.map((d) => d.toLowerCase()) } : {}),
         });
         // Checkpoint only after the host has durably taken the envelope; a throw retries it.
         await ctx.emit(env);

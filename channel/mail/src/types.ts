@@ -19,6 +19,14 @@ export interface MailChannelConfig {
   pollIntervalMs?: number;
   /** BCC our own mail back to this address so sent mail echoes into the mailbox (enables `declared`). */
   bccSelf?: boolean;
+  /**
+   * Opt-in, provider-specific: treat mail from these domains as authenticated by the
+   * mail provider when it was delivered internally, i.e. it carries no `Received` and no
+   * `Authentication-Results` header at all. Mail from outside always gets both from the
+   * provider's MX, which a sender cannot avoid. Verified for Tencent Exmail only; check
+   * your provider before enabling. Evidence becomes `platform_signed`.
+   */
+  internalDelivery?: { domains: string[] };
 }
 
 /** UID-based inbound checkpoint; the host persists it through `MailStore`. */
@@ -127,8 +135,11 @@ export interface MailTransport {
 }
 
 export interface AuthVerdict {
-  /** `dkim_pass` only when DMARC/DKIM aligned-passes for the From domain. */
-  evidence: 'dkim_pass' | 'none';
+  /**
+   * `dkim_pass` only when DMARC/DKIM aligned-passes for the From domain;
+   * `platform_signed` for provider-internal delivery when `internalDelivery` allows it.
+   */
+  evidence: 'dkim_pass' | 'platform_signed' | 'none';
   detail?: string;
 }
 

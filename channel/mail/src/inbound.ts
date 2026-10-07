@@ -15,6 +15,13 @@ export interface ParseDeps {
   verify: MailVerifier;
   /** Our own From address (lowercase): only mail from it can be our echo. */
   self: string;
+  /** Lowercase domains whose provider-internal delivery counts as authenticated (MailChannelConfig.internalDelivery). */
+  internalDomains?: string[];
+}
+
+/** No hop added by the provider's MX: the mail was submitted inside the provider by a logged-in user. */
+export function deliveredInternally(parsed: ParsedMail): boolean {
+  return !parsed.headerLines.some((h) => h.key === 'received' || h.key === 'authentication-results');
 }
 
 const asArray = (v: string | string[] | undefined): string[] => (v === undefined ? [] : Array.isArray(v) ? v : v.split(/\s+/).filter(Boolean));
@@ -61,7 +68,10 @@ export async function parseInbound(uid: number, raw: Buffer, deps: ParseDeps): P
   const fromDomain = fromAddress.split('@')[1] ?? '';
 
   const automated = isAutomated(parsed, fromAddress);
-  const verdict: AuthVerdict = fromDomain ? await deps.verify(raw, fromDomain).catch(() => ({ evidence: 'none' as const })) : { evidence: 'none' };
+  let verdict: AuthVerdict = fromDomain ? await deps.verify(raw, fromDomain).catch(() => ({ evidence: 'none' as const })) : { evidence: 'none' };
+  if (verdict.evidence === 'none' && fromDomain && deps.internalDomains?.includes(fromDomain) && deliveredInternally(parsed)) {
+    verdict = { evidence: 'platform_signed', detail: `internal delivery (${fromDomain})` };
+  }
 
   // Sent records are keyed by Message-IDs we generated; an echo must also come from our own address.
   const sent = await deps.store.getSent(headerId);

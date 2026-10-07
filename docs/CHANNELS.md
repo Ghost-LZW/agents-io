@@ -99,7 +99,8 @@ harness 事件 ──▶ SessionLog（seq）──▶ Compositor（读全量，�
 - 引用的历史邮件（`>` 行、"某某写道："之后的部分、Outlook 头部块）被剥离成一个截断的引用块，只保留新写的内容作为正文。
 - 附件存进网关的 blob 存储，变成 `file`（图片类型是 `image`）块，带 `sha256:` 引用、类型和文件名，agent 按 §1 的方式拿到。超过 blob 上限或存储失败的附件保留 `mail-attachment:<uid>/<序号>` 引用，后面加一行 `[attachment 名称 (类型, 字节数) not stored: 原因]`。HTML 正文里内嵌的图片不算附件。
 - 自动回复、退信、群发（`Auto-Submitted`、`Precedence: bulk`、`MAILER-DAEMON`）直接丢弃。
-- 身份证据：只有发件域的 DKIM/DMARC 对齐通过才算 `dkim_pass`，否则是 `none`。认不认这个人，由宿主策略决定。
+- 身份证据：只有发件域的 DKIM/DMARC 对齐通过才算 `dkim_pass`，否则是 `none`。
+  - 可选的 `internalDelivery: { domains: [...] }`：发件域在列表里、且邮件完全没有 `Received` 和 `Authentication-Results` 头（即在邮件服务商内部投递，外部来信必然经过服务商 MX 而带上这两种头）时，证据记为 `platform_signed`。默认关闭；只在腾讯企业邮上核实过，换服务商前需重新确认。用于同一企业邮域内部互发、没有 DKIM 签名的情况。认不认这个人，由宿主策略决定。
 - 自己发出的邮件回流时只记录不触发，`declared` 只在 Message-ID 是我们发出的那封时才采信。
 
 ### agent 的输出怎么处理
