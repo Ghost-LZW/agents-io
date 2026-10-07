@@ -46,4 +46,14 @@
 - 一个对话可以有多个**话题**，每个话题对应一个 session；对话有一个"当前话题"指针。有线程的平台（飞书话题、邮件线程）照常按线程分 session（`per-thread`）；平铺的对话用新的 session 范围 `topic`。
 - agents-io **只提供机制**：持久化的话题表（标题、摘要、session、harness 原生会话 id、最后活跃时间；旧话题存档不删），输出工具 `session_rotate`（开新话题，把触发本轮的输入连同上一话题的摘要转投过去）、`session_list`、`session_switch`（切回旧话题，用 harness 原生续接恢复完整上下文），以及命令 `/new`、`/topics`、`/switch`。何时切换由 agent 自己判断。
 - **长期记忆不在 agents-io**：有宿主时由宿主负责（x-work-os 的经验与 brief）；无宿主时依靠 harness 原生的项目记忆（工作区里的 CLAUDE.md、AGENTS.md、自动记忆）。agents-io 不写任何记忆文件。
-- 工作区（工作目录与项目级配置）属于 agent 的运行配置；一个项目对应一个工作区，项目配置写在该目录里，由 harness 自行读取。
+- 工作区（工作目录与项目级配置）默认属于 agent 的运行配置；部署方可在 agent 配置里声明允许按会话指定工作区的范围（`sessionParams`），宿主在范围内为会话选定工作区，选定后随会话固定。项目配置仍写在工作区目录里，由 harness 自行读取。
+  - 修订记录（2026-10-07，见决定 7）：原文为"工作区（工作目录与项目级配置）属于 agent 的运行配置；一个项目对应一个工作区，项目配置写在该目录里，由 harness 自行读取。"
+
+## 决定 7：交互会话的启动参数（每会话 cwd/env）—— 采纳方案 A
+
+日期：2026-10-07。方案见 `docs/design/session-launch/README.md`。驱动场景：多租户宿主（每个用户一个工作目录与配置目录）。
+
+- **总体形态**：路由回调的答复可带 `launch: { cwd?, env? }`；新增宿主帧 `session.prepare` 为不经渠道路由打开的会话预先登记；允许的范围写在 agent 条目的 `sessionParams`（`cwdRoots`、`envKeys`、`envPathRoots`）上，未配置即拒绝；`CLAUDE_CONFIG_DIR` / `CODEX_HOME` 列入 `envKeys` 时必须配 `envPathRoots`。`host.hello` 以 `features` 声明 `session.launch`。
+- **修订决定 6 最后一条**：同意，按提案 §10 第 2 项的拟改文（已更新于决定 6）。
+- **launch 整体不可变**：随会话键固定并持久化，先到者为准；同一键收到不同 launch（含无 launch 的老会话收到 launch）一律 `launch_conflict`，要换就换会话键。需要轮换的凭据放在配置目录里由 harness 自己读取，不放进 env 值。
+- **加 `callout.skipWhenPinned`**：按规则开启；规则本地可算出目标键且该键已有 launch 记录时跳过回调，`aio explain` 记 `skipped_pinned`。与决定 2 一致：回调只在每个键的首条输入发生，稳态走本地匹配。

@@ -1,6 +1,6 @@
 # 交互会话的启动参数（每会话 cwd/env）
 
-> 状态：提案（2026-10-07，按维护者评审修订），待拍板。拍板结果由 owner 记入 `docs/design/locus/DECISIONS.md`，本文不改动它。本提案**需要修订决定 6 的一条**（§10 第 2 项），须 owner 明确同意。
+> 状态：已采纳（2026-10-07，owner 拍板：§10 四项均按推荐，记入 `docs/design/locus/DECISIONS.md` 决定 7，决定 6 已修订）。
 > 依据：`docs/POSITIONING.md` §2（机制与策略的判据）、§6；`docs/design/locus/DECISIONS.md` 决定 1–6；`docs/HOSTS.md` §2–§5、§7；待定提案 `docs/design/harness-env`（`inheritEnv`）。代码以当前 `main`（e61a324）为准，下文引用的行号都已对照代码核实。
 
 ## 1. 一句话
