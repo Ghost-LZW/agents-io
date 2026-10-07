@@ -9,20 +9,14 @@
       "default": "./dist/index.js"
     }
   },
-  "bin": {
-    "agents-io-lark": "./dist/setup/cli.js"
-  },
   "files": [
     "dist"
   ],
   "dependencies": {
     "@agents-io/protocol": "workspace:*",
-    "@larksuiteoapi/node-sdk": "^1.0.0",
-    "qrcode-terminal": "^0.12.0"
+    "@larksuiteoapi/node-sdk": "^1.0.0"
   },
   "devDependencies": {
-    "@agents-io/session": "workspace:*",
-    "@agents-io/testkit": "workspace:*",
-    "@types/qrcode-terminal": "^0.12.2"
+    "@agents-io/testkit": "workspace:*"
   }
 }
