@@ -162,6 +162,9 @@ export interface FrameTransport {
   end(): void;
 }
 
+/** How long an ended Unix-socket connection may flush before it is destroyed (as /ws terminates). */
+const SOCKET_CLOSE_GRACE_MS = 1000;
+
 function socketTransport(socket: Socket): FrameTransport {
   return {
     write: (f) => !socket.destroyed && socket.write(encodeFrame(f)),
@@ -179,7 +182,11 @@ function socketTransport(socket: Socket): FrameTransport {
     get gone() {
       return socket.destroyed;
     },
-    end: () => socket.end(),
+    end: () => {
+      socket.end();
+      // A half-closed socket can still be read: destroy it once the last frames had time to flush.
+      setTimeout(() => socket.destroy(), SOCKET_CLOSE_GRACE_MS).unref();
+    },
   };
 }
 
@@ -212,6 +219,9 @@ export class FrameConn implements Peer {
 
   /** One decoded frame from the peer. */
   receive(raw: unknown): void {
+    // A connection ended (replaced by a host takeover, or closing) acts on nothing more:
+    // a half-closed socket or a /ws in its close grace can still deliver frames.
+    if (this.closed) return;
     void this.onFrame(raw);
   }
 
@@ -357,6 +367,7 @@ export class FrameConn implements Peer {
   drop(): void {
     if (this.closed) return;
     this.closed = true;
+    delete this.auth;
     this.ac.abort();
     for (const s of this.subs.values()) s.close();
     this.subs.clear();
