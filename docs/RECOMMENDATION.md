@@ -371,7 +371,7 @@ interface RuntimeSession {
 | 过程 | `item/started|completed`、`item/agentMessage/delta`、`item/reasoning/*Delta`、`item/commandExecution/outputDelta`、`turn/plan/updated`、`turn/diff/updated` | `item.*` / `text.delta` / `plan.updated` / `diff.updated` |
 | 旁白/最终 | `agentMessage.phase = commentary \| final_answer` | `audience: commentary \| answer`；commentary 喂 headline |
 | 审批 | `item/*/requestApproval` → 回 `{decision}`；`serverRequest/resolved` | `request.opened/resolved`；`deny`→`decline`，`deny+interruptTurn`→`cancel` |
-| 自动审查 | `approvalsReviewer: auto_review\|guardian_subagent` + `item/autoApprovalReview/*` | `notice{auto_review}` + `request.resolved{by:'auto_review'}` |
+| 自动审查 | `approvalsReviewer: auto_review\|guardian_subagent` + `item/autoApprovalReview/*` | `notice{auto_review}`（开始与结果；不发 `request.*`：无人能回答它，进了 lane 策略会记下 Codex 不采纳的决定） |
 | 状态 | `thread/status/changed`（`active{waitingOnApproval}`） | `session.state` |
 | consumed | `userMessage` item 的 `clientId` | `input.consumed` |
 

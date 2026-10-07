@@ -259,6 +259,30 @@ describe('turn mapping', () => {
     expect(checkEventStream(c.events)).toEqual([]);
   });
 
+  it('a profile switch resets reviewer, approval policy and sandbox the new profile leaves unset', async () => {
+    const { fake, harness } = setup();
+    const profiles = {
+      auto: { approvalPolicy: 'on-request' as const, approvalsReviewer: 'auto_review' as const, sandbox: 'danger-full-access' as const },
+      human: {},
+    };
+    const s = await open(harness, { run: { ...run, profile: 'auto' }, options: { profiles } });
+    const c = collector(s);
+    fake.onTurnStart = (p, tid) => {
+      fake.echoUser(p.threadId, tid, p.clientUserMessageId);
+      fake.completeTurn(p.threadId, tid, 'completed');
+    };
+    await s.startTurn('T1', [input('i1', 'a')]);
+    await c.until(isCompleted);
+    await s.startTurn('T2', [input('i2', 'b')], { ...run, profile: 'human' });
+    await c.until((e) => isCompleted(e) && e.turnId === 'T2');
+    // turn/start overrides persist on the thread: anything not re-sent stays as profile `auto` set it.
+    expect(fake.sent('turn/start')[1]!.params).toMatchObject({
+      approvalPolicy: 'on-request',
+      approvalsReviewer: 'user',
+      sandboxPolicy: { type: 'workspaceWrite' },
+    });
+  });
+
   it('maps failed turns with code and retryable', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
@@ -377,6 +401,26 @@ describe('steer', () => {
       throw new FakeRpcError(-32603, 'boom');
     };
     await expect(s.steer([input('i6', 'x')], 'T1')).rejects.toThrow('boom');
+  });
+
+  it('a steer whose response is lost keeps its inputs: a later echo still counts them as consumed', async () => {
+    const { fake, harness } = setup({ requestTimeoutMs: 100 });
+    const s = await open(harness);
+    const c = collector(s);
+    fake.onTurnStart = (p, tid) => fake.echoUser(p.threadId, tid, p.clientUserMessageId);
+    fake.handlers['turn/steer'] = (p) => {
+      // Codex takes the steer, but its response never arrives (stalled server): the request times out.
+      setTimeout(() => fake.echoUser(p.threadId, fake.activeTurn.get(p.threadId)!, p.clientUserMessageId, 'more'), 150);
+      return new Promise(() => {});
+    };
+    await s.startTurn('T1', [input('i1', 'a')]);
+    await c.until((e) => e.body.t === 'input.consumed');
+    // Not a failure: the lane must not requeue an input Codex may already have (it reconciles at turn end).
+    expect(await s.steer([input('i2', 'b')], 'T1')).toBe('steered');
+    expect(c.of('notice').some((n) => n.code === 'continuity' && /i2/.test(n.message))).toBe(true);
+    await c.until((e) => e.body.t === 'input.consumed' && (e.body as any).inputIds.includes('i2'));
+    expect(c.of('input.consumed').map((b) => b.inputIds)).toEqual([['i1'], ['i2']]);
+    expect(c.of('item.completed').filter((b) => b.item.type === 'user_message')).toEqual([]);
   });
 });
 
@@ -513,22 +557,54 @@ describe('approvals', () => {
     ]);
   });
 
-  it('shows Codex auto reviews as requests resolved by the harness', async () => {
+  const autoReview = (fake: FakeAppServer, th: string, tid: string, status: 'approved' | 'denied', rationale: string | null = null) => {
+    const base = { threadId: th, turnId: tid, reviewId: 'rv1', targetItemId: 'c1', action: { type: 'command', source: 'shell', command: 'curl example.com', cwd: '/work' } };
+    fake.notify('item/autoApprovalReview/started', { ...base, startedAtMs: 1, review: { status: 'inProgress', riskLevel: null, userAuthorization: null, rationale: null } });
+    fake.notify('item/autoApprovalReview/completed', { ...base, startedAtMs: 1, completedAtMs: 2, decisionSource: 'agent', review: { status, riskLevel: 'high', userAuthorization: null, rationale } });
+  };
+
+  it('reports Codex auto reviews as notices, never as requests a resolver could answer', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
     const c = collector(s);
     fake.onTurnStart = (p, tid) => {
       fake.echoUser(p.threadId, tid, p.clientUserMessageId);
-      const base = { threadId: p.threadId, turnId: tid, reviewId: 'rv1', targetItemId: 'c1', action: { type: 'command', source: 'shell', command: 'curl example.com', cwd: '/work' } };
-      fake.notify('item/autoApprovalReview/started', { ...base, startedAtMs: 1, review: { status: 'inProgress', riskLevel: null, userAuthorization: null, rationale: null } });
-      fake.notify('item/autoApprovalReview/completed', { ...base, startedAtMs: 1, completedAtMs: 2, decisionSource: 'agent', review: { status: 'denied', riskLevel: 'high', userAuthorization: null, rationale: 'exfiltration' } });
+      autoReview(fake, p.threadId, tid, 'denied', 'exfiltration');
       fake.completeTurn(p.threadId, tid, 'completed');
     };
     await s.startTurn('T1', [input('i1', 'x')]);
     await c.until(isCompleted);
-    expect(c.of('request.opened')[0]).toMatchObject({ requestId: 'auto_review:rv1', kind: 'tool_approval', title: 'Run: curl example.com', allowedDecisions: [] });
-    expect(c.of('request.resolved')[0]).toEqual({ t: 'request.resolved', requestId: 'auto_review:rv1', decision: { kind: 'deny', message: 'exfiltration' }, by: { kind: 'harness', id: 'auto_review' } });
+    expect(c.of('request.opened')).toEqual([]);
+    expect(c.of('request.resolved')).toEqual([]);
+    expect(c.of('notice').filter((n) => n.code === 'auto_review').map((n) => n.message)).toEqual([
+      'auto review: Run: curl example.com',
+      'auto review denied: Run: curl example.com (exfiltration)',
+    ]);
+    const done = c.events.find((e) => e.body.t === 'notice' && /denied/.test((e.body as any).message))!;
+    expect(done).toMatchObject({ turnId: 'T1', level: 'primary', native: { method: 'item/autoApprovalReview/completed' } });
     assertConformingStream(c.events);
+  });
+
+  it('a restricted lane records no deny for an action Codex auto review approved', async () => {
+    const { fake, harness } = setup();
+    fake.onTurnStart = (p, tid) => {
+      fake.echoUser(p.threadId, tid, p.clientUserMessageId);
+      autoReview(fake, p.threadId, tid, 'approved');
+      fake.completeTurn(p.threadId, tid, 'completed');
+    };
+    const hub = new Hub(new MemorySessionLog());
+    const lane = new Lane({ sessionKey: 'k', harness, hub, policy: defaultPolicy({ owners: ['lark:someone-else'], run }), cwd: '/work' });
+    try {
+      const stranger = input('i1', 'x', { origin: { kind: 'human', principal: null, evidence: 'platform_signed', via: 'lark:a:c1', adapter: 'lark' } });
+      await lane.command({ type: 'input', sessionKey: 'k', input: stranger, mode: 'queue' });
+      const log = () => hub.log.read('k', 0).map((e) => e.body);
+      for (let i = 0; i < 200 && !log().some((b) => b.t === 'turn.completed'); i++) await tick();
+      expect(log().find((b) => b.t === 'turn.started')).toMatchObject({ run: { profile: 'restricted' } });
+      expect(log().filter((b) => b.t === 'request.opened' || b.t === 'request.resolved')).toEqual([]);
+      expect(log().filter((b) => b.t === 'notice' && b.code === 'auto_review').map((b) => (b as any).message)).toContain('auto review approved: Run: curl example.com');
+    } finally {
+      await lane.close();
+    }
   });
 
   it('refuses server requests it does not implement', async () => {

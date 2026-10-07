@@ -70,7 +70,10 @@ export interface CodexHarnessOptions {
   /**
    * Config overrides for the app-server process: dotted key → value, passed as
    * `-c key=<TOML value>` (strings quoted, arrays/objects as inline TOML).
-   * Only for servers this adapter starts (stdio, unix `own`).
+   * Only for servers this adapter starts (stdio, unix `own`). These are on the
+   * command line, so secret-looking settings are refused: give secrets through
+   * `env` and Codex's env-var indirection (`env_key`, `bearer_token_env_var`,
+   * `env_http_headers`, `env_vars`).
    */
   config?: Record<string, unknown>;
   /** Features to turn on/off (`--enable NAME` / `--disable NAME`). Same restriction as `config`. */
@@ -135,11 +138,42 @@ export function tomlValue(v: unknown, where = 'value'): string {
   throw new Error(`${where}: ${v === null ? 'null' : typeof v} cannot be written as TOML`);
 }
 
-/** `-c key=value`, `--enable`, `--disable` flags for `codex app-server`. Throws on keys/names codex would misparse. */
+/** Names that hold a secret value (`GITHUB_TOKEN`, `Authorization`, `experimental_bearer_token`, `X-Api-Key`…). */
+const SECRET = /(^|[_-])(token|secret|password|passwd|api[_-]?key|authorization|credentials?|cookie)$/i;
+/** Names whose values are environment variable names, not secrets (`env_key`, `env_http_headers`, `bearer_token_env_var`). */
+const ENV_REF = /^env_|_env_var$/i;
+
+/** The dotted path of the first secret-looking setting under `segs`/`v`, if any. */
+function secretAt(segs: string[], v: unknown): string | undefined {
+  for (const [i, raw] of segs.entries()) {
+    const seg = raw.replace(/^"|"$/g, '');
+    if (ENV_REF.test(seg)) return undefined;
+    if (SECRET.test(seg)) return segs.slice(0, i + 1).join('.');
+  }
+  if (v && typeof v === 'object' && !Array.isArray(v)) {
+    for (const [k, x] of Object.entries(v)) {
+      const hit = secretAt([...segs, k], x);
+      if (hit) return hit;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * `-c key=value`, `--enable`, `--disable` flags for `codex app-server`. Throws on keys/names
+ * codex would misparse, and on secret-looking settings: argv is readable by other local users.
+ */
 export function launchFlags(opts: Pick<CodexHarnessOptions, 'config' | 'enable' | 'disable'>): string[] {
   const out: string[] = [];
   for (const [k, v] of Object.entries(opts.config ?? {})) {
     if (!KEY.test(k)) throw new Error(`@agents-io/harness-codex: config key ${JSON.stringify(k)} is not a dotted TOML key`);
+    const secret = secretAt(k.match(new RegExp(SEG, 'g')) ?? [k], v);
+    if (secret) {
+      throw new Error(
+        `@agents-io/harness-codex: config ${secret} looks like a secret; -c values are on the app-server command line (visible via ps). ` +
+          'Pass it through `env` and name the variable instead (env_key, bearer_token_env_var, env_http_headers, env_vars), or put it in CODEX_HOME/config.toml',
+      );
+    }
     out.push('-c', `${k}=${tomlValue(v, `config.${k}`)}`);
   }
   for (const [flag, names] of [['--enable', opts.enable], ['--disable', opts.disable]] as const) {

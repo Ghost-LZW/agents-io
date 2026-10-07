@@ -200,6 +200,92 @@ describe('unix socket transport', () => {
     expect(c2.of('turn.completed')[0]).toMatchObject({ turnId: 'T1', status: 'completed' });
   });
 
+  it('settles an adopted turn that finished while another client started a turn on the thread', async () => {
+    const { fake, sock, dir } = await fakeOnSocket();
+    const a = harnessFor(sock, dir);
+    const s1 = await a.open({ sessionKey: 's', generation: 1, cwd: '/w', run });
+    collector(s1);
+    let tid = '';
+    fake.onTurnStart = (p, t) => {
+      tid = t;
+      fake.echoUser(p.threadId, t, p.clientUserMessageId);
+    };
+    await s1.startTurn('T1', [input('i1')]);
+    await tick();
+    await a.detach();
+    fake.completeTurn('thr-1', tid, 'completed');
+    fake.activeTurn.set('thr-1', 'tui-2'); // e.g. a TUI starts its own turn: the thread is active again
+    fake.turns.get('thr-1')!.push({ id: 'tui-2', items: [], status: 'inProgress', error: null });
+
+    const s2 = await harnessFor(sock, dir).open({ sessionKey: 's', generation: 2, cwd: '/w', run, resume: 'thr-1' });
+    const c2 = collector(s2);
+    await c2.until(isCompleted);
+    expect(c2.of('turn.completed')[0]).toMatchObject({ turnId: 'T1', status: 'completed' });
+    // The other client's turn maps as a foreign turn once its events arrive.
+    const msg = { type: 'agentMessage', id: 'm', text: 'ok', phase: 'final_answer', memoryCitation: null, delivery: null, questions: null };
+    fake.notify('item/started', { threadId: 'thr-1', turnId: 'tui-2', item: msg });
+    fake.notify('item/completed', { threadId: 'thr-1', turnId: 'tui-2', item: msg });
+    fake.completeTurn('thr-1', 'tui-2', 'completed');
+    await c2.until((e) => isCompleted(e) && e.turnId === 'codex:tui-2');
+  });
+
+  it('keeps the adopted turn when Codex still runs it', async () => {
+    const { fake, sock, dir } = await fakeOnSocket();
+    const a = harnessFor(sock, dir);
+    const s1 = await a.open({ sessionKey: 's', generation: 1, cwd: '/w', run });
+    collector(s1);
+    let tid = '';
+    fake.onTurnStart = (p, t) => {
+      tid = t;
+      fake.echoUser(p.threadId, t, p.clientUserMessageId);
+    };
+    await s1.startTurn('T1', [input('i1')]);
+    await tick();
+    await a.detach();
+    fake.turns.set('thr-1', [{ id: tid, items: [], status: 'inProgress', error: null }]);
+
+    const s2 = await harnessFor(sock, dir).open({ sessionKey: 's', generation: 2, cwd: '/w', run, resume: 'thr-1' });
+    const c2 = collector(s2);
+    await tick(20);
+    expect(c2.of('turn.completed')).toHaveLength(0);
+    fake.completeTurn('thr-1', tid, 'completed');
+    await c2.until(isCompleted);
+    expect(c2.of('turn.completed')[0]).toMatchObject({ turnId: 'T1', status: 'completed' });
+  });
+
+  it('an approval answered while reconnecting is delivered when Codex replays it, and only then reported resolved', async () => {
+    const { fake, sock, dir } = await fakeOnSocket();
+    const s = await harnessFor(sock, dir).open({ sessionKey: 's', generation: 1, cwd: '/w', run });
+    const c = collector(s);
+    let answer: unknown;
+    fake.onTurnStart = async (p, t) => {
+      fake.echoUser(p.threadId, t, p.clientUserMessageId);
+      answer = (await fake.request('item/commandExecution/requestApproval', cmdApproval(p.threadId, t))).result;
+      fake.completeTurn(p.threadId, t, 'completed');
+    };
+    await s.startTurn('T1', [input('i1')]);
+    await c.until((e) => e.body.t === 'request.opened');
+
+    // Hold the reconnect's handshake so the answer lands while the old connection is closed.
+    const init = fake.handlers['initialize']!;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    fake.handlers['initialize'] = async (p, f) => (await gate, init(p, f));
+    const first = fake.sent('initialize')[0];
+    fake.dropClients();
+    await fake.waitFor('initialize', (m) => m !== first);
+    await s.respond('0', { kind: 'deny' });
+    expect(c.of('request.resolved')).toHaveLength(0); // not delivered yet
+    await expect(s.respond('0', { kind: 'allow_once' })).rejects.toThrow(/already resolved/);
+
+    release();
+    await c.until(isCompleted);
+    expect(answer).toEqual({ decision: 'decline' });
+    expect(c.of('request.opened')).toHaveLength(1); // the replay is the same request
+    expect(c.of('request.resolved')).toEqual([{ t: 'request.resolved', requestId: '0', decision: { kind: 'deny' }, by: { kind: 'host' } }]);
+    assertConformingStream(c.events, { turnInputs: { T1: ['i1'] } });
+  });
+
   it('gives up after the reconnect window and fails the turn as ambiguous', async () => {
     const { fake, sock, dir } = await fakeOnSocket();
     const h = new CodexHarness({ transport: { kind: 'unix', spawn: 'none', path: sock, stateDir: dir, reconnectWindowMs: 300 } });
@@ -272,6 +358,27 @@ describe('launch settings (named instances)', () => {
     expect(() => launchFlags({ config: { 'x=y': 1 } })).toThrow(/not a dotted TOML key/);
     expect(() => launchFlags({ enable: ['--evil'] })).toThrow(/feature name/);
     expect(() => tomlValue(null, 'config.k')).toThrow('config.k: null cannot be written as TOML');
+  });
+
+  it('refuses secrets in -c values (argv is readable by other local users); env-var indirection is fine', () => {
+    for (const config of [
+      { 'model_providers.x.experimental_bearer_token': 'sk-1' },
+      { 'mcp_servers.gh.env': { GITHUB_TOKEN: 'ghp-1' } },
+      { 'mcp_servers.docs': { url: 'http://d', http_headers: { Authorization: 'Bearer t' } } },
+      { mcp_servers: { docs: { http_headers: { 'X-Api-Key': 'k' } } } },
+      { 'mcp_servers."my server".env.OPENAI_API_KEY': 'k' },
+    ]) {
+      expect(() => launchFlags({ config }), JSON.stringify(config)).toThrow(/command line.*env/);
+    }
+    expect(
+      launchFlags({
+        config: {
+          'model_providers.x.env_key': 'MY_KEY',
+          'mcp_servers.docs': { url: 'http://d', bearer_token_env_var: 'DOCS_TOKEN', env_http_headers: { Authorization: 'DOCS_AUTH' }, env_vars: ['GITHUB_TOKEN'] },
+          model_auto_compact_token_limit: 1000,
+        },
+      }),
+    ).toHaveLength(6);
   });
 
   it('stdio: launch flags follow app-server; env is merged over process.env and CODEX_HOME set', async () => {
