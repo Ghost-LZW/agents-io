@@ -52,6 +52,7 @@ import {
   diffStats,
   encodeClientId,
   errorCode,
+  FALLBACK_PROFILE,
   planSteps,
   renderInputs,
   resolveProfile,
@@ -113,6 +114,8 @@ interface PendingRequest {
   turnId?: string;
   /** Not yet re-sent by Codex since the last reconnect. */
   unconfirmed?: boolean;
+  /** Answered while the connection was down; sent when Codex replays the request. */
+  answer?: Decision;
 }
 
 /** What survives a host restart for a turn still running in a detached app-server. */
@@ -153,8 +156,6 @@ export class CodexSession implements HarnessSession {
   private state: BodyOf<'session.state'>['state'] | undefined;
   private closed = false;
   private finishedCodexTurns = new Set<string>();
-  /** Codex auto reviews in flight (requests that never reach clients). */
-  private reviews = new Map<string, string | undefined>();
   /** File paths of fileChange items, for approval previews. */
   private fileItems = new Map<string, string[]>();
 
@@ -235,17 +236,38 @@ export class CodexSession implements HarnessSession {
     const clientUserMessageId = encodeClientId(ids);
     this.clientIds.set(clientUserMessageId, ids);
     for (const id of ids) t.steerInputs.add(id);
+    const rollback = () => {
+      for (const id of ids) t.steerInputs.delete(id);
+      this.clientIds.delete(clientUserMessageId);
+    };
+    let params: TurnSteerParams;
     try {
       const input = await renderInputs(inputs, { resolveMedia: this.opts.resolveMedia, preface: this.opts.preface });
-      const params: TurnSteerParams = { threadId: this.threadId, expectedTurnId: codexTurnId, clientUserMessageId, input };
+      params = { threadId: this.threadId, expectedTurnId: codexTurnId, clientUserMessageId, input };
+    } catch (e) {
+      rollback();
+      throw e;
+    }
+    try {
       await this.host.rpc.request('turn/steer', params);
       this.saveTurn(t);
       return 'steered';
     } catch (e) {
-      for (const id of ids) t.steerInputs.delete(id);
-      this.clientIds.delete(clientUserMessageId);
+      if (!(e instanceof RpcError) && !t.done) {
+        // Outcome unknown (timed out, connection lost): Codex may have taken it. Keep the
+        // inputs on the turn so a later userMessage echo of the clientId still counts them as
+        // consumed; whatever is never echoed is unconsumed at turn end and reconciled there.
+        this.saveTurn(t);
+        this.emit(
+          { t: 'notice', code: 'continuity', message: `codex steer of ${ids.join(', ')} unconfirmed (${(e as Error).message})` },
+          { turnId: t.turnId, level: 'detail' },
+        );
+        return 'steered';
+      }
+      rollback();
       const r = classifySteerError(e);
       if (r) return r;
+      if (t.done) return 'no_active_turn';
       throw e;
     }
   }
@@ -266,7 +288,15 @@ export class CodexSession implements HarnessSession {
 
   async respond(requestId: string, decision: Decision): Promise<void> {
     const r = this.requests.get(requestId);
-    if (!r) throw new Error(`unknown or already resolved request ${requestId}`);
+    if (!r || r.answer) throw new Error(`unknown or already resolved request ${requestId}`);
+    r.answer = decision;
+    // Connection down (reconnecting), or back but the request not yet replayed: a write now
+    // may be lost. Codex replays the request on the new connection and the answer goes out
+    // then (onServerRequest); until then it is not resolved.
+    if (this.host.rpc.closed === undefined && !r.unconfirmed) await this.sendAnswer(requestId, r, decision);
+  }
+
+  private async sendAnswer(requestId: string, r: PendingRequest, decision: Decision): Promise<void> {
     const { result, interrupt } = responseFor(r.method, r.params, decision);
     this.requests.delete(requestId);
     this.host.rpc.respond(r.rpcId, result);
@@ -325,14 +355,17 @@ export class CodexSession implements HarnessSession {
     const t = this.active;
     if (!t || t.done || !t.codexTurnId) return;
     this.emit({ t: 'notice', code: 'continuity', message: `reattached to codex turn ${t.codexTurnId}; events during the gap were not replayed` }, { turnId: t.turnId, level: 'detail' });
-    if (status.type === 'active') return;
     const list = await this.host.rpc
       .request<ThreadTurnsListResponse>('thread/turns/list', { threadId: this.threadId, limit: 20, sortDirection: 'desc' } satisfies ThreadTurnsListParams)
       .catch(() => undefined);
     if (t.done) return;
     const turn = list?.data.find((x) => x.id === t.codexTurnId);
     if (turn && turn.status === 'inProgress') return;
-    if (!turn) return this.finishTurn(t, 'ambiguous', { code: 'turn_lost', retryable: false, message: 'codex no longer knows this turn' });
+    if (!turn) {
+      // Active with a turn we cannot see: keep ours unless Codex shows another one running.
+      if (status.type === 'active' && !list?.data.some((x) => x.status === 'inProgress')) return;
+      return this.finishTurn(t, 'ambiguous', { code: 'turn_lost', retryable: false, message: 'codex no longer knows this turn' });
+    }
     let st = turnStatus(turn.status);
     if (st === 'completed' && turn.error) st = 'failed';
     for (const item of turn.items) if (item.type === 'agentMessage' && item.phase !== 'commentary') t.lastAnswer = { itemId: item.id, text: item.text };
@@ -486,6 +519,11 @@ export class CodexSession implements HarnessSession {
       known.rpcId = id;
       known.params = params;
       known.unconfirmed = false;
+      if (known.answer) {
+        this.sendAnswer(requestId, known, known.answer).catch((e: Error) =>
+          this.emit({ t: 'notice', code: 'other', message: `answer to request ${requestId} failed: ${e.message}` }, { turnId: known.turnId, level: 'detail' }),
+        );
+      }
       return;
     }
     const t = p.turnId ? this.turnFor(p.turnId) : this.active;
@@ -498,45 +536,23 @@ export class CodexSession implements HarnessSession {
 
   /**
    * With `approvalsReviewer: auto_review` Codex decides by itself and the request
-   * never reaches clients. It is still shown as a request, opened and resolved
-   * `by: { kind: 'harness', id: 'auto_review' }`, so every end sees what was allowed.
+   * never reaches clients. It is reported as `notice{auto_review}` (when it starts,
+   * then its outcome), not as a request: nothing here can answer it, so it must never
+   * reach a resolver or the lane's policy, which would record a decision Codex ignores.
    */
   private onAutoReview(
     method: 'item/autoApprovalReview/started' | 'item/autoApprovalReview/completed',
     p: ItemGuardianApprovalReviewStartedNotification | ItemGuardianApprovalReviewCompletedNotification,
   ): void {
     const t = this.turnFor(p.turnId);
-    const requestId = `auto_review:${p.reviewId}`;
-    if (!this.reviews.has(p.reviewId)) {
-      this.reviews.set(p.reviewId, t?.turnId);
-      const a = reviewAction(p.action);
-      this.emit(
-        {
-          t: 'request.opened',
-          requestId,
-          kind: a.kind,
-          title: a.title,
-          inputPreview: a.preview,
-          risk: { elevated: true, network: p.action.type === 'networkAccess' || undefined, writes: p.action.type === 'applyPatch' || undefined },
-          allowedDecisions: [],
-          allowAlways: false,
-          defaultDeny: true,
-        },
-        { turnId: t?.turnId, itemId: p.targetItemId ?? undefined, audience: 'approval', native: { method, params: p } },
-      );
-      this.emit({ t: 'notice', code: 'auto_review', message: `auto review: ${a.title}` }, { turnId: t?.turnId, level: 'detail' });
+    const title = reviewTitle(p.action);
+    const extra = { turnId: t?.turnId, itemId: p.targetItemId ?? undefined, native: { method, params: p } } satisfies Extra;
+    if (method === 'item/autoApprovalReview/started') {
+      this.emit({ t: 'notice', code: 'auto_review', message: `auto review: ${title}` }, { ...extra, level: 'detail' });
+      return;
     }
-    if (method === 'item/autoApprovalReview/completed') {
-      const turnId = this.reviews.get(p.reviewId);
-      this.reviews.delete(p.reviewId);
-      const s = p.review.status;
-      const decision: Decision | null =
-        s === 'approved' ? { kind: 'allow_once' } : s === 'denied' ? { kind: 'deny', message: p.review.rationale ?? undefined } : null;
-      this.emit(
-        { t: 'request.resolved', requestId, decision, by: { kind: 'harness', id: 'auto_review' } },
-        { turnId: this.liveTurnId(turnId), audience: 'approval', native: { method, params: p } },
-      );
-    }
+    const why = p.review.rationale ? ` (${p.review.rationale})` : '';
+    this.emit({ t: 'notice', code: 'auto_review', message: `auto review ${p.review.status}: ${title}${why}` }, extra);
   }
 
   /** Add context to the thread without starting a turn (`thread/inject_items`, raw Responses API items). */
@@ -721,17 +737,20 @@ export class CodexSession implements HarnessSession {
     return t;
   }
 
-  /** turn/start overrides persist for later turns, so only send what changed. */
+  /**
+   * turn/start overrides persist for later turns, so only send what changed. A
+   * profile switch sends every permission field (defaults for what the profile
+   * leaves unset), so nothing the previous profile set carries over.
+   */
   private overrides(run: RunSpec): Partial<TurnStartParams> {
     const o: Partial<TurnStartParams> = {};
     if (run.model && run.model !== this.applied.model) o.model = run.model;
     if (run.effort && run.effort !== this.applied.effort) o.effort = run.effort;
     if (run.profile !== this.applied.profile) {
       const p = resolveProfile(run.profile, this.opts.profiles);
-      if (p.approvalPolicy) o.approvalPolicy = p.approvalPolicy;
-      if (p.approvalsReviewer) o.approvalsReviewer = p.approvalsReviewer;
-      const sp = sandboxPolicyOf(p);
-      if (sp) o.sandboxPolicy = sp;
+      o.approvalPolicy = p.approvalPolicy ?? FALLBACK_PROFILE.approvalPolicy!;
+      o.approvalsReviewer = p.approvalsReviewer ?? 'user';
+      o.sandboxPolicy = sandboxPolicyOf(p) ?? sandboxPolicyOf(FALLBACK_PROFILE)!;
     }
     return o;
   }
@@ -762,22 +781,22 @@ export class CodexSession implements HarnessSession {
   }
 }
 
-function reviewAction(a: GuardianApprovalReviewAction): { kind: BodyOf<'request.opened'>['kind']; title: string; preview?: string } {
+function reviewTitle(a: GuardianApprovalReviewAction): string {
   switch (a.type) {
     case 'command':
-      return { kind: 'tool_approval', title: `Run: ${displayCommand(a.command)}`, preview: `${displayCommand(a.command)} (in ${a.cwd})` };
+      return `Run: ${displayCommand(a.command)}`;
     case 'execve':
-      return { kind: 'tool_approval', title: `Run: ${a.argv.join(' ') || a.program}`, preview: `${a.program} (in ${a.cwd})` };
+      return `Run: ${a.argv.join(' ') || a.program}`;
     case 'writeStdin':
-      return { kind: 'tool_approval', title: 'Write to terminal', preview: a.stdin.slice(0, 300) };
+      return 'Write to terminal';
     case 'applyPatch':
-      return { kind: 'file_change', title: 'Apply file changes', preview: a.files.join(', ') };
+      return `Apply file changes (${a.files.join(', ')})`;
     case 'networkAccess':
-      return { kind: 'permissions', title: `Network access to ${a.host}`, preview: a.target };
+      return `Network access to ${a.host}`;
     case 'mcpToolCall':
-      return { kind: 'tool_approval', title: `${a.server}.${a.toolName}`, preview: a.toolTitle ?? undefined };
+      return `${a.server}.${a.toolName}`;
     case 'requestPermissions':
-      return { kind: 'permissions', title: a.reason ?? 'Grant additional permissions' };
+      return a.reason ?? 'Grant additional permissions';
   }
 }
 
