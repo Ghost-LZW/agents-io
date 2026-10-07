@@ -1,7 +1,7 @@
 import { Type, type Static } from '@sinclair/typebox';
 import { Evidence, ReplyRoute } from './common.js';
 import { InboundEnvelope } from './inbound.js';
-import { Tier } from './events.js';
+import { ItemSummary, Tier } from './events.js';
 
 const MediaKind = Type.Union([Type.Literal('image'), Type.Literal('file'), Type.Literal('audio')]);
 
@@ -29,6 +29,59 @@ export const ChannelCaps = Type.Object({
   declaresSender: Type.Boolean(),
 });
 export type ChannelCaps = Static<typeof ChannelCaps>;
+
+/** One entry of a turn's visible process, in the order it happened. */
+export const ProgressStep = Type.Union([
+  /** Model thinking (reasoning stream); `done` once the block closed. */
+  Type.Object({ kind: Type.Literal('reasoning'), id: Type.String(), text: Type.String(), done: Type.Boolean() }),
+  /** Interim assistant text between tool calls (commentary), not the final answer. */
+  Type.Object({ kind: Type.Literal('narration'), id: Type.String(), text: Type.String() }),
+  Type.Object({
+    kind: Type.Literal('tool'),
+    itemId: Type.String(),
+    type: ItemSummary.properties.type,
+    title: Type.String(),
+    status: ItemSummary.properties.status,
+    inputSummary: Type.Optional(Type.String()),
+    resultPreview: Type.Optional(Type.String()),
+    isError: Type.Optional(Type.Boolean()),
+    parentItemId: Type.Optional(Type.String()),
+  }),
+]);
+export type ProgressStep = Static<typeof ProgressStep>;
+
+/**
+ * Structured view of one turn for ends that render process natively (a CoT
+ * bubble, collapsible panels). Ends that cannot, use the flat text/sections.
+ * Always cumulative: each update replaces the previous view.
+ */
+export const ProgressView = Type.Object({
+  turnId: Type.String(),
+  status: Type.Union([
+    Type.Literal('running'),
+    Type.Literal('requires_action'),
+    Type.Literal('completed'),
+    Type.Literal('interrupted'),
+    Type.Literal('failed'),
+    Type.Literal('ambiguous'),
+  ]),
+  headline: Type.Optional(Type.String()),
+  steps: Type.Array(ProgressStep),
+  plan: Type.Optional(
+    Type.Array(
+      Type.Object({
+        text: Type.String(),
+        status: Type.Union([Type.Literal('pending'), Type.Literal('in_progress'), Type.Literal('completed')]),
+      }),
+    ),
+  ),
+  /** Answer text so far; final when `answerFinal`. */
+  answer: Type.String(),
+  answerFinal: Type.Boolean(),
+  startedAt: Type.Optional(Type.Number()),
+  endedAt: Type.Optional(Type.Number()),
+});
+export type ProgressView = Static<typeof ProgressView>;
 
 /** Channel-neutral message. Adapters render it into their native format. */
 export const RenderedMessage = Type.Object({
@@ -58,6 +111,8 @@ export const RenderedMessage = Type.Object({
   link: Type.Optional(Type.Object({ label: Type.String(), url: Type.String() })),
   /** Plain spoken form for voice ends. */
   spokenText: Type.Optional(Type.String()),
+  /** Structured process of the turn this message renders, for native process UIs. */
+  progress: Type.Optional(ProgressView),
   /** Escape hatch for native rich content (e.g. a full card JSON). */
   channelData: Type.Optional(Type.Unknown()),
 });

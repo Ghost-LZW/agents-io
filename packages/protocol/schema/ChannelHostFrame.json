@@ -191,6 +191,252 @@
             "spokenText": {
               "type": "string"
             },
+            "progress": {
+              "type": "object",
+              "required": [
+                "turnId",
+                "status",
+                "steps",
+                "answer",
+                "answerFinal"
+              ],
+              "properties": {
+                "turnId": {
+                  "type": "string"
+                },
+                "status": {
+                  "anyOf": [
+                    {
+                      "const": "running",
+                      "type": "string"
+                    },
+                    {
+                      "const": "requires_action",
+                      "type": "string"
+                    },
+                    {
+                      "const": "completed",
+                      "type": "string"
+                    },
+                    {
+                      "const": "interrupted",
+                      "type": "string"
+                    },
+                    {
+                      "const": "failed",
+                      "type": "string"
+                    },
+                    {
+                      "const": "ambiguous",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "headline": {
+                  "type": "string"
+                },
+                "steps": {
+                  "type": "array",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "required": [
+                          "kind",
+                          "id",
+                          "text",
+                          "done"
+                        ],
+                        "properties": {
+                          "kind": {
+                            "const": "reasoning",
+                            "type": "string"
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          },
+                          "done": {
+                            "type": "boolean"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "kind",
+                          "id",
+                          "text"
+                        ],
+                        "properties": {
+                          "kind": {
+                            "const": "narration",
+                            "type": "string"
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "kind",
+                          "itemId",
+                          "type",
+                          "title",
+                          "status"
+                        ],
+                        "properties": {
+                          "kind": {
+                            "const": "tool",
+                            "type": "string"
+                          },
+                          "itemId": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "anyOf": [
+                              {
+                                "const": "command",
+                                "type": "string"
+                              },
+                              {
+                                "const": "file_change",
+                                "type": "string"
+                              },
+                              {
+                                "const": "mcp_tool",
+                                "type": "string"
+                              },
+                              {
+                                "const": "tool",
+                                "type": "string"
+                              },
+                              {
+                                "const": "subagent",
+                                "type": "string"
+                              },
+                              {
+                                "const": "web_search",
+                                "type": "string"
+                              },
+                              {
+                                "const": "hook",
+                                "type": "string"
+                              },
+                              {
+                                "const": "compaction",
+                                "type": "string"
+                              },
+                              {
+                                "const": "user_message",
+                                "type": "string"
+                              },
+                              {
+                                "const": "agent_message",
+                                "type": "string"
+                              },
+                              {
+                                "const": "reasoning",
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          "title": {
+                            "type": "string"
+                          },
+                          "status": {
+                            "anyOf": [
+                              {
+                                "const": "running",
+                                "type": "string"
+                              },
+                              {
+                                "const": "completed",
+                                "type": "string"
+                              },
+                              {
+                                "const": "failed",
+                                "type": "string"
+                              },
+                              {
+                                "const": "declined",
+                                "type": "string"
+                              },
+                              {
+                                "const": "skipped",
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          "inputSummary": {
+                            "type": "string"
+                          },
+                          "resultPreview": {
+                            "type": "string"
+                          },
+                          "isError": {
+                            "type": "boolean"
+                          },
+                          "parentItemId": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                },
+                "plan": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "text",
+                      "status"
+                    ],
+                    "properties": {
+                      "text": {
+                        "type": "string"
+                      },
+                      "status": {
+                        "anyOf": [
+                          {
+                            "const": "pending",
+                            "type": "string"
+                          },
+                          {
+                            "const": "in_progress",
+                            "type": "string"
+                          },
+                          {
+                            "const": "completed",
+                            "type": "string"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                },
+                "answer": {
+                  "type": "string"
+                },
+                "answerFinal": {
+                  "type": "boolean"
+                },
+                "startedAt": {
+                  "type": "number"
+                },
+                "endedAt": {
+                  "type": "number"
+                }
+              }
+            },
             "channelData": {}
           }
         },
@@ -376,6 +622,252 @@
             },
             "spokenText": {
               "type": "string"
+            },
+            "progress": {
+              "type": "object",
+              "required": [
+                "turnId",
+                "status",
+                "steps",
+                "answer",
+                "answerFinal"
+              ],
+              "properties": {
+                "turnId": {
+                  "type": "string"
+                },
+                "status": {
+                  "anyOf": [
+                    {
+                      "const": "running",
+                      "type": "string"
+                    },
+                    {
+                      "const": "requires_action",
+                      "type": "string"
+                    },
+                    {
+                      "const": "completed",
+                      "type": "string"
+                    },
+                    {
+                      "const": "interrupted",
+                      "type": "string"
+                    },
+                    {
+                      "const": "failed",
+                      "type": "string"
+                    },
+                    {
+                      "const": "ambiguous",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "headline": {
+                  "type": "string"
+                },
+                "steps": {
+                  "type": "array",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "required": [
+                          "kind",
+                          "id",
+                          "text",
+                          "done"
+                        ],
+                        "properties": {
+                          "kind": {
+                            "const": "reasoning",
+                            "type": "string"
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          },
+                          "done": {
+                            "type": "boolean"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "kind",
+                          "id",
+                          "text"
+                        ],
+                        "properties": {
+                          "kind": {
+                            "const": "narration",
+                            "type": "string"
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "kind",
+                          "itemId",
+                          "type",
+                          "title",
+                          "status"
+                        ],
+                        "properties": {
+                          "kind": {
+                            "const": "tool",
+                            "type": "string"
+                          },
+                          "itemId": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "anyOf": [
+                              {
+                                "const": "command",
+                                "type": "string"
+                              },
+                              {
+                                "const": "file_change",
+                                "type": "string"
+                              },
+                              {
+                                "const": "mcp_tool",
+                                "type": "string"
+                              },
+                              {
+                                "const": "tool",
+                                "type": "string"
+                              },
+                              {
+                                "const": "subagent",
+                                "type": "string"
+                              },
+                              {
+                                "const": "web_search",
+                                "type": "string"
+                              },
+                              {
+                                "const": "hook",
+                                "type": "string"
+                              },
+                              {
+                                "const": "compaction",
+                                "type": "string"
+                              },
+                              {
+                                "const": "user_message",
+                                "type": "string"
+                              },
+                              {
+                                "const": "agent_message",
+                                "type": "string"
+                              },
+                              {
+                                "const": "reasoning",
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          "title": {
+                            "type": "string"
+                          },
+                          "status": {
+                            "anyOf": [
+                              {
+                                "const": "running",
+                                "type": "string"
+                              },
+                              {
+                                "const": "completed",
+                                "type": "string"
+                              },
+                              {
+                                "const": "failed",
+                                "type": "string"
+                              },
+                              {
+                                "const": "declined",
+                                "type": "string"
+                              },
+                              {
+                                "const": "skipped",
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          "inputSummary": {
+                            "type": "string"
+                          },
+                          "resultPreview": {
+                            "type": "string"
+                          },
+                          "isError": {
+                            "type": "boolean"
+                          },
+                          "parentItemId": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                },
+                "plan": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "text",
+                      "status"
+                    ],
+                    "properties": {
+                      "text": {
+                        "type": "string"
+                      },
+                      "status": {
+                        "anyOf": [
+                          {
+                            "const": "pending",
+                            "type": "string"
+                          },
+                          {
+                            "const": "in_progress",
+                            "type": "string"
+                          },
+                          {
+                            "const": "completed",
+                            "type": "string"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                },
+                "answer": {
+                  "type": "string"
+                },
+                "answerFinal": {
+                  "type": "boolean"
+                },
+                "startedAt": {
+                  "type": "number"
+                },
+                "endedAt": {
+                  "type": "number"
+                }
+              }
             },
             "channelData": {}
           }
@@ -565,6 +1057,252 @@
             },
             "spokenText": {
               "type": "string"
+            },
+            "progress": {
+              "type": "object",
+              "required": [
+                "turnId",
+                "status",
+                "steps",
+                "answer",
+                "answerFinal"
+              ],
+              "properties": {
+                "turnId": {
+                  "type": "string"
+                },
+                "status": {
+                  "anyOf": [
+                    {
+                      "const": "running",
+                      "type": "string"
+                    },
+                    {
+                      "const": "requires_action",
+                      "type": "string"
+                    },
+                    {
+                      "const": "completed",
+                      "type": "string"
+                    },
+                    {
+                      "const": "interrupted",
+                      "type": "string"
+                    },
+                    {
+                      "const": "failed",
+                      "type": "string"
+                    },
+                    {
+                      "const": "ambiguous",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "headline": {
+                  "type": "string"
+                },
+                "steps": {
+                  "type": "array",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "required": [
+                          "kind",
+                          "id",
+                          "text",
+                          "done"
+                        ],
+                        "properties": {
+                          "kind": {
+                            "const": "reasoning",
+                            "type": "string"
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          },
+                          "done": {
+                            "type": "boolean"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "kind",
+                          "id",
+                          "text"
+                        ],
+                        "properties": {
+                          "kind": {
+                            "const": "narration",
+                            "type": "string"
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "kind",
+                          "itemId",
+                          "type",
+                          "title",
+                          "status"
+                        ],
+                        "properties": {
+                          "kind": {
+                            "const": "tool",
+                            "type": "string"
+                          },
+                          "itemId": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "anyOf": [
+                              {
+                                "const": "command",
+                                "type": "string"
+                              },
+                              {
+                                "const": "file_change",
+                                "type": "string"
+                              },
+                              {
+                                "const": "mcp_tool",
+                                "type": "string"
+                              },
+                              {
+                                "const": "tool",
+                                "type": "string"
+                              },
+                              {
+                                "const": "subagent",
+                                "type": "string"
+                              },
+                              {
+                                "const": "web_search",
+                                "type": "string"
+                              },
+                              {
+                                "const": "hook",
+                                "type": "string"
+                              },
+                              {
+                                "const": "compaction",
+                                "type": "string"
+                              },
+                              {
+                                "const": "user_message",
+                                "type": "string"
+                              },
+                              {
+                                "const": "agent_message",
+                                "type": "string"
+                              },
+                              {
+                                "const": "reasoning",
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          "title": {
+                            "type": "string"
+                          },
+                          "status": {
+                            "anyOf": [
+                              {
+                                "const": "running",
+                                "type": "string"
+                              },
+                              {
+                                "const": "completed",
+                                "type": "string"
+                              },
+                              {
+                                "const": "failed",
+                                "type": "string"
+                              },
+                              {
+                                "const": "declined",
+                                "type": "string"
+                              },
+                              {
+                                "const": "skipped",
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          "inputSummary": {
+                            "type": "string"
+                          },
+                          "resultPreview": {
+                            "type": "string"
+                          },
+                          "isError": {
+                            "type": "boolean"
+                          },
+                          "parentItemId": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                },
+                "plan": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "text",
+                      "status"
+                    ],
+                    "properties": {
+                      "text": {
+                        "type": "string"
+                      },
+                      "status": {
+                        "anyOf": [
+                          {
+                            "const": "pending",
+                            "type": "string"
+                          },
+                          {
+                            "const": "in_progress",
+                            "type": "string"
+                          },
+                          {
+                            "const": "completed",
+                            "type": "string"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                },
+                "answer": {
+                  "type": "string"
+                },
+                "answerFinal": {
+                  "type": "boolean"
+                },
+                "startedAt": {
+                  "type": "number"
+                },
+                "endedAt": {
+                  "type": "number"
+                }
+              }
             },
             "channelData": {}
           }
