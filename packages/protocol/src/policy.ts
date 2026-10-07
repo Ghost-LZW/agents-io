@@ -5,6 +5,7 @@ import type { RunSpec } from './run.js';
 import type { Resolver } from './requests.js';
 import type { BodyOf } from './events.js';
 import type { Watch } from './watch.js';
+import type { TurnProvenance } from './host.js';
 
 export interface IdentifyArgs {
   channel: string;
@@ -47,6 +48,8 @@ export interface TurnContext {
   owner?: string;
   /** Extra delivery routes added during the turn (steer from another end, mirror). */
   deliveries: ReplyRoute[];
+  /** Where the turn's inputs came from (tag only, never used to block). */
+  provenance?: TurnProvenance;
 }
 
 export interface ControlArgs {

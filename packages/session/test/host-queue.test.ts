@@ -17,6 +17,7 @@ function item(id = `m${++n}`): Omit<InboundItem, 'cursor'> {
   const env = fakeEnvelope({ id, text: `text ${id}`, raw: { big: 'payload' } });
   return {
     channelRef: channelRefOf(env),
+    account: env.account,
     bindingId: 'to-host',
     input: { inputId: `in_${id}`, origin: { kind: 'human', principal: null, evidence: 'platform_signed', via: 'fake:default:c1', adapter: 'fake' }, content: env.content, replyRoute: env.replyRoute, channelContext: {} },
     envelope: env,
@@ -25,6 +26,14 @@ function item(id = `m${++n}`): Omit<InboundItem, 'cursor'> {
 }
 
 describe('HostQueue', () => {
+  it('dedups per account: the same message id on another bot account is a different message', () => {
+    const q = new HostQueue();
+    const a = item('same-id');
+    expect(q.append(a)).toEqual({ cursor: 1, duplicate: false });
+    expect(q.append({ ...a, account: 'second-bot' })).toEqual({ cursor: 2, duplicate: false });
+    expect(q.append({ ...a })).toEqual({ cursor: 1, duplicate: true });
+  });
+
   it('appends idempotently on the channel reference: a redelivery returns the first cursor', async () => {
     const q = new HostQueue();
     const a = item('same');

@@ -73,7 +73,7 @@ describe('Ingress through the Router', () => {
   });
 
   it('only-host inputs report action host; explain(inputId) shows the rules', async () => {
-    const w = world({ extra: [{ id: 'dm-host', match: { conversationKind: 'dm', principal: 'unknown' }, on: 'host' }] });
+    const w = world({ extra: [{ id: 'dm-host', match: { conversationKind: 'dm', known: false }, on: 'host' }] });
     const r = await w.ingress.accept(fakeEnvelope({ sender: eve, text: 'hello stranger' }));
     expect(r).toMatchObject({ accepted: true, action: 'host', host: { cursor: 1 } });
     expect(w.router.explain(r.inputId!)).toMatchObject({ inputId: r.inputId, principal: null, matched: [{ bindingId: 'dm-host', on: 'host' }] });

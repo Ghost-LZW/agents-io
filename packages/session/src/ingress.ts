@@ -281,7 +281,7 @@ export class Ingress {
     if (decision.host) {
       if (this.o.hostQueue) {
         const { raw: _raw, ...envelope } = env;
-        const r = this.o.hostQueue.append({ channelRef: channelRefOf(env), bindingId: decision.host.bindingId, input, envelope, receivedAt: Date.now() });
+        const r = this.o.hostQueue.append({ channelRef: channelRefOf(env), account: env.account, bindingId: decision.host.bindingId, input, envelope, receivedAt: Date.now() });
         host = { ...r, bindingId: decision.host.bindingId };
       } else this.o.onHostUnavailable?.({ inputId: input.inputId, bindingId: decision.host.bindingId });
     }

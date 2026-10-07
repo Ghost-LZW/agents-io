@@ -117,7 +117,7 @@ describe('host protocol', () => {
       bindings: [
         { id: 'owner-dm', match: { channel: 'lark-bot', conversationKind: 'dm', labels: ['owner'] }, on: 'dispatch', agent: 'assistant', session: 'main' },
         { id: 'xwo-buttons', match: { actionPrefix: 'xwo:' }, on: 'host' },
-        { id: 'triage', match: { channel: 'mail', principal: 'unknown' }, on: 'context', agent: 'assistant', callout: { timeoutMs: 1500, onFailure: 'host' } },
+        { id: 'triage', match: { channel: 'mail', known: false }, on: 'context', agent: 'assistant', callout: { timeoutMs: 1500, onFailure: 'host' } },
       ],
       identities: [{ channel: 'lark-bot', channelUserId: 'on_x', principal: 'member:lzw', labels: ['owner'] }],
     };

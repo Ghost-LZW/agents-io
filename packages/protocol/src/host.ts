@@ -38,8 +38,10 @@ export const BindingMatch = Type.Object({
   senders: Type.Optional(Type.Array(Type.String())),
   /** Sender must carry at least one of these identity labels (from the identity map). */
   labels: Type.Optional(Type.Array(Type.String())),
-  /** `unknown` matches senders not in the identity map (or without enough evidence). */
-  principal: Type.Optional(Type.Union([Type.String(), Type.Literal('unknown')])),
+  /** Sender's host principal id (from the identity map). */
+  principal: Type.Optional(Type.String()),
+  /** true: only senders with a principal; false: only senders without one (not mapped, or not enough evidence). */
+  known: Type.Optional(Type.Boolean()),
   /** Message must mention one of these channel user ids; `self` = this deployment's bot account. */
   mentions: Type.Optional(Type.Array(Type.String())),
   /** Case-insensitive substrings; any match passes. */
@@ -117,6 +119,10 @@ export const RouteExplanation = Type.Object({
   ),
   principal: Type.Union([Type.String(), Type.Null()]),
   evidence: Evidence,
+  /** Unix ms of the routing decision. */
+  at: Type.Optional(Type.Number()),
+  /** Why nothing was delivered, when nothing was. */
+  dropped: Type.Optional(Type.Union([Type.Literal('adapter'), Type.Literal('no_match'), Type.Literal('drop_rule')])),
 });
 export type RouteExplanation = Static<typeof RouteExplanation>;
 
@@ -124,7 +130,7 @@ export type RouteExplanation = Static<typeof RouteExplanation>;
 export const TurnProvenance = Type.Object({
   sessionKey: Type.String(),
   turnId: Type.String(),
-  /** Principals of the inputs that triggered the turn. */
+  /** Principal ids (Origin.principal.id, or null) of the inputs that triggered the turn. */
   triggeredBy: Type.Array(Type.Union([Type.String(), Type.Null()])),
   /** The turn's context includes watched / digest / context-only inputs. */
   watched: Type.Boolean(),
@@ -200,8 +206,9 @@ export type HostRequestFrame = Static<typeof HostRequestFrame>;
 /** One entry of the durable host inbound queue. */
 export const InboundItem = Type.Object({
   cursor: Type.Number(),
-  /** Idempotency key: `channel:<channel>/<message id>`. */
+  /** `channel:<channel>/<message id>` (x-work-os 0010 form). Message ids are unique per account, so dedup is on (account, channelRef). */
   channelRef: Type.String(),
+  account: Type.String(),
   bindingId: Type.String(),
   input: InputRecord,
   /** The envelope without `raw`. */

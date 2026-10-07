@@ -565,7 +565,8 @@ export function matches(m: BindingMatch, env: InboundEnvelope, origin: Origin, s
   if (m.conversationKind !== undefined && m.conversationKind !== env.conversation.kind) return false;
   if (m.senders?.length && !m.senders.includes(env.sender.channelUserId)) return false;
   if (m.labels?.length && !m.labels.some((l) => origin.principal?.labels.includes(l))) return false;
-  if (m.principal !== undefined && (m.principal === 'unknown' ? origin.principal !== null : origin.principal?.id !== m.principal)) return false;
+  if (m.principal !== undefined && origin.principal?.id !== m.principal) return false;
+  if (m.known !== undefined && (origin.principal !== null) !== m.known) return false;
   if (m.mentions?.length) {
     const ids = new Set((env.mentions ?? []).map((x) => x.id));
     if (!m.mentions.some((x) => (x === 'self' ? addressesSelf(env, selfAccounts) : ids.has(x)))) return false;

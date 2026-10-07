@@ -93,7 +93,9 @@ export class HostQueue {
 
   /** Append an item; a channel reference seen before returns the first copy's cursor. */
   append(item: Omit<InboundItem, 'cursor'>): AppendResult {
-    const prior = this.q.refGet.get(item.channelRef) as { cursor: number } | undefined;
+    // Message ids are unique per account: dedup on (account, channelRef).
+    const key = `${item.account}\n${item.channelRef}`;
+    const prior = this.q.refGet.get(key) as { cursor: number } | undefined;
     if (prior) return { cursor: prior.cursor, duplicate: true };
     const at = this.now();
     let cursor: number;
@@ -102,7 +104,7 @@ export class HostQueue {
       const { raw: _raw, ...envelope } = item.envelope;
       const stored = { ...item, envelope };
       cursor = Number(this.q.insert.run(item.channelRef, at, JSON.stringify(stored)).lastInsertRowid);
-      this.q.refPut.run(item.channelRef, cursor, at);
+      this.q.refPut.run(key, cursor, at);
       this.db.exec('COMMIT');
     } catch (e) {
       this.db.exec('ROLLBACK');

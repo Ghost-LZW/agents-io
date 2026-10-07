@@ -163,6 +163,25 @@
           "type": "string"
         }
       ]
+    },
+    "at": {
+      "type": "number"
+    },
+    "dropped": {
+      "anyOf": [
+        {
+          "const": "adapter",
+          "type": "string"
+        },
+        {
+          "const": "no_match",
+          "type": "string"
+        },
+        {
+          "const": "drop_rule",
+          "type": "string"
+        }
+      ]
     }
   }
 }

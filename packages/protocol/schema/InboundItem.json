@@ -5,6 +5,7 @@
   "required": [
     "cursor",
     "channelRef",
+    "account",
     "bindingId",
     "input",
     "envelope",
@@ -15,6 +16,9 @@
       "type": "number"
     },
     "channelRef": {
+      "type": "string"
+    },
+    "account": {
       "type": "string"
     },
     "bindingId": {

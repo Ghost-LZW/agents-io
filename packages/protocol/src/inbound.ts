@@ -49,7 +49,7 @@ export const InboundEnvelope = Type.Object({
   context: Type.Optional(Type.Record(Type.String(), Type.Union([Type.String(), Type.Number(), Type.Boolean()]))),
   /** null = do not reply (e.g. observe-only meeting transcript). */
   replyRoute: Type.Union([ReplyRoute, Type.Null()]),
-  /** Adapter's hint; the host's `Policy.admit` decides. */
+  /** Adapter's hint (`dispatch` = addressed to us); binding tables decide where the input goes. */
   admission: Type.Optional(
     Type.Union([Type.Literal('dispatch'), Type.Literal('observe'), Type.Literal('drop')]),
   ),

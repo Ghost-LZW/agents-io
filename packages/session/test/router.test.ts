@@ -63,8 +63,8 @@ describe('binding match fields', () => {
     expect(m({ labels: ['member'] }, UNKNOWN)).toBe(false);
     expect(m({ principal: 'u-7' })).toBe(true);
     expect(m({ principal: 'u-8' })).toBe(false);
-    expect(m({ principal: 'unknown' })).toBe(false);
-    expect(m({ principal: 'unknown' }, UNKNOWN)).toBe(true);
+    expect(m({ known: false })).toBe(false);
+    expect(m({ known: false }, UNKNOWN)).toBe(true);
   });
 
   it('mentions: platform ids, and `self` = one of our own accounts or the adapter saying it is addressed', () => {

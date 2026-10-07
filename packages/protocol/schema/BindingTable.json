@@ -81,15 +81,10 @@
                 }
               },
               "principal": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "const": "unknown",
-                    "type": "string"
-                  }
-                ]
+                "type": "string"
+              },
+              "known": {
+                "type": "boolean"
               },
               "mentions": {
                 "type": "array",
