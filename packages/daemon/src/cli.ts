@@ -246,7 +246,7 @@ async function input(a: CliArgs): Promise<number> {
 
 async function sessions(a: CliArgs): Promise<number> {
   const client = await LocalClient.connect(socketOf(a));
-  for (const s of await client.sessions()) console.log(`${s.sessionKey}\t${s.state}\tseq ${s.head}${s.turnId ? `\tturn ${s.turnId}` : ''}${s.pendingRequests.length ? `\trequests ${s.pendingRequests.join(',')}` : ''}`);
+  for (const s of await client.sessions()) console.log(`${s.sessionKey}\t${s.state}\tseq ${s.head}${s.turnId ? `\tturn ${s.turnId}` : ''}${s.pendingRequests.length ? `\trequests ${s.pendingRequests.join(',')}` : ''}${s.launch?.cwd ? `\tcwd ${s.launch.cwd}` : ''}${s.launch?.envKeys.length ? `\tenv ${s.launch.envKeys.join(',')}` : ''}`);
   client.close();
   return 0;
 }
