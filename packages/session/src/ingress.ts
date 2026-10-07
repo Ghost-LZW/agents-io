@@ -76,9 +76,11 @@ export interface IngressOptions {
   lanes: (sessionKey: string, agent?: string) => Lane | Promise<Lane>;
   /**
    * A table delivery was refused by `lanes` (`LaneUnavailableError`): tell the
-   * session and the route. Errors it throws are reported to `onReplyError`.
+   * session and, for a `dispatch` delivery, the route (a `context` delivery was never
+   * addressed to the agent, so nothing is said there). Errors it throws are
+   * reported to `onReplyError`.
    */
-  onUnavailable?: (a: { sessionKey: string; agent?: string; code: string; message: string; input: InputRecord }) => Promise<void> | void;
+  onUnavailable?: (a: { sessionKey: string; agent?: string; on: RouteDelivery['on']; code: string; message: string; input: InputRecord }) => Promise<void> | void;
   /**
    * The binding tables. Default: a router with `defaultBindings({ agent: "default" })`
    * (bare route-key sessions) over `watches`, or — when the policy sets the
@@ -396,7 +398,7 @@ export class Ingress {
     } catch (e) {
       if (!(e instanceof LaneUnavailableError)) throw e;
       try {
-        await this.o.onUnavailable?.({ sessionKey: d.sessionKey, ...(d.agent ? { agent: d.agent } : {}), code: e.code, message: e.message, input });
+        await this.o.onUnavailable?.({ sessionKey: d.sessionKey, ...(d.agent ? { agent: d.agent } : {}), on: d.on, code: e.code, message: e.message, input });
       } catch (err) {
         this.o.onReplyError?.(err);
       }

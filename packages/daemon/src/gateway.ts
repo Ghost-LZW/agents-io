@@ -336,8 +336,9 @@ export class Gateway {
       // Inputs of a current topic say how to move between topics, to agents that have the session_* tools.
       ...(tools ? { topicHint: (agent: string | undefined) => (c.agents[agent ?? c.defaultAgent ?? '']?.tools ? TOPIC_TOOLS_HINT : undefined) } : {}),
       onReplyError: (err) => this.log('warn', `topic command reply failed: ${(err as Error).message}`),
-      // A session whose agent is gone refuses the input: its log and the route say so.
-      onUnavailable: (a) => this.refuseUnavailable(a.sessionKey, a.code, a.message, a.input.inputId, a.input.replyRoute),
+      // A session whose agent is gone refuses the input: its log says so, and the route
+      // too when the message was addressed to it (observe-only messages stay silent).
+      onUnavailable: (a) => this.refuseUnavailable(a.sessionKey, a.code, a.message, a.input.inputId, a.on === 'dispatch' ? a.input.replyRoute : null),
     });
     if (c.source) {
       this.configStore = new ConfigStore({ path: c.source.path, ...(c.source.envFile ? { envFile: c.source.envFile } : {}), ...(o.consoleEnv ? { env: o.consoleEnv } : {}) });
@@ -713,16 +714,16 @@ export class Gateway {
 
   /**
    * A session refused an input because its agent is gone (`agent_unavailable`): a
-   * notice and `input.rejected` in its log, a warning, and one short message on the
-   * route the input came from (local ends read their stream).
+   * notice and `input.rejected` in its log, a warning, and — given a route (a
+   * dispatched channel message) — one short message there (local ends read their stream).
    */
-  private async refuseUnavailable(sessionKey: string, code: string, message: string, inputId: string | undefined, route: ReplyRoute | null): Promise<void> {
+  private async refuseUnavailable(sessionKey: string, code: string, message: string, inputId: string, route: ReplyRoute | null): Promise<void> {
     this.log('warn', `${code}: ${message}`);
     const ev = { ts: Date.now(), level: 'primary' as const, audience: 'status' as const, durability: 'durable' as const, visibility: 'participants' as const };
     this.hub.append(sessionKey, { ...ev, body: { t: 'notice', code: 'other', message: `${code}: ${message}` } });
-    if (inputId !== undefined) this.hub.append(sessionKey, { ...ev, body: { t: 'input.rejected', inputIds: [inputId], reason: code } });
+    this.hub.append(sessionKey, { ...ev, body: { t: 'input.rejected', inputIds: [inputId], reason: code } });
     if (route && route.channel !== 'local') {
-      await this.systemReply({ route, text: 'This conversation\'s agent is not available any more, so the message was not delivered. Ask the operator to restore it.', operationId: `${code}:${inputId ?? randomUUID()}`, sessionKey });
+      await this.systemReply({ route, text: 'This conversation\'s agent is not available any more, so the message was not delivered. Ask the operator to restore it.', operationId: `${code}:${inputId}`, sessionKey });
     }
   }
 
@@ -743,7 +744,7 @@ export class Gateway {
    * conversation goes back to `from` and the turn is told to answer there.
    */
   private async handOver(from: TopicRecord, to: TopicRecord, turn: TurnContext, context?: InputRecord): Promise<string[]> {
-    const lane = this.lane(to.sessionKey, to.agent);
+    let lane!: Lane;
     const send = async (i: InputRecord) => {
       const { topic: _topic, topicTitle: _title, topicTools: _tools, ...ctx } = i.channelContext;
       // Handed over on purpose: this topic answers it (the session_* tools refuse to move it again).
@@ -754,6 +755,8 @@ export class Gateway {
     };
     const handed: string[] = [];
     try {
+      // Inside the try: a target topic whose agent is gone (`agent_unavailable`) also sends the conversation back.
+      lane = this.lane(to.sessionKey, to.agent);
       if (context) {
         const r = await lane.observe(context);
         if (!r.ok) throw new Error(r.reason);
@@ -1017,6 +1020,8 @@ ${a.summary}` }],
   /** Apply a command from a local client (subscriptions are the server's business). */
   async command(cmd: ClientCommand, origin: Origin): Promise<Outcome> {
     if (this.stopped) return fail('stopped', 'gateway is stopping');
+    // An input's id is fixed before the lane: a refused input is recorded under it.
+    const inputId = cmd.type === 'input' ? (cmd.input.inputId ?? `in_${randomUUID()}`) : undefined;
     let lane: Lane;
     try {
       const live = this.lanes.get(cmd.sessionKey);
@@ -1024,7 +1029,8 @@ ${a.summary}` }],
       lane = live ?? this.lane(cmd.sessionKey);
     } catch (e) {
       if (e instanceof LaneUnavailableError) {
-        await this.refuseUnavailable(cmd.sessionKey, e.code, e.message, cmd.type === 'input' ? cmd.input.inputId : undefined, null);
+        // Only a refused input is written to the session log; other commands just fail.
+        if (inputId !== undefined) await this.refuseUnavailable(cmd.sessionKey, e.code, e.message, inputId, null);
         return fail(e.code, e.message);
       }
       return fail('no_agent', (e as Error).message);
@@ -1041,7 +1047,7 @@ ${a.summary}` }],
           }
         }
         const input: InputRecord = {
-          inputId: cmd.input.inputId ?? `in_${randomUUID()}`,
+          inputId: inputId!,
           origin,
           content,
           replyRoute: localRoute(cmd.sessionKey),
