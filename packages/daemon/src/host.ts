@@ -65,8 +65,13 @@ export function hostOrigin(name: string): Origin {
 
 export const isHostOrigin = (o: Origin) => o.kind === 'system' && o.adapter === 'host';
 
+/** Two takeovers closer than this suggest two live hosts replacing each other. */
+const TAKEOVER_FLAP_MS = 60_000;
+
 export class HostService implements HostFrames {
   private host: { peer: Peer; name: string; consumer?: string; hooks: Set<CalloutHook>; push?: PushSubscription } | undefined;
+  /** When the last host takeover happened (repeated ones within TAKEOVER_FLAP_MS are logged as errors). */
+  private lastTakeover: number | undefined;
   private readonly token: Buffer;
 
   constructor(private readonly d: HostServiceDeps) {
@@ -159,7 +164,13 @@ export class HostService implements HostFrames {
       // The token proves the same authority: the old connection is most likely half-open.
       const old = this.host;
       replaced = old.name;
-      this.d.log('warn', `host ${name} takes over from host ${old.name} (connection ${old.peer.id}); closing the old connection`);
+      // Any token holder may take over, whatever its name, and the old host's runs are interrupted
+      // (gone → runs.peerGone). Two live hosts both reconnecting with takeover would flap:
+      // say so loudly when takeovers come close together.
+      const now = Date.now();
+      const flapping = this.lastTakeover !== undefined && now - this.lastTakeover < TAKEOVER_FLAP_MS;
+      this.lastTakeover = now;
+      this.d.log(flapping ? 'error' : 'warn', `host ${name} takes over from host ${old.name} (connection ${old.peer.id}); closing the old connection${flapping ? `; another takeover came within ${TAKEOVER_FLAP_MS / 1000} s: are two hosts running with the same token?` : ''}`);
       old.peer.end!(`replaced by host ${name} (takeover)`);
       // end() reports the connection gone; make sure the slot is free even if it did not.
       if (this.host === old) this.gone(old.peer);
