@@ -7,7 +7,7 @@ import { isSnapshotEvent, passes } from '@agents-io/session';
 import { FakeChannel, checkEventStream, defaultChannelCaps } from '@agents-io/testkit';
 import type { ClientSubscription } from './client.js';
 import { LocalClient } from './client.js';
-import type { Config } from './config.js';
+import { defaultInstance, withDefaultInstance, type Config, type HarnessInstance } from './config.js';
 import { Gateway } from './gateway.js';
 
 /*
@@ -118,9 +118,9 @@ interface World {
   watch(sessionKey: string, o?: { tier?: 'full' | 'card' | 'headline' | 'final'; fromSeq?: number; client?: LocalClient }): Promise<Watch>;
 }
 
-/** Per-scenario config: temp dirs, no configured channels, e2e owners, local principal. */
+/** Per-scenario config: temp dirs, no configured channels, e2e owners, local principal. Runs the default instance. */
 export function e2eConfig(base: Config, dir: string): Config {
-  const h = base.harness;
+  const { cwd: _cwd, ...h } = defaultInstance(base);
   const options =
     h.kind === 'claude-code'
       ? // No user/project settings: their permission rules would answer approvals the scenario wants to see.
@@ -129,13 +129,14 @@ export function e2eConfig(base: Config, dir: string): Config {
   const profiles =
     h.kind === 'codex' && !h.profiles.restricted ? { ...h.profiles, restricted: { approvalPolicy: 'untrusted', sandbox: 'workspace-write' } } : h.profiles;
   const run = h.kind === 'codex' && !h.run.effort ? { ...h.run, effort: 'low' } : h.run;
+  // Sessions run in the scenario's work dir, not the instance's cwd.
+  const inst = { ...h, options, profiles, run } as HarnessInstance;
   return {
-    ...base,
+    ...withDefaultInstance(base, inst),
     dataDir: dir,
     logPath: join(dir, 'log.sqlite'),
     socketPath: join(dir, 'run', 'aio.sock'),
     cwd: join(dir, 'work'),
-    harness: { ...h, options, profiles, run },
     channels: [],
     policy: { ...base.policy, owners: [...base.policy.owners, 'e2e:alice', 'e2e:bob'], ownerSessionKey: undefined },
     local: { principal: { id: LOCAL, labels: ['owner'] }, session: 'e2e:local' },
@@ -335,7 +336,7 @@ export const SCENARIOS: Scenario[] = [
       const config = e2eConfig(ctx.base, dir);
       // Every turn restricted, every request to the local principal: the opposite of the defaults.
       const policy: Partial<Policy> = {
-        plan: async () => ({ ...config.harness.run, profile: 'restricted' }),
+        plan: async () => ({ ...defaultInstance(config).run, profile: 'restricted' }),
         resolve: async () => ({ kind: 'human', principals: [LOCAL], routes: [] }),
       };
       const w = await world(ctx, { policy, dir, config });
@@ -397,13 +398,16 @@ export const SCENARIOS: Scenario[] = [
   {
     id: 'h',
     name: 'codex-restart-adopt',
-    skip: (c) => (c.harness.kind !== 'codex' ? 'codex unix transport only' : undefined),
+    skip: (c) => (defaultInstance(c).kind !== 'codex' ? 'codex unix transport only' : undefined),
     async run(ctx) {
       const dir = tempDir(ctx, 'aio-h-');
       const base = e2eConfig(ctx.base, dir);
       // Our own detached app-server on a Unix socket, so it outlives the first gateway.
-      const config: Config = { ...base, harness: { ...base.harness, transport: { kind: 'unix', spawn: 'own', stateDir: join(dir, 'cx') } } };
-      ctx.cleanup.push(() => new CodexHarness({ transport: config.harness.transport }).shutdownOwnServer().then(() => undefined));
+      const inst = defaultInstance(base);
+      if (inst.kind !== 'codex') throw new Error('unreachable');
+      const transport = { kind: 'unix', spawn: 'own', stateDir: join(dir, 'cx') } as const;
+      const config = withDefaultInstance(base, { ...inst, codex: { ...inst.codex, transport } });
+      ctx.cleanup.push(() => new CodexHarness({ transport }).shutdownOwnServer().then(() => undefined));
       const sk = 'e2e:local';
       const one = await world(ctx, { dir, config });
       const c1 = await one.client();

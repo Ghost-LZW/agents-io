@@ -5,17 +5,19 @@ import { parseArgs } from 'node:util';
 import type { Tier } from '@agents-io/protocol';
 import { runAttach } from './attach.js';
 import { LocalClient } from './client.js';
-import { ConfigError, loadConfig, type HarnessKind, type LoadOptions } from './config.js';
+import { ConfigError, defaultInstance, loadConfig, type LoadOptions } from './config.js';
 import { runScenarios } from './e2e.js';
 import { Gateway, buildHarness } from './gateway.js';
 
 const USAGE = `aio-dev: agents-io dev gateway (example)
 
-  aio-dev serve     [--harness claude-code|codex]
+  aio-dev serve     [--harness <instance>]
   aio-dev attach    [--session <key>] [--tier full|card|headline|final] [--from <seq>] [--verbose]
   aio-dev send      [--session <key>] [--mode queue|steer|interrupt] [--wait] <text…>
   aio-dev sessions
-  aio-dev e2e       [--harness claude-code|codex] [--only <id|name>[,…]] [--verbose]
+  aio-dev e2e       [--harness <instance>] [--only <id|name>[,…]] [--verbose]
+
+--harness: a name from \`harnesses\` (or claude-code|codex: that kind's first instance)
 
 common: --config <aio.config.json> (or $AIO_CONFIG)  --env-file <.env.live>`;
 
@@ -47,7 +49,6 @@ export function parseCli(argv: string[]): CliArgs {
     },
   });
   const [cmd = 'help', ...rest] = positionals;
-  if (values.harness !== undefined && values.harness !== 'claude-code' && values.harness !== 'codex') throw new ConfigError(`--harness must be claude-code or codex`);
   if (values.tier !== undefined && !TIERS.includes(values.tier)) throw new ConfigError(`--tier must be one of ${TIERS.join(', ')}`);
   if (values.from !== undefined && !/^\d+$/.test(values.from)) throw new ConfigError('--from must be a seq number');
   if (values.mode !== undefined && !['queue', 'steer', 'interrupt'].includes(values.mode)) throw new ConfigError('--mode must be queue, steer or interrupt');
@@ -58,7 +59,7 @@ function config(a: CliArgs, extra: Partial<LoadOptions> = {}) {
   return loadConfig({
     ...(typeof a.values.config === 'string' ? { path: a.values.config } : {}),
     ...(typeof a.values['env-file'] === 'string' ? { envFile: a.values['env-file'] } : {}),
-    ...(typeof a.values.harness === 'string' ? { harness: a.values.harness as HarnessKind } : {}),
+    ...(typeof a.values.harness === 'string' ? { harness: a.values.harness } : {}),
     ...extra,
   });
 }
@@ -68,12 +69,14 @@ async function serve(a: CliArgs): Promise<number> {
   const gw = await Gateway.start({ config: c, logger: (level, msg) => console.error(`[aio] ${level}: ${msg}`) });
   let version = 'not probed';
   try {
-    version = (await gw.harness.probe()).version;
+    version = (await gw.harness().probe()).version;
   } catch (e) {
     console.error(`[aio] warn: harness probe failed: ${(e as Error).message}`);
   }
   console.error(`[aio] serving on ${c.socketPath}`);
-  console.error(`[aio] harness ${c.harness.kind} (${version}); log ${c.logPath}; local principal ${c.local.principal.id}; default session ${c.local.session}`);
+  // Names and kinds only: instance env values are secrets.
+  const instances = Object.values(c.harnesses).map((i) => `${i.name} (${i.kind}${i.name === c.defaultHarness ? `, default, ${version}` : ''})`);
+  console.error(`[aio] harnesses: ${instances.join(', ')}; log ${c.logPath}; local principal ${c.local.principal.id}; default session ${c.local.session}`);
   console.error(`[aio] channels: ${c.channels.map((ch) => ch.type).join(', ') || 'none'}; owners: ${c.policy.owners.length}`);
   await new Promise<void>((resolve) => {
     let stopping = false;
@@ -142,9 +145,10 @@ async function sessions(a: CliArgs): Promise<number> {
 
 async function e2e(a: CliArgs): Promise<number> {
   const c = config(a, { channels: false });
-  const probe = await buildHarness(c.harness).probe();
-  const modelFrom = process.env[c.harness.kind === 'codex' ? 'AGENTS_IO_LIVE_CODEX_MODEL' : 'AGENTS_IO_LIVE_CLAUDE_MODEL'] ? 'env' : 'config/default';
-  console.log(`e2e against ${c.harness.kind}: ${probe.version}; model from ${modelFrom}`);
+  const inst = defaultInstance(c);
+  const probe = await buildHarness(inst).probe();
+  const modelFrom = process.env[inst.kind === 'codex' ? 'AGENTS_IO_LIVE_CODEX_MODEL' : 'AGENTS_IO_LIVE_CLAUDE_MODEL'] ? 'env' : 'config/default';
+  console.log(`e2e against ${inst.name} (${inst.kind}): ${probe.version}; model ${inst.run.model || '(codex default)'} from ${modelFrom}`);
   const only = typeof a.values.only === 'string' ? a.values.only.split(',').map((s) => s.trim()) : undefined;
   const results = await runScenarios(c, { ...(only ? { only } : {}), verbose: a.values.verbose === true });
   const n = (s: string) => results.filter((r) => r.status === s).length;

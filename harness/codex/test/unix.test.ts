@@ -1,10 +1,10 @@
-import { chmodSync, chmodSync as chmod, existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, chmodSync as chmod, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { HarnessEvent, HarnessSession, InputRecord } from '@agents-io/protocol';
 import { assertConformingStream } from '@agents-io/testkit';
-import { CodexHarness, type CodexHarnessOptions } from '../src/index.js';
+import { CodexHarness, launchFlags, tomlValue, type CodexHarnessOptions } from '../src/index.js';
 import { pidAlive } from '../src/unix.js';
 import { FakeAppServer } from './fake-app-server.js';
 
@@ -250,4 +250,71 @@ describe("spawn: 'own'", () => {
     for (let i = 0; i < 50 && pidAlive(state.pid); i++) await tick(20);
     expect(pidAlive(state.pid)).toBe(false);
   }, 20_000);
+});
+
+describe('launch settings (named instances)', () => {
+  const bin = join(import.meta.dirname, 'fixtures', 'fake-codex.mjs');
+
+  it('-c values are inline TOML; keys and feature names are checked', () => {
+    expect(launchFlags({ config: { model: 'gpt-x', model_reasoning_effort: 'low', 'shell_environment_policy.inherit': 'all', n: 3, ok: true, list: ['a', 'b"c'], 'mcp_servers.docs': { url: 'http://d', 'odd key': 1 } }, enable: ['web_search'], disable: ['undo'] })).toEqual([
+      '-c', 'model="gpt-x"',
+      '-c', 'model_reasoning_effort="low"',
+      '-c', 'shell_environment_policy.inherit="all"',
+      '-c', 'n=3',
+      '-c', 'ok=true',
+      '-c', 'list=["a", "b\\"c"]',
+      '-c', 'mcp_servers.docs={ url = "http://d", "odd key" = 1 }',
+      '--enable', 'web_search',
+      '--disable', 'undo',
+    ]);
+    expect(launchFlags({ config: { 'mcp_servers."my server".url': 'u' } })).toEqual(['-c', 'mcp_servers."my server".url="u"']);
+    expect(() => launchFlags({ config: { 'a b': 1 } })).toThrow(/not a dotted TOML key/);
+    expect(() => launchFlags({ config: { 'x=y': 1 } })).toThrow(/not a dotted TOML key/);
+    expect(() => launchFlags({ enable: ['--evil'] })).toThrow(/feature name/);
+    expect(() => tomlValue(null, 'config.k')).toThrow('config.k: null cannot be written as TOML');
+  });
+
+  it('stdio: launch flags follow app-server; env is merged over process.env and CODEX_HOME set', async () => {
+    const dir = privDir();
+    const out = join(dir, 'seen.json');
+    const fake = join(dir, 'codex');
+    writeFileSync(fake, `#!/bin/sh\nprintf '%s|%s|%s|%s' "$*" "$CODEX_HOME" "$AIO_T_INHERITED" "$AIO_T_REMOVED" > "${out}"\nexit 3\n`, { mode: 0o755 });
+    process.env.AIO_T_INHERITED = 'yes';
+    process.env.AIO_T_REMOVED = 'should-go';
+    try {
+      const h = new CodexHarness({ bin: fake, codexHome: join(dir, 'home'), env: { AIO_T_REMOVED: undefined, CODEX_HOME: '/loses' }, config: { model: 'm' }, disable: ['undo'], handshakeTimeoutMs: 2000 });
+      await expect(h.probe()).rejects.toThrow();
+      expect(readFileSync(out, 'utf8')).toBe(`app-server -c model="m" --disable undo|${join(dir, 'home')}|yes|`);
+    } finally {
+      delete process.env.AIO_T_INHERITED;
+      delete process.env.AIO_T_REMOVED;
+    }
+  });
+
+  it('own: the detached server gets the flags and CODEX_HOME; other settings on the same stateDir are refused', async () => {
+    chmod(bin, 0o755);
+    const dir = privDir();
+    const stateDir = join(dir, 'state');
+    const seen = join(dir, 'argv.json');
+    const opts: CodexHarnessOptions = { bin, codexHome: join(dir, 'home'), env: { FAKE_CODEX_ARGV: seen, FAKE_SECRET: 's3' }, config: { model: 'gpt-x' }, enable: ['f1'], transport: { kind: 'unix', spawn: 'own', stateDir } };
+    const a = new CodexHarness(opts);
+    cleanups.push(() => a.shutdownOwnServer());
+    await a.probe();
+    const got = JSON.parse(readFileSync(seen, 'utf8'));
+    expect(got.argv).toEqual(['app-server', '--listen', `unix://${join(stateDir, 'app-server.sock')}`, '-c', 'model="gpt-x"', '--enable', 'f1']);
+    expect(got.codexHome).toBe(join(dir, 'home'));
+    expect(got.secret).toBe('s3');
+    const state = readFileSync(join(stateDir, 'server.json'), 'utf8');
+    expect(JSON.parse(state).launch).toMatch(/^[0-9a-f]{16}$/);
+    expect(state).not.toContain('gpt-x'); // fingerprint only, no values
+    // Same settings: reattach. Different settings: refused, never silently shared.
+    await new CodexHarness(opts).probe();
+    await expect(new CodexHarness({ ...opts, config: { model: 'other' } }).probe()).rejects.toThrow(/started with other settings/);
+    await expect(new CodexHarness({ ...opts, codexHome: join(dir, 'home2') }).probe()).rejects.toThrow(/started with other settings/);
+  }, 20_000);
+
+  it('config/enable/disable need a server the adapter starts', () => {
+    expect(() => new CodexHarness({ config: { model: 'x' }, transport: { kind: 'unix', spawn: 'daemon' } })).toThrow(/not unix spawn 'daemon'/);
+    expect(() => new CodexHarness({ enable: ['x'], transport: { kind: 'unix', spawn: 'none' } })).toThrow(/not unix spawn 'none'/);
+  });
 });

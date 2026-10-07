@@ -396,3 +396,51 @@ describe('Lane: host restart', () => {
     expect(a.hub.snapshot('s1').turn?.turnId).toBe(h2.session!.starts[0]!.turnId);
   });
 });
+
+describe('Lane: named harness instances', () => {
+  it('opens the adapter the turn names, attributes events to it, and switches generations when the plan changes it', async () => {
+    const a = new FakeHarness(undefined, 'inst-a');
+    const b = new FakeHarness(undefined, 'inst-b');
+    let use = 'inst-a';
+    const resumed: string[] = [];
+    const pick = (name: string) => {
+      if (name === 'inst-a') return a;
+      if (name === 'inst-b') return b;
+      throw new Error(`no harness ${name}`);
+    };
+    const { lane, events } = setup({
+      harness: a,
+      harnessFor: pick,
+      resumeFor: (id) => (resumed.push(id), id === 'inst-b' ? 'native-b-old' : undefined),
+      policy: policy({ plan: async () => ({ harness: use, model: 'm', profile: 'bypass' }) }),
+    });
+    const send = async (text: string) => {
+      await lane.command({ type: 'input', sessionKey: 's1', input: input(text), mode: 'queue' });
+      await lane.whenIdle();
+    };
+    await send('one');
+    await send('two');
+    expect(a.sessions).toHaveLength(1);
+    use = 'inst-b';
+    await send('three');
+    expect(b.sessions).toHaveLength(1);
+    expect(b.sessions[0]!.args).toMatchObject({ run: { harness: 'inst-b' }, resume: 'native-b-old', generation: 2 });
+    expect(resumed).toEqual(['inst-a', 'inst-b']);
+    const evs = events();
+    const turns = evs.filter((e) => e.body.t === 'turn.completed');
+    expect(turns.map((e) => [e.harness, e.generation])).toEqual([
+      ['inst-a', 1],
+      ['inst-a', 1],
+      ['inst-b', 2],
+    ]);
+    expect(bodies(evs, 'notice')).toContainEqual(expect.objectContaining({ code: 'runtime_restart', message: 'switching harness inst-a → inst-b' }));
+    // Nothing from the closed inst-a binding is recorded after the switch.
+    const switchAt = evs.findIndex((e) => e.body.t === 'notice');
+    expect(evs.slice(switchAt + 1).filter((e) => e.harness === 'inst-a')).toEqual([]);
+
+    // An unknown instance rejects the turn's inputs instead of wedging the lane.
+    use = 'nope';
+    await send('four');
+    expect(bodies(events(), 'input.rejected').at(-1)).toMatchObject({ reason: 'start_failed: no harness nope' });
+  });
+});

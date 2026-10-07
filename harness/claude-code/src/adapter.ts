@@ -6,7 +6,7 @@ import { delimiter, dirname, join } from 'node:path';
 import type { HarnessAdapter, HarnessCaps, HarnessOpenArgs, HarnessSession } from '@agents-io/protocol';
 import { AsyncQueue } from './queue.js';
 import { ClaudeCodeSession, defaultProfile, isEffort } from './session.js';
-import type { ClaudeCodeOptions, Options, QueryFn, SDKUserMessage } from './types.js';
+import type { ClaudeCodeOptions, ClaudeProfile, Options, QueryFn, SDKUserMessage } from './types.js';
 
 /** SDK 0.x: the minor is the breaking component. */
 export const SUPPORTED_SDK = /^0\.3\./;
@@ -28,9 +28,40 @@ export const claudeCodeCaps: HarnessCaps = {
   switchProfileMidSession: false,
 };
 
+/**
+ * How this adapter launches Claude Code: one value per deployment harness
+ * instance. Everything is optional; omitted means the CLI's own default.
+ */
 export interface ClaudeCodeHarnessConfig {
   /** Path of the `claude` CLI to drive (default: first `claude` on PATH). */
   claudePath?: string;
+  /**
+   * Environment for the CLI, over `process.env` (an `undefined` value removes
+   * the variable). Per-open `ClaudeCodeOptions.env` goes over this.
+   */
+  env?: Record<string, string | undefined>;
+  /**
+   * Claude Code's config directory (`CLAUDE_CONFIG_DIR`, default `~/.claude`):
+   * login, user settings, user skills/agents/commands, session transcripts.
+   * Wins over `env.CLAUDE_CONFIG_DIR`.
+   */
+  configDir?: string;
+  /** Flag-layer settings: a settings.json path or an object (SDK `settings`, CLI `--settings`). */
+  settings?: Options['settings'];
+  /** Filesystem settings to load (SDK `settingSources`; `[]` = none, omitted = all). */
+  settingSources?: Options['settingSources'];
+  /** MCP servers for every session (the host's `HarnessOpenArgs.mcp` server is added on top). */
+  mcpServers?: Options['mcpServers'];
+  /** Local plugin directories (SDK `plugins: [{ type: 'local', path }]`, CLI `--plugin-dir`). */
+  plugins?: string[];
+  /** Skills to enable (SDK `skills`): `'all'` or names. Omitted: the CLI's defaults. */
+  skills?: Options['skills'];
+  /** Extra CLI flags (SDK `extraArgs`: name without `--` → value, `null` for a bare flag). */
+  extraArgs?: Record<string, string | null>;
+  /** Directories every session may access besides `cwd` (merged with the profile's). */
+  additionalDirectories?: string[];
+  /** Profile name → native settings, defaults for every session (per-open `options.profiles` win). */
+  profiles?: Record<string, ClaudeProfile>;
   /** Injected `query` (tests). Default: the Agent SDK's. */
   query?: QueryFn;
   /** Override detected versions (tests). */
@@ -57,9 +88,9 @@ export function readSdkVersion(): string {
   return (JSON.parse(readFileSync(join(dirname(entry), 'package.json'), 'utf8')) as { version: string }).version;
 }
 
-export function cliVersionOf(path: string): Promise<string> {
+export function cliVersionOf(path: string, env?: NodeJS.ProcessEnv): Promise<string> {
   return new Promise((resolve, reject) =>
-    execFile(path, ['--version'], { timeout: 15_000 }, (err, stdout) => {
+    execFile(path, ['--version'], { timeout: 15_000, ...(env ? { env } : {}) }, (err, stdout) => {
       if (err) return reject(new Error(`cannot run ${path} --version: ${err.message}`));
       const m = /(\d+\.\d+\.\d+)/.exec(stdout);
       if (!m) return reject(new Error(`unrecognized ${path} --version output: ${stdout.trim()}`));
@@ -92,10 +123,25 @@ export class ClaudeCodeHarness implements HarnessAdapter {
     return p;
   }
 
+  /** process.env < config.env < CLAUDE_CONFIG_DIR < per-open env; undefined values removed. */
+  private childEnv(extra?: Record<string, string | undefined>): Record<string, string> {
+    const env: Record<string, string | undefined> = {
+      ...process.env,
+      CLAUDE_AGENT_SDK_CLIENT_APP: 'agents-io/0.1.0',
+      ...this.config.env,
+      ...(this.config.configDir ? { CLAUDE_CONFIG_DIR: this.config.configDir } : {}),
+      ...extra,
+    };
+    // A restart must not silently re-run side effects of an interrupted turn.
+    delete env.CLAUDE_CODE_RESUME_INTERRUPTED_TURN;
+    for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
+    return env as Record<string, string>;
+  }
+
   probe(): Promise<{ version: string; caps: HarnessCaps }> {
     this.probed ??= (async () => {
       const sdk = this.config.sdkVersion ?? readSdkVersion();
-      const cli = await (this.config.cliVersion ?? (() => cliVersionOf(this.claudePath())))();
+      const cli = await (this.config.cliVersion ?? (() => cliVersionOf(this.claudePath(), this.childEnv())))();
       assertSupported(sdk, cli);
       return { version: `claude-code ${cli} (agent-sdk ${sdk})`, caps: claudeCodeCaps };
     })();
@@ -105,7 +151,9 @@ export class ClaudeCodeHarness implements HarnessAdapter {
 
   async open(args: HarnessOpenArgs): Promise<HarnessSession> {
     await this.probe();
-    const options = (args.options ?? {}) as ClaudeCodeOptions;
+    const c = this.config;
+    const given = (args.options ?? {}) as ClaudeCodeOptions;
+    const options: ClaudeCodeOptions = { ...given, profiles: { ...c.profiles, ...given.profiles } };
     const profile = options.profiles?.[args.run.profile] ?? defaultProfile(args.run.profile);
     const permissionMode = profile.permissionMode ?? 'default'; // never omit: the CLI default may be 'auto'
     const sessionId = args.resume ?? randomUUID();
@@ -121,15 +169,9 @@ export class ClaudeCodeHarness implements HarnessAdapter {
       stderrTail: () => stderr.slice(-20).join('').trim(),
     });
 
-    const env: Record<string, string | undefined> = {
-      ...process.env,
-      CLAUDE_AGENT_SDK_CLIENT_APP: 'agents-io/0.1.0',
-      ...options.env,
-    };
-    // A restart must not silently re-run side effects of an interrupted turn.
-    delete env.CLAUDE_CODE_RESUME_INTERRUPTED_TURN;
+    const env = this.childEnv(options.env);
 
-    const mcpServers: Options['mcpServers'] = { ...(options.sdk?.mcpServers ?? {}) };
+    const mcpServers: Options['mcpServers'] = { ...c.mcpServers, ...options.sdk?.mcpServers };
     if (args.mcp) {
       mcpServers[options.mcpServerName ?? 'agents_io'] = {
         type: options.mcpTransport ?? 'http',
@@ -138,7 +180,13 @@ export class ClaudeCodeHarness implements HarnessAdapter {
       };
     }
 
+    const additionalDirectories = [...new Set([...(c.additionalDirectories ?? []), ...(profile.additionalDirectories ?? [])])];
     const sdkOptions: Options = {
+      ...(c.settings !== undefined ? { settings: c.settings } : {}),
+      ...(c.settingSources ? { settingSources: c.settingSources } : {}),
+      ...(c.plugins?.length ? { plugins: c.plugins.map((path) => ({ type: 'local' as const, path })) } : {}),
+      ...(c.skills !== undefined ? { skills: c.skills } : {}),
+      ...(c.extraArgs ? { extraArgs: c.extraArgs } : {}),
       ...options.sdk,
       cwd: args.cwd,
       model: args.run.model,
@@ -147,7 +195,7 @@ export class ClaudeCodeHarness implements HarnessAdapter {
       ...(permissionMode === 'bypassPermissions' ? { allowDangerouslySkipPermissions: true } : {}),
       ...(profile.allowedTools ? { allowedTools: profile.allowedTools } : {}),
       ...(profile.disallowedTools ? { disallowedTools: profile.disallowedTools } : {}),
-      ...(profile.additionalDirectories ? { additionalDirectories: profile.additionalDirectories } : {}),
+      ...(additionalDirectories.length ? { additionalDirectories } : {}),
       permissionPrompts: profile.permissionPrompts ?? 'host',
       // bypassPermissions never consults canUseTool (the SDK warns when both are set).
       ...(permissionMode === 'bypassPermissions' ? {} : { canUseTool: session.canUseTool }),

@@ -1,16 +1,35 @@
 {
   "dataDir": "~/.agents-io/dev-gateway",
-  "harness": {
-    "use": "claude-code",
-    "claude-code": {
+  "defaultHarness": "claude",
+  "harnesses": {
+    "claude": {
+      "use": "claude-code",
       "run": { "model": "haiku" },
       "profiles": {
         "bypass": { "permissionMode": "bypassPermissions" },
         "restricted": { "permissionMode": "default" }
       }
     },
+    "claude-gateway": {
+      "use": "claude-code",
+      "configDir": "~/.agents-io/claude-gateway",
+      "env": {
+        "ANTHROPIC_BASE_URL": "env:GATEWAY_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN": "env:GATEWAY_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY": null
+      },
+      "run": { "model": "gemini-3.8-flash-high" },
+      "settingSources": ["user"],
+      "profiles": {
+        "bypass": { "permissionMode": "bypassPermissions" },
+        "restricted": { "permissionMode": "default" }
+      }
+    },
     "codex": {
+      "use": "codex",
+      "home": "~/.agents-io/codex-home",
       "run": { "effort": "low" },
+      "config": { "model_reasoning_summary": "concise" },
       "profiles": {
         "bypass": { "approvalPolicy": "never", "sandbox": "workspace-write" },
         "restricted": { "approvalPolicy": "untrusted", "sandbox": "workspace-write" }

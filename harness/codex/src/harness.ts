@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import type { HarnessAdapter, HarnessCaps, HarnessOpenArgs, HarnessSession } from '@agents-io/protocol';
 import type { ClientInfo } from './generated/ClientInfo.js';
@@ -57,9 +58,24 @@ export type CodexTransportOption =
 export interface CodexHarnessOptions {
   /** codex binary (default `codex`). */
   bin?: string;
-  /** Arguments after the binary for stdio (default `['app-server']`). */
+  /** Arguments after the binary for stdio (default `['app-server']`); launch flags are appended. */
   args?: string[];
+  /** Environment for the app-server, over `process.env` (an `undefined` value removes the variable). */
   env?: NodeJS.ProcessEnv;
+  /**
+   * `CODEX_HOME` (default `~/.codex`): config.toml, auth, sessions, skills.
+   * Wins over `env.CODEX_HOME`. Each distinct home needs its own app-server.
+   */
+  codexHome?: string;
+  /**
+   * Config overrides for the app-server process: dotted key → value, passed as
+   * `-c key=<TOML value>` (strings quoted, arrays/objects as inline TOML).
+   * Only for servers this adapter starts (stdio, unix `own`).
+   */
+  config?: Record<string, unknown>;
+  /** Features to turn on/off (`--enable NAME` / `--disable NAME`). Same restriction as `config`. */
+  enable?: string[];
+  disable?: string[];
   /** Transport (default stdio), or a factory for a custom one (tests). */
   transport?: CodexTransportOption | (() => Transport | Promise<Transport>);
   clientInfo?: ClientInfo;
@@ -92,24 +108,73 @@ interface Connector {
   stopWhenIdle: boolean;
 }
 
+/** `env` over process.env, `CODEX_HOME` from `codexHome`, undefined values removed. */
+export function codexEnv(opts: Pick<CodexHarnessOptions, 'env' | 'codexHome'>): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...opts.env, ...(opts.codexHome ? { CODEX_HOME: opts.codexHome } : {}) };
+  for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
+  return env;
+}
+
+const SEG = String.raw`(?:[A-Za-z0-9_][A-Za-z0-9_-]*|"[^"\\]*")`;
+const KEY = new RegExp(String.raw`^${SEG}(?:\.${SEG})*$`);
+const FEATURE = /^[A-Za-z0-9_][A-Za-z0-9_-]*$/;
+
+/** A JSON value as an inline TOML value (what `codex -c key=value` parses). */
+export function tomlValue(v: unknown, where = 'value'): string {
+  if (typeof v === 'string') return JSON.stringify(v); // JSON string escapes are valid TOML basic-string escapes
+  if (typeof v === 'boolean') return String(v);
+  if (typeof v === 'number') {
+    if (!Number.isFinite(v)) throw new Error(`${where}: TOML has no ${v}`);
+    return String(v);
+  }
+  if (Array.isArray(v)) return `[${v.map((x, i) => tomlValue(x, `${where}[${i}]`)).join(', ')}]`;
+  if (v && typeof v === 'object') {
+    const parts = Object.entries(v).map(([k, x]) => `${/^[A-Za-z0-9_-]+$/.test(k) ? k : JSON.stringify(k)} = ${tomlValue(x, `${where}.${k}`)}`);
+    return `{ ${parts.join(', ')} }`;
+  }
+  throw new Error(`${where}: ${v === null ? 'null' : typeof v} cannot be written as TOML`);
+}
+
+/** `-c key=value`, `--enable`, `--disable` flags for `codex app-server`. Throws on keys/names codex would misparse. */
+export function launchFlags(opts: Pick<CodexHarnessOptions, 'config' | 'enable' | 'disable'>): string[] {
+  const out: string[] = [];
+  for (const [k, v] of Object.entries(opts.config ?? {})) {
+    if (!KEY.test(k)) throw new Error(`@agents-io/harness-codex: config key ${JSON.stringify(k)} is not a dotted TOML key`);
+    out.push('-c', `${k}=${tomlValue(v, `config.${k}`)}`);
+  }
+  for (const [flag, names] of [['--enable', opts.enable], ['--disable', opts.disable]] as const) {
+    for (const n of names ?? []) {
+      if (!FEATURE.test(n)) throw new Error(`@agents-io/harness-codex: feature name ${JSON.stringify(n)} is invalid`);
+      out.push(flag, n);
+    }
+  }
+  return out;
+}
+
 function makeConnector(opts: CodexHarnessOptions): Connector {
   const t = opts.transport;
   const bin = opts.bin ?? 'codex';
+  const env = codexEnv(opts);
+  const flags = launchFlags(opts);
   if (typeof t === 'function') return { open: async () => t(), reconnect: false, reconnectWindowMs: 0, stopWhenIdle: true };
   if (!t || t.kind === 'stdio') {
     return {
-      open: async () => spawnTransport({ bin, args: opts.args ?? ['app-server'], env: opts.env }),
+      open: async () => spawnTransport({ bin, args: [...(opts.args ?? ['app-server']), ...flags], env }),
       reconnect: false,
       reconnectWindowMs: 0,
       stopWhenIdle: true,
     };
   }
+  if (t.spawn !== 'own' && flags.length)
+    throw new Error(`@agents-io/harness-codex: config/enable/disable need a server this adapter starts (stdio or unix spawn 'own'), not unix spawn '${t.spawn}'`);
   const stateDir = t.stateDir ?? defaultStateDir();
+  // Identifies how the server was launched, so a host never reattaches to one started for other settings.
+  const launch = createHash('sha256').update(JSON.stringify([bin, env.CODEX_HOME ?? '', flags])).digest('hex').slice(0, 16);
   const open = async (): Promise<Transport> => {
     let path: string;
-    if (t.spawn === 'own') path = (await ensureOwnServer({ stateDir, socket: t.path, bin, env: opts.env })).socket;
-    else if (t.spawn === 'daemon') path = t.path ?? (await startDaemon(bin, opts.env)).socket;
-    else path = t.path ?? defaultCodexSocket(opts.env);
+    if (t.spawn === 'own') path = (await ensureOwnServer({ stateDir, socket: t.path, bin, env, args: flags, launch })).socket;
+    else if (t.spawn === 'daemon') path = t.path ?? (await startDaemon(bin, env)).socket;
+    else path = t.path ?? defaultCodexSocket(env);
     if (!t.allowInsecureSocket) assertPrivateSocket(path);
     return connectUnix(path, opts.handshakeTimeoutMs ?? 10_000);
   };
