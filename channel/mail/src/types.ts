@@ -87,9 +87,14 @@ export interface AttachmentBlob {
   content: Buffer;
 }
 
-/** Where attachment bytes go. They are never inlined into envelopes. */
+/**
+ * Where attachment bytes go. They are never inlined into envelopes. A sink that
+ * returns a ref (e.g. a host `BlobStore`'s `sha256:<hex>`) turns the attachment into
+ * an `image`/`file` block with that ref; one that returns nothing leaves a
+ * `mail-attachment:<uid>/<index>` ref block.
+ */
 export interface BlobSink {
-  put(blob: AttachmentBlob): Promise<void>;
+  put(blob: AttachmentBlob): Promise<string | void>;
 }
 
 export interface FetchedMail {

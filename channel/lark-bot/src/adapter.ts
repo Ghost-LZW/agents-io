@@ -2,6 +2,7 @@ import type {
   ChannelAdapter,
   ChannelCaps,
   ChannelContext,
+  InboundEnvelope,
   ProgressView,
   RenderedMessage,
   ReplyRoute,
@@ -11,6 +12,7 @@ import type {
 import { CardKitCard, LarkApiError, errCode } from './cardkit.js';
 import { resolveConfig, type LarkBotConfig, type ResolvedConfig } from './config.js';
 import { CotBubble } from './cot.js';
+import { InboundEnricher } from './enrich.js';
 import { CHANNEL_ID, mapCardAction, mapMessageEvent } from './inbound.js';
 import {
   EL,
@@ -128,6 +130,9 @@ export class LarkBotAdapter implements ChannelAdapter {
   /** `app` or `chat:<id>` → thinking bubble off until a time. */
   private readonly cotOff = new Map<string, number>();
   private readonly cotTasks = new Set<Promise<void>>();
+  private readonly enricher: InboundEnricher;
+  /** chat id → enrichment of its previous message, so messages reach the host in order. */
+  private readonly inboundTails = new Map<string, Promise<void>>();
 
   constructor(config: LarkBotConfig, opts: LarkBotOptions = {}) {
     this.cfg = resolveConfig(config);
@@ -138,6 +143,7 @@ export class LarkBotAdapter implements ChannelAdapter {
     this.dedup = new DedupWindow(this.cfg.dedupWindowMs, 10_000, this.now);
     this.botOpenId = this.cfg.botOpenId;
     this.logFn = opts.log;
+    this.enricher = new InboundEnricher({ client: () => this.client, store: this.store, cfg: this.cfg, now: this.now, log: (l, m) => this.log(l, m) });
   }
 
   caps(_account?: string): ChannelCaps {
@@ -251,7 +257,23 @@ export class LarkBotAdapter implements ChannelAdapter {
       this.dedup.delete(key);
       return;
     }
-    await this.deliver(ctx, key, () => ctx.emit(env));
+    await this.deliver(ctx, key, () => this.enrichThenEmit(ctx, ev.message.chat_id, env));
+  }
+
+  /**
+   * Media download, quoted text and sender name need the network, so they run inside the
+   * thunk `deliver` waits on: the event is acked by `ackTimeoutMs` even while they continue.
+   * Per chat they are chained, so a slow download never lets a later message overtake it.
+   */
+  private enrichThenEmit(ctx: ChannelContext, chatId: string, env: InboundEnvelope): Promise<unknown> {
+    const prev = this.inboundTails.get(chatId) ?? Promise.resolve();
+    const ready = prev.then(() => this.enricher.enrich(env, ctx.blobs)).catch(() => env);
+    const tail = ready.then(() => undefined);
+    this.inboundTails.set(chatId, tail);
+    void tail.then(() => {
+      if (this.inboundTails.get(chatId) === tail) this.inboundTails.delete(chatId);
+    });
+    return ready.then((e) => ctx.emit(e));
   }
 
   private async onCardAction(ctx: ChannelContext, ev: RawCardActionEvent): Promise<Record<string, never>> {

@@ -34,6 +34,8 @@ import type { TurnPlanUpdatedNotification } from './generated/v2/TurnPlanUpdated
 import type { ItemStartedNotification } from './generated/v2/ItemStartedNotification.js';
 import type { ItemCompletedNotification } from './generated/v2/ItemCompletedNotification.js';
 import type { AgentMessageDeltaNotification } from './generated/v2/AgentMessageDeltaNotification.js';
+import type { ReasoningSummaryTextDeltaNotification } from './generated/v2/ReasoningSummaryTextDeltaNotification.js';
+import type { ReasoningTextDeltaNotification } from './generated/v2/ReasoningTextDeltaNotification.js';
 import type { McpToolCallProgressNotification } from './generated/v2/McpToolCallProgressNotification.js';
 import type { ServerRequestResolvedNotification } from './generated/v2/ServerRequestResolvedNotification.js';
 import type { ModelReroutedNotification } from './generated/v2/ModelReroutedNotification.js';
@@ -91,6 +93,8 @@ interface Turn {
   consumed: Set<string>;
   openItems: Map<string, ItemSummary>;
   itemAudience: Map<string, Audience>;
+  /** Reasoning item → which delta stream it uses and the last part index seen. */
+  reasoning: Map<string, { kind: 'summary' | 'raw'; part: number }>;
   usage?: unknown;
   error?: TurnError;
   lastAnswer?: { itemId: string; text: string };
@@ -380,7 +384,17 @@ export class CodexSession implements HarnessSession {
         } else if (method === 'item/commandExecution/outputDelta') {
           this.emit({ t: 'text.delta', delta: p.delta, stream: 'command_output' }, { turnId: t.turnId, itemId: p.itemId, level: 'detail' });
         } else {
-          this.emit({ t: 'text.delta', delta: p.delta, stream: 'reasoning' }, { turnId: t.turnId, itemId: p.itemId, level: 'detail', audience: 'internal' });
+          // Reasoning reaches participants like Claude's thinking (`commentary`, detail level), so
+          // process UIs (the Lark thinking bubble) show it. One stream per item (the first seen:
+          // summary or raw text), so a model sending both is not shown twice; a new part starts a paragraph.
+          const kind = method === 'item/reasoning/summaryTextDelta' ? 'summary' : 'raw';
+          let r = t.reasoning.get(p.itemId);
+          if (!r) t.reasoning.set(p.itemId, (r = { kind, part: -1 }));
+          if (r.kind !== kind) return;
+          const part = kind === 'summary' ? (params as ReasoningSummaryTextDeltaNotification).summaryIndex : (params as ReasoningTextDeltaNotification).contentIndex;
+          const delta = r.part >= 0 && part !== r.part ? `\n\n${p.delta}` : p.delta;
+          r.part = part;
+          this.emit({ t: 'text.delta', delta, stream: 'reasoning' }, { turnId: t.turnId, itemId: p.itemId, level: 'detail', audience: 'commentary' });
         }
         return;
       }
@@ -699,6 +713,7 @@ export class CodexSession implements HarnessSession {
       consumed: new Set(),
       openItems: new Map(),
       itemAudience: new Map(),
+      reasoning: new Map(),
       done: false,
       finished,
       finish: finishFn,

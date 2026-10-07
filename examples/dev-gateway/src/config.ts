@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { Type, type Static } from '@sinclair/typebox';
 import { Tier, errors, type Principal, type RunSpec } from '@agents-io/protocol';
+import { DEFAULT_BLOB_MAX_BYTES } from '@agents-io/session';
 import { loadEnvFile } from '@agents-io/testkit';
 import type { CodexTransportOption } from '@agents-io/harness-codex';
 
@@ -146,6 +147,12 @@ export const ConfigFile = Type.Object(
     logPath: Type.Optional(Type.String()),
     /** Local client socket (default <dataDir>/run/aio.sock; its directory is made 0700). */
     socketPath: Type.Optional(Type.String()),
+    /**
+     * Content-addressed store for inbound media (`sha256:<hex>` refs): Lark images/files and
+     * mail attachments are kept here and handed to the harnesses. Default dir <dataDir>/blobs,
+     * maxBytes 20 MiB per blob.
+     */
+    blobs: Type.Optional(Type.Object({ dir: Type.Optional(Type.String()), maxBytes: Type.Optional(Type.Number({ minimum: 1 })) }, Closed)),
     /** Working directory for harness sessions (default: the current directory). */
     cwd: Type.Optional(Type.String()),
     /** Named harness instances; `RunSpec.harness` is the name. Each entry is checked against its `use`. */
@@ -241,6 +248,8 @@ export interface Config {
   dataDir: string;
   logPath: string;
   socketPath: string;
+  /** Blob store directory (0700) and per-blob limit. */
+  blobs: { dir: string; maxBytes: number };
   cwd: string;
   /** Named harness instances. */
   harnesses: Record<string, HarnessInstance>;
@@ -338,6 +347,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     dataDir,
     logPath: path(c.logPath ?? join(dataDir, 'log.sqlite')),
     socketPath: path(c.socketPath ?? join(dataDir, 'run', 'aio.sock')),
+    blobs: { dir: path(c.blobs?.dir ?? join(dataDir, 'blobs')), maxBytes: c.blobs?.maxBytes ?? DEFAULT_BLOB_MAX_BYTES },
     cwd: path(c.cwd ?? ctx.cwd ?? process.cwd()),
     harnesses,
     defaultHarness,

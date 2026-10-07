@@ -136,6 +136,7 @@ export function e2eConfig(base: Config, dir: string): Config {
     dataDir: dir,
     logPath: join(dir, 'log.sqlite'),
     socketPath: join(dir, 'run', 'aio.sock'),
+    blobs: { ...base.blobs, dir: join(dir, 'blobs') },
     cwd: join(dir, 'work'),
     channels: [],
     policy: { ...base.policy, owners: [...base.policy.owners, 'e2e:alice', 'e2e:bob'], ownerSessionKey: undefined },

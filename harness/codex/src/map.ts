@@ -153,7 +153,8 @@ export function summarizeItem(item: ThreadItem, cwd?: string): MappedItem | unde
     case 'reasoning':
       return {
         summary: { ...base('reasoning', clip(item.summary.join(' ') || 'Reasoning'), 'completed') },
-        audience: 'internal',
+        // Visible to participants like Claude's thinking; process UIs fold it into a reasoning step.
+        audience: 'commentary',
         level: 'detail',
       };
     case 'commandExecution': {

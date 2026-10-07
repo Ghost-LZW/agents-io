@@ -74,8 +74,21 @@ export async function parseInbound(uid: number, raw: Buffer, deps: ParseDeps): P
   for (const att of parsed.attachments) {
     if (att.related) continue; // inline images of the HTML body
     const i = index++;
-    await deps.blobs.put({ uid, index: i, filename: att.filename, contentType: att.contentType, content: att.content });
-    content.push({ type: 'ref', uri: `mail-attachment:${uid}/${i}`, title: att.filename ?? `attachment-${i}` });
+    const mime = att.contentType || 'application/octet-stream';
+    let ref: string | void = undefined;
+    let failure: string | undefined;
+    try {
+      ref = await deps.blobs.put({ uid, index: i, filename: att.filename, contentType: mime, content: att.content });
+    } catch (e) {
+      // Too large for the host's store, or the store failed: keep the platform ref and say so.
+      failure = e instanceof Error ? e.message : String(e);
+    }
+    if (ref) {
+      content.push({ type: mime.startsWith('image/') ? 'image' : 'file', ref, mime, ...(att.filename ? { name: att.filename } : {}) });
+      continue;
+    }
+    content.push({ type: 'ref', uri: `mail-attachment:${uid}/${i}`, title: att.filename ?? `attachment-${i}`, mime });
+    if (failure) content.push({ type: 'text', text: `[attachment ${att.filename ?? `attachment-${i}`} (${mime}, ${att.size ?? att.content.length} bytes) not stored: ${failure}]` });
   }
 
   const meta: MessageMeta = {

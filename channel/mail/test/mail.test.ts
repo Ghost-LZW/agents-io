@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { SendMailOptions } from 'nodemailer';
-import type { InboundEnvelope } from '@agents-io/protocol';
+import type { BlobStore, InboundEnvelope } from '@agents-io/protocol';
 import { runChannelConformance } from '@agents-io/testkit';
 import {
   MailChannel,
@@ -58,18 +58,20 @@ class FakeTransport implements MailTransport {
 
 const passVerifier: MailVerifier = async () => ({ evidence: 'dkim_pass' });
 
-async function harness(opts: { verify?: MailVerifier; store?: MemoryMailStore } = {}) {
+async function harness(opts: { verify?: MailVerifier; store?: MemoryMailStore; hostBlobs?: BlobStore } = {}) {
   const source = new FakeSource();
   const transport = new FakeTransport();
   const store = opts.store ?? new MemoryMailStore();
   const blobs: AttachmentBlob[] = [];
-  const adapter = new MailChannel(cfg, { source, transport, store, verify: opts.verify ?? passVerifier, blobs: { put: async (b) => void blobs.push(b) } });
+  const sink = opts.hostBlobs ? {} : { blobs: { put: async (b: AttachmentBlob) => void blobs.push(b) } };
+  const adapter = new MailChannel(cfg, { source, transport, store, verify: opts.verify ?? passVerifier, ...sink });
   const envs: InboundEnvelope[] = [];
   const ctl = new AbortController();
   const done = adapter.start({
     account: 'bot',
     config: undefined,
     signal: ctl.signal,
+    ...(opts.hostBlobs ? { blobs: opts.hostBlobs } : {}),
     emit: async (e) => {
       envs.push(e);
       return { accepted: true };
@@ -141,11 +143,46 @@ describe('inbound', () => {
       '',
     ].join('\r\n');
     const e = await h.next({ uid: 42, raw: raw({ 'Message-ID': '<att@x>' }, mime.split('\r\n').slice(2).join('\r\n'), 'Content-Type: multipart/mixed; boundary="B"\r\n') });
-    expect(e.content).toContainEqual({ type: 'ref', uri: 'mail-attachment:42/0', title: 'r.pdf' });
+    expect(e.content).toContainEqual({ type: 'ref', uri: 'mail-attachment:42/0', title: 'r.pdf', mime: 'application/pdf' });
     expect(JSON.stringify(e)).not.toContain('PDFDATA');
     expect(h.blobs).toHaveLength(1);
     expect(h.blobs[0]).toMatchObject({ uid: 42, index: 0, filename: 'r.pdf', contentType: 'application/pdf' });
     expect(h.blobs[0]!.content.toString()).toBe('PDFDATA');
+    await h.stop();
+  });
+
+  it('stores attachments in the host BlobStore and emits file/image blocks with its refs', async () => {
+    const stored: { bytes: Uint8Array; mime: string; name?: string }[] = [];
+    const hostBlobs: BlobStore = {
+      async put(bytes, meta) {
+        if (bytes.byteLength > 10) throw new Error('blob too large');
+        stored.push({ bytes, ...meta });
+        return `sha256:${String(stored.length).padStart(64, '0')}`;
+      },
+      async get() {
+        throw new Error('unused');
+      },
+    };
+    const h = await harness({ hostBlobs });
+    const part = (type: string, name: string, data: string) => [
+      '--B',
+      `Content-Type: ${type}; name="${name}"`,
+      `Content-Disposition: attachment; filename="${name}"`,
+      'Content-Transfer-Encoding: base64',
+      '',
+      Buffer.from(data).toString('base64'),
+    ];
+    const body = ['--B', 'Content-Type: text/plain', '', 'see attached', ...part('application/pdf', 'r.pdf', 'PDFDATA'), ...part('image/png', 'p.png', 'PNG'), ...part('application/zip', 'big.zip', 'X'.repeat(50)), '--B--', ''].join('\r\n');
+    const e = await h.next({ uid: 7, raw: raw({ 'Message-ID': '<att2@x>' }, body, 'Content-Type: multipart/mixed; boundary="B"\r\n') });
+    expect(e.content).toContainEqual({ type: 'file', ref: `sha256:${'1'.padStart(64, '0')}`, mime: 'application/pdf', name: 'r.pdf' });
+    expect(e.content).toContainEqual({ type: 'image', ref: `sha256:${'2'.padStart(64, '0')}`, mime: 'image/png', name: 'p.png' });
+    // Refused by the store: the platform ref stays, with a notice the agent can read.
+    expect(e.content).toContainEqual({ type: 'ref', uri: 'mail-attachment:7/2', title: 'big.zip', mime: 'application/zip' });
+    expect(e.content.some((c) => c.type === 'text' && /big\.zip .*not stored: blob too large/.test(c.text))).toBe(true);
+    expect(stored.map((b) => [b.mime, b.name, Buffer.from(b.bytes).toString()])).toEqual([
+      ['application/pdf', 'r.pdf', 'PDFDATA'],
+      ['image/png', 'p.png', 'PNG'],
+    ]);
     await h.stop();
   });
 

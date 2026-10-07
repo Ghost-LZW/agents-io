@@ -7,5 +7,5 @@
   "files": ["dist"],
   "scripts": { "gen-types": "scripts/gen-types.sh" },
   "dependencies": { "@agents-io/protocol": "workspace:*", "ws": "^8.22.0" },
-  "devDependencies": { "@agents-io/testkit": "workspace:*", "@types/ws": "^8.18.2" }
+  "devDependencies": { "@agents-io/session": "workspace:*", "@agents-io/testkit": "workspace:*", "@types/ws": "^8.18.2" }
 }
