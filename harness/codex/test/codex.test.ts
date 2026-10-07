@@ -97,7 +97,7 @@ describe('open', () => {
     expect(s.nativeId()).toBe('thr-1');
     const p = fake.sent('thread/start')[0]!.params;
     expect(p).toMatchObject({ model: 'gpt-5.5', cwd: '/work', approvalPolicy: 'never', sandbox: 'workspace-write' });
-    expect(p.config.mcp_servers.agents_io).toEqual({ url: 'http://127.0.0.1:9/mcp', http_headers: { Authorization: 'Bearer tok' } });
+    expect(p.config.mcp_servers.agents_io).toEqual({ url: 'http://127.0.0.1:9/mcp', http_headers: { Authorization: 'Bearer tok' }, default_tools_approval_mode: 'approve' });
   });
 
   it('uses on-request for unconfigured profiles and honours configured ones', async () => {

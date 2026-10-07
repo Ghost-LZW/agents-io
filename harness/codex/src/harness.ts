@@ -404,7 +404,13 @@ export class CodexHarness implements HarnessAdapter {
     const config: Record<string, JsonValue> = { ...(opts.config as Record<string, JsonValue> | undefined) };
     if (args.mcp) {
       const mcpServers = { ...((config.mcp_servers as Record<string, JsonValue> | undefined) ?? {}) };
-      mcpServers[opts.mcpServerName ?? 'agents_io'] = { url: args.mcp.url, http_headers: { Authorization: `Bearer ${args.mcp.token}` } };
+      mcpServers[opts.mcpServerName ?? 'agents_io'] = {
+        url: args.mcp.url,
+        http_headers: { Authorization: `Bearer ${args.mcp.token}` },
+        // Host tools enforce Policy.outbound themselves. Without this Codex asks before every
+        // non-read-only MCP call, and under approvalPolicy "never" it declines them outright.
+        ...(opts.mcpApprovalMode !== null ? { default_tools_approval_mode: opts.mcpApprovalMode ?? 'approve' } : {}),
+      };
       config.mcp_servers = mcpServers;
     }
     const common = {

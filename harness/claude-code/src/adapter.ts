@@ -172,13 +172,20 @@ export class ClaudeCodeHarness implements HarnessAdapter {
     const env = this.childEnv(options.env);
 
     const mcpServers: Options['mcpServers'] = { ...c.mcpServers, ...options.sdk?.mcpServers };
+    const hostServer = options.mcpServerName ?? 'agents_io';
     if (args.mcp) {
-      mcpServers[options.mcpServerName ?? 'agents_io'] = {
-        type: options.mcpTransport ?? 'http',
+      const transport = options.mcpTransport ?? args.mcp.transport ?? 'http';
+      mcpServers[hostServer] = {
+        type: transport,
         url: args.mcp.url,
         headers: { Authorization: `Bearer ${args.mcp.token}` },
-      };
+        // Host output tools are always in the prompt, never deferred behind tool search.
+        ...(transport === 'http' ? { alwaysLoad: true } : {}),
+      } as NonNullable<Options['mcpServers']>[string];
     }
+    // Host tools check their own destinations (Policy.outbound): never ask a person to approve them.
+    const allowedTools =
+      args.mcp && options.mcpAutoAllow !== false ? [...new Set([...(profile.allowedTools ?? []), `mcp__${hostServer}`])] : profile.allowedTools;
 
     const additionalDirectories = [...new Set([...(c.additionalDirectories ?? []), ...(profile.additionalDirectories ?? [])])];
     const sdkOptions: Options = {
@@ -193,7 +200,7 @@ export class ClaudeCodeHarness implements HarnessAdapter {
       ...(isEffort(args.run.effort) ? { effort: args.run.effort } : {}),
       permissionMode,
       ...(permissionMode === 'bypassPermissions' ? { allowDangerouslySkipPermissions: true } : {}),
-      ...(profile.allowedTools ? { allowedTools: profile.allowedTools } : {}),
+      ...(allowedTools ? { allowedTools } : {}),
       ...(profile.disallowedTools ? { disallowedTools: profile.disallowedTools } : {}),
       ...(additionalDirectories.length ? { additionalDirectories } : {}),
       permissionPrompts: profile.permissionPrompts ?? 'host',

@@ -171,6 +171,11 @@ export const ConfigFile = Type.Object(
       ),
     ),
     channels: Type.Optional(Type.Array(ChannelEntry)),
+    /**
+     * Mount the host MCP output tools (send_file, ask_choice, mention, reply_to,
+     * send_message, get_channel_context) into every harness instance (default true).
+     */
+    outputTools: Type.Optional(Type.Boolean()),
     policy: Type.Optional(
       Type.Object(
         {
@@ -289,6 +294,8 @@ export interface Config {
   };
   /** Owner watches from the config file. */
   watches: (WatchDraft & { id: string })[];
+  /** Host MCP output tools mounted into every harness instance. */
+  outputTools: boolean;
   local: { principal: Principal; session: string };
 }
 
@@ -384,6 +391,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     harnesses,
     defaultHarness,
     channels: ctx.channels === false ? [] : (c.channels ?? []).map((ch) => resolveChannel(ch, env, path)),
+    outputTools: c.outputTools ?? true,
     policy: {
       owners,
       selfAccounts: c.policy?.selfAccounts ?? [],

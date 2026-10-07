@@ -1,0 +1,15 @@
+{
+  "name": "@agents-io/host-mcp",
+  "version": "0.1.0",
+  "description": "Host MCP server for agents-io: channel-neutral output tools (send_file, ask_choice, mention, reply_to, send_message, get_channel_context), destinations limited by Policy.outbound",
+  "type": "module",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist"],
+  "dependencies": {
+    "@agents-io/protocol": "workspace:*",
+    "@agents-io/session": "workspace:*",
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": { "@agents-io/testkit": "workspace:*" }
+}

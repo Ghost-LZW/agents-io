@@ -202,7 +202,7 @@ aio-dev watch remove team-digest
 /watch list all
 ```
 
-配置里的监听必须有 `id`，同 id 的旧监听会被替换，所以改了配置重启就生效。宿主的 MCP 工具可以通过 `Gateway.addWatch(origin, watch)` 让 agent 自己建监听（受 `watchAllowlist` 限制）。
+配置里的监听必须有 `id`，同 id 的旧监听会被替换，所以改了配置重启就生效。agent 自己用输出工具 `watch_add / watch_remove / watch_list` 建监听（见 §7），走的是同一个 `Gateway.addWatch(origin, watch)`，受 `watchAllowlist` 限制。
 
 ### 安全
 
@@ -217,11 +217,93 @@ aio-dev watch remove team-digest
 - **飞书群**：机器人必须在群里，并且应用开了 `im:message.group_msg`（接收群里所有消息，而不只是 @ 机器人的）。否则群里不 @ 机器人的话根本到不了网关。
 - **以主人身份监听**（主人自己的私聊、主人的收件箱）：机器人身份看不到这些。需要一个用主人身份登录的通道，比如私有的 JSONL bridge 通道（用户身份的客户端），或者用主人邮箱 IMAP 登录的邮件通道。
 
-## 7. 已知缺口
+## 7. agent 的输出工具
+
+除了正常的回答（照常渲染、只回到来源），agent 还能**主动**调用一组输出工具：发文件、发选项按钮、@人、往允许的地方另发消息、建监听。它们由网关作为一个 MCP 服务提供（`packages/host-mcp`），挂进每个 harness 实例。工具是通道中立的：工具只构造中立的 `RenderedMessage`，平台怎么画由各通道适配器决定。
+
+### 怎么挂上去
+
+- 每个网关一个 MCP 服务：streamable HTTP，只监听 `127.0.0.1` 的随机端口，无状态（每个请求一个 MCP server 实例）。
+- 每个 harness 绑定（一个 session 的一次 open，即一个 generation）发一个随机 bearer token，token 对应 `(sessionKey, generation)`。每次调用时再取这个 session **当前正在跑的那一轮**，没有在跑的轮次就拒绝（监听工具除外）。没有 token 或 token 不对：HTTP 401。
+- **Claude Code**：通过 SDK `mcpServers` 挂成 `agents_io`（`type: 'http'`，`headers.Authorization`），设 `alwaysLoad: true`（工具总在提示里，不藏在 tool search 后面），并加一条 `allowedTools: mcp__agents_io` 允许规则：这些工具自己按 `Policy.outbound` 检查目的地，不再弹审批。
+- **Codex**：在 `thread/start`（或 `thread/resume`）的 `config` 里按线程覆盖 `mcp_servers.agents_io = { url, http_headers: { Authorization }, default_tools_approval_mode: "approve" }`。已实测（codex-cli 0.160.1）：按线程的配置会启动这个服务（`mcpServer/startupStatus/updated` 显示 `ready`）；不设 `default_tools_approval_mode` 时，非只读的 MCP 工具在 `approvalPolicy: never` 下会被直接拒掉（模型回答"需要审批但无法审批"）。
+- dev-gateway 默认打开（配置 `"outputTools": true`），关掉就不挂。
+- **幂等**：每次调用的 operationId 是 `tool:<sessionKey>:<harness 的工具调用 id>`。Claude Code 在 `_meta["claudecode/toolUseId"]` 里给出调用 id，Codex 在 `_meta.callId` 里给出（同时还有 `x-codex-turn-metadata`、`threadId`、`itemId` 等）。都没有时退回 JSON-RPC 请求 id。同一个调用重试不会发出两条消息。
+- **记录**：每条工具发出的消息在 session 日志里记一条 `native` 事件 `agents-io.output`（内容是工具名、operationId、路由、`RenderedMessage`，ask_choice 还有问题和选项），随后 Outbox 写 `delivery.settled`。工具调用本身的 `item.*` 事件照常来自 harness。
+
+### 工具一览
+
+| 工具 | 做什么 | 目的地 |
+|---|---|---|
+| `get_channel_context()` | 返回当前路由、通道、会话类型、档位、通道能力摘要（markdown 程度、长度上限、按钮、能发哪些媒体）、本轮参与者（可用于 mention 的 id 和名字）、允许的目的地 | — |
+| `send_file(path \| blob, name?, caption?)` | 读文件（相对路径按 session 的 cwd）存进 blob 存储，作为附件发出。上限 30MB；`restricted` 档的轮次只能发 cwd 里的文件 | 本轮回复路由 |
+| `ask_choice(question, options[], multi?)` | 发一个选择题，**立即返回** `choiceId`。用户的选择作为**下一条输入**回来（见下），工具说明里要求模型发完就结束这一轮 | 本轮回复路由 |
+| `mention(user_ids[], text)` | 发一条 @ 某些人的消息 | 本轮回复路由 |
+| `reply_to(route, text, message_id?)` | 另发一条回复（默认回复发起本轮的那条消息） | `"current"` 或允许的路由键 |
+| `send_message(route, text)` | 另发一条独立消息（不是回复） | `"current"` 或允许的路由键 |
+| `watch_add / watch_remove / watch_list` | 见下面"agent 自己建监听" | 永远是自己的 session |
+
+目的地一律过 `Policy.outbound`。默认策略只允许本轮的回复路由（以及本轮输入带来的路由）和主人在 `policy.routes` 里预登记的路由。被拒时工具返回错误，错误里写明被拒的路由、允许的是哪些，并让模型不要换个目的地重试；日志里记一条 `notice`。
+
+### 各通道怎么呈现
+
+| | 飞书 | 邮件 | 终端（attach） |
+|---|---|---|---|
+| send_file | 用 `im.v1.image.create`（图片，≤10MB）或 `im.v1.file.create`（其他，`file_type` 按扩展名取 pdf/doc/xls/ppt/mp4/opus，其余 `stream`）上传，再发 image / file 消息；有 caption 时先发一条文字。同一个 blob 不会重复上传 | 作为这封回复邮件的附件 | 只写事件：attach 打印 `📎 名字 (类型, blob 引用)` |
+| ask_choice | 单选：卡片按钮，回调值 `choice:<choiceId>:<n>`。多选：卡片表单（多选下拉 + 提交按钮 `choice:<choiceId>:form`，回调里的 `form_value` 带回选中的序号） | 正文里列编号，"回复编号" | 打印编号列表和 `/choose <choiceId> <n>` |
+| mention | 文字消息里的 `<at user_id="ou_…">名字</at>`。适配器从收到的事件里记下 union_id → open_id 的对应，认不出的 id 写成 `@名字` | 写成 `@名字` 文字 | 写成 `@名字` 文字 |
+| reply_to / send_message | 普通文字消息（reply_to 用回复接口） | 回复同一线程 / 新邮件 | 打印 `✉ 文字` |
+
+终端靠 `agents-io.output` 事件显示这些输出，它是 `native` 事件，只有 `full` 档 attach（默认就是）看得到。私有 JSONL 通道收到同样的 `RenderedMessage`，`channelData` 里带下面的中立键，能不能画由适配器自己决定，`text` 里总有可读的退化形式。
+
+### 选择怎么回来
+
+用户的选择变成**同一个 session 的一条普通输入**，内容是一个事件块：
+
+```
+[event choice] {"choiceId":"ch_3cd8cc5860","question":"Red or blue?","selected":[{"n":2,"label":"blue"}],"multi":false,"via":"button"}
+```
+
+- 飞书点按钮 / 提交表单：卡片回调先变成 `action` 事件，网关的 `Ingress` 改写钩子（`IngressOptions.rewrite`）认出 `choice:` 前缀，改成 `choice` 事件，并把它送到**提问的那个 session**（不管点击事件按会话该进哪个 session）。
+- 邮件或任何文字通道：在还有未回答选择题的同一路由上，用户只回了编号（如 `2` 或 `1,3`，邮件的 `Subject:` 行忽略），也会被改成 `choice` 事件（`via: "reply"`）。其他文字原样进来。
+- 终端：`/choose <choiceId> <n>[,<n>…]`，网关校验序号范围，不对就拒绝（`bad_choice`）。
+- 已经回答过的选择再被点：照样作为输入进来，带 `alreadyAnswered: true`。
+- 选择题的记录在内存里，网关重启后从 session 日志里的 `agents-io.output` 事件找回。
+
+因为点击是普通输入，它在当前轮次结束后才进 harness（排队），所以模型发完选择题就应结束这一轮。
+
+### agent 自己建监听
+
+`watch_add(source, mode, keywords?, mentions?, digest_every_minutes?, digest_max_items?, expires_in_minutes?, note?, id?)`、`watch_remove(id)`、`watch_list()`，规则：
+
+- 以 agent 身份创建：origin 是 `kind: 'agent'`、没有主体、`declared: "session:<sessionKey>"`，所以 `createdBy` 是 `session:<sessionKey>`。
+- **目标永远是调用者自己的 session**，参数里不能给 target（给了就报错）。
+- 只能删自己建的监听（主人或别的 session 建的会被拒）。`watch_list` 列出投到自己 session 的所有监听，`mine` 标出自己建的。
+- 是否允许由 `Policy.watch` 决定，默认只放行 `policy.watchAllowlist` 里的来源；被拒时错误写明"这个来源不在主人的监听白名单里"。
+- 工具说明里讲清了 `context`（只记下，下一轮可见）/ `digest`（定期一轮汇总）/ `trigger`（每条开一轮）三种模式，以及被监听的内容是别人写的、不可信。
+
+### 中立键（建议进协议）
+
+`RenderedMessage` 还没有对应字段，暂时放在 `channelData` 下：
+
+| 键 | 内容 |
+|---|---|
+| `agents-io/choice` | `{ choiceId, question, options[], multi }`；按钮的 action id 为 `choice:<choiceId>:<n>`（1 起），多选表单提交为 `choice:<choiceId>:form` |
+| `agents-io/mentions` | `{ targets: [{ id, name? }], text }`；`text` 是去掉 @ 之后的正文，`RenderedMessage.text` 是 `@名字 … 正文` 的退化形式 |
+| `agents-io/output` | `{ tool }`：这条消息出自哪个输出工具 |
+
+建议的协议改动：`RenderedMessage.mentions`、`RenderedMessage.choice`（或 `actions[].group` + `multi`）、一个 `output.sent` 事件类型代替 `native agents-io.output`、`InputRecord` 带发送者的通道 id（`senderId`）和消息里的 `mentions`，让 agent 能 @ 本轮之外的人。
+
+## 8. 已知缺口
 
 | 缺口 | 影响 |
 |---|---|
-| 还没有输出工具 | agent 不能主动发文件、发选项按钮、@人，也不能发到别的会话（规划中：宿主 MCP 输出工具）。`reply` 里的 `media` 只是通道能力 |
+| 输出工具在飞书上未经真机验证 | 文件/图片上传、多选表单、at 标签都只用假客户端测过；多选表单的 `form_value` 结构按文档实现 |
+| 只能 @ 认得出的人 | agent 只知道本轮输入里发送者的 id；群消息里 @ 到的其他人只以名字出现。飞书的 at 标签要 open_id，没从事件里见过的 union_id 只能写成 `@名字` |
+| 选择题卡片点完不变 | 点击后按钮仍可点，再点的结果带 `alreadyAnswered`；卡片不会改成"已选：蓝" |
+| 选择要等这一轮结束 | 点击是排队的输入，模型若不结束这一轮，就一直等不到答案 |
+| 输出工具 token 不过期 | token 按 harness 绑定发放，网关进程内一直有效（只在 loopback 上） |
+| 终端只在 full 档看得到工具输出 | `agents-io.output` 是 `native` 事件，card/final 档的订阅端看不到 |
 | blob 存储不清理 | 存进去的附件一直留在 `<dataDir>/blobs`，没有过期和容量回收 |
 | 确认后才下载 | 飞书事件确认后、交给网关前进程崩溃，这条消息会丢（飞书不会重发已确认的事件） |
 | 有些飞书资源取不到 | 合并转发里的子消息、卡片里的图片、表情包，平台接口不支持下载，agent 只看到引用和说明 |
@@ -231,4 +313,4 @@ aio-dev watch remove team-digest
 | 网关重启时的思维链气泡 | 重启前没结束的气泡会一直转圈 |
 | 监听投递是"至多一次" | 记下"已投递"之后、写进目标 session 之前进程崩溃，这条就丢了；digest 则相反，崩溃时可能重复发一次（同一个输入 id） |
 | 两个部署互相监听 | 对方 agent 的消息不算"自己的回流"，两边都开 trigger 时可能来回触发；需要宿主在 `Policy.triage` 里处理 |
-| agent 还不能自己建监听 | `Gateway.addWatch` 已就绪，宿主 MCP 工具（`watch_add/remove/list`）还没接上 |
+| agent 建监听的身份是 session 级 | `createdBy` 是 `session:<key>`：同一 session 换了 harness 实例也能删自己建的监听；宿主想按 run 区分要自己改 `agentOrigin` |

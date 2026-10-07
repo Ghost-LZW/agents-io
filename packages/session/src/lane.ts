@@ -51,7 +51,11 @@ export interface LaneOptions {
   harnessFor?: (name: string) => HarnessAdapter;
   /** Native id to resume when opening this adapter id (with `harnessFor`; wins over `resume`). */
   resumeFor?: (harnessId: string) => string | undefined;
-  mcp?: { url: string; token: string };
+  /**
+   * Host MCP endpoint mounted into the harness. A function is called on every open
+   * (each harness binding), so the host can mint one token per run.
+   */
+  mcp?: LaneMcp | ((args: { sessionKey: string; generation: number; harnessId: string }) => LaneMcp | undefined);
   harnessOptions?: Record<string, unknown>;
   modelReviewer?: ModelReviewer;
   /** Human/host requests without `expiresAt` are denied after this long (default 10 min). */
@@ -63,6 +67,12 @@ export interface LaneOptions {
   newId?: (prefix: string) => string;
   /** Tee of raw harness events (conformance checks, debugging). */
   onHarnessEvent?: (e: HarnessEvent) => void;
+}
+
+export interface LaneMcp {
+  url: string;
+  token: string;
+  transport?: 'http' | 'sse';
 }
 
 export type CommandResult =
@@ -202,6 +212,19 @@ export class Lane {
   activeTurn(): { turnId: string; owner: string | null; inputIds: string[] } | undefined {
     const t = this.turn;
     return t && { turnId: t.turnId, owner: t.owner, inputIds: t.inputs.map((i) => i.inputId) };
+  }
+
+  /**
+   * The running turn as policy hooks see it (reply route, inputs, deliveries), or
+   * undefined when idle. Host tools resolve their destination from it.
+   */
+  currentTurn(): TurnContext | undefined {
+    return this.turn ? this.context() : undefined;
+  }
+
+  /** Harness binding generation of the open (or last) session. */
+  get currentGeneration(): number {
+    return this.generation;
   }
 
   /** Resolves when no turn is running or starting and the queue is empty. */
@@ -439,13 +462,14 @@ export class Lane {
     this.adapter = adapter;
     const resume = this.o.resumeFor ? this.o.resumeFor(adapter.id) : this.o.resume;
     const gen = ++this.generation;
+    const mcp = typeof this.o.mcp === 'function' ? this.o.mcp({ sessionKey: this.sessionKey, generation: gen, harnessId: adapter.id }) : this.o.mcp;
     const s = await adapter.open({
       sessionKey: this.sessionKey,
       generation: gen,
       cwd: this.o.cwd ?? process.cwd(),
       run,
       ...(resume !== undefined ? { resume } : {}),
-      ...(this.o.mcp ? { mcp: this.o.mcp } : {}),
+      ...(mcp ? { mcp } : {}),
       ...(this.o.harnessOptions ? { options: this.o.harnessOptions } : {}),
     });
     this.session = s;

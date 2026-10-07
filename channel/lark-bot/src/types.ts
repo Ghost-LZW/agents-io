@@ -96,9 +96,27 @@ export interface LarkCardKitApi {
   };
 }
 
+/** Upload result: the SDK 1.74 returns the key unwrapped (`{ file_key }`); the raw API wraps it in `data`. */
+export type LarkUploadResponse<K extends string> = ({ [k in K]?: string } & { code?: number; msg?: string; data?: { [k in K]?: string } }) | null;
+
+/** `im.v1.file.create` (multipart; at most 30 MB, not empty). */
+export interface LarkFileApi {
+  create(payload: {
+    data: { file_type: 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream'; file_name: string; duration?: number; file: Buffer };
+  }): Promise<LarkUploadResponse<'file_key'>>;
+}
+
+/** `im.v1.image.create` (multipart; at most 10 MB; `message` images can be sent in chats). */
+export interface LarkImageApi {
+  create(payload: { data: { image_type: 'message' | 'avatar'; image: Buffer } }): Promise<LarkUploadResponse<'image_key'>>;
+}
+
 export interface LarkClientLike {
-  /** `messageResource` is optional so narrow test clients need not provide it (media then keep `lark-file:` refs). */
-  im: { v1: { message: LarkMessageApi; messageResource?: LarkMessageResourceApi } };
+  /**
+   * `messageResource` is optional so narrow test clients need not provide it (media then keep `lark-file:` refs).
+   * `file` / `image` upload host blobs for outbound attachments; absent → such attachments fail to send.
+   */
+  im: { v1: { message: LarkMessageApi; messageResource?: LarkMessageResourceApi; file?: LarkFileApi; image?: LarkImageApi } };
   /** Contact lookups for sender names; absent → names stay unset. */
   contact?: { v3: { user: LarkContactUserApi } };
   /** CardKit. Absent on a client that predates it: process cards then use message patch. */
@@ -162,6 +180,6 @@ export interface RawCardActionEvent {
   event_id?: string;
   token?: string;
   operator?: { open_id?: string; user_id?: string; union_id?: string; name?: string };
-  action?: { value?: unknown; tag?: string; name?: string; option?: string; form_value?: unknown };
+  action?: { value?: unknown; tag?: string; name?: string; option?: string; options?: string[]; form_value?: unknown };
   context?: { open_message_id?: string; open_chat_id?: string };
 }

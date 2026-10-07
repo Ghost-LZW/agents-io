@@ -82,7 +82,8 @@ describe('open → SDK options', () => {
       expect(o.includePartialMessages).toBe(true);
       expect(o.cwd).toBe('/tmp/x');
       expect(o.pathToClaudeCodeExecutable).toBe('/usr/local/bin/claude');
-      expect(o.mcpServers).toEqual({ agents_io: { type: 'http', url: 'http://127.0.0.1:9/mcp', headers: { Authorization: 'Bearer tok' } } });
+      expect(o.mcpServers).toEqual({ agents_io: { type: 'http', url: 'http://127.0.0.1:9/mcp', headers: { Authorization: 'Bearer tok' }, alwaysLoad: true } });
+      expect(o.allowedTools).toEqual(['mcp__agents_io']);
       expect(o.env).not.toHaveProperty('CLAUDE_CODE_RESUME_INTERRUPTED_TURN');
       expect(o.canUseTool).toBeUndefined();
       expect(o.sessionId).toBe(s.nativeId());
@@ -137,7 +138,7 @@ describe('open → SDK options', () => {
       // Per-open profiles win over the instance's; directories are the union.
       expect(o.permissionMode).toBe('default');
       expect(o.additionalDirectories).toEqual(['/shared', '/i', '/p']);
-      expect(o.mcpServers).toEqual({ docs: { type: 'http', url: 'http://docs' }, agents_io: { type: 'http', url: 'http://h/mcp', headers: { Authorization: 'Bearer t' } } });
+      expect(o.mcpServers).toEqual({ docs: { type: 'http', url: 'http://docs' }, agents_io: { type: 'http', url: 'http://h/mcp', headers: { Authorization: 'Bearer t' }, alwaysLoad: true } });
       // Instance profiles apply when the open passes none.
       const b = await setup({ run: { ...run, profile: 'other' } }, {}, { profiles: { other: { permissionMode: 'plan' } }, settings: '/etc/s.json' });
       expect(b.q.options).toMatchObject({ permissionMode: 'plan', settings: '/etc/s.json' });

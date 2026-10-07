@@ -10,6 +10,7 @@ export type AttachAction =
   | { kind: 'interrupt'; cancelQueue: boolean }
   | { kind: 'approve'; requestId: string; always: boolean }
   | { kind: 'deny'; requestId: string; message?: string }
+  | { kind: 'choose'; choiceId: string; selected: number[] }
   | { kind: 'sessions' }
   | { kind: 'watch'; op: 'add'; tokens: string[] }
   | { kind: 'watch'; op: 'list'; all: boolean }
@@ -25,6 +26,7 @@ export const ATTACH_HELP = [
   '/interrupt      stop the running turn (/interrupt --clear also drops the queue)',
   '/approve <id>   allow a pending request (/approve <id> always: for the session)',
   '/deny <id> [why]',
+  '/choose <id> <n>[,<n>…]  answer an ask_choice question (numbers as listed)',
   '/sessions       list sessions',
   '/watch add k=v… watch inputs into this session (e.g. channel=lark-bot conversation=oc_1 mode=digest every=30m)',
   '/watch list     watches into this session (/watch list all: every watch); /watch remove <id>',
@@ -54,6 +56,11 @@ export function parseAttachLine(line: string): AttachAction {
       if (!rest[0]) return { kind: 'error', message: 'usage: /deny <requestId> [reason]' };
       const message = rest.slice(1).join(' ');
       return { kind: 'deny', requestId: rest[0], ...(message ? { message } : {}) };
+    }
+    case 'choose': {
+      const nums = rest.slice(1).join(',').split(/[,\s]+/).filter(Boolean).map(Number);
+      if (!rest[0] || !nums.length || nums.some((n) => !Number.isInteger(n) || n < 1)) return { kind: 'error', message: 'usage: /choose <choiceId> <n>[,<n>…]' };
+      return { kind: 'choose', choiceId: rest[0], selected: nums };
     }
     case 'sessions':
       return { kind: 'sessions' };
@@ -156,6 +163,12 @@ export async function runAttach(o: AttachOptions): Promise<void> {
         } catch (e) {
           out(`   (watch failed: ${e instanceof CommandError ? e.message : e instanceof WatchSpecError ? e.message : (e as Error).message})\n`);
         }
+        break;
+      case 'choose':
+        await report(
+          'choose',
+          client.command({ type: 'input', sessionKey, mode: 'queue', input: { content: [{ type: 'event', name: 'choice', data: { choiceId: a.choiceId, selected: a.selected } }] } }),
+        );
         break;
       case 'sessions':
         try {

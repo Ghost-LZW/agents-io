@@ -4,6 +4,7 @@ import {
   errors,
   routeKey,
   type Command,
+  type ContentBlock,
   type DecisionKind,
   type InputRecord,
   type ChannelCaps,
@@ -49,6 +50,12 @@ export interface IngressOptions {
   /** Lane for a session key; the host decides how lanes are created and kept. */
   lanes: (sessionKey: string) => Lane | Promise<Lane>;
   newId?: (prefix: string) => string;
+  /**
+   * Rewrite an admitted envelope before it becomes an input, e.g. turn a click on
+   * an `ask_choice` button (or a numbered reply) into a `choice` event for the
+   * session that asked. Return undefined to leave it unchanged.
+   */
+  rewrite?: (args: { env: InboundEnvelope; origin: Origin; sessionKey: string }) => InboundRewrite | undefined | Promise<InboundRewrite | undefined>;
   /** How many envelope ids to remember for dedup (default 10 000). */
   dedupWindow?: number;
   /** Watches: after its own admission an envelope is also delivered to every session watching it. */
@@ -60,6 +67,12 @@ export interface IngressOptions {
    * `reply` summary in channelContext (see {@link replySummary}).
    */
   replyCaps?: (channel: string, account: string) => { caps: ChannelCaps; tier?: Tier } | undefined;
+}
+
+export interface InboundRewrite {
+  /** Deliver to this session instead (the one that asked the question). */
+  sessionKey?: string;
+  content?: ContentBlock[];
 }
 
 export interface IngressResult {
@@ -168,7 +181,10 @@ export class Ingress {
 
     const admission = await this.policy.admit(env, origin);
     if (admission.action === 'drop') return { accepted: true, action: 'drop', origin };
-    const sessionKey = admission.sessionKey ?? conversationRouteKey(env);
+    let sessionKey = admission.sessionKey ?? conversationRouteKey(env);
+    const rw = await this.o.rewrite?.({ env, origin, sessionKey });
+    if (rw?.sessionKey) sessionKey = rw.sessionKey;
+    if (rw?.content) env = { ...env, content: rw.content };
 
     // A button click on an approval card becomes a resolve command; the lane re-checks eligibility.
     const click = actionClick(env);
