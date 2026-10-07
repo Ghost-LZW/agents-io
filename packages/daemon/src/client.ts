@@ -211,7 +211,7 @@ export class LocalClient {
   }
 
   /** Authenticate as a host. `consumer` / `callouts` make this connection THE host (at most one). */
-  hello(o: { token: string; name: string; consumer?: string; callouts?: boolean }): Promise<HelloResult> {
+  hello(o: { token: string; name: string; consumer?: string; callouts?: boolean; takeover?: boolean }): Promise<HelloResult> {
     return this.call('host.hello', o);
   }
 

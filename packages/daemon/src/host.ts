@@ -124,8 +124,18 @@ export class HostService implements HostFrames {
     const name = f.name.trim();
     if (!name) return fail('invalid_frame', 'name is empty');
     const role = f.consumer !== undefined || f.callouts === true;
-    if (role && this.host && !this.host.peer.signal.aborted) return fail('host_connected', `host ${this.host.name} is connected; at most one host (consumer / callouts) at a time`);
     if (f.consumer !== undefined && !f.consumer) return fail('invalid_frame', 'consumer is empty');
+    let replaced: string | undefined;
+    if (role && this.host && !this.host.peer.signal.aborted) {
+      if (f.takeover !== true || !this.host.peer.end) return fail('host_connected', `host ${this.host.name} is connected; at most one host (consumer / callouts) at a time (host.hello takeover: true replaces it)`);
+      // The token proves the same authority: the old connection is most likely half-open.
+      const old = this.host;
+      replaced = old.name;
+      this.d.log('warn', `host ${name} takes over from host ${old.name} (connection ${old.peer.id}); closing the old connection`);
+      old.peer.end!(`replaced by host ${name} (takeover)`);
+      // end() reports the connection gone; make sure the slot is free even if it did not.
+      if (this.host === old) this.gone(old.peer);
+    }
     peer.auth = { name, origin: () => hostOrigin(name) };
     if (role) {
       this.host = { peer, name, callouts: f.callouts === true, ...(f.consumer !== undefined ? { consumer: f.consumer } : {}) };
@@ -140,6 +150,7 @@ export class HostService implements HostFrames {
       host: role,
       bindings: { version: st?.table.version ?? null, active: st?.active ?? false, ...(st?.suspended ? { suspended: st.suspended } : {}) },
       ...(f.consumer !== undefined ? { inbound: { consumer: f.consumer, acked: this.d.queue.cursor(f.consumer), head: this.d.queue.head() } } : {}),
+      ...(replaced !== undefined ? { replaced: { name: replaced } } : {}),
       features: FEATURES,
     });
   }
@@ -182,7 +193,7 @@ export class HostService implements HostFrames {
 }
 
 /** Capabilities `host.hello` advertises (a host must not rely on one this list lacks). */
-export const FEATURES = ['session.launch'];
+export const FEATURES = ['session.launch', 'host.takeover'];
 
 function ok<T>(value: T): Outcome {
   return { ok: true, value };

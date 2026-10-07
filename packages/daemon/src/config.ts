@@ -315,6 +315,14 @@ export const ConfigFile = Type.Object(
           uiUrl: Type.Optional(Type.String()),
           /** Lifetime of console sessions from a login link (default 12 h). */
           sessionTtlMs: Type.Optional(Type.Number({ minimum: 1000 })),
+          /**
+           * WebSocket heartbeat of `/ws`: a ping every `intervalMs` (default 30 s; 0 turns it off);
+           * a connection that has not answered (pong, or any message) within `timeoutMs` after a
+           * ping (default 10 s) is closed, which frees the host role it held.
+           */
+          heartbeat: Type.Optional(
+            Type.Object({ intervalMs: Type.Optional(Type.Integer({ minimum: 0 })), timeoutMs: Type.Optional(Type.Integer({ minimum: 100 })) }, Closed),
+          ),
           /** create-lark-bot invocation for `POST /api/bots/lark` (argv; default npx of the pinned release). */
           larkBotCommand: Type.Optional(Type.Array(Type.String(), { minItems: 1 })),
         },
@@ -475,11 +483,15 @@ export interface ConsoleConfig {
   uiUrl?: string;
   sessionTtlMs: number;
   larkBotCommand: string[];
+  /** `/ws` ping interval (0: off) and how long a ping waits for an answer. */
+  heartbeat: { intervalMs: number; timeoutMs: number };
 }
 
 /** create-lark-bot, pinned. */
 export const CREATE_LARK_BOT = ['npx', '-y', 'github:Ghost-LZW/create-lark-bot#v0.2.4'];
 export const DEFAULT_CONSOLE_PORT = 7464;
+export const DEFAULT_WS_HEARTBEAT_MS = 30_000;
+export const DEFAULT_WS_HEARTBEAT_TIMEOUT_MS = 10_000;
 
 /** 127.0.0.0/8, ::1, localhost. */
 export function isLoopbackHost(host: string): boolean {
@@ -524,6 +536,7 @@ function resolveConsole(c: ConfigFile['console']): ConsoleConfig {
     ...(c?.uiUrl !== undefined ? { uiUrl: c.uiUrl.replace(/\/$/, '') } : {}),
     sessionTtlMs: c?.sessionTtlMs ?? 12 * 3_600_000,
     larkBotCommand: c?.larkBotCommand ?? CREATE_LARK_BOT,
+    heartbeat: { intervalMs: c?.heartbeat?.intervalMs ?? DEFAULT_WS_HEARTBEAT_MS, timeoutMs: c?.heartbeat?.timeoutMs ?? DEFAULT_WS_HEARTBEAT_TIMEOUT_MS },
   };
 }
 

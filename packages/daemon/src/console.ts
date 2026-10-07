@@ -395,7 +395,9 @@ export class ConsoleServer {
     };
     const c = new FrameConn(transport, this.o.host.local, () => this.conns.delete(c), { origin: (key) => this.o.host.consoleOrigin(key) });
     this.conns.add(c);
+    const beat = this.heartbeat(ws, c.id);
     ws.on('message', (data, isBinary) => {
+      beat.alive();
       if (isBinary) return void c.send({ v: PROTOCOL_VERSION, type: 'result', id: '', ok: false, error: { code: 'bad_json', message: 'frames are text messages' } });
       let raw: unknown;
       try {
@@ -405,8 +407,51 @@ export class ConsoleServer {
       }
       c.receive(raw);
     });
-    ws.on('close', () => c.drop());
-    ws.on('error', () => c.drop());
+    ws.on('close', () => {
+      beat.stop();
+      c.drop();
+    });
+    ws.on('error', () => {
+      beat.stop();
+      c.drop();
+    });
+  }
+
+  /**
+   * `/ws` heartbeat (`console.heartbeat`): a ping every `intervalMs`; no pong (or
+   * other message) within `timeoutMs` after it and the socket is terminated, so a
+   * half-open connection does not keep the host role (or its pushes) forever.
+   */
+  private heartbeat(ws: WebSocket, id: string): { alive(): void; stop(): void } {
+    const { intervalMs, timeoutMs } = this.o.config.heartbeat;
+    if (intervalMs <= 0) return { alive: () => {}, stop: () => {} };
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    const alive = () => {
+      clearTimeout(deadline);
+      deadline = undefined;
+    };
+    ws.on('pong', alive);
+    const tick = setInterval(() => {
+      if (ws.readyState !== ws.OPEN || deadline) return;
+      deadline = setTimeout(() => {
+        this.o.log('warn', `console: /ws connection ${id} did not answer a heartbeat within ${timeoutMs} ms; closing it`);
+        ws.terminate();
+      }, timeoutMs);
+      deadline.unref?.();
+      try {
+        ws.ping();
+      } catch {
+        // closing already
+      }
+    }, intervalMs);
+    tick.unref?.();
+    return {
+      alive,
+      stop: () => {
+        clearInterval(tick);
+        alive();
+      },
+    };
   }
 }
 

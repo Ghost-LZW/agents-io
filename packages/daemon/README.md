@@ -79,7 +79,10 @@ before any host frame; after it, the connection's client frames carry the origin
 - Any number of authenticated connections may use the request frames (the CLI's
   host commands are such connections). A connection whose hello sets `consumer`
   (push-consume the inbound queue) or `callouts: true` becomes **the host**: at most
-  one at a time (`host_connected` otherwise). While it is connected the router's
+  one at a time (`host_connected` otherwise; a hello with `takeover: true` and the
+  valid token replaces the current host instead: its connection is closed, the
+  takeover logged, its unacked pushes go to the new host, and the result carries
+  `replaced: { name }`; feature `host.takeover`). While it is connected the router's
   host table is active even with `onHostDown: "suspend"`, `route` callouts go to it,
   and runs whose own connection left report `run.ended` to it.
 - `bindings.put` / `bindings.get`: the host table, persisted in the log's database
@@ -126,7 +129,8 @@ against the protocol alone.
   "origins": ["https://ui.example"],   // CORS for a separately hosted UI; none by default
   "uiUrl": "https://ui.example",       // where login links point (default: the console itself)
   "sessionTtlMs": 43200000,
-  "larkBotCommand": ["npx", "-y", "github:Ghost-LZW/create-lark-bot#v0.2.4"]
+  "larkBotCommand": ["npx", "-y", "github:Ghost-LZW/create-lark-bot#v0.2.4"],
+  "heartbeat": { "intervalMs": 30000, "timeoutMs": 10000 }   // /ws ping; no answer in timeoutMs → closed (0 interval: off)
 }
 ```
 
@@ -172,7 +176,10 @@ against the protocol alone.
   honor `ifRevision` (409), and write atomically (temp + fsync + rename, 0600).
   The daemon does not reload: `applied: "restart"` unless the file is back to
   what it started with.
-- **`/ws`**: exactly the local socket's frames. Client frames carry the local
+- **`/ws`**: exactly the local socket's frames. The server pings every
+  `heartbeat.intervalMs`; a connection that answers neither with a pong nor any
+  message within `heartbeat.timeoutMs` is terminated (logged), which frees the host
+  role a half-open remote host held. Client frames carry the local
   principal with `via: "console"`, `adapter: "console"`; host frames work after
   `host.hello` with the host token.
 - **Lark bot provisioning**: `POST /api/bots/lark` runs `larkBotCommand` with
