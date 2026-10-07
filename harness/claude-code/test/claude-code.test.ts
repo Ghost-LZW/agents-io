@@ -82,7 +82,8 @@ describe('open → SDK options', () => {
       expect(o.includePartialMessages).toBe(true);
       expect(o.cwd).toBe('/tmp/x');
       expect(o.pathToClaudeCodeExecutable).toBe('/usr/local/bin/claude');
-      expect(o.mcpServers).toEqual({ agents_io: { type: 'http', url: 'http://127.0.0.1:9/mcp', headers: { Authorization: 'Bearer tok' } } });
+      expect(o.mcpServers).toEqual({ agents_io: { type: 'http', url: 'http://127.0.0.1:9/mcp', headers: { Authorization: 'Bearer ${AGENTS_IO_MCP_TOKEN}' } } });
+      expect(o.env).toMatchObject({ AGENTS_IO_MCP_TOKEN: 'tok' });
       expect(o.env).not.toHaveProperty('CLAUDE_CODE_RESUME_INTERRUPTED_TURN');
       expect(o.canUseTool).toBeUndefined();
       expect(o.sessionId).toBe(s.nativeId());
@@ -90,6 +91,15 @@ describe('open → SDK options', () => {
     } finally {
       delete process.env.CLAUDE_CODE_RESUME_INTERRUPTED_TURN;
     }
+  });
+
+  it('host MCP token is passed through the env, never in mcpServers (the SDK puts those on the CLI argv)', async () => {
+    const { q } = await setup({ run, mcp: { url: 'http://h/mcp', token: 'sekrit-token-123' } });
+    const o = q.options;
+    // The SDK serialises mcpServers as `--mcp-config <json>`; the CLI expands ${VAR} from its env.
+    expect(JSON.stringify(o.mcpServers)).not.toContain('sekrit-token-123');
+    expect(o.mcpServers?.agents_io).toMatchObject({ headers: { Authorization: 'Bearer ${AGENTS_IO_MCP_TOKEN}' } });
+    expect(o.env?.AGENTS_IO_MCP_TOKEN).toBe('sekrit-token-123');
   });
 
   it('non-bypass default is permissionMode default (never omitted), profiles map from options', async () => {
@@ -137,7 +147,8 @@ describe('open → SDK options', () => {
       // Per-open profiles win over the instance's; directories are the union.
       expect(o.permissionMode).toBe('default');
       expect(o.additionalDirectories).toEqual(['/shared', '/i', '/p']);
-      expect(o.mcpServers).toEqual({ docs: { type: 'http', url: 'http://docs' }, agents_io: { type: 'http', url: 'http://h/mcp', headers: { Authorization: 'Bearer t' } } });
+      expect(o.mcpServers).toEqual({ docs: { type: 'http', url: 'http://docs' }, agents_io: { type: 'http', url: 'http://h/mcp', headers: { Authorization: 'Bearer ${AGENTS_IO_MCP_TOKEN}' } } });
+      expect(o.env).toMatchObject({ AGENTS_IO_MCP_TOKEN: 't' });
       // Instance profiles apply when the open passes none.
       const b = await setup({ run: { ...run, profile: 'other' } }, {}, { profiles: { other: { permissionMode: 'plan' } }, settings: '/etc/s.json' });
       expect(b.q.options).toMatchObject({ permissionMode: 'plan', settings: '/etc/s.json' });

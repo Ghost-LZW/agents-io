@@ -173,10 +173,13 @@ export class ClaudeCodeHarness implements HarnessAdapter {
 
     const mcpServers: Options['mcpServers'] = { ...c.mcpServers, ...options.sdk?.mcpServers };
     if (args.mcp) {
+      // The SDK passes mcpServers to the CLI as `--mcp-config <json>` (argv, readable via ps by
+      // other local users). The token goes in the CLI's env instead; the CLI expands ${VAR} in headers.
+      env[MCP_TOKEN_ENV] = args.mcp.token;
       mcpServers[options.mcpServerName ?? 'agents_io'] = {
         type: options.mcpTransport ?? 'http',
         url: args.mcp.url,
-        headers: { Authorization: `Bearer ${args.mcp.token}` },
+        headers: { Authorization: `Bearer \${${MCP_TOKEN_ENV}}` },
       };
     }
 
@@ -218,6 +221,9 @@ export class ClaudeCodeHarness implements HarnessAdapter {
     return session;
   }
 }
+
+/** Env var carrying the host MCP bearer token to the CLI (referenced as ${…} in the server's headers). */
+const MCP_TOKEN_ENV = 'AGENTS_IO_MCP_TOKEN';
 
 async function loadQuery(): Promise<QueryFn> {
   const sdk = await import('@anthropic-ai/claude-agent-sdk');
