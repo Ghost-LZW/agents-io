@@ -28,7 +28,10 @@ export type ResultFrame = Static<typeof ResultFrame>;
 export const LogFrame = Type.Object({
   v: V,
   type: Type.Literal('log'),
-  /** `fatal`: the adapter cannot continue (e.g. start failed); the host should restart or give up. */
+  /**
+   * `fatal`: the adapter has given up (e.g. start failed). The host treats it as the peer
+   * being dead: it kills the process/connection and restarts it with backoff.
+   */
   level: Type.Union([Type.Literal('debug'), Type.Literal('info'), Type.Literal('warn'), Type.Literal('error'), Type.Literal('fatal')]),
   msg: Type.String(),
   data: Type.Optional(Type.Unknown()),
@@ -76,17 +79,11 @@ export type ChannelAdapterFrame = Static<typeof ChannelAdapterFrame>;
 export const ChannelHello = Type.Object({
   adapterId: Type.String(),
   caps: ChannelCaps,
-  /** Optional methods this adapter implements beyond `send`. */
-  methods: Type.Array(
-    Type.Union([
-      Type.Literal('edit'),
-      Type.Literal('finalize'),
-      Type.Literal('retract'),
-      Type.Literal('speak'),
-      Type.Literal('typing'),
-      Type.Literal('reconcile'),
-    ]),
-  ),
+  /**
+   * Optional methods this adapter implements beyond `send`: edit, finalize, retract, speak,
+   * typing, reconcile. Open-ended so a newer adapter can name methods an older host ignores.
+   */
+  methods: Type.Array(Type.String()),
 });
 export type ChannelHello = Static<typeof ChannelHello>;
 
@@ -167,30 +164,64 @@ export function encodeFrame(frame: unknown): string {
   return line + '\n';
 }
 
+export interface FrameDecoderOptions {
+  /** Longest line accepted, in UTF-16 code units. Longer lines are dropped and reported. Default 32Mi. */
+  maxLineLength?: number;
+}
+
 /**
- * Splits a byte/text stream into JSON frames. Malformed lines are reported to
- * `onError` and skipped; they never break the stream.
+ * Splits a byte/text stream into JSON frames. Malformed and oversized lines are
+ * reported to `onError` and skipped; they never break the stream.
  */
 export class FrameDecoder {
   private buf = '';
+  /** Where to resume looking for a newline in `buf`; everything before it has none. */
+  private scanned = 0;
+  /** Inside an oversized line: discard input until its newline. */
+  private skipping = false;
+  private readonly max: number;
   // One decoder for the whole stream, so multi-byte characters split across chunks survive.
   private readonly text = new TextDecoder();
-  constructor(private readonly onError: (line: string, err: unknown) => void = () => {}) {}
+  constructor(
+    private readonly onError: (line: string, err: unknown) => void = () => {},
+    opts: FrameDecoderOptions = {},
+  ) {
+    this.max = opts.maxLineLength ?? 32 * 1024 * 1024;
+  }
 
   push(chunk: string | Uint8Array): unknown[] {
     this.buf += typeof chunk === 'string' ? chunk : this.text.decode(chunk, { stream: true });
     const out: unknown[] = [];
+    let start = 0;
     let nl: number;
-    while ((nl = this.buf.indexOf('\n')) >= 0) {
-      const line = this.buf.slice(0, nl).trim();
-      this.buf = this.buf.slice(nl + 1);
-      if (!line) continue;
-      try {
-        out.push(JSON.parse(line));
-      } catch (err) {
-        this.onError(line, err);
-      }
+    while ((nl = this.buf.indexOf('\n', Math.max(start, this.scanned))) >= 0) {
+      this.scanned = 0;
+      if (this.skipping) this.skipping = false;
+      else if (nl - start > this.max) this.tooLong(this.buf.slice(start, start + 200));
+      else this.parse(this.buf.slice(start, nl).trim(), out);
+      start = nl + 1;
     }
+    this.buf = this.buf.slice(start);
+    if (this.skipping) this.buf = '';
+    else if (this.buf.length > this.max) {
+      this.tooLong(this.buf.slice(0, 200));
+      this.skipping = true;
+      this.buf = '';
+    }
+    this.scanned = this.buf.length;
     return out;
+  }
+
+  private parse(line: string, out: unknown[]): void {
+    if (!line) return;
+    try {
+      out.push(JSON.parse(line));
+    } catch (err) {
+      this.onError(line, err);
+    }
+  }
+
+  private tooLong(head: string): void {
+    this.onError(head, new Error(`line exceeds ${this.max} characters; dropped`));
   }
 }

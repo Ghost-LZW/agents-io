@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   ChannelAdapterFrame,
+  ChannelHello,
   ChannelHostFrame,
   FrameDecoder,
   InboundEnvelope,
@@ -44,6 +45,22 @@ describe('schemas', () => {
     expect(check(ChannelHostFrame, { v: 1, type: 'send', id: '2', route: env.replyRoute, msg: { text: 'x' }, op: { operationId: 'o' } })).toBe(true);
     expect(check(ChannelHostFrame, { v: 1, type: 'shutdown' })).toBe(true);
   });
+
+  it('accepts a hello that names optional methods this side does not know', () => {
+    const caps = {
+      text: { maxChars: 4000, markdown: 'basic' },
+      edit: true,
+      buttons: true,
+      media: { in: [], out: [] },
+      voiceOut: 'none',
+      threads: true,
+      approvals: 'buttons',
+      defaultTier: 'card',
+      evidence: ['platform_signed'],
+      declaresSender: true,
+    };
+    expect(check(ChannelHello, { adapterId: 'x', caps, methods: ['edit', 'react'] })).toBe(true);
+  });
 });
 
 describe('wire', () => {
@@ -59,6 +76,27 @@ describe('wire', () => {
 
   it('routeKey ignores reply target', () => {
     expect(routeKey({ channel: 'c', account: 'a', conversationId: 'x', threadId: 't', replyToMessageId: 'm' })).toBe('c:a:x:t');
+  });
+});
+
+describe('FrameDecoder line limit', () => {
+  it('drops an oversized line, reports it once, and resumes at the next newline', () => {
+    const bad: [string, unknown][] = [];
+    const d = new FrameDecoder((l, e) => bad.push([l, e]), { maxLineLength: 20 });
+    const out: unknown[] = [];
+    for (let i = 0; i < 10; i++) out.push(...d.push('x'.repeat(15)));
+    out.push(...d.push('yyy\n' + encodeFrame({ a: 1 })));
+    expect(out).toEqual([{ a: 1 }]);
+    expect(bad).toHaveLength(1);
+    expect(String(bad[0]![1])).toMatch(/exceeds 20/);
+    expect(bad[0]![0].length).toBeLessThanOrEqual(200);
+  });
+
+  it('keeps lines at the limit and checks a complete long line too', () => {
+    const bad: string[] = [];
+    const d = new FrameDecoder((l) => bad.push(l), { maxLineLength: 12 });
+    expect(d.push('{"a":"1234"}\n{"a":"12345678"}\n{"b":2}\n')).toEqual([{ a: '1234' }, { b: 2 }]);
+    expect(bad).toHaveLength(1);
   });
 });
 

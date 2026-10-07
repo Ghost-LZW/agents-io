@@ -60,8 +60,30 @@ const track = async (p: Promise<BridgedChannel>) => {
 };
 const fakeChild = (env: Record<string, string> = {}, extra = {}) =>
   track(spawnChannel({ command: process.execPath, args: [fixture('fake_child.mjs')], env, account: 'default', ...extra }));
-const rawChild = (mode: string, extra = {}) =>
-  track(spawnChannel({ command: process.execPath, args: [fixture('raw_child.mjs')], env: { MODE: mode }, account: 'default', ...extra }));
+const rawChild = (mode: string, extra = {}, env: Record<string, string> = {}) =>
+  track(spawnChannel({ command: process.execPath, args: [fixture('raw_child.mjs')], env: { MODE: mode, ...env }, account: 'default', ...extra }));
+
+/** A file the raw child appends its pid to on every launch. */
+function pidLog() {
+  const file = join(mkdtempSync(join(tmpdir(), 'bridge-')), 'pids');
+  const pids = () => (existsSync(file) ? readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map(Number) : []);
+  return { file, pids };
+}
+const alive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+const waitFor = async (pred: () => boolean, ms = 5000) => {
+  const deadline = Date.now() + ms;
+  while (!pred()) {
+    if (Date.now() > deadline) throw new Error('condition not met in time');
+    await new Promise((r) => setTimeout(r, 20));
+  }
+};
 
 describe('serveChannel <-> spawnChannel', () => {
   it('performs hello and exposes only declared methods', async () => {
@@ -166,6 +188,108 @@ describe('robustness', () => {
     await expect(
       spawnChannel({ command: process.execPath, args: ['-e', 'setInterval(()=>{},1000)'], account: 'a', helloTimeoutMs: 100 }),
     ).rejects.toMatchObject({ code: 'timeout' });
+  });
+});
+
+describe('lifecycle', () => {
+  it('stops and kills the new child when aborted during a reconnect', async () => {
+    const { file, pids } = pidLog();
+    const flaky = join(mkdtempSync(join(tmpdir(), 'bridge-')), 'flaky');
+    const ch = await rawChild('flaky', { backoff: { minMs: 10, maxMs: 50 } }, { PIDS_FILE: file, FLAKY_FILE: flaky });
+    const r = run(ch);
+    await waitFor(() => pids().length === 2); // second launch is still inside its slow hello
+    const stopped = r.stop().then(() => 'stopped');
+    expect(await Promise.race([stopped, new Promise((res) => setTimeout(() => res('hung'), 3000))])).toBe('stopped');
+    await waitFor(() => !alive(pids()[1]!), 3000);
+    expect(pids()).toHaveLength(2);
+  });
+
+  it('close() during start stops the restart loop instead of respawning', async () => {
+    const { file, pids } = pidLog();
+    const ch = await rawChild('mute', { backoff: { minMs: 5, maxMs: 10 } }, { PIDS_FILE: file });
+    const r = run(ch);
+    await new Promise((res) => setTimeout(res, 50));
+    await ch.close();
+    await new Promise((res) => setTimeout(res, 300));
+    expect(pids()).toHaveLength(1);
+    await r.stop();
+  });
+
+  it('close() while a reconnect is in flight kills the child being connected', async () => {
+    const { file, pids } = pidLog();
+    const flaky = join(mkdtempSync(join(tmpdir(), 'bridge-')), 'flaky');
+    const ch = await rawChild('flaky', { backoff: { minMs: 10, maxMs: 50 } }, { PIDS_FILE: file, FLAKY_FILE: flaky });
+    const r = run(ch);
+    await waitFor(() => pids().length === 2);
+    await ch.close();
+    // The child's hello is still 300ms away; close() must not leave it running until then.
+    await waitFor(() => !alive(pids()[1]!), 150);
+    await r.stop();
+    expect(pids()).toHaveLength(2);
+  });
+
+  it('does not accumulate abort listeners across restarts', async () => {
+    const { getEventListeners } = await import('node:events');
+    const { file, pids } = pidLog();
+    const ch = await rawChild('flap', { backoff: { minMs: 5, maxMs: 10 } }, { PIDS_FILE: file });
+    const ctl = new AbortController();
+    const started = ch.start({ account: 'default', config: undefined, signal: ctl.signal, emit: async () => ({ accepted: true }), log: () => {} });
+    await waitFor(() => pids().length >= 6);
+    expect(getEventListeners(ctl.signal, 'abort').length).toBeLessThanOrEqual(2);
+    ctl.abort();
+    await started;
+  });
+
+  it('restarts a wedged child after repeated request timeouts', async () => {
+    const { file, pids } = pidLog();
+    const ch = await rawChild('mute', { requestTimeoutMs: 50, timeoutsBeforeRestart: 2, backoff: { minMs: 5, maxMs: 10 } }, { PIDS_FILE: file });
+    const r = run(ch);
+    for (let i = 0; i < 2; i++) await expect(ch.send(route, { text: 'x' }, { operationId: `o${i}` })).rejects.toMatchObject({ code: 'timeout' });
+    await waitFor(() => pids().length === 2);
+    expect(alive(pids()[0]!)).toBe(false);
+    expect(r.logs.some((l) => l.includes('not answering'))).toBe(true);
+    await r.stop();
+  });
+
+  it("restarts the child after a 'fatal' log", async () => {
+    const { file, pids } = pidLog();
+    const ch = await rawChild('fatal', { backoff: { minMs: 5, maxMs: 10 } }, { PIDS_FILE: file });
+    const r = run(ch);
+    await waitFor(() => pids().length >= 2);
+    expect(r.logs.some((l) => l.includes('cannot log in'))).toBe(true);
+    await r.stop();
+  });
+});
+
+describe('compatibility', () => {
+  it('ignores optional methods it does not know in hello', async () => {
+    const ch = await rawChild('newer');
+    expect(ch.edit).toBeTypeOf('function');
+    expect((ch as unknown as Record<string, unknown>).react).toBeUndefined();
+    await ch.edit!(route, 'm1', { text: 'x' }, { operationId: 'o', sequence: 1 });
+  });
+
+  it('fails a request at once, non-retryably, when its result frame is malformed', async () => {
+    const ch = await rawChild('badresult', { requestTimeoutMs: 5000 });
+    const t0 = Date.now();
+    const err = await ch.send(route, { text: 'x' }, { operationId: 'o' }).catch((e) => e);
+    expect(err).toMatchObject({ code: 'bad_result', retryable: false });
+    expect(err.message).toContain('not found');
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+});
+
+describe('FrameLink', () => {
+  it('refuses to buffer without limit when the peer stops reading', async () => {
+    const { PassThrough, Writable } = await import('node:stream');
+    const { FrameLink } = await import('../src/link.js');
+    const stuck = new Writable({ write() {} }); // never calls back: a wedged reader
+    const link = new FrameLink(new PassThrough(), stuck, () => {}, () => {}, () => {}, { maxBufferedBytes: 1000 });
+    const frame = { v: 1, type: 'log', level: 'info', msg: 'x'.repeat(100) };
+    let sent = 0;
+    while (link.send(frame) && sent < 1000) sent++;
+    expect(sent).toBeLessThan(20);
+    expect(stuck.writableLength).toBeLessThan(2000);
   });
 });
 
