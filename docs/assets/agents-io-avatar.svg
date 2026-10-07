@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>agents-io</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4338CA"/>
+      <stop offset="1" stop-color="#0D9488"/>
+    </linearGradient>
+    <radialGradient id="core" cx="0.5" cy="0.42" r="0.6">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E0E7FF"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="512" height="512" fill="url(#bg)"/>
+
+  <!-- inputs converge into the core -->
+  <g fill="none" stroke="#FFFFFF" stroke-width="18" stroke-linecap="round" opacity="0.92">
+    <path d="M104 156 C 168 156, 176 256, 212 256"/>
+    <path d="M96 256 H 212"/>
+    <path d="M104 356 C 168 356, 176 256, 212 256"/>
+  </g>
+  <g fill="#FFFFFF">
+    <circle cx="96" cy="156" r="22"/>
+    <circle cx="84" cy="256" r="22"/>
+    <circle cx="96" cy="356" r="22"/>
+  </g>
+
+  <!-- outputs fan out from the core -->
+  <g fill="none" stroke="#CCFBF1" stroke-width="18" stroke-linecap="round">
+    <path d="M300 256 C 336 256, 344 156, 400 156"/>
+    <path d="M300 256 H 412"/>
+    <path d="M300 256 C 336 256, 344 356, 400 356"/>
+  </g>
+  <g fill="none" stroke="#CCFBF1" stroke-width="18" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M384 136 L 410 156 L 384 176"/>
+    <path d="M398 236 L 424 256 L 398 276"/>
+    <path d="M384 336 L 410 356 L 384 376"/>
+  </g>
+
+  <!-- the agent -->
+  <circle cx="256" cy="256" r="64" fill="url(#core)"/>
+  <circle cx="256" cy="256" r="64" fill="none" stroke="#FFFFFF" stroke-width="6" opacity="0.6"/>
+  <circle cx="236" cy="248" r="10" fill="#312E81"/>
+  <circle cx="276" cy="248" r="10" fill="#312E81"/>
+  <path d="M234 278 Q 256 294 278 278" fill="none" stroke="#312E81" stroke-width="9" stroke-linecap="round"/>
+</svg>
