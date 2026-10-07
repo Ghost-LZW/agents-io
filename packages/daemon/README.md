@@ -179,7 +179,9 @@ the conversation's current topic; the first one is created on first use and keep
 the conversation's own session key (so a session from before topics carries on),
 later ones are `<that key>#<topicId>`. A threaded message stays per thread. The
 default owner-DM rule (`default:owner-dm`) uses `topic`; group rules are unchanged
-(`per-thread`).
+(`per-thread`). Context (and digest items) of a flat conversation that keeps topics
+goes to its current topic, also from `per-thread` rules such as the default
+`observe-<kind>`.
 
 - The table (`topics`, in the log's SQLite database): title, summary, session key,
   the harness's native session id (from `session.bound`), current / parked, created
@@ -187,19 +189,29 @@ default owner-DM rule (`default:owner-dm`) uses `topic`; group rules are unchang
 - Every change appends `topic.changed { conversation, from?, to, title?, reason }`
   to the session left and the one now current.
 - Inputs routed to a topic carry `channelContext.topic` / `topicTitle` (the model
-  sees them in its input preface) and, when the agent has the output tools,
-  `topicTools`: one line on when to call `session_rotate` / `session_switch`
+  sees them in its input preface; an input rewritten into another topic's session,
+  e.g. an answer to a question a parked topic asked, carries that topic) and, in the
+  current topic and when the target agent has the output tools, `topicTools`: one line on when to call `session_rotate` / `session_switch`
   (without it, small models never rotate). A message handed over by a rotate or
   switch carries `handedFrom` and a line saying to answer it there; the tools
   refuse to move it again, so topics cannot ping-pong.
 - When to switch is the agent's call, with the host output tools:
   `session_rotate({ title, summary })` starts a new topic and hands the turn's
   triggering inputs to it (new input ids `<id>><topicId>`), the summary first as a
-  labelled context item; `session_list()`; `session_switch({ topicId })` makes a
+  labelled context item; the summary is saved on the topic it describes (the one
+  parked), so `session_list` shows it on that row; `session_list()`; `session_switch({ topicId })` makes a
   parked topic current again and hands the inputs to it: its lane carries on in
   memory, or after a restart opens the harness with the native id its log recorded
   (`--resume` / thread resume). The tool result tells the model to end the turn
-  without answering; the answer comes from the topic now current.
+  without answering; the answer comes from the topic now current. Messages of the
+  conversation still queued behind that turn follow it (`input.cancelled` reason
+  `moved_to_topic` in the old topic, re-queued as `<id>><topicId>`). If the handover
+  fails, the conversation switches back (reason `system`) and the tool tells the
+  model to answer where it is. The old topic's card for that turn ends as one line,
+  `→ Moved to topic "<title>"` (channels that only get final messages get none).
+- A parked topic's lane, and its harness session, closes once it has been parked
+  and idle for `topics.parkedIdleMs` (default 30 min; `0` keeps it open); switching
+  back opens it again, resuming by the native id.
 - Or the user's, with chat commands on a topic route: `/new [title]`, `/topics`,
   `/switch <n|id>` (`n` as `/topics` numbers them). They are checked by
   `Policy.control` as a `reset` of the session they were sent to (owner by default),

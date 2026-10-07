@@ -277,6 +277,21 @@ export class Lane {
     return this.queue.map((q) => q.input.inputId);
   }
 
+  /**
+   * Take the queued inputs `match` selects out of the queue (recorded as
+   * `input.cancelled` with `reason`), e.g. to hand them to another session.
+   */
+  take(match: (input: InputRecord) => boolean, reason: string): Promise<InputRecord[]> {
+    return this.serial(async () => {
+      const taken = this.queue.filter((q) => match(q.input));
+      if (!taken.length) return [];
+      this.queue = this.queue.filter((q) => !taken.includes(q));
+      this.emit({ body: { t: 'input.cancelled', inputIds: taken.map((q) => q.input.inputId), reason } });
+      this.notifyIdle();
+      return taken.map((q) => q.input);
+    });
+  }
+
   activeTurn(): { turnId: string; owner: string | null; inputIds: string[] } | undefined {
     const t = this.turn;
     return t && { turnId: t.turnId, owner: t.owner, inputIds: t.inputs.map((i) => i.inputId) };

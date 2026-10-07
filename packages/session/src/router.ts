@@ -21,7 +21,7 @@ import {
 } from '@agents-io/protocol';
 import { IdentityError, IdentityMap, OWNER_LABEL, checkIdentities, ownerIdentities, type IdentityRules } from './identity.js';
 import { conversationRouteKey } from './policy.js';
-import { titleFrom, type TopicDraft, type TopicRecord, type TopicRegistry } from './topics.js';
+import { titleFrom, type TopicCreateOptions, type TopicDraft, type TopicRecord, type TopicRegistry } from './topics.js';
 import { contentText } from './watch.js';
 
 /*
@@ -408,7 +408,7 @@ export class Router {
       const entry: RouteExplanation['matched'][number] = { bindingId: r.binding.id, source: r.source, on, ...(r.callout ? { callout: r.callout } : {}) };
       if (targets(on)) {
         const agent = r.watchId !== undefined || r.legacyKey !== undefined ? undefined : this.agents.get(r.agent ?? this.o.defaultAgent ?? '');
-        const scope = r.legacyKey !== undefined ? { sessionKey: r.legacyKey } : this.scope(r.session, agent, env);
+        const scope = r.legacyKey !== undefined ? { sessionKey: r.legacyKey } : this.scope(r.session, agent, env, on);
         const sessionKey = scope.sessionKey;
         if (agent) entry.agent = agent.name;
         entry.sessionKey = sessionKey;
@@ -504,12 +504,18 @@ export class Router {
     return this.scope(scope, agent, env).sessionKey;
   }
 
-  private scope(scope: SessionScope | undefined, agent: AgentSpec | undefined, env: InboundEnvelope): { sessionKey: string; topic?: TopicRecord } {
+  private scope(scope: SessionScope | undefined, agent: AgentSpec | undefined, env: InboundEnvelope, on?: BindingAction): { sessionKey: string; topic?: TopicRecord } {
     const s = scope ?? 'per-conversation';
     if (typeof s === 'object') return { sessionKey: s.key };
     const name = agent?.name ?? this.o.defaultAgent ?? 'default';
     if (s === 'main') return { sessionKey: agent?.mainSession ?? `${name}:main` };
     const prefix = agent?.sessionPrefix ?? `${name}:`;
+    // Context (and digest items) of a flat conversation that keeps topics go where its turns go now, the current
+    // topic, also from per-thread / per-conversation rules such as the default `observe-<kind>` (whose key is the first topic's).
+    if (s !== 'topic' && on !== undefined && on !== 'dispatch' && env.conversation.threadId === undefined && this.o.topics) {
+      const cur = this.o.topics.current(topicConversation(env), name);
+      if (cur) return { sessionKey: cur.sessionKey };
+    }
     // Threaded conversations keep one session per thread; without a topic table a topic is the conversation.
     if (s === 'per-thread' || (s === 'topic' && (env.conversation.threadId !== undefined || !this.o.topics))) return { sessionKey: prefix + conversationRouteKey(env) };
     const conversation = topicConversation(env);
@@ -533,10 +539,10 @@ export class Router {
   }
 
   /** Start a new topic in a conversation (it becomes current). Throws without a topic table. */
-  newTopic(agentName: string, conversation: string, draft: TopicDraft, reason: 'user' | 'agent' | 'system') {
+  newTopic(agentName: string, conversation: string, draft: TopicDraft, reason: 'user' | 'agent' | 'system', opts: TopicCreateOptions = {}) {
     if (!this.o.topics) throw new RouterError('invalid', 'no topic table');
     this.target(agentName, 'newTopic');
-    return this.o.topics.create(conversation, agentName, this.topicKey(agentName, conversation), draft, reason);
+    return this.o.topics.create(conversation, agentName, this.topicKey(agentName, conversation), draft, reason, opts);
   }
 
   /** The topic table, when there is one. */

@@ -63,11 +63,11 @@ function agent(holder: { h?: FakeHarness; w?: World }, tools: { name: string; is
   };
 }
 
-async function world(dir = tmp()) {
+async function world(dir = tmp(), raw: Record<string, unknown> = {}) {
   const holder: { h?: FakeHarness; w?: World } = {};
   const tools: { name: string; isError: boolean; json: any; text: string }[] = [];
   const turns: { sessionKey: string; inputs: InputRecord[] }[] = [];
-  const w = await daemon({ dir, script: agent(holder, tools, turns), raw: { outputTools: true } });
+  const w = await daemon({ dir, script: agent(holder, tools, turns), raw: { outputTools: true, ...raw } });
   holder.h = w.harness;
   holder.w = w;
   return { w, tools, turns };
@@ -89,6 +89,9 @@ describe('topics in the daemon', () => {
     expect(tools[0]).toMatchObject({ name: 'session_rotate', isError: false, json: { topic: { topicId: b.id, title: 'Capitals' }, previous: { topicId: a.id }, handed: 1 } });
     expect(tools[0]!.json.note).toMatch(/Do NOT answer/);
     expect(w.gw.topics.current(CONV, 'default')!.id).toBe(b.id);
+    // The summary describes the topic it was written in: it is saved on A, which is now parked; B has none yet.
+    expect(w.gw.topics.get(a.id)).toMatchObject({ state: 'parked', summary: 'The user told me their codename.' });
+    expect(w.gw.topics.get(b.id)!.summary).toBeUndefined();
     // The new topic's first turn: the summary as context, then the user's message under a new id.
     const started = of(read(w, b.sessionKey), 'turn.started')[0]!;
     expect(started.inputIds).toEqual([expect.stringMatching(/^sum_turn_/), `${r.inputId}>${b.id}`]);
@@ -110,6 +113,7 @@ describe('topics in the daemon', () => {
     await until(() => turnsIn(w, CONV).length === 3 && tools.length === 3);
     expect(tools.map((t) => t.name)).toEqual(['session_rotate', 'session_list', 'session_switch']);
     expect(tools[1]!.json.topics.map((t: { topicId: string }) => t.topicId).sort()).toEqual([a.id, b.id].sort());
+    expect(tools[1]!.json.topics.find((t: { topicId: string }) => t.topicId === a.id).summary).toBe('The user told me their codename.');
     expect(tools[2]).toMatchObject({ isError: false, json: { topic: { topicId: a.id }, handed: 1 } });
     expect(w.gw.topics.current(CONV, 'default')!.id).toBe(a.id);
     const answerA = of(read(w, CONV), 'text.snapshot').at(-1)!;
@@ -123,6 +127,105 @@ describe('topics in the daemon', () => {
     const titles = w.chat.sent.map((s) => (s.edits.at(-1)?.channelData as Record<string, { title: string }> | undefined)?.[TOPIC_KEY]?.title);
     expect(titles).toContain('Capitals');
     expect(titles).toContain('Remember my codename: HERON');
+    // The turns that handed the message away end as one line naming the topic now current, not with their own text.
+    const finals = w.chat.sent.map((s) => s.edits.at(-1)?.text ?? s.msg.text);
+    expect(finals).toContain('→ Moved to topic "Capitals"');
+    expect(finals).toContain('→ Moved to topic "Remember my codename: HERON"');
+    expect(finals).not.toContain('→ Capitals');
+    expect(finals).not.toContain('→ back');
+  });
+
+  it('a follow-up queued in the old topic while its turn rotates moves to the new topic', async () => {
+    const holder: { w?: World } = {};
+    const ran: { sessionKey: string; inputs: InputRecord[] }[] = [];
+    const tools: { isError: boolean; text: string }[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const w = await daemon({
+      raw: { outputTools: true },
+      script: async (t) => {
+        const topicId = t.inputs.map((i) => i.channelContext.topic).find((x) => typeof x === 'string') as string;
+        const sk = holder.w!.gw.topics.get(topicId)!.sessionKey;
+        ran.push({ sessionKey: sk, inputs: t.inputs });
+        const text = textOf(t);
+        if (/Tokyo/.test(text) && !/Summary of the previous topic/.test(text)) {
+          await gate;
+          const s = holder.w!.harness.sessions.filter((x) => x.args.sessionKey === sk).at(-1)!;
+          tools.push(await mcpCall(s.args.mcp, 'session_rotate', { title: 'Tokyo trip', summary: 'none' }, `${t.turnId}:r`));
+        }
+        t.emit({ t: 'text.snapshot', text: 'ok', final: true }, { audience: 'answer' });
+      },
+    });
+    holder.w = w;
+    await w.chat.inject({ sender: alice, text: 'Rust CLI question' });
+    await until(() => turnsIn(w, CONV).length === 1);
+    await w.chat.inject({ sender: alice, text: 'Plan a trip to Tokyo' });
+    await until(() => ran.length === 2);
+    const budget = await w.chat.inject({ sender: alice, text: 'budget is 2000 USD' });
+    await until(() => w.gw.lane(CONV).queued().length === 1);
+    release();
+    const b = await until(() => w.gw.topics.list({ conversation: CONV }).find((t) => t.title === 'Tokyo trip'));
+    await until(() => turnsIn(w, b.sessionKey).length === 2);
+    expect(tools).toEqual([expect.objectContaining({ isError: false })]);
+    // The follow-up left A's queue and is answered in B, after the handed message, with what B knows.
+    const inB = of(read(w, b.sessionKey), 'turn.started').flatMap((x) => x.inputIds);
+    expect(inB).toContain(`${budget.inputId}>${b.id}`);
+    expect(of(read(w, CONV), 'input.cancelled')).toEqual([{ t: 'input.cancelled', inputIds: [budget.inputId], reason: 'moved_to_topic' }]);
+    expect(turnsIn(w, CONV)).toHaveLength(2);
+    expect(ran.filter((r) => r.sessionKey === CONV)).toHaveLength(2);
+    const moved = ran.find((r) => r.inputs.some((i) => i.inputId === `${budget.inputId}>${b.id}`))!.inputs.at(-1)!;
+    expect(moved.channelContext).toMatchObject({ topic: b.id, handedFrom: CONV });
+    expect(moved.origin.principal?.id).toBe('fake:alice');
+  });
+
+  it('a handover that fails leaves the conversation in the topic it was in, and that turn answers', async () => {
+    const { w, tools } = await world();
+    await w.chat.inject({ sender: alice, text: 'Remember my codename: HERON' });
+    await until(() => turnsIn(w, CONV).length === 1);
+    await w.chat.inject({ sender: alice, text: 'Something unrelated: what is the capital of Australia?' });
+    const b = await until(() => w.gw.topics.list({ conversation: CONV }).find((t) => t.title === 'Capitals'));
+    await until(() => turnsIn(w, b.sessionKey).length === 1);
+    // A's lane can no longer take inputs (e.g. it is closing).
+    await w.gw.lane(CONV).close();
+    await w.chat.inject({ sender: alice, text: 'Ok, go back to the earlier topic: what is my codename?' });
+    await until(() => turnsIn(w, b.sessionKey).length === 2);
+    expect(tools.map((t) => t.name)).toEqual(['session_rotate', 'session_list', 'session_switch']);
+    expect(tools[2]).toMatchObject({ isError: true, text: expect.stringMatching(/stays in this topic/) });
+    expect(w.gw.topics.current(CONV, 'default')!.id).toBe(b.id);
+    // Its card is the turn's own answer, not a "moved" line.
+    await until(() => w.chat.sent.filter((s) => s.finalized).length >= 3);
+    expect(w.chat.sent.map((s) => s.edits.at(-1)?.text).at(-1)).toBe('→ back');
+  });
+
+  it("parked topics' lanes close after topics.parkedIdleMs and resume by native id when switched back", async () => {
+    expect((await world()).w.config.topics.parkedIdleMs).toBe(30 * 60_000);
+    const { w } = await world(tmp(), { topics: { parkedIdleMs: 50 } });
+    await w.chat.inject({ sender: alice, text: 'Remember my codename: HERON' });
+    await until(() => turnsIn(w, CONV).length === 1);
+    await w.chat.inject({ sender: alice, text: 'Something unrelated: what is the capital of Australia?' });
+    const b = await until(() => w.gw.topics.list({ conversation: CONV }).find((t) => t.title === 'Capitals'));
+    await until(() => turnsIn(w, b.sessionKey).length === 1);
+    const live = (sk: string) => w.gw.sessions().find((s) => s.sessionKey === sk)?.live;
+    await until(() => live(CONV) === false);
+    expect(live(b.sessionKey)).toBe(true);
+    await w.chat.inject({ sender: alice, text: 'Ok, go back to the earlier topic: what is my codename?' });
+    await until(() => turnsIn(w, CONV).length === 3);
+    expect(of(read(w, CONV), 'text.snapshot').at(-1)!.text).toBe('Your codename is HERON.');
+    const opened = w.harness.sessions.filter((s) => s.args.sessionKey === CONV);
+    expect(opened).toHaveLength(2);
+    expect(opened[1]!.args.resume).toBe(`native:${CONV}`);
+    // Now B is parked and idles out too; A, current, stays open.
+    await until(() => live(b.sessionKey) === false);
+    expect(live(CONV)).toBe(true);
+  });
+
+  it('agents without the session_* tools get no topic hint', async () => {
+    const seen: InputRecord[] = [];
+    const w = await daemon({ raw: { outputTools: true, agents: { chat: { harness: 'claude-code', tools: false } } }, script: async (t) => void seen.push(...t.inputs) });
+    await w.chat.inject({ sender: alice, text: 'hello' });
+    await until(() => seen.length === 1);
+    expect(seen[0]!.channelContext.topic).toBeDefined();
+    expect(seen[0]!.channelContext.topicTools).toBeUndefined();
   });
 
   it('chat commands answer with a system reply; switching back after a restart resumes the native session', async () => {

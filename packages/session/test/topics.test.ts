@@ -2,13 +2,15 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { FakeHarness, fakeEnvelope } from '@agents-io/testkit';
+import { FakeChannel, FakeHarness, defaultChannelCaps, fakeEnvelope } from '@agents-io/testkit';
 import type { InputRecord, Origin } from '@agents-io/protocol';
 import {
+  Compositor,
   Hub,
   Ingress,
   Lane,
   MemorySessionLog,
+  Outbox,
   Router,
   SqliteSessionLog,
   TOPIC_KEY,
@@ -25,6 +27,7 @@ import {
   titleFrom,
   topicContext,
   type AgentSpec,
+  type IngressOptions,
   type SessionPolicy,
 } from '../src/index.js';
 import { RUN, bodies, until } from './helpers.js';
@@ -51,7 +54,7 @@ describe('TopicRegistry', () => {
     expect(a.created).toBe(true);
     expect(a.topic).toMatchObject({ conversation: CONV, sessionKey: CONV, state: 'current', title: 'Rust CLI' });
     expect(r.ensureCurrent(CONV, 'default', key)).toEqual({ topic: a.topic, created: false });
-    const b = r.create(CONV, 'default', key, { title: 'Capitals', summary: 'user builds a Rust CLI' }, 'agent');
+    const b = r.create(CONV, 'default', key, { title: 'Capitals' }, 'agent');
     expect(b.created).toBe(true);
     expect(b.previous?.id).toBe(a.topic.id);
     expect(b.topic.sessionKey).toBe(`${CONV}#${b.topic.id}`);
@@ -99,6 +102,32 @@ describe('TopicRegistry', () => {
     const want = { t: 'topic.changed', conversation: CONV, from: a.id, to: b.id, title: 'B', reason: 'agent' };
     expect(bodies(hub.log.read(a.sessionKey, 0), 'topic.changed').at(-1)).toEqual(want);
     expect(bodies(hub.log.read(b.sessionKey, 0), 'topic.changed')).toEqual([want]);
+  });
+
+  it('a rotate stores its summary on the topic it parks (the one it describes); the new topic starts without one', () => {
+    const path = tempDb();
+    const log = new SqliteSessionLog({ path });
+    const r = new TopicRegistry({ db: log.db, newId });
+    const a = r.ensureCurrent(CONV, 'default', key, { title: 'Rust CLI' }).topic;
+    const b = r.create(CONV, 'default', key, { title: 'Capitals' }, 'agent', { summaryOfPrevious: '  user builds a Rust CLI ' }).topic;
+    expect(r.get(a.id)).toMatchObject({ state: 'parked', summary: 'user builds a Rust CLI' });
+    expect(b.summary).toBeUndefined();
+    log.close();
+    const r2 = new TopicRegistry({ db: new SqliteSessionLog({ path }).db });
+    expect(r2.get(a.id)?.summary).toBe('user builds a Rust CLI');
+    expect(r2.get(b.id)?.summary).toBeUndefined();
+  });
+
+  it("a change a turn made is recorded under that turn in the turn's session", () => {
+    const hub = new Hub(new MemorySessionLog());
+    const r = new TopicRegistry({ hub, newId });
+    const a = r.ensureCurrent(CONV, 'default', key).topic;
+    const b = r.create(CONV, 'default', key, { title: 'B' }, 'agent', { turn: { sessionKey: CONV, turnId: 'turn_1' } }).topic;
+    expect(hub.log.read(a.sessionKey, 0).filter((e) => e.body.t === 'topic.changed').at(-1)!.turnId).toBe('turn_1');
+    expect(hub.log.read(b.sessionKey, 0).find((e) => e.body.t === 'topic.changed')!.turnId).toBeUndefined();
+    r.switchTo(a.id, 'agent', { turn: { sessionKey: b.sessionKey, turnId: 'turn_2' } });
+    expect(hub.log.read(b.sessionKey, 0).filter((e) => e.body.t === 'topic.changed').at(-1)!.turnId).toBe('turn_2');
+    expect(hub.log.read(a.sessionKey, 0).filter((e) => e.body.t === 'topic.changed').at(-1)!.turnId).toBeUndefined();
   });
 
   it('titles: trimmed and bounded; a first message gives a short title, a command none', () => {
@@ -150,6 +179,28 @@ describe('router: session "topic"', () => {
     expect(() => plain.newTopic('assistant', CONV, {}, 'user')).toThrow(/no topic table/);
   });
 
+  it('context recorded by the default observe rule follows the current topic of a conversation that has topics', async () => {
+    const topics = new TopicRegistry({ newId });
+    // The owner made the group's rule `topic` (the default observe rule stays `per-thread`).
+    const bindings = defaultBindings({ agent: 'assistant' }).map((b) => (b.id === 'default:owner-group' ? { ...b, session: 'topic' as const } : b));
+    const r = new Router({ agents: AGENTS, defaultAgent: 'assistant', config: { version: 'v', bindings, identities: [] }, topics });
+    const G = 'fake:default:g1';
+    const member: Origin = { kind: 'human', principal: { id: 'fake:bob', labels: [] }, evidence: 'platform_signed', via: G, adapter: 'fake' };
+    const say = (id: string, text: string, conversation: { id: string; kind: 'group'; threadId?: string } = { id, kind: 'group' }) => {
+      const env = fakeEnvelope({ conversation, text });
+      return r.route(env, member, inputOf(env, member));
+    };
+    const first = r.newTopic('assistant', G, { title: 'A' }, 'user').topic;
+    expect(first.sessionKey).toBe(G);
+    expect((await say('g1', 'bob in topic 1')).deliveries).toEqual([expect.objectContaining({ on: 'context', sessionKey: G })]);
+    const second = r.newTopic('assistant', G, { title: 'B' }, 'user').topic;
+    expect((await say('g1', 'bob in topic 2')).deliveries).toEqual([expect.objectContaining({ on: 'context', sessionKey: second.sessionKey })]);
+    // A thread stays its own session; a group without topics keeps its session and gets no topic table entry.
+    expect((await say('g1', 'in a thread', { id: 'g1', kind: 'group', threadId: 't1' })).deliveries[0]!.sessionKey).toBe(`${G}:t1`);
+    expect((await say('g2', 'elsewhere')).deliveries[0]!.sessionKey).toBe('fake:default:g2');
+    expect(topics.list({ conversation: 'fake:default:g2' })).toEqual([]);
+  });
+
   it('the default owner-DM rule uses topics; groups stay per thread', () => {
     const b = defaultBindings({ agent: 'default' });
     expect(b.find((x) => x.id === 'default:owner-dm')!.session).toBe('topic');
@@ -158,7 +209,7 @@ describe('router: session "topic"', () => {
   });
 });
 
-function world(extra: Partial<SessionPolicy> = {}) {
+function world(extra: Partial<SessionPolicy> = {}, more: Partial<IngressOptions> = {}) {
   const hub = new Hub(new MemorySessionLog());
   const policy: SessionPolicy = { ...defaultPolicy({ owners: ['fake:alice', 'fake:bob'], run: RUN }), ...extra };
   const topics = new TopicRegistry({ hub, newId });
@@ -182,6 +233,7 @@ function world(extra: Partial<SessionPolicy> = {}) {
     systemReply: async (a) => {
       replies.push({ text: a.text, sessionKey: a.sessionKey, operationId: a.operationId });
     },
+    ...more,
   });
   return { hub, ingress, topics, lanes, seen, replies };
 }
@@ -247,6 +299,33 @@ describe('topic commands (Ingress)', () => {
     expect(TOPIC_TOOLS_HINT).toMatch(/session_switch/);
   });
 
+  it("an input rewritten into a parked topic's session is labelled with that topic, without the hint", async () => {
+    // A reply "2" to a question topic A asked goes back to A's session, though B is current.
+    const w = world({}, { topicHint: TOPIC_TOOLS_HINT, rewrite: ({ env }) => (JSON.stringify(env.content).includes('"2"') ? { sessionKey: CONV } : undefined) });
+    await say(w, 'Pick a colour');
+    const a = w.topics.current(CONV, 'default')!;
+    await say(w, '/new Groceries');
+    const b = w.topics.current(CONV, 'default')!;
+    await say(w, 'milk');
+    await until(() => w.seen.some((s) => s.sessionKey === b.sessionKey));
+    expect(w.seen.find((s) => s.sessionKey === b.sessionKey)!.inputs[0]!.channelContext).toMatchObject({ topic: b.id, topicTitle: 'Groceries', topicTools: TOPIC_TOOLS_HINT });
+    const r = await say(w, '2');
+    expect(r.sessionKey).toBe(CONV);
+    await until(() => w.seen.filter((s) => s.sessionKey === CONV).length === 2);
+    const ctx = w.seen.filter((s) => s.sessionKey === CONV).at(-1)!.inputs.at(-1)!.channelContext;
+    expect(ctx).toMatchObject({ topic: a.id, topicTitle: 'Pick a colour' });
+    // A parked topic's tools refuse to move anything: no hint to call them.
+    expect(ctx.topicTools).toBeUndefined();
+  });
+
+  it('the hint is chosen per target agent (only agents with the session_* tools get it)', async () => {
+    const w = world({}, { topicHint: (agent) => (agent === 'tools' ? TOPIC_TOOLS_HINT : undefined) });
+    await say(w, 'hello');
+    await until(() => w.seen.length === 1);
+    expect(w.seen[0]!.inputs[0]!.channelContext.topic).toBeDefined();
+    expect(w.seen[0]!.inputs[0]!.channelContext.topicTools).toBeUndefined();
+  });
+
   it('Policy.control decides who may use them (owner by default)', async () => {
     const calls: string[] = [];
     const w = world({ control: async (a) => (calls.push(`${a.op}:${a.sessionKey}`), 'deny') });
@@ -274,5 +353,44 @@ describe('topic title on cards', () => {
     expect(renderTurn(v, 'card').channelData).toBeUndefined();
     expect(renderTurn(v, 'final', { title: 'Groceries' }).channelData).toBeUndefined();
     expect(renderTurn(v, 'headline', { title: 'Groceries' }).channelData).toBeUndefined();
+  });
+});
+
+describe('a turn handed to another topic', () => {
+  const ROUTE = { channel: 'fake', account: 'default', conversationId: 'c1' };
+  async function run(tier: 'card' | 'final', back = false) {
+    const hub = new Hub(new MemorySessionLog());
+    const channel = new FakeChannel('fake', { ...defaultChannelCaps, ...(tier === 'final' ? { edit: false, defaultTier: 'final' as const } : {}) });
+    const c = new Compositor({ hub, sessionKey: CONV, adapter: channel, outbox: new Outbox({ hub, sleep: async () => {} }), throttleMs: 1, title: () => 'Rust CLI' });
+    c.start();
+    const ev = (body: Parameters<Hub['append']>[1]['body'], turnId?: string) =>
+      hub.append(CONV, { ts: Date.now(), level: 'primary', audience: body.t === 'text.snapshot' ? 'answer' : 'status', durability: 'durable', ...(turnId ? { turnId } : {}), body });
+    ev({ t: 'turn.started', turnId: 't1', inputIds: ['in1'], replyRoute: ROUTE });
+    ev({ t: 'topic.changed', conversation: CONV, from: 'tp_a', to: 'tp_b', title: 'Capitals', reason: 'agent' }, 't1');
+    // A failed handover switches back (reason system): the turn answers here after all.
+    if (back) ev({ t: 'topic.changed', conversation: CONV, from: 'tp_b', to: 'tp_a', title: 'Rust CLI', reason: 'system' }, 't1');
+    ev({ t: 'text.snapshot', text: back ? 'Canberra.' : '→ Capitals', final: true }, 't1');
+    ev({ t: 'turn.completed', turnId: 't1', status: 'completed' }, 't1');
+    if (tier === 'card') await until(() => channel.sent[0]?.finalized);
+    else await new Promise((r) => setTimeout(r, 50));
+    await c.stop();
+    return channel.sent;
+  }
+
+  it('its card ends as one line naming the topic it moved to', async () => {
+    const [card] = await run('card');
+    const final = card!.edits.at(-1)!;
+    expect(final.text).toBe('→ Moved to topic "Capitals"');
+    expect(final.progress).toMatchObject({ steps: [], answer: '→ Moved to topic "Capitals"', answerFinal: true });
+    expect(JSON.stringify(final)).not.toContain('→ Capitals');
+  });
+
+  it('a channel that only gets final messages gets none for it', async () => {
+    expect(await run('final')).toEqual([]);
+  });
+
+  it('a handover switched back renders the answer as usual', async () => {
+    const [card] = await run('card', true);
+    expect(card!.edits.at(-1)!.text).toBe('Canberra.');
   });
 });

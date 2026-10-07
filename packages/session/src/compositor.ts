@@ -37,6 +37,8 @@ export interface TurnView {
   answerFinal: boolean;
   startedAt?: number;
   endedAt?: number;
+  /** The turn handed its message to another topic (session_rotate / session_switch): that topic answers. */
+  movedTo?: { topicId: string; title?: string };
 }
 
 export function newTurnView(turnId: string, startedAt?: number): TurnView {
@@ -199,6 +201,12 @@ export function foldTurn(v: TurnView, e: SessionEvent): boolean {
       v.pending = v.pending.filter((r) => r.requestId !== b.requestId);
       return v.pending.length !== n;
     }
+    case 'topic.changed':
+      // Recorded under this turn only when the turn itself moved the conversation (reason agent); a failed
+      // handover switches back (reason system) and the turn answers here after all.
+      if (b.reason === 'agent') v.movedTo = { topicId: b.to, ...(b.title !== undefined ? { title: b.title } : {}) };
+      else delete v.movedTo;
+      return true;
     case 'turn.completed':
       v.status = b.status;
       v.currentTool = null;
@@ -267,6 +275,13 @@ export function renderTurn(v: TurnView, tier: Tier, o: RenderOptions = {}): Rend
       if (!(d in DECISION_LABEL)) continue;
       actions.push({ id: actionId(r.requestId, d as DecisionKind), label: DECISION_LABEL[d]!, ...(d === 'deny' ? { style: 'danger' as const } : d === 'allow_once' && !r.defaultDeny ? { style: 'primary' as const } : {}) });
     }
+  }
+  if (v.movedTo) {
+    // Nothing of the old topic's turn matters any more: one line saying where the conversation went.
+    const line = clip(`→ Moved to topic ${v.movedTo.title !== undefined ? `"${v.movedTo.title}"` : v.movedTo.topicId}`);
+    if (tier === 'headline' || tier === 'final') return { text: line, ...(tier === 'headline' ? { spokenText: line } : {}) };
+    const topic: TopicCardData | undefined = o.title ? { title: o.title } : undefined;
+    return { text: line, sections: [], progress: { ...progressOf(v), steps: [], answer: line }, ...(topic ? { channelData: { [TOPIC_KEY]: topic } } : {}) };
   }
   const done = v.status !== null;
   const statusLine = asks[0] ?? (done ? STATUS_LABEL[v.status!] : v.currentTool ? `▶ ${v.currentTool}` : (v.headline ?? 'Working…'));
@@ -559,6 +574,8 @@ export class Compositor {
       const d = { operationId: `${this.base(r)}:final`, sessionKey: this.o.sessionKey, turnId: r.view.turnId, route: r.route };
       const id = r.messageId;
       const adapter = this.o.adapter;
+      // A turn that moved to another topic, with nothing sent yet (final-only channels): no message at all.
+      if (r.view.movedTo && !id) return;
       if (r.streaming && id) {
         await this.o.outbox.deliver(d, async () => {
           if (adapter.finalize) await adapter.finalize(r.route, id, msg);

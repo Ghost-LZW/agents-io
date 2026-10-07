@@ -50,6 +50,7 @@ import {
   type IngressResult,
   type RemoveWatchResult,
   type SessionLog,
+  type TopicChange,
   type TopicRecord,
   topicContext,
   topicView,
@@ -201,6 +202,8 @@ export class Gateway {
   readonly startedAt = Date.now();
   private readonly log: LogFn;
   private stopped = false;
+  /** Parked topic sessions whose lane closes when this fires (`topics.parkedIdleMs`). */
+  private readonly parkedTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   private constructor(private readonly o: GatewayOptions) {
     const c = o.config;
@@ -220,7 +223,7 @@ export class Gateway {
     this.hostQueue = new HostQueue(db);
     this.token = o.token ?? randomBytes(32).toString('hex');
     // Every topic change is recorded (topic.changed) in the session left and the one now current.
-    this.topics = new TopicRegistry({ ...db, hub: this.hub });
+    this.topics = new TopicRegistry({ ...db, hub: this.hub, onChange: (ch) => this.topicChanged(ch) });
     // Agents: the configured ones, or `default` on the default instance with sessions keyed by bare route keys as before.
     const legacyAdmit = o.policy?.admit;
     const table = configTable(c);
@@ -329,8 +332,8 @@ export class Gateway {
       ...(tools ? { rewrite: (a) => tools.rewriteInbound(a) } : {}),
       // `/new`, `/topics`, `/switch` answer with one short message on the route they came from.
       systemReply: (a) => this.systemReply(a),
-      // With the session_* tools mounted, every input of a topic says how to move between topics.
-      ...(tools ? { topicHint: TOPIC_TOOLS_HINT } : {}),
+      // Inputs of a current topic say how to move between topics, to agents that have the session_* tools.
+      ...(tools ? { topicHint: (agent: string | undefined) => (c.agents[agent ?? c.defaultAgent ?? '']?.tools ? TOPIC_TOOLS_HINT : undefined) } : {}),
       onReplyError: (err) => this.log('warn', `topic command reply failed: ${(err as Error).message}`),
     });
     if (c.source) {
@@ -573,6 +576,8 @@ export class Gateway {
     this.lanes.set(sessionKey, lane);
     this.laneInfo.set(sessionKey, { agent, ...(agent.configured ? { cwd } : {}) });
     for (const ch of this.channels) this.compose(sessionKey, ch.adapter, ch.tier);
+    // A parked topic's lane opened again (an answer to a question it asked): it idles out like any parked one.
+    if (this.topics.bySession(sessionKey)?.state === 'parked') this.idleOut(sessionKey);
     return lane;
   }
 
@@ -704,20 +709,42 @@ export class Gateway {
   /**
    * Hand a turn's triggering inputs to the topic now current (session_rotate /
    * session_switch): the same records under new ids, queued there; `context`
-   * first, as a context item. The turn that handed them over ends on its own.
+   * first, as a context item. Then the conversation's messages still queued behind
+   * that turn follow it (they were sent to the topic that is no longer current).
+   * The turn that handed them over ends on its own. If the handover fails, the
+   * conversation goes back to `from` and the turn is told to answer there.
    */
-  private async handOver(to: TopicRecord, turn: TurnContext, context?: InputRecord): Promise<string[]> {
+  private async handOver(from: TopicRecord, to: TopicRecord, turn: TurnContext, context?: InputRecord): Promise<string[]> {
     const lane = this.lane(to.sessionKey, to.agent);
-    if (context) await lane.observe(context);
-    const handed: string[] = [];
-    for (const i of turn.inputs) {
-      if (i.channelContext.context === true) continue;
+    const send = async (i: InputRecord) => {
       const { topic: _topic, topicTitle: _title, topicTools: _tools, ...ctx } = i.channelContext;
       // Handed over on purpose: this topic answers it (the session_* tools refuse to move it again).
       const input: InputRecord = { ...i, inputId: `${i.inputId}>${to.id}`, channelContext: { ...ctx, ...topicContext(to, HANDED_HINT), handedFrom: turn.sessionKey } };
       const r = await lane.command({ type: 'input', sessionKey: to.sessionKey, input, mode: 'queue' });
-      if (!r.ok) throw new ToolError(`handing the message to topic ${to.id} failed: ${r.reason}`);
-      handed.push(input.inputId);
+      if (!r.ok) throw new Error(r.reason);
+      return input.inputId;
+    };
+    const handed: string[] = [];
+    try {
+      if (context) {
+        const r = await lane.observe(context);
+        if (!r.ok) throw new Error(r.reason);
+      }
+      for (const i of turn.inputs) if (i.channelContext.context !== true) handed.push(await send(i));
+    } catch (e) {
+      // Nothing was handed: the conversation stays where the message is (reason system; the turn's card answers as usual).
+      if (this.topics.current(from.conversation, from.agent)?.id !== from.id) this.topics.switchTo(from.id, 'system', { turn: turnRef(turn) });
+      throw new ToolError(`handing the message to topic ${to.id} failed (${(e as Error).message}); the conversation stays in this topic: answer the message here`);
+    }
+    // Messages of this topic still queued here (not context, not answers to a question this topic asked).
+    const old = this.lanes.get(turn.sessionKey);
+    const queued = old ? await old.take((i) => i.channelContext.topic === from.id && i.channelContext.context !== true && !i.content.some((c) => c.type === 'event'), 'moved_to_topic') : [];
+    for (const i of queued) {
+      try {
+        handed.push(await send(i));
+      } catch (e) {
+        this.log('warn', `${turn.sessionKey}: moving queued input ${i.inputId} to topic ${to.id} failed: ${(e as Error).message}`);
+      }
     }
     return handed;
   }
@@ -731,7 +758,8 @@ export class Gateway {
   /** session_rotate: a new topic, current from now on, gets the turn's inputs with the summary ahead of them. */
   private async rotateTopic(sessionKey: string, turn: TurnContext, a: { title: string; summary: string }): Promise<TopicHandover> {
     const from = this.topicOfSession(sessionKey);
-    const r = this.router.newTopic(from.agent, from.conversation, { title: a.title, summary: a.summary }, 'agent');
+    // The summary describes the topic being left: it is saved on it (and handed to the new one as context).
+    const r = this.router.newTopic(from.agent, from.conversation, { title: a.title }, 'agent', { turn: turnRef(turn), summaryOfPrevious: a.summary });
     const summary: InputRecord = {
       inputId: `sum_${turn.turnId}`,
       origin: { kind: 'system', principal: null, evidence: 'none', via: `topic:${from.id}`, adapter: 'session' },
@@ -740,7 +768,7 @@ ${a.summary}` }],
       replyRoute: turn.replyRoute,
       channelContext: { topicSummary: true, fromTopic: from.id },
     };
-    const handed = await this.handOver(r.topic, turn, summary);
+    const handed = await this.handOver(from, r.topic, turn, summary);
     this.log('info', `${sessionKey}: rotated to topic ${r.topic.id} (${r.topic.sessionKey}), ${handed.length} input(s) handed over`);
     return { topic: topicView(r.topic), previous: topicView(from), handed };
   }
@@ -750,10 +778,48 @@ ${a.summary}` }],
     const from = this.topicOfSession(sessionKey);
     const target = this.topics.get(topicId);
     if (!target || target.conversation !== from.conversation || target.agent !== from.agent) throw new ToolError(`no topic ${topicId} in this conversation`);
-    const r = this.topics.switchTo(topicId, 'agent');
-    const handed = await this.handOver(r.topic, turn);
+    const r = this.topics.switchTo(topicId, 'agent', { turn: turnRef(turn) });
+    const handed = await this.handOver(from, r.topic, turn);
     this.log('info', `${sessionKey}: switched back to topic ${r.topic.id} (${r.topic.sessionKey}), ${handed.length} input(s) handed over`);
     return { topic: topicView(r.topic), ...(r.previous ? { previous: topicView(r.previous) } : {}), handed };
+  }
+
+  /** A topic was parked: its lane idles out; the one now current keeps its lane. */
+  private topicChanged(c: TopicChange): void {
+    const t = this.parkedTimers.get(c.to.sessionKey);
+    if (t) clearTimeout(t);
+    this.parkedTimers.delete(c.to.sessionKey);
+    if (c.from && c.from.sessionKey !== c.to.sessionKey && this.lanes.has(c.from.sessionKey)) this.idleOut(c.from.sessionKey);
+  }
+
+  /** Close a parked topic's lane after `topics.parkedIdleMs` (later while it still has work); switching back reopens and resumes it. */
+  private idleOut(sessionKey: string): void {
+    const ms = this.o.config.topics?.parkedIdleMs ?? 0;
+    if (ms <= 0 || this.stopped) return;
+    const prior = this.parkedTimers.get(sessionKey);
+    if (prior) clearTimeout(prior);
+    const timer = setTimeout(() => {
+      this.parkedTimers.delete(sessionKey);
+      const lane = this.lanes.get(sessionKey);
+      if (this.stopped || !lane || this.topics.bySession(sessionKey)?.state !== 'parked') return;
+      if (lane.activeTurn() || lane.queued().length) return this.idleOut(sessionKey);
+      void this.closeLane(sessionKey, lane, 'topic parked').catch((e) => this.log('warn', `${sessionKey}: closing parked topic failed: ${(e as Error).message}`));
+    }, ms);
+    timer.unref?.();
+    this.parkedTimers.set(sessionKey, timer);
+  }
+
+  /** Drop a lane and its renderers, then close its harness session (its log stays: the next lane resumes from it). */
+  private async closeLane(sessionKey: string, lane: Lane, reason: string): Promise<void> {
+    this.lanes.delete(sessionKey);
+    this.laneInfo.delete(sessionKey);
+    const comps = this.sessionCompositors.get(sessionKey) ?? [];
+    this.sessionCompositors.delete(sessionKey);
+    await within(lane.close(reason).catch(() => undefined), 8000);
+    await within(lane.whenIdle(), 3000);
+    await within(Promise.all(comps.map((x) => x.stop())), 5000);
+    for (const x of comps) this.compositors.splice(this.compositors.indexOf(x), 1);
+    this.log('info', `${sessionKey}: lane closed (${reason})`);
   }
 
   /** `topic.list`: newest activity first, only those of `conversation` / `sessionKey` when given. */
@@ -992,6 +1058,8 @@ ${a.summary}` }],
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
+    for (const t of this.parkedTimers.values()) clearTimeout(t);
+    this.parkedTimers.clear();
     this.host.close();
     // Runs end (interrupted) while their connections can still hear run.ended.
     await within(this.runs.stop(), 10_000);
@@ -1034,6 +1102,8 @@ ${a.summary}` }],
 
 /** `topicTools` of an input handed to a topic by session_rotate / session_switch. */
 const HANDED_HINT = 'this message was handed to this topic by a topic switch: answer it here; do not call session_rotate or session_switch for it';
+
+const turnRef = (t: TurnContext) => ({ sessionKey: t.sessionKey, turnId: t.turnId });
 
 function fail(code: string, message = code): Outcome {
   return { ok: false, code, message };

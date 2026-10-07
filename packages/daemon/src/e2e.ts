@@ -729,7 +729,9 @@ export const SCENARIOS: Scenario[] = [
       assert(rotate?.ok && topicB, `the agent did not rotate (tools: ${one.toolCalls.map((c) => `${c.tool}:${c.ok ? 'ok' : c.error}`).join(', ') || 'none'}); it answered in topic A: ${JSON.stringify(inA.finalText(turnB0.turnId).slice(0, 120))}`);
       const capital = await topicTurn(one, topicB.sessionKey, `${b.inputId}>${topicB.id}`, 'topic B answering the handed message');
       assert(/canberra/i.test(capital.text), `topic B answered ${JSON.stringify(capital.text.slice(0, 80))}`);
-      const summary = topicB.summary ?? '';
+      // The rotation summary describes topic A: it is saved on A (now parked).
+      const summary = one.gw.topics.get(topicA.id)?.summary ?? '';
+      assert(summary && !topicB.summary, `the rotation summary is not on the parked topic A (A: ${JSON.stringify(summary)}, B: ${JSON.stringify(topicB.summary ?? null)})`);
       ctx.progress(`rotated to ${topicB.id} "${topicB.title}" (summary ${JSON.stringify(summary.slice(0, 80))}); B answered ${JSON.stringify(capital.text.slice(0, 40))}; restarting the daemon`);
       await one.gw.stop();
 
@@ -741,7 +743,6 @@ export const SCENARIOS: Scenario[] = [
       const inB = await two.watch(topicB.sessionKey);
       const turnC0 = await inB.turnStartedWith(c.inputId);
       await inB.completed(turnC0.turnId).catch((e: Error) => {
-        if (process.env.AIO_E2E_DEBUG) for (const sk of [topicB.sessionKey, conv]) for (const ev of two.gw.hub.log.read(sk, 0)) console.error(sk.slice(-12), ev.seq, ev.generation, ev.body.t, (ev.body as { name?: string }).name ?? '', ev.turnId ?? '', JSON.stringify((ev.native as { turn?: { id?: string }; turnId?: string; threadId?: string } | undefined)?.turn?.id ?? (ev.native as { turnId?: string } | undefined)?.turnId ?? ''), JSON.stringify((ev.native as { threadId?: string } | undefined)?.threadId ?? (ev.body as { nativeId?: string }).nativeId ?? ''));
         throw new Failure(`topic B handing back: ${e.message}; tools ${two.toolCalls.map((x) => `${x.tool}:${x.ok ? 'ok' : x.error}`).join(', ')}; last events in B: ${tail(two, topicB.sessionKey)}; in A: ${tail(two, conv)}`);
       });
       const sw = two.toolCalls.find((x) => x.tool === 'session_switch');

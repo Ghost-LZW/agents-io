@@ -34,6 +34,8 @@ export interface TopicChange {
   from?: TopicRecord;
   to: TopicRecord;
   reason: TopicChangeReason;
+  /** The turn that made the change (session_rotate / session_switch, or switching back after a failed one). */
+  turn?: TurnRef;
 }
 
 export interface TopicRegistryOptions {
@@ -51,7 +53,23 @@ export interface TopicRegistryOptions {
 /** Fields of a new topic. */
 export interface TopicDraft {
   title?: string;
-  summary?: string;
+}
+
+/** A running turn and the session it runs in. */
+export interface TurnRef {
+  sessionKey: string;
+  turnId: string;
+}
+
+/** How a change came about, besides its reason. */
+export interface TopicChangeOptions {
+  /** The turn that made it: `topic.changed` in that turn's session carries its turn id (its card then says where it went). */
+  turn?: TurnRef;
+}
+
+export interface TopicCreateOptions extends TopicChangeOptions {
+  /** What the topic being parked was about (session_rotate's summary): saved on that topic, the one it describes. */
+  summaryOfPrevious?: string;
 }
 
 /** Spells the session key of a new topic: `first` when the conversation has none yet. */
@@ -104,7 +122,7 @@ export class TopicRegistry {
   private readonly newId: () => string;
   private readonly byId = new Map<string, TopicRecord>();
   private readonly bySessionKey = new Map<string, TopicRecord>();
-  private q: Record<'insert' | 'state' | 'touch' | 'native' | 'title' | 'all', StatementSync>;
+  private q: Record<'insert' | 'state' | 'touch' | 'native' | 'title' | 'summary' | 'all', StatementSync>;
 
   constructor(private readonly o: TopicRegistryOptions = {}) {
     this.ownsDb = !o.db;
@@ -133,6 +151,7 @@ export class TopicRegistry {
       touch: p('UPDATE topics SET last_active_at = ? WHERE id = ?'),
       native: p('UPDATE topics SET native_id = ? WHERE id = ?'),
       title: p('UPDATE topics SET title = ? WHERE id = ?'),
+      summary: p('UPDATE topics SET summary = ? WHERE id = ?'),
       all: p('SELECT * FROM topics'),
     };
     for (const r of this.q.all.all() as unknown as Row[]) this.remember(fromRow(r));
@@ -189,8 +208,8 @@ export class TopicRegistry {
     return { topic: r.topic as TopicRecord, created: true };
   }
 
-  /** Start a new topic and make it current; the current one is parked. */
-  create(conversation: string, agent: string, sessionKey: TopicSessionKey, draft: TopicDraft, reason: TopicChangeReason): TopicSwitchResult & { topic: TopicRecord; previous?: TopicRecord } {
+  /** Start a new topic and make it current; the current one is parked (with `summaryOfPrevious` as its summary). */
+  create(conversation: string, agent: string, sessionKey: TopicSessionKey, draft: TopicDraft, reason: TopicChangeReason, opts: TopicCreateOptions = {}): TopicSwitchResult & { topic: TopicRecord; previous?: TopicRecord } {
     const previous = this.current(conversation, agent);
     const first = !this.list({ conversation, agent }).length;
     const id = this.newId();
@@ -204,28 +223,30 @@ export class TopicRegistry {
       agent,
       sessionKey: key,
       ...(clean(draft.title) !== undefined ? { title: clean(draft.title)! } : {}),
-      ...(draft.summary?.trim() ? { summary: draft.summary.trim() } : {}),
       state: 'current',
       createdAt: at,
       lastActiveAt: at,
     };
+    const summary = previous ? opts.summaryOfPrevious?.trim() : undefined;
     this.db.exec('BEGIN');
     try {
       if (previous) this.q.state.run('parked', previous.lastActiveAt, previous.id);
-      this.q.insert.run(t.id, conversation, agent, key, t.title ?? null, t.summary ?? null, null, 'current', at, at);
+      if (previous && summary) this.q.summary.run(summary, previous.id);
+      this.q.insert.run(t.id, conversation, agent, key, t.title ?? null, null, null, 'current', at, at);
       this.db.exec('COMMIT');
     } catch (e) {
       this.db.exec('ROLLBACK');
       throw e;
     }
     if (previous) previous.state = 'parked';
+    if (previous && summary) previous.summary = summary;
     this.remember(t);
-    this.changed({ conversation, agent, ...(previous ? { from: previous } : {}), to: t, reason });
+    this.changed({ conversation, agent, ...(previous ? { from: previous } : {}), to: t, reason, ...(opts.turn ? { turn: opts.turn } : {}) });
     return { topic: t, ...(previous ? { previous } : {}), created: true };
   }
 
   /** Make an existing topic current (parking the current one). Already current: nothing changes. */
-  switchTo(topicId: string, reason: TopicChangeReason): TopicSwitchResult & { topic: TopicRecord; previous?: TopicRecord } {
+  switchTo(topicId: string, reason: TopicChangeReason, opts: TopicChangeOptions = {}): TopicSwitchResult & { topic: TopicRecord; previous?: TopicRecord } {
     const t = this.byId.get(topicId);
     if (!t) throw new TopicError('unknown_topic', `no topic ${topicId}`);
     const previous = this.current(t.conversation, t.agent);
@@ -243,7 +264,7 @@ export class TopicRegistry {
     if (previous) previous.state = 'parked';
     t.state = 'current';
     t.lastActiveAt = at;
-    this.changed({ conversation: t.conversation, agent: t.agent, ...(previous ? { from: previous } : {}), to: t, reason });
+    this.changed({ conversation: t.conversation, agent: t.agent, ...(previous ? { from: previous } : {}), to: t, reason, ...(opts.turn ? { turn: opts.turn } : {}) });
     return { topic: t, ...(previous ? { previous } : {}), created: false };
   }
 
@@ -281,7 +302,8 @@ export class TopicRegistry {
     if (hub) {
       const body = { t: 'topic.changed' as const, conversation: c.conversation, ...(c.from ? { from: c.from.id } : {}), to: c.to.id, ...(c.to.title !== undefined ? { title: c.to.title } : {}), reason: c.reason };
       for (const key of new Set([...(c.from ? [c.from.sessionKey] : []), c.to.sessionKey])) {
-        hub.append(key, { ts: this.now(), level: 'detail', audience: 'status', durability: 'durable', visibility: 'participants', body });
+        const turnId = c.turn?.sessionKey === key ? { turnId: c.turn.turnId } : {};
+        hub.append(key, { ts: this.now(), ...turnId, level: 'detail', audience: 'status', durability: 'durable', visibility: 'participants', body });
       }
     }
     this.o.onChange?.(c);

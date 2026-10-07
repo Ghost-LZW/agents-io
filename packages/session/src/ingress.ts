@@ -101,11 +101,12 @@ export interface IngressOptions {
    */
   systemReply?: (a: { route: ReplyRoute; text: string; operationId: string; sessionKey: string }) => Promise<void>;
   /**
-   * One line added to inputs routed to a topic (`channelContext.topicTools`), telling
-   * the model how to move between topics, e.g. `TOPIC_TOOLS_HINT` when the agent has
-   * the session_* output tools. Without it the input only names its topic.
+   * One line added to inputs routed to a conversation's current topic
+   * (`channelContext.topicTools`), telling the model how to move between topics, e.g.
+   * `TOPIC_TOOLS_HINT` when the agent has the session_* output tools. A function picks
+   * it per target agent (undefined: none). Without it the input only names its topic.
    */
-  topicHint?: string;
+  topicHint?: string | ((agent: string | undefined) => string | undefined);
   onReplyError?: (err: unknown) => void;
 }
 
@@ -289,6 +290,10 @@ export class Ingress {
         const i = decision.deliveries.findIndex((d) => d !== primary && d.sessionKey === rw.sessionKey && d.source !== 'watch');
         if (i >= 0) decision.deliveries.splice(i, 1);
         primary.sessionKey = rw.sessionKey;
+        // Labelled with the topic whose session answers it (e.g. a parked one that asked the question), or none.
+        const t = this.router.topics?.bySession(rw.sessionKey);
+        if (t) primary.topic = { id: t.id, conversation: t.conversation, ...(t.title !== undefined ? { title: t.title } : {}) };
+        else delete primary.topic;
       }
     }
 
@@ -347,8 +352,12 @@ export class Ingress {
       return { ...base, ...(w.inputId ? { inputId: w.inputId } : {}), ...(w.result ? { result: w.result } : {}), watch: w };
     }
     const lane = await this.o.lanes(d.sessionKey, d.agent);
-    // The model sees which topic it is in (and can rotate or switch with the output tools).
-    if (d.topic) input = { ...input, channelContext: { ...input.channelContext, ...topicContext(d.topic, this.o.topicHint) } };
+    // The model sees which topic it is in (and, in the current one, how to rotate or switch with the output tools).
+    if (d.topic) {
+      const current = this.router.topics?.get(d.topic.id)?.state !== 'parked';
+      const hint = !current ? undefined : typeof this.o.topicHint === 'function' ? this.o.topicHint(d.agent) : this.o.topicHint;
+      input = { ...input, channelContext: { ...input.channelContext, ...topicContext(d.topic, hint) } };
+    }
     if (d.on === 'dispatch') {
       const result = await lane.command({ type: 'input', sessionKey: d.sessionKey, input, mode: d.mode ?? env.modeHint ?? 'queue' });
       return { ...base, result };
