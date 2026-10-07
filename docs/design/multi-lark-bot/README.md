@@ -1,6 +1,6 @@
 # 一个守护进程跑多个飞书机器人（多个 lark-bot 通道实例）
 
-> 状态：提案（2026-10-07，按评审意见修订：拆成两个阶段），未实现，待拍板。拍板结果由 owner 记入 `docs/design/locus/DECISIONS.md`，本文不改动它。
+> 状态：第一阶段已采纳（2026-10-07，记入 `docs/design/locus/DECISIONS.md` 决定 8，§11 第 1–3 项按推荐，第 4 项暂不做）；第二阶段等 live 核实。
 > 依据：`docs/POSITIONING.md` §2（机制与策略的判据）、§4（多 agent 同场的作者认定）；`docs/design/locus/DECISIONS.md` 决定 1–6；`docs/critique/ops-security.md` §2（飞书 ID 有作用域）；待定提案 `docs/design/channel-stamping`（来源盖章、"一个通道 id 只属于一种适配器"）。
 > 代码：行号按 `f8e51fd` 加当前工作区核实。`packages/daemon/src/config.ts`、`packages/daemon/src/records.ts`、`packages/session/src/router.ts` 在工作区里有未提交的改动（会话启动的实现正在进行），这三个文件的行号以写作时的工作区为准，落地前需再刷新；引用时同时给出函数名。
 

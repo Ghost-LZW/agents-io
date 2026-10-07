@@ -57,3 +57,13 @@
 - **修订决定 6 最后一条**：同意，按提案 §10 第 2 项的拟改文（已更新于决定 6）。
 - **launch 整体不可变**：随会话键固定并持久化，先到者为准；同一键收到不同 launch（含无 launch 的老会话收到 launch）一律 `launch_conflict`，要换就换会话键。需要轮换的凭据放在配置目录里由 harness 自己读取，不放进 env 值。
 - **加 `callout.skipWhenPinned`**：按规则开启；规则本地可算出目标键且该键已有 launch 记录时跳过回调，`aio explain` 记 `skipped_pinned`。与决定 2 一致：回调只在每个键的首条输入发生，稳态走本地匹配。
+
+## 决定 8：一个守护进程跑多个飞书机器人 —— 采纳第一阶段
+
+日期：2026-10-07。方案见 `docs/design/multi-lark-bot/README.md`。owner 指示"按设计文档实现"，§11 阻塞项均按推荐：
+
+- **凭据写法**：`lark-bot` 条目在 `config` 里显式写 `appId` / `appSecret` / `domain`（值或 `env:NAME`，整份 `config` 做 `env:` 替换，修好 `encryptKey` 等字段的 `env:` 不生效）；`LARK_APP_*` 只作为至多一个条目的兜底。两个兜底条目、重复应用（同 appId + domain）、重复账号、多条目时非法账号名，都让守护进程启动失败（控制台写入前同样报出）。
+- **出站退路**：多账号时 `deliver` / `systemReply` / `replyCaps` 不再按通道 id 退回，只有该 id 恰好一个运行中账号时才退回；compositor、输出工具按 `(channel, account)` 选实例；lark-bot 适配器拒绝发往别的账号的路由。单账号时是否取消退路留给 channel-stamping §10 第 5 项。
+- **create-lark-bot**：G1，上游加 `--env-prefix`，控制台对非 `default` 账号传 `--env-prefix LARK_<ACCOUNT>_`；开通写入前复查同账号、变量名冲突、appId 重复、启动校验。
+- **通道条目上的 `agent`**（§11 第 4 项）：暂不做。
+- **第二阶段**（兄弟机器人识别）：不做，等 live 核实飞书是否把机器人的群消息推给同群其他机器人（§11 第 5 项）。
