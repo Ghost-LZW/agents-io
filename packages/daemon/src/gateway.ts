@@ -300,7 +300,9 @@ export class Gateway {
     this.policy = {
       ...local,
       // A connected host whose hello lists `resolve` decides who answers a request; when it
-      // cannot (timeout, error, bad answer) the local policy does (fail closed to built-in behaviour).
+      // cannot (timeout, error, bad answer) the local policy does. This falls back (fails open to
+      // the built-in resolvers), it does not deny: a host restricting who may answer is not
+      // enforced while it is slow or down. (outbound below denies instead.)
       resolve: async (req, ctx) => {
         if (!this.host.answers('resolve')) return local.resolve(req, ctx);
         try {
@@ -1298,6 +1300,11 @@ ${a.summary}` }],
   /** Build and start one configured channel next to the running ones (live apply). */
   private async startConfigChannel(cfg: ResolvedChannel, index: number): Promise<RunningChannel> {
     const b = await this.buildConfigChannel(cfg, index);
+    // stop() may have run while it was built: close it rather than start it into closed stores.
+    if (this.stopped) {
+      await b.close?.().catch(() => undefined);
+      throw new Error('gateway stopping');
+    }
     if (this.channels.some((e) => e.adapter.id === b.adapter.id && e.account === b.account)) {
       await b.close?.().catch(() => undefined);
       throw new ConfigError(`two channels have the same (channel, account) = (${b.adapter.id}, ${b.account}); give one another account`);
@@ -1643,6 +1650,9 @@ ${a.summary}` }],
     if (this.tokenFile) removeTokenFile(this.tokenFile, this.token);
     if (this.consoleFile && this.console) removeTokenFile(this.consoleFile, this.console.url);
     this.watches.stop();
+    // A live channel apply in progress finishes (it sees `stopped` and launches nothing more)
+    // before the channels are aborted, so none starts after the snapshot below.
+    await within(this.applying, 5000);
     for (const ch of this.channels) ch.ac.abort();
     await within(Promise.all(this.channels.map((c) => c.running)), 3000);
     // A launched session's own app-server (stdio) ends with it: its lane is closed, not detached.
