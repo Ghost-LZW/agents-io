@@ -182,3 +182,31 @@ describe('live tools (decision 11)', () => {
     expect(w.chat.endpoints[1]!.closes).toEqual(['gateway stopping']);
   });
 });
+
+describe('delegated turns', () => {
+  it('a delegated turn (no reply route) sends to "current" = the chat that opened the live', async () => {
+    const holder: { h?: LiveFakeHarness } = {};
+    const results: { isError: boolean; text: string }[] = [];
+    const w = await setup(async () => {
+      results.push(await mcpCall(holder.h!.sessions.at(-1)!.args.mcp, 'live_join', { target: '9' }, 'join'));
+    });
+    holder.h = w.harness;
+    await w.chat.inject({ sender: { channelUserId: 'alice', evidence: 'platform_signed' }, text: 'join' });
+    await until(() => results.length === 1);
+    const s = w.harness.sessions[0]!;
+    const liveId = w.harness.starts[0]!.liveId;
+    // What the Codex harness emits for a delegation: the handoff, then the turn it starts.
+    const ev = (body: any, turnId?: string) => s.queue.push({ ts: Date.now(), level: 'primary', audience: 'status', durability: 'durable', ...(turnId ? { turnId } : {}), body });
+    await until(() => w.events.some((e) => e.body.t === 'turn.completed'));
+    ev({ t: 'live.handoff', liveId, inputId: `live:${liveId}:h1`, text: 'send me that as text' });
+    ev({ t: 'turn.started', turnId: 'codex:d1', inputIds: [`live:${liveId}:h1`], replyRoute: null, initiator: 'harness' }, 'codex:d1');
+    // The fake harness only scripts its own turns: run the tool call as that turn would.
+    await until(() => w.events.some((e) => e.body.t === 'turn.started' && e.turnId === 'codex:d1'));
+    const mcp = s.args.mcp;
+    results.push(await mcpCall(mcp, 'send_message', { route: 'current', text: 'result as text' }, 'delegated-send'));
+    ev({ t: 'turn.completed', turnId: 'codex:d1', status: 'completed' }, 'codex:d1');
+    expect(results[1]!.isError).toBe(false);
+    expect(JSON.parse(results[1]!.text)).toMatchObject({ ok: true, delivered: 'fake:default:c1' });
+    expect(w.chat.sent.some((m) => m.msg.text === 'result as text' && m.route.conversationId === 'c1')).toBe(true);
+  });
+});

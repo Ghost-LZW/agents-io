@@ -181,6 +181,17 @@ const str = (v: unknown, what: string, opt = false): string | undefined => {
 };
 
 /**
+ * "current": the turn's reply route; for a turn without one (a live's delegated turn,
+ * decision 11) the one route all its inputs reply to, if they share one.
+ */
+function currentRoute(turn: TurnContext): ReplyRoute | null {
+  if (turn.replyRoute) return turn.replyRoute;
+  const routes = turn.inputs.map((i) => i.replyRoute);
+  const first = routes[0];
+  return first && routes.every((r) => r && routeKey(r) === routeKey(first)) ? first : null;
+}
+
+/**
  * The output tools, independent of MCP. Every call resolves the session's running
  * turn, checks the destination against `Policy.outbound`, delivers through the
  * Outbox (operationId from the tool call id, so a retried call never sends twice)
@@ -314,7 +325,7 @@ export class HostTools {
   }
 
   private channelContext(_b: ToolBinding, turn: TurnContext) {
-    const r = turn.replyRoute;
+    const r = currentRoute(turn);
     const first = turn.inputs[0]?.channelContext ?? {};
     const pre = this.o.routes?.() ?? [];
     if (!r) return { turnId: turn.turnId, replyRoute: null, note: 'this turn has no reply route', preregisteredRoutes: pre };
@@ -354,8 +365,9 @@ export class HostTools {
   /** "current" (or nothing) = the turn's reply route; otherwise a route key. */
   private parseRoute(turn: TurnContext, spec: string | undefined): ReplyRoute {
     if (spec === undefined || spec === 'current' || spec === 'reply') {
-      if (!turn.replyRoute) throw new ToolError('this turn has no reply route; name a destination route key');
-      return turn.replyRoute;
+      const r = currentRoute(turn);
+      if (!r) throw new ToolError('this turn has no reply route; name a destination route key');
+      return r;
     }
     const known = this.knownRoutes(turn).find((r) => routeKey(r) === spec);
     if (known) return known;
