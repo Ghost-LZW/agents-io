@@ -26,6 +26,10 @@ describe('a bridge channel whose first hello fails', () => {
     expect(st()).toEqual({ id: 'raw', account: 'b1', state: 'running' });
   });
 
+  it('a bridge whose command cannot be run still fails the start', async () => {
+    await expect(daemon({ raw: { channels: [{ type: 'bridge', account: 'b3', command: join(tmp(), 'missing-binary') }] } })).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('a bridge that connects at once is running, as before', async () => {
     const gate = join(tmp(), 'gate');
     writeFileSync(gate, 'open');

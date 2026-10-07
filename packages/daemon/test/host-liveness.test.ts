@@ -99,6 +99,30 @@ describe('host.hello takeover', () => {
     await expect(a.bindingsGet()).rejects.toThrow();
   });
 
+  it('over /ws: a takeover closes the old (half-open) connection, which goes away even though it never answers', async () => {
+    const w = await daemon({ console: true, raw: { console: { heartbeat: { intervalMs: 0 } } } });
+    const url = `${w.gw.console!.url.replace('http', 'ws')}/ws`;
+    const headers = { Authorization: `Bearer ${w.gw.token}` };
+    const oldWs = new WebSocket(url, [ADMIN_WS_SUBPROTOCOL], { headers });
+    await opened(oldWs);
+    const old = wsClient(oldWs);
+    expect(await old.ask({ type: 'host.hello', token: w.gw.token, name: 'old', consumer: 'remote' })).toMatchObject({ ok: true, value: { host: true } });
+    // Half-open: the old peer's socket stops reading, so it never answers the close frame.
+    (oldWs as unknown as { _socket: { pause(): void } })._socket.pause();
+    const closed = new Promise<void>((r) => oldWs.once('close', () => r()));
+    const newWs = new WebSocket(url, [ADMIN_WS_SUBPROTOCOL], { headers });
+    await opened(newWs);
+    const neu = wsClient(newWs);
+    expect(await neu.ask({ type: 'host.hello', token: w.gw.token, name: 'new', consumer: 'remote', takeover: true })).toMatchObject({ ok: true, value: { host: true, replaced: { name: 'old' } } });
+    expect(w.gw.host.info()?.name).toBe('new');
+    // The daemon drops the old socket after the close grace (not ws's 30 s close timeout), while the peer still does not read.
+    const wss = (w.gw.console as unknown as { wss: { clients: Set<unknown> } }).wss;
+    await until(() => wss.clients.size === 1, 3000);
+    (oldWs as unknown as { _socket: { resume(): void } })._socket.resume();
+    await closed;
+    newWs.close();
+  });
+
   it('takeover with no host connected is a plain hello', async () => {
     const w = await daemon();
     const c = await w.client();

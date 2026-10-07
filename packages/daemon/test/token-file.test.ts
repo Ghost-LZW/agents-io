@@ -55,6 +55,17 @@ describe('operator-set host token (host.tokenFile / --token-file)', () => {
     chmodSync(open, 0o777);
     expect(() => loadOrCreateTokenFile(join(open, 'host.token'))).toThrow(/writable by other users/);
     expect(existsSync(join(open, 'host.token'))).toBe(false);
+    // A sticky shared directory (like /tmp) too: others could plant names in it.
+    const sticky = join(dir, 'sticky');
+    mkdirSync(sticky);
+    chmodSync(sticky, 0o1777);
+    expect(() => loadOrCreateTokenFile(join(sticky, 'host.token'))).toThrow(/writable by other users/);
+    expect(existsSync(join(sticky, 'host.token'))).toBe(false);
+  });
+
+  it('refuses the daemon\'s own copy next to the socket as the operator file', async () => {
+    const dir = tmp();
+    await expect(daemon({ dir, raw: { host: { tokenFile: join(dir, 'run', 'aio.sock.token') } } })).rejects.toThrow(/own copy next to the socket/);
   });
 
   it('config: relative to the config file; the path is not a credential', () => {

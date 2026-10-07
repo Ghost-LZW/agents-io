@@ -30,6 +30,7 @@
 ### 3.2 `host.hello { takeover: true }`
 
 - 只有在 token 校验通过之后才考虑 takeover（错误 token 仍是 `unauthorized`）。
+- `/ws` 上旧连接的 `end()` 先发关闭帧（1001），1 s 内对方没有完成关闭握手就 `terminate()`：半开的旧连接不会挂到 `ws` 自带的 30 s 关闭超时。守护进程侧的状态在 `end()` 时已经清理，这只影响底层 socket 何时释放。
 - 已有宿主且 hello 带 `takeover: true`：记 `warn` 日志（新旧名字、旧连接 id），调用旧连接的 `end()`（发 `closed`、关闭传输、`drop`），`HostService.gone` 清理推送订阅与 `hostConnected`，然后按普通 hello 继续。旧连接上的在途推送以 `disconnected` 结束、不前移游标，改推给新宿主（至少一次）。
 - 不要求新旧名字相同：token 证明的是同一权限；名字只用于日志与 `explain`。
 - 结果 `HostHelloResult.replaced: { name }`；`features` 增加 `"host.takeover"`。旧守护进程会忽略未知字段（TypeBox 对象非封闭），所以宿主应先看 `features`。
@@ -44,7 +45,7 @@
 
 ## 5. 测试
 
-`packages/daemon/test/host-liveness.test.ts`：不回 pong 的 `/ws` 宿主在超时后被断开、槽位释放、新宿主可直接连接；回 pong 的连接跨多个周期保持；配置默认值与关闭；无 takeover 的第二宿主被拒、错误 token 的 takeover 被拒、带 takeover 的宿主顶替旧连接并收到旧连接未确认的推送（同一游标）、旧连接已关闭；无宿主时 takeover 等同普通 hello。
+`packages/daemon/test/host-liveness.test.ts`：不回 pong 的 `/ws` 宿主在超时后被断开、槽位释放、新宿主可直接连接；回 pong 的连接跨多个周期保持；配置默认值与关闭；无 takeover 的第二宿主被拒、错误 token 的 takeover 被拒、带 takeover 的宿主顶替旧连接并收到旧连接未确认的推送（同一游标）、旧连接已关闭；经 `/ws` 的 takeover：旧连接不读数据（半开）时，新宿主接管，守护进程在关闭宽限后丢弃旧 socket；无宿主时 takeover 等同普通 hello。
 
 ## 6. 迁移
 

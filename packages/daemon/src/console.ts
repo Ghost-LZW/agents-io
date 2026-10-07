@@ -69,6 +69,8 @@ const ProofRequest = Type.Object({ challenge: Type.String({ minLength: 16, maxLe
 const LOGIN_TTL_MS = 5 * 60_000;
 const MAX_BODY = 4 * 1024 * 1024;
 const WS_HIGH_WATER = 4 * 1024 * 1024;
+/** How long a closed /ws connection may take to answer the close frame before its socket is dropped. */
+const WS_CLOSE_GRACE_MS = 1000;
 const STATUS_TEXT: Record<number, string> = { 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found' };
 
 /** What the console needs from the daemon. */
@@ -397,7 +399,13 @@ export class ConsoleServer {
       get gone() {
         return ws.readyState !== ws.OPEN;
       },
-      end: () => ws.close(1001, 'closing'),
+      end: () => {
+        ws.close(1001, 'closing');
+        // A half-open peer (host takeover) never answers the close: drop the socket after a short grace.
+        const t = setTimeout(() => ws.terminate(), WS_CLOSE_GRACE_MS);
+        t.unref?.();
+        ws.once('close', () => clearTimeout(t));
+      },
     };
     const c = new FrameConn(transport, this.o.host.local, () => this.conns.delete(c), { origin: (key) => this.o.host.consoleOrigin(key) });
     this.conns.add(c);

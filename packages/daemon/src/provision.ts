@@ -313,11 +313,12 @@ export class LarkBotJobs {
     const incomplete = code === 3 || r.configuration?.ok === false;
     const consoleUrl = `https://open.${domain === 'lark' ? 'larksuite.com' : 'feishu.cn'}/app/${r.appId}`;
     const warnings = r.warnings?.length ? ` (${r.warnings.length} warning${r.warnings.length > 1 ? 's' : ''})` : '';
-    const done = (started: boolean | undefined) =>
+    // started: launched and not failed at once (a later failure shows in GET /api/status only).
+    const done = (started: boolean | undefined, failure?: string) =>
       this.finish(job, 'succeeded', {
         message: incomplete
           ? `app created; the console configuration is not complete: finish it in the developer console${warnings}`
-          : `app created and configured${warnings}; ${started ? 'the channel is started' : addChannel ? 'restart the daemon to start the channel' : 'no channel was added'}`,
+          : `app created and configured${warnings}; ${started ? 'the channel is started' : failure ? `the channel did not start (${failure}); fix it and save the config again, or restart the daemon` : addChannel ? 'restart the daemon to start the channel' : 'no channel was added'}`,
         result: {
           appId: r.appId,
           domain,
@@ -334,7 +335,10 @@ export class LarkBotJobs {
     if (!apply) return done(undefined);
     // Started live: the job stays `configuring` until the channel runs (or could not start).
     void apply().then(
-      (a) => done(a ? a.channels.started.some((c) => c.type === 'lark-bot' && c.account === account) : undefined),
+      (a) => {
+        const mine = (c: { type: string; account: string }) => c.type === 'lark-bot' && c.account === account;
+        done(a ? a.channels.started.some(mine) : undefined, a?.channels.failed?.find(mine)?.error);
+      },
       (e) => {
         this.o.log('warn', `lark bot job ${job.view.job}: channel not started live: ${(e as Error).message}`);
         done(false);

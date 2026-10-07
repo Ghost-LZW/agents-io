@@ -215,6 +215,10 @@ describe('retryFirstConnect', () => {
     await r.stop();
   });
 
+  it('a command that cannot be run still rejects open (a config error, not a peer that is not up yet)', async () => {
+    await expect(spawnChannel({ command: join(tmpdir(), 'no-such-channel-binary'), account: 'default', retryFirstConnect: true })).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('without it, a failed first hello still rejects open', async () => {
     const gate = join(mkdtempSync(join(tmpdir(), 'bridge-')), 'gate');
     await expect(rawChild('gated', {}, { GATE_FILE: gate })).rejects.toThrow();

@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, rmSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve as resolvePath } from 'node:path';
 import {
   PROTOCOL_VERSION,
   routeKey,
@@ -78,7 +78,7 @@ import { blobResolvers, type MediaResolvers } from './media.js';
 import { DaemonRecords } from './records.js';
 import { checkLaunch, launchView, sameLaunch, type LaunchCheck } from './launch.js';
 import { Runs } from './runs.js';
-import { consoleUrlPath, loadOrCreateTokenFile, removeTokenFile, tokenPath, writeTokenFile } from './token.js';
+import { consoleUrlPath, loadOrCreateTokenFile, removeTokenFile, TokenError, tokenPath, writeTokenFile } from './token.js';
 
 export type LogFn = (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
 
@@ -128,6 +128,12 @@ export interface GatewayOptions {
   console?: boolean;
   /** Environment of provisioning children (default process.env; tests). */
   consoleEnv?: NodeJS.ProcessEnv;
+  /**
+   * `console.liveChannels`: how long a channel started live may take to fail its
+   * `start` before it is reported `started` (default 1000). Bridges report their first
+   * connect at once and are not waited for.
+   */
+  channelStartGraceMs?: number;
 }
 
 /** Outcome of a local command, mapped 1:1 onto a `result` frame. */
@@ -144,6 +150,10 @@ interface RunningChannel {
   error?: string;
   /** The config entry it was built from (configured channels only). */
   source?: ResolvedChannel;
+  /** `start` returned or rejected: the channel no longer runs and is not retried. */
+  ended?: boolean;
+  /** A bridge reported its connection state (it has connected or failed a first connect). */
+  reported?: boolean;
 }
 
 const DAEMON_VERSION: string = (() => {
@@ -385,6 +395,8 @@ export class Gateway {
   /** The operator's token file (read, or created), else a fresh token for this start only. */
   private hostToken(file: string | undefined): string {
     if (file === undefined) return randomBytes(32).toString('hex');
+    // `<socket>.token` is the daemon's copy, rewritten at listen and removed at stop: never the operator's file.
+    if (resolvePath(file) === resolvePath(tokenPath(this.o.config.socketPath))) throw new TokenError(`token file ${file} is the daemon's own copy next to the socket (${tokenPath(this.o.config.socketPath)}); choose another path`);
     const r = loadOrCreateTokenFile(file);
     this.log('info', r.created ? `host token generated and written to ${file}` : `host token read from ${file}`);
     return r.token;
@@ -1136,6 +1148,7 @@ ${a.summary}` }],
 
   private bridgeState(entry: RunningChannel, st: BridgeState): void {
     if (entry.ac.signal.aborted || entry.state === 'stopped') return;
+    entry.reported = true;
     const was = entry.state;
     if (st.connected) {
       entry.state = 'running';
@@ -1153,7 +1166,15 @@ ${a.summary}` }],
    * `channels` (after `PUT /api/config` or a provisioned bot). Entries are compared as
    * resolved (env references substituted, so a changed secret counts as a change):
    * removed and changed ones stop, new and changed ones start (stops first, so an app
-   * moved to another entry never runs twice), unchanged ones keep running. Returns
+   * moved to another entry never runs twice), unchanged ones keep running (one whose
+   * `start` already ended is started again).
+   *
+   * `started` lists channels launched that had not failed when the answer was made: a
+   * bridge whose first connect failed (it keeps retrying), or a channel whose `start`
+   * rejects within `channelStartGraceMs`, is listed in `failed` instead, and so is an
+   * unchanged one still failing; the file then does not count as applied. A failure
+   * an adapter only logs (it retries internally, as lark-bot does with bad credentials)
+   * or one after the grace shows in `GET /api/status` only. Returns
    * undefined when it is off, there is no config file, or the file does not resolve.
    */
   applyChannels(): Promise<{ applied: 'live' | 'restart'; channels: AdminChannelsApplied } | undefined> {
@@ -1179,6 +1200,10 @@ ${a.summary}` }],
     const stop: RunningChannel[] = [];
     for (const e of this.channels) {
       if (!e.source) continue;
+      if (e.ended) {
+        stop.push(e);
+        continue;
+      }
       const key = canonical(e.source);
       const same = want.find((w) => !w.kept && w.key === key);
       if (same) same.kept = true;
@@ -1190,6 +1215,7 @@ ${a.summary}` }],
       out.stopped.push(ref(e.source!));
     }
     const failed: NonNullable<AdminChannelsApplied['failed']> = [];
+    const launched: RunningChannel[] = [];
     for (const w of want) {
       if (w.kept) continue;
       if (this.stopped) break;
@@ -1197,12 +1223,26 @@ ${a.summary}` }],
         const e = await this.startConfigChannel(w.c);
         // Sessions already open render to it too, as if it had been there at their start.
         for (const key of this.lanes.keys()) this.compose(key, e.adapter, e.tier, e.account);
-        out.started.push(ref(w.c));
+        launched.push(e);
       } catch (err) {
         failed.push({ ...ref(w.c), error: (err as Error).message });
         this.log('error', `channel ${w.c.type} (${w.c.account}) not started: ${(err as Error).message}`);
       }
     }
+    // A start that fails at once (bad config, unreachable service) is not reported as started.
+    const grace = this.o.channelStartGraceMs ?? 1000;
+    const pending = launched.filter((e) => !e.reported && !e.ended);
+    if (pending.length && grace > 0) await within(Promise.all(pending.map((e) => e.running)), grace);
+    for (const e of launched) {
+      if (e.ended) {
+        // Its start rejected: forget it, so the next apply starts it again.
+        failed.push({ ...ref(e.source!), error: e.error ?? 'the channel stopped' });
+        if (!this.stopped) await this.stopChannel(e);
+      } else if (e.state === 'failed') failed.push({ ...ref(e.source!), error: e.error ?? 'not connected' });
+      else out.started.push(ref(e.source!));
+    }
+    // An unchanged channel that is still failing keeps the file from counting as applied.
+    for (const e of this.channels) if (e.source && !launched.includes(e) && e.state === 'failed') failed.push({ ...ref(e.source), error: e.error ?? 'failed' });
     if (failed.length) out.failed = failed;
     else store.channelsApplied(cur.raw);
     (this.o.config as { channels: ResolvedChannel[] }).channels = this.channels.flatMap((e) => (e.source ? [e.source] : []));
@@ -1248,10 +1288,12 @@ ${a.summary}` }],
       })
       .then(
         () => {
+          entry.ended = true;
           entry.state = 'stopped';
           delete entry.error;
         },
         (err: Error) => {
+          entry.ended = true;
           entry.state = 'failed';
           entry.error = err.message;
           this.log('error', `channel ${ch.adapter.id} stopped: ${err.message}`);

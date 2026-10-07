@@ -173,8 +173,11 @@ export type AdminChannelRef = Static<typeof AdminChannelRef>;
 /**
  * What applying the config file's `channels` to the running daemon did (`console.liveChannels`):
  * entries that are new or changed are started, entries that are gone or changed are stopped;
- * unchanged entries keep running. `failed`: entries that could not be started (the file is then
- * not fully applied).
+ * unchanged entries keep running. `started`: launched and not failed when the answer was made
+ * (a failure later, or one an adapter only logs while retrying internally, shows in
+ * `GET /api/status` only). `failed`: entries that could not be built, whose `start` failed at
+ * once, or that are not connected (a bridge whose first connect failed; it keeps retrying), new or
+ * unchanged; the file is then not counted as applied.
  */
 export const AdminChannelsApplied = Type.Object({
   started: Type.Array(AdminChannelRef),
@@ -330,7 +333,11 @@ export const AdminLarkBotJob = Type.Object({
       owner: Type.Optional(Type.String()),
       /** A channel was added to the config (the daemon starts it when the config applies live). */
       channelAdded: Type.Boolean(),
-      /** The added channel was started at once (`console.liveChannels`); otherwise it starts at the next start. */
+      /**
+       * The added channel was started at once and had not failed (`console.liveChannels`, as
+       * `AdminChannelsApplied.started`); false when it failed to start (the message says why);
+       * absent when it starts at the next start.
+       */
       channelStarted: Type.Optional(Type.Boolean()),
       /** Console URL to finish what could not be automated (e.g. publishing the app version). */
       consoleUrl: Type.Optional(Type.String()),

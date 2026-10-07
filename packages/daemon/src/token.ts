@@ -1,11 +1,13 @@
 import { randomBytes } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 /*
- * The host token: a fresh secret per daemon start, in a 0600 file next to the
- * socket (`<socket>.token`). A host proves it may speak the host protocol by
- * presenting it in `host.hello`; the CLI's host commands read it from the file.
+ * The host token: a fresh secret per daemon start, or the operator's from
+ * `host.tokenFile` / `aio serve --token-file` (loadOrCreateTokenFile), copied
+ * into a 0600 file next to the socket (`<socket>.token`). A host proves it may
+ * speak the host protocol by presenting it in `host.hello`; the CLI's host
+ * commands read it from the file.
  */
 
 export const tokenPath = (socketPath: string) => `${socketPath}.token`;
@@ -13,12 +15,20 @@ export const tokenPath = (socketPath: string) => `${socketPath}.token`;
 /** The console API URL, written by `aio serve` next to the token file (same 0600 handling). */
 export const consoleUrlPath = (socketPath: string) => `${socketPath}.console`;
 
-/** Write atomically, owner-only. */
+/**
+ * Write atomically, owner-only. The temp name is random and created exclusively
+ * (`wx`: never through a file or symlink someone else placed there).
+ */
 export function writeTokenFile(path: string, token: string): void {
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, token + '\n', { mode: 0o600 });
-  chmodSync(tmp, 0o600);
-  renameSync(tmp, path);
+  const tmp = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  try {
+    writeFileSync(tmp, token + '\n', { mode: 0o600, flag: 'wx' });
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, path);
+  } catch (e) {
+    rmSync(tmp, { force: true });
+    throw e;
+  }
 }
 
 /** Remove the file only if it still holds our token (another daemon may have replaced it). */
@@ -82,10 +92,14 @@ export function loadOrCreateTokenFile(path: string): { token: string; created: b
   return { token, created: true };
 }
 
-/** The token file's directory: ours (or root's) and not writable by group / others, so nobody can swap the file. */
+/**
+ * The token file's directory: ours (or root's) and not writable by group / others,
+ * so nobody can swap the file or plant names in it. A sticky shared directory
+ * (`/tmp`) is refused too.
+ */
 function checkDir(dir: string, uid: number | undefined): void {
   if (uid === undefined) return;
   const st = statSync(dir);
   if (st.uid !== uid && st.uid !== 0) throw new TokenError(`token file directory ${dir} is owned by uid ${st.uid}, not ${uid}`);
-  if (st.mode & 0o022 && !(st.mode & 0o1000)) throw new TokenError(`token file directory ${dir} is writable by other users (mode ${(st.mode & 0o777).toString(8)}); use a private directory`);
+  if (st.mode & 0o022) throw new TokenError(`token file directory ${dir} is writable by other users (mode ${(st.mode & 0o777).toString(8)}); use a private directory`);
 }

@@ -61,6 +61,8 @@ export async function daemon(
     consoleEnv?: NodeJS.ProcessEnv;
     /** Build configured channels' adapters (GatewayOptions.channelAdapter). */
     channelAdapter?: GatewayOptions['channelAdapter'];
+    /** GatewayOptions.channelStartGraceMs. */
+    channelStartGraceMs?: number;
   } = {},
 ): Promise<World> {
   const dir = o.dir ?? tmp();
@@ -91,6 +93,7 @@ export async function daemon(
     logger: () => {},
     ...(o.console ? { console: true, consoleEnv: o.consoleEnv ?? {} } : {}),
     ...(o.channelAdapter ? { channelAdapter: o.channelAdapter } : {}),
+    ...(o.channelStartGraceMs !== undefined ? { channelStartGraceMs: o.channelStartGraceMs } : {}),
   });
   let stopped = false;
   const stop = async () => {

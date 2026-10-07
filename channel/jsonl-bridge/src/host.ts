@@ -43,7 +43,8 @@ export interface BridgeOptions {
   log?: ChannelContext['log'];
   /**
    * When the first connect (spawn + `hello`) fails, resolve `open` anyway with a
-   * disconnected bridge instead of rejecting; `start` then keeps retrying with the
+   * disconnected bridge instead of rejecting (except when the command cannot be run
+   * at all: ENOENT / EACCES / ENOTDIR still reject); `start` then keeps retrying with the
    * restart backoff. Until a hello succeeds the adapter reports `id` (below) and
    * offline caps, and every request fails `unavailable` (retryable). Default false.
    */
@@ -133,6 +134,12 @@ export function spawnChannel(opts: SpawnChannelOptions): Promise<BridgedChannel>
   });
 }
 
+/** The child process could not be started at all (ENOENT, EACCES, …): retrying will not help. */
+function isSpawnError(err: unknown): boolean {
+  const e = err as { code?: unknown; syscall?: unknown } | undefined;
+  return typeof e?.syscall === 'string' && e.syscall.startsWith('spawn') && (e.code === 'ENOENT' || e.code === 'EACCES' || e.code === 'ENOTDIR');
+}
+
 /** Attach to an already-running adapter listening on a unix socket (`path`) or TCP (`host`+`port`). */
 export function connectChannel(opts: ConnectChannelOptions): Promise<BridgedChannel> {
   return Bridge.open(opts, () => {
@@ -213,7 +220,8 @@ class Bridge implements BridgedChannel {
     try {
       await b.connect();
     } catch (err) {
-      if (!opts.retryFirstConnect || b.closing) throw err;
+      // A command that cannot be run at all (missing, not executable) is a config error, not a peer that is not up yet.
+      if (!opts.retryFirstConnect || b.closing || isSpawnError(err)) throw err;
       b.firstFailed = true;
       b.failed(err);
       b.log('warn', `channel connect failed: ${errMsg(err)}; retrying once started`);
