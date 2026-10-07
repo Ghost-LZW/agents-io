@@ -62,10 +62,11 @@ import {
 import { HostMcpServer, HostTools, ToolError, type TopicHandover } from '@agents-io/host-mcp';
 import { ClaudeCodeHarness, findOnPath, type ClaudeCodeHarnessConfig } from '@agents-io/harness-claude-code';
 import { CodexHarness, type CodexProfile } from '@agents-io/harness-codex';
+import { loadChannelModule } from './channel-module.js';
 import { LarkBotAdapter } from '@agents-io/channel-lark-bot';
 import { MailChannel, type MailChannelConfig } from '@agents-io/channel-mail';
 import { spawnChannel } from '@agents-io/channel-jsonl-bridge';
-import { agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ResolvedChannel } from './config.js';
+import { ConfigError, agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ResolvedChannel } from './config.js';
 import { ConsoleServer } from './console.js';
 import { ConfigStore } from './console-config.js';
 import { LarkBotJobs } from './provision.js';
@@ -1085,8 +1086,22 @@ ${a.summary}` }],
 
   private async startChannels(): Promise<void> {
     const all: { adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }[] = [];
-    for (const ch of this.o.config.channels) all.push(await buildChannel(ch));
-    for (const x of this.o.channels ?? []) all.push({ adapter: x.adapter, account: x.account ?? 'default', ...(x.tier ? { tier: x.tier } : {}) });
+    const closeAll = () => Promise.all(all.map((c) => c.close?.().catch(() => undefined)));
+    try {
+      let i = 0;
+      for (const ch of this.o.config.channels) all.push(await buildChannel(ch, i++, (l, m, d) => this.log(l, m, d)));
+      for (const x of this.o.channels ?? []) all.push({ adapter: x.adapter, account: x.account ?? 'default', ...(x.tier ? { tier: x.tier } : {}) });
+      // Only now is a module channel's id known: one (channel, account) is one route target.
+      const seen = new Set<string>();
+      for (const c of all) {
+        const k = `${c.adapter.id}\0${c.account}`;
+        if (seen.has(k)) throw new ConfigError(`two channels have the same (channel, account) = (${c.adapter.id}, ${c.account}); give one another account`);
+        seen.add(k);
+      }
+    } catch (e) {
+      await closeAll();
+      throw e;
+    }
     for (const ch of all) {
       const ac = new AbortController();
       const running = ch.adapter
@@ -1471,7 +1486,7 @@ export function buildHarness(i: HarnessInstance, media?: MediaResolvers): Instan
   return new InstanceHarness(inst, new ClaudeCodeHarness(config));
 }
 
-async function buildChannel(ch: ResolvedChannel): Promise<{ adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }> {
+async function buildChannel(ch: ResolvedChannel, index: number, log: (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void): Promise<{ adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }> {
   const tier = ch.tier ? { tier: ch.tier } : {};
   switch (ch.type) {
     case 'lark-bot':
@@ -1488,6 +1503,20 @@ async function buildChannel(ch: ResolvedChannel): Promise<{ adapter: ChannelAdap
         ...(ch.config !== undefined ? { config: ch.config } : {}),
       });
       return { adapter: b, account: ch.account, config: ch.config, close: () => b.close(), ...tier };
+    }
+    case 'module': {
+      // A plugin that fails to load is a config error (exit 2), like any other bad channel entry.
+      const adapter = await loadChannelModule({
+        file: ch.module,
+        ...(ch.export ? { export: ch.export } : {}),
+        index,
+        account: ch.account,
+        config: ch.config,
+        log: (level, msg, data) => log(level, `channel module ${ch.module}: ${msg}`, data),
+      }).catch((e: Error) => {
+        throw new ConfigError(e.message);
+      });
+      return { adapter, account: ch.account, config: ch.config, ...(adapter.close ? { close: () => adapter.close!() } : {}), ...tier };
     }
   }
 }

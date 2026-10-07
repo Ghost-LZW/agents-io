@@ -4,6 +4,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { Type, type Static } from '@sinclair/typebox';
 import { Binding, IdentityEntry, Tier, WatchDraft, errors, type BindingTable, type Principal, type RunSpec, type WatchSource } from '@agents-io/protocol';
 import { DEFAULT_BLOB_MAX_BYTES, Router, RouterError, checkIdentities, ownerIdentities, ownersTable, type AgentSpec } from '@agents-io/session';
+import { resolveChannelModule } from './channel-module.js';
 import { loadEnvFile } from '@agents-io/testkit';
 import type { CodexTransportOption } from '@agents-io/harness-codex';
 
@@ -148,6 +149,22 @@ const ChannelEntry = Type.Union([
       args: Type.Optional(Type.Array(Type.String())),
       env: Type.Optional(Type.Record(Type.String(), Type.String())),
       cwd: Type.Optional(Type.String()),
+      config: Type.Optional(Type.Unknown()),
+    },
+    Closed,
+  ),
+  /**
+   * In-process channel plugin: an ES module exporting a ChannelFactory (`@agents-io/protocol`).
+   * `module` is a path (relative to the config file) to a package directory or a .js/.mjs file,
+   * or a bare package specifier resolved from the config file's directory.
+   */
+  Type.Object(
+    {
+      type: Type.Literal('module'),
+      ...ChannelCommon,
+      module: Type.String(),
+      /** Export holding the factory (default `createChannel`, else `default`). */
+      export: Type.Optional(Type.String()),
       config: Type.Optional(Type.Unknown()),
     },
     Closed,
@@ -523,7 +540,9 @@ export type LarkChannelConfig = Record<string, unknown> & { appId: string; appSe
 export type ResolvedChannel =
   | (Omit<Extract<ChannelEntry, { type: 'lark-bot' }>, 'config'> & { account: string; config: LarkChannelConfig })
   | (Extract<ChannelEntry, { type: 'mail' }> & { account: string })
-  | (Extract<ChannelEntry, { type: 'bridge' }> & { account: string });
+  | (Extract<ChannelEntry, { type: 'bridge' }> & { account: string })
+  /** `module` is the resolved file to import. */
+  | (Extract<ChannelEntry, { type: 'module' }> & { account: string });
 
 /** `topics.parkedIdleMs` default: a parked topic's lane closes after 30 idle minutes. */
 export const DEFAULT_PARKED_IDLE_MS = 30 * 60_000;
@@ -1149,6 +1168,13 @@ function resolveChannel(ch: ChannelEntry, env: Record<string, string | undefined
         ...(ch.env ? { env: substituteEnv(ch.env, env, 'bridge.env') as Record<string, string> } : {}),
         ...(ch.config !== undefined ? { config: substituteEnv(ch.config, env, 'bridge.config') } : {}),
       };
+    case 'module': {
+      const spec = ch.module;
+      const rel = spec.startsWith('.') || spec.startsWith('~') || isAbsolute(spec);
+      const r = resolveChannelModule(spec, rel ? path(spec) : undefined, path('.'));
+      if ('error' in r) fail(`channels[${i}].module: ${r.error}`);
+      return { ...ch, account, module: r.file, ...(ch.config !== undefined ? { config: substituteEnv(ch.config, env, `channels[${i}].config`) } : {}) };
+    }
   }
 }
 

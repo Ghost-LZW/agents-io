@@ -1,0 +1,1 @@
+{ "name": "chan-import-only", "version": "0.0.0", "type": "module", "exports": { "import": "./main.mjs" } }
