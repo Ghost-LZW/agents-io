@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
+import { HOST_RESULT_VALUES, errors } from '@agents-io/protocol';
 import type { FakeTurnScript } from '@agents-io/testkit';
 import { daemon, tmp, until } from './helpers.js';
 
@@ -160,5 +161,101 @@ describe('interactive agents', () => {
     const s = w.harness.sessions.find((x) => x.args.sessionKey === 'helper:fake:default:g9')!;
     expect(s.args.run).toMatchObject({ model: 'opus', profile: 'restricted' });
     expect(s.args.cwd).toBe(join(w.dir, 'helper-dir'));
+  });
+
+  it('a session whose recorded agent is gone refuses input with agent_unavailable, never falling back to the default agent', async () => {
+    const w1 = await daemon({ raw: { agents: { chat: { harness: 'claude-code' }, helper: { harness: 'claude-code', cwd: 'helper-dir' } } }, script });
+    const c1 = await w1.client();
+    await c1.input('helper:x', 'hi');
+    await until(() => w1.harness.sessions.find((s) => s.args.sessionKey === 'helper:x'));
+    await w1.stop();
+
+    // Restarted without `helper`: the session it opened stays its own, closed.
+    const w2 = await daemon({ dir: w1.dir, raw: { agents: { chat: { harness: 'claude-code' } } }, script });
+    const c2 = await w2.client();
+    await expect(c2.input('helper:x', 'again', 'queue', 'in-again')).rejects.toMatchObject({ code: 'agent_unavailable' });
+    expect(w2.harness.sessions.find((s) => s.args.sessionKey === 'helper:x')).toBeUndefined();
+    const log = w2.gw.hub.log.read('helper:x', 0);
+    expect(log.some((e) => e.body.t === 'notice' && e.body.message.startsWith('agent_unavailable: session helper:x belongs to agent "helper"'))).toBe(true);
+    expect(log.some((e) => e.body.t === 'input.rejected' && e.body.inputIds.includes('in-again') && e.body.reason === 'agent_unavailable')).toBe(true);
+    // Without an inputId (`aio send`): the generated one is recorded as rejected.
+    await expect(c2.input('helper:x', 'once more')).rejects.toMatchObject({ code: 'agent_unavailable' });
+    const generated = w2.gw.hub.log.read('helper:x', 0).filter((e) => e.body.t === 'input.rejected' && e.body.inputIds.some((id) => id.startsWith('in_')));
+    expect(generated).toHaveLength(1);
+    // Other commands fail with the same code but write nothing to the log.
+    const before = w2.gw.hub.log.read('helper:x', 0).length;
+    expect(await w2.gw.command({ type: 'interrupt', sessionKey: 'helper:x' }, w2.gw.localOrigin('helper:x'))).toMatchObject({ ok: false, code: 'agent_unavailable' });
+    expect(w2.gw.hub.log.read('helper:x', 0)).toHaveLength(before);
+    // Still pinned to `helper`: a refusal never re-pins.
+    expect(w2.gw.records.agentOf('helper:x')).toBe('helper');
+
+    // A session never pinned still opens with the default agent (its cwd, not helper's), and is pinned to it.
+    await c2.input('helper:new', 'hi');
+    const fresh = await until(() => w2.harness.sessions.find((s) => s.args.sessionKey === 'helper:new'));
+    expect(fresh.args.cwd).not.toBe(join(w1.dir, 'helper-dir'));
+    expect(w2.gw.records.agentOf('helper:new')).toBe('chat');
+  });
+
+  it('a session whose recorded agent is a task agent now refuses input with agent_unavailable', async () => {
+    const w1 = await daemon({ raw: { agents: { chat: { harness: 'claude-code' }, helper: { harness: 'claude-code' } } }, script });
+    const c1 = await w1.client();
+    await c1.input('helper:x', 'hi');
+    await until(() => w1.harness.sessions.find((s) => s.args.sessionKey === 'helper:x'));
+    await w1.stop();
+
+    const w2 = await daemon({ dir: w1.dir, raw: { agents: { chat: { harness: 'claude-code' }, helper: { harness: 'claude-code', mode: 'task' } } }, script });
+    const c2 = await w2.client();
+    await expect(c2.input('helper:x', 'again')).rejects.toMatchObject({ code: 'agent_unavailable', message: expect.stringContaining('is a task agent now') });
+    expect(w2.harness.sessions).toHaveLength(0);
+    expect(w2.gw.records.agentOf('helper:x')).toBe('helper');
+  });
+
+  it('a channel message to a session whose agent is gone: refused (no harness), a notice on the route, and explain says agent_unavailable', async () => {
+    const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };
+    const owner = (agent: string) => [{ id: 'owner', match: { conversationKind: 'dm', labels: ['owner'] }, on: 'dispatch', agent, session: 'main' }];
+    const w1 = await daemon({ raw: { agents: { chat: { harness: 'claude-code' } }, bindings: owner('chat') }, script });
+    const r1 = await w1.chat.inject({ sender: alice, text: 'hi' });
+    const key = w1.gw.router.explain(r1.inputId!)!.matched[0]!.sessionKey!;
+    await until(() => w1.chat.sent.find((s) => s.finalized));
+    await w1.stop();
+
+    // `chat` renamed to `assistant`: the owner's rule still routes to the same session key, pinned to `chat`.
+    const w2 = await daemon({ dir: w1.dir, raw: { agents: { assistant: { harness: 'claude-code' } }, bindings: owner('assistant') }, script });
+    const r2 = await w2.chat.inject({ sender: alice, text: 'still there?' });
+    expect(r2.accepted).toBe(true);
+    const ex = w2.gw.router.explain(r2.inputId!)!;
+    expect(ex.matched[0]).toMatchObject({ sessionKey: key, agent: 'assistant', rejected: { code: 'agent_unavailable' } });
+    const h = await w2.host();
+    const viaHost = await h.explain(r2.inputId!);
+    expect(errors(HOST_RESULT_VALUES.explain, viaHost)).toEqual([]);
+    expect(viaHost.matched[0]!.rejected?.code).toBe('agent_unavailable');
+    const notice = await until(() => w2.chat.sent.find((s) => s.msg.text?.includes('agent is not available')));
+    expect(notice.route).toMatchObject({ channel: 'fake' });
+    expect(w2.harness.sessions).toHaveLength(0);
+    const log = w2.gw.hub.log.read(key, 0);
+    expect(log.some((e) => e.body.t === 'input.rejected' && e.body.inputIds.includes(r2.inputId!) && e.body.reason === 'agent_unavailable')).toBe(true);
+  });
+
+  it('an observe-only (context) message to a session whose agent is gone: refused and logged, but nothing is said on the route', async () => {
+    const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };
+    const rule = (agent: string, on: string) => [{ id: 'owner', match: { conversationKind: 'dm', labels: ['owner'] }, on, agent, session: 'main' }];
+    const w1 = await daemon({ raw: { agents: { chat: { harness: 'claude-code' } }, bindings: rule('chat', 'dispatch') }, script });
+    const r1 = await w1.chat.inject({ sender: alice, text: 'hi' });
+    const key = w1.gw.router.explain(r1.inputId!)!.matched[0]!.sessionKey!;
+    await until(() => w1.chat.sent.find((s) => s.finalized));
+    await w1.stop();
+
+    const w2 = await daemon({ dir: w1.dir, raw: { agents: { assistant: { harness: 'claude-code' } }, bindings: rule('assistant', 'context') }, script });
+    const r2 = await w2.chat.inject({ sender: alice, text: 'just recording' });
+    expect(w2.gw.router.explain(r2.inputId!)!.matched[0]).toMatchObject({ sessionKey: key, on: 'context', rejected: { code: 'agent_unavailable' } });
+    const log = await until(() => {
+      const l = w2.gw.hub.log.read(key, 0);
+      return l.some((e) => e.body.t === 'input.rejected' && e.body.inputIds.includes(r2.inputId!)) ? l : undefined;
+    });
+    expect(log.some((e) => e.body.t === 'notice' && e.body.message.startsWith('agent_unavailable:'))).toBe(true);
+    // Give a stray notice the chance to be sent, then check none was.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(w2.chat.sent).toHaveLength(0);
+    expect(w2.harness.sessions).toHaveLength(0);
   });
 });

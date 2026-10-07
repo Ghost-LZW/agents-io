@@ -45,7 +45,17 @@ see `docs/E2E.md` §0). New:
   `bindings` the owners-based default table (`ownersTable`) routes to the default
   agent, as the dev gateway did. The default agent keeps bare route-key session
   keys; other agents' sessions are `<agent>:<channel>:<account>:<conversation>` (or
-  `<agent>:main`). Each session remembers its agent.
+  `<agent>:main`). Each session remembers its agent. If that agent is later
+  removed or renamed (or becomes a task agent), the session fails closed: every
+  input is refused with `agent_unavailable` (a client command's error code, a
+  `notice` and `input.rejected` in the session log, one short message on the
+  channel route when the message was addressed to the agent — observe-only
+  `context` deliveries stay silent there — and `rejected: { code }` on the rule in
+  `explain`). Other client commands (interrupt, resolve, control) fail with the
+  same code and write nothing. It never falls back to the agent its key's prefix
+  names or to the default agent. The only way to continue such a session is to
+  configure that agent again (as an interactive agent); there is no command yet
+  to retire or re-pin it.
 - Interactive turns plan `{ harness, model, effort }` from the agent; the profile
   is the agent's `profile`, else the policy's (owners only → `bypass`). Task runs
   use the agent's `profile`, default `restricted`.
