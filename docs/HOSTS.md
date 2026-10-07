@@ -35,7 +35,7 @@
   },
   "on": "dispatch",                // dispatch | context | digest | host | drop
   "agent": "assistant",            // dispatch/context/digest 的目标 agent（命名的运行配置）
-  "session": "main",               // main | per-conversation | per-thread
+  "session": "main",               // main | per-conversation | per-thread | topic（决定 6：平铺对话的当前话题）
   "digest": { "everyMs": 3600000, "maxItems": 50 },
   "callout": { "timeoutMs": 1500, "onFailure": "host" }   // 可选：显式开启同步回调（§2.2）
 }

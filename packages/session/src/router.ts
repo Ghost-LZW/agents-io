@@ -21,6 +21,7 @@ import {
 } from '@agents-io/protocol';
 import { IdentityError, IdentityMap, OWNER_LABEL, checkIdentities, ownerIdentities, type IdentityRules } from './identity.js';
 import { conversationRouteKey } from './policy.js';
+import { titleFrom, type TopicDraft, type TopicRecord, type TopicRegistry } from './topics.js';
 import { contentText } from './watch.js';
 
 /*
@@ -81,6 +82,8 @@ export interface RouteDelivery {
   match?: BindingMatch;
   /** Legacy `Policy.admit` only. */
   mode?: InputMode;
+  /** `session: "topic"`: the conversation's current topic this delivery resolved to. */
+  topic?: { id: string; conversation: string; title?: string };
 }
 
 /** `RouteExplanation` plus why nothing was delivered, and when (not in the protocol type yet). */
@@ -124,6 +127,11 @@ export interface RouterOptions {
   path?: string;
   /** Share an open database (e.g. `SqliteSessionLog.db`); the router then never closes it. */
   db?: DatabaseSync;
+  /**
+   * The topic table (decision 6). Without one, `session: "topic"` resolves like
+   * `per-thread` (one session per conversation, or per thread when there is one).
+   */
+  topics?: TopicRegistry;
   /** Answers rule callouts (the daemon forwards to the connected host). */
   routeCallout?: RouteCallout;
   /** Callout timeout when the rule names none (default 1500 ms). */
@@ -400,7 +408,8 @@ export class Router {
       const entry: RouteExplanation['matched'][number] = { bindingId: r.binding.id, source: r.source, on, ...(r.callout ? { callout: r.callout } : {}) };
       if (targets(on)) {
         const agent = r.watchId !== undefined || r.legacyKey !== undefined ? undefined : this.agents.get(r.agent ?? this.o.defaultAgent ?? '');
-        const sessionKey = r.legacyKey ?? this.sessionKey(r.session, agent, env);
+        const scope = r.legacyKey !== undefined ? { sessionKey: r.legacyKey } : this.scope(r.session, agent, env);
+        const sessionKey = scope.sessionKey;
         if (agent) entry.agent = agent.name;
         entry.sessionKey = sessionKey;
         const d: RouteDelivery = {
@@ -414,6 +423,7 @@ export class Router {
           ...(r.binding.note !== undefined ? { note: r.binding.note } : {}),
           ...(r.source !== 'watch' ? { match: r.binding.match } : {}),
           ...(r.mode ? { mode: r.mode } : {}),
+          ...(scope.topic ? { topic: { id: scope.topic.id, conversation: scope.topic.conversation, ...(scope.topic.title !== undefined ? { title: scope.topic.title } : {}) } } : {}),
         };
         const prior = best.get(sessionKey);
         // Same session: the strongest action wins; on a tie the earlier rule (config before host before watches).
@@ -486,15 +496,52 @@ export class Router {
     };
   }
 
-  /** Session key of a scope for an agent (watch rules always name `{ key }`). */
+  /**
+   * Session key of a scope for an agent (watch rules always name `{ key }`). For
+   * `topic` this resolves (and on first use creates) the conversation's current topic.
+   */
   sessionKey(scope: SessionScope | undefined, agent: AgentSpec | undefined, env: InboundEnvelope): string {
+    return this.scope(scope, agent, env).sessionKey;
+  }
+
+  private scope(scope: SessionScope | undefined, agent: AgentSpec | undefined, env: InboundEnvelope): { sessionKey: string; topic?: TopicRecord } {
     const s = scope ?? 'per-conversation';
-    if (typeof s === 'object') return s.key;
+    if (typeof s === 'object') return { sessionKey: s.key };
     const name = agent?.name ?? this.o.defaultAgent ?? 'default';
-    if (s === 'main') return agent?.mainSession ?? `${name}:main`;
+    if (s === 'main') return { sessionKey: agent?.mainSession ?? `${name}:main` };
     const prefix = agent?.sessionPrefix ?? `${name}:`;
-    if (s === 'per-thread') return prefix + conversationRouteKey(env);
-    return prefix + routeKey({ channel: env.channel, account: env.account, conversationId: env.conversation.id });
+    // Threaded conversations keep one session per thread; without a topic table a topic is the conversation.
+    if (s === 'per-thread' || (s === 'topic' && (env.conversation.threadId !== undefined || !this.o.topics))) return { sessionKey: prefix + conversationRouteKey(env) };
+    const conversation = topicConversation(env);
+    if (s === 'topic') {
+      const title = titleFrom(contentText(env.content, 400));
+      const { topic, created } = this.o.topics!.ensureCurrent(conversation, name, this.topicKey(name, conversation), title !== undefined ? { title } : {});
+      if (!created) this.o.topics!.touch(topic.sessionKey);
+      return { sessionKey: topic.sessionKey, topic };
+    }
+    return { sessionKey: prefix + conversation };
+  }
+
+  /**
+   * How an agent's topic sessions are spelled: the first topic of a conversation
+   * keeps the conversation's own key (what `per-conversation` names, so a session
+   * from before topics carries on as the first topic), later ones add `#<topicId>`.
+   */
+  topicKey(agentName: string, conversation: string) {
+    const prefix = this.agents.get(agentName)?.sessionPrefix ?? `${agentName}:`;
+    return ({ topicId, first }: { topicId: string; first: boolean }) => (first ? prefix + conversation : `${prefix}${conversation}#${topicId}`);
+  }
+
+  /** Start a new topic in a conversation (it becomes current). Throws without a topic table. */
+  newTopic(agentName: string, conversation: string, draft: TopicDraft, reason: 'user' | 'agent' | 'system') {
+    if (!this.o.topics) throw new RouterError('invalid', 'no topic table');
+    this.target(agentName, 'newTopic');
+    return this.o.topics.create(conversation, agentName, this.topicKey(agentName, conversation), draft, reason);
+  }
+
+  /** The topic table, when there is one. */
+  get topics(): TopicRegistry | undefined {
+    return this.o.topics;
   }
 
   // ---- explanations -------------------------------------------------------
@@ -524,6 +571,11 @@ interface Resolved extends Rule {
   /** Legacy admit: the session it named. */
   legacyKey?: string;
   mode?: InputMode;
+}
+
+/** Route key of the conversation an envelope belongs to, without thread: what topics are kept per. */
+export function topicConversation(env: InboundEnvelope): string {
+  return routeKey({ channel: env.channel, account: env.account, conversationId: env.conversation.id });
 }
 
 const targets = (on: BindingAction): on is Effective => on === 'dispatch' || on === 'context' || on === 'digest';
@@ -639,13 +691,14 @@ export interface DefaultBindingsOptions {
  * The single-owner defaults (POSITIONING §4) as rules, in place of the old
  * `defaultPolicy.admit`:
  *
- * - `default:owner-dm` — the owner's DM starts a turn (in `ownerSessionKey` when set);
+ * - `default:owner-dm` — the owner's DM starts a turn in the DM's current topic (in `ownerSessionKey` when set);
  * - `default:owner-<kind>` — the owner addressing the deployment anywhere else
  *   (`mentions: ["self"]`: an @ of the bot, or an adapter that hints `dispatch` or nothing) starts a turn there;
  * - `default:observe-<kind>` — anything else outside DMs is recorded as context of that conversation's session.
  *
  * Unknown senders' DMs and our own echoes match nothing and are dropped.
- * Sessions are per thread (`channel:account:conversation[:thread]` plus the agent's prefix).
+ * Sessions are per thread (`channel:account:conversation[:thread]` plus the agent's prefix); the
+ * owner's DM is per topic (its first topic has the DM's own key, later ones `#<topicId>`).
  */
 export function defaultBindings(o: DefaultBindingsOptions): Binding[] {
   const label = o.label ?? OWNER_LABEL;
@@ -655,7 +708,8 @@ export function defaultBindings(o: DefaultBindingsOptions): Binding[] {
       match: { conversationKind: 'dm', labels: [label] },
       on: 'dispatch',
       agent: o.agent,
-      session: o.ownerSessionKey ? { key: o.ownerSessionKey } : 'per-thread',
+      // One topic at a time in a flat DM (decision 6); a DM thread stays its own session.
+      session: o.ownerSessionKey ? { key: o.ownerSessionKey } : 'topic',
       note: 'the owner talking to the deployment directly',
     },
   ];

@@ -237,6 +237,17 @@ export interface RenderOptions {
   caps?: Pick<ChannelCaps, 'buttons' | 'text'>;
   /** Offer a stop button (`interruptActionId`) while the turn runs, on card/full tiers. */
   interrupt?: boolean;
+  /** Title of the session's topic (decision 6): card/full renders carry it as `channelData[TOPIC_KEY]`. */
+  title?: string;
+}
+
+/**
+ * `RenderedMessage.channelData[TOPIC_KEY]`: `{ title }` of the topic a turn's card
+ * belongs to. Adapters that have a card header show it there (Lark); others ignore it.
+ */
+export const TOPIC_KEY = 'agents-io/topic';
+export interface TopicCardData {
+  title: string;
 }
 
 /** Render a turn view for one tier. Pending human requests always show. */
@@ -282,7 +293,8 @@ export function renderTurn(v: TurnView, tier: Tier, o: RenderOptions = {}): Rend
       }
       if (statusLine) sections.push({ kind: 'status', text: statusLine });
       const text = done ? (v.finalText ?? v.text) : v.text || '…';
-      return { text: clip(text), sections, ...(actions.length ? { actions } : {}), progress: progressOf(v) };
+      const topic: TopicCardData | undefined = o.title ? { title: o.title } : undefined;
+      return { text: clip(text), sections, ...(actions.length ? { actions } : {}), progress: progressOf(v), ...(topic ? { channelData: { [TOPIC_KEY]: topic } } : {}) };
     }
   }
 }
@@ -300,6 +312,8 @@ export interface CompositorOptions {
   as?: string;
   /** Put a stop button on streaming cards while the turn runs (see `interruptActionId`). Default false. */
   interruptButton?: boolean;
+  /** The session's topic title, read at every render (a topic can be renamed). */
+  title?: () => string | undefined;
   onError?: (err: unknown) => void;
 }
 
@@ -446,7 +460,8 @@ export class Compositor {
   }
 
   private render(r: RouteState): RenderedMessage {
-    return renderTurn(r.view, r.tier, { route: r.route, caps: r.caps, ...(this.o.interruptButton ? { interrupt: true } : {}) });
+    const title = this.o.title?.();
+    return renderTurn(r.view, r.tier, { route: r.route, caps: r.caps, ...(this.o.interruptButton ? { interrupt: true } : {}), ...(title ? { title } : {}) });
   }
 
   private async sendCard(r: RouteState): Promise<void> {

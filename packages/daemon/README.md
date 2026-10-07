@@ -171,6 +171,43 @@ against the protocol alone.
   `LARK_APP_SECRET` already set in the env file or environment, is 409 (also
   with `addChannel: false`, since the env file would be overwritten).
 
+## Topics (decision 6)
+
+A flat conversation (no platform threads) can hold several **topics**, each its
+own session, with one current topic. A binding with `session: "topic"` routes to
+the conversation's current topic; the first one is created on first use and keeps
+the conversation's own session key (so a session from before topics carries on),
+later ones are `<that key>#<topicId>`. A threaded message stays per thread. The
+default owner-DM rule (`default:owner-dm`) uses `topic`; group rules are unchanged
+(`per-thread`).
+
+- The table (`topics`, in the log's SQLite database): title, summary, session key,
+  the harness's native session id (from `session.bound`), current / parked, created
+  and last-active times. Parked topics are never deleted.
+- Every change appends `topic.changed { conversation, from?, to, title?, reason }`
+  to the session left and the one now current.
+- Inputs routed to a topic carry `channelContext.topic` / `topicTitle` (the model
+  sees them in its input preface).
+- When to switch is the agent's call, with the host output tools:
+  `session_rotate({ title, summary })` starts a new topic and hands the turn's
+  triggering inputs to it (new input ids `<id>><topicId>`), the summary first as a
+  labelled context item; `session_list()`; `session_switch({ topicId })` makes a
+  parked topic current again and hands the inputs to it: its lane carries on in
+  memory, or after a restart opens the harness with the native id its log recorded
+  (`--resume` / thread resume). The tool result tells the model to end the turn
+  without answering; the answer comes from the topic now current.
+- Or the user's, with chat commands on a topic route: `/new [title]`, `/topics`,
+  `/switch <n|id>` (`n` as `/topics` numbers them). They are checked by
+  `Policy.control` as a `reset` of the session they were sent to (owner by default),
+  never reach the harness, and are answered with one short plain message on the
+  route.
+- Client frames `topic.list { conversation?, sessionKey? }` and `topic.switch
+  { conversation, topicId | new: { title? } }` (`Policy.control` against the
+  connection's origin; errors `unknown_conversation`, `unknown_topic`,
+  `invalid_frame` when both or neither are given).
+- Cards of a topic session carry `channelData["agents-io/topic"] = { title }`; the
+  Lark adapter shows it as the card header title (the status moves to the subtitle).
+
 ## CLI
 
 ```
