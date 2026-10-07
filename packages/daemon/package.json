@@ -24,6 +24,10 @@
     "@agents-io/protocol": "workspace:*",
     "@agents-io/session": "workspace:*",
     "@agents-io/testkit": "workspace:*",
-    "@sinclair/typebox": "^0.34.0"
+    "@sinclair/typebox": "^0.34.0",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.2"
   }
 }

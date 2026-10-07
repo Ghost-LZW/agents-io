@@ -61,6 +61,12 @@ export class HostService implements HostFrames {
     return this.host?.name;
   }
 
+  /** The connected host's name and role, if any. */
+  info(): { name: string; consumer?: string; callouts: boolean } | undefined {
+    const h = this.host;
+    return h ? { name: h.name, callouts: h.callouts, ...(h.consumer !== undefined ? { consumer: h.consumer } : {}) } : undefined;
+  }
+
   async handle(peer: Peer, f: HostRequestFrame): Promise<Outcome> {
     switch (f.type) {
       case 'host.hello':

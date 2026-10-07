@@ -94,6 +94,63 @@ before any host frame; after it, the connection's client frames carry the origin
   false` when the daemon never received it. Never a guess.
 - `explain { inputId }`: the persisted routing record.
 
+## Console API (for web UIs)
+
+`aio serve` also serves the console API of `packages/protocol/src/admin.ts`
+(HTTP under `/api`, WebSocket `/ws`), so a web UI in another repo can be built
+against the protocol alone.
+
+```jsonc
+"console": {
+  "enabled": true,            // default true for `aio serve`
+  "host": "127.0.0.1",        // default; a non-loopback host is refused unless "allowRemote": true (then a warning at start)
+  "port": 7464,               // 0: any free port; the URL is written to <socket>.console (0600)
+  "origins": ["https://ui.example"],   // CORS for a separately hosted UI; none by default
+  "uiUrl": "https://ui.example",       // where login links point (default: the console itself)
+  "sessionTtlMs": 43200000,
+  "larkBotCommand": ["npx", "-y", "github:Ghost-LZW/create-lark-bot#v0.2.2"]
+}
+```
+
+- **Auth**: `Authorization: Bearer <token>` with the host token (`<socket>.token`)
+  or a console session token; the session cookie (`aio_console`, HttpOnly,
+  SameSite=Strict); for `/ws` from a browser the subprotocols
+  `["agents-io.v1", "agents-io.bearer.<token>"]`. `aio console-link` prints a
+  one-time login URL (`<uiUrl>/#login=<token>`, 5 minutes, single use);
+  `POST /api/login { loginToken }` exchanges it for a session (cookie + token).
+  Missing, wrong or expired credentials → 401. Sessions live in memory (gone at
+  restart). Login links are made with the host token only
+  (`POST /api/login-link`).
+- **Origins**: requests with an `Origin` that is neither the console's own nor in
+  `origins` → 403; requests whose `Host` is not loopback / the configured host →
+  403 (DNS rebinding). Bodies must be `application/json`.
+- **Endpoints**: `GET /api/status`, `GET|PUT /api/config`,
+  `POST /api/config/validate`, `GET /api/explain/:inputId`, `GET /api/queue`,
+  `GET /api/sessions`, `POST /api/bots/lark`, `GET /api/bots/lark/:job`; `GET /`
+  is a minimal page that completes a login link opened on the console itself.
+- **Config**: `GET` shows `env:NAME` references as written and every other
+  string under a secret-looking key (`password`, `secret`, `token`, `apiKey`,
+  `authorization`, …) as `<redacted>`, plus each referenced variable as set /
+  unset (never its value). `PUT` (and `validate`) run the startup validation
+  (`resolveConfig`, with the env file read afresh), keep stored values where the
+  document says `<redacted>`, refuse new literal secrets (`inline_secret`, 422),
+  honor `ifRevision` (409), and write atomically (temp + fsync + rename, 0600).
+  The daemon does not reload: `applied: "restart"` unless the file is back to
+  what it started with.
+- **`/ws`**: exactly the local socket's frames. Client frames carry the local
+  principal with `via: "console"`, `adapter: "console"`; host frames work after
+  `host.hello` with the host token.
+- **Lark bot provisioning**: `POST /api/bots/lark` runs `larkBotCommand` with
+  `--qr-out <file> --json --write-env <env file> --name … --brand … --preset …`
+  (`--avatar` from a `data:` URI, `--no-owner`); the job goes `starting` →
+  `waiting_scan` (the QR file's content as `qr.payload`) → `configuring` →
+  `succeeded` / `failed` / `expired`. Credentials go only to the env file
+  (`LARK_APP_ID`, `LARK_APP_SECRET`, `LARK_DOMAIN`); the job shows their `env:`
+  references. On success the config gets a `lark-bot` channel (unless
+  `addChannel: false`) and the verified owner `lark-bot:<union_id>` in
+  `policy.owners`; restart to start it. One job at a time, and one lark-bot
+  channel per daemon (409 otherwise).
+
 ## CLI
 
 ```
@@ -105,6 +162,7 @@ aio ack --consumer <name> <cursor>
 aio bindings put [--file table.json|-] | get
 aio explain <inputId>
 aio verify <channelRef>
+aio console-link                                              (one-time console login URL)
 ```
 
 - Host commands find the socket from `--socket`, `$AIO_SOCKET`, or the config, and

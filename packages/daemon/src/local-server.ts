@@ -52,7 +52,7 @@ const HOST_TYPES = new Set<string>(HOST_REQUEST_FRAME_TYPES);
  */
 export class LocalServer {
   private server: Server | undefined;
-  private readonly conns = new Set<Conn>();
+  private readonly conns = new Set<FrameConn>();
   /** Inode of the socket this server bound (close() removes only that). */
   private ino: number | undefined;
 
@@ -77,7 +77,13 @@ export class LocalServer {
       unlinkSync(this.path); // stale socket from a crashed process
     }
     const server = createServer((socket) => {
-      const c = new Conn(socket, this.host, () => this.conns.delete(c));
+      const c = new FrameConn(socketTransport(socket), this.host, () => this.conns.delete(c));
+      const decoder = new FrameDecoder(() => c.send({ v: PROTOCOL_VERSION, type: 'result', id: '', ok: false, error: { code: 'bad_json', message: 'line is not JSON' } }));
+      socket.on('data', (chunk) => {
+        for (const raw of decoder.push(chunk)) c.receive(raw);
+      });
+      socket.on('close', () => c.drop());
+      socket.on('error', () => c.drop());
       this.conns.add(c);
     });
     this.server = server;
@@ -133,29 +139,73 @@ function canConnect(path: string): Promise<boolean> {
   });
 }
 
+/**
+ * How a connection's frames travel: a Unix socket (JSONL) or a WebSocket (one
+ * frame per text message). The connection decodes nothing itself; its owner
+ * hands it decoded frames (`FrameConn.receive`) and reports the end (`drop`).
+ */
+export interface FrameTransport {
+  /** Write one frame; false when it was not written (gone) or the buffer is full (then `drained` resolves). */
+  write(frame: Record<string, unknown>): boolean;
+  /** Resolves when writing may continue, or the transport is gone. */
+  drained(): Promise<void>;
+  /** True once the transport cannot write any more. */
+  readonly gone: boolean;
+  /** Close after flushing. */
+  end(): void;
+}
+
+function socketTransport(socket: Socket): FrameTransport {
+  return {
+    write: (f) => !socket.destroyed && socket.write(encodeFrame(f)),
+    drained: () =>
+      new Promise<void>((resolve) => {
+        if (socket.destroyed) return resolve();
+        const done = () => {
+          socket.off('drain', done);
+          socket.off('close', done);
+          resolve();
+        };
+        socket.on('drain', done);
+        socket.on('close', done);
+      }),
+    get gone() {
+      return socket.destroyed;
+    },
+    end: () => socket.end(),
+  };
+}
+
+export interface FrameConnOptions {
+  /** Origin of client frames before `host.hello` (default: the host's local origin). */
+  origin?: (sessionKey: string) => Origin;
+}
+
 let connSeq = 0;
 
-class Conn implements Peer {
+/**
+ * One connection speaking the client frames and the host frames over any
+ * transport: the Unix socket here, `/ws` of the console server.
+ */
+export class FrameConn implements Peer {
   readonly id = `conn_${++connSeq}`;
   auth?: Peer['auth'];
   private readonly subs = new Map<string, Subscription>();
-  private readonly decoder: FrameDecoder;
   private readonly ac = new AbortController();
   /** Requests this side sent (inbound pushes, callouts), by id. */
   private readonly pending = new Map<string, (r: ResultFrame) => void>();
   private closed = false;
 
   constructor(
-    private readonly socket: Socket,
+    private readonly transport: FrameTransport,
     private readonly host: LocalHost,
     private readonly onGone: () => void,
-  ) {
-    this.decoder = new FrameDecoder(() => this.send({ v: PROTOCOL_VERSION, type: 'result', id: '', ok: false, error: { code: 'bad_json', message: 'line is not JSON' } }));
-    socket.on('data', (chunk) => {
-      for (const raw of this.decoder.push(chunk)) void this.onFrame(raw);
-    });
-    socket.on('close', () => this.gone());
-    socket.on('error', () => this.gone());
+    private readonly opts: FrameConnOptions = {},
+  ) {}
+
+  /** One decoded frame from the peer. */
+  receive(raw: unknown): void {
+    void this.onFrame(raw);
   }
 
   get signal(): AbortSignal {
@@ -163,8 +213,8 @@ class Conn implements Peer {
   }
 
   send(f: ServerFrame | Record<string, unknown>): boolean {
-    if (this.closed || this.socket.destroyed) return false;
-    return this.socket.write(encodeFrame(f));
+    if (this.closed || this.transport.gone) return false;
+    return this.transport.write(f);
   }
 
   request(frame: Record<string, unknown>, timeoutMs = 60_000): Promise<ResultFrame> {
@@ -252,29 +302,22 @@ class Conn implements Peer {
   private async pump(sub: Subscription): Promise<void> {
     for await (const event of sub) {
       if (!this.send({ v: PROTOCOL_VERSION, type: 'event', event })) {
-        if (this.closed || this.socket.destroyed) return;
-        await new Promise<void>((resolve) => {
-          const done = () => {
-            this.socket.off('drain', done);
-            this.socket.off('close', done);
-            resolve();
-          };
-          this.socket.on('drain', done);
-          this.socket.on('close', done);
-        });
+        if (this.closed || this.transport.gone) return;
+        await this.transport.drained();
       }
     }
   }
 
   end(reason: string): void {
     for (const key of this.subs.keys()) this.send({ v: PROTOCOL_VERSION, type: 'closed', sessionKey: key, reason });
-    this.socket.end();
-    this.gone();
+    this.transport.end();
+    this.drop();
   }
 
-  /** Origin of this connection's client frames: the host's once it said hello, else the local principal. */
+  /** Origin of this connection's client frames: the host's once it said hello, else the connection's own (default the local principal). */
   private origin(sessionKey: string): Origin {
-    return this.auth ? this.auth.origin(sessionKey) : this.host.localOrigin(sessionKey);
+    if (this.auth) return this.auth.origin(sessionKey);
+    return this.opts.origin ? this.opts.origin(sessionKey) : this.host.localOrigin(sessionKey);
   }
 
   private async onHostFrame(raw: unknown): Promise<void> {
@@ -294,7 +337,8 @@ class Conn implements Peer {
     }
   }
 
-  private gone(): void {
+  /** The transport is gone: end subscriptions, fail pending requests, tell the host side. */
+  drop(): void {
     if (this.closed) return;
     this.closed = true;
     this.ac.abort();

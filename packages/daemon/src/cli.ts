@@ -10,7 +10,7 @@ import { CommandError, DaemonUnavailable, LocalClient } from './client.js';
 import { ConfigError, defaultInstance, loadConfig, type LoadOptions } from './config.js';
 import { runScenarios } from './e2e.js';
 import { Gateway, buildHarness } from './gateway.js';
-import { TokenError, readTokenFile, tokenPath } from './token.js';
+import { TokenError, consoleUrlPath, readTokenFile, tokenPath } from './token.js';
 import { WATCH_SPEC_HELP, formatWatch, parseDuration, parseWatchSpec } from './watch-spec.js';
 
 const USAGE = `aio: the agents-io daemon and its CLI
@@ -34,6 +34,9 @@ host commands (authenticate with the token file next to the socket; docs/HOSTS.m
   aio bindings  put [--file table.json|-] | get
   aio explain   <inputId>
   aio verify    <channelRef>                                          (channel:<channel>/<message id>)
+
+console (HTTP + WebSocket API for web UIs, on 127.0.0.1:7464 by default; config \`console\`)
+  aio console-link                                                    (prints a one-time login URL, valid 5 min)
 
 watch keys: ${WATCH_SPEC_HELP}
 
@@ -165,7 +168,7 @@ const print = (v: unknown) => console.log(JSON.stringify(v, null, 2));
 
 async function serve(a: CliArgs): Promise<number> {
   const c = config(a);
-  const gw = await Gateway.start({ config: c, logger: (level, msg) => console.error(`[aio] ${level}: ${msg}`) });
+  const gw = await Gateway.start({ config: c, console: c.console.enabled, logger: (level, msg) => console.error(`[aio] ${level}: ${msg}`) });
   let version = 'not probed';
   try {
     version = (await gw.harness().probe()).version;
@@ -179,6 +182,7 @@ async function serve(a: CliArgs): Promise<number> {
   const agents = Object.values(c.agents).map((x) => `${x.name} (${x.mode}, ${x.harness}${x.name === c.defaultAgent ? ', default' : ''})`);
   console.error(`[aio] agents: ${agents.join(', ') || 'none'}; bindings: ${c.table ? `${c.table.bindings.length} from config` : 'owners default table'}`);
   console.error(`[aio] channels: ${c.channels.map((ch) => ch.type).join(', ') || 'none'}; owners: ${c.policy.owners.length}`);
+  if (gw.console) console.error(`[aio] console API on ${gw.console.url} (login link: aio console-link)`);
   await new Promise<void>((done) => {
     let stopping = false;
     const stop = (sig: string) => {
@@ -487,6 +491,32 @@ async function verify(a: CliArgs): Promise<number> {
   }
 }
 
+/**
+ * `aio console-link`: ask the running daemon's console (with the host token)
+ * for a one-time login link and print it.
+ */
+async function consoleLink(a: CliArgs): Promise<number> {
+  const socket = socketOf(a);
+  const token = readTokenFile(tokenPath(socket));
+  let url: string;
+  try {
+    url = readTokenFile(consoleUrlPath(socket));
+  } catch {
+    throw new DaemonUnavailable(`no console URL next to ${socket}: is \`aio serve\` running with the console enabled (config \`console\`)?`);
+  }
+  let res: Response;
+  try {
+    res = await fetch(`${url}/api/login-link`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: '{}' });
+  } catch (e) {
+    throw new DaemonUnavailable(`cannot reach the console at ${url}: ${(e as Error).message}`);
+  }
+  const body = (await res.json()) as { url?: string; expiresAt?: number; error?: { code: string; message: string } };
+  if (!res.ok || !body.url) throw new CommandError(body.error?.code ?? 'failed', body.error?.message ?? `HTTP ${res.status}`);
+  console.log(body.url);
+  if (process.stderr.isTTY) console.error(`one-time login link; valid until ${new Date(body.expiresAt ?? 0).toLocaleTimeString()}`);
+  return 0;
+}
+
 async function e2e(a: CliArgs): Promise<number> {
   const c = config(a, { channels: false });
   const inst = defaultInstance(c);
@@ -500,7 +530,7 @@ async function e2e(a: CliArgs): Promise<number> {
   return n('FAIL') ? 1 : 0;
 }
 
-const COMMANDS: Record<string, (a: CliArgs) => Promise<number>> = { serve, attach, input, sessions, watch, e2e, run: runCmd, send, tail, ack, bindings, explain, verify };
+const COMMANDS: Record<string, (a: CliArgs) => Promise<number>> = { serve, attach, input, sessions, watch, e2e, run: runCmd, send, tail, ack, bindings, explain, verify, 'console-link': consoleLink, console: consoleLink };
 
 export async function main(argv: string[]): Promise<number> {
   const a = parseCli(argv);
