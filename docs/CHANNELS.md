@@ -111,6 +111,12 @@ harness 事件 ──▶ SessionLog（seq）──▶ Compositor（读全量，�
 - 需要人批准时，只用文字列出待批事项，没有按钮，也还没有审批链接。
 - 发信按 operationId 幂等：同一次投递重试不会发出两封。
 
+### 收件进度与状态由宿主保存
+
+- 邮件通道通过 `MailStore` 接口读写收件进度（UID 检查点）、发信记录和线程元数据；agents-io 只提供接口和内存实现 `MemoryMailStore`，持久化由宿主实现。
+- dev-gateway 用的是内存实现，所以每次重启都会把起点重置到收件箱最新一封，停机期间到达的邮件不会被处理。这是示例网关的取舍，不是通道本身的限制。
+- 取信靠 IMAP IDLE 推送，`pollIntervalMs`（默认 60s）作为兜底；在腾讯企业邮上实测 IDLE 没有及时推送，靠轮询取到，建议把轮询设短（如 10s）。
+
 ## 4. 终端（`aio-dev attach`，本地 socket，档位任选）
 
 ### agent 能看到什么
