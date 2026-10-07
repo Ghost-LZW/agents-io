@@ -23,3 +23,18 @@ npx github:Ghost-LZW/create-lark-bot#v0.2.1 verify --live
 `messaging` covers every scope, event and callback in `requirements.ts`; `contact` lets the tool resolve your union_id, which it writes as the owner key.
 
 Then give the adapter the credentials (`LARK_APP_ID`, `LARK_APP_SECRET`, `LARK_DOMAIN`). The owner key that `defaultPolicy({ owners })` from `@agents-io/session` matches is `lark-bot:<union_id>`, because the adapter identifies senders by `union_id` first (falling back to `open_id`).
+
+## Process rendering
+
+A message that carries `progress` (the session compositor attaches it on `card`/`full` tiers) is rendered natively; `config.process` picks how:
+
+| `process` | Reply card | Thinking / tool calls |
+|---|---|---|
+| `auto` (default) | status, plan, typewriter answer, buttons, footer | Feishu's native thinking bubble (`message_cot`) while it works in the chat; otherwise collapsible panels on the card |
+| `cot` | same | thinking bubble only; if it fails, the process is not shown |
+| `panels` | same, plus collapsed thinking and tool-call panels (last `processMaxEntries` entries, `processPanelMaxChars` each) | on the card |
+| `off` | the flat text/sections card | not shown |
+
+The reply card is a CardKit card in streaming mode (`cardkit:card:write`): the answer streams with the typewriter effect, other parts update on their own element ids. On failure it degrades per chat (per app for permission errors, for `degradeTtlMs`): streaming → full `card.update` → an ordinary card replaced by `im.message.patch`. Thinking-bubble failures are remembered the same way and never affect the reply card. An answer larger than the card continues in follow-up cards when the turn ends. The bubble is opened on the first process step, so in the chat it appears below the reply card; it settles with the turn (`RUN_FINISHED`).
+
+Buttons in `actions` (approvals, and the stop button `turn:<turnId>:interrupt` when the compositor runs with `interruptButton: true`) come back as `action` events, which `Ingress` turns into `resolve` / `interrupt` commands.

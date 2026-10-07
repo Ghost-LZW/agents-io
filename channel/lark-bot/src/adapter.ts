@@ -2,13 +2,31 @@ import type {
   ChannelAdapter,
   ChannelCaps,
   ChannelContext,
+  ProgressView,
   RenderedMessage,
   ReplyRoute,
   SendOp,
   SendResult,
 } from '@agents-io/protocol';
+import { CardKitCard, LarkApiError, errCode } from './cardkit.js';
 import { resolveConfig, type LarkBotConfig, type ResolvedConfig } from './config.js';
+import { CotBubble } from './cot.js';
 import { CHANNEL_ID, mapCardAction, mapMessageEvent } from './inbound.js';
+import {
+  EL,
+  PANEL_ORDER,
+  actionElement,
+  actionElementId,
+  buildModel,
+  fitProcessCard,
+  footerElement,
+  panelElement,
+  processCard,
+  splitMarkdown,
+  statusElement,
+  type PanelKey,
+  type ProcessModel,
+} from './process-card.js';
 import {
   cardMessage,
   fitCard,
@@ -22,18 +40,9 @@ import {
 } from './render.js';
 import { defaultLarkDeps } from './sdk.js';
 import { DedupWindow, MemoryDeclaredSenderStore, type DeclaredSenderStore } from './store.js';
-import type { LarkApiResponse, LarkClientLike, LarkConnectionParams, LarkDeps, RawCardActionEvent, RawMessageEvent } from './types.js';
+import type { LarkClientLike, LarkConnectionParams, LarkDeps, RawCardActionEvent, RawMessageEvent } from './types.js';
 
-export class LarkApiError extends Error {
-  constructor(
-    readonly op: string,
-    readonly code: number | undefined,
-    message: string,
-  ) {
-    super(`lark ${op} failed${code !== undefined ? ` (code ${code})` : ''}: ${message}`);
-    this.name = 'LarkApiError';
-  }
-}
+export { LarkApiError };
 
 export interface LarkBotOptions {
   /** Replace SDK construction (tests, custom HTTP agents). */
@@ -42,12 +51,40 @@ export interface LarkBotOptions {
   store?: DeclaredSenderStore;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
+  /** Where degradations are reported before `start()` supplies the host's logger. */
+  log?: ChannelContext['log'];
 }
 
-type MsgKind = 'card' | 'text' | 'post';
+type MsgKind = 'card' | 'text' | 'post' | 'cardkit';
+
+/**
+ * How a process card is updated, best first: `stream` = CardKit streaming mode with per-element
+ * updates (typewriter answer), `update` = CardKit full card replacement, `patch` = an ordinary
+ * interactive message replaced through `im.message.patch`.
+ */
+export type CardLevel = 'stream' | 'update' | 'patch';
+const LEVEL_RANK: Record<CardLevel, number> = { stream: 0, update: 1, patch: 2 };
+
+interface ProcState {
+  route: ReplyRoute;
+  level: CardLevel;
+  card?: CardKitCard;
+  cot?: CotBubble;
+  /** `cot` never shows thinking/tools on the card; `auto` does once the bubble failed. */
+  mode: 'cot' | 'auto' | 'panels';
+  /** Streaming level: what each element last received. */
+  sent: Map<string, string>;
+  panels: Set<PanelKey>;
+  actions: string[];
+  lastAuxAt: number;
+  /** Full-card levels: the card JSON last sent. */
+  lastCard?: string;
+}
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const BOUND = 2000;
+/** Lark codes for a missing scope / app permission: remembered for the whole app, not one chat. */
+const PERMISSION_CODES = new Set([99991672, 99991679, 99991663]);
 
 function bounded<K, V>(m: Map<K, V>, k: K, v: V): void {
   m.delete(k);
@@ -58,15 +95,14 @@ function bounded<K, V>(m: Map<K, V>, k: K, v: V): void {
   }
 }
 
-function errCode(e: unknown): number | undefined {
-  const x = e as { code?: unknown; response?: { data?: { code?: unknown } } };
-  const c = x?.response?.data?.code ?? x?.code;
-  return typeof c === 'number' ? c : undefined;
-}
+const isPermissionError = (e: unknown) =>
+  e instanceof LarkApiError && ((e.code !== undefined && PERMISSION_CODES.has(e.code)) || (e.code === undefined && /\b(403|404)\b/.test(e.message)));
 
 /**
  * Channel adapter for the official Feishu/Lark bot platform: events arrive over the SDK's
  * WebSocket long connection (no public URL needed), messages go out through the REST API.
+ * Messages that carry `progress` are rendered as a native process card (and, per `process`,
+ * Feishu's thinking bubble); see `config.ts`.
  */
 export class LarkBotAdapter implements ChannelAdapter {
   readonly id = CHANNEL_ID;
@@ -79,12 +115,19 @@ export class LarkBotAdapter implements ChannelAdapter {
   private clientInst: LarkClientLike | undefined;
   private botOpenId: string | undefined;
   private account = 'default';
+  private logFn: ChannelContext['log'] | undefined;
 
   private readonly sends = new Map<string, Promise<SendResult>>();
   private readonly kinds = new Map<string, MsgKind>();
   private readonly tails = new Map<string, Promise<void>>();
   private readonly lastPatchAt = new Map<string, number>();
   private readonly lastSeq = new Map<string, number>();
+  private readonly procs = new Map<string, ProcState>();
+  /** `app` or `chat:<id>` → lowest card level that still works there, until a time. */
+  private readonly cardFloor = new Map<string, { level: CardLevel; until: number }>();
+  /** `app` or `chat:<id>` → thinking bubble off until a time. */
+  private readonly cotOff = new Map<string, number>();
+  private readonly cotTasks = new Set<Promise<void>>();
 
   constructor(config: LarkBotConfig, opts: LarkBotOptions = {}) {
     this.cfg = resolveConfig(config);
@@ -94,12 +137,15 @@ export class LarkBotAdapter implements ChannelAdapter {
     this.now = opts.now ?? Date.now;
     this.dedup = new DedupWindow(this.cfg.dedupWindowMs, 10_000, this.now);
     this.botOpenId = this.cfg.botOpenId;
+    this.logFn = opts.log;
   }
 
   caps(_account?: string): ChannelCaps {
     return {
       text: { maxChars: this.cfg.maxChars, markdown: 'basic' },
       edit: true,
+      // Process cards stream the answer natively; the host may edit as often as this.
+      ...(this.cfg.process !== 'off' ? { nativeStream: { minIntervalMs: this.cfg.streamTextIntervalMs, maxBytes: this.cfg.maxCardKitBytes } } : {}),
       buttons: true,
       media: { in: ['image', 'file', 'audio'], out: ['image', 'file', 'audio'] },
       voiceOut: 'none',
@@ -125,10 +171,15 @@ export class LarkBotAdapter implements ChannelAdapter {
     return (this.clientInst ??= this.deps.createClient(this.params()));
   }
 
+  private log(level: 'debug' | 'info' | 'warn', msg: string): void {
+    this.logFn?.(level, msg);
+  }
+
   // ---- inbound ----------------------------------------------------------------------------
 
   async start(ctx: ChannelContext): Promise<void> {
     this.account = ctx.account;
+    this.logFn = ctx.log;
     if (!this.botOpenId) await this.discoverBot(ctx);
 
     const dispatcher = this.deps.createDispatcher(this.params());
@@ -216,7 +267,7 @@ export class LarkBotAdapter implements ChannelAdapter {
 
   // ---- outbound ---------------------------------------------------------------------------
 
-  private async api<T extends LarkApiResponse>(op: string, call: () => Promise<T>): Promise<T> {
+  private async api<T extends { code?: number; msg?: string }>(op: string, call: () => Promise<T>): Promise<T> {
     let res: T;
     try {
       res = await call();
@@ -245,6 +296,23 @@ export class LarkBotAdapter implements ChannelAdapter {
     return res.data?.message_id;
   }
 
+  private attachmentParts(msg: RenderedMessage): { out: OutMessage; kind: MsgKind }[] {
+    const parts: { out: OutMessage; kind: MsgKind }[] = [];
+    for (const a of msg.attachments ?? []) {
+      const m = /^lark-file:[^/]+\/(.+)$/.exec(a.ref);
+      if (!m) continue; // blobs the host holds must be uploaded by the host; only Lark keys can be forwarded
+      const key = m[1]!;
+      const isImage = a.mime.startsWith('image/');
+      const isAudio = a.mime.startsWith('audio/');
+      parts.push(
+        isImage
+          ? { out: { msg_type: 'image', content: JSON.stringify({ image_key: key }) }, kind: 'text' }
+          : { out: { msg_type: isAudio ? 'audio' : 'file', content: JSON.stringify({ file_key: key }) }, kind: 'text' },
+      );
+    }
+    return parts;
+  }
+
   /** Render one RenderedMessage into the ordered platform messages; the primary one is the editable body. */
   private plan(msg: RenderedMessage): { parts: { out: OutMessage; kind: MsgKind }[]; primary: number } {
     const parts: { out: OutMessage; kind: MsgKind }[] = [];
@@ -263,25 +331,14 @@ export class LarkBotAdapter implements ChannelAdapter {
       }
     }
     const primary = parts.length - 1;
-    for (const a of msg.attachments ?? []) {
-      const m = /^lark-file:[^/]+\/(.+)$/.exec(a.ref);
-      if (!m) continue; // blobs the host holds must be uploaded by the host; only Lark keys can be forwarded
-      const key = m[1]!;
-      const isImage = a.mime.startsWith('image/');
-      const isAudio = a.mime.startsWith('audio/');
-      parts.push(
-        isImage
-          ? { out: { msg_type: 'image', content: JSON.stringify({ image_key: key }) }, kind: 'text' }
-          : { out: { msg_type: isAudio ? 'audio' : 'file', content: JSON.stringify({ file_key: key }) }, kind: 'text' },
-      );
-    }
+    parts.push(...this.attachmentParts(msg));
     return { parts, primary };
   }
 
   send(route: ReplyRoute, msg: RenderedMessage, op: SendOp): Promise<SendResult> {
     const prior = this.sends.get(op.operationId);
     if (prior) return prior;
-    const run = this.doSend(route, msg, op);
+    const run = this.useProcess(msg) ? this.sendProcess(route, msg, op) : this.doSend(route, msg, op);
     this.sends.set(op.operationId, run);
     if (this.sends.size > BOUND) {
       const oldest = this.sends.keys().next();
@@ -306,11 +363,11 @@ export class LarkBotAdapter implements ChannelAdapter {
     return providerMessageId ? { providerMessageId } : {};
   }
 
-  /** Serialise edits per message and keep `editMinIntervalMs` between patches. */
-  private serial<T>(id: string, fn: () => Promise<T>): Promise<T> {
+  /** Serialise edits per message and keep `gap` ms between two of them. */
+  private serial<T>(id: string, fn: () => Promise<T>, gap = this.cfg.editMinIntervalMs): Promise<T> {
     const prev = this.tails.get(id) ?? Promise.resolve();
     const run = prev.then(async () => {
-      const wait = (this.lastPatchAt.get(id) ?? -Infinity) + this.cfg.editMinIntervalMs - this.now();
+      const wait = (this.lastPatchAt.get(id) ?? -Infinity) + gap - this.now();
       if (wait > 0) await this.sleep(wait);
       try {
         return await fn();
@@ -325,7 +382,7 @@ export class LarkBotAdapter implements ChannelAdapter {
   private async patch(id: string, msg: RenderedMessage): Promise<void> {
     const kind = this.kinds.get(id) ?? 'card';
     const api = this.client.im.v1.message;
-    if (kind === 'card') {
+    if (kind === 'card' || kind === 'cardkit') {
       const card = isLarkCard(msg.channelData) ? msg.channelData : fitCard(msg, msg.text, this.cfg.maxCardBytes);
       await this.api('message.patch', () => api.patch({ data: { content: JSON.stringify(card) }, path: { message_id: id } }));
     } else {
@@ -336,24 +393,36 @@ export class LarkBotAdapter implements ChannelAdapter {
     }
   }
 
-  /** Streaming updates: the target must have been sent as a card (`sections`/`actions`/`link`/`channelData`). */
-  async edit(_route: ReplyRoute, providerMessageId: string, msg: RenderedMessage, op: SendOp & { sequence: number }): Promise<void> {
-    await this.serial(providerMessageId, async () => {
-      const last = this.lastSeq.get(providerMessageId);
-      if (last !== undefined && op.sequence <= last) return; // stale or duplicate edit
-      bounded(this.lastSeq, providerMessageId, op.sequence);
-      await this.patch(providerMessageId, msg);
-    });
+  /** Streaming updates: the target must have been sent as a card (`sections`/`actions`/`link`/`channelData`/`progress`). */
+  async edit(route: ReplyRoute, providerMessageId: string, msg: RenderedMessage, op: SendOp & { sequence: number }): Promise<void> {
+    const proc = this.isProcessMessage(providerMessageId, msg);
+    const gap = this.procs.get(providerMessageId)?.level === 'stream' ? this.cfg.streamTextIntervalMs : this.cfg.editMinIntervalMs;
+    await this.serial(
+      providerMessageId,
+      async () => {
+        const last = this.lastSeq.get(providerMessageId);
+        if (last !== undefined && op.sequence <= last) return; // stale or duplicate edit
+        bounded(this.lastSeq, providerMessageId, op.sequence);
+        if (proc) await this.editProcess(route, providerMessageId, msg, false);
+        else await this.patch(providerMessageId, msg);
+      },
+      gap,
+    );
   }
 
-  async finalize(_route: ReplyRoute, providerMessageId: string, msg: RenderedMessage): Promise<void> {
-    await this.serial(providerMessageId, () => this.patch(providerMessageId, msg));
+  async finalize(route: ReplyRoute, providerMessageId: string, msg: RenderedMessage): Promise<void> {
+    const proc = this.isProcessMessage(providerMessageId, msg);
+    await this.serial(providerMessageId, () => (proc ? this.editProcess(route, providerMessageId, msg, true) : this.patch(providerMessageId, msg)));
     this.forget(providerMessageId);
   }
 
   async retract(_route: ReplyRoute, providerMessageId: string, outcome: string): Promise<void> {
     await this.serial(providerMessageId, async () => {
-      if ((this.kinds.get(providerMessageId) ?? 'card') === 'card') {
+      const st = this.procs.get(providerMessageId);
+      if (st?.card && st.level !== 'patch') {
+        if (st.level === 'stream') await st.card.settings({ config: { streaming_mode: false } }).catch(() => undefined);
+        await st.card.update(outcomeCard(outcome));
+      } else if ((this.kinds.get(providerMessageId) ?? 'card') !== 'text' && this.kinds.get(providerMessageId) !== 'post') {
         await this.api('message.patch', () =>
           this.client.im.v1.message.patch({
             data: { content: JSON.stringify(outcomeCard(outcome)) },
@@ -369,6 +438,7 @@ export class LarkBotAdapter implements ChannelAdapter {
     this.tails.delete(id);
     this.lastPatchAt.delete(id);
     this.lastSeq.delete(id);
+    this.procs.delete(id);
   }
 
   async reconcile(_route: ReplyRoute, providerMessageId: string): Promise<'alive' | 'gone'> {
@@ -385,5 +455,279 @@ export class LarkBotAdapter implements ChannelAdapter {
   /** The sender declared for a message this adapter sent, if the store knows it. */
   declaredSenderOf(providerMessageId: string): Promise<string | undefined> | string | undefined {
     return this.store.get(providerMessageId);
+  }
+
+  /** Resolves once every thinking bubble request in flight has settled (tests, shutdown). */
+  async settled(): Promise<void> {
+    while (this.cotTasks.size) await Promise.all([...this.cotTasks]);
+  }
+
+  // ---- process cards ----------------------------------------------------------------------
+
+  private useProcess(msg: RenderedMessage): boolean {
+    return this.cfg.process !== 'off' && !!msg.progress && !isLarkCard(msg.channelData);
+  }
+
+  private isProcessMessage(id: string, msg: RenderedMessage): boolean {
+    if (this.procs.has(id)) return true;
+    const kind = this.kinds.get(id);
+    return this.useProcess(msg) && kind !== 'text' && kind !== 'post';
+  }
+
+  private floorOf(route: ReplyRoute): CardLevel {
+    let level: CardLevel = this.client.cardkit ? 'stream' : 'patch';
+    const now = this.now();
+    for (const key of ['app', `chat:${route.conversationId}`]) {
+      const f = this.cardFloor.get(key);
+      if (!f) continue;
+      if (f.until <= now) this.cardFloor.delete(key);
+      else if (LEVEL_RANK[f.level] > LEVEL_RANK[level]) level = f.level;
+    }
+    return level;
+  }
+
+  private cotAllowed(route: ReplyRoute): boolean {
+    const now = this.now();
+    for (const key of ['app', `chat:${route.conversationId}`]) {
+      const until = this.cotOff.get(key);
+      if (until === undefined) continue;
+      if (until <= now) this.cotOff.delete(key);
+      else return false;
+    }
+    return true;
+  }
+
+  /** Remember that `failed` did not work for this chat (or the whole app, for permission errors). */
+  private degrade(route: ReplyRoute, failed: CardLevel | 'cot', err: unknown): void {
+    const key = isPermissionError(err) ? 'app' : `chat:${route.conversationId}`;
+    const until = this.now() + this.cfg.degradeTtlMs;
+    this.log('warn', `lark ${failed === 'cot' ? 'thinking bubble' : `${failed} card`} failed for ${key}, degrading: ${String((err as Error)?.message ?? err)}`);
+    if (failed === 'cot') {
+      bounded(this.cotOff, key, until);
+      return;
+    }
+    const next: CardLevel = failed === 'stream' ? 'update' : 'patch';
+    const prior = this.cardFloor.get(key);
+    if (!prior || prior.until <= this.now() || LEVEL_RANK[next] >= LEVEL_RANK[prior.level]) bounded(this.cardFloor, key, { level: next, until });
+  }
+
+  private newState(route: ReplyRoute, progress: ProgressView, level: CardLevel): ProcState {
+    const mode = this.cfg.process === 'off' ? 'panels' : this.cfg.process;
+    const st: ProcState = { route, level, mode, sent: new Map(), panels: new Set(), actions: [], lastAuxAt: this.now() };
+    if (mode !== 'panels' && this.cotAllowed(route)) {
+      st.cot = new CotBubble({
+        client: this.client,
+        route,
+        turnId: progress.turnId,
+        locale: this.cfg.locale,
+        timeoutMs: this.cfg.processRequestTimeoutMs,
+        now: this.now,
+        log: (m) => this.log('warn', m),
+        onCreateFailed: (err) => this.degrade(route, 'cot', err),
+      });
+    }
+    return st;
+  }
+
+  private feedCot(st: ProcState, p: ProgressView, final: boolean): void {
+    if (!st.cot) return;
+    if (!final) return st.cot.push(p);
+    const task = st.cot.finish(p).finally(() => this.cotTasks.delete(task));
+    this.cotTasks.add(task);
+  }
+
+  private model(msg: RenderedMessage, p: ProgressView, st: ProcState): ProcessModel {
+    const base = {
+      locale: this.cfg.locale,
+      processElsewhere: st.mode === 'cot' || (!!st.cot && !st.cot.failed),
+      maxEntries: this.cfg.processMaxEntries,
+      panelMaxChars: this.cfg.processPanelMaxChars,
+      now: this.now(),
+    };
+    const budget = st.level === 'patch' ? this.cfg.maxCardBytes : this.cfg.maxCardKitBytes;
+    // Answer budget = card budget minus everything else on the card.
+    const rest = Buffer.byteLength(JSON.stringify(processCard(buildModel({ ...msg, text: '' }, { ...p, answer: '' }, { ...base, answerBytes: 1 }), { streaming: true })));
+    return buildModel(msg, p, { ...base, answerBytes: Math.max(1000, budget - rest - 1000) });
+  }
+
+  private static progressFor(msg: RenderedMessage, final: boolean): ProgressView {
+    return msg.progress ?? { turnId: '', status: final ? 'completed' : 'running', steps: [], answer: msg.text, answerFinal: final };
+  }
+
+  private async sendProcess(route: ReplyRoute, msg: RenderedMessage, op: SendOp): Promise<SendResult> {
+    const p = msg.progress!;
+    const uuid = uuidFor(this.account, op.operationId, 0);
+    let level = this.floorOf(route);
+    const st = this.newState(route, p, level);
+    this.feedCot(st, p, false);
+    let id: string | undefined;
+    while (id === undefined) {
+      if (level === 'patch') {
+        st.level = 'patch';
+        const card = fitProcessCard(this.model(msg, p, st), this.cfg.maxCardBytes);
+        st.lastCard = JSON.stringify(card);
+        id = await this.sendOne(route, cardMessage(card), uuid);
+        if (id) bounded(this.kinds, id, 'card');
+        break;
+      }
+      st.level = level;
+      let card: CardKitCard;
+      try {
+        card = await CardKitCard.create(this.client.cardkit!.v1, processCard(this.model(msg, p, st), { streaming: level === 'stream' }), {
+          timeoutMs: this.cfg.processRequestTimeoutMs,
+          sleep: this.sleep,
+        });
+      } catch (err) {
+        this.degrade(route, level, err);
+        level = level === 'stream' ? 'update' : 'patch';
+        continue;
+      }
+      try {
+        id = await this.sendOne(route, { msg_type: 'interactive', content: JSON.stringify({ type: 'card', data: { card_id: card.cardId } }) }, uuid);
+      } catch (err) {
+        // Only an explicit rejection is safe to retry as another message under the same uuid.
+        if (!(err instanceof LarkApiError) || err.code === undefined) throw err;
+        this.degrade(route, 'update', err);
+        level = 'patch';
+        continue;
+      }
+      st.card = card;
+      if (id) bounded(this.kinds, id, 'cardkit');
+    }
+    if (!id) return {};
+    if (op.as) await this.store.set(id, op.as);
+    bounded(this.procs, id, st);
+    this.initSent(st, this.model(msg, p, st));
+    for (const [i, part] of this.attachmentParts(msg).entries()) await this.sendOne(route, part.out, uuidFor(this.account, op.operationId, i + 1));
+    return { providerMessageId: id };
+  }
+
+  /** What a freshly created card already shows, so the first edit only sends differences. */
+  private initSent(st: ProcState, m: ProcessModel): void {
+    st.sent.set(EL.status, m.banner);
+    st.sent.set(EL.answer, m.answer);
+    st.sent.set(EL.footer, m.footer);
+    for (const panel of m.panels) {
+      st.panels.add(panel.key);
+      st.sent.set(EL.panelBody(panel.key), panel.body);
+    }
+    st.actions = m.actions.map((a) => a.id);
+  }
+
+  /** A process message this process did not send (restart): patch it, or take over its CardKit card. */
+  private async recover(route: ReplyRoute, id: string, msg: RenderedMessage, p: ProgressView): Promise<ProcState> {
+    const st = this.newState(route, p, 'patch');
+    st.cot = undefined; // the bubble of a turn we lost track of cannot be resumed
+    const card = JSON.stringify(fitProcessCard(this.model(msg, p, st), this.cfg.maxCardBytes));
+    try {
+      await this.api('message.patch', () => this.client.im.v1.message.patch({ data: { content: card }, path: { message_id: id } }));
+      st.lastCard = card;
+    } catch (err) {
+      const kit = this.client.cardkit?.v1;
+      if (!kit || !(err instanceof LarkApiError) || err.code === undefined) throw err;
+      const res = await this.api('cardkit.card.idConvert', () => kit.card.idConvert({ data: { message_id: id } }));
+      if (!res.data?.card_id) throw err;
+      st.card = CardKitCard.adopt(kit, res.data.card_id, { timeoutMs: this.cfg.processRequestTimeoutMs, sleep: this.sleep });
+      st.level = 'update';
+    }
+    bounded(this.procs, id, st);
+    return st;
+  }
+
+  private async editProcess(route: ReplyRoute, id: string, msg: RenderedMessage, final: boolean): Promise<void> {
+    const p = LarkBotAdapter.progressFor(msg, final);
+    const st = this.procs.get(id) ?? (await this.recover(route, id, msg, p));
+    this.feedCot(st, p, final);
+    const m = this.model(msg, p, st);
+    if (st.level === 'stream') {
+      try {
+        await this.applyStream(st, m, final);
+      } catch (err) {
+        this.degrade(route, 'stream', err);
+        st.level = 'update';
+      }
+    }
+    if (st.level === 'update') await this.applyFull(id, st, m, final);
+    else if (st.level === 'patch') await this.patchProcess(id, st, m);
+    if (final && m.overflow.length) {
+      // The answer did not fit the card: the rest follows as plain cards, each within the message limit.
+      const pages = m.overflow.flatMap((page) => splitMarkdown(page, this.cfg.maxCardBytes - 2000));
+      for (const [i, page] of pages.entries()) {
+        await this.sendOne(route, cardMessage({ schema: '2.0', config: { width_mode: 'fill' }, body: { elements: [{ tag: 'markdown', content: page }] } }), uuidFor(this.account, `${id}:more`, i));
+      }
+    }
+  }
+
+  private async applyStream(st: ProcState, m: ProcessModel, final: boolean): Promise<void> {
+    const card = st.card!;
+    if (final) {
+      // Close streaming before the final layout replaces the card (no buttons, final header).
+      await card.settings({ config: { streaming_mode: false, summary: { content: m.summary } } });
+      await card.update(processCard(m));
+      return;
+    }
+    for (const [i, key] of PANEL_ORDER.entries()) {
+      const panel = m.panels.find((x) => x.key === key);
+      if (!panel || st.panels.has(key)) continue;
+      const before = PANEL_ORDER.slice(0, i).reverse().find((k) => st.panels.has(k));
+      await card.createElements([panelElement(panel)], { type: 'insert_after', target: before ? EL.panel(before) : EL.status });
+      st.panels.add(key);
+      st.sent.set(EL.panelBody(key), panel.body);
+    }
+    if (st.sent.get(EL.answer) !== m.answer) {
+      await card.content(EL.answer, m.answer);
+      st.sent.set(EL.answer, m.answer);
+    }
+    const want = m.actions.map((a) => a.id);
+    for (const gone of st.actions.filter((a) => !want.includes(a))) {
+      await card.deleteElement(actionElementId(gone));
+      st.actions = st.actions.filter((a) => a !== gone);
+    }
+    for (const a of m.actions.filter((x) => !st.actions.includes(x.id))) {
+      await card.createElements([actionElement(a)], { type: 'insert_before', target: EL.footer });
+      st.actions.push(a.id);
+    }
+    const statusChanged = st.sent.get(EL.status) !== m.banner;
+    if (!statusChanged && this.now() - st.lastAuxAt < this.cfg.streamAuxIntervalMs) return;
+    st.lastAuxAt = this.now();
+    if (statusChanged) {
+      await card.updateElement(EL.status, statusElement(m));
+      st.sent.set(EL.status, m.banner);
+    }
+    for (const panel of m.panels) {
+      if (st.sent.get(EL.panelBody(panel.key)) === panel.body) continue;
+      await card.content(EL.panelBody(panel.key), panel.body);
+      st.sent.set(EL.panelBody(panel.key), panel.body);
+    }
+    if (st.sent.get(EL.footer) !== m.footer) {
+      await card.updateElement(EL.footer, footerElement(m));
+      st.sent.set(EL.footer, m.footer);
+    }
+  }
+
+  private async applyFull(id: string, st: ProcState, m: ProcessModel, final: boolean): Promise<void> {
+    const card = processCard(m);
+    const json = JSON.stringify(card);
+    if (json === st.lastCard && !final) return;
+    try {
+      await st.card!.update(card);
+      st.lastCard = json;
+    } catch (err) {
+      // Last resort: a message patch (works for cards sent as JSON; the platform decides for CardKit ones).
+      this.degrade(st.route, 'update', err);
+      st.level = 'patch';
+      try {
+        await this.patchProcess(id, st, m);
+      } catch {
+        throw err;
+      }
+    }
+  }
+
+  private async patchProcess(id: string, st: ProcState, m: ProcessModel): Promise<void> {
+    const json = JSON.stringify(fitProcessCard(m, this.cfg.maxCardBytes));
+    if (json === st.lastCard) return;
+    await this.api('message.patch', () => this.client.im.v1.message.patch({ data: { content: json }, path: { message_id: id } }));
+    st.lastCard = json;
   }
 }

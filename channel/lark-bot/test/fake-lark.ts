@@ -12,17 +12,161 @@ export interface PlatformMessage {
   deleted?: boolean;
 }
 
+export interface FakeCard {
+  id: string;
+  /** Latest full card JSON (create / card.update). */
+  json: any;
+  seq: number;
+  ops: { op: string; sequence: number; uuid?: string; elementId?: string; body?: any }[];
+}
+
+export interface CotRecord {
+  cotId: string;
+  messageId: string;
+  create: { params: any; data: any };
+  events: { event_type: string; content: any }[];
+  completed?: string;
+}
+
 /** In-memory Lark: REST client with uuid dedup, a dispatcher and a WS that never touches the network. */
 export class FakeLark {
   readonly messages: PlatformMessage[] = [];
   readonly handlers = new Map<string, LarkEventHandler>();
   readonly byUuid = new Map<string, PlatformMessage>();
+  readonly cards = new Map<string, FakeCard>();
+  readonly cots: CotRecord[] = [];
+  /** Codes to answer the next calls of an op with (`card.create`, `cardElement.content`, `cot.create`, `cot.put`, `message.patch`…). */
+  readonly fail = new Map<string, number[]>();
+  /** Every CardKit / CoT call in order, for asserting sequences. */
+  readonly log: string[] = [];
   botOpenId = 'ou_bot';
   wsStarts = 0;
   wsFailuresLeft = 0;
   private seq = 0;
+  private cardSeq = 0;
+
+  private failing(op: string): { code: number; msg: string } | undefined {
+    const codes = this.fail.get(op);
+    const code = codes?.shift();
+    // 0 in the list lets that call through.
+    return code === undefined || code === 0 ? undefined : { code, msg: `injected ${op} failure` };
+  }
+
+  private mutate(op: string, cardId: string, sequence: number, uuid: string | undefined, apply: (c: FakeCard) => void, elementId?: string, body?: any) {
+    this.log.push(`${op}${elementId ? `:${elementId}` : ''}`);
+    const f = this.failing(op);
+    if (f) return f;
+    const c = this.cards.get(cardId);
+    if (!c) return { code: 300100, msg: 'card not found' };
+    if (sequence <= c.seq) return { code: 300317, msg: `sequence ${sequence} <= ${c.seq}` };
+    c.seq = sequence;
+    c.ops.push({ op, sequence, ...(uuid ? { uuid } : {}), ...(elementId ? { elementId } : {}), ...(body !== undefined ? { body } : {}) });
+    apply(c);
+    return { code: 0, data: {} };
+  }
+
+  /** Card JSON element by id, searched through panels. */
+  static element(card: any, id: string): any {
+    const walk = (els: any[]): any => {
+      for (const e of els ?? []) {
+        if (e.element_id === id) return e;
+        const inner = walk(e.elements ?? []);
+        if (inner) return inner;
+      }
+      return undefined;
+    };
+    return walk(card?.body?.elements ?? []);
+  }
+
+  readonly cardkitApi: NonNullable<LarkClientLike['cardkit']>['v1'] = {
+    card: {
+      create: async ({ data }) => {
+        this.log.push('card.create');
+        const f = this.failing('card.create');
+        if (f) return f;
+        const id = `card_${++this.cardSeq}`;
+        this.cards.set(id, { id, json: JSON.parse(data.data), seq: 1, ops: [] });
+        return { code: 0, data: { card_id: id } };
+      },
+      settings: async ({ data, path }) =>
+        this.mutate('card.settings', path.card_id, data.sequence, data.uuid, (c) => {
+          const s = JSON.parse(data.settings);
+          c.json.config = { ...c.json.config, ...s.config };
+        }, undefined, JSON.parse(data.settings)),
+      update: async ({ data, path }) =>
+        this.mutate('card.update', path.card_id, data.sequence, data.uuid, (c) => {
+          c.json = JSON.parse(data.card.data);
+        }),
+      idConvert: async ({ data }) => {
+        const m = this.find(data.message_id);
+        const id = m && m.msg_type === 'interactive' ? JSON.parse(m.content)?.data?.card_id : undefined;
+        return id ? { code: 0, data: { card_id: id } } : { code: 300100, msg: 'not a card entity' };
+      },
+    },
+    cardElement: {
+      content: async ({ data, path }) =>
+        this.mutate('cardElement.content', path.card_id, data.sequence, data.uuid, (c) => {
+          const e = FakeLark.element(c.json, path.element_id);
+          if (e) e.content = data.content;
+        }, path.element_id, data.content),
+      update: async ({ data, path }) =>
+        this.mutate('cardElement.update', path.card_id, data.sequence, data.uuid, (c) => {
+          const e = FakeLark.element(c.json, path.element_id);
+          if (e) Object.assign(e, JSON.parse(data.element));
+        }, path.element_id, JSON.parse(data.element)),
+      create: async ({ data, path }) =>
+        this.mutate('cardElement.create', path.card_id, data.sequence, data.uuid, (c) => {
+          const els: any[] = c.json.body.elements;
+          const add = JSON.parse(data.elements);
+          const at = els.findIndex((e) => e.element_id === data.target_element_id);
+          if (data.type === 'append' || at < 0) els.push(...add);
+          else els.splice(data.type === 'insert_after' ? at + 1 : at, 0, ...add);
+        }, data.target_element_id, JSON.parse(data.elements)),
+      delete: async ({ data, path }) =>
+        this.mutate('cardElement.delete', path.card_id, data.sequence, data.uuid, (c) => {
+          c.json.body.elements = c.json.body.elements.filter((e: any) => e.element_id !== path.element_id);
+        }, path.element_id),
+    },
+  };
+
+  /** Raw requests: bot info and the `message_cot` thinking bubble. */
+  private async request(opts: { method: string; url: string; data?: any; params?: any }): Promise<unknown> {
+    if (opts.url === '/open-apis/bot/v3/info') return { code: 0, bot: { open_id: this.botOpenId } };
+    if (opts.url === '/open-apis/im/v1/message_cot' && opts.method === 'POST') {
+      this.log.push('cot.create');
+      const f = this.failing('cot.create');
+      if (f) return f;
+      const n = this.cots.length + 1;
+      const rec: CotRecord = { cotId: `cot_${n}`, messageId: `om_cot${n}`, create: { params: opts.params, data: opts.data }, events: [] };
+      this.cots.push(rec);
+      return { code: 0, data: { cot_id: rec.cotId, message_id: rec.messageId } };
+    }
+    if (opts.url === '/open-apis/im/v1/message_cot' && opts.method === 'PUT') {
+      this.log.push('cot.put');
+      const f = this.failing('cot.put');
+      if (f) return f;
+      const rec = this.cots.find((c) => c.cotId === opts.data.cot_id && c.messageId === opts.data.message_id);
+      if (!rec) return { code: 230002, msg: 'cot not found' };
+      if (rec.completed) return { code: 230099, msg: 'COT already in terminal state' };
+      if (opts.data.events.length > 50) return { code: 99992402, msg: 'too many events' };
+      for (const e of opts.data.events) {
+        rec.events.push({ event_type: e.event_type, content: JSON.parse(e.content) });
+        if (e.event_type === 'RUN_FINISHED') rec.completed = 'finished';
+      }
+      return { code: 0, data: {} };
+    }
+    const done = /^\/open-apis\/im\/v1\/message_cot\/complete\/(.+)$/.exec(opts.url);
+    if (done && opts.method === 'POST') {
+      this.log.push('cot.complete');
+      const rec = this.cots.find((c) => c.cotId === decodeURIComponent(done[1]!));
+      if (rec) rec.completed = opts.params.reason;
+      return { code: 0, data: {} };
+    }
+    throw Object.assign(new Error('Request failed with status code 404'), { response: { status: 404, data: {} } });
+  }
 
   readonly client: LarkClientLike = {
+    cardkit: { v1: this.cardkitApi },
     im: {
       v1: {
         message: {
@@ -30,6 +174,8 @@ export class FakeLark {
           reply: async ({ data, path }) =>
             this.record({ kind: 'reply', to: path.message_id, inThread: !!data.reply_in_thread }, data),
           patch: async ({ data, path }) => {
+            const f = this.failing('message.patch');
+            if (f) return f;
             const m = this.find(path.message_id);
             if (!m) return { code: 230002, msg: 'not found' };
             if (m.msg_type !== 'interactive') return { code: 230001, msg: 'not a card' };
@@ -50,7 +196,7 @@ export class FakeLark {
         },
       },
     },
-    request: async () => ({ code: 0, bot: { open_id: this.botOpenId } }),
+    request: (opts) => this.request(opts as never),
   };
 
   readonly dispatcher: LarkDispatcherLike = {

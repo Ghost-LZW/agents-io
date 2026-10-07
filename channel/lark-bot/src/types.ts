@@ -25,10 +25,52 @@ export interface LarkApiResponse<T = unknown> {
   data?: T;
 }
 
+/** `cardkit.v1` as typed by `@larksuiteoapi/node-sdk` 1.74 (only the methods the adapter calls). */
+export interface LarkCardKitApi {
+  card: {
+    create(payload: { data: { type: string; data: string } }): Promise<LarkApiResponse<{ card_id?: string }>>;
+    settings(payload: { data: { settings: string; uuid?: string; sequence: number }; path: { card_id: string } }): Promise<LarkApiResponse>;
+    update(payload: {
+      data: { card: { type: 'card_json'; data: string }; uuid?: string; sequence: number };
+      path: { card_id: string };
+    }): Promise<LarkApiResponse>;
+    idConvert(payload: { data: { message_id: string } }): Promise<LarkApiResponse<{ card_id?: string }>>;
+  };
+  cardElement: {
+    /** Streams a markdown/plain_text element's full text (typewriter while streaming_mode is on). */
+    content(payload: {
+      data: { uuid?: string; content: string; sequence: number };
+      path: { card_id: string; element_id: string };
+    }): Promise<LarkApiResponse>;
+    /** Replaces one element. `element` is the element JSON, serialised. */
+    update(payload: {
+      data: { uuid?: string; element: string; sequence: number };
+      path: { card_id: string; element_id: string };
+    }): Promise<LarkApiResponse>;
+    create(payload: {
+      data: {
+        type: 'insert_before' | 'insert_after' | 'append';
+        target_element_id?: string;
+        uuid?: string;
+        sequence: number;
+        /** JSON array of elements, serialised. */
+        elements: string;
+      };
+      path: { card_id: string };
+    }): Promise<LarkApiResponse>;
+    delete(payload: { data: { uuid?: string; sequence: number }; path: { card_id: string; element_id: string } }): Promise<LarkApiResponse>;
+  };
+}
+
 export interface LarkClientLike {
   im: { v1: { message: LarkMessageApi } };
-  /** Raw OpenAPI call (used for `GET /open-apis/bot/v3/info`). Resolves to the response body. */
-  request(opts: { method: string; url: string; data?: unknown; params?: unknown }): Promise<unknown>;
+  /** CardKit. Absent on a client that predates it: process cards then use message patch. */
+  cardkit?: { v1: LarkCardKitApi };
+  /**
+   * Raw OpenAPI call (bot info, the `message_cot` thinking bubble, which the SDK has no
+   * method for). Resolves to the response body; rejects on HTTP errors.
+   */
+  request(opts: { method: string; url: string; data?: unknown; params?: unknown; timeout?: number }): Promise<unknown>;
 }
 
 export interface LarkWsLike {
