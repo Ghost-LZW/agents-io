@@ -39,14 +39,21 @@ function safeParse(s: string): Record<string, any> {
   }
 }
 
+/** Replace whole placeholders in one pass, so `@_user_1` never matches the start of `@_user_10`. */
+function replaceKeys(text: string, keys: Map<string, string>): string {
+  if (!keys.size) return text;
+  const alt = [...keys.keys()].sort((a, b) => b.length - a.length).map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  return text.replace(new RegExp(`(?:${alt.join('|')})(?!\\d)`, 'g'), (k) => keys.get(k) ?? k);
+}
+
 /** Replace `@_user_1` placeholders: the bot's own mention is removed, others become `@name`. */
 function normalizeMentions(text: string, mentions: Mention[] | undefined, botOpenId: string | undefined): string {
-  let out = text;
+  const keys = new Map<string, string>();
   for (const m of mentions ?? []) {
     const isBot = !!botOpenId && m.id?.open_id === botOpenId;
-    out = out.split(m.key).join(isBot ? '' : `@${m.name ?? 'user'}`);
+    keys.set(m.key, isBot ? '' : `@${m.name ?? 'user'}`);
   }
-  return out.replace(/[ \t]{2,}/g, ' ').trim();
+  return replaceKeys(text, keys).replace(/[ \t]{2,}/g, ' ').trim();
 }
 
 /** Flatten a `post` (rich text) body into markdown-ish text plus the media it references. */
@@ -119,7 +126,7 @@ function cardText(v: unknown, out: string[] = [], depth = 0): string[] {
  */
 export function messageText(msgType: string | undefined, rawContent: string | undefined, mentions: { key: string; name?: string }[] = []): string {
   const c = safeParse(rawContent ?? '');
-  const named = (t: string) => mentions.reduce((acc, m) => acc.split(m.key).join(`@${m.name ?? 'user'}`), t);
+  const named = (t: string) => replaceKeys(t, new Map(mentions.map((m) => [m.key, `@${m.name ?? 'user'}`])));
   switch (msgType) {
     case 'text':
       return named(String(c.text ?? '')).trim();
@@ -193,15 +200,16 @@ export function mapMessageEvent(ev: RawMessageEvent, ctx: MapContext): InboundEn
       content.push({ type: 'text', text: `[unsupported ${msg.message_type} message]` });
   }
 
-  // A reply to an earlier message (not merely a thread member replying within its own thread).
-  if (msg.parent_id && (!msg.root_id || msg.parent_id !== msg.root_id)) {
+  // Only `thread_id` marks a topic; `root_id`/`parent_id` are set on every reply, including a
+  // plain quote-reply in the chat (where root_id = parent_id = the quoted message).
+  const threadId = msg.thread_id || undefined;
+  // A reply to an earlier message (not merely a topic member replying within its own topic).
+  if (msg.parent_id && (!threadId || msg.parent_id !== msg.root_id)) {
     content.unshift({ type: 'quote', text: '', fromMessageId: msg.parent_id });
   }
 
-  const inThread = !!(msg.thread_id || msg.root_id);
   const isDm = msg.chat_type === 'p2p';
-  const kind = isDm ? 'dm' : inThread ? 'thread' : 'group';
-  const threadId = msg.thread_id || msg.root_id || undefined;
+  const kind = isDm ? 'dm' : threadId ? 'thread' : 'group';
   const isBot = ev.sender?.sender_type === 'app';
   const echo = ctx.botOpenId !== undefined && ev.sender?.sender_id?.open_id === ctx.botOpenId;
   const declared = isBot || echo ? ctx.declared : undefined;

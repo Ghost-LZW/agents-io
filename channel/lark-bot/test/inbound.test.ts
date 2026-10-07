@@ -123,7 +123,37 @@ describe('inbound mapping', () => {
     await r.done;
   });
 
-  it('thread via root_id / thread_id; quote only for real replies', async () => {
+  it('a plain quote-reply (root_id = parent_id, no thread_id) is a quote in the chat, not a thread', async () => {
+    const { lark, adapter, envs, ctl, done } = await setup();
+    await lark.fire('im.message.receive_v1', messageEvent({ id: 'om_r', chatType: 'group', root: 'om_2', parent: 'om_2', content: { text: 're' } }));
+    const e = envs[0]!;
+    expect(e.conversation).toEqual({ id: 'oc_chat', kind: 'group' });
+    expect(e.replyRoute?.threadId).toBeUndefined();
+    expect(e.content[0]).toEqual({ type: 'quote', text: '', fromMessageId: 'om_2' });
+    await adapter.send(e.replyRoute!, { text: 'ok' }, { operationId: 'q1' });
+    expect(lark.messages.at(-1)!.receive).toEqual({ kind: 'reply', to: 'om_r', inThread: false });
+    // In a DM the same.
+    await lark.fire('im.message.receive_v1', messageEvent({ id: 'om_d', root: 'om_1', parent: 'om_1' }));
+    expect(envs[1]!.conversation).toEqual({ id: 'oc_chat', kind: 'dm' });
+    expect(envs[1]!.content[0]).toMatchObject({ type: 'quote', fromMessageId: 'om_1' });
+    ctl.abort();
+    await done;
+  });
+
+  it('replaces mention placeholders exactly (@_user_1 vs @_user_10)', async () => {
+    const { lark, envs, ctl, done } = await setup();
+    const mentions = [
+      { key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'Bot' },
+      ...Array.from({ length: 8 }, (_, i) => ({ key: `@_user_${i + 2}`, id: { open_id: `ou_${i + 2}` }, name: `P${i + 2}` })),
+      { key: '@_user_10', id: { open_id: 'ou_10' }, name: 'Zed' },
+    ];
+    await lark.fire('im.message.receive_v1', messageEvent({ chatType: 'group', content: { text: '@_user_1 ask @_user_10 and @_user_2 to review' }, mentions }));
+    expect(envs[0]!.content).toEqual([{ type: 'text', text: 'ask @Zed and @P2 to review' }]);
+    ctl.abort();
+    await done;
+  });
+
+  it('thread via thread_id; quote only for real replies', async () => {
     const { lark, envs, ctl, done } = await setup();
     await lark.fire(
       'im.message.receive_v1',
@@ -138,8 +168,16 @@ describe('inbound mapping', () => {
       replyRoute: { threadId: 'omt_1' },
     });
     expect(envs[0]!.content).toEqual([{ type: 'text', text: 'in thread' }]);
-    expect(envs[1]!.conversation.threadId).toBe('om_root');
+    // A reply chain without thread_id stays in the chat.
+    expect(envs[1]!.conversation).toEqual({ id: 'oc_chat', kind: 'group' });
     expect(envs[1]!.content[0]).toEqual({ type: 'quote', text: '', fromMessageId: 'om_other' });
+    // A reply to a specific message inside a topic quotes it and stays in the topic.
+    await lark.fire(
+      'im.message.receive_v1',
+      messageEvent({ id: 'om_t3', chatType: 'group', root: 'om_root', parent: 'om_t1', thread: 'omt_1', content: { text: 'to t1' } }),
+    );
+    expect(envs[2]).toMatchObject({ conversation: { kind: 'thread', threadId: 'omt_1' } });
+    expect(envs[2]!.content[0]).toEqual({ type: 'quote', text: '', fromMessageId: 'om_t1' });
     ctl.abort();
     await done;
   });
@@ -191,13 +229,80 @@ describe('inbound mapping', () => {
         return { accepted: true };
       },
     });
-    await lark.fire('im.message.receive_v1', messageEvent());
-    await tick();
+    // The handler rejects, so the SDK answers 500 and Lark redelivers.
+    await expect(lark.fire('im.message.receive_v1', messageEvent())).rejects.toThrow('host down');
     fail = false;
     await lark.fire('im.message.receive_v1', messageEvent());
     expect(envs).toHaveLength(1);
     ctl.abort();
     await done;
+  });
+
+  it('a card click whose emit fails is not acked either', async () => {
+    let fail = true;
+    const { lark, envs, ctl, done } = await setup({
+      emit: async (env) => {
+        if (fail) throw new Error('host down');
+        envs.push(env);
+        return { accepted: true };
+      },
+    });
+    const card = { event_id: 'ev_c', operator: { open_id: 'ou_a' }, action: { value: { actionId: 'x' } }, context: { open_message_id: 'om_c', open_chat_id: 'oc' } };
+    await expect(lark.fire('card.action.trigger', card)).rejects.toThrow('host down');
+    fail = false;
+    await lark.fire('card.action.trigger', card);
+    expect(envs).toHaveLength(1);
+    ctl.abort();
+    await done;
+  });
+
+  it('an emit that fails after the ack deadline is retried by the adapter, keeping the dedup key', async () => {
+    const lark = new FakeLark();
+    const adapter = new LarkBotAdapter({ ...cfg, ackTimeoutMs: 5 }, { deps: lark.deps, sleep: () => tick() as Promise<void> });
+    let calls = 0;
+    const r = startAdapter(adapter, {
+      emit: async (env) => {
+        calls++;
+        if (calls === 1) {
+          await new Promise((res) => setTimeout(res, 20));
+          throw new Error('host slow and down');
+        }
+        r.envs.push(env);
+        return { accepted: true };
+      },
+    });
+    await tick();
+    await lark.fire('im.message.receive_v1', messageEvent()); // acked at the deadline
+    await lark.fire('im.message.receive_v1', messageEvent()); // a redelivery meanwhile is ours already
+    for (let i = 0; i < 40 && r.envs.length === 0; i++) await tick();
+    expect(r.envs).toHaveLength(1);
+    expect(calls).toBe(2);
+    expect(r.logs.some((l) => l.includes('retrying'))).toBe(true);
+    r.ctl.abort();
+    await r.done;
+  });
+
+  it('a failing declared-sender lookup is not acked and leaves no dedup key behind', async () => {
+    const lark = new FakeLark();
+    let broken = true;
+    const store = {
+      set: () => {},
+      get: async () => {
+        if (broken) throw new Error('db timeout');
+        return 'runner:me/agentA';
+      },
+    };
+    const adapter = new LarkBotAdapter(cfg, { deps: lark.deps, store });
+    const r = startAdapter(adapter);
+    await tick();
+    const ev = messageEvent({ sender: { open_id: 'ou_other_bot' }, senderType: 'app' });
+    await expect(lark.fire('im.message.receive_v1', ev)).rejects.toThrow('db timeout');
+    broken = false;
+    await lark.fire('im.message.receive_v1', ev);
+    expect(r.envs).toHaveLength(1);
+    expect(r.envs[0]!.sender.declared).toBe('runner:me/agentA');
+    r.ctl.abort();
+    await r.done;
   });
 
   it('restarts the SDK ws client after a failed start without throwing', async () => {

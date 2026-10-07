@@ -39,6 +39,8 @@ export interface SentRecord {
 export interface MessageMeta {
   /** Address replies go to (Reply-To, else From). */
   replyTo: string;
+  /** From address of that message (absent on records written by older versions). */
+  from?: string;
   subject: string;
   /** References chain of that message, plus the message itself. */
   references: string[];

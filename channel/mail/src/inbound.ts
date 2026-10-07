@@ -13,6 +13,8 @@ export interface ParseDeps {
   store: MailStore;
   blobs: BlobSink;
   verify: MailVerifier;
+  /** Our own From address (lowercase): only mail from it can be our echo. */
+  self: string;
 }
 
 const asArray = (v: string | string[] | undefined): string[] => (v === undefined ? [] : Array.isArray(v) ? v : v.split(/\s+/).filter(Boolean));
@@ -47,10 +49,12 @@ export function threadRootOf(messageId: string, inReplyTo: string | undefined, r
 /** Parses one raw message into an envelope (and records metadata needed to reply to it). */
 export async function parseInbound(uid: number, raw: Buffer, deps: ParseDeps): Promise<InboundEnvelope> {
   const parsed = await simpleParser(raw);
-  const messageId = parsed.messageId ?? `<sha256-${createHash('sha256').update(raw).digest('hex').slice(0, 32)}@generated.invalid>`;
+  const rawHash = createHash('sha256').update(raw).digest('hex').slice(0, 32);
+  // The Message-ID header is chosen by the sender (and seen by every recipient): never a trusted key on its own.
+  const headerId = parsed.messageId ?? `<sha256-${rawHash}@generated.invalid>`;
   const references = asArray(parsed.references);
   const inReplyTo = parsed.inReplyTo?.trim() || undefined;
-  const root = threadRootOf(messageId, inReplyTo, references);
+  const root = threadRootOf(headerId, inReplyTo, references);
 
   const from = parsed.from?.value[0];
   const fromAddress = (from?.address ?? '').toLowerCase();
@@ -59,11 +63,13 @@ export async function parseInbound(uid: number, raw: Buffer, deps: ParseDeps): P
   const automated = isAutomated(parsed, fromAddress);
   const verdict: AuthVerdict = fromDomain ? await deps.verify(raw, fromDomain).catch(() => ({ evidence: 'none' as const })) : { evidence: 'none' };
 
-  const sent = await deps.store.getSent(messageId);
-  const ours = sent !== undefined;
+  // Sent records are keyed by Message-IDs we generated; an echo must also come from our own address.
+  const sent = await deps.store.getSent(headerId);
+  const ours = sent !== undefined && fromAddress === deps.self;
   // Declared identity comes only from the header, only on mail we sent ourselves, and only if it matches what we recorded.
+  // Recipients see our Message-ID and header, so the echo must also be DKIM-signed for our domain.
   const header = headerString(parsed, SENDER_HEADER)?.trim();
-  const declared = ours && header && sent.as === header ? header : undefined;
+  const declared = ours && verdict.evidence === 'dkim_pass' && header && sent.as === header ? header : undefined;
 
   const subject = parsed.subject?.trim() ?? '';
   const { body, quoted } = splitQuote(parsed.text ?? '');
@@ -93,11 +99,18 @@ export async function parseInbound(uid: number, raw: Buffer, deps: ParseDeps): P
 
   const meta: MessageMeta = {
     replyTo: (parsed.replyTo?.value[0]?.address ?? fromAddress).toLowerCase(),
+    from: fromAddress,
     subject,
-    references: [...references, messageId],
+    references: [...references, headerId],
     threadRoot: root,
   };
-  await deps.store.putMeta(messageId, meta);
+  // A Message-ID already taken by our own mail or by another sender's gets a key of its own,
+  // so nobody can overwrite the reply metadata (and redirect the reply) of a message they saw.
+  let messageId = headerId;
+  const prior = await deps.store.getMeta(headerId);
+  const taken = prior ? prior.replyTo !== meta.replyTo || (prior.from !== undefined && prior.from !== meta.from) : sent !== undefined && !ours;
+  if (taken) messageId = `<sha256-${rawHash}@collision.invalid>`;
+  if (!prior || taken) await deps.store.putMeta(messageId, meta);
 
   const env: InboundEnvelope = {
     v: PROTOCOL_VERSION,

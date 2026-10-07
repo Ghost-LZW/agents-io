@@ -8,6 +8,11 @@ const paras = (s: string) =>
     .map((p) => `<p>${esc(p).replace(/\n/g, '<br>')}</p>`)
     .join('\n');
 
+/** The bare, lowercase address of a `Name <addr>` or `addr` string. */
+export function addressOf(from: string): string {
+  return (/<([^>]+)>/.exec(from)?.[1] ?? from).trim().toLowerCase();
+}
+
 /** Same operationId (and sending domain) always yields the same Message-ID. */
 export function messageIdFor(operationId: string, fromAddress: string): string {
   const domain = fromAddress.split('@')[1]?.replace(/>$/, '') || 'agents-io.invalid';
