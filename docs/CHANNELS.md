@@ -206,6 +206,33 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 - **输出怎么处理**：适配器收到 `RenderedMessage`，其中包含 `progress`（结构化过程视图），以及它在 hello 里声明过的方法（edit、finalize 等）。能渲染到什么程度，由适配器自己决定。
 - **档位**：由配置决定。
 
+### 私有/外部通道插件（`type: "module"`）
+
+私有通道有两种接法，按需要选：
+
+| | `bridge` | `module` |
+|---|---|---|
+| 运行方式 | 独立子进程，JSONL stdio | 守护进程内加载一个 ES 模块 |
+| 语言 | 任意 | 只限 Node/TS |
+| blob 存储 | 拿不到 | 拿得到（`start()` 的 `ctx.blobs`） |
+| 信任边界 | 进程隔离 | 与守护进程同进程、同权限，只加载自己信任的代码 |
+
+`module` 条目的模块导出一个 `ChannelFactory`（类型在 `@agents-io/protocol`）：具名导出 `createChannel`（`export` 可改名），没有该导出时用 `default`。工厂拿到 `{ account, config, log }`，返回（或 resolve 为）一个 `ChannelAdapter`；`start()` 之后与内置通道一样拿到 `ChannelContext`。适配器可选带 `close()`，网关停止时调用。
+
+```jsonc
+{
+  "type": "module",
+  "module": "../my-channel",       // 相对配置文件所在目录或绝对路径（包目录或 .js/.mjs 文件），或从该目录可解析的包名
+  "export": "createChannel",       // 可选，默认 createChannel，缺失时退回 default
+  "account": "lan",
+  "config": { "token": "env:MY_TOKEN" }  // 可选，env:NAME 在启动时替换，变量缺失则启动失败并指明变量
+}
+```
+
+- 包目录按 `package.json` 的 `exports["."]`（`import`/`default` 条件）或 `main` 解析，ESM 包即可。
+- 模块缺失（路径不存在、包名解析不到）在配置校验阶段就报错；导出不是函数、工厂抛错、返回值缺 `id`/`caps`/`start`/`send` 则在启动时失败，均按配置错误退出（退出码 2）。
+- 适配器的 `id` 要等工厂返回后才知道：两个条目（含内置通道）的 `(id, account)` 相同时启动失败。
+
 ## 6. 监听（watch）
 
 ### 是什么

@@ -1,7 +1,7 @@
 # @agents-io/daemon (`aio`)
 
 The agents-io daemon and its CLI. `aio serve` runs everything in one long-lived
-process: channels (Lark, mail, JSONL bridges), the binding-table router, one lane
+process: channels (Lark, mail, JSONL bridges, in-process plugin modules), the binding-table router, one lane
 per session, the hub (SQLite session log), compositors + outbox, the host MCP
 output tools, watches, the durable host inbound queue, and a local Unix socket
 that speaks both the client frames (`packages/protocol/src/client.ts`) and the
@@ -56,6 +56,15 @@ see `docs/E2E.md` §0). New:
   names or to the default agent. The only way to continue such a session is to
   configure that agent again (as an interactive agent); there is no command yet
   to retire or re-pin it.
+- **Channel entries** (`channels[]`): `lark-bot`, `mail`, `bridge` (out-of-process,
+  JSONL stdio, any language, no blob store) and `module` (in-process plugin:
+  `{ "type": "module", "module": "../my-channel", "export": "createChannel",
+  "account": "lan", "config": { "token": "env:MY_TOKEN" } }`). `module` is a path
+  relative to the config file (a package directory or a `.js` / `.mjs` file) or a bare
+  specifier; the module exports a `ChannelFactory` (`@agents-io/protocol`) as
+  `createChannel` (or `default`). It runs in the daemon's process with the blob
+  store, so load only code you trust. Two channels with the same (id, account)
+  fail the start. See `docs/CHANNELS.md` §5.
 - Interactive turns plan `{ harness, model, effort }` from the agent; the profile
   is the agent's `profile`, else the policy's (owners only → `bypass`). Task runs
   use the agent's `profile`, default `restricted`.
