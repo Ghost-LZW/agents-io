@@ -162,6 +162,8 @@ describe('session launch: checks (§8.2–8.4)', () => {
     expect(prepare(w, { cwd: fx.ws }, 'ok-root')).toMatchObject({ ok: true });
     expect(prepare(w, { cwd: join(fx.ws, 'alias-b') }, 'ok2')).toMatchObject({ ok: true, value: { launch: { cwd: fx.b } } });
     expect(w.gw.records.launchOf('ok2')).toEqual({ cwd: fx.b });
+    // Prepared, never opened: listed with its launch.
+    expect(w.gw.sessions().find((s) => s.sessionKey === 'ok2')).toMatchObject({ live: false, launch: { cwd: fx.b, envKeys: [] } });
   });
 
   it('env: keys outside envKeys, AGENTS_IO_*, malformed names are refused', async () => {

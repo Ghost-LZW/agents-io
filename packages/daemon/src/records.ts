@@ -21,7 +21,7 @@ export type VerifyResult = InputVerifyResult;
 export class DaemonRecords implements OutboxStore {
   readonly db: DatabaseSync;
   private readonly ownsDb: boolean;
-  private q: Record<'inPut' | 'inGet' | 'inPrune' | 'outGet' | 'outPut' | 'outPrune' | 'agentGet' | 'agentPut' | 'launchGet' | 'launchPut', StatementSync>;
+  private q: Record<'inPut' | 'inGet' | 'inPrune' | 'outGet' | 'outPut' | 'outPrune' | 'agentGet' | 'agentPut' | 'launchGet' | 'launchPut' | 'launchKeys', StatementSync>;
   /** Tests: called between the agent row and the launch row of `pin` (a throw rolls both back). */
   betweenPinWrites?: () => void;
 
@@ -47,6 +47,7 @@ export class DaemonRecords implements OutboxStore {
       agentGet: p('SELECT agent FROM daemon_session_agents WHERE session_key = ?'),
       agentPut: p('INSERT INTO daemon_session_agents (session_key, agent) VALUES (?, ?) ON CONFLICT DO NOTHING'),
       launchGet: p('SELECT cwd, env_json FROM daemon_session_launch WHERE session_key = ?'),
+      launchKeys: p('SELECT session_key FROM daemon_session_launch'),
       launchPut: p('INSERT INTO daemon_session_launch (session_key, cwd, env_json, at) VALUES (?, ?, ?, ?)'),
     };
     const retain = o.retainMs ?? 30 * DAY;
@@ -114,6 +115,11 @@ export class DaemonRecords implements OutboxStore {
     if (!r) return undefined;
     const env = JSON.parse(r.env_json) as Record<string, string>;
     return { ...(r.cwd !== null ? { cwd: r.cwd } : {}), ...(Object.keys(env).length ? { env } : {}) };
+  }
+
+  /** Sessions with a pinned launch (prepared ones too, before any input opened them). */
+  launchedSessions(): string[] {
+    return (this.q.launchKeys.all() as { session_key: string }[]).map((r) => r.session_key);
   }
 
   /**

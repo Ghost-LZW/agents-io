@@ -1240,7 +1240,8 @@ ${a.summary}` }],
   }
 
   sessions(): SessionInfo[] {
-    const keys = new Set([...this.hub.log.sessions(), ...this.lanes.keys()]);
+    // Prepared sessions (session.prepare) are listed before their first input.
+    const keys = new Set([...this.hub.log.sessions(), ...this.lanes.keys(), ...this.records.launchedSessions()]);
     return [...keys].sort().map((sessionKey) => {
       const s = this.hub.snapshot(sessionKey);
       const launch = this.records.launchOf(sessionKey);
