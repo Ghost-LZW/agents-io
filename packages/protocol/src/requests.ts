@@ -45,7 +45,10 @@ export const ResolvedBy = Type.Union([
       Type.Literal('host'),
       Type.Literal('harness'),
     ]),
+    /** The principal the answer counts as. */
     id: Type.Optional(Type.String()),
+    /** Relayed by this host connection on `id`'s behalf (`resolve { onBehalfOf }`), e.g. `host:<name>`. */
+    via: Type.Optional(Type.String()),
   }),
   Type.Literal('timeout'),
   Type.Literal('runtime_cancelled'),

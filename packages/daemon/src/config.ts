@@ -253,6 +253,20 @@ export const ConfigFile = Type.Object(
      * reopens it, resuming the harness session by its native id.
      */
     topics: Type.Optional(Type.Object({ parkedIdleMs: Type.Optional(Type.Number({ minimum: 0 })) }, Closed)),
+    /**
+     * Timeouts of the host's `resolve` / `outbound` callouts (a host opts in with
+     * `host.hello { callouts: [...] }`; `route` callouts use the rule's own timeout).
+     * Defaults 3000 / 2000 ms.
+     */
+    hostCallouts: Type.Optional(
+      Type.Object(
+        {
+          resolve: Type.Optional(Type.Object({ timeoutMs: Type.Optional(Type.Number({ minimum: 1 })) }, Closed)),
+          outbound: Type.Optional(Type.Object({ timeoutMs: Type.Optional(Type.Number({ minimum: 1 })) }, Closed)),
+        },
+        Closed,
+      ),
+    ),
     policy: Type.Optional(
       Type.Object(
         {
@@ -446,6 +460,8 @@ export interface Config {
   outputTools: boolean;
   /** How long a parked topic's lane stays open while idle (0: until the daemon stops). */
   topics: { parkedIdleMs: number };
+  /** Host `resolve` / `outbound` callout timeouts (ms). */
+  hostCallouts: { resolveTimeoutMs: number; outboundTimeoutMs: number };
   local: { principal: Principal; session: string };
   /** The console API server. */
   console: ConsoleConfig;
@@ -645,6 +661,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     channels: ctx.channels === false ? [] : resolveChannels(c.channels ?? [], env, path, warnings),
     outputTools,
     topics: { parkedIdleMs: c.topics?.parkedIdleMs ?? DEFAULT_PARKED_IDLE_MS },
+    hostCallouts: { resolveTimeoutMs: c.hostCallouts?.resolve?.timeoutMs ?? 3000, outboundTimeoutMs: c.hostCallouts?.outbound?.timeoutMs ?? 2000 },
     policy: {
       owners,
       selfAccounts: c.policy?.selfAccounts ?? [],

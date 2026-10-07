@@ -7,6 +7,9 @@ import {
   type BindingTable,
   type ContentBlock,
   type InboundItem,
+  type InboundRedispatchResult,
+  type SessionLaunch,
+  type SessionScope,
   type RenderedMessage,
   type ReplyRoute,
   type ResultFrame,
@@ -211,7 +214,7 @@ export class LocalClient {
   }
 
   /** Authenticate as a host. `consumer` / `callouts` make this connection THE host (at most one). */
-  hello(o: { token: string; name: string; consumer?: string; callouts?: boolean }): Promise<HelloResult> {
+  hello(o: { token: string; name: string; consumer?: string; callouts?: boolean | string[] }): Promise<HelloResult> {
     return this.call('host.hello', o);
   }
 
@@ -258,6 +261,11 @@ export class LocalClient {
 
   inboundAck(consumer: string, cursor: number): Promise<{ consumer: string; acked: number }> {
     return this.call('inbound.ack', { consumer, cursor });
+  }
+
+  /** Deliver a queued host-inbound item to a session with its original origin (idempotent per cursor). */
+  inboundRedispatch(o: { cursor: number; agent?: string; session?: SessionScope; launch?: SessionLaunch }): Promise<InboundRedispatchResult> {
+    return this.call('inbound.redispatch', o);
   }
 
   explain(inputId: string): Promise<RouteExplanation> {

@@ -34,7 +34,14 @@ export const ClientCommand = Type.Union([
     expectedTurnId: Type.Optional(Type.String()),
   }),
   Type.Object({ type: Type.Literal('interrupt'), sessionKey: Type.String(), turnId: Type.Optional(Type.String()), cancelQueue: Type.Optional(Type.Boolean()) }),
-  Type.Object({ type: Type.Literal('resolve'), sessionKey: Type.String(), requestId: Type.String(), decision: Decision }),
+  Type.Object({
+    type: Type.Literal('resolve'),
+    sessionKey: Type.String(),
+    requestId: Type.String(),
+    decision: Decision,
+    /** Host connections only: answer as this principal (checked against a `human` resolver's principals; recorded with `via`). */
+    onBehalfOf: Type.Optional(Type.String()),
+  }),
   Type.Object({
     type: Type.Literal('control'),
     sessionKey: Type.String(),

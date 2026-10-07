@@ -382,6 +382,9 @@
                       }
                     }
                   ]
+                },
+                "onBehalfOf": {
+                  "type": "string"
                 }
               }
             },

@@ -40,7 +40,7 @@ export interface World {
   built: HarnessInstance[];
   client(): Promise<LocalClient>;
   /** A connection that said host.hello with the daemon's token. */
-  host(o?: { name?: string; consumer?: string; callouts?: boolean }): Promise<LocalClient>;
+  host(o?: { name?: string; consumer?: string; callouts?: boolean | string[] }): Promise<LocalClient>;
   stop(): Promise<void>;
 }
 
@@ -101,9 +101,9 @@ export async function daemon(
     cleanups.push(() => c.close());
     return c;
   };
-  const host = async (h: { name?: string; consumer?: string; callouts?: boolean } = {}) => {
+  const host = async (h: { name?: string; consumer?: string; callouts?: boolean | string[] } = {}) => {
     const c = await client();
-    await c.hello({ token: readTokenFile(tokenPath(config.socketPath)), name: h.name ?? 'xwo', ...(h.consumer !== undefined ? { consumer: h.consumer } : {}), ...(h.callouts ? { callouts: true } : {}) });
+    await c.hello({ token: readTokenFile(tokenPath(config.socketPath)), name: h.name ?? 'xwo', ...(h.consumer !== undefined ? { consumer: h.consumer } : {}), ...(h.callouts ? { callouts: h.callouts } : {}) });
     return c;
   };
   return { gw, dir, config, chat, harness, built, client, host, stop };

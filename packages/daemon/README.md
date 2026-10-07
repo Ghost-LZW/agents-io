@@ -71,7 +71,7 @@ before any host frame; after it, the connection's client frames carry the origin
 
 - Any number of authenticated connections may use the request frames (the CLI's
   host commands are such connections). A connection whose hello sets `consumer`
-  (push-consume the inbound queue) or `callouts: true` becomes **the host**: at most
+  (push-consume the inbound queue) or any callout hook (`callouts`) becomes **the host**: at most
   one at a time (`host_connected` otherwise). While it is connected the router's
   host table is active even with `onHostDown: "suspend"`, `route` callouts go to it,
   and runs whose own connection left report `run.ended` to it.
@@ -84,6 +84,17 @@ before any host frame; after it, the connection's client frames carry the origin
   Reads never move the cursor.
 - `policy { hook: "route" }`: the callout of a rule with `callout`; the rule's
   `timeoutMs` and `onFailure` apply, and the outcome is in `explain`.
+- `callouts` is `true` (= `["route"]`) or a list of hooks: `route`, `resolve`,
+  `outbound` (unknown names are ignored; the hello result's `callouts` lists the
+  granted ones). `policy { hook: "resolve", args: { request, ctx } }` is
+  `Policy.resolve` (answer a `Resolver`); on timeout (`hostCallouts.resolve.timeoutMs`,
+  default 3000), an error or a bad answer the local policy decides.
+  `policy { hook: "outbound", args: { from, to } }` is `Policy.outbound` (answer
+  `{ verdict }`); timeout (`hostCallouts.outbound.timeoutMs`, default 2000), error or
+  a bad answer deny. Without a host that answers the hook, the local policy decides.
+- `resolve { onBehalfOf }` (host connections only): answer a request as that
+  principal. A `human` request still requires it among its `principals`; the log
+  records `by: { kind, id: <principal>, via: "host:<name>" }`.
 - `run.start`: only `mode: task` agents. A fresh session `run:<runId>`, its own
   harness adapter (Codex: its own app-server over stdio) with the request `env`
   over the instance's env, in the child process only (never logged, never on
@@ -102,6 +113,19 @@ before any host frame; after it, the connection's client frames carry the origin
   author (channel user id, display name, bot flag), its evidence, and the
   principal / labels the identity map stamped, per receiving account; `found:
   false` when the daemon never received it. Never a guess.
+- `inbound.redispatch { cursor, agent?, session?, launch? }`: deliver a queued
+  host-inbound item (one still in the queue, acked or not) to the session a
+  `dispatch` rule for `agent` (default agent) with `session` (default
+  `per-conversation`, or `{ key }`) would pick, as the input it was when it
+  arrived: original origin (sender, principal, evidence, route), content, reply
+  route and channel context, plus `channelContext.redispatchedBy`. The new input id
+  is `<original>~r<cursor>`. `launch` is checked as in a callout answer. Idempotent
+  per cursor: a second request answers the first outcome with `duplicate: true`
+  (a failed delivery is not recorded, so another session may be tried). It does
+  not ack the item. `explain` shows `redispatchOf` on the new input and
+  `redispatched` on the original. Errors: `unknown_cursor`, `unknown_agent`,
+  `not_interactive_agent`, `invalid_frame`, launch codes (`launch_conflict`, …),
+  `agent_unavailable`.
 - `explain { inputId }`: the persisted routing record.
 
 ## Console API (for web UIs)

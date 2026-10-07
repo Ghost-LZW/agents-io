@@ -25,6 +25,8 @@ import {
   type SessionLaunch,
   type SessionPrepare,
   type SessionPrepareResult,
+  type InboundRedispatch,
+  type InboundRedispatchResult,
   type Tier,
   type TopicSwitchFrame,
   type TurnContext,
@@ -261,7 +263,7 @@ export class Gateway {
       watchAllowlist: c.policy.watchAllowlist,
       run: c.harnesses[c.defaultHarness]!.run,
     });
-    this.policy = {
+    const local = {
       ...base,
       // The router's identity maps (the owners config; a host's map once one is pushed).
       identify: async (a) => router.identify(a),
@@ -269,6 +271,30 @@ export class Gateway {
       control: async (a) => (isHostOrigin(a.origin) ? 'allow' : base.control(a)),
       ...o.policy,
     } as FullPolicy;
+    this.policy = {
+      ...local,
+      // A connected host whose hello lists `resolve` decides who answers a request; when it
+      // cannot (timeout, error, bad answer) the local policy does (fail closed to built-in behaviour).
+      resolve: async (req, ctx) => {
+        if (!this.host.answers('resolve')) return local.resolve(req, ctx);
+        try {
+          return await this.host.resolveCallout(req, ctx);
+        } catch (e) {
+          this.log('warn', `${ctx.sessionKey}: host resolve callout for ${req.requestId} failed (${(e as Error).message}); the local policy decides`);
+          return local.resolve(req, ctx);
+        }
+      },
+      // A connected host whose hello lists `outbound` decides where agents may send; no answer denies.
+      outbound: async (a) => {
+        if (!this.host.answers('outbound')) return local.outbound(a);
+        try {
+          return await this.host.outboundCallout(a.from, a.to);
+        } catch (e) {
+          this.log('warn', `host outbound callout to ${routeKey(a.to)} failed (${(e as Error).message}); denied`);
+          return 'deny';
+        }
+      },
+    };
     this.outbox = new Outbox({ hub: this.hub, policy: this.policy, store: this.records });
     this.runs = new Runs({
       hub: this.hub,
@@ -286,6 +312,8 @@ export class Gateway {
       runs: this.runs,
       deliver: (name, f) => this.deliver(name, f),
       prepareSession: (f) => this.prepareSession(f),
+      redispatch: (name, f) => this.redispatch(name, f),
+      calloutTimeouts: { resolve: c.hostCallouts.resolveTimeoutMs, outbound: c.hostCallouts.outboundTimeoutMs },
       log: (level, msg, data) => this.log(level, msg, data),
       ...(o.hostPush?.timeoutMs !== undefined ? { pushTimeoutMs: o.hostPush.timeoutMs } : {}),
       ...(o.hostPush?.retryMs !== undefined ? { pushRetryMs: o.hostPush.retryMs } : {}),
@@ -706,6 +734,57 @@ export class Gateway {
       this.log('info', `${f.sessionKey}: prepared for agent ${f.agent}${v.cwd ? ` in ${v.cwd}` : ''}${v.envKeys.length ? ` (env: ${v.envKeys.join(', ')})` : ''}`);
     }
     return { ok: true, value: { sessionKey: f.sessionKey, agent: f.agent, launch: launchView(c.launch), created: c.outcome === 'applied' } satisfies SessionPrepareResult };
+  }
+
+  /** `inbound.redispatch` in flight, per cursor (a second request waits for the first). */
+  private readonly redispatching = new Map<number, Promise<Outcome>>();
+
+  /**
+   * `inbound.redispatch`: deliver a queued host-inbound item to a session as the
+   * input it was (original origin), once per cursor. A delivery that fails is not
+   * recorded, so the host may try another session.
+   */
+  redispatch(hostName: string, f: InboundRedispatch): Promise<Outcome> {
+    const running = this.redispatching.get(f.cursor);
+    if (running) return running.then((r) => (r.ok ? { ok: true, value: { ...(r.value as InboundRedispatchResult), duplicate: true } } : this.redispatch(hostName, f)));
+    const p = this.redispatchOnce(hostName, f).finally(() => this.redispatching.delete(f.cursor));
+    this.redispatching.set(f.cursor, p);
+    return p;
+  }
+
+  private async redispatchOnce(hostName: string, f: InboundRedispatch): Promise<Outcome> {
+    if (this.stopped) return fail('stopped', 'daemon is stopping');
+    const prior = this.hostQueue.redispatched<InboundRedispatchResult>(f.cursor);
+    if (prior) return { ok: true, value: { ...prior, duplicate: true } };
+    const item = this.hostQueue.get(f.cursor);
+    if (!item) return fail('unknown_cursor', `no host inbound item at cursor ${f.cursor} (never queued, or pruned after every consumer acked it)`);
+    const by = `host:${hostName}`;
+    const r = await this.ingress.redispatch(item, {
+      by,
+      ...(f.agent !== undefined ? { agent: f.agent } : {}),
+      ...(f.session !== undefined ? { session: f.session } : {}),
+      ...(f.launch !== undefined ? { launch: f.launch } : {}),
+    });
+    if (!r.ok) return fail(r.code === 'task_agent' ? 'not_interactive_agent' : r.code, r.message);
+    const res = r.outcome.result;
+    if (r.outcome.unavailable) return fail(r.outcome.unavailable.code, r.outcome.unavailable.message);
+    if (res && !res.ok) return fail(res.reason, `session ${r.delivery.sessionKey} refused the input: ${res.reason}`);
+    const value: InboundRedispatchResult = {
+      cursor: item.cursor,
+      of: item.input.inputId,
+      inputId: r.inputId,
+      sessionKey: r.delivery.sessionKey,
+      ...(r.delivery.agent ? { agent: r.delivery.agent } : {}),
+      on: r.delivery.on === 'dispatch' ? 'dispatch' : 'context',
+      ...(r.launch ? { launch: r.launch } : {}),
+      ...(res?.ok && res.disposition !== undefined ? { disposition: res.disposition } : {}),
+      at: Date.now(),
+      by,
+      duplicate: false,
+    };
+    this.hostQueue.recordRedispatch(item.cursor, value);
+    this.log('info', `host ${hostName} redispatched inbound ${item.cursor} (${item.input.inputId}) to ${value.sessionKey}`);
+    return { ok: true, value };
   }
 
   /**
@@ -1242,8 +1321,11 @@ ${a.summary}` }],
             : await lane.command({ type: 'input', sessionKey: cmd.sessionKey, input, mode: cmd.mode, ...(cmd.expectedTurnId ? { expectedTurnId: cmd.expectedTurnId } : {}) });
         return r.ok ? { ok: true, value: { inputId: input.inputId, disposition: r.disposition } } : fail(r.reason);
       }
-      case 'interrupt':
       case 'resolve':
+        // Answering on someone's behalf is the host's (its connection is authenticated with the token).
+        if (cmd.onBehalfOf !== undefined && !isHostOrigin(origin)) return fail('not_eligible', 'onBehalfOf is for host connections');
+      // falls through
+      case 'interrupt':
       case 'control': {
         const r = await lane.command({ ...cmd, origin });
         return r.ok ? { ok: true, value: {} } : fail(r.reason);

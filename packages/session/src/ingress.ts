@@ -12,12 +12,14 @@ import {
   type ReplyRoute,
   type Tier,
   type SessionLaunch,
+  type SessionScope,
+  type InboundItem,
 } from '@agents-io/protocol';
 import { channelRefOf, type HostQueue } from './host-queue.js';
 import type { Hub } from './hub.js';
 import type { CommandResult, Lane } from './lane.js';
 import { conversationRouteKey, withDefaults, type FullPolicy, type SessionPolicy } from './policy.js';
-import { Router, defaultBindings, sourceOf, type Explanation, type RouteDelivery } from './router.js';
+import { Router, RouterError, defaultBindings, sourceOf, type Explanation, type RouteDelivery } from './router.js';
 import type { TopicRecord } from './topics.js';
 import { contentText, type WatchDelivery, type WatchDispatcher } from './watch.js';
 
@@ -381,6 +383,51 @@ export class Ingress {
       ...(host ? { host } : {}),
       explanation,
     };
+  }
+
+  /**
+   * Deliver a queued host-inbound item to a session the host names (`inbound.redispatch`),
+   * as the input it was when it arrived: same origin (sender, evidence, route), content,
+   * reply route and channel context, plus `channelContext.redispatchedBy`. Its input id is
+   * `<original>~r<cursor>`. Both explanations are recorded: the new input's
+   * (`redispatchOf`), and the original's gains a `redispatched` entry. Idempotency
+   * per cursor is the caller's (the queue records it).
+   */
+  async redispatch(
+    item: InboundItem,
+    o: { agent?: string; session?: SessionScope; launch?: SessionLaunch; by: string },
+  ): Promise<{ ok: true; delivery: RouteDelivery; outcome: DeliveryOutcome; inputId: string; launch?: { cwd?: string; envKeys: string[]; outcome: string } } | { ok: false; code: string; message: string }> {
+    const env = item.envelope;
+    const origin = item.input.origin;
+    const inputId = `${item.input.inputId}~r${item.cursor}`;
+    let r: ReturnType<Router['redirect']>;
+    try {
+      r = this.router.redirect(env, origin, {
+        inputId,
+        ...(o.agent !== undefined ? { agent: o.agent } : {}),
+        ...(o.session !== undefined ? { session: o.session } : {}),
+        ...(o.launch !== undefined ? { launch: o.launch } : {}),
+        redispatchOf: { inputId: item.input.inputId, cursor: item.cursor, by: o.by },
+      });
+    } catch (e) {
+      if (e instanceof RouterError) return { ok: false, code: e.code === 'invalid' ? 'invalid_frame' : e.code, message: e.message };
+      throw e;
+    }
+    if (!r.ok) return r;
+    const { delivery, explanation } = r;
+    const input: InputRecord = { ...item.input, inputId, channelContext: { ...item.input.channelContext, redispatchedBy: o.by } };
+    const outcome = await this.deliverOwn(delivery, env, origin, input);
+    if (outcome.unavailable) explanation.matched[0]!.rejected = { code: outcome.unavailable.code, message: outcome.unavailable.message };
+    this.router.record(explanation);
+    if (outcome.result?.ok !== false) {
+      const orig = this.router.explain(item.input.inputId);
+      if (orig) {
+        const entry = { cursor: item.cursor, inputId, sessionKey: delivery.sessionKey, ...(delivery.agent ? { agent: delivery.agent } : {}), by: o.by, at: explanation.at };
+        this.router.record({ ...orig, redispatched: [...(orig.redispatched ?? []), entry] });
+      }
+    }
+    const launch = explanation.matched[0]!.launch;
+    return { ok: true, delivery, outcome, inputId, ...(launch ? { launch } : {}) };
   }
 
   /** One table delivery: a turn, a context record, or a digest item. */
