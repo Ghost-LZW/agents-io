@@ -117,6 +117,8 @@ const CodexInstance = Type.Object(
     enable: Type.Optional(Type.Array(Type.String())),
     disable: Type.Optional(Type.Array(Type.String())),
     transport: Type.Optional(CodexTransport),
+    /** Realtime voice (decision 11): opt the app-server connection into Codex's experimental realtime API, so `live_join` works. Default false. */
+    live: Type.Optional(Type.Boolean()),
     /** Not supported: `codex app-server` rejects --profile (checked: codex-cli 0.160). Listed to give a clear error. */
     profile: Type.Optional(Type.String()),
   },
@@ -431,6 +433,7 @@ export interface CodexLaunch {
   enable?: string[];
   disable?: string[];
   transport: CodexTransportOption;
+  live?: boolean;
 }
 
 export type HarnessInstance = InstanceBase & ({ kind: 'claude-code'; claude: ClaudeLaunch } | { kind: 'codex'; codex: CodexLaunch });
@@ -1015,6 +1018,7 @@ function resolveInstance(name: string, raw: unknown, env: Record<string, string 
       ...(x.config ? { config: codexConfigViaEnv(x.config, `${where}.config`, secrets) } : {}),
       ...(x.enable ? { enable: x.enable } : {}),
       ...(x.disable ? { disable: x.disable } : {}),
+      ...(x.live ? { live: true } : {}),
       transport,
     };
     return { ...common, kind: 'codex', codex, ...(unavailable ? { unavailable } : {}) };

@@ -97,6 +97,24 @@ export const TOOL_DEFS = {
     input: {},
     readOnly: true,
   },
+  live_join: {
+    description:
+      'Join a live voice session (e.g. a meeting) yourself, as a realtime voice: you hear everyone there and speak with your own voice; it carries this conversation\'s history. `target` is the channel\'s own: on a channel with meetings a meeting number, or "new" to start a meeting (the result names it, with a link to share). `channel` picks another channel than the current one (a channel id, or channel:account). `instructions` tells the voice how to behave there (language, role, when to stay quiet). Use it only when the user asks you to join or call in. While in it, what people say comes to you as turns; those answers are spoken. Leave with live_leave.',
+    input: {
+      target: z.string().describe('What to join, in the channel\'s terms (e.g. a meeting number, or "new")'),
+      channel: z.string().optional().describe('Channel id or channel:account (default: the current conversation\'s)'),
+      instructions: z.string().optional().describe('How the voice should behave in this session'),
+      voice: z.string().optional().describe('Voice name (harness-specific)'),
+    },
+  },
+  live_say: {
+    description: 'Say something out loud in your running live session (your voice speaks this text). Use it to announce a result or to speak up on your own.',
+    input: { text: z.string().describe('What to say, short and spoken-style') },
+  },
+  live_leave: {
+    description: 'Leave your running live session (hang up). Use it when asked to leave/hang up, or when you are done.',
+    input: {},
+  },
   session_rotate: {
     description:
       "Start a NEW TOPIC in this conversation when the user's message is about something clearly unrelated to the current topic (a different task or question, not a follow-up). A new topic is a fresh session with a clean context; the current one is parked, never deleted, and can be resumed later with session_switch. The message that triggered this turn is handed to the new topic together with your `summary` (what the new topic should know from this one: names, decisions, facts the user may refer to; or \"none\"), and that topic answers it. After calling this, end your turn without answering: the answer comes from the new topic. Do not rotate for follow-ups, small digressions, or when unsure. While topics are on, every input's preface carries `topic` / `topicTitle`.",
@@ -259,6 +277,7 @@ export class HostMcpServer {
     for (const name of TOOL_NAMES) {
       if (name.startsWith('watch_') && !this.o.tools.hasWatches) continue;
       if (name.startsWith('session_') && !this.o.tools.hasTopics) continue;
+      if (name.startsWith('live_') && !this.o.tools.hasLive) continue;
       const def = TOOL_DEFS[name];
       server.registerTool(
         name,

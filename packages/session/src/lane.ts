@@ -10,6 +10,7 @@ import {
   type HarnessSession,
   type InputMode,
   type InputRecord,
+  type LiveStartArgs,
   type Origin,
   type ReplyRoute,
   type ResolvedBy,
@@ -76,6 +77,18 @@ export interface LaneOptions {
   context?: { maxItems?: number; maxChars?: number };
   /** Tee of raw harness events (conformance checks, debugging). */
   onHarnessEvent?: (e: HarnessEvent) => void;
+  /** A live (realtime voice) on this session ended, whichever side ended it (decision 11). */
+  onLiveEnded?: (liveId: string, reason: string) => void;
+}
+
+/** A live running on the session (decision 11): what delegated inputs are attributed to. */
+export interface LiveInfo {
+  liveId: string;
+  title: string;
+  /** Where the live happens (the channel's media peer). */
+  route: ReplyRoute;
+  /** Route of the turn that opened it: delegated turns may send text there. */
+  controlRoute: ReplyRoute | null;
 }
 
 export interface LaneMcp {
@@ -208,6 +221,9 @@ export class Lane {
   private ctxDropped = 0;
   /** Original ids of context inputs already handed to a turn (bounded). */
   private handedCtx = new Set<string>();
+  private live: LiveInfo | undefined;
+  /** Delegations (live.handoff) waiting for the turn the harness starts for them. */
+  private handoffs = new Map<string, InputRecord>();
 
   constructor(private readonly o: LaneOptions) {
     this.sessionKey = o.sessionKey;
@@ -350,6 +366,50 @@ export class Lane {
   async close(reason = 'lane closed'): Promise<void> {
     this.stopTimers();
     await this.session?.close(reason);
+  }
+
+  /** The live running on this session, if any. */
+  liveInfo(): LiveInfo | undefined {
+    return this.live;
+  }
+
+  /**
+   * Start realtime voice on this session's harness thread (decision 11). Opens the
+   * harness when needed. Resolves with the harness's SDP answer for the far side.
+   */
+  async startLive(info: LiveInfo, args: Omit<LiveStartArgs, 'liveId'>): Promise<{ answerSdp: string }> {
+    const s = await this.serial(async () => {
+      if (this.closed) throw new Error('session is closed');
+      if (this.live) throw new Error(`a live (${this.live.title}) is already running in this session`);
+      const s = await this.ensureSession(this.lastRun ?? (await this.policy.plan({ sessionKey: this.sessionKey, inputs: [] })));
+      if (!s.live) throw new Error(`harness ${this.adapter.id} has no realtime voice (live)`);
+      this.live = info;
+      return s;
+    });
+    try {
+      const r = await s.live!.start({ liveId: info.liveId, ...args });
+      await this.serial(async () => {
+        this.emit({ body: { t: 'live.started', liveId: info.liveId, title: info.title, route: info.route, controlRoute: info.controlRoute } });
+      });
+      return r;
+    } catch (e) {
+      await this.serial(async () => {
+        if (this.live?.liveId === info.liveId) this.live = undefined;
+      });
+      throw e;
+    }
+  }
+
+  /** Have the live's voice say `text`. */
+  async liveSay(text: string): Promise<void> {
+    if (!this.live || !this.session?.live) throw new Error('no live is running in this session');
+    await this.session.live.say(text);
+  }
+
+  /** End the live (its `live.ended` follows from the harness). */
+  async stopLive(): Promise<void> {
+    if (!this.live) return;
+    await this.session?.live?.stop();
   }
 
   /**
@@ -852,7 +912,64 @@ export class Lane {
     const b = e.body;
     const t = this.turn;
     switch (b.t) {
+      case 'live.handoff': {
+        // The voice side delegated (decision 11): one input from the far side, no principal.
+        const live = this.live?.liveId === b.liveId ? this.live : undefined;
+        const record: InputRecord = {
+          inputId: b.inputId,
+          origin: {
+            kind: 'human',
+            principal: null,
+            evidence: 'none',
+            via: live ? routeKey(live.route) : `live:${b.liveId}`,
+            adapter: live?.route.channel ?? 'live',
+          },
+          content: [{ type: 'transcript', text: b.text, startMs: 0, endMs: 0, stable: true }],
+          replyRoute: live?.controlRoute ?? null,
+          channelContext: { live: true, liveId: b.liveId, conversationKind: 'meeting', ...(live ? { liveTitle: live.title } : {}) },
+        };
+        this.emit({ body: { t: 'input.admitted', inputId: b.inputId, disposition: t ? 'steer' : 'new_turn', input: record } });
+        this.emitHarness(e, gen);
+        if (t) t.inputs.push(record);
+        else {
+          this.handoffs.set(b.inputId, record);
+          for (const k of this.handoffs.keys()) {
+            if (this.handoffs.size <= 32) break;
+            this.handoffs.delete(k);
+          }
+        }
+        return;
+      }
+      case 'live.ended':
+        if (this.live?.liveId === b.liveId) this.live = undefined;
+        this.emitHarness(e, gen);
+        this.o.onLiveEnded?.(b.liveId, b.reason);
+        return;
       case 'turn.started': {
+        if (!t && b.initiator === 'harness') {
+          // A turn the harness started for a delegation: the lane runs it like its own (queue
+          // waits, tools and provenance see it). No reply route: the voice speaks the answer.
+          const inputs = b.inputIds.map((id) => this.handoffs.get(id)).filter((r): r is InputRecord => !!r);
+          for (const id of b.inputIds) this.handoffs.delete(id);
+          this.turn = {
+            turnId: b.turnId,
+            inputs,
+            attempts: new Map(),
+            owner: null,
+            replyRoute: null,
+            run: this.lastRun,
+            starting: false,
+            interruptRequested: false,
+            deliveries: [],
+            consumed: new Set(inputs.map((i) => i.inputId)),
+            foreignConsumed: false,
+            context: [],
+          };
+          this.track(b.turnId, inputs);
+          this.emitHarness(e, gen);
+          this.refreshState();
+          return;
+        }
         const ours = t && t.turnId === b.turnId;
         const body = ours && b.owner === undefined && t.owner !== null ? { ...b, owner: t.owner } : b;
         this.emitHarness(e, gen, { body });

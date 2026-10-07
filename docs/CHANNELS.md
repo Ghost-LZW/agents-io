@@ -345,6 +345,7 @@ aio-dev watch remove team-digest
 | `reply_to(route, text, message_id?)` | 另发一条回复（默认回复发起本轮的那条消息） | `"current"` 或允许的路由键 |
 | `send_message(route, text)` | 另发一条独立消息（不是回复） | `"current"` 或允许的路由键 |
 | `watch_add / watch_remove / watch_list` | 见下面"agent 自己建监听" | 永远是自己的 session |
+| `live_join / live_say / live_leave` | 以语音进出会议或通话，见 §7a | 通道的媒体对端 |
 
 目的地一律过 `Policy.outbound`。默认策略只允许本轮的回复路由（以及本轮输入带来的路由）和主人在 `policy.routes` 里预登记的路由。被拒时工具返回错误，错误里写明被拒的路由、允许的是哪些，并让模型不要换个目的地重试；日志里记一条 `notice`。
 
@@ -396,6 +397,19 @@ aio-dev watch remove team-digest
 | `agents-io/output` | `{ tool }`：这条消息出自哪个输出工具 |
 
 建议的协议改动：`RenderedMessage.mentions`、`RenderedMessage.choice`（或 `actions[].group` + `multi`）、一个 `output.sent` 事件类型代替 `native agents-io.output`、`InputRecord` 带发送者的通道 id（`senderId`）和消息里的 `mentions`，让 agent 能 @ 本轮之外的人。
+
+## 7a. 实时语音会话（live，决定 11）
+
+agent 自己以语音进一个会议或通话：听得到所有人，用自己的声音说话。语音由 harness 出（目前只有 Codex realtime v3，WebRTC），媒体对端由通道出（`ChannelAdapter.openLive`，例如某个通道的"加入会议"），网关只在两者之间转交 SDP，**音频不经过 agents-io**。
+
+- **开启**：Codex 实例配 `"live": true`（连接改用 Codex 的实验接口）；agent 挂了输出工具（`tools`）。
+- **工具**：`live_join { target, channel?, instructions?, voice? }`：在当前对话的通道（或 `channel` 指定的通道）上打开对端，`target` 由通道解释（如会议号、`new`），挂到本 session 的 Codex thread 上；`live_say { text }`：让语音说一段话；`live_leave`：离开。一个 session 同时至多一个 live。
+- **带着上下文进会**：语音挂在这个 session 的 thread 上，知道之前文字里聊过什么；会后在同一个对话里用文字接着问，它也知道会上说了什么。
+- **会里说的话怎么到 agent**：语音端自己能答的直接答；需要查资料、跑工具的，委托给 Codex：每次委托是一条输入（`transcript` 块，`from=unknown`，`channelContext` 带 `live=true`、`liveId`、`liveTitle`，回复路由是发起 live 的那个对话），Codex 随即在 thread 上开一轮，lane 把它当作本 session 的当前轮（排队、工具、来源标记照常）。这一轮**没有回复路由**：答案由语音说出，不自动发到 IM；要落成文字用 `send_message` 发到 `current`。委托时已有一轮在跑，就并进那一轮。
+- **权限**：委托出来的轮次用 thread 当时的设置，与文字轮次相同；来源标记 `external`（决定 4、5：只标记，不降档）。会里任何人都能让它干活，按需给这个 agent 合适的 profile。
+- **日志**：`live.started`（标题、对端路由、发起路由）、`live.transcript`（双方，每句一条）、`live.handoff`、`live.ended`。
+- **结束**：对端离会/会议结束、`live_leave`、harness 关闭、守护进程停止，任一发生都关闭另一端并记 `live.ended`。守护进程重启不恢复 live。
+- **已知限制**：语音转述可能出错（实测把"目录是空的"说成"有个文件"），要紧的结果另发文字；几乎每句实质性的话都委托，回答延迟约 10–20 秒；`appendText` 注入的文字不会触发委托，只有真实语音会。
 
 ## 8. 已知缺口
 

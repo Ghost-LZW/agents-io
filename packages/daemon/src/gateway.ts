@@ -19,6 +19,7 @@ import {
   type HostRequestFrame,
   type InboundEnvelope,
   type InputRecord,
+  type LiveEndpoint,
   type Origin,
   type Policy,
   type ReplyRoute,
@@ -214,6 +215,8 @@ export class Gateway {
   /** Adapters of configured agents (their cwd and instructions over the instance's). */
   private readonly agentAdapters = new Map<string, HarnessAdapter>();
   private readonly lanes = new Map<string, Lane>();
+  /** Running lives (decision 11), by session: the channel's media peer of each. */
+  private readonly lives = new Map<string, { liveId: string; endpoint: LiveEndpoint }>();
   /** Agent and working directory of each live lane. */
   private readonly laneInfo = new Map<string, { agent: AgentConfig; cwd?: string }>();
   /** Per-session adapters of launched sessions (decision 7), closed with their lane. */
@@ -377,6 +380,16 @@ export class Gateway {
           list: (key) => (this.topics.bySession(key) ? this.topics.siblings(key).map(topicView) : undefined),
           rotate: (key, turn, a) => this.rotateTopic(key, turn, a),
           switch: (key, turn, a) => this.switchTopicFor(key, turn, a.topicId),
+        },
+        // Decision 9: realtime voice on the session's harness, the media peer from a channel.
+        live: {
+          join: (key, turn, a) => this.joinLive(key, turn, a),
+          say: async (key, text) => {
+            const lane = this.lanes.get(key);
+            if (!lane?.liveInfo()) throw new ToolError('no live is running in this session; live_join first');
+            await lane.liveSay(text);
+          },
+          leave: (key) => this.leaveLive(key, 'left by the agent'),
         },
       });
       const tools = this.tools;
@@ -668,6 +681,7 @@ export class Gateway {
       policy: this.agentPolicy(agent),
       cwd,
       ...(this.mcp && agent.tools ? { mcp: (a: { sessionKey: string; generation: number; harnessId: string }) => this.mcp!.mcpFor(a) } : {}),
+      onLiveEnded: (liveId, reason) => this.liveEnded(sessionKey, liveId, reason),
       onHarnessEvent: (e) => {
         // A topic remembers its harness session id (switching back resumes it; the lane resumes from the log).
         if (e.body.t === 'session.bound') this.topics.setNativeId(sessionKey, e.body.nativeId);
@@ -1101,6 +1115,76 @@ export class Gateway {
   }
 
   /** session_rotate: a new topic, current from now on, gets the turn's inputs with the summary ahead of them. */
+  // ---- live (decision 11) ----------------------------------------------------
+
+  private async joinLive(sessionKey: string, turn: TurnContext, a: { target: string; channel?: string; instructions?: string; voice?: string }) {
+    const lane = this.lanes.get(sessionKey);
+    if (!lane) throw new ToolError(`no session ${sessionKey}`);
+    const cur = this.lives.get(sessionKey);
+    if (cur) throw new ToolError(`already in a live (${cur.endpoint.title}); live_leave first`);
+    const ch = this.liveChannel(turn, a.channel);
+    const endpoint = await ch.adapter.openLive!(ch.account, a.target);
+    const liveId = `live_${randomUUID().slice(0, 8)}`;
+    this.lives.set(sessionKey, { liveId, endpoint });
+    try {
+      const { answerSdp } = await lane.startLive(
+        { liveId, title: endpoint.title, route: endpoint.route, controlRoute: turn.replyRoute },
+        { transport: { type: 'webrtc', sdp: endpoint.offer.sdp }, instructions: a.instructions ?? DEFAULT_LIVE_INSTRUCTIONS, ...(a.voice ? { voice: a.voice } : {}) },
+      );
+      await endpoint.answer(answerSdp);
+    } catch (e) {
+      if (this.lives.get(sessionKey)?.liveId === liveId) this.lives.delete(sessionKey);
+      await lane.stopLive().catch(() => undefined);
+      await endpoint.close(`join failed: ${(e as Error).message}`).catch(() => undefined);
+      throw e;
+    }
+    this.log('info', `${sessionKey}: live ${liveId} joined ${endpoint.title}`);
+    // The far side ended it (left, removed, meeting over): stop the voice; its live.ended closes the rest.
+    void endpoint.ended.then((reason) => {
+      if (this.lives.get(sessionKey)?.liveId !== liveId) return;
+      this.log('info', `${sessionKey}: live ${liveId} ended by the channel (${reason})`);
+      void lane.stopLive().catch(() => undefined);
+    });
+    return { liveId, title: endpoint.title, route: routeKey(endpoint.route) };
+  }
+
+  /** The channel a live opens on: `spec` (id or id:account), else the turn's reply channel. */
+  private liveChannel(turn: TurnContext, spec: string | undefined): RunningChannel {
+    const able = this.channels.filter((c) => typeof c.adapter.openLive === 'function');
+    const names = able.map((c) => `${c.adapter.id}:${c.account}`).join(', ') || 'none';
+    let ch: RunningChannel | undefined;
+    if (spec) {
+      const [id, account] = spec.split(':');
+      const same = this.channels.filter((c) => c.adapter.id === id && (account === undefined || c.account === account));
+      ch = same.length === 1 ? same[0] : undefined;
+      if (!ch) throw new ToolError(`no single running channel ${spec} (channels that can open a live: ${names})`);
+    } else {
+      if (!turn.replyRoute) throw new ToolError(`this turn has no reply channel; name one with \`channel\` (channels that can open a live: ${names})`);
+      ch = this.channelFor(turn.replyRoute);
+      if (!ch) throw new ToolError(`no running channel for ${routeKey(turn.replyRoute)}`);
+    }
+    if (typeof ch.adapter.openLive !== 'function') throw new ToolError(`channel ${ch.adapter.id} cannot open a live session (channels that can: ${names})`);
+    return ch;
+  }
+
+  private async leaveLive(sessionKey: string, reason: string): Promise<boolean> {
+    const cur = this.lives.get(sessionKey);
+    if (!cur) return false;
+    this.lives.delete(sessionKey);
+    await this.lanes.get(sessionKey)?.stopLive().catch(() => undefined);
+    await cur.endpoint.close(reason).catch((e: Error) => this.log('warn', `${sessionKey}: closing live ${cur.liveId}: ${e.message}`));
+    return true;
+  }
+
+  /** The harness ended the live (voice closed, harness gone): leave the channel side too. */
+  private liveEnded(sessionKey: string, liveId: string, reason: string): void {
+    const cur = this.lives.get(sessionKey);
+    if (!cur || cur.liveId !== liveId) return;
+    this.lives.delete(sessionKey);
+    this.log('info', `${sessionKey}: live ${liveId} ended (${reason})`);
+    void cur.endpoint.close(reason).catch((e: Error) => this.log('warn', `${sessionKey}: closing live ${liveId}: ${e.message}`));
+  }
+
   private async rotateTopic(sessionKey: string, turn: TurnContext, a: { title: string; summary: string }): Promise<TopicHandover> {
     const from = this.topicOfSession(sessionKey);
     // The summary describes the topic being left: it is saved on it (and handed to the new one as context).
@@ -1642,6 +1726,8 @@ ${a.summary}` }],
     for (const t of this.parkedTimers.values()) clearTimeout(t);
     this.parkedTimers.clear();
     this.host.close();
+    // Lives end first: the voice runs in the harness and the media peer in a channel, both about to go.
+    await within(Promise.all([...this.lives.keys()].map((k) => this.leaveLive(k, 'gateway stopping'))), 5000);
     // Runs end (interrupted) while their connections can still hear run.ended.
     await within(this.runs.stop(), 10_000);
     this.server?.close('gateway stopping');
@@ -1808,6 +1894,7 @@ export function buildHarness(i: HarnessInstance, media?: MediaResolvers): Instan
         ...(x.config ? { config: x.config } : {}),
         ...(x.enable ? { enable: x.enable } : {}),
         ...(x.disable ? { disable: x.disable } : {}),
+        ...(x.live ? { live: true } : {}),
         ...(media ? { resolveMedia: media.resolveMedia } : {}),
       }),
     );
@@ -1830,6 +1917,10 @@ export function buildHarness(i: HarnessInstance, media?: MediaResolvers): Instan
   const inst = media ? { ...i, options: { resolveImage: media.resolveImage, resolveFile: media.resolveFile, ...i.options } } : i;
   return new InstanceHarness(inst, new ClaudeCodeHarness(config));
 }
+
+/** What a live's voice is told when the agent gives no instructions (decision 11). */
+const DEFAULT_LIVE_INSTRUCTIONS =
+  'You take part by voice in a live session (a meeting or a call) as this deployment\'s assistant. Speak briefly and naturally, in the language people use. Stay quiet unless someone addresses you. For anything that needs facts, files, tools or actions, delegate it, then report the result accurately, without adding details.';
 
 /** A channel built but not started yet. */
 type BuiltChannel = { adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void>; source?: ResolvedChannel; bind?: (e: RunningChannel) => void };

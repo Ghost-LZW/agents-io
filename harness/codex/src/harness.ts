@@ -10,7 +10,7 @@ import type { ThreadStartResponse } from './generated/v2/ThreadStartResponse.js'
 import type { ThreadResumeParams } from './generated/v2/ThreadResumeParams.js';
 import type { ThreadResumeResponse } from './generated/v2/ThreadResumeResponse.js';
 import type { JsonValue } from './generated/serde_json/JsonValue.js';
-import { CODEX_CAPS, DEFAULT_OPT_OUT } from './caps.js';
+import { CODEX_CAPS, DEFAULT_OPT_OUT, LIVE_NOTIFICATIONS } from './caps.js';
 import { resolveProfile, sandboxModeOf, type CodexProfile, type MediaResolver } from './map.js';
 import { RpcClient, spawnTransport, type Transport } from './rpc.js';
 import { CodexSession, type CodexOpenOptions, type SessionHost, type TurnSnapshot } from './session.js';
@@ -88,6 +88,11 @@ export interface CodexHarnessOptions {
   handshakeTimeoutMs?: number;
   /** Notification methods this connection never wants (sent in initialize). */
   optOutNotificationMethods?: string[];
+  /**
+   * Realtime voice on threads (decision 11, `HarnessSession.live`): opts the connection
+   * into Codex's experimental API (`thread/realtime/*`, v3 over WebRTC). Off by default.
+   */
+  live?: boolean;
   /** Defaults for every session; `HarnessOpenArgs.options` overrides per session. */
   profiles?: Record<string, CodexProfile>;
   resolveMedia?: MediaResolver;
@@ -221,9 +226,9 @@ async function handshake(transport: Transport, opts: CodexHarnessOptions): Promi
     const params: InitializeParams = {
       clientInfo: opts.clientInfo ?? { name: 'agents_io', title: 'agents-io', version: '0.1.0' },
       capabilities: {
-        experimentalApi: false,
+        experimentalApi: !!opts.live,
         requestAttestation: false,
-        optOutNotificationMethods: opts.optOutNotificationMethods ?? DEFAULT_OPT_OUT,
+        optOutNotificationMethods: (opts.optOutNotificationMethods ?? DEFAULT_OPT_OUT).filter((m) => !opts.live || !LIVE_NOTIFICATIONS.includes(m)),
       },
     };
     const init = await rpc.request<InitializeResponse>('initialize', params, opts.handshakeTimeoutMs ?? 30_000);
@@ -397,6 +402,7 @@ export class CodexHarness implements HarnessAdapter {
       ...options,
       profiles: { ...this.opts.profiles, ...options.profiles },
       resolveMedia: options.resolveMedia ?? this.opts.resolveMedia,
+      live: !!this.opts.live && options.live !== false,
     };
     this.opening++;
     try {

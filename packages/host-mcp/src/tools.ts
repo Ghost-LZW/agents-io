@@ -103,6 +103,17 @@ export interface HostToolsOptions {
   provenance?(sessionKey: string, turnId: string): TurnProvenance | undefined;
   /** Topics of the caller's conversation (decision 6); absent = no session_* tools. */
   topics?: TopicControl;
+  /** Live (realtime voice) control (decision 11); absent = no live_* tools. */
+  live?: LiveControl;
+}
+
+/** What the live_* tools need from the host (decision 11). */
+export interface LiveControl {
+  /** Open a live on `channel` (default: the turn's reply channel) and attach it to this session's harness thread. */
+  join(sessionKey: string, turn: TurnContext, a: { target: string; channel?: string; instructions?: string; voice?: string }): Promise<{ liveId: string; title: string; route: string }>;
+  say(sessionKey: string, text: string): Promise<void>;
+  /** Ends the session's live; false when none runs. */
+  leave(sessionKey: string): Promise<boolean>;
 }
 
 /**
@@ -200,6 +211,11 @@ export class HostTools {
     return !!this.o.watches;
   }
 
+  /** Whether the live_* tools are offered (the host passed `live`). */
+  get hasLive(): boolean {
+    return !!this.o.live;
+  }
+
   /** Whether the session_* tools are offered (the host passed `topics`). */
   get hasTopics(): boolean {
     return !!this.o.topics;
@@ -231,8 +247,45 @@ export class HostTools {
       case 'session_rotate':
       case 'session_switch':
         return json(await this.handover(b, turn, name, args, operationId));
+      case 'live_join':
+      case 'live_say':
+      case 'live_leave':
+        return json(await this.liveTool(b, turn, name, args));
       default:
         throw new ToolError(`unknown tool ${name}`);
+    }
+  }
+
+  // ---- live (decision 11) ------------------------------------------------------------------
+
+  private async liveTool(b: ToolBinding, turn: TurnContext, name: 'live_join' | 'live_say' | 'live_leave', args: Record<string, unknown>) {
+    const live = this.o.live;
+    if (!live) throw new ToolError('live sessions are not available in this deployment');
+    try {
+      switch (name) {
+        case 'live_join': {
+          const target = str(args.target, 'target')!;
+          const r = await live.join(b.sessionKey, turn, {
+            target,
+            ...(str(args.channel, 'channel', true) ? { channel: args.channel as string } : {}),
+            ...(str(args.instructions, 'instructions', true) ? { instructions: args.instructions as string } : {}),
+            ...(str(args.voice, 'voice', true) ? { voice: args.voice as string } : {}),
+          });
+          return {
+            ok: true,
+            ...r,
+            note: 'You are now in the live session by voice. What people say there reaches you as delegated turns (inputs marked live=true); your answer in such a turn is spoken by the voice side, so keep it short and plain. The voice side may paraphrase wrongly: send results that matter as text (send_message to "current") as well. Call live_leave when asked to leave.',
+          };
+        }
+        case 'live_say':
+          await live.say(b.sessionKey, str(args.text, 'text')!);
+          return { ok: true };
+        case 'live_leave':
+          return { ok: true, left: await live.leave(b.sessionKey) };
+      }
+    } catch (e) {
+      if (e instanceof ToolError) throw e;
+      throw new ToolError(`${name} failed: ${(e as Error).message}`);
     }
   }
 

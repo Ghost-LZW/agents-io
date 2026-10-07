@@ -4,11 +4,13 @@ import type {
   BodyOf,
   Decision,
   HarnessEvent,
+  HarnessLive,
   HarnessOpenArgs,
   HarnessSession,
   InputRecord,
   ItemSummary,
   Level,
+  LiveStartArgs,
   RunSpec,
   SteerResult,
 } from '@agents-io/protocol';
@@ -78,6 +80,11 @@ export interface CodexOpenOptions {
   baseInstructions?: string;
   developerInstructions?: string;
   ephemeral?: boolean;
+  /**
+   * Realtime voice on the thread (decision 11). Set by the harness when the connection
+   * opted into the experimental API; per-session options can turn it off.
+   */
+  live?: boolean;
   /** Name the host MCP endpoint is mounted under (default `agents_io`). */
   mcpServerName?: string;
   /**
@@ -90,7 +97,7 @@ export interface CodexOpenOptions {
 interface Turn {
   turnId: string;
   run?: RunSpec;
-  initiator: 'host' | 'foreign';
+  initiator: Initiator;
   codexTurnId?: string;
   bound: Promise<string | undefined>;
   bind(id: string | undefined): void;
@@ -128,7 +135,7 @@ export interface TurnSnapshot {
   turnId: string;
   codexTurnId: string;
   run?: RunSpec;
-  initiator?: 'host' | 'foreign';
+  initiator?: Initiator;
   startInputs: string[];
   steerInputs: string[];
   consumed: string[];
@@ -149,6 +156,20 @@ export interface SessionHost {
 }
 
 type Extra = Partial<Omit<HarnessEvent, 'body' | 'ts'>>;
+type Initiator = 'host' | 'harness' | 'foreign';
+
+/** Realtime voice running on the thread (experimental `thread/realtime/*`, protocol v3). */
+interface LiveState {
+  liveId: string;
+  /** Waits for `thread/realtime/sdp` (the answer to the far side's offer). */
+  answer?: { resolve(sdp: string): void; reject(e: Error): void };
+  /** A delegation waiting for the turn Codex starts for it. */
+  handoff?: { inputId: string };
+  ended: boolean;
+}
+
+/** How long `live.start` waits for Codex's SDP answer. */
+const LIVE_ANSWER_TIMEOUT_MS = 30_000;
 
 const EPHEMERAL = new Set<Body['t']>(['text.delta', 'item.progress', 'headline']);
 
@@ -163,6 +184,8 @@ export class CodexSession implements HarnessSession {
   private finishedCodexTurns = new Set<string>();
   /** File paths of fileChange items, for approval previews. */
   private fileItems = new Map<string, string[]>();
+  private liveState: LiveState | undefined;
+  readonly live?: HarnessLive;
 
   constructor(
     private readonly host: SessionHost,
@@ -173,6 +196,13 @@ export class CodexSession implements HarnessSession {
     adopt?: TurnSnapshot,
   ) {
     this.emit({ t: 'session.bound', nativeId: threadId }, { level: 'detail' });
+    if (opts.live) {
+      this.live = {
+        start: (a) => this.liveStart(a),
+        say: (text) => this.liveRequest('thread/realtime/appendSpeech', { threadId: this.threadId, text }),
+        stop: () => this.liveStop(),
+      };
+    }
     if (adopt) {
       const t = this.newTurn(adopt.turnId, adopt.run, adopt.startInputs, adopt.initiator ?? 'host');
       t.bind(adopt.codexTurnId);
@@ -318,6 +348,10 @@ export class CodexSession implements HarnessSession {
       await Promise.race([t.finished, delay(3000)]);
       if (!t.done) this.finishTurn(t, 'ambiguous', { code: 'session_closed', retryable: false, message: reason });
     }
+    if (this.liveState && !this.liveState.ended) {
+      await this.liveStop().catch(() => undefined);
+      this.liveEnded('session closed');
+    }
     this.closed = true;
     const params: ThreadUnsubscribeParams = { threadId: this.threadId };
     await this.host.rpc.request('thread/unsubscribe', params, 5000).catch(() => undefined);
@@ -383,6 +417,7 @@ export class CodexSession implements HarnessSession {
     const t = this.active;
     if (t && !t.done) this.finishTurn(t, 'ambiguous', { code: 'harness_exited', retryable: false, message: reason });
     for (const id of [...this.requests.keys()]) this.cancelRequest(id);
+    this.liveEnded(`harness exited: ${reason}`);
     this.setState('error');
     this.closed = true;
     this.queue.close();
@@ -500,6 +535,13 @@ export class CodexSession implements HarnessSession {
       case 'item/autoApprovalReview/started':
       case 'item/autoApprovalReview/completed':
         return this.onAutoReview(method, params as ItemGuardianApprovalReviewStartedNotification | ItemGuardianApprovalReviewCompletedNotification);
+      case 'thread/realtime/sdp':
+      case 'thread/realtime/transcript/done':
+      case 'thread/realtime/itemAdded':
+      case 'thread/realtime/error':
+      case 'thread/realtime/closed':
+      case 'thread/realtime/started':
+        return this.onLive(method, params);
       case 'model/rerouted': {
         const p = params as ModelReroutedNotification;
         const t = this.turnFor(p.turnId);
@@ -694,14 +736,122 @@ export class CodexSession implements HarnessSession {
    * with a minted turnId, so its items, approvals and completion map normally.
    */
   private foreignTurn(codexTurnId: string): Turn {
-    const t = this.newTurn(`codex:${codexTurnId}`, undefined, [], 'foreign');
+    // A turn the voice side asked for (decision 11): it carries the delegation as its input.
+    const handoff = this.liveState?.handoff;
+    if (this.liveState) this.liveState.handoff = undefined;
+    const inputs = handoff ? [handoff.inputId] : [];
+    const initiator: Initiator = handoff ? 'harness' : 'foreign';
+    const t = this.newTurn(`codex:${codexTurnId}`, undefined, inputs, initiator);
     t.bind(codexTurnId);
     this.active = t;
     this.emit(
-      { t: 'turn.started', turnId: t.turnId, inputIds: [], replyRoute: null, initiator: 'foreign', nativeTurnId: codexTurnId },
+      { t: 'turn.started', turnId: t.turnId, inputIds: inputs, replyRoute: null, initiator, nativeTurnId: codexTurnId },
       { turnId: t.turnId },
     );
+    // Codex never echoes a delegation as a userMessage with our clientId: it is consumed by construction.
+    for (const id of inputs) t.consumed.add(id);
+    if (inputs.length) this.emit({ t: 'input.consumed', inputIds: inputs, turnId: t.turnId }, { turnId: t.turnId, level: 'detail' });
     return t;
+  }
+
+  // ---- live (realtime voice) ----------------------------------------------------
+
+  private async liveStart(a: LiveStartArgs): Promise<{ answerSdp: string }> {
+    if (this.closed) throw new Error('codex session is closed');
+    if (this.liveState && !this.liveState.ended) throw new Error(`live ${this.liveState.liveId} is already running on this thread`);
+    const st: LiveState = { liveId: a.liveId, ended: false };
+    this.liveState = st;
+    const answer = new Promise<string>((resolve, reject) => {
+      st.answer = { resolve, reject };
+      setTimeout(() => reject(new Error(`no SDP answer from codex within ${LIVE_ANSWER_TIMEOUT_MS / 1000}s`)), LIVE_ANSWER_TIMEOUT_MS).unref();
+    });
+    answer.catch(() => undefined);
+    try {
+      await this.host.rpc.request('thread/realtime/start', {
+        threadId: this.threadId,
+        version: 'v3',
+        outputModality: 'audio',
+        transport: a.transport,
+        ...(a.instructions ? { initialItems: [{ role: 'developer', text: a.instructions }] } : {}),
+        ...(a.voice ? { voice: a.voice } : {}),
+      });
+      const sdp = await answer;
+      st.answer = undefined;
+      return { answerSdp: sdp };
+    } catch (e) {
+      st.answer = undefined;
+      if (!st.ended) {
+        st.ended = true;
+        if (this.liveState === st) this.liveState = undefined;
+        await this.host.rpc.request('thread/realtime/stop', { threadId: this.threadId }, 5000).catch(() => undefined);
+      }
+      throw e;
+    }
+  }
+
+  private async liveStop(): Promise<void> {
+    const st = this.liveState;
+    if (!st || st.ended) return;
+    await this.host.rpc.request('thread/realtime/stop', { threadId: this.threadId }, 10_000).catch((e: Error) => {
+      // The server may already have closed it; `thread/realtime/closed` (or the fallback below) ends it.
+      this.emit({ t: 'notice', code: 'other', message: `realtime stop: ${e.message}` }, { level: 'detail' });
+    });
+    // Normally `thread/realtime/closed` follows; do not leave the live open if it never comes.
+    setTimeout(() => this.liveEnded('stopped', st), 5000).unref();
+  }
+
+  private async liveRequest(method: string, params: unknown): Promise<void> {
+    if (!this.liveState || this.liveState.ended) throw new Error('no live session is running on this thread');
+    await this.host.rpc.request(method, params);
+  }
+
+  private liveEnded(reason: string, which?: LiveState): void {
+    const st = this.liveState;
+    if (!st || st.ended || (which && which !== st)) return;
+    st.ended = true;
+    this.liveState = undefined;
+    st.answer?.reject(new Error(`realtime closed: ${reason}`));
+    this.emit({ t: 'live.ended', liveId: st.liveId, reason }, { level: 'primary' });
+  }
+
+  private onLive(method: string, params: unknown): void {
+    const st = this.liveState;
+    if (!st) return this.native(method, params);
+    const p = params as Record<string, unknown>;
+    switch (method) {
+      case 'thread/realtime/sdp':
+        if (typeof p.sdp === 'string') st.answer?.resolve(p.sdp);
+        return;
+      case 'thread/realtime/transcript/done': {
+        const role = p.role === 'user' || p.role === 'assistant' ? p.role : undefined;
+        const text = typeof p.text === 'string' ? p.text.trim() : '';
+        if (role && text) this.emit({ t: 'live.transcript', liveId: st.liveId, role, text }, { audience: role === 'assistant' ? 'answer' : 'status' });
+        return;
+      }
+      case 'thread/realtime/itemAdded': {
+        const item = (p.item ?? {}) as { type?: unknown; handoff_id?: unknown; item_id?: unknown; input_transcript?: unknown };
+        if (item.type !== 'handoff_request') return this.native(method, params);
+        const id = typeof item.handoff_id === 'string' ? item.handoff_id : typeof item.item_id === 'string' ? item.item_id : `${Date.now()}`;
+        const inputId = `live:${st.liveId}:${id}`;
+        const text = typeof item.input_transcript === 'string' ? item.input_transcript : '';
+        this.emit({ t: 'live.handoff', liveId: st.liveId, inputId, text }, { level: 'detail', native: params });
+        const t = this.active;
+        if (t && !t.done) {
+          // Codex folds a delegation made while a turn runs into that turn.
+          t.steerInputs.add(inputId);
+          t.consumed.add(inputId);
+          this.emit({ t: 'input.consumed', inputIds: [inputId], turnId: t.turnId }, { turnId: t.turnId, level: 'detail' });
+        } else st.handoff = { inputId };
+        return;
+      }
+      case 'thread/realtime/error':
+        this.emit({ t: 'notice', code: 'other', message: `realtime error: ${typeof p.message === 'string' ? p.message : JSON.stringify(p)}` }, { level: 'detail' });
+        return;
+      case 'thread/realtime/closed':
+        return this.liveEnded(typeof p.reason === 'string' && p.reason ? p.reason : 'closed');
+      default:
+        return; // thread/realtime/started: nothing to add
+    }
   }
 
   /** turnFor, or a new foreign turn when nothing of ours is running. */
@@ -717,7 +867,7 @@ export class CodexSession implements HarnessSession {
     return turnId && this.active?.turnId === turnId && !this.active.done ? turnId : undefined;
   }
 
-  private newTurn(turnId: string, run: RunSpec | undefined, startInputs: string[], initiator: 'host' | 'foreign' = 'host'): Turn {
+  private newTurn(turnId: string, run: RunSpec | undefined, startInputs: string[], initiator: Initiator = 'host'): Turn {
     let bindFn!: (id: string | undefined) => void;
     let finishFn!: () => void;
     const bound = new Promise<string | undefined>((r) => (bindFn = r));

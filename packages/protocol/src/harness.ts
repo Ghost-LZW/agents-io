@@ -22,6 +22,28 @@ export interface HarnessOpenArgs {
   env?: Record<string, string>;
 }
 
+/** Start a realtime voice session on the harness session's native thread (decision 11). */
+export interface LiveStartArgs {
+  liveId: string;
+  /** The far side's offer; the answer comes back from `start`. */
+  transport: { type: 'webrtc'; sdp: string };
+  /** Instructions for the voice side (spoken style, what to delegate). */
+  instructions?: string;
+  voice?: string;
+}
+
+/**
+ * Realtime voice on the session's thread. The harness emits `live.transcript`,
+ * `live.handoff` (each delegation, before the turn it starts) and `live.ended`.
+ */
+export interface HarnessLive {
+  start(args: LiveStartArgs): Promise<{ answerSdp: string }>;
+  /** Have the voice side say this. */
+  say(text: string): Promise<void>;
+  /** End the voice session; `live.ended` follows. Idempotent. */
+  stop(): Promise<void>;
+}
+
 export type SteerResult = 'steered' | 'stale' | 'not_steerable' | 'no_active_turn' | 'unsupported';
 
 /**
@@ -52,6 +74,8 @@ export interface HarnessSession {
    * resolver (auto, model, human) and drops the adapter's echo.
    */
   respond(requestId: string, decision: Decision): Promise<void>;
+  /** Realtime voice on this session's thread, when the harness has it. */
+  readonly live?: HarnessLive;
   /** Events in emission order. Ends when the session closes. */
   readonly events: AsyncIterable<HarnessEvent>;
   close(reason: string): Promise<void>;

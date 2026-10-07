@@ -168,8 +168,31 @@ export interface ChannelAdapter {
   typing?(route: ReplyRoute, on: boolean): Promise<void>;
   /** After restart: is a previously sent (streaming) message still editable? */
   reconcile?(route: ReplyRoute, providerMessageId: string): Promise<'alive' | 'gone'>;
+  /**
+   * Open a live media endpoint (decision 11), e.g. join a meeting: `target` is the
+   * channel's own (a meeting number…). The harness answers the endpoint's offer;
+   * media then flows between them, never through the gateway.
+   */
+  openLive?(account: string, target: string): Promise<LiveEndpoint>;
   /** Release resources (called once, at daemon shutdown, after `start`'s signal aborted). */
   close?(): Promise<void>;
+}
+
+/** A live media peer a channel opened (`ChannelAdapter.openLive`). */
+export interface LiveEndpoint {
+  /** Channel-side id (e.g. the meeting participant). */
+  readonly id: string;
+  /** What was joined, for the log and the agent (e.g. "meeting 490437292"). */
+  readonly title: string;
+  /** Where the live happens, as a route (transcripts and provenance name it). */
+  readonly route: ReplyRoute;
+  readonly offer: { type: 'webrtc'; sdp: string };
+  /** Hand the harness's answer to the far side. */
+  answer(sdp: string): Promise<void>;
+  /** Leave. Idempotent. */
+  close(reason: string): Promise<void>;
+  /** Resolves with a reason when the far side ends it (left, removed, meeting over), or after `close`. */
+  readonly ended: Promise<string>;
 }
 
 /** Passed to a channel plugin's factory. */

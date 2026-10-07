@@ -65,6 +65,15 @@ see `docs/E2E.md` §0). New:
   `createChannel` (or `default`). It runs in the daemon's process with the blob
   store, so load only code you trust. Two channels with the same (id, account)
   fail the start. See `docs/CHANNELS.md` §5.
+- **Live (realtime voice, decision 11)**: a Codex instance with `"live": true` opts
+  its app-server connection into Codex's experimental realtime API. Agents on it
+  (with `tools`) get `live_join { target, channel?, instructions?, voice? }`,
+  `live_say { text }` and `live_leave`: a channel that implements
+  `ChannelAdapter.openLive` (e.g. a meeting) provides the media peer, the session's
+  Codex thread answers it with realtime v3 over WebRTC, and the audio flows between
+  them, never through the daemon. What people say there is delegated by the voice
+  into turns of the same session (same permissions as its text turns; inputs carry
+  `live=true`, no principal). See `docs/CHANNELS.md` §7a.
 - Interactive turns plan `{ harness, model, effort }` from the agent; the profile
   is the agent's `profile`, else the policy's (owners only → `bypass`). Task runs
   use the agent's `profile`, default `restricted`.

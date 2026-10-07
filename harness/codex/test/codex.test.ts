@@ -791,3 +791,109 @@ describe('helpers', () => {
     ]);
   });
 });
+
+describe('live (realtime voice, decision 11)', () => {
+  const offer = { type: 'webrtc' as const, sdp: 'v=0 offer' };
+
+  function liveServer(fake: FakeAppServer) {
+    fake.handlers['thread/realtime/start'] = (p) => {
+      queueMicrotask(() => {
+        fake.notify('thread/realtime/started', { threadId: p.threadId, realtimeSessionId: p.threadId, version: 'v3' });
+        fake.notify('thread/realtime/sdp', { threadId: p.threadId, sdp: 'v=0 answer' });
+      });
+      return {};
+    };
+    fake.handlers['thread/realtime/stop'] = (p) => {
+      queueMicrotask(() => fake.notify('thread/realtime/closed', { threadId: p.threadId, reason: 'requested' }));
+      return {};
+    };
+    fake.handlers['thread/realtime/appendSpeech'] = () => ({});
+  }
+
+  it('is only offered when enabled, and opts the connection into the experimental API', async () => {
+    const off = setup();
+    expect((await open(off.harness)).live).toBeUndefined();
+    expect(off.fake.sent('initialize')[0]!.params.capabilities.experimentalApi).toBe(false);
+    const on = setup({ live: true });
+    const s = await open(on.harness);
+    expect(s.live).toBeDefined();
+    const caps = on.fake.sent('initialize')[0]!.params.capabilities;
+    expect(caps.experimentalApi).toBe(true);
+    expect(caps.optOutNotificationMethods).not.toContain('thread/realtime/itemAdded');
+    expect(caps.optOutNotificationMethods).toContain('thread/realtime/outputAudio/delta');
+    expect((await open(on.harness, { options: { live: false } })).live).toBeUndefined();
+  });
+
+  it('starts v3 over WebRTC on the thread and returns the answer; transcripts, speech and stop map', async () => {
+    const { fake, harness } = setup({ live: true });
+    liveServer(fake);
+    const s = await open(harness);
+    const c = collector(s);
+    const r = await s.live!.start({ liveId: 'L1', transport: offer, instructions: 'be brief', voice: 'cove' });
+    expect(r).toEqual({ answerSdp: 'v=0 answer' });
+    expect(fake.sent('thread/realtime/start')[0]!.params).toEqual({
+      threadId: 'thr-1',
+      version: 'v3',
+      outputModality: 'audio',
+      transport: offer,
+      initialItems: [{ role: 'developer', text: 'be brief' }],
+      voice: 'cove',
+    });
+    await expect(s.live!.start({ liveId: 'L2', transport: offer })).rejects.toThrow(/already running/);
+    fake.notify('thread/realtime/transcript/done', { threadId: 'thr-1', role: 'user', text: ' 听见吗 ' });
+    fake.notify('thread/realtime/transcript/done', { threadId: 'thr-1', role: 'assistant', text: '听见啦' });
+    await s.live!.say('hello all');
+    expect(fake.sent('thread/realtime/appendSpeech')[0]!.params).toEqual({ threadId: 'thr-1', text: 'hello all' });
+    await s.live!.stop();
+    await c.until((e) => e.body.t === 'live.ended');
+    expect(c.of('live.transcript')).toEqual([
+      { t: 'live.transcript', liveId: 'L1', role: 'user', text: '听见吗' },
+      { t: 'live.transcript', liveId: 'L1', role: 'assistant', text: '听见啦' },
+    ]);
+    expect(c.of('live.ended')).toEqual([{ t: 'live.ended', liveId: 'L1', reason: 'requested' }]);
+    await expect(s.live!.say('x')).rejects.toThrow(/no live/);
+  });
+
+  it('a delegation becomes the input of the turn Codex starts for it (initiator harness, consumed)', async () => {
+    const { fake, harness } = setup({ live: true });
+    liveServer(fake);
+    const s = await open(harness);
+    const c = collector(s);
+    await s.live!.start({ liveId: 'L1', transport: offer });
+    fake.notify('thread/realtime/itemAdded', { threadId: 'thr-1', item: { type: 'handoff_request', handoff_id: 'h1', item_id: 'h1', input_transcript: '看看当前目录', active_transcript: [] } });
+    fake.notify('turn/started', { threadId: 'thr-1', turn: { id: 'd-1', status: 'inProgress', items: [] } });
+    fake.notify('item/completed', { threadId: 'thr-1', turnId: 'd-1', item: { type: 'agentMessage', id: 'm', text: '目录是空的', phase: 'final_answer', memoryCitation: null, delivery: null, questions: null } });
+    // a second delegation while that turn runs is folded into it
+    fake.notify('thread/realtime/itemAdded', { threadId: 'thr-1', item: { type: 'handoff_request', handoff_id: 'h2', input_transcript: '你挂了吧' } });
+    fake.notify('turn/completed', { threadId: 'thr-1', turn: { id: 'd-1', status: 'completed', items: [], error: null } });
+    await c.until(isCompleted);
+    expect(c.of('live.handoff')).toEqual([
+      { t: 'live.handoff', liveId: 'L1', inputId: 'live:L1:h1', text: '看看当前目录' },
+      { t: 'live.handoff', liveId: 'L1', inputId: 'live:L1:h2', text: '你挂了吧' },
+    ]);
+    expect(c.of('turn.started')).toEqual([{ t: 'turn.started', turnId: 'codex:d-1', inputIds: ['live:L1:h1'], replyRoute: null, initiator: 'harness', nativeTurnId: 'd-1' }]);
+    expect(c.of('input.consumed').map((b) => b.inputIds)).toEqual([['live:L1:h1'], ['live:L1:h2']]);
+    expect(c.of('turn.completed')[0]).toMatchObject({ turnId: 'codex:d-1', status: 'completed' });
+    // a turn with no delegation pending stays foreign
+    fake.notify('turn/started', { threadId: 'thr-1', turn: { id: 'tui-2', status: 'inProgress', items: [] } });
+    await c.until((e) => e.body.t === 'turn.started' && e.turnId === 'codex:tui-2');
+    expect(c.of('turn.started')[1]).toMatchObject({ initiator: 'foreign', inputIds: [] });
+  });
+
+  it('a start whose answer never comes or fails cleans up; the session closing ends the live', async () => {
+    const { fake, harness } = setup({ live: true });
+    fake.handlers['thread/realtime/start'] = () => {
+      throw new FakeRpcError(-32600, 'realtime unavailable');
+    };
+    fake.handlers['thread/realtime/stop'] = () => ({});
+    const s = await open(harness);
+    const c = collector(s);
+    await expect(s.live!.start({ liveId: 'L1', transport: offer })).rejects.toThrow(/realtime unavailable/);
+    liveServer(fake);
+    fake.handlers['thread/realtime/stop'] = () => ({});
+    await s.live!.start({ liveId: 'L2', transport: offer });
+    await s.close('bye');
+    await c.done;
+    expect(c.of('live.ended')).toEqual([{ t: 'live.ended', liveId: 'L2', reason: 'session closed' }]);
+  });
+});

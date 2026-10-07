@@ -333,7 +333,7 @@ describe('HostMcpServer (streamable HTTP)', () => {
     await s.listen();
     const client = await connect(s.url, s.mcpFor({ sessionKey: SK, generation: 1, harnessId: 'fake' }).token);
     const listed = await client.listTools();
-    expect(listed.tools.map((t) => t.name).sort()).toEqual(TOOL_NAMES.filter((n) => !n.startsWith('watch_') && !n.startsWith('session_')).sort());
+    expect(listed.tools.map((t) => t.name).sort()).toEqual(TOOL_NAMES.filter((n) => !n.startsWith('watch_') && !n.startsWith('session_') && !n.startsWith('live_')).sort());
     for (const t of listed.tools) expect(t.description!.length).toBeGreaterThan(80);
     const args = { name: 'send_message', arguments: { route: 'current', text: 'via mcp' }, _meta: { 'claudecode/toolUseId': 'toolu_abc' } };
     const r1 = await client.callTool(args);

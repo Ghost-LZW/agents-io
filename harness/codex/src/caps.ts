@@ -35,6 +35,16 @@ export const DEFAULT_OPT_OUT = [
   'windowsSandbox/setupCompleted',
 ];
 
+/** Realtime notifications a `live` connection needs (audio and partial transcripts stay opted out). */
+export const LIVE_NOTIFICATIONS = [
+  'thread/realtime/closed',
+  'thread/realtime/error',
+  'thread/realtime/itemAdded',
+  'thread/realtime/sdp',
+  'thread/realtime/started',
+  'thread/realtime/transcript/done',
+];
+
 /**
  * What Codex 0.160 app-server supports, as agents-io capabilities:
  * - steer: `turn/steer` with `expectedTurnId` injects into the running turn;

@@ -212,6 +212,24 @@ export const Body = Type.Union([
     title: Type.Optional(Type.String()),
     reason: TopicChangeReason,
   }),
+  /** A realtime voice session opened on this session (decision 11). Recorded by the session layer. */
+  T('live.started', {
+    liveId: Type.String(),
+    title: Type.String(),
+    /** Where the live happens (the channel's media peer). */
+    route: ReplyRoute,
+    /** Route of the turn that opened it; delegated turns may send text there. */
+    controlRoute: Type.Union([ReplyRoute, Type.Null()]),
+  }),
+  /** One finished utterance of the live: `user` = the far side (everyone else, mixed), `assistant` = the voice. */
+  T('live.transcript', { liveId: Type.String(), role: Type.Union([Type.Literal('user'), Type.Literal('assistant')]), text: Type.String() }),
+  /**
+   * The voice side delegated to the harness's agent. The harness emits it before the
+   * turn it starts (`turn.started{initiator:'harness', inputIds:[inputId]}`); the session
+   * layer turns it into an input record.
+   */
+  T('live.handoff', { liveId: Type.String(), inputId: Type.String(), text: Type.String() }),
+  T('live.ended', { liveId: Type.String(), reason: Type.String() }),
   T('native', { name: Type.String() }),
 ]);
 export type Body = Static<typeof Body>;
