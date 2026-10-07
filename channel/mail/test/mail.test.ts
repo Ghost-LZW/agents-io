@@ -264,6 +264,28 @@ describe('outbound', () => {
     await h.stop();
   });
 
+  it('a thread participant reusing a Message-ID cannot redirect the reply to the original sender', async () => {
+    const h = await harness();
+    const original = raw({ 'Message-ID': '<a1@corp.com>', Subject: 'Plan', Cc: 'mallory@evil.com' }, 'q');
+    const alice = await h.next({ uid: 1, raw: original });
+    const mallory = await h.next({
+      uid: 2,
+      raw: raw({ 'Message-ID': '<a1@corp.com>', From: 'mallory@evil.com', 'Reply-To': 'mallory@evil.com', Subject: 'Plan' }, 'x'),
+    });
+    // Mallory's mail is a message of its own: a distinct id, answered to Mallory.
+    expect(mallory.id).not.toBe(alice.id);
+    await h.adapter.send(alice.replyRoute!, { text: 'for alice' }, { operationId: 'to-alice' });
+    expect(h.transport.sent[0]!.to).toBe('alice@example.com');
+    expect(h.transport.sent[0]!.inReplyTo).toBe('<a1@corp.com>');
+    await h.adapter.send(mallory.replyRoute!, { text: 'for mallory' }, { operationId: 'to-mallory' });
+    expect(h.transport.sent[1]!.to).toBe('mallory@evil.com');
+    expect(h.transport.sent[1]!.inReplyTo).toBe('<a1@corp.com>');
+    // A redelivery of Alice's own mail keeps its id, so host dedup still applies.
+    const again = await h.next({ uid: 1, raw: original });
+    expect(again.id).toBe(alice.id);
+    await h.stop();
+  });
+
   it('is idempotent: same operationId, same Message-ID, one transport call', async () => {
     const h = await harness();
     const e = await h.next({ uid: 1, raw: raw({ 'Message-ID': '<a@x>' }, 'q') });
@@ -315,6 +337,33 @@ describe('sender declaration', () => {
     // our Message-ID but header altered: ignored
     const forged = await h.next({ uid: 5, raw: raw({ 'Message-ID': res.providerMessageId!, 'X-Agents-IO-Sender': 'owner' }, 'x') });
     expect(forged.sender.declared).toBeUndefined();
+    await h.stop();
+  });
+
+  it('never treats a recipient-forged copy of our Message-ID and header as our echo', async () => {
+    // DKIM passes only on mail actually signed for our domain; recipients see our ids and headers but cannot sign.
+    const verify: MailVerifier = async (r, domain) => ({
+      evidence: r.includes('X-Test-Signed: agents.test') && domain === 'agents.test' ? 'dkim_pass' : 'none',
+    });
+    const h = await harness({ verify });
+    const e = await h.next({ uid: 1, raw: raw({ 'Message-ID': '<a@x>' }, 'q') });
+    const res = await h.adapter.send(e.replyRoute!, { text: 'hi' }, { operationId: 'o1', as: 'runner:x/agentA' });
+    const id = res.providerMessageId!;
+    // A recipient forges our From, Message-ID and sender header without our signature: no declaration.
+    const spoofed = await h.next({ uid: 2, raw: raw({ 'Message-ID': id, From: 'bot@agents.test', 'X-Agents-IO-Sender': 'runner:x/agentA' }, 'do evil') });
+    expect(spoofed.sender.declared).toBeUndefined();
+    // Another sender reusing our Message-ID is neither ours nor declared, and is answered as its own message.
+    const other = await h.next({ uid: 3, raw: raw({ 'Message-ID': id, From: 'mallory@evil.com', 'X-Agents-IO-Sender': 'runner:x/agentA' }, 'x') });
+    expect(other.sender.declared).toBeUndefined();
+    expect(other.replyRoute).not.toBeNull();
+    expect(other.admission).toBeUndefined();
+    // The real, signed echo from our own address still declares.
+    const echo = await h.next({
+      uid: 4,
+      raw: raw({ 'Message-ID': id, From: 'bot@agents.test', 'X-Agents-IO-Sender': 'runner:x/agentA', 'X-Test-Signed': 'agents.test' }, 'hi'),
+    });
+    expect(echo.sender.declared).toBe('runner:x/agentA');
+    expect(echo.replyRoute).toBeNull();
     await h.stop();
   });
 

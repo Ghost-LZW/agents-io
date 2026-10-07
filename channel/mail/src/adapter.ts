@@ -3,7 +3,7 @@ import type { BlobStore, ChannelAdapter, ChannelCaps, ChannelContext, RenderedMe
 import { mailauthVerifier } from './auth.js';
 import { ImapSource } from './imap.js';
 import { SENDER_HEADER, parseInbound } from './inbound.js';
-import { messageIdFor, renderHtml, renderText, replySubject } from './outbound.js';
+import { addressOf, messageIdFor, renderHtml, renderText, replySubject } from './outbound.js';
 import {
   MemoryMailStore,
   type BlobSink,
@@ -84,6 +84,7 @@ export class MailChannel implements ChannelAdapter {
           store: this.store,
           blobs: this.blobs,
           verify: this.verify,
+          self: addressOf(this.cfg.from),
         });
         // Checkpoint only after the host has durably taken the envelope; a throw retries it.
         await ctx.emit(env);
@@ -143,10 +144,11 @@ export class MailChannel implements ChannelAdapter {
       const first = msg.text.split('\n').find((l) => l.trim()) ?? '(no subject)';
       return { to, subject: first.slice(0, 80), inReplyTo: undefined as string | undefined, references: [] as string[] };
     }
-    const meta =
-      (route.replyToMessageId ? await this.store.getMeta(route.replyToMessageId) : undefined) ?? (await this.store.getMeta(route.conversationId));
+    const byMessage = route.replyToMessageId ? await this.store.getMeta(route.replyToMessageId) : undefined;
+    const meta = byMessage ?? (await this.store.getMeta(route.conversationId));
     if (!meta) throw new Error(`mail: no known message to reply to for ${route.replyToMessageId ?? route.conversationId}`);
-    const inReplyTo = route.replyToMessageId ?? meta.references.at(-1);
+    // The route's message key is ours; the message's own Message-ID header is the last reference.
+    const inReplyTo = byMessage ? byMessage.references.at(-1) : (route.replyToMessageId ?? meta.references.at(-1));
     const refs = [...meta.references];
     if (!refs.includes(meta.threadRoot)) refs.unshift(meta.threadRoot);
     return { to: meta.replyTo, subject: replySubject(meta.subject), inReplyTo, references: refs };
