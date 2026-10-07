@@ -37,3 +37,9 @@ agents-io 的 agent IO 层（多端输入 / 多端输出 / 过程可见 / 可扩
 |---|---|
 | [critique/feasibility.md](critique/feasibility.md) | 可行性与事实核查：Claude 合批、音箱无音频通道、Codex TUI 不能只读、重启丢 turn |
 | [critique/ops-security.md](critique/ops-security.md) | 运维与安全：trust 粒度、身份伪造、审批安全、崩溃重放、限流、成本 |
+
+## 待实现方案
+
+| 文件 | 内容 |
+|---|---|
+| [design/claude-persistence.md](design/claude-persistence.md) | Claude Code 跨守护进程重启的轮次接管：`spawnClaudeCodeProcess` + `reinitialize()` + 常驻的 `aio-hold` 进程 |
