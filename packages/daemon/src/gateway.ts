@@ -1,7 +1,13 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { dirname } from 'node:path';
+import { readFileSync, rmSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import {
+  PROTOCOL_VERSION,
   routeKey,
+  type AdminQueue,
+  type AdminSession,
+  type AdminSessions,
+  type AdminStatus,
   type ChannelAdapter,
   type ContentBlock,
   type HarnessAdapter,
@@ -47,6 +53,9 @@ import { LarkBotAdapter } from '@agents-io/channel-lark-bot';
 import { MailChannel, type MailChannelConfig } from '@agents-io/channel-mail';
 import { spawnChannel } from '@agents-io/channel-jsonl-bridge';
 import { agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ResolvedChannel } from './config.js';
+import { ConsoleServer } from './console.js';
+import { ConfigStore } from './console-config.js';
+import { LarkBotJobs } from './provision.js';
 import type { ClientCommand, SessionInfo } from './frames.js';
 import { HostService, isHostOrigin } from './host.js';
 import { LocalServer } from './local-server.js';
@@ -54,7 +63,7 @@ import { privateDb, privateDir } from './private.js';
 import { blobResolvers, type MediaResolvers } from './media.js';
 import { DaemonRecords } from './records.js';
 import { Runs } from './runs.js';
-import { removeTokenFile, tokenPath, writeTokenFile } from './token.js';
+import { consoleUrlPath, removeTokenFile, tokenPath, writeTokenFile } from './token.js';
 
 export type LogFn = (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
 
@@ -93,6 +102,10 @@ export interface GatewayOptions {
   token?: string;
   /** Inbound push: how long a pushed item waits for the host's result, and the retry delay (tests). */
   hostPush?: { timeoutMs?: number; retryMs?: number };
+  /** Serve the console API per `config.console` (default false; `aio serve` turns it on unless `console.enabled` is false). */
+  console?: boolean;
+  /** Environment of provisioning children (default process.env; tests). */
+  consoleEnv?: NodeJS.ProcessEnv;
 }
 
 /** Outcome of a local command, mapped 1:1 onto a `result` frame. */
@@ -105,7 +118,17 @@ interface RunningChannel {
   ac: AbortController;
   running: Promise<void>;
   close?: () => Promise<void>;
+  state: 'running' | 'stopped' | 'failed';
+  error?: string;
 }
+
+const DAEMON_VERSION: string = (() => {
+  try {
+    return (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
+  } catch {
+    return '0.0.0';
+  }
+})();
 
 /** Local ends post to this route; no adapter renders it, they read the stream instead. */
 export const localRoute = (sessionKey: string): ReplyRoute => ({ channel: 'local', account: 'local', conversationId: sessionKey });
@@ -159,6 +182,13 @@ export class Gateway {
   private readonly channels: RunningChannel[] = [];
   private server: LocalServer | undefined;
   private tokenFile: string | undefined;
+  /** The console API server (`GatewayOptions.console`). */
+  console: ConsoleServer | undefined;
+  private consoleFile: string | undefined;
+  /** The config file as the console edits it (when the config came from a file). */
+  readonly configStore: ConfigStore | undefined;
+  readonly larkBots: LarkBotJobs | undefined;
+  readonly startedAt = Date.now();
   private readonly log: LogFn;
   private stopped = false;
 
@@ -279,6 +309,17 @@ export class Gateway {
       // Clicks on ask_choice buttons (and numbered replies) go back to the session that asked.
       ...(tools ? { rewrite: (a) => tools.rewriteInbound(a) } : {}),
     });
+    if (c.source) {
+      this.configStore = new ConfigStore({ path: c.source.path, ...(c.source.envFile ? { envFile: c.source.envFile } : {}), ...(o.consoleEnv ? { env: o.consoleEnv } : {}) });
+      const store = this.configStore;
+      this.larkBots = new LarkBotJobs({
+        command: c.console.larkBotCommand,
+        dir: join(c.dataDir, 'provision'),
+        config: store,
+        log: (level, msg) => this.log(level, msg),
+        ...(o.consoleEnv ? { env: o.consoleEnv } : {}),
+      });
+    }
   }
 
   static async start(o: GatewayOptions): Promise<Gateway> {
@@ -300,6 +341,7 @@ export class Gateway {
         gw.tokenFile = tokenPath(o.config.socketPath);
         writeTokenFile(gw.tokenFile, gw.token);
       }
+      if (o.console) await gw.startConsole();
     } catch (e) {
       await gw.stop().catch(() => undefined);
       throw e;
@@ -309,6 +351,123 @@ export class Gateway {
 
   get config(): Config {
     return this.o.config;
+  }
+
+  /**
+   * The console API. A port that is taken is logged, not fatal: the daemon's
+   * channels and sockets keep working without it.
+   */
+  private async startConsole(): Promise<void> {
+    const c = this.o.config;
+    if (this.larkBots) privateDir(join(c.dataDir, 'provision'), (msg) => this.log('warn', msg));
+    const server = new ConsoleServer({
+      config: c.console,
+      host: {
+        local: this,
+        token: this.token,
+        status: () => this.adminStatus(),
+        queue: () => this.adminQueue(),
+        sessions: () => this.adminSessions(),
+        explain: (id) => this.router.explain(id),
+        consoleOrigin: (key) => this.consoleOrigin(key),
+        ...(this.configStore ? { configStore: this.configStore } : {}),
+        ...(this.larkBots ? { larkBots: this.larkBots } : {}),
+      },
+      log: (level, msg) => this.log(level, msg),
+    });
+    // A file left by a daemon that died must not point `aio console-link` at whoever holds that port now.
+    const urlFile = consoleUrlPath(c.socketPath);
+    if (this.tokenFile) rmSync(urlFile, { force: true });
+    try {
+      await server.listen();
+    } catch (e) {
+      this.log('error', `console API not started: cannot listen on ${c.console.host}:${c.console.port}: ${(e as Error).message}`);
+      return;
+    }
+    this.console = server;
+    this.log('info', `console API on ${server.url}`);
+    if (this.tokenFile) {
+      // Next to the token file (same private directory), so `aio console-link` finds the port.
+      this.consoleFile = urlFile;
+      writeTokenFile(this.consoleFile, server.url);
+    }
+  }
+
+  /** Origin of a console connection's client frames: the local principal, via the console. */
+  consoleOrigin(sessionKey: string): Origin {
+    return { ...this.localOrigin(sessionKey), via: 'console', adapter: 'console' };
+  }
+
+  /** `GET /api/status`. */
+  adminStatus(): AdminStatus {
+    const c = this.o.config;
+    const h = this.host.info();
+    const st = this.router.hostTable();
+    const sessions = this.sessions();
+    return {
+      version: DAEMON_VERSION,
+      protocol: PROTOCOL_VERSION,
+      pid: process.pid,
+      startedAt: this.startedAt,
+      now: Date.now(),
+      dataDir: c.dataDir,
+      socket: c.socketPath,
+      ...(c.source ? { configPath: c.source.path } : {}),
+      host: {
+        connected: this.router.hostConnected,
+        ...(h ? { name: h.name, callouts: h.callouts, ...(h.consumer !== undefined ? { consumer: h.consumer } : {}) } : {}),
+        ...(st ? { table: { version: st.table.version, active: st.active, ...(st.suspended ? { suspended: st.suspended } : {}) } } : {}),
+      },
+      channels: this.channels.map((ch) => ({ id: ch.adapter.id, account: ch.account, state: ch.state, ...(ch.error ? { error: ch.error } : {}) })),
+      agents: Object.values(c.agents).map((a) => ({
+        name: a.name,
+        harness: a.harness,
+        mode: a.mode,
+        ...(a.model !== undefined ? { model: a.model } : {}),
+        ...(a.effort !== undefined ? { effort: a.effort } : {}),
+        ...(a.profile !== undefined ? { profile: a.profile } : {}),
+        ...(a.cwd !== undefined ? { cwd: a.cwd } : {}),
+        ...(a.name === c.defaultAgent ? { default: true } : {}),
+      })),
+      sessions: { total: sessions.length, live: sessions.filter((s) => s.live).length, running: sessions.filter((s) => s.turnId !== undefined).length },
+      runs: { running: this.runs.running() },
+      queue: { head: this.hostQueue.head() },
+    };
+  }
+
+  /** `GET /api/queue`: per consumer, without registering anyone. */
+  adminQueue(): AdminQueue {
+    const h = this.host.info();
+    return {
+      head: this.hostQueue.head(),
+      consumers: this.hostQueue.consumers().map((x) => {
+        const p = this.hostQueue.pending(x.acked);
+        return { consumer: x.name, acked: x.acked, pending: p.count, push: h?.consumer === x.name, ...(p.oldestAt !== undefined ? { oldestPendingAt: p.oldestAt } : {}) };
+      }),
+    };
+  }
+
+  /** `GET /api/sessions`: `SessionInfo` plus agent, conversation (the latest reply route), run id, last event time. */
+  adminSessions(): AdminSessions {
+    const c = this.o.config;
+    return {
+      sessions: this.sessions().map((info): AdminSession => {
+        let route: ReplyRoute | undefined;
+        let lastEventAt: number | undefined;
+        for (const e of this.hub.log.read(info.sessionKey, 0)) {
+          lastEventAt = e.ts;
+          if (e.body.t === 'turn.started' && e.body.replyRoute) route = e.body.replyRoute;
+        }
+        const agent = this.laneInfo.get(info.sessionKey)?.agent.name ?? this.records.agentOf(info.sessionKey) ?? (info.sessionKey.startsWith('run:') ? undefined : c.defaultAgent);
+        return {
+          ...info,
+          ...(agent !== undefined ? { agent } : {}),
+          ...(route && route.channel !== 'local' ? { conversation: routeKey(route) } : {}),
+          ...(info.sessionKey.startsWith('run:') ? { runId: info.sessionKey.slice(4) } : {}),
+          ...(lastEventAt !== undefined ? { lastEventAt } : {}),
+        };
+      }),
+    };
   }
 
   /** Host frames on the local socket (LocalHost). */
@@ -544,8 +703,18 @@ export class Gateway {
           },
           log: (level, msg) => this.log(level, `${ch.adapter.id}: ${msg}`),
         })
-        .catch((err: Error) => this.log('error', `channel ${ch.adapter.id} stopped: ${err.message}`));
-      this.channels.push({ adapter: ch.adapter, account: ch.account, ...(ch.tier ? { tier: ch.tier } : {}), ac, running, ...(ch.close ? { close: ch.close } : {}) });
+        .then(
+          () => {
+            entry.state = 'stopped';
+          },
+          (err: Error) => {
+            entry.state = 'failed';
+            entry.error = err.message;
+            this.log('error', `channel ${ch.adapter.id} stopped: ${err.message}`);
+          },
+        );
+      const entry: RunningChannel = { adapter: ch.adapter, account: ch.account, ...(ch.tier ? { tier: ch.tier } : {}), ac, running, state: 'running', ...(ch.close ? { close: ch.close } : {}) };
+      this.channels.push(entry);
       this.log('info', `channel ${ch.adapter.id} (${ch.account}) started`);
     }
   }
@@ -698,7 +867,10 @@ export class Gateway {
     // Runs end (interrupted) while their connections can still hear run.ended.
     await within(this.runs.stop(), 10_000);
     this.server?.close('gateway stopping');
+    this.console?.close('gateway stopping');
+    this.larkBots?.close();
     if (this.tokenFile) removeTokenFile(this.tokenFile, this.token);
+    if (this.consoleFile && this.console) removeTokenFile(this.consoleFile, this.console.url);
     this.watches.stop();
     for (const ch of this.channels) ch.ac.abort();
     await within(Promise.all(this.channels.map((c) => c.running)), 3000);

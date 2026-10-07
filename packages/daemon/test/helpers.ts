@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach } from 'vitest';
@@ -48,14 +48,30 @@ export interface World {
  * A daemon over a SQLite log in `dir` (reuse `dir` to restart it), a FakeChannel `fake`
  * (owner fake:alice) and a FakeHarness behind every instance.
  */
-export async function daemon(o: { raw?: Record<string, unknown>; script?: FakeTurnScript; dir?: string; policy?: Partial<Policy>; single?: boolean } = {}): Promise<World> {
+export async function daemon(
+  o: {
+    raw?: Record<string, unknown>;
+    script?: FakeTurnScript;
+    dir?: string;
+    policy?: Partial<Policy>;
+    single?: boolean;
+    /** Serve the console API (on a free port unless `raw.console.port` says otherwise); the config is written to `<dir>/aio.config.json` (0600) as its source. */
+    console?: boolean;
+    /** The env the console's config store and provisioning children see. */
+    consoleEnv?: NodeJS.ProcessEnv;
+  } = {},
+): Promise<World> {
   const dir = o.dir ?? tmp();
   mkdirSync(join(dir, 'work'), { recursive: true });
-  const base = resolveConfig(
-    { dataDir: dir, policy: { owners: ['fake:alice'] }, local: { principal: 'me' }, cwd: join(dir, 'work'), ...o.raw },
-    { env: {}, baseDir: dir, cwd: dir },
-  );
-  const config = { ...base, socketPath: join(dir, 'run', 'aio.sock') };
+  const raw = { dataDir: dir, policy: { owners: ['fake:alice'] }, local: { principal: 'me' }, cwd: join(dir, 'work'), ...o.raw };
+  if (o.console) {
+    const c = (raw as { console?: Record<string, unknown> }).console;
+    (raw as Record<string, unknown>).console = { port: 0, ...c };
+  }
+  const base = resolveConfig(raw, { env: {}, baseDir: dir, cwd: dir });
+  const configPath = join(dir, 'aio.config.json');
+  if (o.console && !o.dir) writeFileSync(configPath, JSON.stringify(raw, null, 2) + '\n', { mode: 0o600 });
+  const config = { ...base, socketPath: join(dir, 'run', 'aio.sock'), ...(o.console ? { source: { path: configPath, envFile: join(dir, '.env.live') } } : {}) };
   const chat = new FakeChannel('fake');
   const harness = new FakeHarness(o.script);
   const built: HarnessInstance[] = [];
@@ -71,6 +87,7 @@ export async function daemon(o: { raw?: Record<string, unknown>; script?: FakeTu
     ...(o.policy ? { policy: o.policy } : {}),
     hostPush: { timeoutMs: 300, retryMs: 20 },
     logger: () => {},
+    ...(o.console ? { console: true, consoleEnv: o.consoleEnv ?? {} } : {}),
   });
   let stopped = false;
   const stop = async () => {

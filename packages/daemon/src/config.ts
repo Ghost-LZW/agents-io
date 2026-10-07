@@ -257,6 +257,37 @@ export const ConfigFile = Type.Object(
      * the config takes effect on restart.
      */
     watches: Type.Optional(Type.Array(Type.Intersect([WatchDraft, Type.Object({ id: Type.String() })]))),
+    /**
+     * The console API (HTTP + WebSocket for web UIs; protocol admin.ts). Default on for
+     * `aio serve`, on 127.0.0.1:7464. A non-loopback `host` is refused unless
+     * `allowRemote` is true (then every request still needs a token).
+     */
+    console: Type.Optional(
+      Type.Object(
+        {
+          enabled: Type.Optional(Type.Boolean()),
+          host: Type.Optional(Type.String()),
+          /** 0: any free port (the URL is written next to the socket, `<socket>.console`). */
+          port: Type.Optional(Type.Integer({ minimum: 0, maximum: 65535 })),
+          allowRemote: Type.Optional(Type.Boolean()),
+          /**
+           * Extra names the `Host` header may carry (anti DNS rebinding), e.g. the LAN name or
+           * address remote browsers use. Loopback names and a concrete `host` are always accepted.
+           * Required with a wildcard `host` (0.0.0.0, ::) and `allowRemote`.
+           */
+          allowedHosts: Type.Optional(Type.Array(Type.String())),
+          /** Origins of separately hosted UIs allowed to call the API (CORS); none by default. */
+          origins: Type.Optional(Type.Array(Type.String())),
+          /** Where the UI is; login links point there (default: the console URL itself). */
+          uiUrl: Type.Optional(Type.String()),
+          /** Lifetime of console sessions from a login link (default 12 h). */
+          sessionTtlMs: Type.Optional(Type.Number({ minimum: 1000 })),
+          /** create-lark-bot invocation for `POST /api/bots/lark` (argv; default npx of the pinned release). */
+          larkBotCommand: Type.Optional(Type.Array(Type.String(), { minItems: 1 })),
+        },
+        Closed,
+      ),
+    ),
     /** Who local socket clients are. */
     local: Type.Optional(
       Type.Object(
@@ -367,6 +398,74 @@ export interface Config {
   /** Host MCP output tools mounted into every harness instance. */
   outputTools: boolean;
   local: { principal: Principal; session: string };
+  /** The console API server. */
+  console: ConsoleConfig;
+  /** Where this config came from (loadConfig): the file (it may not exist) and the env file found for it. */
+  source?: { path: string; envFile?: string };
+}
+
+export interface ConsoleConfig {
+  enabled: boolean;
+  host: string;
+  port: number;
+  allowRemote: boolean;
+  /** Lowercased host names (no port, no brackets) the `Host` header may carry besides loopback and `host`. */
+  allowedHosts: string[];
+  /** Normalized origins (`scheme://host[:port]`). */
+  origins: string[];
+  uiUrl?: string;
+  sessionTtlMs: number;
+  larkBotCommand: string[];
+}
+
+/** create-lark-bot, pinned. */
+export const CREATE_LARK_BOT = ['npx', '-y', 'github:Ghost-LZW/create-lark-bot#v0.2.2'];
+export const DEFAULT_CONSOLE_PORT = 7464;
+
+/** 127.0.0.0/8, ::1, localhost. */
+export function isLoopbackHost(host: string): boolean {
+  const h = host.replace(/^\[|\]$/g, '').toLowerCase();
+  return h === 'localhost' || h === '::1' || /^127(\.\d{1,3}){3}$/.test(h);
+}
+
+/** 0.0.0.0, ::, [::]: every interface. */
+export function isWildcardHost(host: string): boolean {
+  const h = host.replace(/^\[|\]$/g, '');
+  return h === '0.0.0.0' || h === '::' || h === '';
+}
+
+function resolveConsole(c: ConfigFile['console']): ConsoleConfig {
+  const host = c?.host ?? '127.0.0.1';
+  if (!isLoopbackHost(host) && c?.allowRemote !== true)
+    fail(`console.host ${JSON.stringify(host)} is not a loopback address; the console only listens on loopback unless console.allowRemote is true`);
+  const allowedHosts = (c?.allowedHosts ?? []).map((h, i) => {
+    const n = h.replace(/^\[|\]$/g, '').toLowerCase();
+    if (!/^[a-z0-9.:-]+$/.test(n) || isWildcardHost(n)) fail(`console.allowedHosts[${i}]: ${JSON.stringify(h)} is not a host name or address (no port, no wildcard)`);
+    return n;
+  });
+  if (isWildcardHost(host) && c?.allowRemote === true && allowedHosts.length === 0)
+    fail(`console.host ${JSON.stringify(host)} listens on every interface: list the names remote browsers use in console.allowedHosts (the Host header is checked against them)`);
+  const origins = (c?.origins ?? []).map((o, i) => {
+    try {
+      const u = new URL(o);
+      if ((u.protocol !== 'http:' && u.protocol !== 'https:') || u.origin !== o.replace(/\/$/, '')) throw new Error('not an origin');
+      return u.origin;
+    } catch {
+      return fail(`console.origins[${i}]: ${JSON.stringify(o)} is not an origin (scheme://host[:port], no path)`);
+    }
+  });
+  if (c?.uiUrl !== undefined && !/^https?:\/\//.test(c.uiUrl)) fail('console.uiUrl must be an http(s) URL');
+  return {
+    enabled: c?.enabled ?? true,
+    host,
+    port: c?.port ?? DEFAULT_CONSOLE_PORT,
+    allowRemote: c?.allowRemote === true,
+    allowedHosts,
+    origins,
+    ...(c?.uiUrl !== undefined ? { uiUrl: c.uiUrl.replace(/\/$/, '') } : {}),
+    sessionTtlMs: c?.sessionTtlMs ?? 12 * 3_600_000,
+    larkBotCommand: c?.larkBotCommand ?? CREATE_LARK_BOT,
+  };
 }
 
 export type ResolvedChannel =
@@ -438,7 +537,8 @@ export function loadConfig(o: LoadOptions = {}): Config {
   const envPath = findEnvFile({ envFile: o.envFile, configDir: dirname(path), cwd });
   const fileEnv = envPath ? loadEnvFile(envPath) : {};
   const env: Record<string, string | undefined> = { ...fileEnv, ...procEnv };
-  return resolveConfig(raw, { env, fileEnv, baseDir: dirname(path), harness: o.harness, cwd, channels: o.channels });
+  const c = resolveConfig(raw, { env, fileEnv, baseDir: dirname(path), harness: o.harness, cwd, channels: o.channels });
+  return { ...c, source: { path, ...(envPath ? { envFile: resolve(cwd, envPath) } : {}) } };
 }
 
 export interface ResolveContext {
@@ -501,6 +601,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
       principal: { id: c.local?.principal ?? owners[0] ?? 'local:owner', labels: c.local?.labels ?? ['owner'] },
       session: localSession,
     },
+    console: resolveConsole(c.console),
   };
 }
 

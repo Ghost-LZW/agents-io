@@ -8,6 +8,9 @@ import { chmodSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSyn
 
 export const tokenPath = (socketPath: string) => `${socketPath}.token`;
 
+/** The console API URL, written by `aio serve` next to the token file (same 0600 handling). */
+export const consoleUrlPath = (socketPath: string) => `${socketPath}.console`;
+
 /** Write atomically, owner-only. */
 export function writeTokenFile(path: string, token: string): void {
   const tmp = `${path}.${process.pid}.tmp`;

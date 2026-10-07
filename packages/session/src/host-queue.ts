@@ -60,7 +60,7 @@ export class HostQueue {
   readonly db: DatabaseSync;
   private readonly ownsDb: boolean;
   private readonly now: () => number;
-  private q: Record<'refGet' | 'refPut' | 'insert' | 'after' | 'consumerGet' | 'consumerPut' | 'consumerAck' | 'consumers' | 'consumerDel' | 'head' | 'prune' | 'pruneRefs', StatementSync>;
+  private q: Record<'refGet' | 'refPut' | 'insert' | 'after' | 'consumerGet' | 'consumerPut' | 'consumerAck' | 'consumers' | 'consumerDel' | 'head' | 'prune' | 'pruneRefs' | 'pending', StatementSync>;
   private waiters = new Set<() => void>();
   private pushes = new Map<string, Push>();
   private closed = false;
@@ -88,6 +88,7 @@ export class HostQueue {
       head: p("SELECT seq FROM sqlite_sequence WHERE name = 'host_inbound'"),
       prune: p('DELETE FROM host_inbound WHERE cursor <= ? AND at < ?'),
       pruneRefs: p('DELETE FROM host_inbound_refs WHERE at < ? AND cursor NOT IN (SELECT cursor FROM host_inbound)'),
+      pending: p('SELECT COUNT(*) AS n, MIN(at) AS oldest FROM host_inbound WHERE cursor > ?'),
     };
   }
 
@@ -128,6 +129,12 @@ export class HostQueue {
 
   consumers(): { name: string; acked: number; seen: number }[] {
     return this.q.consumers.all() as { name: string; acked: number; seen: number }[];
+  }
+
+  /** How many items there are after `after`, and when the oldest of them arrived (Unix ms). Reads only. */
+  pending(after: number): { count: number; oldestAt?: number } {
+    const r = this.q.pending.get(after) as { n: number; oldest: number | null };
+    return { count: r.n, ...(r.oldest !== null ? { oldestAt: r.oldest } : {}) };
   }
 
   /** Stop counting a consumer for retention. */
