@@ -370,6 +370,103 @@ describe('rule callouts', () => {
   });
 });
 
+describe('session launch in callout answers (decision 7)', () => {
+  const env = fakeEnvelope({ conversation: group, text: 'please deploy' });
+  const rule = (o: Partial<Binding> = {}): BindingTable => table([{ id: 'ask', match: {}, on: 'dispatch', agent: 'assistant', callout: { onFailure: 'context' }, ...o }]);
+  const launch = { cwd: '/w/a', env: { K: 'secret-v' } };
+  const launches = (o: Partial<NonNullable<RouterOptions['launches']>> = {}): NonNullable<RouterOptions['launches']> => ({
+    check: ({ launch: l }) => ({ ok: true, outcome: 'applied', launch: { ...l, cwd: `/real${l.cwd}` } }),
+    pinned: () => false,
+    ...o,
+  });
+
+  it('an accepted launch rides the delivery (as checked) and explain shows cwd and env keys, never values', async () => {
+    const checked: unknown[] = [];
+    const r = router({
+      config: rule(),
+      hostConnected: true,
+      routeCallout: async () => ({ on: 'dispatch', session: { key: 'S1' }, launch }),
+      launches: launches({ check: (a) => (checked.push(a), { ok: true, outcome: 'applied', launch: { ...a.launch, cwd: '/real/w/a' } }) }),
+    });
+    const d = await route(r, env);
+    expect(checked).toEqual([{ sessionKey: 'S1', agent: 'assistant', launch }]);
+    expect(d.deliveries).toMatchObject([{ sessionKey: 'S1', on: 'dispatch', launch: { cwd: '/real/w/a', env: { K: 'secret-v' } } }]);
+    expect(d.explanation.matched[0]).toMatchObject({ callout: { outcome: 'answered' }, launch: { cwd: '/w/a', envKeys: ['K'], outcome: 'applied' } });
+    expect(JSON.stringify(d.explanation)).not.toContain('secret-v');
+  });
+
+  it('a refused launch counts as an error answer: onFailure applies without the launch, the reason is recorded', async () => {
+    const r = router({
+      config: rule(),
+      hostConnected: true,
+      routeCallout: async () => ({ on: 'dispatch', session: { key: 'S1' }, launch }),
+      launches: launches({ check: () => ({ ok: false, code: 'launch_conflict', message: 'pinned otherwise' }) }),
+    });
+    const d = await route(r, env);
+    expect(d.deliveries).toHaveLength(1);
+    expect(d.deliveries[0]).toMatchObject({ on: 'context', sessionKey: 'assistant:fake:default:g1' });
+    expect(d.deliveries[0]!.launch).toBeUndefined();
+    expect(d.explanation.matched[0]).toMatchObject({ on: 'context', callout: { outcome: 'error', on: 'context', reason: 'launch_conflict' }, launch: { envKeys: ['K'], outcome: 'launch_conflict' } });
+
+    // Default onFailure (host): into the queue.
+    const h = router({ config: rule({ callout: {} }), hostConnected: true, routeCallout: async () => ({ on: 'dispatch', launch }), launches: launches({ check: () => ({ ok: false, code: 'bad_cwd', message: 'x' }) }) });
+    const dh = await route(h, env);
+    expect(dh.host).toEqual({ bindingId: 'ask', source: 'config' });
+    expect(dh.deliveries).toEqual([]);
+    expect(dh.explanation.matched[0]!.callout).toEqual({ outcome: 'error', on: 'host', reason: 'bad_cwd' });
+
+    // Without `launches`, a launch is refused too.
+    const none = router({ config: rule(), hostConnected: true, routeCallout: async () => ({ on: 'dispatch', launch }) });
+    expect((await route(none, env)).explanation.matched[0]).toMatchObject({ callout: { outcome: 'error', reason: 'launch_unsupported' } });
+  });
+
+  it('a launch with an on that targets no session (host, drop) or a malformed one is a bad answer', async () => {
+    for (const answer of [{ on: 'host', launch }, { on: 'drop', launch }, { on: 'dispatch', launch: { cwd: 3 } }] as unknown as CalloutAnswer[]) {
+      const r = router({ config: rule(), hostConnected: true, routeCallout: async () => answer, launches: launches() });
+      const d = await route(r, env);
+      expect(d.explanation.matched[0]!.callout).toEqual({ outcome: 'error', on: 'context', reason: 'bad_launch' });
+    }
+  });
+
+  it('two rules for one session: the launch rides whichever delivery wins', async () => {
+    const t = table([
+      { id: 'ctx', match: {}, on: 'context', agent: 'assistant', session: { key: 'S' }, callout: {} },
+      { id: 'run', match: {}, on: 'dispatch', agent: 'assistant', session: { key: 'S' } },
+    ]);
+    const r = router({ config: t, hostConnected: true, routeCallout: async () => ({ on: 'context', session: { key: 'S' }, launch }), launches: launches() });
+    const d = await route(r, env);
+    expect(d.deliveries).toHaveLength(1);
+    expect(d.deliveries[0]).toMatchObject({ bindingId: 'run', on: 'dispatch', launch: { cwd: '/real/w/a' } });
+  });
+
+  it('skipWhenPinned: once the rule\'s own session is pinned the host is not asked; explain says skipped_pinned', async () => {
+    const pinned = new Set<string>();
+    let calls = 0;
+    const r = router({
+      config: rule({ on: 'dispatch', session: 'per-conversation', callout: { skipWhenPinned: true } }),
+      hostConnected: true,
+      routeCallout: async () => (calls++, { on: 'dispatch', launch }),
+      launches: launches({ pinned: (k) => pinned.has(k) }),
+    });
+    const first = await route(r, env);
+    expect(calls).toBe(1);
+    expect(first.explanation.matched[0]!.callout).toEqual({ outcome: 'answered', on: 'dispatch' });
+    pinned.add('assistant:fake:default:g1');
+    const later = await route(r, env);
+    expect(calls).toBe(1);
+    expect(later.deliveries).toMatchObject([{ sessionKey: 'assistant:fake:default:g1', on: 'dispatch' }]);
+    expect(later.explanation.matched[0]!.callout).toEqual({ outcome: 'skipped_pinned', on: 'dispatch' });
+    // Without the flag the host is asked every time.
+    const always = router({ config: rule({ session: 'per-conversation' }), hostConnected: true, routeCallout: async () => (calls++, { on: 'dispatch' }), launches: launches({ pinned: () => true }) });
+    await route(always, env);
+    expect(calls).toBe(2);
+  });
+
+  it('skipWhenPinned is only for rules whose own on targets a session', () => {
+    expect(() => router({ config: table([{ id: 'x', match: {}, on: 'host', callout: { skipWhenPinned: true } }]) })).toThrow(/skipWhenPinned/);
+  });
+});
+
 describe('explanations', () => {
   it('are persisted: explain(inputId) works across a restart', async () => {
     const path = tempDb();

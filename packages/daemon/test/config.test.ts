@@ -365,4 +365,38 @@ describe('config', () => {
       expect(resolve({ harnesses: { cx: { use: 'codex', config: { 'mcp_servers.y.bearer_token': 'env:NOPE' } } } }).harnesses.cx!.unavailable).toMatch(/NOPE is not set/);
     });
   });
+
+  describe('agents.<name>.sessionParams (decision 7)', () => {
+    const bad = (sessionParams: unknown, extra: Record<string, unknown> = {}) => {
+      try {
+        resolve({ agents: { dev: { harness: 'claude-code', sessionParams, ...extra } } });
+      } catch (e) {
+        expect(e).toBeInstanceOf(ConfigError);
+        return (e as Error).message;
+      }
+      return 'no error';
+    };
+
+    it('resolves roots against the config file; envPathRoots defaults to none', () => {
+      const c = resolve({ agents: { dev: { harness: 'claude-code', sessionParams: { cwdRoots: ['ws', '/abs'], envKeys: ['GIT_AUTHOR_NAME', 'CLAUDE_CONFIG_DIR'], envPathRoots: { CLAUDE_CONFIG_DIR: ['homes'] } } }, other: { harness: 'claude-code' } } });
+      expect(c.agents.dev!.sessionParams).toEqual({ cwdRoots: ['/base/ws', '/abs'], envKeys: ['GIT_AUTHOR_NAME', 'CLAUDE_CONFIG_DIR'], envPathRoots: { CLAUDE_CONFIG_DIR: ['/base/homes'] } });
+      expect(c.agents.other!.sessionParams).toBeUndefined();
+      expect(resolve({ agents: { dev: { harness: 'claude-code', sessionParams: { cwdRoots: [], envKeys: [] } } } }).agents.dev!.sessionParams).toEqual({ cwdRoots: [], envKeys: [], envPathRoots: {} });
+    });
+
+    it('CLAUDE_CONFIG_DIR / CODEX_HOME in envKeys need envPathRoots', () => {
+      expect(bad({ cwdRoots: [], envKeys: ['CLAUDE_CONFIG_DIR'] })).toMatch(/CLAUDE_CONFIG_DIR is in envKeys.*envPathRoots\.CLAUDE_CONFIG_DIR/);
+      expect(bad({ cwdRoots: [], envKeys: ['CODEX_HOME'] })).toMatch(/CODEX_HOME is in envKeys/);
+      expect(bad({ cwdRoots: [], envKeys: ['CODEX_HOME'], envPathRoots: { CODEX_HOME: [] } })).toMatch(/envPathRoots\.CODEX_HOME: needs at least one root/);
+    });
+
+    it('refuses AGENTS_IO_* and malformed keys, envPathRoots keys not in envKeys, task agents, unknown fields', () => {
+      expect(bad({ cwdRoots: [], envKeys: ['AGENTS_IO_MCP_TOKEN'] })).toMatch(/AGENTS_IO_\* variables are the daemon's own/);
+      expect(bad({ cwdRoots: [], envKeys: ['1BAD'] })).toMatch(/not a variable name/);
+      expect(bad({ cwdRoots: [], envKeys: ['A'], envPathRoots: { HOME: ['/h'] } })).toMatch(/envPathRoots\.HOME: not in envKeys/);
+      expect(bad({ cwdRoots: [], envKeys: [] }, { mode: 'task' })).toMatch(/task agents take their cwd and env per run/);
+      expect(bad({ cwdRoots: [], envKeys: [], extra: 1 })).toMatch(/invalid config/);
+      expect(bad({ envKeys: [] })).toMatch(/invalid config/);
+    });
+  });
 });
