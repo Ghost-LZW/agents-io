@@ -8,7 +8,7 @@ import { CHOICE_KEY, OUTPUT_EVENT, parseChoiceActionId, type ChoiceData, type Ou
 import { FakeChannel, checkEventStream, defaultChannelCaps } from '@agents-io/testkit';
 import type { ClientSubscription } from './client.js';
 import { LocalClient } from './client.js';
-import { defaultInstance, withDefaultInstance, type Config, type HarnessInstance } from './config.js';
+import { DEFAULT_AGENT, defaultInstance, withDefaultInstance, type Config, type HarnessInstance } from './config.js';
 import { Gateway } from './gateway.js';
 
 /*
@@ -136,8 +136,13 @@ export function e2eConfig(base: Config, dir: string): Config {
   const run = h.kind === 'codex' && !h.run.effort ? { ...h.run, effort: 'low' } : h.run;
   // Sessions run in the scenario's work dir, not the instance's cwd.
   const inst = { ...h, options, profiles, run } as HarnessInstance;
+  const { table: _table, ...rest } = withDefaultInstance(base, inst);
   return {
-    ...withDefaultInstance(base, inst),
+    ...rest,
+    // The scenarios talk to one agent on the default instance through the owners default table.
+    agents: { [DEFAULT_AGENT]: { name: DEFAULT_AGENT, harness: inst.name, mode: 'interactive', tools: base.outputTools, configured: false } },
+    defaultAgent: DEFAULT_AGENT,
+    identities: [],
     dataDir: dir,
     logPath: join(dir, 'log.sqlite'),
     socketPath: join(dir, 'run', 'aio.sock'),
@@ -546,6 +551,40 @@ export const SCENARIOS: Scenario[] = [
       const consumed = new Set(watch.of('input.consumed').filter((b) => b.turnId === turn.turnId).flatMap((b) => b.inputIds));
       conforms(w, sk, watch);
       return `2 stranger messages → context (no turn); owner @ → 1 turn handed [ctx, ctx, ask] (harness confirmed ${[...consumed].filter((id) => ctxIds.includes(id)).length}/2 context consumed), completed; answer mentions both: ${JSON.stringify(text.slice(0, 160))}`;
+    },
+  },
+  {
+    id: 'r',
+    name: 'task-run',
+    async run(ctx) {
+      // A task agent on the default instance, run the way a host does (run.start over the socket, env in the child only).
+      const dir = tempDir(ctx);
+      const base = e2eConfig(ctx.base, dir);
+      const inst = base.harnesses[base.defaultHarness]!;
+      const config: Config = { ...base, agents: { ...base.agents, exec: { name: 'exec', harness: inst.name, mode: 'task', profile: 'bypass', tools: false, configured: true } } };
+      const w = await world(ctx, { dir, config });
+      const c = await w.client();
+      await c.hello({ token: w.gw.token, name: 'e2e-host' });
+      const t0 = Date.now();
+      const r = await c.runStart({ runId: 'e2e-r1', agent: 'exec', cwd: config.cwd, env: { E2E_PROBE: 'kiwi-42' }, input: [{ type: 'text', text: 'Run the shell command `echo $E2E_PROBE` and reply with exactly its output.' }] });
+      assert(r.state === 'started', `run.start answered ${r.state}`);
+      const ended = await Promise.race([c.runEndedOf('e2e-r1'), new Promise<never>((_, rej) => setTimeout(() => rej(new Failure('no run.ended')), TURN_MS))]);
+      assert(ended.exitCode === 0, `run ended ${ended.status} (exit ${ended.exitCode})${ended.error ? ` ${ended.error.code}` : ''}`);
+      const log = w.gw.hub.log.read('run:e2e-r1', 0);
+      const answer = log.filter((e) => e.body.t === 'text.snapshot' && e.body.final && e.audience === 'answer').map((e) => (e.body as BodyOf<'text.snapshot'>).text).join('\n');
+      assert(/kiwi-42/.test(answer), `answer does not show the child env: ${JSON.stringify(answer.slice(0, 80))}`);
+      // Model output (tool results, the answer, the harness's native payloads and usage) may show it; nothing the daemon writes itself may.
+      const strip = (e: SessionEvent) => ({ ...e, native: undefined, ...(e.body.t === 'turn.completed' ? { body: { ...e.body, usage: undefined } } : {}) });
+      const leaked = [...new Set(log.filter((e) => JSON.stringify(strip(e)).includes('kiwi-42')).map((e) => e.body.t))];
+      const outside = leaked.filter((t) => !['item.started', 'item.completed', 'text.snapshot', 'usage', 'native'].includes(t));
+      const where = (t: string) => { const j = JSON.stringify(strip(log.find((e) => e.body.t === t)!)); const i = j.indexOf('kiwi-42'); return j.slice(Math.max(0, i - 120), i + 20); };
+      assert(!outside.length, `the env value is in non-output events: ${outside.map((t) => `${t} (${where(t)})`).join(', ')}`);
+      assert(!w.gw.sessions().find((s) => s.sessionKey === 'run:e2e-r1')?.live, 'run session still live after run.ended');
+      const again = await c.runStart({ runId: 'e2e-r1', agent: 'exec', input: [{ type: 'text', text: 'x' }] });
+      assert(again.state === 'ended' && again.ended?.exitCode === 0, 'the same runId ran again');
+      const refused = await c.runStart({ runId: 'e2e-r2', agent: DEFAULT_AGENT, input: [{ type: 'text', text: 'x' }] }).then(() => 'started', (e: Error) => e.message);
+      assert(/not_task_agent/.test(refused), `interactive agent: ${refused}`);
+      return `exit 0 in ${sec(Date.now() - t0)}; child saw its env; session closed; rerun reports the outcome; interactive agent refused`;
     },
   },
   {

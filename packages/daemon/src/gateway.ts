@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 import {
   routeKey,
@@ -9,10 +9,13 @@ import {
   type HarnessEvent,
   type HarnessOpenArgs,
   type HarnessSession,
+  type HostRequestFrame,
+  type InboundEnvelope,
   type InputRecord,
   type Origin,
   type Policy,
   type ReplyRoute,
+  type RunSpec,
   type Tier,
   type TurnProvenance,
   type Watch,
@@ -21,6 +24,7 @@ import {
 import {
   Compositor,
   FsBlobStore,
+  HostQueue,
   Hub,
   Ingress,
   Lane,
@@ -30,9 +34,9 @@ import {
   WatchDispatcher,
   WatchRegistry,
   defaultPolicy,
-  ownersTable,
   type AddWatchResult,
   type FullPolicy,
+  type IngressResult,
   type RemoveWatchResult,
   type SessionLog,
 } from '@agents-io/session';
@@ -42,11 +46,15 @@ import { CodexHarness, type CodexProfile } from '@agents-io/harness-codex';
 import { LarkBotAdapter } from '@agents-io/channel-lark-bot';
 import { MailChannel, type MailChannelConfig } from '@agents-io/channel-mail';
 import { spawnChannel } from '@agents-io/channel-jsonl-bridge';
-import type { Config, HarnessInstance, ResolvedChannel } from './config.js';
+import { agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ResolvedChannel } from './config.js';
 import type { ClientCommand, SessionInfo } from './frames.js';
+import { HostService, isHostOrigin } from './host.js';
 import { LocalServer } from './local-server.js';
 import { privateDb, privateDir } from './private.js';
 import { blobResolvers, type MediaResolvers } from './media.js';
+import { DaemonRecords } from './records.js';
+import { Runs } from './runs.js';
+import { removeTokenFile, tokenPath, writeTokenFile } from './token.js';
 
 export type LogFn = (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
 
@@ -81,6 +89,10 @@ export interface GatewayOptions {
   /** Tee of raw harness events per session (conformance checks). */
   onHarnessEvent?: (sessionKey: string, e: HarnessEvent) => void;
   logger?: LogFn;
+  /** Host token (default: a fresh random one, written next to the socket when listening). */
+  token?: string;
+  /** Inbound push: how long a pushed item waits for the host's result, and the retry delay (tests). */
+  hostPush?: { timeoutMs?: number; retryMs?: number };
 }
 
 /** Outcome of a local command, mapped 1:1 onto a `result` frame. */
@@ -94,9 +106,6 @@ interface RunningChannel {
   running: Promise<void>;
   close?: () => Promise<void>;
 }
-
-/** The one agent the dev gateway runs (every binding of its default table targets it). */
-const DEFAULT_AGENT = 'default';
 
 /** Local ends post to this route; no adapter renders it, they read the stream instead. */
 export const localRoute = (sessionKey: string): ReplyRoute => ({ channel: 'local', account: 'local', conversationId: sessionKey });
@@ -128,12 +137,28 @@ export class Gateway {
   /** Host output tools (`config.outputTools`), mounted into every harness binding over MCP. */
   readonly tools: HostTools | undefined;
   private readonly mcp: HostMcpServer | undefined;
+  /** The durable host inbound queue (`on: "host"` rules), in the log's database. */
+  readonly hostQueue: HostQueue;
+  /** Who sent each channel message (`input.verify`), settled deliveries, session → agent. */
+  readonly records: DaemonRecords;
+  /** The host protocol on the local socket. */
+  readonly host: HostService;
+  /** Task runs (`run.start`). */
+  readonly runs: Runs;
+  /** Secret a host presents in `host.hello` (written 0600 next to the socket). */
+  readonly token: string;
   /** Built instance adapters, by instance name (lazily, on first use). */
   private readonly instances = new Map<string, HarnessAdapter>();
+  /** Adapters of configured agents (their cwd and instructions over the instance's). */
+  private readonly agentAdapters = new Map<string, HarnessAdapter>();
   private readonly lanes = new Map<string, Lane>();
+  /** Agent and working directory of each live lane. */
+  private readonly laneInfo = new Map<string, { agent: AgentConfig; cwd?: string }>();
   private readonly compositors: Compositor[] = [];
+  private readonly sessionCompositors = new Map<string, Compositor[]>();
   private readonly channels: RunningChannel[] = [];
   private server: LocalServer | undefined;
+  private tokenFile: string | undefined;
   private readonly log: LogFn;
   private stopped = false;
 
@@ -149,36 +174,62 @@ export class Gateway {
       privateDb(c.logPath, warn);
     }
     const log = o.log ?? new SqliteSessionLog({ path: c.logPath });
+    const db = log instanceof SqliteSessionLog ? { db: log.db } : {};
     this.hub = new Hub(log);
-    // One agent: the configured harness instances, sessions keyed by bare route keys as before.
+    this.records = new DaemonRecords(db);
+    this.hostQueue = new HostQueue(db);
+    this.token = o.token ?? randomBytes(32).toString('hex');
+    // Agents: the configured ones, or `default` on the default instance with sessions keyed by bare route keys as before.
     const legacyAdmit = o.policy?.admit;
+    const table = configTable(c);
     this.router = new Router({
-      agents: [{ name: DEFAULT_AGENT, sessionPrefix: '', mainSession: c.local.session }],
-      defaultAgent: DEFAULT_AGENT,
-      ...(legacyAdmit
-        ? { legacyAdmit: legacyAdmit.bind(o.policy) }
-        : { config: ownersTable({ owners: c.policy.owners, agent: DEFAULT_AGENT, ...(c.policy.ownerSessionKey ? { ownerSessionKey: c.policy.ownerSessionKey } : {}) }) }),
+      agents: Object.values(c.agents).map((a) => agentSpec(a, c)),
+      ...(c.defaultAgent !== undefined ? { defaultAgent: c.defaultAgent } : {}),
+      ...(legacyAdmit ? { legacyAdmit: legacyAdmit.bind(o.policy) } : table ? { config: table } : {}),
       watches: { list: () => this.watches.list() },
       selfAccounts: c.policy.selfAccounts,
       agentAccounts: c.policy.agentAccounts,
-      ...(log instanceof SqliteSessionLog ? { db: log.db } : {}),
+      routeCallout: (bindingId, input, envelope) => this.host.routeCallout(bindingId, input, envelope),
+      ...db,
       log: (level, msg) => this.log(level, `router: ${msg}`),
     });
     const router = this.router;
+    const base = defaultPolicy({
+      owners: c.policy.owners,
+      selfAccounts: c.policy.selfAccounts,
+      agentAccounts: c.policy.agentAccounts,
+      routes: c.policy.routes,
+      watchAllowlist: c.policy.watchAllowlist,
+      run: c.harnesses[c.defaultHarness]!.run,
+    });
     this.policy = {
-      ...defaultPolicy({
-        owners: c.policy.owners,
-        selfAccounts: c.policy.selfAccounts,
-        agentAccounts: c.policy.agentAccounts,
-        routes: c.policy.routes,
-        watchAllowlist: c.policy.watchAllowlist,
-        run: c.harnesses[c.defaultHarness]!.run,
-      }),
+      ...base,
       // The router's identity maps (the owners config; a host's map once one is pushed).
       identify: async (a) => router.identify(a),
+      // The host (authenticated with the token) may interrupt and cancel what it started and what it watches.
+      control: async (a) => (isHostOrigin(a.origin) ? 'allow' : base.control(a)),
       ...o.policy,
     } as FullPolicy;
-    this.outbox = new Outbox({ hub: this.hub, policy: this.policy });
+    this.outbox = new Outbox({ hub: this.hub, policy: this.policy, store: this.records });
+    this.runs = new Runs({
+      hub: this.hub,
+      agents: () => c.agents,
+      agentCwd: (a) => a.cwd ?? c.harnesses[a.harness]?.cwd ?? c.cwd,
+      openRunLane: (r) => this.openRunLane(r),
+      hostPeer: () => this.host.hostPeer(),
+      log: (level, msg, data) => this.log(level, msg, data),
+    });
+    this.host = new HostService({
+      token: this.token,
+      router,
+      queue: this.hostQueue,
+      records: this.records,
+      runs: this.runs,
+      deliver: (name, f) => this.deliver(name, f),
+      log: (level, msg, data) => this.log(level, msg, data),
+      ...(o.hostPush?.timeoutMs !== undefined ? { pushTimeoutMs: o.hostPush.timeoutMs } : {}),
+      ...(o.hostPush?.retryMs !== undefined ? { pushRetryMs: o.hostPush.retryMs } : {}),
+    });
     this.blobs = new FsBlobStore(c.blobs);
     // Watches live next to the log (same SQLite file), so they and their digest buffers survive a restart.
     const registry = o.watches ?? new WatchRegistry(log instanceof SqliteSessionLog ? { db: log.db } : {});
@@ -198,7 +249,7 @@ export class Gateway {
         turn: (key) => this.lanes.get(key)?.currentTurn(),
         adapter: (id) => this.channels.find((ch) => ch.adapter.id === id)?.adapter,
         blobs: this.blobs,
-        cwd: (key) => this.instanceOf(this.lanes.get(key)?.harnessId)?.cwd ?? c.cwd,
+        cwd: (key) => this.laneInfo.get(key)?.cwd ?? this.instanceOf(this.lanes.get(key)?.harnessId)?.cwd ?? c.cwd,
         tier: (r) => this.channels.find((ch) => ch.adapter.id === r.channel)?.tier,
         routes: () => c.policy.routes,
         // Agents add watches as themselves (kind agent); Policy.watch decides, the target is pinned to their session.
@@ -218,12 +269,12 @@ export class Gateway {
     this.ingress = new Ingress({
       policy: this.policy,
       router: this.router,
-      lanes: (key) => this.lane(key),
+      lanes: (key, agent) => this.lane(key, agent),
       hub: this.hub,
       watches: this.watches,
       onWatchError: (err) => this.log('warn', `watch fan-out failed: ${(err as Error).message}`),
-      // No host here (the daemon adds the durable host queue): a `host` rule is only logged.
-      onHostUnavailable: ({ inputId, bindingId }) => this.log('warn', `input ${inputId} matched host rule ${bindingId}, but no host queue is configured`),
+      // `on: "host"` inputs wait in the durable queue until the host acks them.
+      hostQueue: this.hostQueue,
       replyCaps: (ch, account) => this.replyCaps(ch, account),
       // Clicks on ask_choice buttons (and numbered replies) go back to the session that asked.
       ...(tools ? { rewrite: (a) => tools.rewriteInbound(a) } : {}),
@@ -238,12 +289,16 @@ export class Gateway {
         gw.log('info', `host MCP output tools on ${url}`);
       }
       gw.watches.start();
+      gw.runs.settleAllDangling();
       await gw.loadConfigWatches();
       await gw.startChannels();
       await gw.adoptRunningTurns();
       if (o.listen !== false) {
         gw.server = new LocalServer(gw, o.config.socketPath);
         await gw.server.listen();
+        // The socket directory is private (0700) by now; the token file is 0600 in it.
+        gw.tokenFile = tokenPath(o.config.socketPath);
+        writeTokenFile(gw.tokenFile, gw.token);
       }
     } catch (e) {
       await gw.stop().catch(() => undefined);
@@ -254,6 +309,27 @@ export class Gateway {
 
   get config(): Config {
     return this.o.config;
+  }
+
+  /** Host frames on the local socket (LocalHost). */
+  get hostFrames(): HostService {
+    return this.host;
+  }
+
+  /**
+   * Accept one envelope from a channel: route it (Ingress) and remember who sent
+   * it as the channel reported it, so `input.verify` can answer later.
+   */
+  async accept(env: InboundEnvelope): Promise<IngressResult> {
+    const r = await this.ingress.accept(env);
+    if (r.accepted && r.origin && r.action !== 'duplicate') {
+      try {
+        this.records.recordInput(env, r.origin, r.inputId);
+      } catch (e) {
+        this.log('warn', `recording input ${r.inputId ?? env.id} failed: ${(e as Error).message}`);
+      }
+    }
+    return r;
   }
 
   /**
@@ -275,24 +351,152 @@ export class Gateway {
     return this.o.harness || harnessId === undefined ? undefined : this.o.config.harnesses[harnessId];
   }
 
-  /** The lane of a session, created on first use. Its harness session opens with the first turn. */
-  lane(sessionKey: string): Lane {
+  /**
+   * The lane of a session, created on first use with the session's agent (the
+   * one recorded for it, else `agent`, else the agent whose prefix the key has,
+   * else the default agent). Its harness session opens with the first turn.
+   */
+  lane(sessionKey: string, agentName?: string): Lane {
     let lane = this.lanes.get(sessionKey);
-    if (lane) return lane;
+    if (lane) {
+      const had = this.laneInfo.get(sessionKey)?.agent.name;
+      if (agentName !== undefined && had !== undefined && had !== agentName) this.log('warn', `${sessionKey} belongs to agent ${had}; a rule for agent ${agentName} delivered to it`);
+      return lane;
+    }
+    if (sessionKey.startsWith('run:')) throw new Error(`${sessionKey} is a task run session; it only exists while its run.start runs`);
+    const agent = this.agentFor(sessionKey, agentName);
+    const c = this.o.config;
+    const cwd = agent.configured ? (agent.cwd ?? c.harnesses[agent.harness]?.cwd ?? c.cwd) : c.cwd;
     lane = new Lane({
       sessionKey,
-      harness: this.harness(),
-      ...(this.o.harness ? {} : { harnessFor: (name: string) => this.harness(name) }),
+      harness: this.agentHarness(agent),
+      ...(this.o.harness ? {} : { harnessFor: (name: string) => (name === agent.harness ? this.agentHarness(agent) : this.harness(name)) }),
       resumeFor: (id) => this.nativeIdOf(sessionKey, id),
       hub: this.hub,
-      policy: this.policy,
-      cwd: this.o.config.cwd,
-      ...(this.mcp ? { mcp: (a: { sessionKey: string; generation: number; harnessId: string }) => this.mcp!.mcpFor(a) } : {}),
+      policy: this.agentPolicy(agent),
+      cwd,
+      ...(this.mcp && agent.tools ? { mcp: (a: { sessionKey: string; generation: number; harnessId: string }) => this.mcp!.mcpFor(a) } : {}),
       onHarnessEvent: (e) => this.o.onHarnessEvent?.(sessionKey, e),
     });
     this.lanes.set(sessionKey, lane);
+    this.laneInfo.set(sessionKey, { agent, ...(agent.configured ? { cwd } : {}) });
     for (const ch of this.channels) this.compose(sessionKey, ch.adapter, ch.tier);
     return lane;
+  }
+
+  /** The agent of an interactive session. */
+  private agentFor(sessionKey: string, wanted: string | undefined): AgentConfig {
+    const c = this.o.config;
+    const usable = (n: string | undefined) => (n !== undefined && c.agents[n]?.mode === 'interactive' ? c.agents[n] : undefined);
+    const recorded = usable(this.records.agentOf(sessionKey));
+    if (recorded) return recorded;
+    const byPrefix = Object.values(c.agents).find((a) => a.name !== c.defaultAgent && a.mode === 'interactive' && sessionKey.startsWith(`${a.name}:`));
+    const agent = usable(wanted) ?? byPrefix ?? usable(c.defaultAgent);
+    if (!agent) throw new Error(`no interactive agent for session ${sessionKey} (configure one, or a defaultAgent)`);
+    if (agent.configured) this.records.setAgent(sessionKey, agent.name);
+    return agent;
+  }
+
+  /** The adapter an agent's sessions open: its instance's, with the agent's cwd and instructions. */
+  private agentHarness(agent: AgentConfig): HarnessAdapter {
+    if (this.o.harness || !agent.configured) return this.harness(agent.harness);
+    let a = this.agentAdapters.get(agent.name);
+    if (!a) {
+      a = withAgent(this.harness(agent.harness), agent, agent.cwd);
+      this.agentAdapters.set(agent.name, a);
+    }
+    return a;
+  }
+
+  /** Configured agents plan their own harness, model, effort and (when set) profile; the policy's profile otherwise. */
+  private agentPolicy(agent: AgentConfig): FullPolicy {
+    if (!agent.configured || this.o.policy?.plan) return this.policy;
+    const policy = this.policy;
+    const inst = this.o.config.harnesses[agent.harness]!;
+    return {
+      ...policy,
+      plan: async (draft) => {
+        const p = await policy.plan(draft);
+        return { ...agentRun(agent, inst), profile: agent.profile ?? p.profile };
+      },
+    };
+  }
+
+  /**
+   * The lane of one task run: its own harness adapter, built for this run with the
+   * request env over the instance's (the child's environment only), the run's cwd,
+   * the agent's run config, and no retry of an unconsumed input.
+   */
+  private openRunLane(r: { runId: string; sessionKey: string; agent: AgentConfig; cwd: string; env: Record<string, string>; turnId: string }): { lane: Lane; dispose(): Promise<void> } {
+    const c = this.o.config;
+    const inst = c.harnesses[r.agent.harness];
+    if (!inst) throw new Error(`agent ${r.agent.name}: unknown harness instance ${r.agent.harness}`);
+    const provenance: TurnProvenance = { sessionKey: r.sessionKey, turnId: r.turnId, triggeredBy: [`host:${this.host.hostName() ?? 'cli'}`], watched: false, external: false, group: false };
+    const env = { ...r.env, AGENTS_IO_RUN_ID: r.runId, AGENTS_IO_TURN_PROVENANCE: JSON.stringify(provenance) };
+    let adapter: HarnessAdapter;
+    let own: HarnessAdapter | undefined;
+    if (this.o.harness) adapter = this.o.harness;
+    else {
+      // A Codex run gets its own app-server over stdio: the env reaches only this run's child, which ends with it.
+      const runInst = {
+        ...inst,
+        cwd: r.cwd,
+        env: { ...inst.env, ...env },
+        ...(inst.kind === 'codex' ? { codex: { ...inst.codex, transport: { kind: 'stdio' as const } } } : {}),
+      } as HarnessInstance;
+      own = this.o.buildHarness?.(runInst) ?? buildHarness(runInst, blobResolvers(this.blobs));
+      adapter = withAgent(own, r.agent, r.cwd);
+    }
+    const spec: RunSpec = { ...agentRun(r.agent, inst), profile: r.agent.profile ?? 'restricted' };
+    let firstTurn = true;
+    const lane = new Lane({
+      sessionKey: r.sessionKey,
+      harness: adapter,
+      hub: this.hub,
+      policy: { ...this.policy, plan: async () => spec },
+      cwd: r.cwd,
+      requeueLimit: 0,
+      newId: (p) => {
+        if (p === 'turn' && firstTurn) {
+          firstTurn = false;
+          return r.turnId;
+        }
+        return `${p}_${randomUUID()}`;
+      },
+      ...(this.mcp && r.agent.tools ? { mcp: (a: { sessionKey: string; generation: number; harnessId: string }) => this.mcp!.mcpFor(a) } : {}),
+      onHarnessEvent: (e) => this.o.onHarnessEvent?.(r.sessionKey, e),
+    });
+    this.lanes.set(r.sessionKey, lane);
+    this.laneInfo.set(r.sessionKey, { agent: r.agent, cwd: r.cwd });
+    for (const ch of this.channels) this.compose(r.sessionKey, ch.adapter, ch.tier);
+    return {
+      lane,
+      dispose: async () => {
+        await within(lane.close('run ended').catch(() => undefined), 8000);
+        await within(lane.whenIdle(), 3000);
+        const comps = this.sessionCompositors.get(r.sessionKey) ?? [];
+        await within(Promise.all(comps.map((x) => x.stop())), 5000);
+        this.sessionCompositors.delete(r.sessionKey);
+        for (const x of comps) this.compositors.splice(this.compositors.indexOf(x), 1);
+        this.lanes.delete(r.sessionKey);
+        this.laneInfo.delete(r.sessionKey);
+        await within(codexOf(own)?.dispose(), 3000);
+      },
+    };
+  }
+
+  /** `deliver`: send a host's message through the outbox, idempotent per operationId (across restarts too). */
+  async deliver(hostName: string, f: Extract<HostRequestFrame, { type: 'deliver' }>): Promise<Outcome> {
+    if (this.stopped) return fail('stopped', 'daemon is stopping');
+    if (!f.operationId) return fail('invalid_frame', 'operationId is empty');
+    // Host operation ids get their own namespace, apart from the compositor's and the output tools'.
+    const operationId = `host:${f.operationId}`;
+    const settled = this.outbox.get(operationId);
+    if (settled) return { ok: true, value: { ...settled, operationId: f.operationId, duplicate: true } };
+    const ch = this.channels.find((x) => x.adapter.id === f.route.channel && x.account === f.route.account) ?? this.channels.find((x) => x.adapter.id === f.route.channel);
+    if (!ch) return fail('unknown_channel', `no running channel ${f.route.channel} (running: ${this.channels.map((x) => x.adapter.id).join(', ') || 'none'})`);
+    const rec = await this.outbox.send(ch.adapter, { operationId, sessionKey: `host:${hostName}`, route: f.route, msg: f.message });
+    return { ok: true, value: { ...rec, operationId: f.operationId, duplicate: false } };
   }
 
   /** The instance's own session/thread id last bound to this session, so a restart resumes it. */
@@ -317,6 +521,9 @@ export class Gateway {
     });
     c.start();
     this.compositors.push(c);
+    const list = this.sessionCompositors.get(sessionKey);
+    if (list) list.push(c);
+    else this.sessionCompositors.set(sessionKey, [c]);
   }
 
   private async startChannels(): Promise<void> {
@@ -331,7 +538,10 @@ export class Gateway {
           config: ch.config,
           signal: ac.signal,
           blobs: this.blobs,
-          emit: this.ingress.emitter(),
+          emit: async (env) => {
+            const r = await this.accept(env);
+            return { accepted: r.accepted, ...(r.inputId !== undefined ? { inputId: r.inputId } : {}) };
+          },
           log: (level, msg) => this.log(level, `${ch.adapter.id}: ${msg}`),
         })
         .catch((err: Error) => this.log('error', `channel ${ch.adapter.id} stopped: ${err.message}`));
@@ -355,6 +565,7 @@ export class Gateway {
    */
   private async adoptRunningTurns(): Promise<void> {
     for (const key of this.hub.log.sessions()) {
+      if (key.startsWith('run:')) continue; // runs are settled at start (Runs.settleAllDangling)
       const snap = this.hub.snapshot(key);
       const inst = this.instanceOf(snap.harness);
       if (!snap.turn || inst?.kind !== 'codex' || inst.codex.transport.kind !== 'unix') continue;
@@ -414,7 +625,14 @@ export class Gateway {
   /** Apply a command from a local client (subscriptions are the server's business). */
   async command(cmd: ClientCommand, origin: Origin): Promise<Outcome> {
     if (this.stopped) return fail('stopped', 'gateway is stopping');
-    const lane = this.lane(cmd.sessionKey);
+    let lane: Lane;
+    try {
+      const live = this.lanes.get(cmd.sessionKey);
+      if (!live && cmd.sessionKey.startsWith('run:')) return fail('no_run', `${cmd.sessionKey} is not running (task run sessions only take commands while their run runs)`);
+      lane = live ?? this.lane(cmd.sessionKey);
+    } catch (e) {
+      return fail('no_agent', (e as Error).message);
+    }
     switch (cmd.type) {
       case 'input': {
         let content: ContentBlock[] = cmd.input.content;
@@ -476,7 +694,11 @@ export class Gateway {
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
+    this.host.close();
+    // Runs end (interrupted) while their connections can still hear run.ended.
+    await within(this.runs.stop(), 10_000);
     this.server?.close('gateway stopping');
+    if (this.tokenFile) removeTokenFile(this.tokenFile, this.token);
     this.watches.stop();
     for (const ch of this.channels) ch.ac.abort();
     await within(Promise.all(this.channels.map((c) => c.running)), 3000);
@@ -501,6 +723,8 @@ export class Gateway {
     await within(this.mcp?.close(), 2000);
     await within(new Promise(() => {}), 50);
     this.watches.registry.close();
+    this.hostQueue.close();
+    this.records.close();
     this.router.close();
     this.hub.log.close?.();
   }
@@ -508,6 +732,30 @@ export class Gateway {
 
 function fail(code: string, message = code): Outcome {
   return { ok: false, code, message };
+}
+
+/** An agent's RunSpec over its instance's defaults (without the profile). */
+function agentRun(agent: AgentConfig, inst: HarnessInstance): Omit<RunSpec, 'profile'> {
+  const effort = agent.effort ?? inst.run.effort;
+  return { harness: inst.name, model: agent.model ?? inst.run.model, ...(effort !== undefined ? { effort } : {}) };
+}
+
+/**
+ * An instance adapter as one agent opens it: the agent's working directory and
+ * instructions (Claude: appended to the preset system prompt; Codex: developer
+ * instructions) over the instance's. Other adapters (tests) are used as they are.
+ */
+export function withAgent(a: HarnessAdapter, agent: AgentConfig, cwd: string | undefined): HarnessAdapter {
+  if (!(a instanceof InstanceHarness)) return a;
+  const i = a.instance;
+  let options = i.options;
+  if (agent.instructions !== undefined) {
+    options =
+      i.kind === 'claude-code'
+        ? { ...options, sdk: { ...(options.sdk as Record<string, unknown> | undefined), systemPrompt: { type: 'preset', preset: 'claude_code', append: agent.instructions } } }
+        : { ...options, developerInstructions: agent.instructions };
+  }
+  return new InstanceHarness({ ...i, ...(cwd !== undefined ? { cwd } : {}), options } as HarnessInstance, a.inner);
 }
 
 /** The Codex adapter behind an instance adapter, if it is one (Codex is detached at shutdown, not closed). */

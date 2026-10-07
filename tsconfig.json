@@ -10,6 +10,7 @@
     { "path": "channel/mail" },
     { "path": "harness/claude-code" },
     { "path": "harness/codex" },
+    { "path": "packages/daemon" },
     { "path": "examples/dev-gateway" }
   ]
 }

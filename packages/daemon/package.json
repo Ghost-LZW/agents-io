@@ -1,0 +1,29 @@
+{
+  "name": "@agents-io/daemon",
+  "version": "0.1.0",
+  "description": "The agents-io daemon and CLI (aio): channels, binding-table router, lanes, host protocol on a local socket, task runs, host inbound queue",
+  "type": "module",
+  "bin": { "aio": "./dist/cli.js" },
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./cli": { "types": "./dist/cli.d.ts", "default": "./dist/cli.js" }
+  },
+  "files": ["dist", "aio.config.example.json"],
+  "scripts": {
+    "serve": "node dist/cli.js serve",
+    "attach": "node dist/cli.js attach",
+    "e2e": "node dist/cli.js e2e"
+  },
+  "dependencies": {
+    "@agents-io/channel-jsonl-bridge": "workspace:*",
+    "@agents-io/channel-lark-bot": "workspace:*",
+    "@agents-io/channel-mail": "workspace:*",
+    "@agents-io/host-mcp": "workspace:*",
+    "@agents-io/harness-claude-code": "workspace:*",
+    "@agents-io/harness-codex": "workspace:*",
+    "@agents-io/protocol": "workspace:*",
+    "@agents-io/session": "workspace:*",
+    "@agents-io/testkit": "workspace:*",
+    "@sinclair/typebox": "^0.34.0"
+  }
+}

@@ -71,36 +71,9 @@ importers:
 
   examples/dev-gateway:
     dependencies:
-      '@agents-io/channel-jsonl-bridge':
+      '@agents-io/daemon':
         specifier: workspace:*
-        version: link:../../channel/jsonl-bridge
-      '@agents-io/channel-lark-bot':
-        specifier: workspace:*
-        version: link:../../channel/lark-bot
-      '@agents-io/channel-mail':
-        specifier: workspace:*
-        version: link:../../channel/mail
-      '@agents-io/harness-claude-code':
-        specifier: workspace:*
-        version: link:../../harness/claude-code
-      '@agents-io/harness-codex':
-        specifier: workspace:*
-        version: link:../../harness/codex
-      '@agents-io/host-mcp':
-        specifier: workspace:*
-        version: link:../../packages/host-mcp
-      '@agents-io/protocol':
-        specifier: workspace:*
-        version: link:../../packages/protocol
-      '@agents-io/session':
-        specifier: workspace:*
-        version: link:../../packages/session
-      '@agents-io/testkit':
-        specifier: workspace:*
-        version: link:../../packages/testkit
-      '@sinclair/typebox':
-        specifier: ^0.34.0
-        version: 0.34.52
+        version: link:../../packages/daemon
 
   harness/claude-code:
     dependencies:
@@ -133,6 +106,39 @@ importers:
       '@types/ws':
         specifier: ^8.18.2
         version: 8.18.2
+
+  packages/daemon:
+    dependencies:
+      '@agents-io/channel-jsonl-bridge':
+        specifier: workspace:*
+        version: link:../../channel/jsonl-bridge
+      '@agents-io/channel-lark-bot':
+        specifier: workspace:*
+        version: link:../../channel/lark-bot
+      '@agents-io/channel-mail':
+        specifier: workspace:*
+        version: link:../../channel/mail
+      '@agents-io/harness-claude-code':
+        specifier: workspace:*
+        version: link:../../harness/claude-code
+      '@agents-io/harness-codex':
+        specifier: workspace:*
+        version: link:../../harness/codex
+      '@agents-io/host-mcp':
+        specifier: workspace:*
+        version: link:../host-mcp
+      '@agents-io/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@agents-io/session':
+        specifier: workspace:*
+        version: link:../session
+      '@agents-io/testkit':
+        specifier: workspace:*
+        version: link:../testkit
+      '@sinclair/typebox':
+        specifier: ^0.34.0
+        version: 0.34.52
 
   packages/host-mcp:
     dependencies:

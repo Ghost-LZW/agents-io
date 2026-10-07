@@ -7,7 +7,7 @@
     "build": "tsc -b",
     "typecheck": "tsc -b --noEmit false",
     "test": "vitest run",
-    "e2e": "pnpm build && pnpm --filter @agents-io/example-dev-gateway e2e",
+    "e2e": "pnpm build && pnpm --filter @agents-io/daemon e2e",
     "schema": "pnpm build && node scripts/emit-schema.mjs"
   },
   "devDependencies": {

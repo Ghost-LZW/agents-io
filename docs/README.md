@@ -4,7 +4,7 @@ agents-io 的 agent IO 层（多端输入 / 多端输出 / 过程可见 / 可扩
 
 **先读：[POSITIONING.md](POSITIONING.md)**：仓库定位与边界。agents-io 是输入输出基建，只提供机制；信任、审批、模型选择等策略通过钩子交给宿主（如 x-work-os）。
 
-**动手跑：[E2E.md](E2E.md)**：`examples/dev-gateway`（`aio-dev`）把全部包接进一个进程，本地两个终端、真实飞书、多端与重启的端到端测试。
+**动手跑：[E2E.md](E2E.md)**：`packages/daemon`（`aio`，`examples/dev-gateway` 的 `aio-dev` 是它的旧名包装）把全部包接进一个进程，本地两个终端、真实飞书、多端与重启的端到端测试。
 
 **通道行为：[CHANNELS.md](CHANNELS.md)**：每个通道里 agent 能看到什么、它的输出怎么被渲染，以及和原生启动 harness 的区别。
 

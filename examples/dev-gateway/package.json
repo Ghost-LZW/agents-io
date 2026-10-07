@@ -2,7 +2,7 @@
   "name": "@agents-io/example-dev-gateway",
   "version": "0.0.0",
   "private": true,
-  "description": "Example: every agents-io piece in one process for local end-to-end testing (aio-dev serve | attach | send | e2e)",
+  "description": "Example: the agents-io daemon (`aio`, packages/daemon) under its old name aio-dev, with a dev config example (aio-dev serve | attach | input | e2e)",
   "type": "module",
   "bin": { "aio-dev": "./dist/cli.js" },
   "scripts": {
@@ -11,15 +11,6 @@
     "e2e": "node dist/cli.js e2e"
   },
   "dependencies": {
-    "@agents-io/channel-jsonl-bridge": "workspace:*",
-    "@agents-io/channel-lark-bot": "workspace:*",
-    "@agents-io/channel-mail": "workspace:*",
-    "@agents-io/host-mcp": "workspace:*",
-    "@agents-io/harness-claude-code": "workspace:*",
-    "@agents-io/harness-codex": "workspace:*",
-    "@agents-io/protocol": "workspace:*",
-    "@agents-io/session": "workspace:*",
-    "@agents-io/testkit": "workspace:*",
-    "@sinclair/typebox": "^0.34.0"
+    "@agents-io/daemon": "workspace:*"
   }
 }
