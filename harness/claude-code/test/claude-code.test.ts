@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { assertConformingStream } from '@agents-io/testkit';
+import { assertConformingStream, runHarnessEnvConformance } from '@agents-io/testkit';
 import type { HarnessEvent, HarnessOpenArgs, HarnessSession, RunSpec } from '@agents-io/protocol';
 import { ClaudeCodeHarness, type ClaudeCodeHarnessConfig, convertBlock, inputUuid, mapAnswers, preface, riskOf } from '../src/index.js';
 import type { ClaudeCodeOptions, PermissionResult } from '../src/types.js';
@@ -101,6 +101,44 @@ describe('open → SDK options', () => {
     expect(JSON.stringify(o.mcpServers)).not.toContain('sekrit-token-123');
     expect(o.mcpServers?.agents_io).toMatchObject({ headers: { Authorization: 'Bearer ${AGENTS_IO_MCP_TOKEN}' } });
     expect(o.env?.AGENTS_IO_MCP_TOKEN).toBe('sekrit-token-123');
+  });
+
+  describe('per-session env (args.env)', () => {
+    it('is the top layer of the child env: over config.configDir and options.env', async () => {
+      const { q } = await setup(
+        { env: { CLAUDE_CONFIG_DIR: '/session/cfg', FOO: 'session' } },
+        { env: { FOO: 'open', BAR: 'open' } },
+        { configDir: '/instance/cfg' },
+      );
+      expect(q.options.env).toMatchObject({ CLAUDE_CONFIG_DIR: '/session/cfg', FOO: 'session', BAR: 'open' });
+    });
+
+    it('without args.env the instance configDir still applies', async () => {
+      const { q } = await setup({}, {}, { configDir: '/instance/cfg' });
+      expect(q.options.env?.CLAUDE_CONFIG_DIR).toBe('/instance/cfg');
+    });
+
+    it('never reaches argv-bound options or events (conformance)', async () => {
+      const fq = fakeQueryFn();
+      const h = new ClaudeCodeHarness({ query: fq.fn, claudePath: '/usr/local/bin/claude', sdkVersion: '0.3.291', cliVersion: async () => '2.1.291' });
+      const report = await runHarnessEnvConformance({
+        adapter: h,
+        open: { sessionKey: 's', generation: 1, cwd: '/tmp/x', run },
+        // The SDK builds argv from every option except env; functions drop out of the JSON.
+        lastSpawn: () => {
+          const { env, ...rest } = fq.last().options;
+          return { env: env ?? {}, argv: [JSON.stringify(rest)] };
+        },
+        turn: { turnId: 't1', inputs: [input('i1', 'hi')] },
+        settle: async () => {
+          const q = fq.last();
+          await q.waitWritten(1);
+          q.push(sdk.init(), sdk.text('m1', 'hello'), sdk.result({ uuids: [uuidOf(q, 0)] }));
+        },
+      });
+      expect(report.failed).toEqual([]);
+      expect(report.passed).toEqual(['env.in_child_env', 'env.not_in_argv', 'env.not_in_events']);
+    });
   });
 
   it('non-bypass default is permissionMode default (never omitted), profiles map from options', async () => {

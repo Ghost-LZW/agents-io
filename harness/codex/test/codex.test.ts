@@ -109,6 +109,14 @@ describe('open', () => {
     expect(fake.spawned).toBe(1); // one process, many threads
   });
 
+  it('rejects a per-session env (one shared app-server), accepts an empty one', async () => {
+    const { fake, harness } = setup();
+    await expect(open(harness, { env: { K: 'v' } })).rejects.toThrow(/per-session env.*own app-server/);
+    expect(fake.sent('thread/start')).toHaveLength(0);
+    await open(harness, { env: {} });
+    expect(fake.sent('thread/start')).toHaveLength(1);
+  });
+
   it('resumes an existing thread', async () => {
     const { fake, harness } = setup();
     const s = await open(harness, { resume: 'thr-old' });

@@ -123,7 +123,7 @@ export class ClaudeCodeHarness implements HarnessAdapter {
     return p;
   }
 
-  /** process.env < config.env < CLAUDE_CONFIG_DIR < per-open env; undefined values removed. */
+  /** process.env < config.env < CLAUDE_CONFIG_DIR < options.env < args.env (per session, top layer); undefined values removed. */
   private childEnv(extra?: Record<string, string | undefined>): Record<string, string> {
     const env: Record<string, string | undefined> = {
       ...process.env,
@@ -169,7 +169,7 @@ export class ClaudeCodeHarness implements HarnessAdapter {
       stderrTail: () => stderr.slice(-20).join('').trim(),
     });
 
-    const env = this.childEnv(options.env);
+    const env = this.childEnv({ ...options.env, ...args.env });
 
     const mcpServers: Options['mcpServers'] = { ...c.mcpServers, ...options.sdk?.mcpServers };
     const hostServer = options.mcpServerName ?? 'agents_io';

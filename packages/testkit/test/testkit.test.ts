@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { assertConformingStream, checkEventStream, FakeChannel, FakeHarness, loadEnvFile, parseEnv, runChannelConformance } from '../src/index.js';
+import { assertConformingStream, checkEventStream, FakeChannel, FakeHarness, loadEnvFile, parseEnv, runChannelConformance, runHarnessEnvConformance } from '../src/index.js';
 import type { HarnessEvent, InputRecord } from '@agents-io/protocol';
 
 const input = (id: string, text: string): InputRecord => ({
@@ -95,5 +95,33 @@ describe('channel conformance', () => {
       platformMessages: async () => ch.sent.map((s) => s.providerMessageId),
     });
     expect(report.failed).toEqual([]);
+  });
+});
+
+describe('runHarnessEnvConformance', () => {
+  const adapterOf = (leakToArgv: boolean) => {
+    let spawn = { env: {} as Record<string, string | undefined>, argv: [] as string[] };
+    const adapter = {
+      id: 'leaky',
+      probe: async () => ({ version: '0', caps: {} as never }),
+      open: async (args: { env?: Record<string, string> }) => {
+        spawn = { env: { ...args.env }, argv: leakToArgv ? Object.values(args.env ?? {}) : [] };
+        return { events: (async function* () {})(), close: async () => {} } as never;
+      },
+    };
+    return { adapter, lastSpawn: () => spawn };
+  };
+  const open = { sessionKey: 's', generation: 1, cwd: '/tmp', run: { harness: 'x', model: 'm', profile: 'p' } };
+
+  it('passes an adapter that keeps env to the child environment', async () => {
+    const { adapter, lastSpawn } = adapterOf(false);
+    const r = await runHarnessEnvConformance({ adapter, open, lastSpawn });
+    expect(r.failed).toEqual([]);
+  });
+
+  it('fails an adapter that puts the value on argv', async () => {
+    const { adapter, lastSpawn } = adapterOf(true);
+    const r = await runHarnessEnvConformance({ adapter, open, lastSpawn });
+    expect(r.failed.map((f) => f.check)).toEqual(['env.not_in_argv']);
   });
 });

@@ -389,6 +389,9 @@ export class CodexHarness implements HarnessAdapter {
   }
 
   async open(args: HarnessOpenArgs): Promise<HarnessSession> {
+    // One app-server process serves every session, so its environment cannot differ per session.
+    if (args.env && Object.keys(args.env).length)
+      throw new Error('codex: a per-session env is not supported (all sessions share one app-server); give that session its own app-server');
     const options = (args.options ?? {}) as CodexOpenOptions;
     const opts: CodexOpenOptions = {
       ...options,
