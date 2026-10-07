@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "rootDir": "src", "outDir": "dist" },
+  "include": ["src"],
+  "references": [
+    { "path": "../../packages/protocol" },
+    { "path": "../../packages/session" },
+    { "path": "../../packages/testkit" },
+    { "path": "../../harness/claude-code" },
+    { "path": "../../harness/codex" },
+    { "path": "../../channel/lark-bot" },
+    { "path": "../../channel/mail" },
+    { "path": "../../channel/jsonl-bridge" }
+  ]
+}

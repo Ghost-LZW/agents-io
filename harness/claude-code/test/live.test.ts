@@ -2,10 +2,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { checkEventStream } from '@agents-io/testkit';
+import { checkEventStream, loadEnvFile } from '@agents-io/testkit';
 import type { HarnessEvent } from '@agents-io/protocol';
 import { ClaudeCodeHarness } from '../src/index.js';
-import { loadEnvFile } from './env-file.js';
 import { input } from './fake-query.js';
 
 /**

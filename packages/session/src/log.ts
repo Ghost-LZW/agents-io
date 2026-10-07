@@ -110,6 +110,16 @@ export function foldSnapshot(s: SessionSnapshot, e: SessionEvent): void {
       s.plan = null;
       s.headline = null;
       break;
+    case 'turn.adopted':
+      // Same turn as the one the log already shows open: keep what it knew (route, owner, deliveries).
+      if (s.turn?.turnId !== b.turnId) {
+        s.turn = { turnId: b.turnId, inputIds: [...b.inputIds], replyRoute: null, ...(b.run ? { run: b.run } : {}), deliveries: [] };
+        s.partialText = '';
+        s.activeItems = [];
+        s.plan = null;
+      }
+      s.state = 'running';
+      break;
     case 'turn.delivery_added':
       if (s.turn?.turnId === b.turnId) s.turn.deliveries.push(b.route);
       break;

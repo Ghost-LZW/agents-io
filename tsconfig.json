@@ -8,6 +8,7 @@
     { "path": "channel/lark-bot" },
     { "path": "channel/mail" },
     { "path": "harness/claude-code" },
-    { "path": "harness/codex" }
+    { "path": "harness/codex" },
+    { "path": "examples/dev-gateway" }
   ]
 }
