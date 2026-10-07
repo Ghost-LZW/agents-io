@@ -4,6 +4,7 @@ import type { InboundEnvelope, InputRecord, Origin } from './inbound.js';
 import type { RunSpec } from './run.js';
 import type { Resolver } from './requests.js';
 import type { BodyOf } from './events.js';
+import type { Watch } from './watch.js';
 
 export interface IdentifyArgs {
   channel: string;
@@ -69,4 +70,15 @@ export interface Policy {
   control?(args: ControlArgs): Promise<'allow' | 'deny'>;
   /** A `model` resolver could not decide; who answers next. */
   escalate?(req: BodyOf<'request.opened'>, ctx: TurnContext): Promise<Resolver>;
+  /**
+   * May `by` create this watch? Default: owners may watch anything; an agent only
+   * sources on the deployment's allowlist (no human approval).
+   */
+  watch?(args: { watch: Watch; by: Origin }): Promise<'allow' | 'deny'>;
+  /**
+   * Semantic gate for a watched input that passed the watch's filters. Default
+   * keeps the watch's own mode. Inputs that arrive via a watch are untrusted:
+   * their origin stays the original sender, never the watch's creator.
+   */
+  triage?(args: { watch: Watch; input: InputRecord }): Promise<'drop' | 'context' | 'trigger'>;
 }
