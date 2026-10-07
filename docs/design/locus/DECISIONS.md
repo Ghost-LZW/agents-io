@@ -83,3 +83,15 @@
 - `/ws` 服务端心跳；`host.hello { takeover: true }` 在 token 正确时替换半开的旧宿主连接并告警。
 - bridge 通道首次 hello 失败时标为 `failed` 并按退避重试，不再阻止守护进程启动。
 - 经 `PUT /api/config` 的通道增删热生效（`applied: "live"`），只启停变化的通道。
+
+## 决定 11：实时语音会话（live）—— harness 出语音，通道出媒体对端
+
+日期：2026-10-08。调研见 `docs/research/codex-realtime-live.md`（真人语音实测）。owner 指示：入会必须是 Codex realtime v3 这类语音原生能力，不是文本 agent 转语音；会中委托出来的 Codex 工作与文字会话**同权限**。
+
+- **分工**：实时语音是 harness 的能力（`HarnessSession.live`，目前只有 Codex：`thread/realtime/start`，v3，WebRTC）；通道只提供"媒体对端"（`ChannelAdapter.openLive(account, target)` → `LiveEndpoint`：一段 WebRTC offer、`answer(sdp)`、`close()`、`ended`）。网关在两者之间转交 SDP，**音频不经过 agents-io**。
+- **挂在会话的 thread 上**：live 打开在调用者所在 session 的 harness 会话上，语音端带着这个 session 的历史入会；文字 turn 与语音并行；会后同一个 session 用文字接着聊。一个 session 同时至多一个 live。
+- **委托 turn 归 lane 管**：语音端每次委托（Codex `handoff_request`）记成一条输入（`transcript` 块，`origin.principal = null`，`channelContext.live = true`，回复路由 = 发起 live 的那个路由），随后 Codex 自己开的 turn 以 `turn.started{initiator: 'harness'}` 交给 lane，lane 把它当作当前 turn（排队、工具、来源标记照常），turn 本身没有回复路由：答案由语音说出，不自动发到 IM。委托时已有 turn 在跑，则记成该 turn 的输入（Codex 合并进去）。
+- **权限**：委托 turn 用 thread 当时的设置，即与文字会话相同（owner 指示）。来源照决定 4/5 只标记（`external`），不降档。
+- **日志**：`live.started` / `live.transcript`（双方，每句一条）/ `live.handoff` / `live.ended`，都进 session 日志。
+- **工具**（宿主 MCP）：`live_join { target, instructions?, voice? }`（在当前 turn 的通道上打开对端，target 由通道解释，例如会议号）、`live_say { text }`（让语音端说一段话）、`live_leave`。委托 turn 里同样可用，所以会里说"挂了吧"能离会。语音转述不可靠：要紧的结果应另用 `send_message` 落成文字（工具说明里写明）。
+- **结束**：任一端结束（对端离会、harness 关闭、`live_leave`、守护进程停止）都关闭另一端并记 `live.ended`。守护进程重启不恢复 live。
