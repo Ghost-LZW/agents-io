@@ -170,16 +170,26 @@ against the protocol alone.
   `host.hello` with the host token.
 - **Lark bot provisioning**: `POST /api/bots/lark` runs `larkBotCommand` with
   `--qr-out <file> --json --write-env <env file> --name … --brand … --preset …`
-  (`--avatar` from a `data:` URI, `--no-owner`); the job goes `starting` →
-  `waiting_scan` (the QR file's content as `qr.payload`) → `configuring` →
-  `succeeded` / `failed` / `expired`. Credentials go only to the env file
-  (`LARK_APP_ID`, `LARK_APP_SECRET`, `LARK_DOMAIN`); the job shows their `env:`
-  references. On success the config gets a `lark-bot` channel (unless
-  `addChannel: false`) and the verified owner `lark-bot:<union_id>` in
-  `policy.owners`; restart to start it. One job at a time, and one lark-bot
-  channel per daemon: a lark-bot channel in the config, or `LARK_APP_ID` /
-  `LARK_APP_SECRET` already set in the env file or environment, is 409 (also
-  with `addChannel: false`, since the env file would be overwritten).
+  (`--avatar` from a `data:` URI, `--no-owner`, and `--env-prefix LARK_<ACCOUNT>_`
+  for an `account` other than `default`; create-lark-bot ≥ 0.2.4); the job goes
+  `starting` → `waiting_scan` (the QR file's content as `qr.payload`) →
+  `configuring` → `succeeded` / `failed` / `expired`. A daemon runs one bot per
+  channel account (decision 8). Credentials go only to the env file, under the
+  account's names: `LARK_APP_ID` / `LARK_APP_SECRET` / `LARK_DOMAIN` for
+  `default`, `LARK_PROJ_A_APP_ID` / … for `proj-a`; the job shows their `env:`
+  references. On success the config gets a `lark-bot` channel for the account
+  whose `config` references those names explicitly (unless `addChannel: false`)
+  and the verified owner `lark-bot:<union_id>` in `policy.owners`; restart to
+  start it. One job at a time. Refused at start (409, also with `addChannel:
+  false`, since the env file would be overwritten): a lark-bot channel with the
+  same account, the target variables already set (env file or environment), or
+  another channel reading them (`proj-a` and `proj_a` share names); a bad
+  account name is 400. The scan may take minutes, so before writing, the config
+  is checked again as it is then: the same account added meanwhile (`conflict`),
+  the new app already run by a configured channel (`duplicate_app`), or a config
+  that would not load (`config_invalid`, the `PUT` validation) fail the job and
+  write nothing; the credentials stay in the env file, unreferenced, and the
+  message names them (remove them by hand).
 
 ## Topics (decision 6)
 

@@ -242,7 +242,9 @@ export type AdminSessions = Static<typeof AdminSessions>;
  * `POST /api/bots/lark`: start creating a Feishu / Lark app the way
  * create-lark-bot does (the user scans a QR code to authorize; the app gets the
  * scopes, events and callbacks channel/lark-bot needs). Answer 202
- * `AdminLarkBotStarted`; 409 `conflict` while another job waits for a scan.
+ * `AdminLarkBotStarted`; 409 `conflict` while another job waits for a scan, when
+ * the account already has a lark-bot channel, or when the variables its
+ * credentials go to are set or read by another channel; 400 for a bad account.
  */
 export const AdminLarkBotRequest = Type.Object({
   /** App / bot display name. */
@@ -253,7 +255,13 @@ export const AdminLarkBotRequest = Type.Object({
   domain: Type.Optional(Type.Union([Type.Literal('feishu'), Type.Literal('lark')])),
   /** create-lark-bot presets; default `messaging`, `contact`. */
   presets: Type.Optional(Type.Array(Type.String())),
-  /** Channel account name to add the bot as (default `default`). */
+  /**
+   * Channel account name to add the bot as (default `default`): letters, digits,
+   * `.`, `_`, `-`, starting with a letter or digit, at most 64. One daemon runs one
+   * bot per account. Its credentials go to LARK_APP_ID / LARK_APP_SECRET /
+   * LARK_DOMAIN for `default`, else LARK_<ACCOUNT>_APP_ID / … (upper case, other
+   * characters as `_`; `proj-a` → LARK_PROJ_A_APP_ID).
+   */
   account: Type.Optional(Type.String()),
   /** Add a `lark-bot` channel for it to the config (default true). */
   addChannel: Type.Optional(Type.Boolean()),
@@ -293,7 +301,7 @@ export const AdminLarkBotJob = Type.Object({
       domain: Type.Union([Type.Literal('feishu'), Type.Literal('lark')]),
       botName: Type.Optional(Type.String()),
       account: Type.String(),
-      /** `env:NAME` references the config uses: `{ appId: "env:LARK_APP_ID", appSecret: "env:LARK_APP_SECRET", … }`. */
+      /** The `env:NAME` references of this account's credentials, as the channel entry uses them: `{ appId: "env:LARK_PROJ_A_APP_ID", … }`. */
       env: Type.Record(Type.String(), Type.String()),
       /** The owner key added (`lark-bot:<union_id>`), when `owner`. */
       owner: Type.Optional(Type.String()),

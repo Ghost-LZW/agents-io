@@ -3,26 +3,65 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AdminLarkBotJob, AdminLarkBotJobState, AdminLarkBotRequest } from '@agents-io/protocol';
-import type { ConfigStore } from './console-config.js';
+import { envRefs, type ConfigStore } from './console-config.js';
 import type { LogFn } from './gateway.js';
 
 /*
  * Lark bot provisioning for the console (`POST /api/bots/lark`): runs
  * create-lark-bot as a child process
- *   <command> --qr-out <file> --json --write-env <daemon env file> --name … --brand … --preset …
+ *   <command> --qr-out <file> --json --write-env <daemon env file> [--env-prefix LARK_<ACCOUNT>_] --name … --brand … --preset …
  * and follows it: the QR file appears → `waiting_scan` (its content is the QR
  * payload); progress on stderr after that → `configuring`; exit → the `--json`
  * result on stdout (it never carries the app secret) → `succeeded` / `failed` /
- * `expired`. The credentials go only into the env file (LARK_APP_ID /
- * LARK_APP_SECRET / LARK_DOMAIN, which the lark-bot channel reads); the job
- * shows their `env:NAME` references. With `addChannel` the config gets a
- * `lark-bot` channel, with a verified owner `policy.owners` gets
- * `lark-bot:<union_id>`; both take effect at the next start.
+ * `expired`. The credentials go only into the env file, under names per account
+ * (`default`: LARK_APP_ID / LARK_APP_SECRET / LARK_DOMAIN; `proj-a`:
+ * LARK_PROJ_A_APP_ID / …); the daemon never handles them. With `addChannel` the
+ * config gets a `lark-bot` channel for the account that references those names
+ * explicitly (decision 8: one daemon, several bots), with a verified owner
+ * `policy.owners` gets `lark-bot:<union_id>`; both take effect at the next start.
+ * The job may wait minutes for a scan, so the config is checked again, as it is
+ * then, before anything is written (same account, variable names, a duplicate
+ * app, the startup validation).
  */
 
 const FINAL = new Set<AdminLarkBotJobState>(['succeeded', 'failed', 'expired']);
 const QR_ART = /[█▀▄▌▐░▒▓]/;
 const AVATAR = /^data:image\/(png|jpe?g|webp|gif);base64,([A-Za-z0-9+/=\s]+)$/;
+/** Channel account names (as harness instance names): they are part of route and session keys. */
+const ACCOUNT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+/** The variables a bot's credentials go to: fixed names for `default`, `LARK_<ACCOUNT>_*` otherwise. */
+export function larkEnvNames(account: string): { prefix?: string; appId: string; appSecret: string; domain: string } {
+  if (account === 'default') return { appId: 'LARK_APP_ID', appSecret: 'LARK_APP_SECRET', domain: 'LARK_DOMAIN' };
+  const prefix = `LARK_${account.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_`;
+  return { prefix, appId: `${prefix}APP_ID`, appSecret: `${prefix}APP_SECRET`, domain: `${prefix}DOMAIN` };
+}
+
+interface LarkEntry {
+  type?: unknown;
+  account?: unknown;
+  config?: Record<string, unknown>;
+}
+
+const larkEntries = (raw: unknown): LarkEntry[] => {
+  const channels = (raw as { channels?: unknown } | undefined)?.channels;
+  return Array.isArray(channels) ? (channels as LarkEntry[]).filter((c) => c && c.type === 'lark-bot') : [];
+};
+const accountOf = (c: LarkEntry) => (typeof c.account === 'string' ? c.account : 'default');
+/** An entry without explicit appId / appSecret reads the fixed LARK_APP_* variables. */
+const fallback = (c: LarkEntry) => c.config?.appId === undefined && c.config?.appSecret === undefined;
+/** Variables an entry reads its credentials from. */
+const entryVars = (c: LarkEntry): string[] => [...envRefs(c.config ?? {}), ...(fallback(c) ? ['LARK_APP_ID', 'LARK_APP_SECRET', 'LARK_DOMAIN'] : [])];
+
+/** A provisioning step refused against the config as it is now. */
+class ProvisionConflict extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
 
 export interface LarkBotJobsOptions {
   /** argv of create-lark-bot (config `console.larkBotCommand`). */
@@ -75,15 +114,19 @@ export class LarkBotJobs {
     if (req.avatar !== undefined && !AVATAR.test(req.avatar)) return { ok: false, status: 400, code: 'invalid_request', message: 'avatar must be a data:image/(png|jpeg|webp|gif);base64 URI' };
     if (req.presets?.some((p) => !/^[A-Za-z][\w-]*$/.test(p))) return { ok: false, status: 400, code: 'invalid_request', message: 'presets are names (letters, digits, - and _)' };
     const account = req.account ?? 'default';
-    // create-lark-bot always writes LARK_APP_ID / LARK_APP_SECRET into the daemon's env file, whether or not the
-    // config gets a channel (addChannel): with a bot already there, that would silently replace its credentials.
-    const raw = this.o.config.read().raw as { channels?: { type?: string; account?: string }[] };
-    const existing = (raw.channels ?? []).find((c) => c.type === 'lark-bot');
-    if (existing)
-      return { ok: false, status: 409, code: 'conflict', message: `a lark-bot channel (account ${existing.account ?? 'default'}) is already configured; its credentials (LARK_APP_ID, LARK_APP_SECRET) would be replaced. Remove it first` };
-    const taken = this.o.config.defined(['LARK_APP_ID', 'LARK_APP_SECRET']);
+    if (!ACCOUNT.test(account)) return { ok: false, status: 400, code: 'invalid_request', message: 'account: letters, digits, ".", "_" and "-", starting with a letter or digit (at most 64)' };
+    // create-lark-bot writes the credentials into the daemon's env file whether or not the config gets a
+    // channel (addChannel): variables already set, or read by another bot, would be silently replaced.
+    try {
+      this.checkAccount(this.o.config.read().raw, account);
+    } catch (e) {
+      if (!(e instanceof ProvisionConflict)) throw e;
+      return { ok: false, status: 409, code: 'conflict', message: e.message };
+    }
+    const names = larkEnvNames(account);
+    const taken = this.o.config.defined([names.appId, names.appSecret, names.domain]);
     if (taken.length)
-      return { ok: false, status: 409, code: 'conflict', message: `${taken.join(' and ')} ${taken.length > 1 ? 'are' : 'is'} already set (env file ${this.o.config.envFilePath()} or the environment); a new bot would replace those credentials. Remove them first` };
+      return { ok: false, status: 409, code: 'conflict', message: `${taken.join(', ')} ${taken.length > 1 ? 'are' : 'is'} already set (env file ${this.o.config.envFilePath()} or the environment); a new bot would replace those credentials. Remove them first` };
     const id = `lark_${randomUUID()}`;
     const dir = join(this.o.dir, id);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -106,9 +149,35 @@ export class LarkBotJobs {
     return { ok: true, job: id };
   }
 
+  /**
+   * The account against the config (at start, and again before writing): no
+   * lark-bot entry with the same account, none reading the variables this one's
+   * credentials go to (e.g. `proj-a` and `proj_a` share LARK_PROJ_A_*).
+   */
+  private checkAccount(raw: unknown, account: string): void {
+    const entries = larkEntries(raw);
+    if (entries.some((c) => accountOf(c) === account))
+      throw new ProvisionConflict('conflict', `a lark-bot channel with account ${account} is already configured; provision another account, or remove it first`);
+    const names = larkEnvNames(account);
+    const mine = new Set([names.appId, names.appSecret, names.domain]);
+    for (const c of entries) {
+      const shared = entryVars(c).filter((v) => mine.has(v));
+      if (shared.length) throw new ProvisionConflict('conflict', `the lark-bot channel with account ${accountOf(c)} reads ${[...new Set(shared)].join(', ')}, where account ${account}'s credentials would go; choose another account name`);
+    }
+  }
+
+  /** The app id an entry runs (its explicit appId, `env:` resolved, or LARK_APP_ID for a fallback entry). */
+  private appIdOf(c: LarkEntry): string | undefined {
+    const v = fallback(c) ? 'env:LARK_APP_ID' : c.config?.appId;
+    if (typeof v !== 'string') return undefined;
+    return v.startsWith('env:') ? this.o.config.lookup(v.slice(4)) : v;
+  }
+
   private args(job: Job): string[] {
     const r = job.req;
     const a = ['--qr-out', join(job.dir, 'qr.txt'), '--json', '--write-env', this.o.config.envFilePath(), '--name', r.name, '--brand', r.domain ?? 'feishu', '--preset', (r.presets ?? ['messaging', 'contact']).join(',')];
+    const prefix = larkEnvNames(r.account ?? 'default').prefix;
+    if (prefix) a.push('--env-prefix', prefix);
     if (r.avatar !== undefined) a.push('--avatar', this.avatarFile(job.dir, r.avatar));
     if (r.owner === false) a.push('--no-owner');
     return a;
@@ -206,18 +275,36 @@ export class LarkBotJobs {
     const unionId = r.owner?.verified?.unionId ? r.owner.unionId : undefined;
     const owner = req.owner !== false && unionId ? `lark-bot:${unionId}` : undefined;
     const addChannel = req.addChannel !== false;
+    const names = larkEnvNames(account);
+    const env = { appId: `env:${names.appId}`, appSecret: `env:${names.appSecret}`, domain: `env:${names.domain}` };
     if (addChannel || owner) {
-      this.o.config.update((raw) => {
-        if (addChannel) {
-          const channels = Array.isArray(raw.channels) ? (raw.channels as { type?: string }[]) : [];
-          if (!channels.some((c) => c.type === 'lark-bot')) raw.channels = [...channels, { type: 'lark-bot', ...(account !== 'default' ? { account } : {}) }];
-        }
-        if (owner) {
-          const policy = (raw.policy && typeof raw.policy === 'object' ? raw.policy : {}) as { owners?: string[] };
-          if (!(policy.owners ?? []).includes(owner)) raw.policy = { ...policy, owners: [...(policy.owners ?? []), owner] };
-        }
-        return raw;
-      });
+      // The credentials are in the env file by now; if the config is not written they stay there, unreferenced.
+      const left = `the credentials were written to ${this.o.config.envFilePath()} as ${names.appId}, ${names.appSecret}, ${names.domain}; no channel references them: remove them by hand (provisioning account ${account} again is refused while they are set)`;
+      let w: ReturnType<ConfigStore['updateValidated']>;
+      try {
+        w = this.o.config.updateValidated((raw) => {
+          if (addChannel) {
+            // Checked again as the config is now: it may have changed while the job waited for a scan.
+            this.checkAccount(raw, account);
+            const dup = larkEntries(raw).find((c) => this.appIdOf(c) === r.appId);
+            if (dup) throw new ProvisionConflict('duplicate_app', `app ${r.appId} is already the lark-bot channel with account ${accountOf(dup)}; one app runs one channel`);
+            const channels = Array.isArray(raw.channels) ? (raw.channels as unknown[]) : [];
+            raw.channels = [...channels, { type: 'lark-bot', ...(account !== 'default' ? { account } : {}), config: { ...env } }];
+          }
+          if (owner) {
+            const policy = (raw.policy && typeof raw.policy === 'object' ? raw.policy : {}) as { owners?: string[] };
+            if (!(policy.owners ?? []).includes(owner)) raw.policy = { ...policy, owners: [...(policy.owners ?? []), owner] };
+          }
+          return raw;
+        });
+      } catch (e) {
+        if (!(e instanceof ProvisionConflict)) throw e;
+        return this.finish(job, 'failed', { error: { code: e.code, message: `${e.message}; ${left}` } });
+      }
+      if (!w.ok) {
+        const issues = w.issues.map((i) => `${i.path || '/'}: ${i.message}`).join('; ');
+        return this.finish(job, 'failed', { error: { code: 'config_invalid', message: `the config with this bot would not load (${issues}); nothing was written; ${left}` } });
+      }
     }
     const incomplete = code === 3 || r.configuration?.ok === false;
     const consoleUrl = `https://open.${domain === 'lark' ? 'larksuite.com' : 'feishu.cn'}/app/${r.appId}`;
@@ -229,7 +316,7 @@ export class LarkBotJobs {
         domain,
         ...(r.identity?.name ? { botName: r.identity.name } : {}),
         account,
-        env: { appId: 'env:LARK_APP_ID', appSecret: 'env:LARK_APP_SECRET', domain: 'env:LARK_DOMAIN' },
+        env,
         ...(owner ? { owner } : {}),
         channelAdded: addChannel,
         ...(incomplete ? { consoleUrl } : {}),

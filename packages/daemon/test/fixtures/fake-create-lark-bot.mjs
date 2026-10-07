@@ -1,5 +1,6 @@
 // A stand-in for create-lark-bot (--qr-out <file> --json --write-env <file> …), for the provisioning tests.
 // FAKE_MODE: ok (default) | expire | crash | incomplete. It waits for `<qr file>.scanned` before "configuring".
+// `--env-prefix P` writes P + APP_ID / APP_SECRET / DOMAIN (default LARK_); FAKE_APP_ID sets the app id it reports.
 import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
 
 const argv = process.argv.slice(2);
@@ -37,13 +38,15 @@ log('   已经扫码，等待手机确认');
 log('   正在创建应用「' + arg('--name') + '」…');
 await sleep(50);
 writeFileSync(envFile, '# kept\nOTHER=1\n', { flag: 'a', mode: 0o600 });
-appendFileSync(envFile, 'LARK_APP_ID=cli_fake123\nLARK_APP_SECRET=very-secret-value\nLARK_DOMAIN=feishu\n');
+const prefix = arg('--env-prefix') ?? 'LARK_';
+const appId = process.env.FAKE_APP_ID ?? 'cli_fake123';
+appendFileSync(envFile, `${prefix}APP_ID=${appId}\n${prefix}APP_SECRET=very-secret-value\n${prefix}DOMAIN=feishu\n`);
 const owner = argv.includes('--no-owner') ? {} : { owner: { unionId: 'on_owner1', openId: 'ou_x', verified: { unionId: true, openId: false }, status: 'verified' } };
 process.stdout.write(
   JSON.stringify(
     {
       ok: true,
-      appId: 'cli_fake123',
+      appId,
       brand: arg('--brand') ?? 'feishu',
       source: 'console',
       identity: { name: arg('--name') },

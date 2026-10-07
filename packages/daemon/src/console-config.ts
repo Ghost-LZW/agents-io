@@ -217,6 +217,12 @@ export class ConfigStore {
     return { ...fileEnv, ...(this.o.env ?? process.env) };
   }
 
+  /** The value of one variable (same lookup as `defined`). Stays in the daemon: provisioning compares app ids with it. */
+  lookup(name: string): string | undefined {
+    const v = this.env()[name];
+    return v === '' ? undefined : v;
+  }
+
   /** Which of `names` the env file or the environment sets (names only; values never leave). */
   defined(names: string[]): string[] {
     const env = this.env();
@@ -292,6 +298,21 @@ export class ConfigStore {
     const cur = this.read();
     if (cur.parseError) throw new ConfigError(`${this.o.path} is not JSON: ${cur.parseError}`);
     return this.write(fn(structuredClone(cur.raw) as Record<string, unknown>));
+  }
+
+  /**
+   * `update`, but only if the result passes the checks `PUT` runs (schema, the
+   * startup validation with the env file read afresh; literal secrets already in
+   * the file stay warnings): otherwise nothing is written and the issues come back.
+   * Errors thrown by `fn` propagate (nothing written).
+   */
+  updateValidated(fn: (raw: Record<string, unknown>) => Record<string, unknown>): { ok: true; revision: string } | { ok: false; issues: ConfigIssue[] } {
+    const cur = this.read();
+    if (cur.parseError) throw new ConfigError(`${this.o.path} is not JSON: ${cur.parseError}`);
+    const doc = fn(structuredClone(cur.raw) as Record<string, unknown>);
+    const issues = this.check(doc, 'all').filter((i) => i.severity === 'error');
+    if (issues.length) return { ok: false, issues };
+    return { ok: true, revision: this.write(doc) };
   }
 
   private write(doc: Json): string {
