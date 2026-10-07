@@ -21,6 +21,7 @@ agents-io 的 agent IO 层（多端输入 / 多端输出 / 过程可见 / 可扩
 | [research/openclaw-channels.md](research/openclaw-channels.md) | openclaw channel 侧：ChannelPlugin 契约、MsgContext、路由/session key、progress drafts、pairing/信任分级 |
 | [research/openclaw-runtime.md](research/openclaw-runtime.md) | openclaw runtime 侧：harness、`AgentEventPayload`、Gateway WS 订阅、queue mode、实时语音 consult |
 | [research/multica.md](research/multica.md) | multica：Task 统一输入、`agent.Message` 7 类事件、bus fan-out、IM Channel 注册表、supplement 注入 |
+| [research/meeting.md](research/meeting.md) | 飞书会议：实时转写、视频（无官方接口）、会议文档、会中聊天、语音发声（需 realtime 权限，本租户未开放）；Codex realtime 接口与真机探测 |
 
 ## design/：三份候选方案
 
