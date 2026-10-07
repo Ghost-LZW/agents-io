@@ -50,14 +50,35 @@ export function parseInterruptActionId(id: string): { turnId: string } | undefin
   return turnId ? { turnId } : undefined;
 }
 
+/**
+ * Thrown by `IngressOptions.lanes` when a session must not take input at all,
+ * e.g. `agent_unavailable`: the agent it is pinned to is gone. Ingress answers
+ * the delivery with `{ ok: false, reason: code }`, marks it in the explanation and
+ * calls `onUnavailable`; any other error from `lanes` propagates.
+ */
+export class LaneUnavailableError extends Error {
+  override name = 'LaneUnavailableError';
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
 export interface IngressOptions {
   policy?: SessionPolicy;
   /**
    * Lane for a session key; the host decides how lanes are created and kept.
    * `agent` is the binding's target agent (a named run configuration), absent for
-   * watch deliveries and legacy admits.
+   * watch deliveries and legacy admits. Throws `LaneUnavailableError` to refuse.
    */
   lanes: (sessionKey: string, agent?: string) => Lane | Promise<Lane>;
+  /**
+   * A table delivery was refused by `lanes` (`LaneUnavailableError`): tell the
+   * session and the route. Errors it throws are reported to `onReplyError`.
+   */
+  onUnavailable?: (a: { sessionKey: string; agent?: string; code: string; message: string; input: InputRecord }) => Promise<void> | void;
   /**
    * The binding tables. Default: a router with `defaultBindings({ agent: "default" })`
    * (bare route-key sessions) over `watches`, or — when the policy sets the
@@ -127,6 +148,8 @@ export interface DeliveryOutcome {
   result?: CommandResult;
   /** Watch and digest deliveries: what the watch machinery did. */
   watch?: WatchDelivery;
+  /** The session refused it before it reached a lane (`LaneUnavailableError`). */
+  unavailable?: { code: string; message: string };
 }
 
 export interface IngressResult {
@@ -248,7 +271,13 @@ export class Ingress {
       const action = click.kind === 'interrupt' ? ('interrupt' as const) : ('resolve' as const);
       // Unknown id: answer without creating a lane for the click's conversation.
       if (owner === undefined) return { accepted: true, action, origin, result: { ok: false, reason: click.kind === 'interrupt' ? 'stale_turn' : 'unknown_request' } };
-      const lane = await this.o.lanes(owner);
+      let lane: Lane;
+      try {
+        lane = await this.o.lanes(owner);
+      } catch (e) {
+        if (!(e instanceof LaneUnavailableError)) throw e;
+        return { accepted: true, action, sessionKey: owner, origin, result: { ok: false, reason: e.code } };
+      }
       const cmd: Command =
         click.kind === 'interrupt'
           ? { type: 'interrupt', sessionKey: owner, turnId: click.turnId, origin }
@@ -323,6 +352,16 @@ export class Ingress {
       }
     }
 
+    // Refused deliveries say so in `explain` (recorded again, same input id).
+    const refused = outcomes.filter((x) => x.unavailable && x.source !== 'watch');
+    if (refused.length) {
+      for (const m of explanation.matched) {
+        const r = refused.find((x) => x.bindingId === m.bindingId && x.source === m.source);
+        if (r) m.rejected = { code: r.unavailable!.code, message: r.unavailable!.message };
+      }
+      this.router.record(explanation);
+    }
+
     const first = outcomes.find((x) => x.source !== 'watch' && x.on === 'dispatch') ?? outcomes.find((x) => x.source !== 'watch');
     const action: IngressResult['action'] = first ? (first.on === 'dispatch' ? 'dispatch' : 'observe') : host ? 'host' : 'drop';
     return {
@@ -351,7 +390,18 @@ export class Ingress {
       );
       return { ...base, ...(w.inputId ? { inputId: w.inputId } : {}), ...(w.result ? { result: w.result } : {}), watch: w };
     }
-    const lane = await this.o.lanes(d.sessionKey, d.agent);
+    let lane: Lane;
+    try {
+      lane = await this.o.lanes(d.sessionKey, d.agent);
+    } catch (e) {
+      if (!(e instanceof LaneUnavailableError)) throw e;
+      try {
+        await this.o.onUnavailable?.({ sessionKey: d.sessionKey, ...(d.agent ? { agent: d.agent } : {}), code: e.code, message: e.message, input });
+      } catch (err) {
+        this.o.onReplyError?.(err);
+      }
+      return { ...base, result: { ok: false, reason: e.code }, unavailable: { code: e.code, message: e.message } };
+    }
     // The model sees which topic it is in (and, in the current one, how to rotate or switch with the output tools).
     if (d.topic) {
       const current = this.router.topics?.get(d.topic.id)?.state !== 'parked';

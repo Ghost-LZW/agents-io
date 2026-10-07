@@ -36,6 +36,7 @@ import {
   Hub,
   Ingress,
   Lane,
+  LaneUnavailableError,
   Outbox,
   Router,
   SqliteSessionLog,
@@ -335,6 +336,8 @@ export class Gateway {
       // Inputs of a current topic say how to move between topics, to agents that have the session_* tools.
       ...(tools ? { topicHint: (agent: string | undefined) => (c.agents[agent ?? c.defaultAgent ?? '']?.tools ? TOPIC_TOOLS_HINT : undefined) } : {}),
       onReplyError: (err) => this.log('warn', `topic command reply failed: ${(err as Error).message}`),
+      // A session whose agent is gone refuses the input: its log and the route say so.
+      onUnavailable: (a) => this.refuseUnavailable(a.sessionKey, a.code, a.message, a.input.inputId, a.input.replyRoute),
     });
     if (c.source) {
       this.configStore = new ConfigStore({ path: c.source.path, ...(c.source.envFile ? { envFile: c.source.envFile } : {}), ...(o.consoleEnv ? { env: o.consoleEnv } : {}) });
@@ -581,12 +584,22 @@ export class Gateway {
     return lane;
   }
 
-  /** The agent of an interactive session. */
+  /**
+   * The agent of an interactive session. A session keeps the agent first recorded
+   * for it; if that agent is no longer configured (or no longer interactive), the
+   * session refuses with `agent_unavailable` instead of running the conversation
+   * under another agent's cwd, profile and tools.
+   */
   private agentFor(sessionKey: string, wanted: string | undefined): AgentConfig {
     const c = this.o.config;
     const usable = (n: string | undefined) => (n !== undefined && c.agents[n]?.mode === 'interactive' ? c.agents[n] : undefined);
-    const recorded = usable(this.records.agentOf(sessionKey));
-    if (recorded) return recorded;
+    const pinned = this.records.agentOf(sessionKey);
+    if (pinned !== undefined) {
+      const recorded = usable(pinned);
+      if (recorded) return recorded;
+      const why = c.agents[pinned] ? 'is a task agent now' : 'is not configured any more';
+      throw new LaneUnavailableError('agent_unavailable', `session ${sessionKey} belongs to agent ${JSON.stringify(pinned)}, which ${why}; configure it again to continue this session`);
+    }
     const byPrefix = Object.values(c.agents).find((a) => a.name !== c.defaultAgent && a.mode === 'interactive' && sessionKey.startsWith(`${a.name}:`));
     const agent = usable(wanted) ?? byPrefix ?? usable(c.defaultAgent);
     if (!agent) throw new Error(`no interactive agent for session ${sessionKey} (configure one, or a defaultAgent)`);
@@ -697,6 +710,21 @@ export class Gateway {
   }
 
   // ---- topics (decision 6) -------------------------------------------------
+
+  /**
+   * A session refused an input because its agent is gone (`agent_unavailable`): a
+   * notice and `input.rejected` in its log, a warning, and one short message on the
+   * route the input came from (local ends read their stream).
+   */
+  private async refuseUnavailable(sessionKey: string, code: string, message: string, inputId: string | undefined, route: ReplyRoute | null): Promise<void> {
+    this.log('warn', `${code}: ${message}`);
+    const ev = { ts: Date.now(), level: 'primary' as const, audience: 'status' as const, durability: 'durable' as const, visibility: 'participants' as const };
+    this.hub.append(sessionKey, { ...ev, body: { t: 'notice', code: 'other', message: `${code}: ${message}` } });
+    if (inputId !== undefined) this.hub.append(sessionKey, { ...ev, body: { t: 'input.rejected', inputIds: [inputId], reason: code } });
+    if (route && route.channel !== 'local') {
+      await this.systemReply({ route, text: 'This conversation\'s agent is not available any more, so the message was not delivered. Ask the operator to restore it.', operationId: `${code}:${inputId ?? randomUUID()}`, sessionKey });
+    }
+  }
 
   /** A topic command's answer: one plain message on the route, through the outbox (recorded in the topic's session). */
   private async systemReply(a: { route: ReplyRoute; text: string; operationId: string; sessionKey: string }): Promise<void> {
@@ -995,6 +1023,10 @@ ${a.summary}` }],
       if (!live && cmd.sessionKey.startsWith('run:')) return fail('no_run', `${cmd.sessionKey} is not running (task run sessions only take commands while their run runs)`);
       lane = live ?? this.lane(cmd.sessionKey);
     } catch (e) {
+      if (e instanceof LaneUnavailableError) {
+        await this.refuseUnavailable(cmd.sessionKey, e.code, e.message, cmd.type === 'input' ? cmd.input.inputId : undefined, null);
+        return fail(e.code, e.message);
+      }
       return fail('no_agent', (e as Error).message);
     }
     switch (cmd.type) {

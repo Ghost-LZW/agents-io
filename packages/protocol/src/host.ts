@@ -117,6 +117,12 @@ export const RouteExplanation = Type.Object({
       callout: Type.Optional(
         Type.Object({ outcome: Type.Union([Type.Literal('answered'), Type.Literal('timeout'), Type.Literal('error'), Type.Literal('no_host')]), on: BindingAction }),
       ),
+      /**
+       * The target session refused the delivery before it reached a lane, with a
+       * stable code, e.g. `agent_unavailable`: the agent the session is pinned to is
+       * no longer configured (or no longer interactive).
+       */
+      rejected: Type.Optional(Type.Object({ code: Type.String(), message: Type.Optional(Type.String()) })),
     }),
   ),
   principal: Type.Union([Type.String(), Type.Null()]),
