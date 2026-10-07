@@ -5,12 +5,12 @@ import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FrameDecoder, encodeFrame, type Policy, type SessionEvent } from '@agents-io/protocol';
-import { MemorySessionLog } from '@agents-io/session';
+import { MemorySessionLog, SqliteSessionLog } from '@agents-io/session';
 import { FakeChannel, FakeHarness, assertConformingStream, type FakeTurnScript } from '@agents-io/testkit';
 import { runAttach } from '../src/attach.js';
 import { CommandError, LocalClient } from '../src/client.js';
-import { resolveConfig } from '../src/config.js';
-import { Gateway } from '../src/gateway.js';
+import { resolveConfig, type HarnessInstance } from '../src/config.js';
+import { Gateway, InstanceHarness, buildHarness as buildRealHarness } from '../src/gateway.js';
 
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
@@ -197,5 +197,73 @@ describe('gateway wiring', () => {
     expect(text).toContain('echo: hello');
     expect(text).toContain('(input: new_turn)');
     expect(text).toContain('unknown command /bogus');
+  });
+});
+
+describe('named harness instances', () => {
+  it('lanes open the instance the plan names (its cwd, options, id); a restart resumes per instance', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'aio-gwi-'));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const config = resolveConfig(
+      {
+        harnesses: {
+          a: { use: 'claude-code', cwd: 'wa', profiles: { bypass: { permissionMode: 'bypassPermissions' } }, options: { forwardSubagentText: true } },
+          b: { use: 'codex', run: { model: 'gpt-b' } },
+        },
+        defaultHarness: 'a',
+        policy: { owners: ['fake:alice'] },
+        local: { principal: 'me' },
+      },
+      { env: {}, baseDir: dir, cwd: dir },
+    );
+    const built = new Map<string, FakeHarness>();
+    const buildHarness = (i: HarnessInstance) => {
+      const inner = new FakeHarness(async (t) => {
+        t.emit({ t: 'session.bound', nativeId: `native-${i.name}` });
+        t.emit({ t: 'text.snapshot', text: 'ok', final: true }, { audience: 'answer' });
+      }, `inner-${i.name}`);
+      built.set(i.name, inner);
+      return new InstanceHarness(i, inner);
+    };
+    let use = 'a';
+    const policy: Partial<Policy> = { plan: async () => ({ ...config.harnesses[use]!.run, profile: 'bypass' }) };
+    const start = async (log: MemorySessionLog | SqliteSessionLog) =>
+      Gateway.start({ config: { ...config, socketPath: join(dir, 'run', 'aio.sock') }, buildHarness, policy, log, channels: [{ adapter: new FakeChannel('fake') }], logger: () => {} });
+    const log = new SqliteSessionLog({ path: join(dir, 'log.sqlite') });
+    const gw = await start(log);
+    const c = await LocalClient.connect(join(dir, 'run', 'aio.sock'));
+    const send = async (text: string) => {
+      const n = gw.hub.log.read('s', 0).filter((e) => e.body.t === 'turn.completed').length;
+      await c.input('s', text);
+      await until(() => gw.hub.log.read('s', 0).filter((e) => e.body.t === 'turn.completed').length > n);
+    };
+    await send('one');
+    expect([...built.keys()]).toEqual(['a']); // lazily: b is not built until a turn names it
+    const sa = built.get('a')!.sessions[0]!;
+    expect(sa.args).toMatchObject({ cwd: join(dir, 'wa'), run: { harness: 'a', model: 'haiku' }, options: { forwardSubagentText: true, profiles: { bypass: { permissionMode: 'bypassPermissions' } } } });
+    use = 'b';
+    await send('two');
+    const sb = built.get('b')!.sessions[0]!;
+    expect(sb.args).toMatchObject({ cwd: config.cwd, run: { harness: 'b', model: 'gpt-b' } });
+    expect(sb.args.resume).toBeUndefined();
+    const evs = gw.hub.log.read('s', 0);
+    expect(evs.filter((e) => e.body.t === 'turn.completed').map((e) => e.harness)).toEqual(['a', 'b']);
+    expect(evs.filter((e) => e.body.t === 'session.bound').map((e) => e.harness)).toEqual(['a', 'b']);
+    c.close();
+    await gw.stop();
+
+    // Restart: a turn on `a` resumes a's native id, not b's.
+    built.clear();
+    use = 'a';
+    const gw2 = await start(new SqliteSessionLog({ path: join(dir, 'log.sqlite') }));
+    cleanups.push(() => gw2.stop());
+    const c2 = await LocalClient.connect(join(dir, 'run', 'aio.sock'));
+    cleanups.push(() => c2.close());
+    await c2.input('s', 'three');
+    await until(() => built.get('a')?.sessions[0]);
+    expect(built.get('a')!.sessions[0]!.args.resume).toBe('native-a');
+    expect(gw2.harness('b').id).toBe('b');
+    expect(() => buildRealHarness({ ...config.harnesses.a!, unavailable: 'harnesses.a.env.K: environment variable K is not set' })).toThrow('harness instance a is unavailable: harnesses.a.env.K: environment variable K is not set');
+    expect(() => gw2.harness('zzz')).toThrow(/unknown harness instance "zzz" \(configured: a, b\)/);
   });
 });

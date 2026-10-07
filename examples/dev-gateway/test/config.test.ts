@@ -2,7 +2,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { ConfigError, findEnvFile, loadConfig, resolveConfig, substituteEnv } from '../src/config.js';
+import { homedir } from 'node:os';
+import { ConfigError, codexStateDir, defaultInstance, findEnvFile, loadConfig, resolveConfig, substituteEnv } from '../src/config.js';
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -18,7 +19,9 @@ const resolve = (raw: unknown, env: Record<string, string> = {}, extra = {}) => 
 describe('config', () => {
   it('fills defaults from an empty file', () => {
     const c = resolve({});
-    expect(c.harness).toMatchObject({ kind: 'claude-code', run: { harness: 'claude-code', model: 'haiku' }, transport: { kind: 'stdio' } });
+    expect(c.defaultHarness).toBe('claude-code');
+    expect(Object.keys(c.harnesses)).toEqual(['claude-code']);
+    expect(defaultInstance(c)).toMatchObject({ name: 'claude-code', kind: 'claude-code', run: { harness: 'claude-code', model: 'haiku' }, claude: {} });
     expect(c.logPath).toBe(join(c.dataDir, 'log.sqlite'));
     expect(c.socketPath).toBe(join(c.dataDir, 'run', 'aio.sock'));
     expect(c.cwd).toBe('/work');
@@ -36,9 +39,10 @@ describe('config', () => {
       { AGENTS_IO_LIVE_CODEX_MODEL: 'env-model', AGENTS_IO_OWNERS: 'mail:a@b.c, lark-bot:u2' },
     );
     expect(c.dataDir).toBe('/base/state');
-    expect(c.harness.run).toEqual({ harness: 'codex', model: 'env-model', effort: 'low' });
-    expect(c.harness.transport).toMatchObject({ kind: 'unix', spawn: 'own' });
-    expect((c.harness.transport as { stateDir: string }).stateDir).not.toContain('~');
+    const cx = defaultInstance(c);
+    expect(cx.run).toEqual({ harness: 'codex', model: 'env-model', effort: 'low' });
+    if (cx.kind !== 'codex') throw new Error('codex');
+    expect(cx.codex.transport).toMatchObject({ kind: 'unix', spawn: 'own', stateDir: join(homedir(), 'cx') });
     expect(c.policy.owners).toEqual(['lark-bot:u1', 'mail:a@b.c', 'lark-bot:u2']);
     // The local end is the owner by default, in the owner's session.
     expect(c.local).toEqual({ principal: { id: 'lark-bot:u1', labels: ['owner'] }, session: 'main' });
@@ -46,7 +50,130 @@ describe('config', () => {
 
   it('--harness overrides harness.use; codex defaults to the codex default model', () => {
     const c = resolve({ harness: { use: 'claude-code' } }, {}, { harness: 'codex' });
-    expect(c.harness.run).toEqual({ harness: 'codex', model: '' });
+    expect(c.defaultHarness).toBe('codex');
+    expect(defaultInstance(c).run).toEqual({ harness: 'codex', model: '' });
+    // The older form keeps the adapter's default stateDir so a running deployment still adopts its turns.
+    const u = defaultInstance(resolve({ harness: { use: 'codex', codex: { transport: { kind: 'unix', spawn: 'own' } } } }));
+    expect(u.kind === 'codex' && u.codex.transport).toEqual({ kind: 'unix', spawn: 'own' });
+  });
+
+  it('named instances: per-kind launch settings, env refs, paths, default and --harness by name', () => {
+    const c = resolve(
+      {
+        harnesses: {
+          claude: { use: 'claude-code' },
+          'claude-gateway': {
+            use: 'claude-code',
+            env: { ANTHROPIC_BASE_URL: 'env:GW_URL', ANTHROPIC_AUTH_TOKEN: 'env:GW_TOKEN', ANTHROPIC_API_KEY: null, FIXED: 'v' },
+            run: { model: 'gemini-3.8-flash-high' },
+            configDir: '~/.claude-gw',
+            executable: 'bin/claude',
+            settings: { permissions: { allow: ['Read'] }, env: { X: 'env:GW_TOKEN' } },
+            settingSources: ['user'],
+            mcpServers: { docs: { type: 'http', url: 'https://docs', headers: { Authorization: 'env:GW_TOKEN' } } },
+            plugins: ['plugins/one'],
+            skills: 'all',
+            extraArgs: { 'debug-to-stderr': null },
+            additionalDirectories: ['shared'],
+            cwd: 'work',
+            profiles: { bypass: { permissionMode: 'bypassPermissions' } },
+          },
+          codex: {
+            use: 'codex',
+            home: '~/.codex-aio',
+            executable: 'codex',
+            config: { model_reasoning_summary: 'concise', 'mcp_servers.x.url': 'env:GW_URL' },
+            enable: ['web_search'],
+            disable: ['undo'],
+            transport: { kind: 'unix', spawn: 'own' },
+          },
+        },
+        defaultHarness: 'claude-gateway',
+      },
+      { GW_URL: 'https://gw.example', GW_TOKEN: 'tok-secret', AGENTS_IO_LIVE_CLAUDE_MODEL: 'env-model' },
+    );
+    expect(c.defaultHarness).toBe('claude-gateway');
+    const gw = c.harnesses['claude-gateway']!;
+    expect(gw).toMatchObject({
+      name: 'claude-gateway',
+      kind: 'claude-code',
+      // The env model override only touches the default instance.
+      run: { harness: 'claude-gateway', model: 'env-model' },
+      env: { ANTHROPIC_BASE_URL: 'https://gw.example', ANTHROPIC_AUTH_TOKEN: 'tok-secret', ANTHROPIC_API_KEY: undefined, FIXED: 'v' },
+      cwd: '/base/work',
+      claude: {
+        claudePath: '/base/bin/claude',
+        configDir: join(homedir(), '.claude-gw'),
+        settings: { permissions: { allow: ['Read'] }, env: { X: 'tok-secret' } },
+        settingSources: ['user'],
+        mcpServers: { docs: { headers: { Authorization: 'tok-secret' } } },
+        plugins: ['/base/plugins/one'],
+        skills: 'all',
+        extraArgs: { 'debug-to-stderr': null },
+        additionalDirectories: ['/base/shared'],
+      },
+    });
+    expect('ANTHROPIC_API_KEY' in gw.env).toBe(true); // null → removed from the child's environment
+    expect(c.harnesses.claude).toMatchObject({ run: { harness: 'claude', model: 'haiku' }, env: {}, claude: {} });
+    const cx = c.harnesses.codex!;
+    expect(cx).toMatchObject({
+      kind: 'codex',
+      run: { harness: 'codex', model: '' },
+      codex: {
+        bin: 'codex',
+        codexHome: join(homedir(), '.codex-aio'),
+        config: { model_reasoning_summary: 'concise', 'mcp_servers.x.url': 'https://gw.example' },
+        enable: ['web_search'],
+        disable: ['undo'],
+        // Namespaced per instance: restart adoption never crosses instances.
+        transport: { kind: 'unix', spawn: 'own', stateDir: codexStateDir('codex') },
+      },
+    });
+    expect(codexStateDir('codex')).toBe(join(homedir(), '.agents-io', 'codex.codex'));
+
+    // --harness picks an instance by name, or a kind's first instance.
+    const raw = { harnesses: { a: { use: 'claude-code' }, b: { use: 'codex' } } };
+    expect(resolve(raw).defaultHarness).toBe('a');
+    expect(resolve(raw, {}, { harness: 'b' }).defaultHarness).toBe('b');
+    expect(resolve(raw, {}, { harness: 'codex' }).defaultHarness).toBe('b');
+    expect(() => resolve(raw, {}, { harness: 'nope' })).toThrow('unknown harness instance "nope" (configured: a, b)');
+  });
+
+  it('named instances: clear errors that never echo values', () => {
+    const bad = (raw: unknown, env: Record<string, string> = {}) => {
+      try {
+        resolve(raw, env);
+      } catch (e) {
+        expect(e).toBeInstanceOf(ConfigError);
+        expect((e as Error).message).not.toContain('SECRET-VALUE');
+        return (e as Error).message;
+      }
+      throw new Error('no error');
+    };
+    expect(bad({ harnesses: { a: { use: 'claude-code', home: '/x' } } })).toMatch(/harnesses\.a.*home/);
+    expect(bad({ harnesses: { a: { use: 'codex', configDir: '/x' } } })).toMatch(/harnesses\.a.*configDir/);
+    expect(bad({ harnesses: { a: { use: 'gpt' } } })).toMatch(/invalid config/);
+    // A missing env ref only makes that instance unavailable (the gateway refuses to build it), naming the variable.
+    const m = resolve({ harnesses: { a: { use: 'claude-code' }, b: { use: 'claude-code', env: { K: 'env:MISSING' }, mcpServers: { x: { headers: { h: 'env:ALSO' } } } } } });
+    expect(m.harnesses.a!.unavailable).toBeUndefined();
+    expect(m.harnesses.b!.unavailable).toBe('harnesses.b.env.K: environment variable MISSING is not set');
+    expect(bad({ harnesses: { a: { use: 'claude-code', env: { K: 3 } } } }, { X: 'SECRET-VALUE' })).toMatch(/harnesses\.a\/env\/K/);
+    expect(bad({ harnesses: { 'a/b': { use: 'claude-code' } } })).toMatch(/instance names/);
+    expect(bad({ harnesses: {} })).toMatch(/empty/);
+    expect(bad({ harnesses: { a: { use: 'codex' } }, defaultHarness: 'z' })).toMatch(/defaultHarness "z" is not one of the harnesses \(a\)/);
+    expect(bad({ harnesses: { a: { use: 'codex' } }, harness: { use: 'codex' } })).toMatch(/not both/);
+    expect(bad({ harnesses: { a: { use: 'codex', profile: 'fast' } } })).toMatch(/does not accept --profile/);
+    expect(bad({ harnesses: { a: { use: 'codex', home: '/h', env: { CODEX_HOME: '/h2' } } } })).toMatch(/not both/);
+    expect(bad({ harnesses: { a: { use: 'claude-code', configDir: '/h', env: { CLAUDE_CONFIG_DIR: '/h2' } } } })).toMatch(/not both/);
+    expect(bad({ harnesses: { a: { use: 'codex', config: { k: 1 }, transport: { kind: 'unix', spawn: 'daemon' } } } })).toMatch(/not spawn "daemon"/);
+    expect(
+      bad({
+        harnesses: {
+          a: { use: 'codex', transport: { kind: 'unix', spawn: 'own', stateDir: '/s' } },
+          b: { use: 'codex', transport: { kind: 'unix', spawn: 'none', stateDir: '/s' } },
+        },
+      }),
+    ).toBe('harnesses a and b use the same codex stateDir /s; give each its own');
   });
 
   it('rejects unknown keys and bad values without echoing values', () => {
@@ -79,15 +206,20 @@ describe('config', () => {
     writeFileSync(join(d, '.env.live'), 'LARK_APP_ID=a\nLARK_APP_SECRET=b\nANTHROPIC_BASE_URL=http://x\n');
     const c = loadConfig({ cwd: d, env: {} });
     expect(c.channels[0]).toMatchObject({ lark: { appId: 'a', appSecret: 'b', domain: 'feishu' } });
-    expect(c.harness.env).toEqual({ ANTHROPIC_BASE_URL: 'http://x' });
+    expect(defaultInstance(c).env).toEqual({ ANTHROPIC_BASE_URL: 'http://x' });
     // Process env wins over the file.
     expect(loadConfig({ cwd: d, env: { LARK_APP_ID: 'z' } }).channels[0]).toMatchObject({ lark: { appId: 'z' } });
+    // Named instances get only what their `env` names.
+    writeFileSync(join(d, 'aio.config.json'), JSON.stringify({ harnesses: { a: { use: 'claude-code' }, g: { use: 'claude-code', env: { ANTHROPIC_BASE_URL: 'env:ANTHROPIC_BASE_URL' } } } }));
+    const n = loadConfig({ cwd: d, env: {} });
+    expect(n.harnesses.a!.env).toEqual({});
+    expect(n.harnesses.g!.env).toEqual({ ANTHROPIC_BASE_URL: 'http://x' });
   });
 
   it('an explicit missing config is an error; a missing default is all defaults', () => {
     const d = tmp();
     expect(() => loadConfig({ cwd: d, path: 'nope.json', env: {} })).toThrow(/not found/);
-    expect(loadConfig({ cwd: d, env: {} }).harness.kind).toBe('claude-code');
+    expect(defaultInstance(loadConfig({ cwd: d, env: {} })).kind).toBe('claude-code');
   });
 
   it('finds .env.live up the tree', () => {
@@ -99,8 +231,12 @@ describe('config', () => {
 
   it('the committed example config is valid', () => {
     const raw = JSON.parse(readFileSync(new URL('../aio.config.example.json', import.meta.url), 'utf8'));
-    const c = resolve(raw, { LARK_APP_ID: 'a', LARK_APP_SECRET: 'b' });
-    expect(c.harness.kind).toBe('claude-code');
+    const c = resolve(raw, { LARK_APP_ID: 'a', LARK_APP_SECRET: 'b', GATEWAY_BASE_URL: 'u', GATEWAY_AUTH_TOKEN: 't' });
+    expect(Object.values(c.harnesses).filter((i) => i.unavailable)).toEqual([]);
+    // Without the gateway's variables only that instance is unavailable.
+    expect(Object.values(resolve(raw, { LARK_APP_ID: 'a', LARK_APP_SECRET: 'b' }).harnesses).filter((i) => i.unavailable).map((i) => i.name)).toEqual(['claude-gateway']);
+    expect(defaultInstance(c).kind).toBe('claude-code');
+    expect(Object.values(c.harnesses).map((i) => `${i.name}:${i.kind}`)).toEqual(['claude:claude-code', 'claude-gateway:claude-code', 'codex:codex']);
     expect(c.channels.map((ch) => ch.type)).toContain('lark-bot');
   });
 });

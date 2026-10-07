@@ -42,6 +42,15 @@ export interface LaneOptions {
   cwd?: string;
   /** Native session/thread id to resume on first open. */
   resume?: string;
+  /**
+   * Several harnesses (named instances): the adapter a turn's `RunSpec.harness`
+   * names. Each open uses it; a turn naming another adapter than the open
+   * session's closes that session and opens the new one (next generation).
+   * `harness` stays the adapter events are attributed to before the first open.
+   */
+  harnessFor?: (name: string) => HarnessAdapter;
+  /** Native id to resume when opening this adapter id (with `harnessFor`; wins over `resume`). */
+  resumeFor?: (harnessId: string) => string | undefined;
   mcp?: { url: string; token: string };
   harnessOptions?: Record<string, unknown>;
   modelReviewer?: ModelReviewer;
@@ -124,6 +133,8 @@ export class Lane {
   private turn: ActiveTurn | undefined;
   private session: HarnessSession | undefined;
   private caps: HarnessCaps | undefined;
+  /** The adapter of the open session (or the last one, or `o.harness` before any). */
+  private adapter: HarnessAdapter;
   private generation = 0;
   private lastRun: RunSpec | undefined;
   private state: SessionState = 'idle';
@@ -139,6 +150,7 @@ export class Lane {
 
   constructor(private readonly o: LaneOptions) {
     this.sessionKey = o.sessionKey;
+    this.adapter = o.harness;
     this.policy = withDefaults(o.policy);
     this.newId = o.newId ?? ((p) => `${p}_${randomUUID()}`);
     // A log written by an earlier host: continue its generations, and remember a turn it left open
@@ -168,6 +180,11 @@ export class Lane {
   /** Latest revision of every observe-only input, in first-seen order. */
   observed(): InputRecord[] {
     return [...this.observedInputs.values()];
+  }
+
+  /** Id of the adapter the session is (or was last) bound to; `harness` before the first open. */
+  get harnessId(): string {
+    return this.adapter.id;
   }
 
   /** Queued input ids, in order. */
@@ -237,7 +254,7 @@ export class Lane {
       level: 'primary',
       audience: 'status',
       durability: 'durable',
-      harness: this.o.harness.id,
+      harness: this.adapter.id,
       generation: this.generation,
       ...d,
     });
@@ -247,7 +264,7 @@ export class Lane {
     const merged = { ...e, ...override };
     return this.o.hub.append(this.sessionKey, {
       ...merged,
-      harness: this.o.harness.id,
+      harness: this.adapter.id,
       generation: gen,
       visibility: visibilityOf(merged),
     });
@@ -270,7 +287,7 @@ export class Lane {
     return {
       sessionKey: this.sessionKey,
       turnId: t?.turnId ?? turnId ?? '',
-      run: t?.run ?? this.lastRun ?? { harness: this.o.harness.id, model: 'default', profile: 'restricted' },
+      run: t?.run ?? this.lastRun ?? { harness: this.adapter.id, model: 'default', profile: 'restricted' },
       inputs: t?.inputs ?? [],
       replyRoute: t?.replyRoute ?? null,
       ...(t?.owner != null ? { owner: t.owner } : {}),
@@ -402,15 +419,25 @@ export class Lane {
   }
 
   private async ensureSession(run: RunSpec): Promise<HarnessSession> {
+    const adapter = this.o.harnessFor ? this.o.harnessFor(run.harness) : this.o.harness;
+    if (this.session && adapter !== this.adapter) {
+      // The turn names another harness: end this binding, the next one opens below.
+      const old = this.session;
+      this.session = undefined;
+      this.emit({ level: 'detail', body: { t: 'notice', code: 'runtime_restart', message: `switching harness ${this.adapter.id} → ${adapter.id}` } });
+      await old.close(`switching to harness ${adapter.id}`).catch(() => undefined);
+    }
     if (this.session) return this.session;
-    if (!this.caps) this.caps = (await this.o.harness.probe()).caps;
+    if (!this.caps || adapter !== this.adapter) this.caps = (await adapter.probe()).caps;
+    this.adapter = adapter;
+    const resume = this.o.resumeFor ? this.o.resumeFor(adapter.id) : this.o.resume;
     const gen = ++this.generation;
-    const s = await this.o.harness.open({
+    const s = await adapter.open({
       sessionKey: this.sessionKey,
       generation: gen,
       cwd: this.o.cwd ?? process.cwd(),
       run,
-      ...(this.o.resume !== undefined ? { resume: this.o.resume } : {}),
+      ...(resume !== undefined ? { resume } : {}),
       ...(this.o.mcp ? { mcp: this.o.mcp } : {}),
       ...(this.o.harnessOptions ? { options: this.o.harnessOptions } : {}),
     });
@@ -481,7 +508,8 @@ export class Lane {
       for await (const e of s.events) {
         if (gen !== this.generation || this.detached) continue; // late event from an older binding
         this.o.onHarnessEvent?.(e);
-        await this.serial(() => this.onHarnessEvent(e, gen));
+        // Re-checked when it runs: a switch to another harness may have started a new generation meanwhile.
+        await this.serial(async () => (gen === this.generation ? this.onHarnessEvent(e, gen) : undefined));
       }
     } catch (err) {
       if (this.detached) return;

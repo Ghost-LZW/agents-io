@@ -19,8 +19,29 @@ alias aio-dev="node $PWD/examples/dev-gateway/dist/cli.js"
 
 - 配置文件：`--config <path>`、`$AIO_CONFIG` 或当前目录的 `aio.config.json`（不存在就全用默认值：claude-code + haiku、无通道）。相对路径按配置文件所在目录解析。
 - 密钥只放环境变量或 `.env.live`（KEY=VALUE，已 gitignore）。查找顺序：`--env-file`、配置文件同目录、从当前目录向上最近的一个。进程环境变量优先于文件。通道配置里的字符串 `"env:NAME"` 会替换成该变量。
-- 只有 `ANTHROPIC_* / CLAUDE_* / OPENAI_* / CODEX_* / *_PROXY` 这些键会传给 harness CLI，Lark、邮件密钥留在网关进程里。工具从不打印变量的值。
-- 模型：`harness.<kind>.run.model`，环境变量 `AGENTS_IO_LIVE_CLAUDE_MODEL` / `AGENTS_IO_LIVE_CODEX_MODEL` 优先；默认 claude 用 `haiku`，codex 用它自己的默认模型。
+- Harness 是**命名实例**（见下节）：每个实例的子进程只拿到网关自身的环境加上该实例 `env` 里写明的变量（`"env:NAME"` 从环境/`.env.live` 取值，`null` 表示从子进程环境里删掉）。旧的单 `harness` 块仍可用，此时沿用旧行为：`.env.live` 里 `ANTHROPIC_* / CLAUDE_* / OPENAI_* / CODEX_* / *_PROXY` 这些键传给 harness CLI。Lark、邮件密钥始终留在网关进程里。工具从不打印变量的值（`serve` 日志只列实例名和种类）。
+- 模型：实例的 `run.model`，环境变量 `AGENTS_IO_LIVE_CLAUDE_MODEL` / `AGENTS_IO_LIVE_CODEX_MODEL` 只覆盖**默认实例**（同种类的其他实例可能接的是别家模型）；默认 claude 用 `haiku`，codex 用它自己的默认模型。
+
+### Harness 实例
+
+```jsonc
+"defaultHarness": "claude",
+"harnesses": {
+  "claude":         { "use": "claude-code", "run": { "model": "haiku" }, "profiles": { … } },
+  "claude-gateway": { "use": "claude-code", "configDir": "~/.agents-io/claude-gateway",
+                      "env": { "ANTHROPIC_BASE_URL": "env:GATEWAY_BASE_URL", "ANTHROPIC_AUTH_TOKEN": "env:GATEWAY_AUTH_TOKEN", "ANTHROPIC_API_KEY": null },
+                      "run": { "model": "gemini-3.8-flash-high" } },
+  "codex":          { "use": "codex", "home": "~/.agents-io/codex-home", "config": { "model_reasoning_summary": "concise" },
+                      "transport": { "kind": "unix", "spawn": "own" } }
+}
+```
+
+- `RunSpec.harness` 是实例名；`Policy.plan` 每轮选实例，默认策略用 `defaultHarness`（缺省为第一个）。会话事件的 `harness` 字段、续接用的原生 id（`session.bound`）都按实例名记，所以不同 `configDir` / `CODEX_HOME` 的会话不会互相 `--resume`。同一 session 的下一轮换了实例时，lane 关掉旧绑定、开新一代（`notice runtime_restart: switching harness a → b`）。适配器在第一次用到时才建。
+- 共有字段：`use`、`env`、`cwd`（该实例会话的工作目录）、`run`、`profiles`（权限 profile → 原生设置，同以前）、`options`（原样作为 `HarnessOpenArgs.options`）。
+- claude-code：`configDir` → `CLAUDE_CONFIG_DIR`（登录态、用户 settings、用户级 skills/agents/commands、会话记录都在这里；用户级 skills 从 `<configDir>/skills` 发现，且只在 `settingSources` 含 `user` 或缺省时加载——已用 system/init 的 skills 列表实测；e2e 用 `settingSources: []`，所以 e2e 里不加载用户 skills）；`executable`（`claude` 路径）；`settings`（settings.json 路径或内联对象，即 Agent SDK `settings` = CLI `--settings` 的 flag 层，`settingSources: []` 时也生效）；`settingSources`（`user`/`project`/`local`，`[]` 表示都不加载，缺省全加载）；`mcpServers`；`plugins`（本地插件目录，SDK `plugins: [{type:'local', path}]` → `--plugin-dir`，插件可带 skills/agents/commands/hooks）；`skills`（`"all"` 或名字列表，SDK `skills`）；`extraArgs`（额外 CLI 参数，`null` 为无值 flag）；`additionalDirectories`（与 profile 的合并）。
+- codex：`home` → `CODEX_HOME`；`executable`；`config`（点分键 → 值，作为 `codex app-server -c key=<TOML>` 传入）；`enable` / `disable`（`--enable/--disable <feature>`）；`transport`（`stdio` | `unix` + `spawn: own/daemon/none`）。`config/enable/disable` 只对网关自己起的服务（stdio、unix own）有效，`daemon/none` 时报错。**没有 `profile`**：`codex app-server` 不接受 `--profile`（codex-cli 0.160 报错 "--profile only applies to runtime commands"），`-c profile=…` 也已废弃，写了会报错，请用 `config` 或单独的 `home`。
+- 每个 codex 实例有自己的 app-server：unix 状态目录默认 `~/.agents-io/codex.<实例名>`（socket、`server.json`、`turns/` 快照），两个实例写同一个 `stateDir` 是配置错误，重启接管不会跨实例。`server.json` 里记一个启动指纹（二进制、`CODEX_HOME`、`-c/--enable/--disable` 的哈希，不含值）：设置变了再连旧服务会被拒绝，提示先停掉旧进程。旧 `harness` 块的 codex 仍用 `~/.agents-io/codex`，正在跑的部署照常接管。
+- 路径支持 `~`，相对路径按配置文件目录解析；`executable` 写裸名（`claude`、`codex`）时走 PATH。实例名限字母、数字、`.`、`_`、`-`。`env`、`settings`（对象）、`mcpServers`、`config` 里的 `"env:NAME"` 都会替换；变量缺失只让该实例不可用（用到时报错并给出变量名），不影响其他实例。校验错误只给键名、不给值。
 - 主人：`policy.owners` 加上 `AGENTS_IO_OWNERS`（逗号分隔），键是 `<channel>:<channelUserId>`。
 - 本地端（attach/send）以 `local.principal` 的身份说话，默认是第一个主人（没有主人时是 `local:owner`），labels 默认 `['owner']`。默认 session 是 `policy.ownerSessionKey`，否则 `local:main`。
 
@@ -30,11 +51,12 @@ alias aio-dev="node $PWD/examples/dev-gateway/dist/cli.js"
 
 ```sh
 pnpm e2e                                   # 根目录：build 后跑 claude-code
-pnpm e2e --harness codex
+pnpm e2e --harness codex                   # 实例名，或种类名（取该种类的第一个实例）
+aio-dev e2e --harness claude-gateway --only a
 aio-dev e2e --only a,d --verbose           # 只跑某几个；--verbose 打印过程
 ```
 
-每个场景起一个独立的进程内网关（临时目录、SQLite log、本地 socket），一个脚本化通道 `e2e`（主人 `e2e:alice`、`e2e:bob`），对**真实** harness 发便宜且确定的提示，在订阅流上断言，逐个打印 `PASS/FAIL/SKIP` 和原因：
+e2e 跑的是默认实例（`--harness` 可换），保留它的 `env`、`configDir`/`home`、`settings` 等启动设置，但会话放在场景临时目录里。每个场景起一个独立的进程内网关（临时目录、SQLite log、本地 socket），一个脚本化通道 `e2e`（主人 `e2e:alice`、`e2e:bob`），对**真实** harness 发便宜且确定的提示，在订阅流上断言，逐个打印 `PASS/FAIL/SKIP` 和原因：
 
 | id | 场景 | 断言 |
 |---|---|---|
@@ -100,7 +122,7 @@ attach 里直接输入文字就是 queue 输入；`/steer <text>`、`/interrupt 
 
 ## Tier 3：多端 + 重启
 
-1. 配置 `harness.use: "codex"` 且 `codex.transport: { kind: "unix", spawn: "own" }`（app-server 独立于网关进程运行，状态在 `~/.agents-io/codex`）。
+1. 默认实例是 codex 且 `transport: { kind: "unix", spawn: "own" }`（`aio-dev serve --harness codex`；app-server 独立于网关进程运行，状态在 `~/.agents-io/codex.<实例名>`，旧 `harness` 块为 `~/.agents-io/codex`）。
 2. 终端 A `aio-dev serve`，终端 B、C 各 `aio-dev attach`，飞书里也开着同一 session。
 3. 发一个长任务（"Use the shell to run `sleep 30`, then reply with exactly: done"），看到 `▶ command` 后在 A 里 Ctrl-C。
    - [ ] B、C 打印 `[subscription ended]`；log 里这一轮**没有**结束事件（codex 是 detach，不是 close）。
@@ -116,3 +138,5 @@ attach 里直接输入文字就是 queue 输入；`/steer <text>`、`/interrupt 
 - 本地 socket 上所有连接都是同一个本地主体；没有每连接鉴权。
 - `control` 命令（set_model 等）lane 尚未实现，返回 `unsupported`。
 - 没有 host MCP 工具（reply/send_file），agent 只能通过本轮回复路由输出。
+- 默认策略每轮都选 `defaultHarness`；按输入换实例要自己写 `Policy.plan`（本地端/通道还没有"切实例"命令，`control set_model` 也未实现）。
+- 新 `configDir` / `CODEX_HOME` 是空的登录态：claude 报 `Not logged in · Please run /login`，codex 报 401，需要在该目录里各自登录一次（`CLAUDE_CONFIG_DIR=… claude` 后 `/login`；`CODEX_HOME=… codex login`），或给实例配 API key / 网关的 `env`。

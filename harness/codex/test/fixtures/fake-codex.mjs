@@ -2,7 +2,7 @@
 // Stand-in for `codex app-server --listen unix://PATH`: WebSocket over a Unix
 // socket (0600), enough JSON-RPC for the spawn:'own' tests. A turn completes
 // after FAKE_CODEX_TURN_MS (default 400ms), even if no client is connected.
-import { chmodSync } from 'node:fs';
+import { chmodSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
 
@@ -12,6 +12,7 @@ if (process.argv[2] !== 'app-server' || !listen.startsWith('unix://')) {
   process.exit(2);
 }
 const path = listen.slice('unix://'.length);
+if (process.env.FAKE_CODEX_ARGV) writeFileSync(process.env.FAKE_CODEX_ARGV, JSON.stringify({ argv: process.argv.slice(2), codexHome: process.env.CODEX_HOME ?? null, secret: process.env.FAKE_SECRET ?? null }));
 const turnMs = Number(process.env.FAKE_CODEX_TURN_MS ?? 400);
 const clients = new Set();
 const broadcast = (m) => {

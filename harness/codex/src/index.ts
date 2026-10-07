@@ -1,4 +1,4 @@
-export { CodexHarness, CODEX_CAPS, DEFAULT_OPT_OUT, type CodexHarnessOptions, type CodexTransportOption } from './harness.js';
+export { CodexHarness, CODEX_CAPS, DEFAULT_OPT_OUT, codexEnv, launchFlags, tomlValue, type CodexHarnessOptions, type CodexTransportOption } from './harness.js';
 export { connectUnix, defaultCodexSocket, defaultStateDir, ensureOwnServer, startDaemon, stopOwnServer, assertPrivateSocket } from './unix.js';
 export { CodexSession, classifySteerError, type CodexOpenOptions, type TurnSnapshot } from './session.js';
 export {

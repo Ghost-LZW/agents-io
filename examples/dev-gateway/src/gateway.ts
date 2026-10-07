@@ -5,7 +5,10 @@ import {
   routeKey,
   type ChannelAdapter,
   type HarnessAdapter,
+  type HarnessCaps,
   type HarnessEvent,
+  type HarnessOpenArgs,
+  type HarnessSession,
   type InputRecord,
   type Origin,
   type Policy,
@@ -23,12 +26,12 @@ import {
   type FullPolicy,
   type SessionLog,
 } from '@agents-io/session';
-import { ClaudeCodeHarness } from '@agents-io/harness-claude-code';
+import { ClaudeCodeHarness, findOnPath, type ClaudeCodeHarnessConfig } from '@agents-io/harness-claude-code';
 import { CodexHarness, type CodexProfile } from '@agents-io/harness-codex';
 import { LarkBotAdapter } from '@agents-io/channel-lark-bot';
 import { MailChannel, type MailChannelConfig } from '@agents-io/channel-mail';
 import { spawnChannel } from '@agents-io/channel-jsonl-bridge';
-import type { Config, HarnessConfig, ResolvedChannel } from './config.js';
+import type { Config, HarnessInstance, ResolvedChannel } from './config.js';
 import type { ClientCommand, SessionInfo } from './frames.js';
 import { LocalServer } from './local-server.js';
 
@@ -43,8 +46,10 @@ export interface ExtraChannel {
 
 export interface GatewayOptions {
   config: Config;
-  /** Use this harness instead of building one from the config (tests). */
+  /** Use this harness for every instance instead of building them from the config (tests). */
   harness?: HarnessAdapter;
+  /** Build instance adapters with this instead of `buildHarness` (tests). */
+  buildHarness?: (instance: HarnessInstance) => HarnessAdapter;
   /** In-process channels besides the configured ones. */
   channels?: ExtraChannel[];
   /** Hooks that replace defaultPolicy's. */
@@ -90,8 +95,9 @@ export class Gateway {
   readonly hub: Hub;
   readonly policy: FullPolicy;
   readonly ingress: Ingress;
-  readonly harness: HarnessAdapter;
   readonly outbox: Outbox;
+  /** Built instance adapters, by instance name (lazily, on first use). */
+  private readonly instances = new Map<string, HarnessAdapter>();
   private readonly lanes = new Map<string, Lane>();
   private readonly compositors: Compositor[] = [];
   private readonly channels: RunningChannel[] = [];
@@ -101,6 +107,8 @@ export class Gateway {
 
   private constructor(private readonly o: GatewayOptions) {
     const c = o.config;
+    // The default instance must be usable (e.g. its env refs set); others fail when a turn names them.
+    this.harness();
     this.log = o.logger ?? ((level, msg) => console.error(`[aio] ${level}: ${msg}`));
     if (!o.log && c.logPath !== ':memory:') mkdirSync(dirname(c.logPath), { recursive: true, mode: 0o700 });
     this.hub = new Hub(o.log ?? new SqliteSessionLog({ path: c.logPath }));
@@ -110,12 +118,11 @@ export class Gateway {
         selfAccounts: c.policy.selfAccounts,
         agentAccounts: c.policy.agentAccounts,
         routes: c.policy.routes,
-        run: c.harness.run,
+        run: c.harnesses[c.defaultHarness]!.run,
         ...(c.policy.ownerSessionKey ? { ownerSessionKey: c.policy.ownerSessionKey } : {}),
       }),
       ...o.policy,
     } as FullPolicy;
-    this.harness = o.harness ?? buildHarness(c.harness);
     this.outbox = new Outbox({ hub: this.hub, policy: this.policy });
     this.ingress = new Ingress({ policy: this.policy, lanes: (key) => this.lane(key) });
   }
@@ -140,20 +147,37 @@ export class Gateway {
     return this.o.config;
   }
 
+  /**
+   * The adapter of a harness instance (`RunSpec.harness`), built on first use.
+   * Its id is the instance name, so session events and resume ids stay per instance.
+   */
+  harness(name: string = this.o.config.defaultHarness): HarnessAdapter {
+    if (this.o.harness) return this.o.harness;
+    let a = this.instances.get(name);
+    if (a) return a;
+    const inst = this.o.config.harnesses[name];
+    if (!inst) throw new Error(`unknown harness instance ${JSON.stringify(name)} (configured: ${Object.keys(this.o.config.harnesses).join(', ')})`);
+    a = this.o.buildHarness?.(inst) ?? buildHarness(inst);
+    this.instances.set(name, a);
+    return a;
+  }
+
+  private instanceOf(harnessId: string | undefined): HarnessInstance | undefined {
+    return this.o.harness || harnessId === undefined ? undefined : this.o.config.harnesses[harnessId];
+  }
+
   /** The lane of a session, created on first use. Its harness session opens with the first turn. */
   lane(sessionKey: string): Lane {
     let lane = this.lanes.get(sessionKey);
     if (lane) return lane;
-    const h = this.o.config.harness;
-    const resume = this.nativeIdOf(sessionKey);
     lane = new Lane({
       sessionKey,
-      harness: this.harness,
+      harness: this.harness(),
+      ...(this.o.harness ? {} : { harnessFor: (name: string) => this.harness(name) }),
+      resumeFor: (id) => this.nativeIdOf(sessionKey, id),
       hub: this.hub,
       policy: this.policy,
       cwd: this.o.config.cwd,
-      ...(resume ? { resume } : {}),
-      harnessOptions: h.kind === 'claude-code' ? { ...h.options, profiles: h.profiles, env: { ...h.env, ...(h.options.env as object | undefined) } } : h.options,
       onHarnessEvent: (e) => this.o.onHarnessEvent?.(sessionKey, e),
     });
     this.lanes.set(sessionKey, lane);
@@ -161,11 +185,11 @@ export class Gateway {
     return lane;
   }
 
-  /** The harness's own session/thread id last bound to this session, so a restart resumes it. */
-  private nativeIdOf(sessionKey: string): string | undefined {
+  /** The instance's own session/thread id last bound to this session, so a restart resumes it. */
+  private nativeIdOf(sessionKey: string, harnessId: string): string | undefined {
     let id: string | undefined;
     for (const e of this.hub.log.read(sessionKey, 0)) {
-      if (e.body.t === 'session.bound' && e.harness === this.harness.id) id = e.body.nativeId;
+      if (e.body.t === 'session.bound' && e.harness === harnessId) id = e.body.nativeId;
     }
     return id;
   }
@@ -211,11 +235,10 @@ export class Gateway {
    * now so the harness adopts it (turn.adopted) instead of waiting for input.
    */
   private async adoptRunningTurns(): Promise<void> {
-    const h = this.o.config.harness;
-    if (!(this.harness instanceof CodexHarness) || h.transport.kind !== 'unix') return;
     for (const key of this.hub.log.sessions()) {
       const snap = this.hub.snapshot(key);
-      if (!snap.turn || snap.harness !== this.harness.id) continue;
+      const inst = this.instanceOf(snap.harness);
+      if (!snap.turn || inst?.kind !== 'codex' || inst.codex.transport.kind !== 'unix') continue;
       try {
         await this.lane(key).open();
         this.log('info', `${key}: reopened to adopt turn ${snap.turn.turnId}`);
@@ -295,16 +318,21 @@ export class Gateway {
     this.server?.close('gateway stopping');
     for (const ch of this.channels) ch.ac.abort();
     await within(Promise.all(this.channels.map((c) => c.running)), 3000);
-    const lanes = [...this.lanes.values()];
-    if (this.harness instanceof CodexHarness) {
-      for (const l of lanes) l.detach();
-      await within(this.harness.detach(), 5000);
-    } else {
-      // Bounded by a timer that holds the event loop: harness close() may wait on unref'd timers only.
-      await within(Promise.all(lanes.map((l) => l.close('gateway stopping').catch(() => undefined))), 8000);
-      // Let the last events (interrupted turn, consumed inputs) reach the log before it closes.
-      await within(Promise.all(lanes.map((l) => l.whenIdle())), 3000);
-    }
+    const codex = (l: Lane) => codexOf(this.o.harness ?? this.instances.get(l.harnessId));
+    const detached = [...this.lanes.values()].filter(codex);
+    const closed = [...this.lanes.values()].filter((l) => !codex(l));
+    for (const l of detached) l.detach();
+    const adapters = this.o.harness ? [this.o.harness] : [...this.instances.values()];
+    // Bounded by a timer that holds the event loop: harness close() may wait on unref'd timers only.
+    await within(
+      Promise.all([
+        ...adapters.map((a) => codexOf(a)?.detach()),
+        ...closed.map((l) => l.close('gateway stopping').catch(() => undefined)),
+      ]),
+      8000,
+    );
+    // Let the last events (interrupted turn, consumed inputs) reach the log before it closes.
+    await within(Promise.all(closed.map((l) => l.whenIdle())), 3000);
     await within(Promise.all(this.compositors.map((c) => c.stop())), 5000);
     for (const ch of this.channels) await within(ch.close?.().catch(() => undefined), 3000);
     await within(new Promise(() => {}), 50);
@@ -316,16 +344,71 @@ function fail(code: string, message = code): Outcome {
   return { ok: false, code, message };
 }
 
-export function buildHarness(h: HarnessConfig): HarnessAdapter {
-  if (h.kind === 'codex') {
-    return new CodexHarness({
-      bin: h.codexBin ?? 'codex',
-      transport: h.transport,
-      env: { ...process.env, ...h.env },
-      profiles: h.profiles as Record<string, CodexProfile>,
-    });
+/** The Codex adapter behind an instance adapter, if it is one (Codex is detached at shutdown, not closed). */
+function codexOf(a: HarnessAdapter | undefined): CodexHarness | undefined {
+  if (a instanceof InstanceHarness) return codexOf(a.inner);
+  return a instanceof CodexHarness ? a : undefined;
+}
+
+/**
+ * One deployment harness instance: the kind's adapter launched with the
+ * instance's environment and config dirs, under the instance name, opening its
+ * sessions in the instance's cwd with its options.
+ */
+export class InstanceHarness implements HarnessAdapter {
+  readonly id: string;
+  constructor(
+    readonly instance: HarnessInstance,
+    readonly inner: HarnessAdapter,
+  ) {
+    this.id = instance.name;
   }
-  return new ClaudeCodeHarness(h.claudePath ? { claudePath: h.claudePath } : {});
+
+  probe(): Promise<{ version: string; caps: HarnessCaps }> {
+    return this.inner.probe();
+  }
+
+  open(args: HarnessOpenArgs): Promise<HarnessSession> {
+    const i = this.instance;
+    const options = i.kind === 'claude-code' ? { ...i.options, profiles: i.profiles } : i.options;
+    return this.inner.open({ ...args, ...(i.cwd ? { cwd: i.cwd } : {}), options: { ...options, ...args.options } });
+  }
+}
+
+/** The adapter for one instance. Environment values are handed to the child process only, never logged. */
+export function buildHarness(i: HarnessInstance): InstanceHarness {
+  if (i.unavailable) throw new Error(`harness instance ${i.name} is unavailable: ${i.unavailable}`);
+  if (i.kind === 'codex') {
+    const x = i.codex;
+    return new InstanceHarness(
+      i,
+      new CodexHarness({
+        bin: x.bin ?? 'codex',
+        env: i.env,
+        transport: x.transport,
+        profiles: i.profiles as Record<string, CodexProfile>,
+        ...(x.codexHome ? { codexHome: x.codexHome } : {}),
+        ...(x.config ? { config: x.config } : {}),
+        ...(x.enable ? { enable: x.enable } : {}),
+        ...(x.disable ? { disable: x.disable } : {}),
+      }),
+    );
+  }
+  const x = i.claude;
+  const claudePath = x.claudePath && !x.claudePath.includes('/') ? (findOnPath(x.claudePath, i.env.PATH ?? process.env.PATH) ?? x.claudePath) : x.claudePath;
+  const config: ClaudeCodeHarnessConfig = {
+    env: i.env,
+    ...(claudePath ? { claudePath } : {}),
+    ...(x.configDir ? { configDir: x.configDir } : {}),
+    ...(x.settings !== undefined ? { settings: x.settings as ClaudeCodeHarnessConfig['settings'] } : {}),
+    ...(x.settingSources ? { settingSources: x.settingSources } : {}),
+    ...(x.mcpServers ? { mcpServers: x.mcpServers as ClaudeCodeHarnessConfig['mcpServers'] } : {}),
+    ...(x.plugins ? { plugins: x.plugins } : {}),
+    ...(x.skills !== undefined ? { skills: x.skills } : {}),
+    ...(x.extraArgs ? { extraArgs: x.extraArgs } : {}),
+    ...(x.additionalDirectories ? { additionalDirectories: x.additionalDirectories } : {}),
+  };
+  return new InstanceHarness(i, new ClaudeCodeHarness(config));
 }
 
 async function buildChannel(ch: ResolvedChannel): Promise<{ adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }> {

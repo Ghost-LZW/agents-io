@@ -100,6 +100,8 @@ export interface OwnServerState {
   socket: string;
   bin: string;
   startedAt: number;
+  /** Fingerprint of bin, CODEX_HOME and launch flags (absent in records from older versions). */
+  launch?: string;
 }
 
 const stateFile = (dir: string) => join(dir, 'server.json');
@@ -153,11 +155,26 @@ export async function canConnect(path: string): Promise<boolean> {
  * survives the host. Two hosts racing is safe: codex refuses to bind a socket
  * that is already accepting connections, and the loser connects to the winner.
  */
-export async function ensureOwnServer(opts: { stateDir: string; socket?: string; bin: string; env?: NodeJS.ProcessEnv; startTimeoutMs?: number }): Promise<{ socket: string; state: OwnServerState; spawned: boolean }> {
+export async function ensureOwnServer(opts: {
+  stateDir: string;
+  socket?: string;
+  bin: string;
+  env?: NodeJS.ProcessEnv;
+  /** Extra `app-server` arguments (`-c`, `--enable`, …). */
+  args?: string[];
+  /** Launch fingerprint; a recorded live server with a different one is refused. */
+  launch?: string;
+  startTimeoutMs?: number;
+}): Promise<{ socket: string; state: OwnServerState; spawned: boolean }> {
   ensurePrivateDir(opts.stateDir);
   const socket = opts.socket ?? join(opts.stateDir, 'app-server.sock');
   ensurePrivateDir(dirname(socket));
   const prev = readJson<OwnServerState>(stateFile(opts.stateDir));
+  if (prev && prev.socket === socket && opts.launch && prev.launch && prev.launch !== opts.launch && pidAlive(prev.pid))
+    throw new Error(
+      `codex app-server ${prev.pid} on ${socket} was started with other settings (binary, CODEX_HOME or -c/--enable/--disable); ` +
+        `stop it (kill ${prev.pid}) to restart with the new ones, or give this harness its own stateDir`,
+    );
   if (await canConnect(socket)) {
     const state = prev && prev.socket === socket && pidAlive(prev.pid) ? prev : { pid: 0, socket, bin: opts.bin, startedAt: Date.now() };
     return { socket, state, spawned: false };
@@ -168,7 +185,7 @@ export async function ensureOwnServer(opts: { stateDir: string; socket?: string;
   }
 
   const log = openSync(join(opts.stateDir, 'app-server.log'), 'a', 0o600);
-  const child = spawn(opts.bin, ['app-server', '--listen', `unix://${socket}`], {
+  const child = spawn(opts.bin, ['app-server', '--listen', `unix://${socket}`, ...(opts.args ?? [])], {
     detached: true,
     stdio: ['ignore', log, log],
     env: opts.env ?? process.env,
@@ -192,7 +209,7 @@ export async function ensureOwnServer(opts: { stateDir: string; socket?: string;
     })();
     throw new Error(`codex app-server on ${socket} ${typeof ready === 'string' ? ready : 'did not start in time'}\n${tail}`);
   }
-  const state: OwnServerState = { pid: child.pid!, socket, bin: opts.bin, startedAt: Date.now() };
+  const state: OwnServerState = { pid: child.pid!, socket, bin: opts.bin, startedAt: Date.now(), ...(opts.launch ? { launch: opts.launch } : {}) };
   writeJson(stateFile(opts.stateDir), state);
   return { socket, state, spawned: true };
 }

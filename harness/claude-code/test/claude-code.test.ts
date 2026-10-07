@@ -1,15 +1,19 @@
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { assertConformingStream } from '@agents-io/testkit';
 import type { HarnessEvent, HarnessOpenArgs, HarnessSession, RunSpec } from '@agents-io/protocol';
-import { ClaudeCodeHarness, convertBlock, inputUuid, mapAnswers, preface, riskOf } from '../src/index.js';
+import { ClaudeCodeHarness, type ClaudeCodeHarnessConfig, convertBlock, inputUuid, mapAnswers, preface, riskOf } from '../src/index.js';
 import type { ClaudeCodeOptions, PermissionResult } from '../src/types.js';
 import { bodies, collectUntil, fakeQueryFn, input, isTurnCompleted, sdk, type FakeQuery } from './fake-query.js';
 
 const run: RunSpec = { harness: 'claude-code', model: 'haiku', profile: 'bypass' };
 
-async function setup(over: Partial<HarnessOpenArgs> = {}, options: ClaudeCodeOptions = {}) {
+async function setup(over: Partial<HarnessOpenArgs> = {}, options: ClaudeCodeOptions = {}, config: ClaudeCodeHarnessConfig = {}) {
   const fq = fakeQueryFn();
   const h = new ClaudeCodeHarness({
+    ...config,
     query: fq.fn,
     claudePath: '/usr/local/bin/claude',
     sdkVersion: '0.3.291',
@@ -100,6 +104,65 @@ describe('open → SDK options', () => {
     expect(b.q.options).toMatchObject({ permissionMode: 'dontAsk', allowedTools: ['Read'], disallowedTools: ['Bash'], resume: 'abc-session' });
     expect(b.q.options.sessionId).toBeUndefined();
     expect(b.s.nativeId()).toBe('abc-session');
+  });
+
+  it('instance launch config: env over process.env, configDir, settings, sources, plugins, skills, flags, dirs, MCP', async () => {
+    process.env.AGENTS_IO_TEST_INHERITED = 'from-process';
+    process.env.AGENTS_IO_TEST_REMOVED = 'from-process';
+    try {
+      const { q } = await setup(
+        { run: { ...run, profile: 'ro' }, mcp: { url: 'http://h/mcp', token: 't' } },
+        { env: { PER_OPEN: '1' }, profiles: { ro: { permissionMode: 'default', additionalDirectories: ['/p', '/shared'] } } },
+        {
+          env: { ANTHROPIC_BASE_URL: 'http://gw', AGENTS_IO_TEST_REMOVED: undefined, CLAUDE_CONFIG_DIR: '/loses' },
+          configDir: '/cfg/claude-a',
+          settings: { model: 'x', permissions: { allow: ['Read'] } },
+          settingSources: ['user'],
+          mcpServers: { docs: { type: 'http', url: 'http://docs' } },
+          plugins: ['/plugins/one'],
+          skills: ['pdf'],
+          extraArgs: { 'debug-to-stderr': null },
+          additionalDirectories: ['/shared', '/i'],
+          profiles: { ro: { permissionMode: 'dontAsk' }, other: { permissionMode: 'plan' } },
+        },
+      );
+      const o = q.options;
+      expect(o.env).toMatchObject({ AGENTS_IO_TEST_INHERITED: 'from-process', ANTHROPIC_BASE_URL: 'http://gw', CLAUDE_CONFIG_DIR: '/cfg/claude-a', PER_OPEN: '1' });
+      expect(o.env).not.toHaveProperty('AGENTS_IO_TEST_REMOVED');
+      expect(o.settings).toEqual({ model: 'x', permissions: { allow: ['Read'] } });
+      expect(o.settingSources).toEqual(['user']);
+      expect(o.plugins).toEqual([{ type: 'local', path: '/plugins/one' }]);
+      expect(o.skills).toEqual(['pdf']);
+      expect(o.extraArgs).toEqual({ 'debug-to-stderr': null });
+      // Per-open profiles win over the instance's; directories are the union.
+      expect(o.permissionMode).toBe('default');
+      expect(o.additionalDirectories).toEqual(['/shared', '/i', '/p']);
+      expect(o.mcpServers).toEqual({ docs: { type: 'http', url: 'http://docs' }, agents_io: { type: 'http', url: 'http://h/mcp', headers: { Authorization: 'Bearer t' } } });
+      // Instance profiles apply when the open passes none.
+      const b = await setup({ run: { ...run, profile: 'other' } }, {}, { profiles: { other: { permissionMode: 'plan' } }, settings: '/etc/s.json' });
+      expect(b.q.options).toMatchObject({ permissionMode: 'plan', settings: '/etc/s.json' });
+      expect(b.q.options.settingSources).toBeUndefined();
+      expect(b.q.options.env).not.toHaveProperty('CLAUDE_CONFIG_DIR', '/cfg/claude-a');
+      // Per-open sdk options (e.g. e2e's settingSources: []) still win.
+      const c = await setup({}, { sdk: { settingSources: [] } }, { settingSources: ['user', 'project'] });
+      expect(c.q.options.settingSources).toEqual([]);
+    } finally {
+      delete process.env.AGENTS_IO_TEST_INHERITED;
+      delete process.env.AGENTS_IO_TEST_REMOVED;
+    }
+  });
+
+  it('probe runs the configured `claude` with the instance environment', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'aio-cc-'));
+    try {
+      const bin = join(dir, 'claude');
+      writeFileSync(bin, `#!/bin/sh\nprintf '%s|%s' "$CLAUDE_CONFIG_DIR" "$X_INST" > "${join(dir, 'seen')}"\necho "2.1.291 (Claude Code)"\n`, { mode: 0o755 });
+      const h = new ClaudeCodeHarness({ sdkVersion: '0.3.291', claudePath: bin, configDir: join(dir, 'cfg'), env: { X_INST: 'on' } });
+      expect((await h.probe()).version).toBe('claude-code 2.1.291 (agent-sdk 0.3.291)');
+      expect(readFileSync(join(dir, 'seen'), 'utf8')).toBe(`${join(dir, 'cfg')}|on`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('emits nativeId at open and again when system/init reports another id', async () => {
