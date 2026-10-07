@@ -88,6 +88,17 @@ describe('topic tools', () => {
     expect(w.calls.map((c) => c.op)).toEqual(['switch']);
   });
 
+  it('a message just handed over by a rotate or switch is not moved again (no ping-pong)', async () => {
+    const w = world();
+    w.setTurn(turnOf([input('in1>tp_a', { handedFrom: 's1#tp_b' })]));
+    await expect(w.run('session_rotate', { title: 'x', summary: 'y' })).rejects.toThrow(/just handed to this topic/);
+    await expect(w.run('session_switch', { topicId: 'tp_b' })).rejects.toThrow(/just handed to this topic/);
+    // A fresh message batched with it may still move the turn.
+    w.setTurn(turnOf([input('in1>tp_a', { handedFrom: 's1#tp_b' }), input('in2')]));
+    expect(await w.run('session_switch', { topicId: 'tp_b' })).toMatchObject({ ok: true });
+    expect(w.calls).toHaveLength(1);
+  });
+
   it('a parked topic session may not hand over (someone switched meanwhile)', async () => {
     const w = world();
     await expect(w.run('session_rotate', { title: 'x', summary: 'y' }, 'k', 's1#tp_b')).rejects.toThrow(/no longer the conversation's current one/);

@@ -583,7 +583,10 @@ export class HostTools {
     const { control, topics } = this.topicsOf(b);
     const me = topics.find((t) => t.sessionKey === b.sessionKey);
     if (me && me.state !== 'current') throw new ToolError("this topic is no longer the conversation's current one (the user or another turn switched); just answer here");
-    if (!turn.inputs.some((i) => i.channelContext.context !== true)) throw new ToolError('this turn has no message to hand over');
+    const own = turn.inputs.filter((i) => i.channelContext.context !== true);
+    if (!own.length) throw new ToolError('this turn has no message to hand over');
+    // A message just handed here by a rotate/switch is this topic's to answer: no ping-pong between topics.
+    if (own.every((i) => i.channelContext.handedFrom !== undefined)) throw new ToolError('this message was just handed to this topic by a topic switch; answer it here, in this turn');
     let r: TopicHandover;
     if (tool === 'session_rotate') {
       const title = str(args.title, 'title')!.trim();

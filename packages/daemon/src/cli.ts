@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { readFileSync, realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -18,7 +19,7 @@ const USAGE = `aio: the agents-io daemon and its CLI
 
 daemon
   aio serve     [--harness <instance>]
-  aio e2e       [--harness <instance>] [--only <id|name>[,…]] [--verbose]
+  aio e2e       [--harness <instance>] [--only <id|name>[,…]] [--data-dir <dir>] [--verbose]
 
 local ends (as the local principal)
   aio attach    [--session <key>] [--tier full|card|headline|final] [--from <seq>] [--verbose]
@@ -73,6 +74,7 @@ export function parseCli(argv: string[]): CliArgs {
         from: { type: 'string' },
         mode: { type: 'string' },
         only: { type: 'string' },
+        'data-dir': { type: 'string' },
         wait: { type: 'boolean' },
         verbose: { type: 'boolean', short: 'v' },
         'no-color': { type: 'boolean' },
@@ -536,7 +538,8 @@ async function e2e(a: CliArgs): Promise<number> {
   const modelFrom = process.env[inst.kind === 'codex' ? 'AGENTS_IO_LIVE_CODEX_MODEL' : 'AGENTS_IO_LIVE_CLAUDE_MODEL'] ? 'env' : 'config/default';
   console.log(`e2e against ${inst.name} (${inst.kind}): ${probe.version}; model ${inst.run.model || '(codex default)'} from ${modelFrom}`);
   const only = str(a, 'only')?.split(',').map((s) => s.trim());
-  const results = await runScenarios(c, { ...(only ? { only } : {}), verbose: a.values.verbose === true });
+  const root = str(a, 'data-dir');
+  const results = await runScenarios(c, { ...(only ? { only } : {}), ...(root ? { root: resolve(root.replace(/^~(?=$|\/)/, homedir())) } : {}), verbose: a.values.verbose === true });
   const n = (s: string) => results.filter((r) => r.status === s).length;
   console.log(`\n${n('PASS')} passed, ${n('FAIL')} failed, ${n('SKIP')} skipped`);
   return n('FAIL') ? 1 : 0;

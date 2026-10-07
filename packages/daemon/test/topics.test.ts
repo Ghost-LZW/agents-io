@@ -94,7 +94,7 @@ describe('topics in the daemon', () => {
     expect(started.inputIds).toEqual([expect.stringMatching(/^sum_turn_/), `${r.inputId}>${b.id}`]);
     const [summary, handed] = turns.find((x) => x.sessionKey === b.sessionKey)!.inputs;
     expect(handed!.origin.principal?.id).toBe('fake:alice');
-    expect(handed!.channelContext).toMatchObject({ topic: b.id, topicTitle: 'Capitals', handedFrom: CONV });
+    expect(handed!.channelContext).toMatchObject({ topic: b.id, topicTitle: 'Capitals', handedFrom: CONV, topicTools: expect.stringMatching(/answer it here/) });
     expect(summary!.channelContext).toMatchObject({ context: true, topicSummary: true, fromTopic: a.id });
     expect(JSON.stringify(summary!.content)).toContain('Summary of the previous topic');
     expect(JSON.stringify(summary!.content)).toContain('The user told me their codename.');

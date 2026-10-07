@@ -56,6 +56,7 @@ pnpm e2e                                   # 根目录：build 后跑 claude-cod
 pnpm e2e --harness codex                   # 实例名，或种类名（取该种类的第一个实例）
 aio e2e --harness claude-gateway --only a
 aio e2e --only a,d --verbose           # 只跑某几个；--verbose 打印过程
+aio e2e --only p,q --data-dir ~/.agents-io/e2e   # 场景目录放在短路径下（Unix socket 路径须 < 104 字节；默认系统临时目录）
 ```
 
 e2e 跑的是默认实例（`--harness` 可换），保留它的 `env`、`configDir`/`home`、`settings` 等启动设置，但会话放在场景临时目录里。每个场景起一个独立的进程内网关（临时目录、SQLite log、本地 socket），一个脚本化通道 `e2e`（主人 `e2e:alice`、`e2e:bob`），对**真实** harness 发便宜且确定的提示，在订阅流上断言，逐个打印 `PASS/FAIL/SKIP` 和原因：
@@ -75,6 +76,8 @@ e2e 跑的是默认实例（`--harness` 可换），保留它的 `env`、`config
 | m | output-ask-choice | 输出工具：模型调 `ask_choice` → 通道上出现 red/blue 按钮（`choice:` action id），该轮结束；模拟点击 blue → 新一轮的输入是 `choice` 事件，回答含 blue；`delivery.settled` delivered；报告 harness 在 `_meta` 里带了哪些键 |
 | n | output-send-file | 输出工具：工作目录里写 README.md，模型调 `send_file` → 通道收到附件，blob 字节与文件一致，delivery settled |
 | o | output-terminal-choose | 输出工具：本地路由上 `ask_choice` 只写 `agents-io.output` 事件；`/choose <id> <n>` 等价的输入 → 新一轮回答含所选项；越界序号被拒（`bad_choice`） |
+| p | topic-rotate | 话题（决定 6）：主人私聊先说 A（Rust GPX 工具、代号 BLUE-HERON-7），再问无关的 B（澳大利亚首都）→ agent 调 `session_rotate`，新话题 session（`<会话 key>#<topicId>`）以摘要为 context 接手这条消息并回答 Canberra；**重启守护进程**；再说"回到刚才 Rust GPX 命令行工具的话题：它的秘密代号是什么"→ B 里的 agent 调 `session_list` + `session_switch`，A 成为当前话题，A 的 session 用原生 id 续接并答出 BLUE-HERON-7；报告摘要里是否带了代号 |
+| q | topic-command | 聊天命令：`/new Groceries` → 系统回复、新话题当前；下一条消息进新话题，卡片 `channelData["agents-io/topic"].title` 为 Groceries；`/topics` 列出两个（▶ 标当前）；`/switch 2` 回到第一个话题，回答记得第一个话题里的词（kiwi）而不是第二个的（mango）；命令本身不进 harness（共 3 个 turn） |
 
 e2e 会忽略配置里的通道（不需要通道密钥），claude-code 下不加载用户/项目 settings（否则用户的权限规则会替人回答审批），codex 下 `restricted` 未配置时用 `approvalPolicy: untrusted`、effort 默认 `low`。
 

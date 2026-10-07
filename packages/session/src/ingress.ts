@@ -100,6 +100,12 @@ export interface IngressOptions {
    * command still acts, the reply is only in the result.
    */
   systemReply?: (a: { route: ReplyRoute; text: string; operationId: string; sessionKey: string }) => Promise<void>;
+  /**
+   * One line added to inputs routed to a topic (`channelContext.topicTools`), telling
+   * the model how to move between topics, e.g. `TOPIC_TOOLS_HINT` when the agent has
+   * the session_* output tools. Without it the input only names its topic.
+   */
+  topicHint?: string;
   onReplyError?: (err: unknown) => void;
 }
 
@@ -342,7 +348,7 @@ export class Ingress {
     }
     const lane = await this.o.lanes(d.sessionKey, d.agent);
     // The model sees which topic it is in (and can rotate or switch with the output tools).
-    if (d.topic) input = { ...input, channelContext: { ...input.channelContext, topic: d.topic.id, ...(d.topic.title !== undefined ? { topicTitle: d.topic.title } : {}) } };
+    if (d.topic) input = { ...input, channelContext: { ...input.channelContext, ...topicContext(d.topic, this.o.topicHint) } };
     if (d.on === 'dispatch') {
       const result = await lane.command({ type: 'input', sessionKey: d.sessionKey, input, mode: d.mode ?? env.modeHint ?? 'queue' });
       return { ...base, result };
@@ -425,6 +431,15 @@ export const DEFAULT_AGENT = 'default';
 export function replySummary(caps: ChannelCaps, tier: Tier): string {
   const media = caps.media.out.length ? caps.media.out.join(',') : 'none';
   return `${tier} markdown=${caps.text.markdown} maxChars=${caps.text.maxChars} buttons=${caps.buttons ? 'yes' : 'no'} media=${media}`;
+}
+
+/** `IngressOptions.topicHint` for agents that have the session_* output tools. */
+export const TOPIC_TOOLS_HINT =
+  'this conversation keeps topics: if this message starts a clearly unrelated subject, call session_rotate (title, summary) and end the turn; if it returns to an earlier topic, call session_list then session_switch and end the turn; otherwise just answer';
+
+/** What an input routed to a topic carries: the topic's id and title, and the hint when given. */
+export function topicContext(t: { id: string; title?: string }, hint?: string): InputRecord['channelContext'] {
+  return { topic: t.id, ...(t.title !== undefined ? { topicTitle: t.title } : {}), ...(hint ? { topicTools: hint } : {}) };
 }
 
 /** A chat command on topics: `/new [title]`, `/topics`, `/switch <n|id>`. */

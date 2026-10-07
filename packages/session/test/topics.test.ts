@@ -12,6 +12,7 @@ import {
   Router,
   SqliteSessionLog,
   TOPIC_KEY,
+  TOPIC_TOOLS_HINT,
   TopicError,
   TopicRegistry,
   defaultBindings,
@@ -22,6 +23,7 @@ import {
   parseTopicCommand,
   renderTurn,
   titleFrom,
+  topicContext,
   type AgentSpec,
   type SessionPolicy,
 } from '../src/index.js';
@@ -236,6 +238,13 @@ describe('topic commands (Ingress)', () => {
     expect(w.replies.at(-1)!.text).toMatch(/^Already in topic/);
     expect((await say(w, '/switch 9')).command).toMatchObject({ ok: false });
     expect(w.replies.at(-1)!.text).toMatch(/No topic 9/);
+  });
+
+  it('inputs routed to a topic carry the hint on how to move between topics when one is configured', () => {
+    expect(topicContext({ id: 'tp_1', title: 'A' })).toEqual({ topic: 'tp_1', topicTitle: 'A' });
+    expect(topicContext({ id: 'tp_1' }, TOPIC_TOOLS_HINT)).toEqual({ topic: 'tp_1', topicTools: TOPIC_TOOLS_HINT });
+    expect(TOPIC_TOOLS_HINT).toMatch(/session_rotate/);
+    expect(TOPIC_TOOLS_HINT).toMatch(/session_switch/);
   });
 
   it('Policy.control decides who may use them (owner by default)', async () => {

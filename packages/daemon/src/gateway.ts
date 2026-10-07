@@ -39,6 +39,7 @@ import {
   Outbox,
   Router,
   SqliteSessionLog,
+  TOPIC_TOOLS_HINT,
   TopicError,
   TopicRegistry,
   WatchDispatcher,
@@ -50,6 +51,7 @@ import {
   type RemoveWatchResult,
   type SessionLog,
   type TopicRecord,
+  topicContext,
   topicView,
 } from '@agents-io/session';
 import { HostMcpServer, HostTools, ToolError, type TopicHandover } from '@agents-io/host-mcp';
@@ -327,6 +329,8 @@ export class Gateway {
       ...(tools ? { rewrite: (a) => tools.rewriteInbound(a) } : {}),
       // `/new`, `/topics`, `/switch` answer with one short message on the route they came from.
       systemReply: (a) => this.systemReply(a),
+      // With the session_* tools mounted, every input of a topic says how to move between topics.
+      ...(tools ? { topicHint: TOPIC_TOOLS_HINT } : {}),
       onReplyError: (err) => this.log('warn', `topic command reply failed: ${(err as Error).message}`),
     });
     if (c.source) {
@@ -708,8 +712,9 @@ export class Gateway {
     const handed: string[] = [];
     for (const i of turn.inputs) {
       if (i.channelContext.context === true) continue;
-      const { topic: _topic, topicTitle: _title, ...ctx } = i.channelContext;
-      const input: InputRecord = { ...i, inputId: `${i.inputId}>${to.id}`, channelContext: { ...ctx, topic: to.id, ...(to.title !== undefined ? { topicTitle: to.title } : {}), handedFrom: turn.sessionKey } };
+      const { topic: _topic, topicTitle: _title, topicTools: _tools, ...ctx } = i.channelContext;
+      // Handed over on purpose: this topic answers it (the session_* tools refuse to move it again).
+      const input: InputRecord = { ...i, inputId: `${i.inputId}>${to.id}`, channelContext: { ...ctx, ...topicContext(to, HANDED_HINT), handedFrom: turn.sessionKey } };
       const r = await lane.command({ type: 'input', sessionKey: to.sessionKey, input, mode: 'queue' });
       if (!r.ok) throw new ToolError(`handing the message to topic ${to.id} failed: ${r.reason}`);
       handed.push(input.inputId);
@@ -1026,6 +1031,9 @@ ${a.summary}` }],
     this.hub.log.close?.();
   }
 }
+
+/** `topicTools` of an input handed to a topic by session_rotate / session_switch. */
+const HANDED_HINT = 'this message was handed to this topic by a topic switch: answer it here; do not call session_rotate or session_switch for it';
 
 function fail(code: string, message = code): Outcome {
   return { ok: false, code, message };

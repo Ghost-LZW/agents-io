@@ -187,7 +187,11 @@ default owner-DM rule (`default:owner-dm`) uses `topic`; group rules are unchang
 - Every change appends `topic.changed { conversation, from?, to, title?, reason }`
   to the session left and the one now current.
 - Inputs routed to a topic carry `channelContext.topic` / `topicTitle` (the model
-  sees them in its input preface).
+  sees them in its input preface) and, when the agent has the output tools,
+  `topicTools`: one line on when to call `session_rotate` / `session_switch`
+  (without it, small models never rotate). A message handed over by a rotate or
+  switch carries `handedFrom` and a line saying to answer it there; the tools
+  refuse to move it again, so topics cannot ping-pong.
 - When to switch is the agent's call, with the host output tools:
   `session_rotate({ title, summary })` starts a new topic and hands the turn's
   triggering inputs to it (new input ids `<id>><topicId>`), the summary first as a
