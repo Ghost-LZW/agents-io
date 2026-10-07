@@ -27,6 +27,20 @@ export function parseActionId(id: string): { requestId: string; kind: 'allow_onc
   return { requestId, kind };
 }
 
+const STOP_PREFIX = 'turn:';
+const STOP_SUFFIX = ':interrupt';
+
+/** Action id of a stop button on a turn's card: `turn:<turnId>:interrupt`. A click becomes an `interrupt` command. */
+export function interruptActionId(turnId: string): string {
+  return `${STOP_PREFIX}${turnId}${STOP_SUFFIX}`;
+}
+
+export function parseInterruptActionId(id: string): { turnId: string } | undefined {
+  if (!id.startsWith(STOP_PREFIX) || !id.endsWith(STOP_SUFFIX)) return undefined;
+  const turnId = id.slice(STOP_PREFIX.length, id.length - STOP_SUFFIX.length);
+  return turnId ? { turnId } : undefined;
+}
+
 export interface IngressOptions {
   policy?: SessionPolicy;
   /** Lane for a session key; the host decides how lanes are created and kept. */
@@ -39,7 +53,7 @@ export interface IngressOptions {
 export interface IngressResult {
   /** The host durably took the envelope (also true for a deliberate drop). */
   accepted: boolean;
-  action: 'dispatch' | 'observe' | 'drop' | 'resolve' | 'duplicate' | 'invalid';
+  action: 'dispatch' | 'observe' | 'drop' | 'resolve' | 'interrupt' | 'duplicate' | 'invalid';
   inputId?: string;
   sessionKey?: string;
   origin?: Origin;
@@ -117,6 +131,12 @@ export class Ingress {
 
     // A button click on an approval card becomes a resolve command; the lane re-checks eligibility.
     const click = actionClick(env);
+    if (click?.kind === 'interrupt') {
+      // The lane checks Policy.control and that the turn is still the running one.
+      const lane = await this.o.lanes(sessionKey);
+      const result = await lane.command({ type: 'interrupt', sessionKey, turnId: click.turnId, origin });
+      return { accepted: true, action: 'interrupt', sessionKey, origin, result };
+    }
     if (click) {
       const lane = await this.o.lanes(sessionKey);
       const cmd: Command = { type: 'resolve', sessionKey, requestId: click.requestId, decision: { kind: click.kind }, origin };
@@ -152,6 +172,8 @@ function actionClick(env: InboundEnvelope) {
   if (env.content.length !== 1) return undefined;
   const c = env.content[0]!;
   if (c.type !== 'event' || c.name !== 'action' || typeof c.data.actionId !== 'string') return undefined;
+  const stop = parseInterruptActionId(c.data.actionId);
+  if (stop) return { kind: 'interrupt' as const, turnId: stop.turnId };
   return parseActionId(c.data.actionId);
 }
 

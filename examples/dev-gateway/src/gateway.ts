@@ -177,6 +177,8 @@ export class Gateway {
       adapter,
       outbox: this.outbox,
       ...(tier ? { tier } : {}),
+      // A stop button on streaming cards; Ingress turns its click into an `interrupt` command.
+      interruptButton: true,
       onError: (err) => this.log('warn', `render to ${adapter.id} failed: ${(err as Error).message}`),
     });
     c.start();
