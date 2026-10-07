@@ -14,6 +14,8 @@ import {
   type Policy,
   type ReplyRoute,
   type Tier,
+  type Watch,
+  type WatchDraft,
 } from '@agents-io/protocol';
 import {
   Compositor,
@@ -22,8 +24,12 @@ import {
   Lane,
   Outbox,
   SqliteSessionLog,
+  WatchDispatcher,
+  WatchRegistry,
   defaultPolicy,
+  type AddWatchResult,
   type FullPolicy,
+  type RemoveWatchResult,
   type SessionLog,
 } from '@agents-io/session';
 import { ClaudeCodeHarness, findOnPath, type ClaudeCodeHarnessConfig } from '@agents-io/harness-claude-code';
@@ -56,6 +62,8 @@ export interface GatewayOptions {
   policy?: Partial<Policy>;
   /** Use this log instead of SQLite at `config.logPath` (tests). */
   log?: SessionLog;
+  /** Use this watch registry (default: tables in the SQLite log's database, else in memory). */
+  watches?: WatchRegistry;
   /** Serve the local client socket (default true). */
   listen?: boolean;
   /** Tee of raw harness events per session (conformance checks). */
@@ -96,6 +104,8 @@ export class Gateway {
   readonly policy: FullPolicy;
   readonly ingress: Ingress;
   readonly outbox: Outbox;
+  /** Watches: sessions subscribed to inputs not addressed to them. */
+  readonly watches: WatchDispatcher;
   /** Built instance adapters, by instance name (lazily, on first use). */
   private readonly instances = new Map<string, HarnessAdapter>();
   private readonly lanes = new Map<string, Lane>();
@@ -111,25 +121,43 @@ export class Gateway {
     this.harness();
     this.log = o.logger ?? ((level, msg) => console.error(`[aio] ${level}: ${msg}`));
     if (!o.log && c.logPath !== ':memory:') mkdirSync(dirname(c.logPath), { recursive: true, mode: 0o700 });
-    this.hub = new Hub(o.log ?? new SqliteSessionLog({ path: c.logPath }));
+    const log = o.log ?? new SqliteSessionLog({ path: c.logPath });
+    this.hub = new Hub(log);
     this.policy = {
       ...defaultPolicy({
         owners: c.policy.owners,
         selfAccounts: c.policy.selfAccounts,
         agentAccounts: c.policy.agentAccounts,
         routes: c.policy.routes,
+        watchAllowlist: c.policy.watchAllowlist,
         run: c.harnesses[c.defaultHarness]!.run,
         ...(c.policy.ownerSessionKey ? { ownerSessionKey: c.policy.ownerSessionKey } : {}),
       }),
       ...o.policy,
     } as FullPolicy;
     this.outbox = new Outbox({ hub: this.hub, policy: this.policy });
-    this.ingress = new Ingress({ policy: this.policy, lanes: (key) => this.lane(key) });
+    // Watches live next to the log (same SQLite file), so they and their digest buffers survive a restart.
+    const registry = o.watches ?? new WatchRegistry(log instanceof SqliteSessionLog ? { db: log.db } : {});
+    this.watches = new WatchDispatcher({
+      registry,
+      policy: this.policy,
+      lanes: (key) => this.lane(key),
+      replyRoute: (w) => this.homeRoute(w.target.sessionKey),
+      onError: (err, id) => this.log('warn', `watch ${id}: ${(err as Error).message}`),
+    });
+    this.ingress = new Ingress({
+      policy: this.policy,
+      lanes: (key) => this.lane(key),
+      watches: this.watches,
+      onWatchError: (err) => this.log('warn', `watch fan-out failed: ${(err as Error).message}`),
+    });
   }
 
   static async start(o: GatewayOptions): Promise<Gateway> {
     const gw = new Gateway(o);
     try {
+      gw.watches.start();
+      await gw.loadConfigWatches();
       await gw.startChannels();
       await gw.adoptRunningTurns();
       if (o.listen !== false) {
@@ -248,6 +276,39 @@ export class Gateway {
     }
   }
 
+  /** Config watches are the owner's: created as the local principal. A bad entry is logged, not fatal. */
+  private async loadConfigWatches(): Promise<void> {
+    const by: Origin = { ...this.localOrigin(this.o.config.local.session), via: 'config', adapter: 'config' };
+    for (const w of this.o.config.watches) {
+      const r = await this.watches.add(by, w);
+      if (r.ok) this.log('info', `watch ${w.id} → ${w.target.sessionKey} (${w.mode})`);
+      else this.log('warn', `config watch ${w.id}: ${r.message}`);
+    }
+  }
+
+  /**
+   * Where turns a watch starts reply: the route of the target session's latest
+   * turn that had one (e.g. the owner's DM), else nowhere but the session stream.
+   */
+  homeRoute(sessionKey: string): ReplyRoute | null {
+    let route: ReplyRoute | null = null;
+    for (const e of this.hub.log.read(sessionKey, 0)) if (e.body.t === 'turn.started' && e.body.replyRoute) route = e.body.replyRoute;
+    return route;
+  }
+
+  /** Create or replace a watch as `by` (checked by `Policy.watch`). Host MCP tools call this for agents. */
+  addWatch(by: Origin, watch: WatchDraft): Promise<AddWatchResult> {
+    return this.watches.add(by, watch);
+  }
+
+  removeWatch(by: Origin, id: string): Promise<RemoveWatchResult> {
+    return this.watches.remove(by, id);
+  }
+
+  listWatches(sessionKey?: string): Watch[] {
+    return this.watches.list(sessionKey !== undefined ? { target: sessionKey } : {});
+  }
+
   /** Origin stamped on everything a local client sends. Clients cannot choose it. */
   localOrigin(sessionKey: string): Origin {
     return {
@@ -316,6 +377,7 @@ export class Gateway {
     if (this.stopped) return;
     this.stopped = true;
     this.server?.close('gateway stopping');
+    this.watches.stop();
     for (const ch of this.channels) ch.ac.abort();
     await within(Promise.all(this.channels.map((c) => c.running)), 3000);
     const codex = (l: Lane) => codexOf(this.o.harness ?? this.instances.get(l.harnessId));
@@ -335,7 +397,9 @@ export class Gateway {
     await within(Promise.all(closed.map((l) => l.whenIdle())), 3000);
     await within(Promise.all(this.compositors.map((c) => c.stop())), 5000);
     for (const ch of this.channels) await within(ch.close?.().catch(() => undefined), 3000);
+    await within(this.watches.idle(), 3000);
     await within(new Promise(() => {}), 50);
+    this.watches.registry.close();
     this.hub.log.close?.();
   }
 }

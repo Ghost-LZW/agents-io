@@ -177,6 +177,13 @@ export class Lane {
     });
   }
 
+  /** Record a `notice` in this session's log (e.g. a watch digest being delivered). */
+  notice(message: string, level: 'primary' | 'detail' = 'detail'): Promise<void> {
+    return this.serial(async () => {
+      this.emit({ level, body: { t: 'notice', code: 'other', message } });
+    });
+  }
+
   /** Latest revision of every observe-only input, in first-seen order. */
   observed(): InputRecord[] {
     return [...this.observedInputs.values()];
@@ -776,9 +783,13 @@ function visibilityOf(e: HarnessEvent): Visibility {
   return 'participants';
 }
 
-function pid(i: InputRecord): { principalId?: string } {
+/**
+ * Principal of an admitted input; inputs that arrived via a watch also carry the
+ * record itself, so the target session's log shows what arrived and from where.
+ */
+function pid(i: InputRecord): { principalId?: string; input?: InputRecord } {
   const id = principalId(i);
-  return id === undefined ? {} : { principalId: id };
+  return { ...(id === undefined ? {} : { principalId: id }), ...(i.channelContext.watch !== undefined ? { input: i } : {}) };
 }
 
 function errMsg(err: unknown): string {

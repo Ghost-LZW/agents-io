@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { Type, type Static } from '@sinclair/typebox';
-import { Tier, errors, type Principal, type RunSpec } from '@agents-io/protocol';
+import { Tier, WatchDraft, errors, type Principal, type RunSpec, type WatchSource } from '@agents-io/protocol';
 import { loadEnvFile } from '@agents-io/testkit';
 import type { CodexTransportOption } from '@agents-io/harness-codex';
 
@@ -174,10 +174,33 @@ export const ConfigFile = Type.Object(
           /** Put every owner DM (any channel) into this one session. */
           ownerSessionKey: Type.Optional(Type.String()),
           routes: Type.Optional(Type.Array(Type.String())),
+          /**
+           * Sources an agent may watch without asking (defaultPolicy `watchAllowlist`):
+           * each entry matches when every field it sets equals the watch source's.
+           */
+          watchAllowlist: Type.Optional(
+            Type.Array(
+              Type.Object(
+                {
+                  channel: Type.Optional(Type.String()),
+                  account: Type.Optional(Type.String()),
+                  conversation: Type.Optional(Type.String()),
+                  conversationKind: Type.Optional(WatchDraft.properties.source.properties.conversationKind),
+                },
+                Closed,
+              ),
+            ),
+          ),
         },
         Closed,
       ),
     ),
+    /**
+     * Watches the owner sets up (loaded at start, created as the local principal).
+     * Each needs an `id`; an existing watch with that id is replaced, so editing
+     * the config takes effect on restart.
+     */
+    watches: Type.Optional(Type.Array(Type.Intersect([WatchDraft, Type.Object({ id: Type.String() })]))),
     /** Who local socket clients are. */
     local: Type.Optional(
       Type.Object(
@@ -247,7 +270,16 @@ export interface Config {
   /** The instance the default policy plans. */
   defaultHarness: string;
   channels: ResolvedChannel[];
-  policy: { owners: string[]; selfAccounts: string[]; agentAccounts: string[]; ownerSessionKey?: string; routes: string[] };
+  policy: {
+    owners: string[];
+    selfAccounts: string[];
+    agentAccounts: string[];
+    ownerSessionKey?: string;
+    routes: string[];
+    watchAllowlist: Partial<Pick<WatchSource, 'channel' | 'account' | 'conversation' | 'conversationKind'>>[];
+  };
+  /** Owner watches from the config file. */
+  watches: (WatchDraft & { id: string })[];
   local: { principal: Principal; session: string };
 }
 
@@ -348,7 +380,9 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
       agentAccounts: c.policy?.agentAccounts ?? [],
       ...(ownerSessionKey ? { ownerSessionKey } : {}),
       routes: c.policy?.routes ?? [],
+      watchAllowlist: c.policy?.watchAllowlist ?? [],
     },
+    watches: c.watches ?? [],
     local: {
       principal: { id: c.local?.principal ?? owners[0] ?? 'local:owner', labels: c.local?.labels ?? ['owner'] },
       session: c.local?.session ?? ownerSessionKey ?? 'local:main',

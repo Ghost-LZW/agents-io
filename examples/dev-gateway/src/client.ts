@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { createConnection, type Socket } from 'node:net';
-import { FrameDecoder, PROTOCOL_VERSION, encodeFrame, type ResultFrame, type SessionEvent, type Tier } from '@agents-io/protocol';
+import { FrameDecoder, PROTOCOL_VERSION, encodeFrame, type ResultFrame, type SessionEvent, type Tier, type Watch, type WatchDraft } from '@agents-io/protocol';
 import { AsyncQueue } from '@agents-io/testkit';
 import type { ClientCommand, ServerFrame, SessionInfo } from './frames.js';
 
@@ -109,6 +109,25 @@ export class LocalClient {
     const r = await this.request({ type: 'sessions' });
     if (!r.ok) throw new CommandError(r.error?.code ?? 'error', r.error?.message ?? 'error');
     return r.value as SessionInfo[];
+  }
+
+  private async value<T>(frame: Record<string, unknown>): Promise<T> {
+    const r = await this.request(frame);
+    if (!r.ok) throw new CommandError(r.error?.code ?? 'error', r.error?.message ?? 'error');
+    return r.value as T;
+  }
+
+  /** Create (or replace, same id) a watch as this connection's principal. */
+  watchAdd(watch: WatchDraft): Promise<Watch> {
+    return this.value({ type: 'watch.add', watch });
+  }
+
+  watchRemove(watchId: string): Promise<{ removed: boolean }> {
+    return this.value({ type: 'watch.remove', watchId });
+  }
+
+  watchList(sessionKey?: string): Promise<Watch[]> {
+    return this.value({ type: 'watch.list', ...(sessionKey !== undefined ? { sessionKey } : {}) });
   }
 
   /** One subscription per session per connection; subscribing again replaces it. */

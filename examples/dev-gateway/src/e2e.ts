@@ -20,6 +20,8 @@ import { Gateway } from './gateway.js';
 
 const ALICE = { channelUserId: 'alice', evidence: 'platform_signed' as const };
 const BOB = { channelUserId: 'bob', evidence: 'platform_signed' as const };
+/** Not an owner: in a group the default policy only observes it. */
+const STRANGER = { channelUserId: 'eve', displayName: 'Eve', evidence: 'platform_signed' as const };
 const LOCAL = 'local:e2e';
 const TURN_MS = 180_000;
 
@@ -429,6 +431,57 @@ export const SCENARIOS: Scenario[] = [
       const at = (t: string) => all.findIndex((e) => e.body.t === t && (e.body as { turnId?: string }).turnId === turn.turnId);
       assert(at('turn.adopted') >= 0 && at('turn.adopted') < at('turn.completed'), 'turn was not left open by gateway 1 and adopted by gateway 2');
       return `turn left open by gateway 1; gateway 2 adopted it (${adopted.inputIds.length} input) and it completed: ${JSON.stringify(w2.finalText(turn.turnId).slice(0, 30))}`;
+    },
+  },
+  {
+    id: 'i',
+    name: 'watch-digest',
+    async run(ctx) {
+      const w = await world(ctx);
+      const target = 'e2e:local';
+      const c = await w.client();
+      const watch = await w.watch(target, { client: c });
+      const conv = { id: 'x', kind: 'group' as const };
+      const added = await c.watchAdd({
+        id: 'wx',
+        source: { channel: 'e2e', conversation: 'x' },
+        target: { sessionKey: target },
+        mode: 'digest',
+        digest: { everyMs: 5000 },
+        note: 'Summarise these group messages for me in one short paragraph; mention every item.',
+      });
+      assert(added.createdBy === LOCAL, `watch created by ${added.createdBy}`);
+      const texts = [
+        'The launch moved to Thursday.',
+        'Please bring the blue folder to the review.',
+        'Budget approved at 42k.',
+      ];
+      for (const text of texts) {
+        const r = await w.chat.inject({ sender: STRANGER, conversation: conv, text });
+        assert(r.accepted, 'group message not accepted');
+      }
+      const ctxInputs = await waitFor('three watched context inputs', 10_000, () => {
+        const xs = watch.of('input.admitted').filter((b) => b.disposition === 'observe_only' && b.input?.channelContext.watch === 'wx');
+        return xs.length === 3 && xs;
+      });
+      assert(ctxInputs.every((b) => b.input?.origin.principal === null && b.input.origin.via === 'e2e:default:x'), 'watched inputs lost their original (stranger) origin');
+      assert(watch.of('turn.started').length === 0, 'a turn started before the digest');
+      ctx.progress('3 context inputs recorded; waiting for the digest');
+      const digest = await waitFor('the digest input', 20_000, () => watch.of('input.admitted').find((b) => b.input?.origin.kind === 'system' && b.input.channelContext.watch === 'wx'));
+      const turn = await watch.turnStartedWith(digest.inputId);
+      const done = await watch.completed(turn.turnId);
+      assert(done.status === 'completed', `digest turn ended ${done.status}${done.error ? ` (${done.error.code})` : ''}`);
+      await new Promise((r) => setTimeout(r, 1000));
+      const turns = watch.of('turn.started');
+      assert(turns.length === 1, `expected exactly one turn, got ${turns.length}`);
+      assert(turn.inputIds.length === 1 && turn.run?.profile === 'restricted', `digest turn: ${turn.inputIds.length} inputs, profile ${turn.run?.profile}`);
+      const notice = watch.of('notice').find((n) => n.message.startsWith('watch wx: digest of 3 items'));
+      assert(notice, 'no digest notice in the target log');
+      const text = watch.finalText(turn.turnId);
+      const missing = [/thursday/i, /folder/i, /42/].filter((re) => !re.test(text));
+      assert(missing.length === 0, `answer misses ${missing.join(', ')}: ${JSON.stringify(text.slice(0, 200))}`);
+      conforms(w, target, watch);
+      return `3 stranger messages → 3 context inputs → 1 digest turn (system origin, restricted); answer mentions all three: ${JSON.stringify(text.slice(0, 160))}`;
     },
   },
 ];

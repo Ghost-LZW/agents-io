@@ -4,6 +4,7 @@ import { InputMode } from './commands.js';
 import { Level, SessionEvent, Tier } from './events.js';
 import { Decision } from './requests.js';
 import { ResultFrame } from './wire.js';
+import { WatchFilter, WatchMode, WatchSource } from './watch.js';
 
 /*
  * Local client protocol: JSONL over a Unix socket, one frame per line (the same
@@ -52,11 +53,34 @@ export const ClientCommand = Type.Union([
 ]);
 export type ClientCommand = Static<typeof ClientCommand>;
 
+/**
+ * A watch as a client (or config file) asks for it: a `Watch` without `createdBy`
+ * and `createdAt`, which the server stamps from the connection's principal. An
+ * absent `id` gets a fresh one; an existing `id` replaces that watch.
+ */
+export const WatchDraft = Type.Object({
+  id: Type.Optional(Type.String()),
+  source: WatchSource,
+  filter: Type.Optional(WatchFilter),
+  target: Type.Object({ sessionKey: Type.String() }),
+  mode: WatchMode,
+  digest: Type.Optional(Type.Object({ everyMs: Type.Number(), maxItems: Type.Optional(Type.Number()) })),
+  expiresAt: Type.Optional(Type.Number()),
+  note: Type.Optional(Type.String()),
+});
+export type WatchDraft = Static<typeof WatchDraft>;
+
 /** Client → server. Every request carries `id`; the server answers with a `result` frame of the same id. */
 export const ClientFrame = Type.Union([
   Type.Object({ v: V, type: Type.Literal('command'), id: Type.String(), command: ClientCommand }),
   /** Value: `SessionInfo[]`. */
   Type.Object({ v: V, type: Type.Literal('sessions'), id: Type.String() }),
+  /** Create (or replace) a watch; checked by `Policy.watch` against the connection's origin. Value: the stored `Watch`. */
+  Type.Object({ v: V, type: Type.Literal('watch.add'), id: Type.String(), watch: WatchDraft }),
+  /** Value: `{ removed: boolean }`. */
+  Type.Object({ v: V, type: Type.Literal('watch.remove'), id: Type.String(), watchId: Type.String() }),
+  /** Value: `Watch[]` (only those targeting `sessionKey` when given). */
+  Type.Object({ v: V, type: Type.Literal('watch.list'), id: Type.String(), sessionKey: Type.Optional(Type.String()) }),
 ]);
 export type ClientFrame = Static<typeof ClientFrame>;
 
@@ -89,5 +113,5 @@ export const ServerFrame = Type.Union([
 ]);
 export type ServerFrame = Static<typeof ServerFrame>;
 
-export const CLIENT_FRAME_TYPES = ['command', 'sessions'] as const;
+export const CLIENT_FRAME_TYPES = ['command', 'sessions', 'watch.add', 'watch.remove', 'watch.list'] as const;
 export const SERVER_FRAME_TYPES = ['result', 'event', 'closed'] as const;
