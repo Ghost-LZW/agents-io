@@ -65,7 +65,14 @@ see `docs/E2E.md` §0). New:
 ## Host connection
 
 `aio serve` writes a fresh host token to `<socket>.token` (0600) at every start and
-removes it at stop. A connection sends `host.hello { token, name, consumer?, callouts? }`
+removes it at stop. For a token that stays the same across restarts, set
+`host.tokenFile` in the config (relative to the config file) or pass
+`aio serve --token-file <path>` (wins): the file is read when it exists (it must be a
+regular file of this user, not accessible to group / others, in a directory others
+cannot write, holding at least 16 characters without whitespace; otherwise the daemon
+does not start), else a fresh token is generated and written there (0600, a missing
+directory is created 0700). It is still copied to `<socket>.token` for the CLI; the
+daemon never removes or rotates the operator's file. A connection sends `host.hello { token, name, consumer?, callouts? }`
 before any host frame; after it, the connection's client frames carry the origin
 `{ kind: "system", principal: "host:<name>" }`.
 

@@ -321,6 +321,14 @@ export const ConfigFile = Type.Object(
         Closed,
       ),
     ),
+    /**
+     * The host connection. `tokenFile`: an operator-set host token, stable across restarts
+     * (relative paths are relative to the config file). Read when the file exists (it must be
+     * ours, 0600-ish, in a directory others cannot write); otherwise generated and written there
+     * (0600). Without it every start makes a fresh token. `aio serve --token-file` wins.
+     * The token is still copied to `<socket>.token` for the CLI.
+     */
+    host: Type.Optional(Type.Object({ tokenFile: Type.Optional(Type.String()) }, Closed)),
     /** Who local socket clients are. */
     local: Type.Optional(
       Type.Object(
@@ -449,6 +457,8 @@ export interface Config {
   local: { principal: Principal; session: string };
   /** The console API server. */
   console: ConsoleConfig;
+  /** The host connection: `tokenFile` is an absolute path when set. */
+  host?: { tokenFile?: string };
   /** Where this config came from (loadConfig): the file (it may not exist) and the env file found for it. */
   source?: { path: string; envFile?: string };
 }
@@ -659,6 +669,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
       session: localSession,
     },
     console: resolveConsole(c.console),
+    host: c.host?.tokenFile !== undefined ? { tokenFile: path(c.host.tokenFile) } : {},
     ...(warnings.length ? { warnings } : {}),
   };
 }

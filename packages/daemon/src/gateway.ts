@@ -77,7 +77,7 @@ import { blobResolvers, type MediaResolvers } from './media.js';
 import { DaemonRecords } from './records.js';
 import { checkLaunch, launchView, sameLaunch, type LaunchCheck } from './launch.js';
 import { Runs } from './runs.js';
-import { consoleUrlPath, removeTokenFile, tokenPath, writeTokenFile } from './token.js';
+import { consoleUrlPath, loadOrCreateTokenFile, removeTokenFile, tokenPath, writeTokenFile } from './token.js';
 
 export type LogFn = (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
 
@@ -112,8 +112,13 @@ export interface GatewayOptions {
   /** Tee of raw harness events per session (conformance checks). */
   onHarnessEvent?: (sessionKey: string, e: HarnessEvent) => void;
   logger?: LogFn;
-  /** Host token (default: a fresh random one, written next to the socket when listening). */
+  /** Host token (default: from `tokenFile`, else a fresh random one; written next to the socket when listening). */
   token?: string;
+  /**
+   * Operator-set host token file (`aio serve --token-file`; default `config.host.tokenFile`):
+   * read if present, else generated and written (0600). Ignored when `token` is given.
+   */
+  tokenFile?: string;
   /** Inbound push: how long a pushed item waits for the host's result, and the retry delay (tests). */
   hostPush?: { timeoutMs?: number; retryMs?: number };
   /** Serve the console API per `config.console` (default false; `aio serve` turns it on unless `console.enabled` is false). */
@@ -218,6 +223,8 @@ export class Gateway {
     this.harness();
     this.log = o.logger ?? ((level, msg) => console.error(`[aio] ${level}: ${msg}`));
     for (const w of c.warnings ?? []) this.log('warn', `config: ${w}`);
+    // Before anything opens: a bad token file fails the start without leaving handles behind.
+    this.token = o.token ?? this.hostToken(o.tokenFile ?? c.host?.tokenFile);
     if (!o.log && c.logPath !== ':memory:') {
       // Transcripts and tool output: 0600 before SQLite opens it (its -wal/-shm files take the database's mode).
       const warn = (msg: string) => this.log('warn', msg);
@@ -229,7 +236,6 @@ export class Gateway {
     this.hub = new Hub(log);
     this.records = new DaemonRecords(db);
     this.hostQueue = new HostQueue(db);
-    this.token = o.token ?? randomBytes(32).toString('hex');
     // Every topic change is recorded (topic.changed) in the session left and the one now current.
     this.topics = new TopicRegistry({ ...db, hub: this.hub, onChange: (ch) => this.topicChanged(ch) });
     // Agents: the configured ones, or `default` on the default instance with sessions keyed by bare route keys as before.
@@ -364,6 +370,14 @@ export class Gateway {
         ...(o.consoleEnv ? { env: o.consoleEnv } : {}),
       });
     }
+  }
+
+  /** The operator's token file (read, or created), else a fresh token for this start only. */
+  private hostToken(file: string | undefined): string {
+    if (file === undefined) return randomBytes(32).toString('hex');
+    const r = loadOrCreateTokenFile(file);
+    this.log('info', r.created ? `host token generated and written to ${file}` : `host token read from ${file}`);
+    return r.token;
   }
 
   static async start(o: GatewayOptions): Promise<Gateway> {

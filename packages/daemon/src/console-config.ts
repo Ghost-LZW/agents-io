@@ -50,6 +50,8 @@ const tomlSegs = (k: string) => (k.match(/[A-Za-z0-9_][A-Za-z0-9_-]*|"[^"\\]*"/g
 export function isCredential(doc: Json, at: Path): boolean {
   const s = at.map(String);
   const leaf = s.at(-1);
+  // `host.tokenFile` is a path, not the token.
+  if (s[0] === 'host' && s[1] === 'tokenFile') return false;
   // Header values, anywhere (claude mcpServers `headers`, codex `http_headers`, options passed through).
   if (s.slice(0, -1).some((x) => x === 'headers' || x === 'http_headers' || /(^|\.)http_headers$/.test(x))) return true;
   if (s[0] === 'harnesses' && s.length >= 4) {
