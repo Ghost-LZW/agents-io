@@ -96,9 +96,11 @@ export function buildCard(msg: RenderedMessage, text: string = msg.text): Record
       behaviors: [{ type: 'open_url', default_url: msg.link.url }],
     });
   }
+  const topic = neutral<TopicCardData>(msg, TOPIC_KEY)?.title;
   return {
     schema: '2.0',
     config: { update_multi: true, summary: { content: (msg.text || msg.link?.label || '').slice(0, 80) } },
+    ...(typeof topic === 'string' && topic.trim() ? { header: { title: { tag: 'plain_text', content: topic.trim().slice(0, 60) }, template: 'blue' } } : {}),
     body: { elements },
   };
 }
@@ -141,6 +143,11 @@ export function outcomeCard(outcome: string): Record<string, unknown> {
  */
 export const MENTIONS_KEY = 'agents-io/mentions';
 export const CHOICE_KEY = 'agents-io/choice';
+/** From the session compositor (`@agents-io/session` TOPIC_KEY): the title of the topic a turn's card belongs to. */
+export const TOPIC_KEY = 'agents-io/topic';
+export interface TopicCardData {
+  title: string;
+}
 
 export interface MentionsData {
   targets: { id: string; name?: string }[];

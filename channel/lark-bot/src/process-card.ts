@@ -1,4 +1,5 @@
 import type { ProgressStep, ProgressView, RenderedMessage } from '@agents-io/protocol';
+import { TOPIC_KEY, neutral, type TopicCardData } from './render.js';
 
 /**
  * The reply card for a message that carries `progress`: status banner, collapsible
@@ -76,7 +77,10 @@ const PLAN_MARK = { pending: '○', in_progress: '◐', completed: '●' } as co
 export interface ProcessModel {
   status: Status;
   done: boolean;
+  /** Header title: the topic's title when the turn's session is a topic, else the status. */
   title: string;
+  /** Header subtitle: the status, when the title is the topic's. */
+  subtitle?: string;
   template: string;
   summary: string;
   banner: string;
@@ -205,6 +209,8 @@ export function buildModel(msg: RenderedMessage, p: ProgressView, o: ModelOption
   const status = p.status;
   const done = status !== 'running' && status !== 'requires_action';
   const statusSection = msg.sections?.find((s) => s.kind === 'status')?.text;
+  const topicTitle = neutral<TopicCardData>(msg, TOPIC_KEY)?.title;
+  const topic = typeof topicTitle === 'string' && topicTitle.trim() ? clip(oneLine(topicTitle), 60) : undefined;
   const current = done ? t.status[status] : (statusSection ?? p.headline ?? t.working);
   const plain = o.style === 'plain';
   const banner = plain ? current : `${ICON[status]} ${current}`;
@@ -238,7 +244,8 @@ export function buildModel(msg: RenderedMessage, p: ProgressView, o: ModelOption
   return {
     status,
     done,
-    title: t.status[status],
+    title: topic ?? t.status[status],
+    ...(topic !== undefined ? { subtitle: t.status[status] } : {}),
     template: TEMPLATE[status],
     summary: clip(oneLine(done ? full || t.status[status] : current), 60),
     banner,
@@ -320,7 +327,7 @@ export function processCard(m: ProcessModel, o: { streaming?: boolean } = {}): R
       summary: { content: m.summary },
       ...(o.streaming ? { streaming_mode: true, streaming_config: STREAMING_CONFIG } : {}),
     },
-    header: { title: { tag: 'plain_text', content: m.title }, template: m.template },
+    header: { title: { tag: 'plain_text', content: m.title }, ...(m.subtitle !== undefined ? { subtitle: { tag: 'plain_text', content: m.subtitle } } : {}), template: m.template },
     body: { elements },
   };
 }

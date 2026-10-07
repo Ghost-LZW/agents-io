@@ -2,7 +2,7 @@ import { chmodSync, lstatSync, mkdirSync, statSync, unlinkSync, type Stats } fro
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { FrameDecoder, HOST_REQUEST_FRAME_TYPES, HostRequestFrame, PROTOCOL_VERSION, check, encodeFrame, errors, type Origin, type ResultFrame, type Watch, type WatchDraft } from '@agents-io/protocol';
+import { FrameDecoder, HOST_REQUEST_FRAME_TYPES, HostRequestFrame, PROTOCOL_VERSION, check, encodeFrame, errors, type Origin, type ResultFrame, type Topic, type TopicSwitchFrame, type Watch, type WatchDraft } from '@agents-io/protocol';
 import type { AddWatchResult, RemoveWatchResult } from '@agents-io/session';
 import type { Hub, Subscription } from '@agents-io/session';
 import { parseClientFrame, type ClientCommand, type ClientFrame, type ServerFrame, type SessionInfo } from './frames.js';
@@ -38,6 +38,11 @@ export interface LocalHost {
   listWatches(sessionKey?: string): Watch[];
   /** Host protocol; without it host frames are answered `unsupported`. */
   readonly hostFrames?: HostFrames;
+  /** Topic frames; without it they are answered `unsupported`. */
+  readonly topicFrames?: {
+    topicList(f: { conversation?: string; sessionKey?: string }): Topic[];
+    topicSwitch(f: TopicSwitchFrame, origin: Origin): Promise<Outcome>;
+  };
 }
 
 const HOST_TYPES = new Set<string>(HOST_REQUEST_FRAME_TYPES);
@@ -269,8 +274,17 @@ export class FrameConn implements Peer {
     } catch (e) {
       return this.result(f.id, { ok: false, code: 'internal', message: (e as Error).message });
     }
-    // Topics (decision 6) are in the protocol; this daemon does not keep a topic table yet.
-    if (f.type === 'topic.list' || f.type === 'topic.switch') return this.result(f.id, { ok: false, code: 'unsupported', message: `${f.type} is not supported by this daemon yet` });
+    // Topics (decision 6): a switch is checked by Policy.control against this connection's origin.
+    if (f.type === 'topic.list' || f.type === 'topic.switch') {
+      const t = this.host.topicFrames;
+      if (!t) return this.result(f.id, { ok: false, code: 'unsupported', message: `${f.type} is not supported by this server` });
+      try {
+        if (f.type === 'topic.list') return this.result(f.id, { ok: true, value: t.topicList(f) });
+        return this.result(f.id, await t.topicSwitch(f, this.origin(f.conversation)));
+      } catch (e) {
+        return this.result(f.id, { ok: false, code: 'internal', message: (e as Error).message });
+      }
+    }
     const cmd = f.command;
     try {
       if (cmd.type === 'subscribe') return this.result(f.id, this.subscribe(cmd));

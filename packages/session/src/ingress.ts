@@ -9,6 +9,7 @@ import {
   type InputRecord,
   type ChannelCaps,
   type Origin,
+  type ReplyRoute,
   type Tier,
 } from '@agents-io/protocol';
 import { channelRefOf, type HostQueue } from './host-queue.js';
@@ -16,7 +17,8 @@ import type { Hub } from './hub.js';
 import type { CommandResult, Lane } from './lane.js';
 import { conversationRouteKey, withDefaults, type FullPolicy, type SessionPolicy } from './policy.js';
 import { Router, defaultBindings, sourceOf, type Explanation, type RouteDelivery } from './router.js';
-import type { WatchDelivery, WatchDispatcher } from './watch.js';
+import type { TopicRecord } from './topics.js';
+import { contentText, type WatchDelivery, type WatchDispatcher } from './watch.js';
 
 const ACTION_PREFIX = 'req:';
 
@@ -91,6 +93,21 @@ export interface IngressOptions {
    * `reply` summary in channelContext (see {@link replySummary}).
    */
   replyCaps?: (channel: string, account: string) => { caps: ChannelCaps; tier?: Tier } | undefined;
+  /**
+   * Sends the short system reply to a topic command (`/new`, `/topics`, `/switch`) on
+   * the route it came from (`sessionKey`: the topic session now current, where the delivery
+   * is recorded); `operationId` is stable per command input. Without it the
+   * command still acts, the reply is only in the result.
+   */
+  systemReply?: (a: { route: ReplyRoute; text: string; operationId: string; sessionKey: string }) => Promise<void>;
+  /**
+   * One line added to inputs routed to a conversation's current topic
+   * (`channelContext.topicTools`), telling the model how to move between topics, e.g.
+   * `TOPIC_TOOLS_HINT` when the agent has the session_* output tools. A function picks
+   * it per target agent (undefined: none). Without it the input only names its topic.
+   */
+  topicHint?: string | ((agent: string | undefined) => string | undefined);
+  onReplyError?: (err: unknown) => void;
 }
 
 export interface InboundRewrite {
@@ -116,7 +133,7 @@ export interface IngressResult {
   /** The host durably took the envelope (also true for a deliberate drop). */
   accepted: boolean;
   /** The strongest table delivery: `dispatch`, else `observe` (context / digest), else `host` (only queued), else `drop`. */
-  action: 'dispatch' | 'observe' | 'host' | 'drop' | 'resolve' | 'interrupt' | 'duplicate' | 'invalid';
+  action: 'dispatch' | 'observe' | 'host' | 'drop' | 'resolve' | 'interrupt' | 'command' | 'duplicate' | 'invalid';
   inputId?: string;
   sessionKey?: string;
   origin?: Origin;
@@ -130,6 +147,8 @@ export interface IngressResult {
   host?: { cursor: number; duplicate: boolean; bindingId: string };
   /** Why (also persisted: `Router.explain(inputId)`). */
   explanation?: Explanation;
+  /** A topic command was answered instead of delivering the input. */
+  command?: { name: TopicCommand['name']; ok: boolean; reply: string; topic?: string };
 }
 
 /**
@@ -257,6 +276,9 @@ export class Ingress {
 
     // The strongest table delivery is the input's own place (where a click on a choice is rewritten to).
     const primary = own.find((d) => d.on === 'dispatch') ?? own.find((d) => d.on === 'digest') ?? own[0];
+    // `/new`, `/topics`, `/switch` addressed to a topic session act on its conversation's topics; nothing is delivered.
+    const cmd = primary?.on === 'dispatch' && primary.topic && this.router.topics ? parseTopicCommand(env.content) : undefined;
+    if (cmd && primary) return this.topicCommand(cmd, primary, env, origin, input, explanation);
     if (primary && this.o.rewrite) {
       const rw = await this.o.rewrite({ env, origin, sessionKey: primary.sessionKey });
       if (rw?.content) {
@@ -268,6 +290,10 @@ export class Ingress {
         const i = decision.deliveries.findIndex((d) => d !== primary && d.sessionKey === rw.sessionKey && d.source !== 'watch');
         if (i >= 0) decision.deliveries.splice(i, 1);
         primary.sessionKey = rw.sessionKey;
+        // Labelled with the topic whose session answers it (e.g. a parked one that asked the question), or none.
+        const t = this.router.topics?.bySession(rw.sessionKey);
+        if (t) primary.topic = { id: t.id, conversation: t.conversation, ...(t.title !== undefined ? { title: t.title } : {}) };
+        else delete primary.topic;
       }
     }
 
@@ -326,6 +352,12 @@ export class Ingress {
       return { ...base, ...(w.inputId ? { inputId: w.inputId } : {}), ...(w.result ? { result: w.result } : {}), watch: w };
     }
     const lane = await this.o.lanes(d.sessionKey, d.agent);
+    // The model sees which topic it is in (and, in the current one, how to rotate or switch with the output tools).
+    if (d.topic) {
+      const current = this.router.topics?.get(d.topic.id)?.state !== 'parked';
+      const hint = !current ? undefined : typeof this.o.topicHint === 'function' ? this.o.topicHint(d.agent) : this.o.topicHint;
+      input = { ...input, channelContext: { ...input.channelContext, ...topicContext(d.topic, hint) } };
+    }
     if (d.on === 'dispatch') {
       const result = await lane.command({ type: 'input', sessionKey: d.sessionKey, input, mode: d.mode ?? env.modeHint ?? 'queue' });
       return { ...base, result };
@@ -333,6 +365,54 @@ export class Ingress {
     // context (or a digest without the watch machinery: recorded, never batched)
     const result = await lane.observe(input);
     return { ...base, result };
+  }
+
+  /** Answer a topic command, checked by `Policy.control` (as a `reset` of the session it was sent to). */
+  private async topicCommand(cmd: TopicCommand, d: RouteDelivery, env: InboundEnvelope, origin: Origin, input: InputRecord, explanation: Explanation): Promise<IngressResult> {
+    const topics = this.router.topics!;
+    const conversation = d.topic!.conversation;
+    const agent = d.agent ?? DEFAULT_AGENT;
+    let ok = (await this.policy.control({ sessionKey: d.sessionKey, op: 'reset', origin })) === 'allow';
+    let reply: string;
+    let now: TopicRecord | undefined = topics.get(d.topic!.id);
+    if (!ok) reply = 'Topic commands are only for the owner.';
+    else if (cmd.name === 'new') {
+      const r = this.router.newTopic(agent, conversation, cmd.arg ? { title: cmd.arg } : {}, 'user');
+      now = r.topic;
+      reply = `New topic${r.topic.title ? `: ${r.topic.title}` : ''}. Your next message starts it; /topics lists the earlier ones.`;
+    } else {
+      const list = topics.list({ conversation, agent });
+      if (cmd.name === 'topics') reply = formatTopics(list);
+      else {
+        const arg = cmd.arg ?? '';
+        const n = /^#?\d+$/.test(arg) ? Number(arg.replace('#', '')) : undefined;
+        const target = n !== undefined ? list[n - 1] : list.find((t) => t.id === arg);
+        if (!target) {
+          ok = false;
+          reply = arg ? `No topic ${arg}. /topics lists them.` : 'Usage: /switch <number or id> (see /topics).';
+        } else if (target.state === 'current') reply = `Already in topic ${list.indexOf(target) + 1}${target.title ? `: ${target.title}` : ''}.`;
+        else {
+          now = topics.switchTo(target.id, 'user').topic;
+          reply = `Switched to topic ${list.indexOf(target) + 1}${target.title ? `: ${target.title}` : ''}. It continues where it left off.`;
+        }
+      }
+    }
+    if (env.replyRoute && this.o.systemReply) {
+      try {
+        await this.o.systemReply({ route: env.replyRoute, text: reply, operationId: `topic-cmd:${input.inputId}`, sessionKey: now?.sessionKey ?? d.sessionKey });
+      } catch (e) {
+        this.o.onReplyError?.(e);
+      }
+    }
+    return {
+      accepted: true,
+      action: 'command',
+      inputId: input.inputId,
+      sessionKey: now?.sessionKey ?? d.sessionKey,
+      origin,
+      explanation,
+      command: { name: cmd.name, ok, reply, ...(now ? { topic: now.id } : {}) },
+    };
   }
 
   private replyOf(env: InboundEnvelope): string | undefined {
@@ -360,6 +440,47 @@ export const DEFAULT_AGENT = 'default';
 export function replySummary(caps: ChannelCaps, tier: Tier): string {
   const media = caps.media.out.length ? caps.media.out.join(',') : 'none';
   return `${tier} markdown=${caps.text.markdown} maxChars=${caps.text.maxChars} buttons=${caps.buttons ? 'yes' : 'no'} media=${media}`;
+}
+
+/** `IngressOptions.topicHint` for agents that have the session_* output tools. */
+export const TOPIC_TOOLS_HINT =
+  'this conversation keeps topics: if this message starts a clearly unrelated subject, call session_rotate (title, summary) and end the turn; if it returns to an earlier topic, call session_list then session_switch and end the turn; otherwise just answer';
+
+/** What an input routed to a topic carries: the topic's id and title, and the hint when given. */
+export function topicContext(t: { id: string; title?: string }, hint?: string): InputRecord['channelContext'] {
+  return { topic: t.id, ...(t.title !== undefined ? { topicTitle: t.title } : {}), ...(hint ? { topicTools: hint } : {}) };
+}
+
+/** A chat command on topics: `/new [title]`, `/topics`, `/switch <n|id>`. */
+export interface TopicCommand {
+  name: 'new' | 'topics' | 'switch';
+  arg?: string;
+}
+
+/** The topic command a message is, if it is one (one text block, the command first). */
+export function parseTopicCommand(content: ContentBlock[]): TopicCommand | undefined {
+  if (content.length !== 1 || content[0]!.type !== 'text') return undefined;
+  const m = /^\/(new|topics|switch)(?:\s+([\s\S]*))?$/i.exec(contentText(content, 2000).trim());
+  if (!m) return undefined;
+  const name = m[1]!.toLowerCase() as TopicCommand['name'];
+  const arg = m[2]?.replace(/\s+/g, ' ').trim();
+  if (name === 'topics' && arg) return undefined;
+  return { name, ...(arg ? { arg } : {}) };
+}
+
+/** The `/topics` answer: newest first, numbered as `/switch <n>` takes them, the current one marked. */
+export function formatTopics(list: TopicRecord[], now = Date.now()): string {
+  if (!list.length) return 'No topics yet.';
+  const lines = list.map((t, i) => `${t.state === 'current' ? '▶' : '  '} ${i + 1}. ${t.title ?? '(untitled)'} · ${ago(now - t.lastActiveAt)}`);
+  return [`Topics (▶ current):`, ...lines, '/switch <n> resumes one, /new [title] starts another.'].join('\n');
+}
+
+function ago(ms: number): string {
+  const m = Math.floor(Math.max(0, ms) / 60_000);
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  return h < 48 ? `${h}h ago` : `${Math.floor(h / 24)}d ago`;
 }
 
 const envKey = (channel: string, account: string, id: string) => `${channel}:${account}:${id}`;

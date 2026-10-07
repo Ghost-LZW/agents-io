@@ -1,9 +1,9 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BodyOf, HarnessEvent, Policy, SessionEvent, Tier } from '@agents-io/protocol';
 import { CodexHarness } from '@agents-io/harness-codex';
-import { isSnapshotEvent, passes } from '@agents-io/session';
+import { TOPIC_KEY, isSnapshotEvent, passes, type TopicCardData } from '@agents-io/session';
 import { CHOICE_KEY, OUTPUT_EVENT, parseChoiceActionId, type ChoiceData, type OutputRecord } from '@agents-io/host-mcp';
 import { FakeChannel, checkEventStream, defaultChannelCaps } from '@agents-io/testkit';
 import type { ClientSubscription } from './client.js';
@@ -36,6 +36,8 @@ export interface Scenario {
 
 export interface E2EContext {
   base: Config;
+  /** Where scenario data dirs go (default: the OS temp dir). Keep it short: Unix socket paths stay < 104 bytes. */
+  root?: string;
   progress(msg: string): void;
   /** Gateways and dirs to clean up after the scenario. */
   cleanup: (() => Promise<void> | void)[];
@@ -155,7 +157,9 @@ export function e2eConfig(base: Config, dir: string): Config {
 }
 
 function tempDir(ctx: E2EContext, prefix = 'aio-e2e-'): string {
-  const dir = mkdtempSync(join(tmpdir(), prefix));
+  const root = ctx.root ?? tmpdir();
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const dir = mkdtempSync(join(root, prefix));
   ctx.cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
   return dir;
 }
@@ -223,6 +227,19 @@ function metaSummary(w: World): string {
   const keys = new Set(w.toolCalls.flatMap((c) => Object.keys(c.meta ?? {})));
   const idKey = ['claudecode/toolUseId', 'callId'].find((k) => w.toolCalls.some((c) => typeof c.meta?.[k] === 'string'));
   return `_meta keys [${[...keys].join(', ') || 'none'}]${idKey ? ` (${idKey} → operationId)` : ' (no call id: JSON-RPC id fallback)'}`;
+}
+
+/** The last few durable events of a session, as `type(detail)` (diagnostics for a failure). */
+function tail(w: World, sk: string, n = 25): string {
+  return w.gw.hub.log
+    .read(sk, 0)
+    .slice(-n)
+    .map((e) => {
+      const b = e.body as { t: string; status?: string; message?: string; item?: { title: string; status: string }; state?: string; name?: string };
+      const d = b.status ?? b.state ?? b.name ?? b.message?.slice(0, 80) ?? (b.item ? `${b.item.title.slice(0, 40)} ${b.item.status}` : '');
+      return d ? `${b.t}(${d})` : b.t;
+    })
+    .join(' ');
 }
 
 const outputsOf = (w: World, sk: string) =>
@@ -672,6 +689,119 @@ export const SCENARIOS: Scenario[] = [
       return `choice event on the local stream (event-only), /choose ${choice.choiceId} ${pear} → ${JSON.stringify(text.slice(0, 30))}; bad answer refused (${bad.slice(0, 40)})`;
     },
   },
+  {
+    id: 'p',
+    name: 'topic-rotate',
+    skip: (c) => (c.outputTools ? undefined : 'outputTools is off'),
+    async run(ctx) {
+      // Topics (decision 6): the agent rotates on an unrelated question and switches back when asked,
+      // across a daemon restart (so switching back resumes the parked harness session natively).
+      const dir = tempDir(ctx, 'aio-p-');
+      const config = e2eConfig(ctx.base, dir);
+      const one = await world(ctx, { dir, config });
+      const conv = 'e2e:default:c1';
+      const topicTurn = async (w: World, sk: string, inputId: string, what: string) => {
+        const watch = await w.watch(sk);
+        const started = await waitFor(`${what} (a turn in ${sk} with ${inputId})`, TURN_MS, () => watch.of('turn.started').find((b) => b.inputIds.includes(inputId)));
+        const done = await watch.completed(started.turnId).catch((e: Error) => {
+          throw new Failure(`${what}: ${e.message}; last events in ${sk}: ${tail(w, sk)}`);
+        });
+        assert(done.status === 'completed', `${what}: turn ended ${done.status}${done.error ? ` (${done.error.code})` : ''}`);
+        return { text: watch.finalText(started.turnId), turnId: started.turnId };
+      };
+      const answerOf = (w: World, sk: string, turnId: string) =>
+        bodies(w.gw.hub.log.read(sk, 0).filter((e) => e.turnId === turnId && e.audience === 'answer'), 'text.snapshot').filter((b) => b.final).map((b) => b.text).join('\n');
+
+      const a = await one.chat.inject({ sender: ALICE, text: 'My side project is a Rust command-line tool that parses GPX files. Its secret codename is BLUE-HERON-7. Remember it. Reply with exactly: noted' });
+      assert(a.accepted && a.inputId, 'first message not accepted');
+      await topicTurn(one, conv, a.inputId, 'topic A');
+      const topicA = one.gw.topics.current(conv, DEFAULT_AGENT);
+      assert(topicA && topicA.sessionKey === conv, `first topic: ${JSON.stringify(topicA)}`);
+      ctx.progress(`topic A ${topicA.id} answered; asking something unrelated`);
+
+      const b = await one.chat.inject({ sender: ALICE, text: 'Completely unrelated new question: what is the capital of Australia? Answer in one word.' });
+      assert(b.accepted && b.inputId, 'second message not accepted');
+      const inA = await one.watch(conv);
+      const turnB0 = await inA.turnStartedWith(b.inputId);
+      await inA.completed(turnB0.turnId);
+      const rotate = one.toolCalls.find((c) => c.tool === 'session_rotate');
+      const topicB = one.gw.topics.list({ conversation: conv }).find((t) => t.id !== topicA.id);
+      assert(rotate?.ok && topicB, `the agent did not rotate (tools: ${one.toolCalls.map((c) => `${c.tool}:${c.ok ? 'ok' : c.error}`).join(', ') || 'none'}); it answered in topic A: ${JSON.stringify(inA.finalText(turnB0.turnId).slice(0, 120))}`);
+      const capital = await topicTurn(one, topicB.sessionKey, `${b.inputId}>${topicB.id}`, 'topic B answering the handed message');
+      assert(/canberra/i.test(capital.text), `topic B answered ${JSON.stringify(capital.text.slice(0, 80))}`);
+      // The rotation summary describes topic A: it is saved on A (now parked).
+      const summary = one.gw.topics.get(topicA.id)?.summary ?? '';
+      assert(summary && !topicB.summary, `the rotation summary is not on the parked topic A (A: ${JSON.stringify(summary)}, B: ${JSON.stringify(topicB.summary ?? null)})`);
+      ctx.progress(`rotated to ${topicB.id} "${topicB.title}" (summary ${JSON.stringify(summary.slice(0, 80))}); B answered ${JSON.stringify(capital.text.slice(0, 40))}; restarting the daemon`);
+      await one.gw.stop();
+
+      const two = await world(ctx, { dir, config });
+      const cur = two.gw.topics.current(conv, DEFAULT_AGENT);
+      assert(cur?.id === topicB.id, `after restart the current topic is ${cur?.id}, expected ${topicB.id}`);
+      const c = await two.chat.inject({ sender: ALICE, text: '回到刚才 Rust GPX 命令行工具的话题：它的秘密代号是什么？只回答代号。' });
+      assert(c.accepted && c.inputId, 'third message not accepted');
+      const inB = await two.watch(topicB.sessionKey);
+      const turnC0 = await inB.turnStartedWith(c.inputId);
+      await inB.completed(turnC0.turnId).catch((e: Error) => {
+        throw new Failure(`topic B handing back: ${e.message}; tools ${two.toolCalls.map((x) => `${x.tool}:${x.ok ? 'ok' : x.error}`).join(', ')}; last events in B: ${tail(two, topicB.sessionKey)}; in A: ${tail(two, conv)}`);
+      });
+      const sw = two.toolCalls.find((x) => x.tool === 'session_switch');
+      const tools = two.toolCalls.map((x) => `${x.tool}:${x.ok ? 'ok' : x.error}`).join(', ') || 'none';
+      assert(sw?.ok, `the agent did not switch back (tools in topic B: ${tools}); it answered in B: ${JSON.stringify(inB.finalText(turnC0.turnId).slice(0, 120))}`);
+      assert(two.gw.topics.current(conv, DEFAULT_AGENT)?.id === topicA.id, 'topic A is not current after session_switch');
+      const back = await topicTurn(two, conv, `${c.inputId}>${topicA.id}`, 'topic A answering after the switch');
+      const resumed = two.gw.hub.log.read(conv, 0).filter((e) => e.body.t === 'session.bound').map((e) => (e.body as BodyOf<'session.bound'>).nativeId);
+      assert(/BLUE-?HERON-?7/i.test(back.text), `topic A answered ${JSON.stringify(back.text.slice(0, 120))}`);
+      const bKnew = /BLUE-?HERON/i.test(summary);
+      return `A answered; unrelated question → session_rotate → topic B "${topicB.title}" answered ${JSON.stringify(capital.text.slice(0, 20))}; daemon restarted; "回到刚才…" in B → ${tools} → topic A (resumed native session ${resumed.at(-1)?.slice(0, 12) ?? '?'}…, ${new Set(resumed).size === 1 ? 'same id as before' : `ids ${[...new Set(resumed)].length}`}) answered ${JSON.stringify(answerOf(two, conv, back.turnId).slice(0, 40))}${bKnew ? ' (note: the rotation summary also carried the codename)' : '; the rotation summary did not carry the codename'}`;
+    },
+  },
+  {
+    id: 'q',
+    name: 'topic-command',
+    async run(ctx) {
+      const w = await world(ctx);
+      const conv = 'e2e:default:c1';
+      const turnIn = async (sk: string, inputId: string) => {
+        const watch = await w.watch(sk);
+        const t = await watch.turnStartedWith(inputId);
+        const done = await watch.completed(t.turnId);
+        assert(done.status === 'completed', `turn in ${sk} ended ${done.status}`);
+        return watch.finalText(t.turnId);
+      };
+      const reply = (re: RegExp, what: string) => waitFor(what, 10_000, () => w.chat.sent.find((s) => re.test(s.msg.text)));
+      const one = await w.chat.inject({ sender: ALICE, text: 'Reply with exactly: kiwi' });
+      assert(one.accepted && one.inputId, 'first message not accepted');
+      await turnIn(conv, one.inputId);
+      const first = w.gw.topics.current(conv, DEFAULT_AGENT)!;
+
+      const n = await w.chat.inject({ sender: ALICE, text: '/new Groceries' });
+      assert(n.accepted && n.inputId, '/new not accepted');
+      await reply(/^New topic: Groceries/, 'the /new reply');
+      const g = w.gw.topics.current(conv, DEFAULT_AGENT)!;
+      assert(g.id !== first.id && g.title === 'Groceries' && g.sessionKey === `${conv}#${g.id}`, `after /new the current topic is ${JSON.stringify(g)}`);
+      const two = await w.chat.inject({ sender: ALICE, text: 'Reply with exactly: mango' });
+      const t2 = await turnIn(g.sessionKey, two.inputId!);
+      assert(/mango/i.test(t2), `topic Groceries answered ${JSON.stringify(t2.slice(0, 60))}`);
+      const card = await waitFor('the Groceries card', 15_000, () => w.chat.sent.find((s) => s.finalized && /mango/i.test(s.edits.at(-1)?.text ?? '')));
+      const title = ((card.edits.at(-1)?.channelData ?? {}) as Record<string, TopicCardData | undefined>)[TOPIC_KEY]?.title;
+      assert(title === 'Groceries', `card title ${JSON.stringify(title)}`);
+
+      await w.chat.inject({ sender: ALICE, text: '/topics' });
+      const list = await reply(/^Topics/, 'the /topics reply');
+      assert(/▶ 1\. Groceries/.test(list.msg.text) && / 2\. /.test(list.msg.text), `/topics answered ${JSON.stringify(list.msg.text)}`);
+      await w.chat.inject({ sender: ALICE, text: '/switch 2' });
+      await reply(/^Switched to topic 2/, 'the /switch reply');
+      assert(w.gw.topics.current(conv, DEFAULT_AGENT)?.id === first.id, 'the first topic is not current after /switch 2');
+      const three = await w.chat.inject({ sender: ALICE, text: 'Which single word did I ask you to reply with earlier in this conversation? Reply with just that word.' });
+      const t3 = await turnIn(conv, three.inputId!);
+      assert(/kiwi/i.test(t3) && !/mango/i.test(t3), `back in the first topic the agent answered ${JSON.stringify(t3.slice(0, 60))}`);
+      const cmdTurns = [conv, g.sessionKey].flatMap((sk) => w.gw.hub.log.read(sk, 0)).filter((e) => e.body.t === 'turn.started').length;
+      assert(cmdTurns === 3, `expected 3 turns (commands never reach the harness), got ${cmdTurns}`);
+      const changed = bodies(w.gw.hub.log.read(conv, 0), 'topic.changed').map((x) => x.reason);
+      return `/new → "Groceries" (${g.sessionKey}) answered ${JSON.stringify(t2.slice(0, 10))}, card titled "${title}"; /topics listed 2; /switch 2 → first topic recalls ${JSON.stringify(t3.slice(0, 10))} (not mango); 3 turns, commands never reached the harness; topic.changed in the first topic: ${changed.join(', ')}`;
+    },
+  },
 ];
 
 export interface E2EResult {
@@ -682,7 +812,7 @@ export interface E2EResult {
   ms: number;
 }
 
-export async function runScenarios(base: Config, o: { only?: string[]; out?: (line: string) => void; verbose?: boolean } = {}): Promise<E2EResult[]> {
+export async function runScenarios(base: Config, o: { only?: string[]; out?: (line: string) => void; verbose?: boolean; root?: string } = {}): Promise<E2EResult[]> {
   const out = o.out ?? ((l: string) => console.log(l));
   const picked = SCENARIOS.filter((s) => !o.only?.length || o.only.some((x) => x === s.id || x === s.name));
   const results: E2EResult[] = [];
@@ -694,7 +824,8 @@ export async function runScenarios(base: Config, o: { only?: string[]; out?: (li
       out(`SKIP ${label}: ${skip}`);
       continue;
     }
-    const ctx: E2EContext = { base, cleanup: [], progress: (m) => o.verbose && out(`     ${s.id}: ${m}`) };
+    const root = o.root?.replace(/^~(?=$|\/)/, homedir());
+    const ctx: E2EContext = { base, cleanup: [], progress: (m) => o.verbose && out(`     ${s.id}: ${m}`), ...(root ? { root } : {}) };
     const t0 = Date.now();
     let r: E2EResult;
     try {

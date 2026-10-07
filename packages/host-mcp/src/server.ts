@@ -97,6 +97,24 @@ export const TOOL_DEFS = {
     input: {},
     readOnly: true,
   },
+  session_rotate: {
+    description:
+      "Start a NEW TOPIC in this conversation when the user's message is about something clearly unrelated to the current topic (a different task or question, not a follow-up). A new topic is a fresh session with a clean context; the current one is parked, never deleted, and can be resumed later with session_switch. The message that triggered this turn is handed to the new topic together with your `summary` (what the new topic should know from this one: names, decisions, facts the user may refer to; or \"none\"), and that topic answers it. After calling this, end your turn without answering: the answer comes from the new topic. Do not rotate for follow-ups, small digressions, or when unsure. While topics are on, every input's preface carries `topic` / `topicTitle`.",
+    input: {
+      title: z.string().describe("Short title of the new topic (a few words, in the user's language)"),
+      summary: z.string().describe('What the new topic should know from the current one, or "none"'),
+    },
+  },
+  session_list: {
+    description: 'List the topics of this conversation (newest activity first): id, title, which one is current, which one you are, summary. Use it before session_switch, e.g. when the user wants to go back to something discussed earlier.',
+    input: {},
+    readOnly: true,
+  },
+  session_switch: {
+    description:
+      "Go back to an EARLIER TOPIC of this conversation (an id from session_list) when the user returns to it (\"back to the X question\", \"回到刚才…\"). That topic's session resumes with its full earlier context, and the message that triggered this turn is handed to it, which answers it. After calling this, end your turn without answering.",
+    input: { topicId: z.string().describe('Topic id from session_list') },
+  },
 } as const;
 
 export type ToolName = keyof typeof TOOL_DEFS;
@@ -240,6 +258,7 @@ export class HostMcpServer {
     const server = new McpServer({ name: SERVER_NAME, version: '0.1.0' }, { capabilities: { tools: {} } });
     for (const name of TOOL_NAMES) {
       if (name.startsWith('watch_') && !this.o.tools.hasWatches) continue;
+      if (name.startsWith('session_') && !this.o.tools.hasTopics) continue;
       const def = TOOL_DEFS[name];
       server.registerTool(
         name,

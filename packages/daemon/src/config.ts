@@ -220,6 +220,12 @@ export const ConfigFile = Type.Object(
      * send_message, get_channel_context) into every harness instance (default true).
      */
     outputTools: Type.Optional(Type.Boolean()),
+    /**
+     * Topics (decision 6). `parkedIdleMs`: a parked topic's lane (and harness session) closes
+     * once it has been parked and idle this long (default 30 min; 0 = never); switching back
+     * reopens it, resuming the harness session by its native id.
+     */
+    topics: Type.Optional(Type.Object({ parkedIdleMs: Type.Optional(Type.Number({ minimum: 0 })) }, Closed)),
     policy: Type.Optional(
       Type.Object(
         {
@@ -397,6 +403,8 @@ export interface Config {
   watches: (WatchDraft & { id: string })[];
   /** Host MCP output tools mounted into every harness instance. */
   outputTools: boolean;
+  /** How long a parked topic's lane stays open while idle (0: until the daemon stops). */
+  topics: { parkedIdleMs: number };
   local: { principal: Principal; session: string };
   /** The console API server. */
   console: ConsoleConfig;
@@ -472,6 +480,9 @@ export type ResolvedChannel =
   | (Extract<ChannelEntry, { type: 'lark-bot' }> & { account: string; lark: { appId: string; appSecret: string; domain: 'feishu' | 'lark' } })
   | (Extract<ChannelEntry, { type: 'mail' }> & { account: string })
   | (Extract<ChannelEntry, { type: 'bridge' }> & { account: string });
+
+/** `topics.parkedIdleMs` default: a parked topic's lane closes after 30 idle minutes. */
+export const DEFAULT_PARKED_IDLE_MS = 30 * 60_000;
 
 export class ConfigError extends Error {
   override name = 'ConfigError';
@@ -588,6 +599,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     identities,
     channels: ctx.channels === false ? [] : (c.channels ?? []).map((ch) => resolveChannel(ch, env, path)),
     outputTools,
+    topics: { parkedIdleMs: c.topics?.parkedIdleMs ?? DEFAULT_PARKED_IDLE_MS },
     policy: {
       owners,
       selfAccounts: c.policy?.selfAccounts ?? [],

@@ -13,6 +13,7 @@ import {
   type RenderedMessage,
   type ReplyRoute,
   type Tier,
+  type Topic,
   type TurnContext,
   type TurnProvenance,
   type Watch,
@@ -100,6 +101,28 @@ export interface HostToolsOptions {
   watches?: WatchControl;
   /** Provenance of a session's turn (`Lane.provenance`), attached to every write the turn makes. */
   provenance?(sessionKey: string, turnId: string): TurnProvenance | undefined;
+  /** Topics of the caller's conversation (decision 6); absent = no session_* tools. */
+  topics?: TopicControl;
+}
+
+/**
+ * What the session_* tools need from the host. The host moves the conversation's
+ * current topic and hands the turn's triggering inputs to the topic now current.
+ */
+export interface TopicControl {
+  /** The topics of the conversation this session is a topic of (newest activity first), or undefined when it is not a topic session. */
+  list(sessionKey: string): Topic[] | undefined;
+  /** Start a new topic (current from now on) and hand the turn's inputs to it, the summary first as a labelled context item. */
+  rotate(sessionKey: string, turn: TurnContext, a: { title: string; summary: string }): Promise<TopicHandover>;
+  /** Make a parked topic current again (its harness session resumes natively) and hand the turn's inputs to it. */
+  switch(sessionKey: string, turn: TurnContext, a: { topicId: string }): Promise<TopicHandover>;
+}
+
+export interface TopicHandover {
+  topic: Topic;
+  previous?: Topic;
+  /** Input ids as handed to the topic. */
+  handed: string[];
 }
 
 /** What the watch tools need from the host; `Policy.watch` is applied behind `add`. */
@@ -177,9 +200,18 @@ export class HostTools {
     return !!this.o.watches;
   }
 
+  /** Whether the session_* tools are offered (the host passed `topics`). */
+  get hasTopics(): boolean {
+    return !!this.o.topics;
+  }
+
+  /** Session + turn → what its session_rotate / session_switch did (a retried call answers the same; a second handover is refused). */
+  private readonly handovers = new Map<string, { key: string; result: Record<string, unknown> }>();
+
   /** Run one tool. Returns the JSON text result; throws ToolError for anything the model should fix. */
   async call(b: ToolBinding, name: string, args: Record<string, unknown>, meta: CallMeta = {}): Promise<string> {
     if (name === 'watch_add' || name === 'watch_remove' || name === 'watch_list') return json(await this.watchTool(b, name, args));
+    if (name === 'session_list') return json(this.sessionList(b));
     const turn = this.o.turn(b.sessionKey);
     if (!turn) throw new ToolError('no turn is running in this session: output tools only work while you are answering a message');
     const key = meta.toolCallId ?? `g${b.generation}:${turn.turnId}:rpc${meta.requestId ?? Math.random().toString(36).slice(2)}`;
@@ -196,6 +228,9 @@ export class HostTools {
       case 'reply_to':
       case 'send_message':
         return json(await this.message(b, turn, name, args, operationId));
+      case 'session_rotate':
+      case 'session_switch':
+        return json(await this.handover(b, turn, name, args, operationId));
       default:
         throw new ToolError(`unknown tool ${name}`);
     }
@@ -512,6 +547,79 @@ export class HostTools {
       throw new ToolError(r.message);
     }
     return { ok: true, watch: view(r.watch) };
+  }
+
+  // ---- topics -----------------------------------------------------------------------------
+
+  private topicsOf(b: ToolBinding): { control: TopicControl; topics: Topic[] } {
+    const control = this.o.topics;
+    if (!control) throw new ToolError('topics are not available on this host');
+    const topics = control.list(b.sessionKey);
+    if (!topics) throw new ToolError('this conversation does not keep topics (its binding does not use session "topic", or it is threaded): session_rotate / session_switch are not available here; just answer');
+    return { control, topics };
+  }
+
+  private sessionList(b: ToolBinding) {
+    const { topics } = this.topicsOf(b);
+    return {
+      ok: true,
+      topics: topics.map((t) => ({
+        topicId: t.id,
+        title: t.title ?? null,
+        current: t.state === 'current',
+        ...(t.sessionKey === b.sessionKey ? { you: true } : {}),
+        summary: t.summary ?? null,
+        lastActiveAt: new Date(t.lastActiveAt).toISOString(),
+      })),
+      note: 'Newest activity first; `you` marks the topic this session is. session_switch({topicId}) resumes a parked topic with its full earlier context; session_rotate({title, summary}) starts a new one.',
+    };
+  }
+
+  private async handover(b: ToolBinding, turn: TurnContext, tool: 'session_rotate' | 'session_switch', args: Record<string, unknown>, operationId: string) {
+    const hk = `${b.sessionKey}\u0000${turn.turnId}`;
+    const prior = this.handovers.get(hk);
+    if (prior?.key === operationId) return prior.result;
+    if (prior) throw new ToolError('this turn was already handed to another topic; end the turn now without answering');
+    const { control, topics } = this.topicsOf(b);
+    const me = topics.find((t) => t.sessionKey === b.sessionKey);
+    if (me && me.state !== 'current') throw new ToolError("this topic is no longer the conversation's current one (the user or another turn switched); just answer here");
+    const own = turn.inputs.filter((i) => i.channelContext.context !== true);
+    if (!own.length) throw new ToolError('this turn has no message to hand over');
+    // A message just handed here by a rotate/switch is this topic's to answer: no ping-pong between topics.
+    if (own.every((i) => i.channelContext.handedFrom !== undefined)) throw new ToolError('this message was just handed to this topic by a topic switch; answer it here, in this turn');
+    let r: TopicHandover;
+    if (tool === 'session_rotate') {
+      const title = str(args.title, 'title')!.trim();
+      const summary = str(args.summary, 'summary')!.trim();
+      if (!title) throw new ToolError('title is required');
+      if (!summary) throw new ToolError('summary is required: what the new topic should know from this one (or "none")');
+      r = await control.rotate(b.sessionKey, turn, { title, summary });
+    } else {
+      const topicId = str(args.topicId ?? args.topic_id, 'topicId')!;
+      const target = topics.find((t) => t.id === topicId);
+      if (!target) throw new ToolError(`no topic ${topicId} in this conversation; session_list shows the topic ids`);
+      if (target.sessionKey === b.sessionKey) throw new ToolError('you are already in that topic; just answer');
+      r = await control.switch(b.sessionKey, turn, { topicId });
+    }
+    const label = `"${r.topic.title ?? r.topic.id}"`;
+    const short = r.topic.title ?? (tool === 'session_rotate' ? 'new topic' : 'earlier topic');
+    const result = {
+      ok: true,
+      topic: { topicId: r.topic.id, title: r.topic.title ?? null },
+      ...(r.previous ? { previous: { topicId: r.previous.id, title: r.previous.title ?? null } } : {}),
+      handed: r.handed.length,
+      note:
+        (tool === 'session_rotate'
+          ? `The conversation moved to the new topic ${label}. The user's message has been handed to it, with your summary as context, and that topic's session answers it there.`
+          : `The conversation is back in topic ${label}; its session resumes with its full earlier context and answers the user's message there.`) +
+        ` Do NOT answer the message in this turn: end the turn now, writing nothing more (at most one short line such as "→ ${short}").`,
+    };
+    this.handovers.set(hk, { key: operationId, result });
+    for (const k of this.handovers.keys()) {
+      if (this.handovers.size <= 1000) break;
+      this.handovers.delete(k);
+    }
+    return result;
   }
 
   // ---- answers coming back ----------------------------------------------------------------

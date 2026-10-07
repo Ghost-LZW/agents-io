@@ -14,6 +14,8 @@ import {
   type RunEnded,
   type SessionEvent,
   type Tier,
+  type Topic,
+  type TopicSwitchResult,
   type Watch,
   type WatchDraft,
 } from '@agents-io/protocol';
@@ -189,6 +191,16 @@ export class LocalClient {
 
   watchList(sessionKey?: string): Promise<Watch[]> {
     return this.value({ type: 'watch.list', ...(sessionKey !== undefined ? { sessionKey } : {}) });
+  }
+
+  /** Topics of flat conversations (decision 6), newest activity first. */
+  topicList(f: { conversation?: string; sessionKey?: string } = {}): Promise<Topic[]> {
+    return this.value({ type: 'topic.list', ...f });
+  }
+
+  /** Make a topic current: an existing one (`topicId`) or a new one (`new`). */
+  topicSwitch(f: { conversation: string; topicId: string } | { conversation: string; new: { title?: string } }): Promise<TopicSwitchResult> {
+    return this.value({ type: 'topic.switch', ...f });
   }
 
   // ---- host protocol (docs/HOSTS.md §4) ------------------------------------
