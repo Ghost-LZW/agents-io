@@ -82,7 +82,7 @@
 
 `run.start` 可带 `overrides: { model?, effort?, profile? }`，只覆盖本次运行的 agent 默认值。每个请求的 `result.value` 都有 schema（`packages/protocol/src/host.ts` 末尾的 `HOST_RESULT_VALUES`，JSON Schema 见 `packages/protocol/schema/*Result.json`）。
 
-**宿主写命令的来源标记**：守护进程为每一轮提供来源摘要（是否含 context/digest/外部/群聊输入），通过 harness 环境变量 `AGENTS_IO_TURN_PROVENANCE` 与输出工具的调用元数据传给宿主；不拦截任何调用（决定 4）。
+**宿主写命令的来源标记**：守护进程为每一轮算出来源摘要（是否含 context/digest/外部/群聊输入），附在输出工具的每次调用上（`agents-io.output` 记录的 `provenance` 字段，宿主 MCP `onCall` 事件的 `provenance`），交互 session 与任务运行都是如此。harness 环境变量 `AGENTS_IO_TURN_PROVENANCE` 只有 `run.start` 的任务运行才有：子进程为这一次运行单独启动，值在启动时定下（`triggeredBy` 为 `["host:<宿主名>"]`（无宿主名时为 `host:cli`），其余标记为 `false`）；交互 session 的子进程跨多轮复用，环境变量不按轮设置，所以没有这个变量（见 CHANNELS.md §1a 的来源标记）。不拦截任何调用（决定 4）。
 
 ## 5. 命令行（给不想写 socket 客户端的宿主）
 

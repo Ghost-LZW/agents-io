@@ -72,7 +72,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 - 每条输入的路由解释（命中了哪些规则、表版本、回调结果、主体、证据，没投递时还有原因）写进日志所在的 SQLite，重启后仍能用 `Router.explain(inputId)` 查到。
 - 宿主应用自己实现的 `Policy.admit` 只在没有任何表时生效（dev-gateway 传入 `policy.admit` 时不再生成默认表，监听照常生效）。这是兼容旧接口，新代码请写 Binding 规则。
 
-**来源标记**（决定 4、5：只标记，不拦截，不降档）：每一轮都算出 `TurnProvenance`：触发这一轮的输入的主体；上下文里有没有被监听、汇总或只记录的输入；有没有来自外部（没有主体）的输入；有没有群聊输入。用 `Lane.provenance(turnId)` 读取。harness 子进程的环境变量按 session 设置而不是按轮设置，所以来源标记不放进 `AGENTS_IO_TURN_PROVENANCE`，而是附在输出工具的每次写入上：`agents-io.output` 记录的 `provenance` 字段，以及宿主 MCP `onCall` 事件的 `provenance`。标记按这一轮**实际交给 harness 的内容**算（见 §1b）：只记录的输入交给了哪一轮，那一轮和这个 session 之后的每一轮都标 `watched`（来自陌生人的再标 `external`，来自群聊的再标 `group`），因为它们留在 harness 的对话里了；被监听开的轮次（digest、trigger）的输入同样延续到之后的轮次。某一轮运行期间才记下的输入不在这一轮里，从下一轮起才算。
+**来源标记**（决定 4、5：只标记，不拦截，不降档）：每一轮都算出 `TurnProvenance`：触发这一轮的输入的主体；上下文里有没有被监听、汇总或只记录的输入；有没有来自外部（没有主体）的输入；有没有群聊输入。用 `Lane.provenance(turnId)` 读取。harness 子进程的环境变量按 session 设置而不是按轮设置，所以交互 session 的来源标记不放进 `AGENTS_IO_TURN_PROVENANCE`，而是附在输出工具的每次写入上：`agents-io.output` 记录的 `provenance` 字段，以及宿主 MCP `onCall` 事件的 `provenance`。只有 `run.start` 的任务运行在子进程环境里带 `AGENTS_IO_TURN_PROVENANCE`（子进程只跑这一次运行，值在启动时定下：`triggeredBy` 为 `["host:<宿主名>"]`（无宿主名时为 `host:cli`），其余标记为 `false`）；任务运行里输出工具的写入同样带 `provenance`。标记按这一轮**实际交给 harness 的内容**算（见 §1b）：只记录的输入交给了哪一轮，那一轮和这个 session 之后的每一轮都标 `watched`（来自陌生人的再标 `external`，来自群聊的再标 `group`），因为它们留在 harness 的对话里了；被监听开的轮次（digest、trigger）的输入同样延续到之后的轮次。某一轮运行期间才记下的输入不在这一轮里，从下一轮起才算。
 
 ## 1b. 只记录的输入怎样交给 agent
 
