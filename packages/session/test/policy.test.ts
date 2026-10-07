@@ -101,3 +101,23 @@ describe('defaultPolicy.plan / resolve / outbound', () => {
 function turnOwnedBy(owner: string) {
   return { sessionKey: 's', turnId: 't', run: { harness: 'fake', model: 'm', profile: 'p' }, inputs: [], replyRoute: null, owner, deliveries: [] };
 }
+
+describe('defaultPolicy.watch', () => {
+  const w = (source: Record<string, unknown>) => ({ id: 'w', source, target: { sessionKey: 'main' }, mode: 'digest', createdBy: 'x', createdAt: 0 }) as any;
+  const origin = (kind: string, id: string | null, labels: string[] = []) =>
+    ({ kind, principal: id ? { id, labels } : null, evidence: 'platform_signed', via: 'v', adapter: 'a' }) as any;
+  const p = defaultPolicy({ owners: ['fake:alice'], watchAllowlist: [{ channel: 'mail' }, { channel: 'lark-bot', conversation: 'oc_team' }] });
+
+  it('owners may watch anything; agents only allowlisted sources; others never', async () => {
+    expect(await p.watch!({ watch: w({ channel: 'lark-bot', conversation: 'oc_secret' }), by: origin('human', 'fake:alice', ['owner']) })).toBe('allow');
+    expect(await p.watch!({ watch: w({ channel: 'mail', conversationKind: 'mail' }), by: origin('agent', 'runner:x') })).toBe('allow');
+    expect(await p.watch!({ watch: w({ channel: 'lark-bot', conversation: 'oc_team' }), by: origin('agent', 'runner:x') })).toBe('allow');
+    expect(await p.watch!({ watch: w({ channel: 'lark-bot', conversation: 'oc_secret' }), by: origin('agent', 'runner:x') })).toBe('deny');
+    expect(await p.watch!({ watch: w({ channel: 'mail' }), by: origin('human', 'fake:eve') })).toBe('deny');
+  });
+
+  it('triage keeps the watch mode by default', async () => {
+    expect(await p.triage!({ watch: { ...w({ channel: 'mail' }), mode: 'trigger' }, input: {} as any })).toBe('trigger');
+    expect(await p.triage!({ watch: w({ channel: 'mail' }), input: {} as any })).toBe('context');
+  });
+});

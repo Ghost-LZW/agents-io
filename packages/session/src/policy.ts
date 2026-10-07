@@ -13,6 +13,9 @@ import {
   type TurnContext,
   type TurnDraft,
   type ControlArgs,
+  type InputRecord,
+  type Watch,
+  type WatchSource,
 } from '@agents-io/protocol';
 
 export type { ControlArgs };
@@ -37,6 +40,11 @@ export interface DefaultPolicyOptions {
   routes?: string[];
   /** Put every owner DM into this one session instead of one per conversation. */
   ownerSessionKey?: string;
+  /**
+   * Sources an agent may watch without asking anyone. Each entry matches when every
+   * field it sets equals the watch's source (channel, account, conversation, conversationKind).
+   */
+  watchAllowlist?: Partial<Pick<WatchSource, 'channel' | 'account' | 'conversation' | 'conversationKind'>>[];
 }
 
 const OWNER = 'owner';
@@ -133,6 +141,20 @@ export function defaultPolicy(o: DefaultPolicyOptions): FullPolicy {
         routes: ctx.replyRoute ? [routeKey(ctx.replyRoute)] : [],
       };
     },
+
+    async watch({ watch, by }: { watch: Watch; by: Origin }): Promise<'allow' | 'deny'> {
+      if (isOwner(by)) return 'allow';
+      if (by.kind !== 'agent' && by.kind !== 'system') return 'deny';
+      const src = watch.source;
+      const ok = (o.watchAllowlist ?? []).some((a) =>
+        (['channel', 'account', 'conversation', 'conversationKind'] as const).every((k) => a[k] === undefined || a[k] === src[k]),
+      );
+      return ok ? 'allow' : 'deny';
+    },
+
+    async triage({ watch }: { watch: Watch; input: InputRecord }): Promise<'drop' | 'context' | 'trigger'> {
+      return watch.mode === 'trigger' ? 'trigger' : 'context';
+    },
   };
 }
 
@@ -147,5 +169,7 @@ export function withDefaults(p: SessionPolicy = {}): FullPolicy {
     outbound: p.outbound?.bind(p) ?? d.outbound,
     control: p.control?.bind(p) ?? d.control,
     escalate: p.escalate?.bind(p) ?? d.escalate,
+    watch: p.watch?.bind(p) ?? d.watch,
+    triage: p.triage?.bind(p) ?? d.triage,
   };
 }
