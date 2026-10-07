@@ -130,7 +130,8 @@ against the protocol alone.
   "uiUrl": "https://ui.example",       // where login links point (default: the console itself)
   "sessionTtlMs": 43200000,
   "larkBotCommand": ["npx", "-y", "github:Ghost-LZW/create-lark-bot#v0.2.4"],
-  "heartbeat": { "intervalMs": 30000, "timeoutMs": 10000 }   // /ws ping; no answer in timeoutMs → closed (0 interval: off)
+  "heartbeat": { "intervalMs": 30000, "timeoutMs": 10000 },  // /ws ping; no answer in timeoutMs → closed (0 interval: off)
+  "liveChannels": false       // true: channel changes written through the console start/stop channels at once
 }
 ```
 
@@ -175,7 +176,12 @@ against the protocol alone.
   credential fields (`inline_secret`, 422),
   honor `ifRevision` (409), and write atomically (temp + fsync + rename, 0600).
   The daemon does not reload: `applied: "restart"` unless the file is back to
-  what it started with.
+  what it runs. With `liveChannels: true` the `channels` part is applied at once:
+  entries new or changed (compared after env substitution) start, entries gone or
+  changed stop (stops first), the rest keep running, and sessions already open
+  render to the new ones; the answer's `channels` lists `started` / `stopped` /
+  `failed`, and `applied` is `"live"` when nothing else differs (otherwise the
+  rest still needs a restart). Off by default (docs/design/live-channels).
 - **`/ws`**: exactly the local socket's frames. The server pings every
   `heartbeat.intervalMs`; a connection that answers neither with a pong nor any
   message within `heartbeat.timeoutMs` is terminated (logged), which frees the host
@@ -194,7 +200,8 @@ against the protocol alone.
   references. On success the config gets a `lark-bot` channel for the account
   whose `config` references those names explicitly (unless `addChannel: false`)
   and the verified owner `lark-bot:<union_id>` in `policy.owners`; restart to
-  start it. One job at a time. Refused at start (409, also with `addChannel:
+  start it, or, with `console.liveChannels`, the channel is started before the job
+  turns `succeeded` (`result.channelStarted`; a new owner still needs the restart). One job at a time. Refused at start (409, also with `addChannel:
   false`, since the env file would be overwritten): a lark-bot channel with the
   same account, the target variables already set (env file or environment), or
   another channel reading them (`proj-a` and `proj_a` share names); a bad

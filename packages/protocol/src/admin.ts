@@ -166,12 +166,35 @@ export const AdminConfigPut = Type.Object({
 });
 export type AdminConfigPut = Static<typeof AdminConfigPut>;
 
+/** A configured channel, by its config entry `type` and `account`. */
+export const AdminChannelRef = Type.Object({ type: Type.String(), account: Type.String() });
+export type AdminChannelRef = Static<typeof AdminChannelRef>;
+
+/**
+ * What applying the config file's `channels` to the running daemon did (`console.liveChannels`):
+ * entries that are new or changed are started, entries that are gone or changed are stopped;
+ * unchanged entries keep running. `failed`: entries that could not be started (the file is then
+ * not fully applied).
+ */
+export const AdminChannelsApplied = Type.Object({
+  started: Type.Array(AdminChannelRef),
+  stopped: Type.Array(AdminChannelRef),
+  failed: Type.Optional(Type.Array(Type.Object({ type: Type.String(), account: Type.String(), error: Type.String() }))),
+});
+export type AdminChannelsApplied = Static<typeof AdminChannelsApplied>;
+
 export const AdminConfigPutResult = Type.Object({
   revision: Type.String(),
   /** Warnings (errors refuse the write; they come back in a 422 body as `AdminConfigValidation`). */
   issues: Type.Array(ConfigIssue),
-  /** live: applied to the running daemon; restart: saved, takes effect at the next start. */
+  /**
+   * live: the running daemon matches the file; restart: saved, (the rest) takes effect at the
+   * next start. With `console.liveChannels` channel changes are applied at once (see `channels`)
+   * even when another change still needs a restart.
+   */
   applied: Type.Union([Type.Literal('live'), Type.Literal('restart')]),
+  /** What applying the channels did (`console.liveChannels`); absent when it is off. */
+  channels: Type.Optional(AdminChannelsApplied),
 });
 export type AdminConfigPutResult = Static<typeof AdminConfigPutResult>;
 
@@ -307,6 +330,8 @@ export const AdminLarkBotJob = Type.Object({
       owner: Type.Optional(Type.String()),
       /** A channel was added to the config (the daemon starts it when the config applies live). */
       channelAdded: Type.Boolean(),
+      /** The added channel was started at once (`console.liveChannels`); otherwise it starts at the next start. */
+      channelStarted: Type.Optional(Type.Boolean()),
       /** Console URL to finish what could not be automated (e.g. publishing the app version). */
       consoleUrl: Type.Optional(Type.String()),
     }),

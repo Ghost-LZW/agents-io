@@ -7,6 +7,7 @@ import {
   type AdminQueue,
   type AdminSession,
   type AdminSessions,
+  type AdminChannelsApplied,
   type AdminStatus,
   type ChannelAdapter,
   type ContentBlock,
@@ -67,7 +68,7 @@ import { MailChannel, type MailChannelConfig } from '@agents-io/channel-mail';
 import { spawnChannel, type BridgeState } from '@agents-io/channel-jsonl-bridge';
 import { agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ResolvedChannel } from './config.js';
 import { ConsoleServer } from './console.js';
-import { ConfigStore } from './console-config.js';
+import { ConfigStore, canonical } from './console-config.js';
 import { LarkBotJobs } from './provision.js';
 import type { ClientCommand, SessionInfo } from './frames.js';
 import { HostService, isHostOrigin } from './host.js';
@@ -96,6 +97,8 @@ export interface GatewayOptions {
   buildHarness?: (instance: HarnessInstance) => HarnessAdapter;
   /** In-process channels besides the configured ones. */
   channels?: ExtraChannel[];
+  /** Build a configured channel's adapter with this instead of the built-in one when it returns one (embedding, tests). */
+  channelAdapter?: (ch: ResolvedChannel) => ChannelAdapter | undefined;
   /**
    * Hooks that replace defaultPolicy's. A `Policy.admit` here is legacy: it then
    * routes instead of the default binding table (watches still apply).
@@ -204,6 +207,10 @@ export class Gateway {
   private readonly launched = new Map<string, LaunchAdapters>();
   private readonly compositors: Compositor[] = [];
   private readonly sessionCompositors = new Map<string, Compositor[]>();
+  /** The channel adapter each compositor renders to (to stop them with a channel removed live). */
+  private readonly compositorAdapter = new WeakMap<Compositor, ChannelAdapter>();
+  /** Live channel applies run one at a time. */
+  private applying: Promise<unknown> = Promise.resolve();
   private readonly channels: RunningChannel[] = [];
   private server: LocalServer | undefined;
   private tokenFile: string | undefined;
@@ -368,6 +375,7 @@ export class Gateway {
         command: c.console.larkBotCommand,
         dir: join(c.dataDir, 'provision'),
         config: store,
+        ...(c.console.liveChannels ? { applyChannels: () => this.applyChannels() } : {}),
         log: (level, msg) => this.log(level, msg),
         ...(o.consoleEnv ? { env: o.consoleEnv } : {}),
       });
@@ -432,6 +440,7 @@ export class Gateway {
         consoleOrigin: (key) => this.consoleOrigin(key),
         ...(this.configStore ? { configStore: this.configStore } : {}),
         ...(this.larkBots ? { larkBots: this.larkBots } : {}),
+        ...(this.configStore && c.console.liveChannels ? { applyChannels: () => this.applyChannels() } : {}),
       },
       log: (level, msg) => this.log(level, msg),
     });
@@ -1093,6 +1102,7 @@ ${a.summary}` }],
       onError: (err) => this.log('warn', `render to ${adapter.id} failed: ${(err as Error).message}`),
     });
     c.start();
+    this.compositorAdapter.set(c, adapter);
     this.compositors.push(c);
     const list = this.sessionCompositors.get(sessionKey);
     if (list) list.push(c);
@@ -1116,7 +1126,8 @@ ${a.summary}` }],
       if (!entry) return void (early = st);
       this.bridgeState(entry, st);
     };
-    const built = await buildChannel(cfg, onState);
+    const own = this.o.channelAdapter?.(cfg);
+    const built = own ? { adapter: own, account: cfg.account, ...(cfg.tier ? { tier: cfg.tier } : {}) } : await buildChannel(cfg, onState);
     entry = this.startChannel(built);
     entry.source = cfg;
     if (early) this.bridgeState(entry, early);
@@ -1135,6 +1146,90 @@ ${a.summary}` }],
       entry.error = `${st.error ?? 'not connected'}; retrying`;
       if (was !== 'failed') this.log('warn', `channel ${entry.adapter.id} (${entry.account}): ${entry.error}`);
     }
+  }
+
+  /**
+   * `console.liveChannels`: make the running configured channels match the config file's
+   * `channels` (after `PUT /api/config` or a provisioned bot). Entries are compared as
+   * resolved (env references substituted, so a changed secret counts as a change):
+   * removed and changed ones stop, new and changed ones start (stops first, so an app
+   * moved to another entry never runs twice), unchanged ones keep running. Returns
+   * undefined when it is off, there is no config file, or the file does not resolve.
+   */
+  applyChannels(): Promise<{ applied: 'live' | 'restart'; channels: AdminChannelsApplied } | undefined> {
+    const p = this.applying.then(() => this.applyChannelsNow());
+    this.applying = p.catch(() => undefined);
+    return p;
+  }
+
+  private async applyChannelsNow(): Promise<{ applied: 'live' | 'restart'; channels: AdminChannelsApplied } | undefined> {
+    const store = this.configStore;
+    if (this.stopped || !store || !this.o.config.console.liveChannels) return undefined;
+    const cur = store.read();
+    if (cur.parseError) return undefined;
+    let next: ResolvedChannel[];
+    try {
+      next = store.resolve(cur.raw).channels;
+    } catch (e) {
+      this.log('warn', `config channels not applied: ${(e as Error).message}`);
+      return undefined;
+    }
+    const ref = (c: ResolvedChannel) => ({ type: c.type, account: c.account });
+    const want = next.map((c) => ({ c, key: canonical(c), kept: false }));
+    const stop: RunningChannel[] = [];
+    for (const e of this.channels) {
+      if (!e.source) continue;
+      const key = canonical(e.source);
+      const same = want.find((w) => !w.kept && w.key === key);
+      if (same) same.kept = true;
+      else stop.push(e);
+    }
+    const out: AdminChannelsApplied = { started: [], stopped: [] };
+    for (const e of stop) {
+      await this.stopChannel(e);
+      out.stopped.push(ref(e.source!));
+    }
+    const failed: NonNullable<AdminChannelsApplied['failed']> = [];
+    for (const w of want) {
+      if (w.kept) continue;
+      if (this.stopped) break;
+      try {
+        const e = await this.startConfigChannel(w.c);
+        // Sessions already open render to it too, as if it had been there at their start.
+        for (const key of this.lanes.keys()) this.compose(key, e.adapter, e.tier, e.account);
+        out.started.push(ref(w.c));
+      } catch (err) {
+        failed.push({ ...ref(w.c), error: (err as Error).message });
+        this.log('error', `channel ${w.c.type} (${w.c.account}) not started: ${(err as Error).message}`);
+      }
+    }
+    if (failed.length) out.failed = failed;
+    else store.channelsApplied(cur.raw);
+    (this.o.config as { channels: ResolvedChannel[] }).channels = this.channels.flatMap((e) => (e.source ? [e.source] : []));
+    if (out.started.length || out.stopped.length || failed.length) {
+      const list = (xs: { type: string; account: string }[]) => xs.map((x) => `${x.type} (${x.account})`).join(', ') || 'none';
+      this.log('info', `channels applied live: started ${list(out.started)}; stopped ${list(out.stopped)}${failed.length ? `; failed ${list(failed)}` : ''}`);
+    }
+    return { applied: store.appliedOf(cur.raw), channels: out };
+  }
+
+  /** Stop one running channel and the compositors rendering to it, and forget it. */
+  private async stopChannel(e: RunningChannel): Promise<void> {
+    e.ac.abort();
+    await within(e.running, 3000);
+    const comps = this.compositors.filter((c) => this.compositorAdapter.get(c) === e.adapter);
+    await within(Promise.all(comps.map((c) => c.stop())), 5000);
+    for (const c of comps) this.compositors.splice(this.compositors.indexOf(c), 1);
+    for (const [key, list] of this.sessionCompositors) {
+      const rest = list.filter((c) => !comps.includes(c));
+      if (rest.length !== list.length) this.sessionCompositors.set(key, rest);
+    }
+    await within(e.close?.().catch(() => undefined), 3000);
+    const i = this.channels.indexOf(e);
+    if (i >= 0) this.channels.splice(i, 1);
+    e.state = 'stopped';
+    delete e.error;
+    this.log('info', `channel ${e.adapter.id} (${e.account}) stopped`);
   }
 
   private startChannel(ch: { adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }): RunningChannel {

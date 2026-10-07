@@ -8,6 +8,7 @@ import {
   ADMIN_WS_BEARER_PREFIX,
   ADMIN_WS_PATH,
   ADMIN_WS_SUBPROTOCOL,
+  type AdminChannelsApplied,
   AdminConfigPut,
   AdminConfigValidateRequest,
   AdminLarkBotRequest,
@@ -85,6 +86,8 @@ export interface ConsoleHost {
   /** Absent: the daemon was started without a config file path (`/api/config*` answer 404). */
   readonly configStore?: ConfigStore;
   readonly larkBots?: LarkBotJobs;
+  /** `console.liveChannels`: apply the file's `channels` to the running daemon after a `PUT`. */
+  applyChannels?(): Promise<{ applied: 'live' | 'restart'; channels: AdminChannelsApplied } | undefined>;
 }
 
 type Role = 'host' | 'session';
@@ -336,8 +339,11 @@ export class ConsoleServer {
         const body = await readJson(req, AdminConfigPut);
         const r = store.put(body.config, body.ifRevision);
         if (r.status === 409) throw new HttpError(409, r.code, r.message);
-        if (r.status === 200) this.o.log('info', `console: config written (revision ${r.body.revision}, ${r.body.applied === 'restart' ? 'restart required' : 'unchanged'})`);
-        return { status: r.status, body: r.body };
+        if (r.status !== 200) return { status: r.status, body: r.body };
+        const live = await h.applyChannels?.();
+        const res = live ? { ...r.body, applied: live.applied, channels: live.channels } : r.body;
+        this.o.log('info', `console: config written (revision ${res.revision}, ${res.applied === 'restart' ? 'restart required' : live ? 'applied live' : 'unchanged'})`);
+        return { status: 200, body: res };
       }
     }
     if (p === '/api/bots/lark' || p.startsWith('/api/bots/lark/')) {

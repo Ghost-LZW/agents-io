@@ -102,6 +102,9 @@
         "channelAdded": {
           "type": "boolean"
         },
+        "channelStarted": {
+          "type": "boolean"
+        },
         "consoleUrl": {
           "type": "string"
         }

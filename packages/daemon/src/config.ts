@@ -327,6 +327,12 @@ export const ConfigFile = Type.Object(
           ),
           /** create-lark-bot invocation for `POST /api/bots/lark` (argv; default npx of the pinned release). */
           larkBotCommand: Type.Optional(Type.Array(Type.String(), { minItems: 1 })),
+          /**
+           * Apply `channels` changes written through the console (`PUT /api/config`, a bot added by
+           * `POST /api/bots/lark`) to the running daemon: start new or changed entries, stop removed
+           * or changed ones, keep the rest. Default false (changes take effect at the next start).
+           */
+          liveChannels: Type.Optional(Type.Boolean()),
         },
         Closed,
       ),
@@ -487,6 +493,8 @@ export interface ConsoleConfig {
   larkBotCommand: string[];
   /** `/ws` ping interval (0: off) and how long a ping waits for an answer. */
   heartbeat: { intervalMs: number; timeoutMs: number };
+  /** Apply channel changes written through the console at once. */
+  liveChannels: boolean;
 }
 
 /** create-lark-bot, pinned. */
@@ -539,6 +547,7 @@ function resolveConsole(c: ConfigFile['console']): ConsoleConfig {
     sessionTtlMs: c?.sessionTtlMs ?? 12 * 3_600_000,
     larkBotCommand: c?.larkBotCommand ?? CREATE_LARK_BOT,
     heartbeat: { intervalMs: c?.heartbeat?.intervalMs ?? DEFAULT_WS_HEARTBEAT_MS, timeoutMs: c?.heartbeat?.timeoutMs ?? DEFAULT_WS_HEARTBEAT_TIMEOUT_MS },
+    liveChannels: c?.liveChannels === true,
   };
 }
 

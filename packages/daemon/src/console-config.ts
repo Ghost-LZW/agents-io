@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { Value } from '@sinclair/typebox/value';
 import { ADMIN_REDACTED, type AdminConfigDocument, type AdminConfigPutResult, type AdminConfigValidation, type ConfigIssue } from '@agents-io/protocol';
 import { loadEnvFile } from '@agents-io/testkit';
-import { ConfigError, ConfigFile, findEnvFile, resolveConfig } from './config.js';
+import { ConfigError, ConfigFile, findEnvFile, resolveConfig, type Config } from './config.js';
 
 /*
  * The config file as the console sees it (`GET/PUT /api/config`,
@@ -22,7 +22,9 @@ import { ConfigError, ConfigFile, findEnvFile, resolveConfig } from './config.js
  * field is refused (`inline_secret`). Validation is the startup one
  * (`resolveConfig`, with the env file read afresh). Writes are atomic (temp
  * file + fsync + rename) and 0600. The daemon does not reload its config: a
- * changed file takes effect at the next start (`applied: "restart"`).
+ * changed file takes effect at the next start (`applied: "restart"`), except
+ * `channels` with `console.liveChannels` (the gateway applies them and calls
+ * `channelsApplied`).
  */
 
 /** Keys whose string values are secrets, in the free-form parts of the config. */
@@ -192,11 +194,32 @@ export type PutOutcome =
   | { status: 422; body: AdminConfigValidation };
 
 export class ConfigStore {
-  /** The file as the daemon started with it (canonical JSON), to tell whether a change needs a restart. */
-  private readonly started: string;
+  /**
+   * The file as the running daemon reflects it: as it started, with `channels` replaced by
+   * the ones last applied live. To tell whether a change needs a restart.
+   */
+  private running: Record<string, unknown>;
 
   constructor(private readonly o: ConfigStoreOptions) {
-    this.started = canonical(this.read().raw);
+    const raw = this.read().raw;
+    this.running = raw && typeof raw === 'object' && !Array.isArray(raw) ? structuredClone(raw as Record<string, unknown>) : {};
+  }
+
+  /** `live` when the running daemon matches `doc`, else `restart`. */
+  appliedOf(doc: Json): 'live' | 'restart' {
+    return canonical(doc) === canonical(this.running) ? 'live' : 'restart';
+  }
+
+  /** The daemon now runs the `channels` of `doc`. */
+  channelsApplied(doc: Json): void {
+    const ch = doc && typeof doc === 'object' ? (doc as { channels?: unknown }).channels : undefined;
+    const { channels: _old, ...rest } = this.running;
+    this.running = ch === undefined ? rest : { ...rest, channels: structuredClone(ch) };
+  }
+
+  /** The startup resolution of `raw`, with the env file read afresh (throws `ConfigError`). */
+  resolve(raw: Json): Config {
+    return resolveConfig(raw, { env: this.env(), baseDir: dirname(this.o.path), ...(this.o.cwd ? { cwd: this.o.cwd } : {}) });
   }
 
   get path(): string {
@@ -277,7 +300,7 @@ export class ConfigStore {
     issues.push(...secretIssues(raw, kept));
     if (!issues.some((i) => i.code === 'schema')) {
       try {
-        resolveConfig(raw, { env: this.env(), baseDir: dirname(this.o.path), ...(this.o.cwd ? { cwd: this.o.cwd } : {}) });
+        this.resolve(raw);
       } catch (e) {
         if (!(e instanceof ConfigError)) throw e;
         issues.push({ path: pathOfMessage(e.message), code: 'invalid', message: e.message, severity: 'error' });
@@ -292,7 +315,7 @@ export class ConfigStore {
     const { doc, issues } = this.prepare(next);
     if (issues.some((i) => i.severity === 'error')) return { status: 422, body: { valid: false, issues } };
     const revision = this.write(doc);
-    return { status: 200, body: { revision, issues, applied: canonical(doc) === this.started ? 'live' : 'restart' } };
+    return { status: 200, body: { revision, issues, applied: this.appliedOf(doc) } };
   }
 
   /** Change the file programmatically (bot provisioning); same atomic 0600 write, no secret checks. */
@@ -347,7 +370,7 @@ export function writeFileAtomic(path: string, text: string): void {
   }
 }
 
-function canonical(v: Json): string {
+export function canonical(v: Json): string {
   const sort = (x: Json): Json =>
     Array.isArray(x) ? x.map(sort) : x && typeof x === 'object' ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, y]) => [k, sort(y)])) : x;
   return JSON.stringify(sort(v));
