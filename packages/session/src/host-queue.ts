@@ -61,7 +61,7 @@ export class HostQueue {
   private readonly ownsDb: boolean;
   private readonly now: () => number;
   private q: Record<
-    'refGet' | 'refPut' | 'insert' | 'after' | 'one' | 'consumerGet' | 'consumerPut' | 'consumerAck' | 'consumers' | 'consumerDel' | 'head' | 'prune' | 'pruneRefs' | 'pending' | 'redispatchGet' | 'redispatchPut' | 'pruneRedispatch',
+    'refGet' | 'refPut' | 'insert' | 'after' | 'one' | 'consumerGet' | 'consumerPut' | 'consumerAck' | 'consumers' | 'consumerDel' | 'head' | 'prune' | 'pruneRefs' | 'pending' | 'redispatchGet' | 'redispatchPut' | 'redispatchSet' | 'redispatchDel' | 'pruneRedispatch',
     StatementSync
   >;
   private waiters = new Set<() => void>();
@@ -87,6 +87,8 @@ export class HostQueue {
       one: p('SELECT cursor, json FROM host_inbound WHERE cursor = ?'),
       redispatchGet: p('SELECT json FROM host_redispatch WHERE cursor = ?'),
       redispatchPut: p('INSERT INTO host_redispatch (cursor, at, json) VALUES (?, ?, ?) ON CONFLICT(cursor) DO NOTHING'),
+      redispatchSet: p('UPDATE host_redispatch SET at = ?, json = ? WHERE cursor = ?'),
+      redispatchDel: p('DELETE FROM host_redispatch WHERE cursor = ?'),
       pruneRedispatch: p('DELETE FROM host_redispatch WHERE at < ? AND cursor NOT IN (SELECT cursor FROM host_inbound)'),
       consumerGet: p('SELECT acked FROM host_consumers WHERE name = ?'),
       consumerPut: p('INSERT INTO host_consumers (name, acked, seen) VALUES (?, 0, ?) ON CONFLICT(name) DO UPDATE SET seen = excluded.seen'),
@@ -176,9 +178,24 @@ export class HostQueue {
     return r ? (JSON.parse(r.json) as T) : undefined;
   }
 
-  /** Record a redispatch; false when the cursor already has one (the first stays). */
+  /**
+   * Record a redispatch; false when the cursor already has one (the first stays).
+   * The gateway records a pending one before it delivers (so a delivery cut off by
+   * a stop is never repeated: at most once), then replaces it (`finishRedispatch`)
+   * or removes it when the delivery failed (`dropRedispatch`).
+   */
   recordRedispatch(cursor: number, value: unknown): boolean {
     return Number(this.q.redispatchPut.run(cursor, this.now(), JSON.stringify(value)).changes) > 0;
+  }
+
+  /** Replace the cursor's recorded redispatch (the pending one with its outcome). */
+  finishRedispatch(cursor: number, value: unknown): void {
+    this.q.redispatchSet.run(this.now(), JSON.stringify(value), cursor);
+  }
+
+  /** Forget the cursor's redispatch (its delivery failed: the host may try again). */
+  dropRedispatch(cursor: number): void {
+    this.q.redispatchDel.run(cursor);
   }
 
   /** Pull: items after `after` (default the acked cursor), waiting up to `waitMs` when there are none yet. */

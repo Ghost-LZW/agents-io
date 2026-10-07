@@ -462,8 +462,8 @@ export class Router {
    * (default `per-conversation`) would pick for this envelope, and `launch`
    * checked as a callout answer's would be. The origin is the one the input was
    * stamped with when it arrived; the deployment's own echo is recorded as
-   * context, never a turn. Throws `RouterError` for an unknown or task agent or
-   * a bad scope; a refused launch is `{ ok: false }`. Records nothing.
+   * context, never a turn. Throws `RouterError` for an unknown or task agent, a
+   * bad scope or a task run session key; a refused launch is `{ ok: false }`. Records nothing.
    */
   redirect(
     env: InboundEnvelope,
@@ -476,6 +476,7 @@ export class Router {
     const r: Resolved = { binding: { id: REDISPATCH_RULE, match: {}, on: 'dispatch' }, source: 'host', on: 'dispatch', agent: agent.name, ...(o.session !== undefined ? { session: o.session } : {}) };
     const { entry, delivery } = this.place(r, env, origin);
     if (!delivery) throw new RouterError('invalid', 'redispatch has no target session');
+    if (delivery.sessionKey.startsWith('run:')) throw new RouterError('invalid', `${delivery.sessionKey} is a task run session key (task runs use run.start)`);
     if (o.launch !== undefined) {
       const c = this.o.launches
         ? this.o.launches.check({ sessionKey: delivery.sessionKey, agent: delivery.agent, launch: o.launch })

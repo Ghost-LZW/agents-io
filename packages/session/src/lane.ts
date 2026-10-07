@@ -1079,9 +1079,10 @@ export class Lane {
     const p = this.requests.get(requestId);
     if (!p) return { ok: false, reason: this.resolved.has(requestId) ? 'already_resolved' : 'unknown_request' };
     let by: ResolvedBy;
-    // A host relays a principal's answer: only system origins may, and a human request still checks the principal.
+    // A host relays a principal's answer: only a host connection may (system origin through the host adapter;
+    // the gateway checks this too), and a human request still checks the principal.
     if (onBehalfOf !== undefined) {
-      if (origin.kind !== 'system' || !onBehalfOf) return { ok: false, reason: 'not_eligible' };
+      if (origin.kind !== 'system' || origin.adapter !== 'host' || !onBehalfOf) return { ok: false, reason: 'not_eligible' };
       const via = origin.principal?.id ?? origin.via;
       if (p.resolver.kind === 'human') {
         if (!p.resolver.principals.includes(onBehalfOf)) return { ok: false, reason: 'not_eligible' };

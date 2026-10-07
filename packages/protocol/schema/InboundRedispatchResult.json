@@ -72,6 +72,9 @@
     },
     "duplicate": {
       "type": "boolean"
+    },
+    "interrupted": {
+      "type": "boolean"
     }
   }
 }

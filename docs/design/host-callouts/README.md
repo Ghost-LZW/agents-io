@@ -31,7 +31,7 @@ POSITIONING §2 的判据：某个请求交给谁答、某个目的地能不能�
 
 | 方案 | 做法 | 取舍 |
 |---|---|---|
-| **a `resolve` 帧加 `onBehalfOf`（采用）** | 只接受宿主连接（`origin.kind = system`）；`human` 请求仍按 `principals` 校验资格 | 资格仍由守护进程复核；日志里记成员与经由的宿主 |
+| **a `resolve` 帧加 `onBehalfOf`（采用）** | 只接受宿主连接（`origin.kind = system` 且 `origin.adapter = host`；网关和 lane 都查，其它系统来源如 watch、run 不可代答）；`human` 请求仍按 `principals` 校验资格 | 资格仍由守护进程复核；日志里记成员与经由的宿主 |
 | b 宿主伪造成员 origin 发帧 | 允许宿主连接改写 origin | 破坏 origin 只由守护进程盖章的原则 |
 
 ## 4. 设计
@@ -45,7 +45,7 @@ POSITIONING §2 的判据：某个请求交给谁答、某个目的地能不能�
 - `callouts: true` 等于 `["route"]`（旧语义）；`false`、`[]`、缺省：不回答任何回调。
 - 数组里未知的钩子名被忽略（向前兼容）；结果 `HostHelloResult.callouts` 列出实际开启的钩子。
 - 任一钩子开启（或带 `consumer`）都使连接成为**宿主**（至多一个），与原规则一致。
-- `features` 新增 `callouts.resolve`、`callouts.outbound`、`resolve.onBehalfOf`。旧守护进程的 `callouts` 只认布尔：宿主应先用 `callouts: true` 握手，或在收到 `invalid_frame` 时退回布尔。
+- `features` 新增 `callouts.resolve`、`callouts.outbound`、`resolve.onBehalfOf`。旧守护进程的 `callouts` 只认布尔：宿主应直接发列表，收到 `invalid_frame` 时改用 `callouts: true` 重发。不要先用 `callouts: true` 握手探测：那次握手已让连接成为唯一的宿主、只开 `route`，换列表需断开重连，期间占着宿主位置。
 
 ### 4.2 `resolve` 钩子
 
@@ -58,7 +58,7 @@ POSITIONING §2 的判据：某个请求交给谁答、某个目的地能不能�
 
 `policy { hook: "outbound", args: { from, to } }`（`from: TurnContext | null`，`to: ReplyRoute`），宿主答复 `{ verdict: "allow" | "deny" }`。
 
-- 宿主未连接或没开启 `outbound`：沿用本地 `policy.outbound`（行为不变）。
+- 宿主未连接或没开启 `outbound`：沿用本地 `policy.outbound`（行为不变）。注意：开启过 `outbound` 的宿主断开后同样回到本地策略，本地允许的去向（如预注册 `routes`）照常放行；宿主施加的限制离线期间不生效（见 §8）。
 - **fail closed = 拒绝**：已开启时超时、出错、答复不合 schema，一律 `deny`。
 - 超时：`hostCallouts.outbound.timeoutMs`，默认 2000 ms。
 
@@ -66,7 +66,7 @@ POSITIONING §2 的判据：某个请求交给谁答、某个目的地能不能�
 
 客户端帧 `resolve` 增加可选 `onBehalfOf: string`（宿主成员 id）：
 
-- 只有宿主连接（`origin.kind === "system"`）可带；其它连接带了答 `not_eligible`。
+- 只有宿主连接（`origin.kind === "system"` 且 `origin.adapter === "host"`）可带；其它连接带了答 `not_eligible`。网关（`ClientCommand`）与 lane（`resolveCommand`）各查一次：以后新增的内部系统来源（watch、run 等）也不能代答。
 - 请求 resolver 为 `human`：`onBehalfOf` 必须在 `principals` 里，否则 `not_eligible`；记 `request.resolved.by = { kind: "human", id: <成员>, via: "host:<name>" }`。
 - resolver 为 `host`：记 `by = { kind: "host", id: <成员>, via: "host:<name>" }`。
 - 不带 `onBehalfOf` 与今天完全相同。`ResolvedBy` 新增可选 `via`：`id` 始终是答复所算作的主体，`via` 是转达它的宿主连接。
@@ -97,3 +97,8 @@ POSITIONING §2 的判据：某个请求交给谁答、某个目的地能不能�
 ## 7. 迁移
 
 无需迁移。已有宿主（`callouts: true`）行为不变；不握手声明新钩子就不会收到新帧。
+
+## 8. 后续
+
+- **离线时的 `outbound`**：可加配置（如 `hostCallouts.outbound.whenOffline: "deny"`），让开启过 `outbound` 的宿主断开期间一律拒绝外发，而不是回到本地策略。当前只在文档中说明。
+- **Schema 去重**：`HostEventFrame.json` 内联了完整的 `request.opened` 事件体与 `TurnContextView`（约 1300 行），与 `TurnContextView.json`、`ResolveCalloutAnswer.json` 重复。可在 `emit-schema` 中用 `$id` / `$ref` 共享定义；不影响正确性。

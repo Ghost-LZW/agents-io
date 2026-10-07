@@ -741,8 +741,10 @@ export class Gateway {
 
   /**
    * `inbound.redispatch`: deliver a queued host-inbound item to a session as the
-   * input it was (original origin), once per cursor. A delivery that fails is not
-   * recorded, so the host may try another session.
+   * input it was (original origin), at most once per cursor. A pending record is
+   * written before the delivery and completed after it: a delivery cut off by a
+   * stop is reported (`duplicate`, `interrupted`), never repeated. A delivery that
+   * fails is not recorded, so the host may try another session.
    */
   redispatch(hostName: string, f: InboundRedispatch): Promise<Outcome> {
     const running = this.redispatching.get(f.cursor);
@@ -754,37 +756,76 @@ export class Gateway {
 
   private async redispatchOnce(hostName: string, f: InboundRedispatch): Promise<Outcome> {
     if (this.stopped) return fail('stopped', 'daemon is stopping');
-    const prior = this.hostQueue.redispatched<InboundRedispatchResult>(f.cursor);
-    if (prior) return { ok: true, value: { ...prior, duplicate: true } };
+    const prior = this.hostQueue.redispatched<InboundRedispatchResult & { pending?: true }>(f.cursor);
+    if (prior) {
+      // Not in flight here (the map would have it): a pending record is an attempt an earlier run cut off.
+      const { pending, ...v } = prior;
+      return { ok: true, value: { ...v, duplicate: true, ...(pending ? { interrupted: true } : {}) } satisfies InboundRedispatchResult };
+    }
     const item = this.hostQueue.get(f.cursor);
     if (!item) return fail('unknown_cursor', `no host inbound item at cursor ${f.cursor} (never queued, or pruned after every consumer acked it)`);
     const by = `host:${hostName}`;
-    const r = await this.ingress.redispatch(item, {
-      by,
-      ...(f.agent !== undefined ? { agent: f.agent } : {}),
-      ...(f.session !== undefined ? { session: f.session } : {}),
-      ...(f.launch !== undefined ? { launch: f.launch } : {}),
-    });
-    if (!r.ok) return fail(r.code === 'task_agent' ? 'not_interactive_agent' : r.code, r.message);
-    const res = r.outcome.result;
-    if (r.outcome.unavailable) return fail(r.outcome.unavailable.code, r.outcome.unavailable.message);
-    if (res && !res.ok) return fail(res.reason, `session ${r.delivery.sessionKey} refused the input: ${res.reason}`);
-    const value: InboundRedispatchResult = {
-      cursor: item.cursor,
-      of: item.input.inputId,
-      inputId: r.inputId,
-      sessionKey: r.delivery.sessionKey,
-      ...(r.delivery.agent ? { agent: r.delivery.agent } : {}),
-      on: r.delivery.on === 'dispatch' ? 'dispatch' : 'context',
-      ...(r.launch ? { launch: r.launch } : {}),
-      ...(res?.ok && res.disposition !== undefined ? { disposition: res.disposition } : {}),
-      at: Date.now(),
-      by,
-      duplicate: false,
-    };
-    this.hostQueue.recordRedispatch(item.cursor, value);
-    this.log('info', `host ${hostName} redispatched inbound ${item.cursor} (${item.input.inputId}) to ${value.sessionKey}`);
-    return { ok: true, value };
+    let recorded = false;
+    let agent: string | undefined;
+    try {
+      const r = await this.ingress.redispatch(item, {
+        by,
+        ...(f.agent !== undefined ? { agent: f.agent } : {}),
+        ...(f.session !== undefined ? { session: f.session } : {}),
+        ...(f.launch !== undefined ? { launch: f.launch } : {}),
+        beforeDeliver: (d, inputId, launch) => {
+          // The session's own agent: a named agent must match it (as session.prepare checks).
+          const had = this.laneInfo.get(d.sessionKey)?.agent.name ?? this.records.agentOf(d.sessionKey);
+          if (f.agent !== undefined && had !== undefined && had !== f.agent) return { ok: false, code: 'agent_conflict', message: `session ${d.sessionKey} belongs to agent ${had}` };
+          agent = had ?? d.agent;
+          const pending = {
+            cursor: item.cursor,
+            of: item.input.inputId,
+            inputId,
+            sessionKey: d.sessionKey,
+            ...(agent ? { agent } : {}),
+            on: d.on === 'dispatch' ? 'dispatch' : 'context',
+            ...(launch ? { launch } : {}),
+            at: Date.now(),
+            by,
+            duplicate: false,
+            pending: true,
+          };
+          // A concurrent request on another connection for this cursor waits on the map, so this is the first.
+          recorded = this.hostQueue.recordRedispatch(item.cursor, pending);
+          return recorded ? { ok: true } : { ok: false, code: 'conflict', message: `cursor ${item.cursor} is being redispatched` };
+        },
+      });
+      if (!r.ok) {
+        if (recorded) this.hostQueue.dropRedispatch(item.cursor);
+        return fail(r.code === 'task_agent' ? 'not_interactive_agent' : r.code, r.message);
+      }
+      const res = r.outcome.result;
+      const refused = r.outcome.unavailable ? fail(r.outcome.unavailable.code, r.outcome.unavailable.message) : res && !res.ok ? fail(res.reason, `session ${r.delivery.sessionKey} refused the input: ${res.reason}`) : undefined;
+      if (refused) {
+        this.hostQueue.dropRedispatch(item.cursor);
+        return refused;
+      }
+      const value: InboundRedispatchResult = {
+        cursor: item.cursor,
+        of: item.input.inputId,
+        inputId: r.inputId,
+        sessionKey: r.delivery.sessionKey,
+        ...(agent ? { agent } : {}),
+        on: r.delivery.on === 'dispatch' ? 'dispatch' : 'context',
+        ...(r.launch ? { launch: r.launch } : {}),
+        ...(res?.ok && res.disposition !== undefined ? { disposition: res.disposition } : {}),
+        at: Date.now(),
+        by,
+        duplicate: false,
+      };
+      this.hostQueue.finishRedispatch(item.cursor, value);
+      this.log('info', `host ${hostName} redispatched inbound ${item.cursor} (${item.input.inputId}) to ${value.sessionKey}`);
+      return { ok: true, value };
+    } catch (e) {
+      if (recorded) this.hostQueue.dropRedispatch(item.cursor);
+      throw e;
+    }
   }
 
   /**

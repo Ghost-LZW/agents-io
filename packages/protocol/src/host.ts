@@ -590,6 +590,12 @@ export const InboundRedispatchResult = Type.Object({
   at: Type.Number(),
   by: Type.String(),
   duplicate: Type.Boolean(),
+  /**
+   * With `duplicate`: the first redispatch of this cursor was cut off (the daemon
+   * stopped mid-delivery) before its outcome was recorded. The input may or may
+   * not have reached the session; it is never sent again (at most once).
+   */
+  interrupted: Type.Optional(Type.Boolean()),
 });
 export type InboundRedispatchResult = Static<typeof InboundRedispatchResult>;
 

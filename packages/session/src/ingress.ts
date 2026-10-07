@@ -391,11 +391,20 @@ export class Ingress {
    * reply route and channel context, plus `channelContext.redispatchedBy`. Its input id is
    * `<original>~r<cursor>`. Both explanations are recorded: the new input's
    * (`redispatchOf`), and the original's gains a `redispatched` entry. Idempotency
-   * per cursor is the caller's (the queue records it).
+   * per cursor is the caller's (the queue records it, pending from `beforeDeliver`).
+   * The delivery goes straight to the session: a topic command in the item's text
+   * (`/new`, `/topics`, `/switch`) is plain input here, not handled as a command.
    */
   async redispatch(
     item: InboundItem,
-    o: { agent?: string; session?: SessionScope; launch?: SessionLaunch; by: string },
+    o: {
+      agent?: string;
+      session?: SessionScope;
+      launch?: SessionLaunch;
+      by: string;
+      /** Called with the placed delivery before it is made: a refusal stops it (nothing delivered or recorded). */
+      beforeDeliver?: (d: RouteDelivery, inputId: string, launch?: { cwd?: string; envKeys: string[]; outcome: string }) => { ok: true } | { ok: false; code: string; message: string };
+    },
   ): Promise<{ ok: true; delivery: RouteDelivery; outcome: DeliveryOutcome; inputId: string; launch?: { cwd?: string; envKeys: string[]; outcome: string } } | { ok: false; code: string; message: string }> {
     const env = item.envelope;
     const origin = item.input.origin;
@@ -415,6 +424,8 @@ export class Ingress {
     }
     if (!r.ok) return r;
     const { delivery, explanation } = r;
+    const before = o.beforeDeliver?.(delivery, inputId, explanation.matched[0]!.launch);
+    if (before && !before.ok) return before;
     const input: InputRecord = { ...item.input, inputId, channelContext: { ...item.input.channelContext, redispatchedBy: o.by } };
     const outcome = await this.deliverOwn(delivery, env, origin, input);
     if (outcome.unavailable) explanation.matched[0]!.rejected = { code: outcome.unavailable.code, message: outcome.unavailable.message };
