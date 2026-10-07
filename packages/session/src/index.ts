@@ -9,3 +9,6 @@ export * from './outbox.js';
 export * from './compositor.js';
 export * from './watch.js';
 export * from './blobs.js';
+export * from './identity.js';
+export * from './router.js';
+export * from './host-queue.js';

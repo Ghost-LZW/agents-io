@@ -14,6 +14,7 @@ import {
   type Policy,
   type ReplyRoute,
   type Tier,
+  type TurnProvenance,
   type Watch,
   type WatchDraft,
 } from '@agents-io/protocol';
@@ -24,10 +25,12 @@ import {
   Ingress,
   Lane,
   Outbox,
+  Router,
   SqliteSessionLog,
   WatchDispatcher,
   WatchRegistry,
   defaultPolicy,
+  ownersTable,
   type AddWatchResult,
   type FullPolicy,
   type RemoveWatchResult,
@@ -62,7 +65,10 @@ export interface GatewayOptions {
   buildHarness?: (instance: HarnessInstance) => HarnessAdapter;
   /** In-process channels besides the configured ones. */
   channels?: ExtraChannel[];
-  /** Hooks that replace defaultPolicy's. */
+  /**
+   * Hooks that replace defaultPolicy's. A `Policy.admit` here is legacy: it then
+   * routes instead of the default binding table (watches still apply).
+   */
   policy?: Partial<Policy>;
   /** Use this log instead of SQLite at `config.logPath` (tests). */
   log?: SessionLog;
@@ -71,7 +77,7 @@ export interface GatewayOptions {
   /** Serve the local client socket (default true). */
   listen?: boolean;
   /** Every host output-tool call (debugging; e2e checks what harnesses send in `_meta`). */
-  onToolCall?: (e: { sessionKey: string; tool: string; meta: Record<string, unknown> | undefined; ok: boolean; error?: string }) => void;
+  onToolCall?: (e: { sessionKey: string; tool: string; meta: Record<string, unknown> | undefined; ok: boolean; error?: string; provenance?: TurnProvenance }) => void;
   /** Tee of raw harness events per session (conformance checks). */
   onHarnessEvent?: (sessionKey: string, e: HarnessEvent) => void;
   logger?: LogFn;
@@ -88,6 +94,9 @@ interface RunningChannel {
   running: Promise<void>;
   close?: () => Promise<void>;
 }
+
+/** The one agent the dev gateway runs (every binding of its default table targets it). */
+const DEFAULT_AGENT = 'default';
 
 /** Local ends post to this route; no adapter renders it, they read the stream instead. */
 export const localRoute = (sessionKey: string): ReplyRoute => ({ channel: 'local', account: 'local', conversationId: sessionKey });
@@ -108,6 +117,8 @@ async function within(p: Promise<unknown> | undefined, ms: number): Promise<void
 export class Gateway {
   readonly hub: Hub;
   readonly policy: FullPolicy;
+  /** The binding tables: the owners config as the default table, plus watches as runtime rules. */
+  readonly router: Router;
   readonly ingress: Ingress;
   readonly outbox: Outbox;
   /** Watches: sessions subscribed to inputs not addressed to them. */
@@ -139,6 +150,21 @@ export class Gateway {
     }
     const log = o.log ?? new SqliteSessionLog({ path: c.logPath });
     this.hub = new Hub(log);
+    // One agent: the configured harness instances, sessions keyed by bare route keys as before.
+    const legacyAdmit = o.policy?.admit;
+    this.router = new Router({
+      agents: [{ name: DEFAULT_AGENT, sessionPrefix: '', mainSession: c.local.session }],
+      defaultAgent: DEFAULT_AGENT,
+      ...(legacyAdmit
+        ? { legacyAdmit: legacyAdmit.bind(o.policy) }
+        : { config: ownersTable({ owners: c.policy.owners, agent: DEFAULT_AGENT, ...(c.policy.ownerSessionKey ? { ownerSessionKey: c.policy.ownerSessionKey } : {}) }) }),
+      watches: { list: () => this.watches.list() },
+      selfAccounts: c.policy.selfAccounts,
+      agentAccounts: c.policy.agentAccounts,
+      ...(log instanceof SqliteSessionLog ? { db: log.db } : {}),
+      log: (level, msg) => this.log(level, `router: ${msg}`),
+    });
+    const router = this.router;
     this.policy = {
       ...defaultPolicy({
         owners: c.policy.owners,
@@ -147,8 +173,9 @@ export class Gateway {
         routes: c.policy.routes,
         watchAllowlist: c.policy.watchAllowlist,
         run: c.harnesses[c.defaultHarness]!.run,
-        ...(c.policy.ownerSessionKey ? { ownerSessionKey: c.policy.ownerSessionKey } : {}),
       }),
+      // The router's identity maps (the owners config; a host's map once one is pushed).
+      identify: async (a) => router.identify(a),
       ...o.policy,
     } as FullPolicy;
     this.outbox = new Outbox({ hub: this.hub, policy: this.policy });
@@ -176,17 +203,27 @@ export class Gateway {
         routes: () => c.policy.routes,
         // Agents add watches as themselves (kind agent); Policy.watch decides, the target is pinned to their session.
         watches: { add: (by, d) => this.addWatch(by, d), remove: (by, id) => this.removeWatch(by, id), list: (key) => this.listWatches(key) },
+        // Decision 4: every write carries where the turn's inputs came from.
+        provenance: (key, turnId) => this.lanes.get(key)?.provenance(turnId),
       });
       const tools = this.tools;
-      this.mcp = new HostMcpServer({ tools, ...(o.onToolCall ? { onCall: (e) => o.onToolCall!({ sessionKey: e.binding.sessionKey, tool: e.tool, meta: e.meta, ok: e.ok, ...(e.error ? { error: e.error } : {}) }) } : {}) });
+      this.mcp = new HostMcpServer({
+        tools,
+        ...(o.onToolCall
+          ? { onCall: (e) => o.onToolCall!({ sessionKey: e.binding.sessionKey, tool: e.tool, meta: e.meta, ok: e.ok, ...(e.error ? { error: e.error } : {}), ...(e.provenance ? { provenance: e.provenance } : {}) }) }
+          : {}),
+      });
     }
     const tools = this.tools;
     this.ingress = new Ingress({
       policy: this.policy,
+      router: this.router,
       lanes: (key) => this.lane(key),
       hub: this.hub,
       watches: this.watches,
       onWatchError: (err) => this.log('warn', `watch fan-out failed: ${(err as Error).message}`),
+      // No host here (the daemon adds the durable host queue): a `host` rule is only logged.
+      onHostUnavailable: ({ inputId, bindingId }) => this.log('warn', `input ${inputId} matched host rule ${bindingId}, but no host queue is configured`),
       replyCaps: (ch, account) => this.replyCaps(ch, account),
       // Clicks on ask_choice buttons (and numbered replies) go back to the session that asked.
       ...(tools ? { rewrite: (a) => tools.rewriteInbound(a) } : {}),
@@ -464,6 +501,7 @@ export class Gateway {
     await within(this.mcp?.close(), 2000);
     await within(new Promise(() => {}), 50);
     this.watches.registry.close();
+    this.router.close();
     this.hub.log.close?.();
   }
 }

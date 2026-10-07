@@ -14,6 +14,7 @@ import {
   type ReplyRoute,
   type Tier,
   type TurnContext,
+  type TurnProvenance,
   type Watch,
   type WatchDraft,
 } from '@agents-io/protocol';
@@ -60,6 +61,8 @@ export interface OutputRecord {
   route: ReplyRoute;
   msg: RenderedMessage;
   choice?: ChoiceData;
+  /** Where the sending turn's inputs came from (decision 4: tagged, never blocked). */
+  provenance?: TurnProvenance;
 }
 
 export interface ChoiceRecord extends ChoiceData {
@@ -95,6 +98,8 @@ export interface HostToolsOptions {
   as?(sessionKey: string): string | undefined;
   /** Watch control (dev-gateway `addWatch`/`removeWatch`/`listWatches`); absent = no watch tools. */
   watches?: WatchControl;
+  /** Provenance of a session's turn (`Lane.provenance`), attached to every write the turn makes. */
+  provenance?(sessionKey: string, turnId: string): TurnProvenance | undefined;
 }
 
 /** What the watch tools need from the host; `Policy.watch` is applied behind `add`. */
@@ -155,6 +160,16 @@ export class HostTools {
 
   constructor(private readonly o: HostToolsOptions) {
     this.eventOnly = new Set(o.eventOnlyChannels ?? ['local']);
+  }
+
+  /**
+   * Provenance of the turn running in the binding's session, if any: what the host
+   * sees with each write (output records, `onCall`). Since harnesses take their
+   * environment per session, not per turn, this is how it reaches the host.
+   */
+  provenanceOf(b: ToolBinding): TurnProvenance | undefined {
+    const turn = this.o.turn(b.sessionKey);
+    return turn ? this.o.provenance?.(b.sessionKey, turn.turnId) : undefined;
   }
 
   /** Whether the watch tools are offered (the host passed `watches`). */
@@ -286,7 +301,8 @@ export class HostTools {
     const prior = this.o.outbox.get(operationId);
     const body: RenderedMessage = { ...msg, channelData: { ...(msg.channelData as object | undefined), [OUTPUT_KEY]: { tool } } };
     if (!prior) {
-      const rec: OutputRecord = { tool, operationId, route, msg: body, ...(choice ? { choice } : {}) };
+      const provenance = this.o.provenance?.(b.sessionKey, turn.turnId);
+      const rec: OutputRecord = { tool, operationId, route, msg: body, ...(choice ? { choice } : {}), ...(provenance ? { provenance } : {}) };
       this.o.hub.append(b.sessionKey, {
         ts: Date.now(),
         turnId: turn.turnId,

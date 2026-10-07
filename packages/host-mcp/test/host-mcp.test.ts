@@ -89,6 +89,30 @@ describe('HostTools', () => {
     expect(settled[0]!.body).toMatchObject({ result: 'delivered', operationId: 'tool:s1:toolu_1' });
   });
 
+  it('tags every write with the turn provenance (never blocks it)', async () => {
+    const hub = new Hub(new MemorySessionLog());
+    const policy = defaultPolicy({ owners: ['fake:alice'] });
+    const fake = new FakeChannel('fake', defaultChannelCaps);
+    const prov = { sessionKey: SK, turnId: 't1', triggeredBy: ['fake:alice'], watched: true, external: true, group: true };
+    const asked: string[] = [];
+    const tools = new HostTools({
+      hub,
+      outbox: new Outbox({ hub, policy, sleep: async () => {} }),
+      policy,
+      turn: () => turnOf(route()),
+      adapter: () => fake,
+      blobs: new MemoryBlobStore(),
+      cwd: () => tmpdir(),
+      provenance: (key, turnId) => (asked.push(`${key}/${turnId}`), prov),
+    });
+    expect(tools.provenanceOf(B)).toEqual(prov);
+    await tools.call(B, 'send_message', { route: 'current', text: 'after reading a watched group' }, { toolCallId: 'p1' });
+    expect(fake.sent).toHaveLength(1);
+    const rec = hub.log.read(SK, 0).find((e) => e.body.t === 'native' && e.body.name === OUTPUT_EVENT)!.native as OutputRecord;
+    expect(rec.provenance).toEqual(prov);
+    expect(asked).toContain('s1/t1');
+  });
+
   it('reply_to keeps the reply target; message_id overrides it', async () => {
     const w = world();
     await call(w, 'reply_to', { route: 'current', text: 'a' }, 'c1');
