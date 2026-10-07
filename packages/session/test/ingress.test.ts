@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { FakeHarness, fakeEnvelope } from '@agents-io/testkit';
-import { Hub, Ingress, Lane, MemorySessionLog, actionId, defaultPolicy, parseActionId, replySummary, type SessionPolicy } from '../src/index.js';
+import { Hub, Ingress, Lane, MemorySessionLog, actionId, defaultPolicy, interruptActionId, parseActionId, replySummary, type SessionPolicy } from '../src/index.js';
 import type { ChannelCaps, InputRecord } from '@agents-io/protocol';
 import { RUN, bodies, until } from './helpers.js';
 
@@ -89,6 +89,60 @@ describe('Ingress', () => {
     const other = await ingress.accept({ ...env, channel: 'other' });
     expect(other.action).not.toBe('duplicate');
     await lanes.get('fake:default:c1')!.whenIdle();
+  });
+
+  it('dedups a duplicate that arrives while the first copy is still being processed', async () => {
+    const { ingress, lanes, seen } = world();
+    const env = fakeEnvelope({ id: 'twice', sender: alice });
+    const rs = await Promise.all([ingress.accept(env), ingress.accept({ ...env })]);
+    expect(rs.map((r) => r.action).sort()).toEqual(['dispatch', 'duplicate']);
+    expect(rs[1]!.inputId).toBe(rs[0]!.inputId);
+    await lanes.get('fake:default:c1')!.whenIdle();
+    expect(seen).toHaveLength(1);
+  });
+
+  it('dedups per account: the same platform message id reaching two accounts is two envelopes', async () => {
+    const { ingress, lanes } = world();
+    const a = await ingress.accept(fakeEnvelope({ id: 'om_1', account: 'a', sender: alice }));
+    const b = await ingress.accept(fakeEnvelope({ id: 'om_1', account: 'b', sender: alice }));
+    expect([a.action, b.action]).toEqual(['dispatch', 'dispatch']);
+    expect(b.sessionKey).toBe('fake:b:c1');
+    await lanes.get('fake:a:c1')!.whenIdle();
+    await lanes.get('fake:b:c1')!.whenIdle();
+  });
+
+  it('routes approval and stop clicks to the session that owns the request or turn', async () => {
+    const hub = new Hub(new MemorySessionLog());
+    const policy = defaultPolicy({ owners: ['fake:alice'], ownerSessionKey: 'main', run: RUN });
+    const asked = new FakeHarness(async (t) => {
+      t.emit({ t: 'request.opened', requestId: 'r1', kind: 'tool_approval', title: 'push', risk: {}, allowedDecisions: ['allow_once', 'deny'], allowAlways: false, defaultDeny: true });
+      await t.waitDecision('r1');
+      await new Promise((_, reject) => t.signal.addEventListener('abort', () => reject(new Error('aborted'))));
+    });
+    const lanes = new Map<string, Lane>();
+    const humanPolicy: SessionPolicy = { ...policy, resolve: async () => ({ kind: 'human', principals: ['fake:alice'], routes: [] }) };
+    const ingress = new Ingress({
+      policy: humanPolicy,
+      hub,
+      lanes: (k) => {
+        let l = lanes.get(k);
+        if (!l) lanes.set(k, (l = new Lane({ sessionKey: k, harness: asked, hub, policy: humanPolicy, thinkingHeadline: null })));
+        return l;
+      },
+    });
+    await ingress.accept(fakeEnvelope({ sender: alice, text: 'ship it' }));
+    const main = () => hub.log.read('main', 0);
+    await until(() => bodies(main(), 'request.opened').length === 1);
+    const turnId = (bodies(main(), 'turn.started')[0] as { turnId: string }).turnId;
+    // Card callbacks carry no DM kind (or thread): the click conversation is not where the turn runs.
+    const click = (aid: string) =>
+      ingress.accept(fakeEnvelope({ sender: alice, conversation: { id: 'c1', kind: 'other' }, content: [{ type: 'event', name: 'action', data: { actionId: aid } }] }));
+    expect(await click(actionId('r1', 'allow_once'))).toMatchObject({ action: 'resolve', sessionKey: 'main', result: { ok: true } });
+    expect(await click(interruptActionId(turnId))).toMatchObject({ action: 'interrupt', sessionKey: 'main', result: { ok: true } });
+    await until(() => bodies(main(), 'turn.completed').length === 1);
+    // An id no session knows is answered without creating a lane for the click's conversation.
+    expect(await click(actionId('nope', 'deny'))).toMatchObject({ action: 'resolve', result: { ok: false, reason: 'unknown_request' } });
+    expect([...lanes.keys()]).toEqual(['main']);
   });
 
   it('drops self echoes and unknown DMs; observes strangers in groups', async () => {

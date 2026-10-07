@@ -34,6 +34,15 @@ describe('defaultPolicy.identify', () => {
     expect(await id('peerbot')).toEqual({ kind: 'agent', principal: null });
   });
 
+  it('never accepts a declared identity that names an owner, even from a trusted agent account', async () => {
+    const r = await id('peerbot', { declared: 'fake:alice' });
+    expect(r.principal).toBeNull();
+    expect(r.kind).toBe('agent');
+    // So it can neither act as the owner's turn nor pass Policy.control as them.
+    const o = { kind: r.kind, principal: r.principal, evidence: 'platform_signed' as const, via: 'fake:default:c1', adapter: 'fake' };
+    expect(await p.control({ sessionKey: 's', op: 'interrupt', origin: o, turn: { owner: 'fake:alice' } as TurnContext })).toBe('deny');
+  });
+
   it('marks this deployment’s own echoes as self', async () => {
     expect(await id('mybot', { declared: 'runner:me/run:1' })).toMatchObject({ kind: 'agent', self: true });
     expect(await id('peerbot', { declared: 'runner:me/run:2' })).toMatchObject({ self: true });

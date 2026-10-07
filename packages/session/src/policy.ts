@@ -77,7 +77,8 @@ export function defaultPolicy(o: DefaultPolicyOptions): FullPolicy {
         return { kind: 'agent', principal: null, self: true, ...(a.declared !== undefined ? { declared: a.declared } : {}) };
       }
       if (agentAccounts.has(key)) {
-        if (a.declared === undefined) return { kind: 'agent', principal: null };
+        // Declarations only describe agents: one naming an owner is a forgery, never that owner.
+        if (a.declared === undefined || owners.has(a.declared)) return { kind: 'agent', principal: null };
         const self = o.isSelfDeclared?.(a.declared) ?? false;
         return { kind: 'agent', principal: { id: a.declared, labels: ['agent'] }, declared: a.declared, ...(self ? { self } : {}) };
       }

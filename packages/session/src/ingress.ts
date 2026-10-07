@@ -10,6 +10,7 @@ import {
   type Origin,
   type Tier,
 } from '@agents-io/protocol';
+import type { Hub } from './hub.js';
 import type { CommandResult, Lane } from './lane.js';
 import { conversationRouteKey, withDefaults, type FullPolicy, type SessionPolicy } from './policy.js';
 import type { WatchDelivery, WatchDispatcher } from './watch.js';
@@ -48,6 +49,12 @@ export interface IngressOptions {
   policy?: SessionPolicy;
   /** Lane for a session key; the host decides how lanes are created and kept. */
   lanes: (sessionKey: string) => Lane | Promise<Lane>;
+  /**
+   * The hub the lanes write to. When given, approval and stop clicks go to the
+   * session that owns the request or turn (`Hub.locate`), not to the click's
+   * conversation (card callbacks often carry another conversation kind, no thread).
+   */
+  hub?: Pick<Hub, 'locate'>;
   newId?: (prefix: string) => string;
   /** How many envelope ids to remember for dedup (default 10 000). */
   dedupWindow?: number;
@@ -83,7 +90,9 @@ export class Ingress {
   private readonly policy: FullPolicy;
   private readonly newId: (prefix: string) => string;
   private seen = new Map<string, IngressResult>();
-  /** `${channel}:${envelopeId}` → inputId, so revisions keep the original input id. */
+  /** Envelopes being processed, so a concurrent duplicate waits for (and reuses) the first. */
+  private inflight = new Map<string, Promise<IngressResult>>();
+  /** `${channel}:${account}:${envelopeId}` → inputId, so revisions keep the original input id. */
   private inputIds = new Map<string, string>();
 
   constructor(private readonly o: IngressOptions) {
@@ -102,11 +111,24 @@ export class Ingress {
   async accept(env: InboundEnvelope): Promise<IngressResult> {
     const errs = errors(InboundEnvelope, env);
     if (errs.length) return { accepted: false, action: 'invalid', error: errs.slice(0, 3).join('; ') };
-    const key = `${env.channel}:${env.id}`;
+    // Per account too: a platform message id is shared by every bot account that receives it.
+    const key = envKey(env.channel, env.account, env.id);
     const prior = this.seen.get(key);
     if (prior) return { ...prior, action: 'duplicate' };
-    const r = await this.process(env);
-    if (r.accepted) this.remember(key, r);
+    const running = this.inflight.get(key);
+    if (running) {
+      const first = await running.catch(() => undefined);
+      return first?.accepted ? { ...first, action: 'duplicate' } : this.accept(env);
+    }
+    const p = this.process(env);
+    this.inflight.set(key, p);
+    let r: IngressResult;
+    try {
+      r = await p;
+      if (r.accepted) this.remember(key, r);
+    } finally {
+      this.inflight.delete(key);
+    }
     const watched = await this.fanout(env, r);
     return watched?.length ? { ...r, watched } : r;
   }
@@ -170,27 +192,29 @@ export class Ingress {
     if (admission.action === 'drop') return { accepted: true, action: 'drop', origin };
     const sessionKey = admission.sessionKey ?? conversationRouteKey(env);
 
-    // A button click on an approval card becomes a resolve command; the lane re-checks eligibility.
+    // A button click acts on a request or turn: it goes to the session that owns it, which
+    // re-checks who may act (resolver eligibility, Policy.control, still the running turn).
     const click = actionClick(env);
-    if (click?.kind === 'interrupt') {
-      // The lane checks Policy.control and that the turn is still the running one.
-      const lane = await this.o.lanes(sessionKey);
-      const result = await lane.command({ type: 'interrupt', sessionKey, turnId: click.turnId, origin });
-      return { accepted: true, action: 'interrupt', sessionKey, origin, result };
-    }
     if (click) {
-      const lane = await this.o.lanes(sessionKey);
-      const cmd: Command = { type: 'resolve', sessionKey, requestId: click.requestId, decision: { kind: click.kind }, origin };
+      const owner = this.o.hub ? this.o.hub.locate(click.kind === 'interrupt' ? { turnId: click.turnId } : { requestId: click.requestId }) : sessionKey;
+      const action = click.kind === 'interrupt' ? ('interrupt' as const) : ('resolve' as const);
+      // Unknown id: answer without creating a lane for the click's conversation.
+      if (owner === undefined) return { accepted: true, action, origin, result: { ok: false, reason: click.kind === 'interrupt' ? 'stale_turn' : 'unknown_request' } };
+      const lane = await this.o.lanes(owner);
+      const cmd: Command =
+        click.kind === 'interrupt'
+          ? { type: 'interrupt', sessionKey: owner, turnId: click.turnId, origin }
+          : { type: 'resolve', sessionKey: owner, requestId: click.requestId, decision: { kind: click.kind }, origin };
       const result = await lane.command(cmd);
-      return { accepted: true, action: 'resolve', sessionKey, origin, result };
+      return { accepted: true, action, sessionKey: owner, origin, result };
     }
 
-    const revisionOf = env.revisionOf !== undefined ? this.inputIds.get(`${env.channel}:${env.revisionOf}`) : undefined;
+    const revisionOf = env.revisionOf !== undefined ? this.inputIds.get(envKey(env.channel, env.account, env.revisionOf)) : undefined;
     const observe = admission.action === 'observe';
     // Latest-wins revisions keep the original input id, but only for observe-only inputs:
     // a dispatched input may already be running, so its revision is a new input.
     const inputId = observe && revisionOf ? revisionOf : this.newId('in');
-    this.inputIds.set(`${env.channel}:${env.id}`, inputId);
+    this.inputIds.set(envKey(env.channel, env.account, env.id), inputId);
 
     const input: InputRecord = {
       inputId,
@@ -231,6 +255,8 @@ export function replySummary(caps: ChannelCaps, tier: Tier): string {
   const media = caps.media.out.length ? caps.media.out.join(',') : 'none';
   return `${tier} markdown=${caps.text.markdown} maxChars=${caps.text.maxChars} buttons=${caps.buttons ? 'yes' : 'no'} media=${media}`;
 }
+
+const envKey = (channel: string, account: string, id: string) => `${channel}:${account}:${id}`;
 
 function actionClick(env: InboundEnvelope) {
   if (env.content.length !== 1) return undefined;

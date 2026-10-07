@@ -113,6 +113,42 @@ describe('Hub', () => {
     expect(await kinds('final', 3)).toEqual(['request.opened', 'request.resolved', 'text.snapshot']);
   });
 
+  it('a lagging subscription yields nothing more once closed', async () => {
+    const hub = new Hub(new MemorySessionLog());
+    const ac = new AbortController();
+    const sub = hub.subscribe({ sessionKey: 's', fromSeq: 0, tier: 'full', bufferSize: 2, signal: ac.signal });
+    for (let i = 0; i < 10; i++) hub.append('s', draft({ t: 'headline', text: `h${i}` }));
+    expect(sub.lagging).toBe(true);
+    ac.abort();
+    const got: SessionEvent[] = [];
+    for await (const e of sub) got.push(e);
+    expect(got).toEqual([]);
+  });
+
+  it("a late joiner's snapshot holds only what its visibility and tier would show live", async () => {
+    const hub = new Hub(new MemorySessionLog());
+    const item = (itemId: string) => ({ itemId, type: 'command' as const, title: 't', status: 'running' as const, inputSummary: `SECRET ${itemId}` });
+    hub.append('s', draft({ t: 'item.started', item: item('dbg') }, { level: 'debug', visibility: 'operators' }));
+    hub.append('s', draft({ t: 'item.started', item: item('int') }, { audience: 'internal', visibility: 'internal' }));
+    hub.append('s', draft({ t: 'item.started', item: item('ok') }));
+    type Snap = SessionEvent & { native: { activeItems: { itemId: string; inputSummary?: string }[] } };
+    const first = async (tier: 'full' | 'card') => ((await take(hub.subscribe({ sessionKey: 's', tier }), 1))[0] as Snap).native.activeItems;
+    expect(await first('card')).toEqual([{ itemId: 'ok', type: 'command', title: 't', status: 'running' }]);
+    expect((await first('full')).map((i) => i.itemId)).toEqual(['ok']);
+    expect((await first('full'))[0]!.inputSummary).toBe('SECRET ok');
+  });
+
+  it('knows which session a turn or request belongs to', () => {
+    const hub = new Hub(new MemorySessionLog());
+    hub.append('a', draft({ t: 'turn.started', turnId: 't1', inputIds: [], replyRoute: null }));
+    hub.append('b', draft({ t: 'request.opened', requestId: 'r1', kind: 'tool_approval', title: 'x', risk: {}, allowedDecisions: [], allowAlways: false, defaultDeny: true }));
+    hub.append('c', draft({ t: 'turn.adopted', turnId: 't2', nativeTurnId: 'n', inputIds: [] }));
+    expect(hub.locate({ turnId: 't1' })).toBe('a');
+    expect(hub.locate({ requestId: 'r1' })).toBe('b');
+    expect(hub.locate({ turnId: 't2' })).toBe('c');
+    expect(hub.locate({ turnId: 'nope' })).toBeUndefined();
+  });
+
   it('keeps internal events out unless asked for', () => {
     const e = { ...draft({ t: 'headline', text: 'x' }), v: 1, sessionKey: 's', seq: 1, harness: 'h', generation: 1, visibility: 'internal' } as SessionEvent;
     expect(passes(e, 'full')).toBe(false);
