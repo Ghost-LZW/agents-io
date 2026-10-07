@@ -4,6 +4,7 @@ import type { AddressInfo } from 'node:net';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
+import type { TurnProvenance } from '@agents-io/protocol';
 import { ToolError, type CallMeta, type HostTools, type ToolBinding } from './tools.js';
 
 export const SERVER_NAME = 'agents_io';
@@ -108,7 +109,7 @@ export interface HostMcpServerOptions {
   /** Default 0: an ephemeral port. */
   port?: number;
   /** Called for every tool call (debugging, verifying what harnesses send in `_meta`). */
-  onCall?: (e: { binding: ToolBinding; tool: string; meta: Record<string, unknown> | undefined; ok: boolean; error?: string }) => void;
+  onCall?: (e: { binding: ToolBinding; tool: string; meta: Record<string, unknown> | undefined; ok: boolean; error?: string; provenance?: TurnProvenance }) => void;
 }
 
 function isLoopback(host: string): boolean {
@@ -257,13 +258,16 @@ export class HostMcpServer {
           const id = callIdOf(extra._meta);
           if (id) meta.toolCallId = id;
           if (extra.requestId !== undefined) meta.requestId = extra.requestId;
+          // Taken before the call: the turn may end while the tool runs.
+          const provenance = this.o.tools.provenanceOf(b);
+          const prov = provenance ? { provenance } : {};
           try {
             const text = await this.o.tools.call(b, name, args ?? {}, meta);
-            this.o.onCall?.({ binding: b, tool: name, meta: extra._meta, ok: true });
+            this.o.onCall?.({ binding: b, tool: name, meta: extra._meta, ok: true, ...prov });
             return { content: [{ type: 'text' as const, text }] };
           } catch (e) {
             const msg = e instanceof ToolError ? e.message : `internal error: ${(e as Error).message}`;
-            this.o.onCall?.({ binding: b, tool: name, meta: extra._meta, ok: false, error: msg });
+            this.o.onCall?.({ binding: b, tool: name, meta: extra._meta, ok: false, error: msg, ...prov });
             return { isError: true, content: [{ type: 'text' as const, text: msg }] };
           }
         },

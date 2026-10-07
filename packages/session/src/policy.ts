@@ -1,6 +1,5 @@
 import {
   routeKey,
-  type Admission,
   type BodyOf,
   type IdentifyArgs,
   type Identity,
@@ -18,13 +17,18 @@ import {
   type Watch,
   type WatchSource,
 } from '@agents-io/protocol';
+import { IdentityMap, OWNER_LABEL, ownerIdentities } from './identity.js';
 
 export type { ControlArgs };
 
 /** The protocol `Policy`; kept as an alias for existing imports. */
 export type SessionPolicy = Policy;
 
-export type FullPolicy = Required<SessionPolicy>;
+/**
+ * Every hook filled in, except `admit`: routing is the `Router`'s binding tables.
+ * `admit` is legacy and only present when a host app set it (see `RouterOptions.legacyAdmit`).
+ */
+export type FullPolicy = Required<Omit<SessionPolicy, 'admit'>> & Pick<SessionPolicy, 'admit'>;
 
 export interface DefaultPolicyOptions {
   /** Owners as `${channel}:${channelUserId}`. Nobody else is identified. */
@@ -39,7 +43,11 @@ export interface DefaultPolicyOptions {
   run?: Omit<RunSpec, 'profile'>;
   /** Route keys the owner preregistered as allowed outbound destinations. */
   routes?: string[];
-  /** Put every owner DM into this one session instead of one per conversation. */
+  /**
+   * Not used by the policy any more: owner DMs go to this session through the
+   * default binding table (`ownersTable({ ownerSessionKey })`). Kept so existing
+   * option objects still type-check.
+   */
   ownerSessionKey?: string;
   /**
    * Evidence an input must carry to be recognised as an owner. Default
@@ -53,7 +61,7 @@ export interface DefaultPolicyOptions {
   watchAllowlist?: Partial<Pick<WatchSource, 'channel' | 'account' | 'conversation' | 'conversationKind'>>[];
 }
 
-const OWNER = 'owner';
+const OWNER = OWNER_LABEL;
 
 export function conversationRouteKey(env: InboundEnvelope): string {
   return routeKey({
@@ -71,43 +79,16 @@ const isOwner = (o: Origin | undefined) => !!o?.principal?.labels.includes(OWNER
  * is meant to be overridden by spreading: `{ ...defaultPolicy(o), resolve }`.
  */
 export function defaultPolicy(o: DefaultPolicyOptions): FullPolicy {
-  const owners = new Set(o.owners);
-  const selfAccounts = new Set(o.selfAccounts ?? []);
-  const agentAccounts = new Set(o.agentAccounts ?? []);
-  const ownerEvidence = new Set<Evidence>(o.ownerEvidence ?? ['platform_signed', 'dkim_pass']);
+  const ids = new IdentityMap([ownerIdentities(o.owners, o.ownerEvidence)], {
+    ...(o.selfAccounts ? { selfAccounts: o.selfAccounts } : {}),
+    ...(o.agentAccounts ? { agentAccounts: o.agentAccounts } : {}),
+    ...(o.isSelfDeclared ? { isSelfDeclared: o.isSelfDeclared } : {}),
+  });
   const routes = new Set(o.routes ?? []);
 
   return {
     async identify(a: IdentifyArgs): Promise<Identity> {
-      const key = `${a.channel}:${a.channelUserId}`;
-      if (selfAccounts.has(key)) {
-        return { kind: 'agent', principal: null, self: true, ...(a.declared !== undefined ? { declared: a.declared } : {}) };
-      }
-      if (agentAccounts.has(key)) {
-        // Declarations only describe agents: one naming an owner is a forgery, never that owner.
-        if (a.declared === undefined || owners.has(a.declared)) return { kind: 'agent', principal: null };
-        const self = o.isSelfDeclared?.(a.declared) ?? false;
-        return { kind: 'agent', principal: { id: a.declared, labels: ['agent'] }, declared: a.declared, ...(self ? { self } : {}) };
-      }
-      // A declaration from any other account is a claim we do not accept.
-      // An owner address alone proves nothing (a mail From header is trivially forged): require evidence.
-      if (owners.has(key) && ownerEvidence.has(a.evidence)) return { kind: 'human', principal: { id: key, labels: [OWNER] } };
-      return { kind: a.isBot ? 'agent' : 'human', principal: null };
-    },
-
-    async admit(env: InboundEnvelope, origin: Origin): Promise<Admission> {
-      const key = conversationRouteKey(env);
-      if (origin.self || env.admission === 'drop') return { action: 'drop' };
-      const dm = env.conversation.kind === 'dm';
-      if (isOwner(origin)) {
-        return {
-          action: env.admission === 'observe' ? 'observe' : 'dispatch',
-          sessionKey: dm && o.ownerSessionKey ? o.ownerSessionKey : key,
-          mode: env.modeHint ?? 'queue',
-        };
-      }
-      if (dm) return { action: 'drop' };
-      return { action: 'observe', sessionKey: key };
+      return ids.identify(a);
     },
 
     async plan(turn: TurnDraft): Promise<RunSpec> {
@@ -172,7 +153,7 @@ export function withDefaults(p: SessionPolicy = {}): FullPolicy {
   const d = defaultPolicy({ owners: [] });
   return {
     identify: p.identify?.bind(p) ?? d.identify,
-    admit: p.admit?.bind(p) ?? d.admit,
+    ...(p.admit ? { admit: p.admit.bind(p) } : {}),
     plan: p.plan?.bind(p) ?? d.plan,
     resolve: p.resolve?.bind(p) ?? d.resolve,
     outbound: p.outbound?.bind(p) ?? d.outbound,

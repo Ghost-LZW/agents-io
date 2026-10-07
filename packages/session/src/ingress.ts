@@ -11,9 +11,11 @@ import {
   type Origin,
   type Tier,
 } from '@agents-io/protocol';
+import { channelRefOf, type HostQueue } from './host-queue.js';
 import type { Hub } from './hub.js';
 import type { CommandResult, Lane } from './lane.js';
 import { conversationRouteKey, withDefaults, type FullPolicy, type SessionPolicy } from './policy.js';
+import { Router, defaultBindings, sourceOf, type Explanation, type RouteDelivery } from './router.js';
 import type { WatchDelivery, WatchDispatcher } from './watch.js';
 
 const ACTION_PREFIX = 'req:';
@@ -48,8 +50,20 @@ export function parseInterruptActionId(id: string): { turnId: string } | undefin
 
 export interface IngressOptions {
   policy?: SessionPolicy;
-  /** Lane for a session key; the host decides how lanes are created and kept. */
-  lanes: (sessionKey: string) => Lane | Promise<Lane>;
+  /**
+   * Lane for a session key; the host decides how lanes are created and kept.
+   * `agent` is the binding's target agent (a named run configuration), absent for
+   * watch deliveries and legacy admits.
+   */
+  lanes: (sessionKey: string, agent?: string) => Lane | Promise<Lane>;
+  /**
+   * The binding tables. Default: a router with `defaultBindings({ agent: "default" })`
+   * (bare route-key sessions) over `watches`, or — when the policy sets the
+   * legacy `Policy.admit` — no table at all, so `admit` decides.
+   */
+  router?: Router;
+  /** Where `on: "host"` inputs go. Without one they are only logged (`onHostUnavailable`). */
+  hostQueue?: HostQueue;
   /**
    * The hub the lanes write to. When given, approval and stop clicks go to the
    * session that owns the request or turn (`Hub.locate`), not to the click's
@@ -58,16 +72,19 @@ export interface IngressOptions {
   hub?: Pick<Hub, 'locate'>;
   newId?: (prefix: string) => string;
   /**
-   * Rewrite an admitted envelope before it becomes an input, e.g. turn a click on
+   * Rewrite a routed envelope before it becomes an input, e.g. turn a click on
    * an `ask_choice` button (or a numbered reply) into a `choice` event for the
-   * session that asked. Return undefined to leave it unchanged.
+   * session that asked. Applies to the strongest table delivery (not to watch
+   * deliveries). Return undefined to leave it unchanged.
    */
   rewrite?: (args: { env: InboundEnvelope; origin: Origin; sessionKey: string }) => InboundRewrite | undefined | Promise<InboundRewrite | undefined>;
   /** How many envelope ids to remember for dedup (default 10 000). */
   dedupWindow?: number;
-  /** Watches: after its own admission an envelope is also delivered to every session watching it. */
+  /** Watches: delivered through when a watch rule wins a session, and the digest machinery of `on: "digest"` rules. */
   watches?: WatchDispatcher;
   onWatchError?: (err: unknown) => void;
+  /** A `host` rule matched but there is no `hostQueue`. */
+  onHostUnavailable?: (args: { inputId: string; bindingId: string }) => void;
   /**
    * Capabilities of the adapter that renders replies to a route, and the tier it renders
    * at (default `caps.defaultTier`). When given, inputs with a reply route carry a
@@ -82,25 +99,47 @@ export interface InboundRewrite {
   content?: ContentBlock[];
 }
 
+/** What happened at one target session. */
+export interface DeliveryOutcome {
+  bindingId: string;
+  source: RouteDelivery['source'];
+  on: RouteDelivery['on'];
+  sessionKey: string;
+  agent?: string;
+  inputId?: string;
+  result?: CommandResult;
+  /** Watch and digest deliveries: what the watch machinery did. */
+  watch?: WatchDelivery;
+}
+
 export interface IngressResult {
   /** The host durably took the envelope (also true for a deliberate drop). */
   accepted: boolean;
-  action: 'dispatch' | 'observe' | 'drop' | 'resolve' | 'interrupt' | 'duplicate' | 'invalid';
+  /** The strongest table delivery: `dispatch`, else `observe` (context / digest), else `host` (only queued), else `drop`. */
+  action: 'dispatch' | 'observe' | 'host' | 'drop' | 'resolve' | 'interrupt' | 'duplicate' | 'invalid';
   inputId?: string;
   sessionKey?: string;
   origin?: Origin;
   result?: CommandResult;
   error?: string;
-  /** Deliveries to watching sessions (only when a watch matched). */
+  /** Deliveries through watches (only when a watch rule won a session). */
   watched?: WatchDelivery[];
+  /** Every target session, table rules and watches. */
+  deliveries?: DeliveryOutcome[];
+  /** Queued for the host. */
+  host?: { cursor: number; duplicate: boolean; bindingId: string };
+  /** Why (also persisted: `Router.explain(inputId)`). */
+  explanation?: Explanation;
 }
 
 /**
- * Turns adapter claims into stamped inputs. Identity is only ever concluded by
- * `Policy.identify`; whatever the envelope says about the sender is evidence.
+ * Turns adapter claims into stamped, routed inputs. Identity is only ever
+ * concluded by `Policy.identify`; whatever the envelope says about the sender is
+ * evidence. Where the input goes is the `Router`'s binding tables.
  */
 export class Ingress {
   private readonly policy: FullPolicy;
+  private readonly router: Router;
   private readonly newId: (prefix: string) => string;
   private seen = new Map<string, IngressResult>();
   /** Envelopes being processed, so a concurrent duplicate waits for (and reuses) the first. */
@@ -111,6 +150,14 @@ export class Ingress {
   constructor(private readonly o: IngressOptions) {
     this.policy = withDefaults(o.policy);
     this.newId = o.newId ?? ((p) => `${p}_${randomUUID()}`);
+    this.router =
+      o.router ??
+      new Router({
+        agents: [{ name: DEFAULT_AGENT, sessionPrefix: '' }],
+        defaultAgent: DEFAULT_AGENT,
+        ...(this.policy.admit ? { legacyAdmit: this.policy.admit } : { config: { version: 'default', bindings: defaultBindings({ agent: DEFAULT_AGENT }), identities: [] } }),
+        ...(o.watches ? { watches: o.watches } : {}),
+      });
   }
 
   /** A `ChannelContext.emit` implementation for one adapter. */
@@ -135,40 +182,12 @@ export class Ingress {
     }
     const p = this.process(env);
     this.inflight.set(key, p);
-    let r: IngressResult;
     try {
-      r = await p;
+      const r = await p;
       if (r.accepted) this.remember(key, r);
+      return r;
     } finally {
       this.inflight.delete(key);
-    }
-    const watched = await this.fanout(env, r);
-    return watched?.length ? { ...r, watched } : r;
-  }
-
-  /**
-   * The watch step, separate from (and after) the envelope's own admission.
-   *
-   * It runs whatever the admission was, including `drop`: a policy drop means
-   * "not for the session it would have gone to" (a stranger's DM, a group
-   * message nobody addressed to the bot), which is exactly what a watch on the
-   * owner's inbox or a group is for. It does not run for what is not a message
-   * at all: an adapter-level drop (`env.admission === 'drop'`: auto-replies,
-   * bounces, bulk mail), card clicks (resolve/interrupt), invalid envelopes and
-   * duplicates. Our own echoes reach it but are filtered by `excludeSelf`
-   * (default true) and can never trigger. A host that wants a sender ignored
-   * everywhere says so in `Policy.triage` as well as in `Policy.admit`.
-   */
-  private async fanout(env: InboundEnvelope, r: IngressResult): Promise<WatchDelivery[] | undefined> {
-    const w = this.o.watches;
-    if (!w || !r.accepted || !r.origin) return undefined;
-    if (r.action !== 'dispatch' && r.action !== 'observe' && r.action !== 'drop') return undefined;
-    if (env.admission === 'drop' || actionClick(env)) return undefined;
-    try {
-      return await w.fanout(env, r.origin, r.action === 'drop' ? undefined : r.sessionKey, channelContext(env, undefined)); // no reply summary: it would describe the watched source, not where the reply goes
-    } catch (e) {
-      this.o.onWatchError?.(e);
-      return undefined;
     }
   }
 
@@ -201,18 +220,12 @@ export class Ingress {
       adapter: env.channel,
     };
 
-    const admission = await this.policy.admit(env, origin);
-    if (admission.action === 'drop') return { accepted: true, action: 'drop', origin };
-    let sessionKey = admission.sessionKey ?? conversationRouteKey(env);
-    const rw = await this.o.rewrite?.({ env, origin, sessionKey });
-    if (rw?.sessionKey) sessionKey = rw.sessionKey;
-    if (rw?.content) env = { ...env, content: rw.content };
-
-    // A button click acts on a request or turn: it goes to the session that owns it, which
-    // re-checks who may act (resolver eligibility, Policy.control, still the running turn).
-    const click = actionClick(env);
+    // A click on an approval or stop button acts on a request or turn: it goes to the session that
+    // owns it (Hub index), which re-checks who may act (resolver eligibility, Policy.control, still
+    // the running turn). Other action ids are inputs and route through the bindings (`actionPrefix`).
+    const click = env.admission === 'drop' || origin.self ? undefined : actionClick(env);
     if (click) {
-      const owner = this.o.hub ? this.o.hub.locate(click.kind === 'interrupt' ? { turnId: click.turnId } : { requestId: click.requestId }) : sessionKey;
+      const owner = this.o.hub ? this.o.hub.locate(click.kind === 'interrupt' ? { turnId: click.turnId } : { requestId: click.requestId }) : conversationRouteKey(env);
       const action = click.kind === 'interrupt' ? ('interrupt' as const) : ('resolve' as const);
       // Unknown id: answer without creating a lane for the click's conversation.
       if (owner === undefined) return { accepted: true, action, origin, result: { ok: false, reason: click.kind === 'interrupt' ? 'stale_turn' : 'unknown_request' } };
@@ -226,26 +239,100 @@ export class Ingress {
     }
 
     const revisionOf = env.revisionOf !== undefined ? this.inputIds.get(envKey(env.channel, env.account, env.revisionOf)) : undefined;
-    const observe = admission.action === 'observe';
-    // Latest-wins revisions keep the original input id, but only for observe-only inputs:
-    // a dispatched input may already be running, so its revision is a new input.
-    const inputId = observe && revisionOf ? revisionOf : this.newId('in');
-    this.inputIds.set(envKey(env.channel, env.account, env.id), inputId);
-
-    const input: InputRecord = {
-      inputId,
+    let input: InputRecord = {
+      inputId: revisionOf ?? this.newId('in'),
       origin,
       content: env.content,
       replyRoute: env.replyRoute,
       channelContext: channelContext(env, this.replyOf(env)),
     };
-    const lane = await this.o.lanes(sessionKey);
-    if (observe) {
-      const result = await lane.observe(input);
-      return { accepted: true, action: 'observe', inputId, sessionKey, origin, result };
+    const decision = await this.router.route(env, origin, input);
+    const own = decision.deliveries.filter((d) => d.source !== 'watch');
+    // Latest-wins revisions keep the original input id, but only for context-only inputs:
+    // a dispatched input may already be running, so its revision is a new input.
+    if (revisionOf && own.some((d) => d.on === 'dispatch')) input = { ...input, inputId: this.newId('in') };
+    this.inputIds.set(envKey(env.channel, env.account, env.id), input.inputId);
+    const explanation: Explanation = { ...decision.explanation, inputId: input.inputId };
+    this.router.record(explanation);
+
+    // The strongest table delivery is the input's own place (where a click on a choice is rewritten to).
+    const primary = own.find((d) => d.on === 'dispatch') ?? own.find((d) => d.on === 'digest') ?? own[0];
+    if (primary && this.o.rewrite) {
+      const rw = await this.o.rewrite({ env, origin, sessionKey: primary.sessionKey });
+      if (rw?.content) {
+        env = { ...env, content: rw.content };
+        input = { ...input, content: rw.content };
+      }
+      if (rw?.sessionKey && rw.sessionKey !== primary.sessionKey) {
+        // Another table delivery already going there yields to the rewritten primary.
+        const i = decision.deliveries.findIndex((d) => d !== primary && d.sessionKey === rw.sessionKey && d.source !== 'watch');
+        if (i >= 0) decision.deliveries.splice(i, 1);
+        primary.sessionKey = rw.sessionKey;
+      }
     }
-    const result = await lane.command({ type: 'input', sessionKey, input, mode: admission.mode ?? env.modeHint ?? 'queue' });
-    return { accepted: true, action: 'dispatch', inputId, sessionKey, origin, result };
+
+    const outcomes: DeliveryOutcome[] = [];
+    const watched: WatchDelivery[] = [];
+    for (const d of decision.deliveries) {
+      if (d.source === 'watch') continue;
+      outcomes.push(await this.deliverOwn(d, env, origin, input));
+    }
+    let host: IngressResult['host'];
+    if (decision.host) {
+      if (this.o.hostQueue) {
+        const { raw: _raw, ...envelope } = env;
+        const r = this.o.hostQueue.append({ channelRef: channelRefOf(env), bindingId: decision.host.bindingId, input, envelope, receivedAt: Date.now() });
+        host = { ...r, bindingId: decision.host.bindingId };
+      } else this.o.onHostUnavailable?.({ inputId: input.inputId, bindingId: decision.host.bindingId });
+    }
+    for (const d of decision.deliveries) {
+      if (d.source !== 'watch' || !this.o.watches || d.watchId === undefined) continue;
+      try {
+        // No reply summary: it would describe the watched source, not where the reply goes.
+        const w = await this.o.watches.deliverWatch(d.watchId, env, origin, channelContext(env, undefined));
+        watched.push(w);
+        outcomes.push({ bindingId: d.bindingId, source: d.source, on: d.on, sessionKey: d.sessionKey, ...(w.inputId ? { inputId: w.inputId } : {}), ...(w.result ? { result: w.result } : {}), watch: w });
+      } catch (e) {
+        this.o.onWatchError?.(e);
+      }
+    }
+
+    const first = outcomes.find((x) => x.source !== 'watch' && x.on === 'dispatch') ?? outcomes.find((x) => x.source !== 'watch');
+    const action: IngressResult['action'] = first ? (first.on === 'dispatch' ? 'dispatch' : 'observe') : host ? 'host' : 'drop';
+    return {
+      accepted: true,
+      action,
+      inputId: first?.inputId ?? input.inputId,
+      ...(first ? { sessionKey: first.sessionKey } : {}),
+      origin,
+      ...(first?.result ? { result: first.result } : {}),
+      ...(watched.length ? { watched } : {}),
+      deliveries: outcomes,
+      ...(host ? { host } : {}),
+      explanation,
+    };
+  }
+
+  /** One table delivery: a turn, a context record, or a digest item. */
+  private async deliverOwn(d: RouteDelivery, env: InboundEnvelope, origin: Origin, input: InputRecord): Promise<DeliveryOutcome> {
+    const base = { bindingId: d.bindingId, source: d.source, on: d.on, sessionKey: d.sessionKey, ...(d.agent ? { agent: d.agent } : {}), inputId: input.inputId };
+    if (d.on === 'digest' && this.o.watches && d.digest) {
+      const w = await this.o.watches.deliverDigest(
+        { rule: `${d.source}:${d.bindingId}`, sessionKey: d.sessionKey, digest: d.digest, source: sourceOf(d.match), ...(d.note !== undefined ? { note: d.note } : {}) },
+        env,
+        origin,
+        channelContext(env, undefined),
+      );
+      return { ...base, ...(w.inputId ? { inputId: w.inputId } : {}), ...(w.result ? { result: w.result } : {}), watch: w };
+    }
+    const lane = await this.o.lanes(d.sessionKey, d.agent);
+    if (d.on === 'dispatch') {
+      const result = await lane.command({ type: 'input', sessionKey: d.sessionKey, input, mode: d.mode ?? env.modeHint ?? 'queue' });
+      return { ...base, result };
+    }
+    // context (or a digest without the watch machinery: recorded, never batched)
+    const result = await lane.observe(input);
+    return { ...base, result };
   }
 
   private replyOf(env: InboundEnvelope): string | undefined {
@@ -258,6 +345,9 @@ export class Ingress {
     }
   }
 }
+
+/** Agent name of the router `Ingress` builds when given none. */
+export const DEFAULT_AGENT = 'default';
 
 /**
  * How a reply to this input will be shown, as one compact line (`channelContext.reply`):

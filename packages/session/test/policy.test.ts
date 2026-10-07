@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest';
-import { fakeEnvelope } from '@agents-io/testkit';
 import type { TurnContext } from '@agents-io/protocol';
 import { defaultPolicy } from '../src/index.js';
 import { input, origin, route } from './helpers.js';
@@ -46,25 +45,6 @@ describe('defaultPolicy.identify', () => {
   it('marks this deployment’s own echoes as self', async () => {
     expect(await id('mybot', { declared: 'runner:me/run:1' })).toMatchObject({ kind: 'agent', self: true });
     expect(await id('peerbot', { declared: 'runner:me/run:2' })).toMatchObject({ self: true });
-  });
-});
-
-describe('defaultPolicy.admit', () => {
-  const dm = { id: 'c1', kind: 'dm' as const };
-  const group = { id: 'g1', kind: 'group' as const };
-  it('dispatches owner DMs, observes unknown senders in groups, drops them in DMs, drops self echoes', async () => {
-    const owner = origin('fake:alice');
-    const unknown = origin(null);
-    expect(await p.admit(fakeEnvelope({ conversation: dm }), owner)).toEqual({ action: 'dispatch', sessionKey: 'fake:default:c1', mode: 'queue' });
-    expect(await p.admit(fakeEnvelope({ conversation: group, modeHint: 'steer' }), owner)).toEqual({ action: 'dispatch', sessionKey: 'fake:default:g1', mode: 'steer' });
-    expect(await p.admit(fakeEnvelope({ conversation: group }), unknown)).toEqual({ action: 'observe', sessionKey: 'fake:default:g1' });
-    expect(await p.admit(fakeEnvelope({ conversation: dm }), unknown)).toEqual({ action: 'drop' });
-    expect(await p.admit(fakeEnvelope({ conversation: group }), { ...owner, self: true })).toEqual({ action: 'drop' });
-  });
-
-  it('can merge owner DMs into one session', async () => {
-    const q = defaultPolicy({ owners: ['fake:alice'], ownerSessionKey: 'main' });
-    expect(await q.admit(fakeEnvelope({ conversation: dm }), origin('fake:alice'))).toMatchObject({ sessionKey: 'main' });
   });
 });
 

@@ -17,10 +17,12 @@ import {
   type RunSpec,
   type SessionEvent,
   type TurnContext,
+  type TurnProvenance,
 } from '@agents-io/protocol';
 import type { Hub } from './hub.js';
 import type { EventDraft, SessionSnapshot, SessionState, Visibility } from './log.js';
 import { withDefaults, type FullPolicy, type SessionPolicy } from './policy.js';
+import { GROUPISH } from './watch.js';
 
 export interface ModelReviewArgs {
   sessionKey: string;
@@ -159,6 +161,10 @@ export class Lane {
   private dangling: Dangling | undefined;
   /** The harness was opened (once) to give it a chance to adopt `dangling` before a new turn settles it. */
   private adoptionChecked = false;
+  /** Provenance of recent turns, by turn id (bounded). */
+  private provenances = new Map<string, TurnProvenance>();
+  /** What the context-only inputs recorded in this lane so far bring into every later turn. */
+  private ctxSeen = { any: false, external: false, group: false };
 
   constructor(private readonly o: LaneOptions) {
     this.sessionKey = o.sessionKey;
@@ -184,6 +190,9 @@ export class Lane {
   observe(input: InputRecord): Promise<CommandResult> {
     return this.serial(async () => {
       this.observedInputs.set(input.inputId, input);
+      this.ctxSeen.any = true;
+      if (isExternal(input)) this.ctxSeen.external = true;
+      if (isGroup(input)) this.ctxSeen.group = true;
       this.emit({ body: { t: 'input.admitted', inputId: input.inputId, disposition: 'observe_only', ...pid(input) } });
       return { ok: true, disposition: 'observe_only' } as const;
     });
@@ -222,6 +231,33 @@ export class Lane {
    */
   currentTurn(): TurnContext | undefined {
     return this.turn ? this.context() : undefined;
+  }
+
+  /**
+   * Where a turn's inputs came from (decision 4: tag, never block): who triggered
+   * it, and whether its context holds watched / digest / context-only, external or
+   * group content. Default: the running turn. Context-only inputs count for every
+   * turn after they were recorded in this lane (they stay in the session's context).
+   */
+  provenance(turnId?: string): TurnProvenance | undefined {
+    const id = turnId ?? this.turn?.turnId;
+    return id === undefined ? undefined : this.provenances.get(id);
+  }
+
+  private track(turnId: string, inputs: InputRecord[]): void {
+    const p: TurnProvenance = {
+      sessionKey: this.sessionKey,
+      turnId,
+      triggeredBy: inputs.map((i) => i.origin.principal?.id ?? null),
+      watched: this.ctxSeen.any || inputs.some(isWatched),
+      external: this.ctxSeen.external || inputs.some(isExternal),
+      group: this.ctxSeen.group || inputs.some(isGroup),
+    };
+    this.provenances.set(turnId, p);
+    for (const k of this.provenances.keys()) {
+      if (this.provenances.size <= 256) break;
+      this.provenances.delete(k);
+    }
   }
 
   /** Harness binding generation of the open (or last) session. */
@@ -400,6 +436,7 @@ export class Lane {
     }
     if (res !== 'steered') return degrade(res);
     t.inputs.push(input);
+    this.track(t.turnId, t.inputs);
     t.attempts.set(input.inputId, 0);
     this.emit({ turnId: t.turnId, body: { t: 'input.admitted', inputId: input.inputId, disposition: 'steer', ...pid(input) } });
     const extra = input.replyRoute;
@@ -534,6 +571,7 @@ export class Lane {
         foreignConsumed: false,
       };
       this.turn = t;
+      this.track(t.turnId, inputs);
       try {
         const run = await this.policy.plan({ sessionKey: this.sessionKey, inputs, ...(this.lastRun ? { previous: this.lastRun } : {}) });
         t.run = run;
@@ -630,6 +668,7 @@ export class Lane {
             consumed: new Set(),
             foreignConsumed: false,
           };
+          this.track(b.turnId, []);
         }
         this.emitHarness(e, gen);
         this.refreshState();
@@ -863,6 +902,17 @@ function pid(i: InputRecord): { principalId?: string; input?: InputRecord } {
   const id = principalId(i);
   return { ...(id === undefined ? {} : { principalId: id }), ...(i.channelContext.watch !== undefined ? { input: i } : {}) };
 }
+
+/** Arrived through a watch (context, trigger) or is a digest of watched items. */
+const isWatched = (i: InputRecord) => i.channelContext.watch !== undefined;
+
+/** From a sender without a principal; a digest carries its senders' content. Host/system inputs are not external. */
+const isExternal = (i: InputRecord) => i.origin.principal === null && (i.origin.kind !== 'system' || i.origin.adapter === 'watch');
+
+const isGroup = (i: InputRecord) => {
+  const k = i.channelContext.conversationKind;
+  return (typeof k === 'string' && GROUPISH.has(k)) || i.channelContext.watchGroup === true;
+};
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);

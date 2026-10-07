@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { FakeHarness, fakeEnvelope } from '@agents-io/testkit';
-import { Hub, Ingress, Lane, MemorySessionLog, actionId, defaultPolicy, interruptActionId, parseActionId, replySummary, type SessionPolicy } from '../src/index.js';
+import { Hub, Ingress, Lane, MemorySessionLog, Router, actionId, defaultPolicy, interruptActionId, ownersTable, parseActionId, replySummary, type SessionPolicy } from '../src/index.js';
 import type { ChannelCaps, InputRecord } from '@agents-io/protocol';
 import { RUN, bodies, until } from './helpers.js';
 
@@ -113,7 +113,7 @@ describe('Ingress', () => {
 
   it('routes approval and stop clicks to the session that owns the request or turn', async () => {
     const hub = new Hub(new MemorySessionLog());
-    const policy = defaultPolicy({ owners: ['fake:alice'], ownerSessionKey: 'main', run: RUN });
+    const policy = defaultPolicy({ owners: ['fake:alice'], run: RUN });
     const asked = new FakeHarness(async (t) => {
       t.emit({ t: 'request.opened', requestId: 'r1', kind: 'tool_approval', title: 'push', risk: {}, allowedDecisions: ['allow_once', 'deny'], allowAlways: false, defaultDeny: true });
       await t.waitDecision('r1');
@@ -121,8 +121,11 @@ describe('Ingress', () => {
     });
     const lanes = new Map<string, Lane>();
     const humanPolicy: SessionPolicy = { ...policy, resolve: async () => ({ kind: 'human', principals: ['fake:alice'], routes: [] }) };
+    // Owner DMs merged into `main`: a rule of the default table now, no longer a policy option.
+    const router = new Router({ agents: [{ name: 'default', sessionPrefix: '' }], config: ownersTable({ owners: ['fake:alice'], agent: 'default', ownerSessionKey: 'main' }) });
     const ingress = new Ingress({
       policy: humanPolicy,
+      router,
       hub,
       lanes: (k) => {
         let l = lanes.get(k);

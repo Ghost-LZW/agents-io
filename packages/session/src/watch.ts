@@ -20,10 +20,12 @@ import { withDefaults, type FullPolicy, type SessionPolicy } from './policy.js';
  *
  * `WatchRegistry` stores watches and their delivery state (SQLite, `:memory:` by
  * default): which envelopes each watch already delivered (idempotency across
- * restarts) and the buffered items of digest watches. `WatchDispatcher` matches
- * admitted envelopes against the registry, asks `Policy.triage`, delivers into
- * the target lane and runs the digest timers. `Ingress` calls it after its own
- * admission (see `IngressOptions.watches`).
+ * restarts) and the buffered items of digest watches. Each watch is a runtime
+ * binding of the `Router` (`watchBinding`): the router matches it together with
+ * the tables, and `Ingress` hands the deliveries it wins to `WatchDispatcher`,
+ * which asks `Policy.triage`, delivers into the target lane and runs the digest
+ * timers. The same digest machinery batches `on: "digest"` rules of the binding
+ * tables (`deliverDigest`).
  */
 
 export class WatchError extends Error {
@@ -49,6 +51,19 @@ export interface DigestItem {
   via: string;
   /** Plain-text rendering of the content (already clipped). */
   text: string;
+  /** Conversation kind of the source message (turn provenance `group`). */
+  kind?: string;
+}
+
+/** A binding-table digest rule for one target session (see `WatchDispatcher.deliverDigest`). */
+export interface DigestSpec {
+  /** `${source}:${bindingId}`, unique per table rule. */
+  rule: string;
+  sessionKey: string;
+  digest: { everyMs: number; maxItems?: number };
+  /** Describes the source in the digest text (from the rule's match). */
+  source: WatchSource;
+  note?: string;
 }
 
 export interface WatchRegistryOptions {
@@ -91,9 +106,13 @@ export class WatchRegistry {
     | 'delBuf'
     | 'metaGet'
     | 'metaPut'
-    | 'delMeta',
+    | 'delMeta'
+    | 'bdPut'
+    | 'bdAll',
     StatementSync
   >;
+  /** Digest definitions of binding-table rules: watch-shaped, never listed as watches. */
+  private readonly bindingDigests = new Map<string, Watch>();
   private claims = 0;
 
   constructor(o: WatchRegistryOptions = {}) {
@@ -112,6 +131,7 @@ export class WatchRegistry {
         PRIMARY KEY (watch_id, env_key)
       ) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS watch_meta (watch_id TEXT PRIMARY KEY, last_flush INTEGER);
+      CREATE TABLE IF NOT EXISTS binding_digests (id TEXT PRIMARY KEY, json TEXT NOT NULL);
     `);
     const p = (sql: string) => this.db.prepare(sql);
     this.q = {
@@ -136,11 +156,30 @@ export class WatchRegistry {
       metaGet: p('SELECT last_flush FROM watch_meta WHERE watch_id = ?'),
       metaPut: p('INSERT INTO watch_meta (watch_id, last_flush) VALUES (?, ?) ON CONFLICT(watch_id) DO UPDATE SET last_flush = excluded.last_flush'),
       delMeta: p('DELETE FROM watch_meta WHERE watch_id = ?'),
+      bdPut: p('INSERT INTO binding_digests (id, json) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET json = excluded.json'),
+      bdAll: p('SELECT json FROM binding_digests'),
     };
     for (const r of this.q.all.all() as { json: string }[]) {
       const w = JSON.parse(r.json) as Watch;
       this.watches.set(w.id, w);
     }
+    for (const r of this.q.bdAll.all() as { json: string }[]) {
+      const w = JSON.parse(r.json) as Watch;
+      this.bindingDigests.set(w.id, w);
+    }
+  }
+
+  /** Store the digest definition of a binding-table rule (kept so its buffer still flushes after a restart). */
+  putBindingDigest(w: Watch): void {
+    const prior = this.bindingDigests.get(w.id);
+    if (prior && JSON.stringify(prior) === JSON.stringify(w)) return;
+    this.q.bdPut.run(w.id, JSON.stringify(w));
+    this.bindingDigests.set(w.id, structuredClone(w));
+  }
+
+  bindingDigest(id: string): Watch | undefined {
+    const w = this.bindingDigests.get(id);
+    return w && structuredClone(w);
   }
 
   /** Validate and store (replacing a watch with the same id). Throws `WatchError('invalid')`. */
@@ -406,7 +445,7 @@ export class WatchDispatcher {
   start(): void {
     this.stopped = false;
     for (const id of this.registry.withBuffers()) {
-      if (!this.registry.raw(id)) continue;
+      if (!this.def(id)) continue;
       // A flush begun before a crash is redone first, with the same input id.
       if (this.registry.pendingFlushes(id).length) void this.flush(id);
       else this.schedule(id);
@@ -476,34 +515,76 @@ export class WatchDispatcher {
     return (await this.policy.watch({ watch: w, by })) === 'allow';
   }
 
+  /** A watch, or the digest definition of a binding-table rule. */
+  private def(id: string): Watch | undefined {
+    return this.registry.raw(id) ?? this.registry.bindingDigest(id);
+  }
+
   /**
-   * Deliver one admitted envelope to every matching watch. `ownSessionKey` is
-   * the session the envelope itself went to (none when it was dropped): a watch
-   * never delivers there again. `channelContext` is the envelope's own context.
+   * Match and deliver one envelope to every watch (filters applied here), for
+   * callers without a `Router`. `ownSessionKey` is the session the envelope itself
+   * went to (none when it was dropped): a watch never delivers there again.
+   * `channelContext` is the envelope's own context. `Ingress` does not call this:
+   * the `Router` matches watches as bindings, then `deliverWatch` runs.
    */
   async fanout(env: InboundEnvelope, origin: Origin, ownSessionKey: string | undefined, channelContext: InputRecord['channelContext']): Promise<WatchDelivery[]> {
     this.sweep();
+    const out: WatchDelivery[] = [];
+    for (const w of this.registry.bySource(env)) {
+      if (w.target.sessionKey === ownSessionKey) continue;
+      if (!passesFilter(w.filter, env, origin)) continue;
+      out.push(await this.claimAndDeliver(w, env, origin, channelContext));
+    }
+    return out;
+  }
+
+  /**
+   * Deliver one envelope through one watch whose source and filters already
+   * matched (the router did that): claim it (idempotent per watch and envelope,
+   * also across restarts), ask `Policy.triage`, then record context, buffer for
+   * the digest, or start a turn. Failures come back as `action: "error"`.
+   */
+  async deliverWatch(watchId: string, env: InboundEnvelope, origin: Origin, channelContext: InputRecord['channelContext']): Promise<WatchDelivery> {
+    const w = this.registry.get(watchId);
+    if (!w) return { watchId, sessionKey: '', action: 'error', error: `watch ${watchId} not found` };
+    return this.claimAndDeliver(w, env, origin, channelContext);
+  }
+
+  /**
+   * An `on: "digest"` rule of a binding table: record the input as context in the
+   * target session and batch it into one system turn per period, with the same
+   * buffers, timers and crash recovery as digest watches.
+   */
+  async deliverDigest(spec: DigestSpec, env: InboundEnvelope, origin: Origin, channelContext: InputRecord['channelContext']): Promise<WatchDelivery> {
+    const id = bindingDigestId(spec.rule, spec.sessionKey);
+    const prior = this.registry.bindingDigest(id);
+    const w: Watch = {
+      id,
+      source: spec.source,
+      target: { sessionKey: spec.sessionKey },
+      mode: 'digest',
+      digest: spec.digest,
+      createdBy: `binding:${spec.rule}`,
+      createdAt: prior?.createdAt ?? this.now(),
+      ...(spec.note !== undefined ? { note: spec.note } : {}),
+    };
+    this.registry.putBindingDigest(w);
+    return this.claimAndDeliver(w, env, origin, channelContext);
+  }
+
+  private async claimAndDeliver(w: Watch, env: InboundEnvelope, origin: Origin, channelContext: InputRecord['channelContext']): Promise<WatchDelivery> {
     const envKey = `${env.channel}:${env.id}`;
     const root = env.revisionOf !== undefined ? (this.revisionRoot.get(`${env.channel}:${env.revisionOf}`) ?? `${env.channel}:${env.revisionOf}`) : envKey;
     if (env.revisionOf !== undefined) this.revisionRoot.set(envKey, root);
-    const out: WatchDelivery[] = [];
-    for (const w of this.registry.bySource(env)) {
-      const sessionKey = w.target.sessionKey;
-      if (sessionKey === ownSessionKey) continue;
-      if (!passesFilter(w.filter, env, origin)) continue;
-      if (!this.registry.claim(w.id, envKey)) {
-        out.push({ watchId: w.id, sessionKey, action: 'duplicate' });
-        continue;
-      }
-      try {
-        out.push(await this.deliver(w, env, origin, envKey, root, channelContext));
-      } catch (e) {
-        this.registry.unclaim(w.id, envKey);
-        this.o.onError?.(e, w.id);
-        out.push({ watchId: w.id, sessionKey, action: 'error', error: (e as Error).message });
-      }
+    const sessionKey = w.target.sessionKey;
+    if (!this.registry.claim(w.id, envKey)) return { watchId: w.id, sessionKey, action: 'duplicate' };
+    try {
+      return await this.deliver(w, env, origin, envKey, root, channelContext);
+    } catch (e) {
+      this.registry.unclaim(w.id, envKey);
+      this.o.onError?.(e, w.id);
+      return { watchId: w.id, sessionKey, action: 'error', error: (e as Error).message };
     }
-    return out;
   }
 
   private async deliver(w: Watch, env: InboundEnvelope, origin: Origin, envKey: string, root: string, base: InputRecord['channelContext']): Promise<WatchDelivery> {
@@ -537,6 +618,7 @@ export class WatchDispatcher {
         sender,
         via: origin.via,
         text: contentText(env.content, this.o.digestLineChars ?? 240),
+        kind: env.conversation.kind,
       });
       if (w.digest?.maxItems !== undefined && n >= w.digest.maxItems) void this.flush(w.id);
       else this.schedule(w.id);
@@ -550,7 +632,7 @@ export class WatchDispatcher {
 
   private schedule(id: string): void {
     if (this.stopped || this.timers.has(id) || this.flushing.has(id)) return;
-    const w = this.registry.raw(id);
+    const w = this.def(id);
     const oldest = this.registry.oldestBuffered(id);
     if (!w || w.mode !== 'digest' || !w.digest || oldest === undefined) return;
     const delay = Math.max(0, Math.min(oldest + w.digest.everyMs - this.now(), 2 ** 31 - 1));
@@ -584,7 +666,7 @@ export class WatchDispatcher {
   }
 
   private async doFlush(id: string): Promise<void> {
-    const w = this.registry.raw(id);
+    const w = this.def(id);
     if (!w) return;
     const flushId = this.registry.pendingFlushes(id)[0] ?? `dg_${id}_${this.newId('f')}`;
     const items = this.registry.beginFlush(id, flushId);
@@ -596,7 +678,13 @@ export class WatchDispatcher {
       origin: { kind: 'system', principal: null, evidence: 'none', via: `watch:${id}`, adapter: 'watch' },
       content: [{ type: 'text', text }],
       replyRoute: await this.route(w),
-      channelContext: { watch: id, watchMode: 'digest', watchItems: items.length, watchSource: describeSource(w.source) },
+      channelContext: {
+        watch: id,
+        watchMode: 'digest',
+        watchItems: items.length,
+        watchSource: describeSource(w.source),
+        ...(items.some((i) => i.kind !== undefined && GROUPISH.has(i.kind)) ? { watchGroup: true } : {}),
+      },
     };
     let lane: Lane;
     let r: CommandResult;
@@ -628,6 +716,14 @@ export class WatchDispatcher {
       }
     }
   }
+}
+
+/** Conversation kinds with more than two parties (turn provenance `group`). */
+export const GROUPISH: ReadonlySet<string> = new Set(['group', 'thread', 'meeting', 'call']);
+
+/** Digest state id of a binding-table digest rule for one target session. */
+export function bindingDigestId(rule: string, sessionKey: string): string {
+  return `bd_${createHash('sha256').update(`${rule}\u0000${sessionKey}`).digest('hex').slice(0, 16)}`;
 }
 
 /** Principal id of a watch's creator, from the origin that asked. */
