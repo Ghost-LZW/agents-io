@@ -33,7 +33,17 @@
           "type": "string"
         },
         "callouts": {
-          "type": "boolean"
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
         },
         "lease": {
           "type": "object",
@@ -1214,6 +1224,81 @@
         },
         "agent": {
           "type": "string"
+        },
+        "launch": {
+          "type": "object",
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "env": {
+              "type": "object",
+              "patternProperties": {
+                "^(.*)$": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "cursor"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "inbound.redispatch",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "cursor": {
+          "type": "number"
+        },
+        "agent": {
+          "type": "string"
+        },
+        "session": {
+          "anyOf": [
+            {
+              "const": "main",
+              "type": "string"
+            },
+            {
+              "const": "per-conversation",
+              "type": "string"
+            },
+            {
+              "const": "per-thread",
+              "type": "string"
+            },
+            {
+              "const": "topic",
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "required": [
+                "key"
+              ],
+              "properties": {
+                "key": {
+                  "type": "string"
+                }
+              }
+            }
+          ]
         },
         "launch": {
           "type": "object",

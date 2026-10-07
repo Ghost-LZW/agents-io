@@ -1743,6 +1743,9 @@
                     },
                     "id": {
                       "type": "string"
+                    },
+                    "via": {
+                      "type": "string"
                     }
                   }
                 },

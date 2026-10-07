@@ -60,7 +60,10 @@ export class HostQueue {
   readonly db: DatabaseSync;
   private readonly ownsDb: boolean;
   private readonly now: () => number;
-  private q: Record<'refGet' | 'refPut' | 'insert' | 'after' | 'consumerGet' | 'consumerPut' | 'consumerAck' | 'consumers' | 'consumerDel' | 'head' | 'prune' | 'pruneRefs' | 'pending', StatementSync>;
+  private q: Record<
+    'refGet' | 'refPut' | 'insert' | 'after' | 'one' | 'consumerGet' | 'consumerPut' | 'consumerAck' | 'consumers' | 'consumerDel' | 'head' | 'prune' | 'pruneRefs' | 'pending' | 'redispatchGet' | 'redispatchPut' | 'redispatchSet' | 'redispatchDel' | 'pruneRedispatch',
+    StatementSync
+  >;
   private waiters = new Set<() => void>();
   private pushes = new Map<string, Push>();
   private closed = false;
@@ -73,6 +76,7 @@ export class HostQueue {
       CREATE TABLE IF NOT EXISTS host_inbound (cursor INTEGER PRIMARY KEY AUTOINCREMENT, channel_ref TEXT NOT NULL, at INTEGER NOT NULL, json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS host_inbound_refs (channel_ref TEXT PRIMARY KEY, cursor INTEGER NOT NULL, at INTEGER NOT NULL) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS host_consumers (name TEXT PRIMARY KEY, acked INTEGER NOT NULL, seen INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS host_redispatch (cursor INTEGER PRIMARY KEY, at INTEGER NOT NULL, json TEXT NOT NULL);
     `);
     const p = (sql: string) => this.db.prepare(sql);
     this.q = {
@@ -80,6 +84,12 @@ export class HostQueue {
       refPut: p('INSERT INTO host_inbound_refs (channel_ref, cursor, at) VALUES (?, ?, ?)'),
       insert: p('INSERT INTO host_inbound (channel_ref, at, json) VALUES (?, ?, ?)'),
       after: p('SELECT cursor, json FROM host_inbound WHERE cursor > ? ORDER BY cursor LIMIT ?'),
+      one: p('SELECT cursor, json FROM host_inbound WHERE cursor = ?'),
+      redispatchGet: p('SELECT json FROM host_redispatch WHERE cursor = ?'),
+      redispatchPut: p('INSERT INTO host_redispatch (cursor, at, json) VALUES (?, ?, ?) ON CONFLICT(cursor) DO NOTHING'),
+      redispatchSet: p('UPDATE host_redispatch SET at = ?, json = ? WHERE cursor = ?'),
+      redispatchDel: p('DELETE FROM host_redispatch WHERE cursor = ?'),
+      pruneRedispatch: p('DELETE FROM host_redispatch WHERE at < ? AND cursor NOT IN (SELECT cursor FROM host_inbound)'),
       consumerGet: p('SELECT acked FROM host_consumers WHERE name = ?'),
       consumerPut: p('INSERT INTO host_consumers (name, acked, seen) VALUES (?, 0, ?) ON CONFLICT(name) DO UPDATE SET seen = excluded.seen'),
       consumerAck: p('UPDATE host_consumers SET acked = MAX(acked, ?), seen = ? WHERE name = ?'),
@@ -152,6 +162,42 @@ export class HostQueue {
     return (this.q.after.all(after, Math.max(1, Math.min(limit, 10_000))) as { cursor: number; json: string }[]).map((r) => ({ ...(JSON.parse(r.json) as Omit<InboundItem, 'cursor'>), cursor: r.cursor }));
   }
 
+  /** One queued item by cursor (undefined once pruned, or never queued). */
+  get(cursor: number): InboundItem | undefined {
+    if (!Number.isSafeInteger(cursor) || cursor <= 0) return undefined;
+    const r = this.q.one.get(cursor) as { cursor: number; json: string } | undefined;
+    return r ? { ...(JSON.parse(r.json) as Omit<InboundItem, 'cursor'>), cursor: r.cursor } : undefined;
+  }
+
+  /**
+   * The recorded outcome of the item's redispatch (`inbound.redispatch` is
+   * idempotent per cursor). Kept while the item is, and `refTtlMs` after.
+   */
+  redispatched<T = unknown>(cursor: number): T | undefined {
+    const r = this.q.redispatchGet.get(cursor) as { json: string } | undefined;
+    return r ? (JSON.parse(r.json) as T) : undefined;
+  }
+
+  /**
+   * Record a redispatch; false when the cursor already has one (the first stays).
+   * The gateway records a pending one before it delivers (so a delivery cut off by
+   * a stop is never repeated: at most once), then replaces it (`finishRedispatch`)
+   * or removes it when the delivery failed (`dropRedispatch`).
+   */
+  recordRedispatch(cursor: number, value: unknown): boolean {
+    return Number(this.q.redispatchPut.run(cursor, this.now(), JSON.stringify(value)).changes) > 0;
+  }
+
+  /** Replace the cursor's recorded redispatch (the pending one with its outcome). */
+  finishRedispatch(cursor: number, value: unknown): void {
+    this.q.redispatchSet.run(this.now(), JSON.stringify(value), cursor);
+  }
+
+  /** Forget the cursor's redispatch (its delivery failed: the host may try again). */
+  dropRedispatch(cursor: number): void {
+    this.q.redispatchDel.run(cursor);
+  }
+
   /** Pull: items after `after` (default the acked cursor), waiting up to `waitMs` when there are none yet. */
   async read(consumer: string, o: ReadOptions = {}): Promise<InboundItem[]> {
     const after = o.after ?? this.cursor(consumer);
@@ -186,6 +232,7 @@ export class HostQueue {
     const now = this.now();
     const n = Number(this.q.prune.run(min, now - (this.o.retainAckedMs ?? DAY)).changes);
     this.q.pruneRefs.run(now - (this.o.refTtlMs ?? 7 * DAY));
+    this.q.pruneRedispatch.run(now - (this.o.refTtlMs ?? 7 * DAY));
     return n;
   }
 

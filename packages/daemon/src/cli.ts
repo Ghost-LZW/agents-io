@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
-import type { ContentBlock, RenderedMessage, ReplyRoute, RunEnded, SessionEvent, Tier } from '@agents-io/protocol';
+import type { ContentBlock, RenderedMessage, ReplyRoute, RunEnded, SessionEvent, SessionLaunch, SessionScope, Tier } from '@agents-io/protocol';
 import { runAttach } from './attach.js';
 import { CommandError, DaemonUnavailable, LocalClient } from './client.js';
 import { ConfigError, defaultInstance, loadConfig, type LoadOptions } from './config.js';
@@ -33,6 +33,8 @@ host commands (authenticate with the token file next to the socket; docs/HOSTS.m
   aio send      --route <route json> --operation-id <id> [--file message.json|-] [--text <text>]
   aio tail      --consumer <name> [--from <cursor>] [--once]          (JSON lines, each with its cursor)
   aio ack       --consumer <name> <cursor>
+  aio redispatch <cursor> [--agent <name>] [--session main|per-conversation|per-thread|topic|<key json>]
+                [--cwd <dir>] [--env K=V …]                           (a queued item to a session, original sender kept)
   aio bindings  put [--file table.json|-] | get
   aio explain   <inputId>
   aio verify    <channelRef>                                          (channel:<channel>/<message id>)
@@ -448,6 +450,35 @@ async function ack(a: CliArgs): Promise<number> {
   }
 }
 
+/** The `inbound.redispatch` request `aio redispatch` sends, from its arguments. */
+export function redispatchRequest(a: CliArgs): { cursor: number; agent?: string; session?: SessionScope; launch?: SessionLaunch } {
+  const cursor = a.rest[0];
+  if (!cursor || !/^\d+$/.test(cursor)) throw new ConfigError('usage: aio redispatch <cursor> [--agent <name>] [--session <scope>] [--cwd <dir>] [--env K=V …]');
+  const s = str(a, 'session');
+  let session: SessionScope | undefined;
+  if (s !== undefined) {
+    if (['main', 'per-conversation', 'per-thread', 'topic'].includes(s)) session = s as SessionScope;
+    else if (s.trimStart().startsWith('{')) session = json<SessionScope>(s, '--session');
+    else session = { key: s };
+  }
+  const env = parseEnvPairs(list(a, 'env'));
+  const cwd = str(a, 'cwd');
+  const launch: SessionLaunch | undefined = cwd !== undefined || Object.keys(env).length ? { ...(cwd !== undefined ? { cwd } : {}), ...(Object.keys(env).length ? { env } : {}) } : undefined;
+  const agent = str(a, 'agent');
+  return { cursor: Number(cursor), ...(agent !== undefined ? { agent } : {}), ...(session !== undefined ? { session } : {}), ...(launch ? { launch } : {}) };
+}
+
+async function redispatch(a: CliArgs): Promise<number> {
+  const req = redispatchRequest(a);
+  const client = await hostClient(a);
+  try {
+    print(await client.inboundRedispatch(req));
+    return 0;
+  } finally {
+    client.close();
+  }
+}
+
 async function bindings(a: CliArgs): Promise<number> {
   const [sub] = a.rest;
   if (sub !== 'put' && sub !== 'get') throw new ConfigError('usage: aio bindings put [--file table.json|-] | aio bindings get');
@@ -545,7 +576,7 @@ async function e2e(a: CliArgs): Promise<number> {
   return n('FAIL') ? 1 : 0;
 }
 
-const COMMANDS: Record<string, (a: CliArgs) => Promise<number>> = { serve, attach, input, sessions, watch, e2e, run: runCmd, send, tail, ack, bindings, explain, verify, 'console-link': consoleLink, console: consoleLink };
+const COMMANDS: Record<string, (a: CliArgs) => Promise<number>> = { serve, attach, input, sessions, watch, e2e, run: runCmd, send, tail, ack, redispatch, bindings, explain, verify, 'console-link': consoleLink, console: consoleLink };
 
 export async function main(argv: string[]): Promise<number> {
   const a = parseCli(argv);

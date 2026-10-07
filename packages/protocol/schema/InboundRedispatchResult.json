@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/InboundRedispatchResult",
+  "type": "object",
+  "required": [
+    "cursor",
+    "of",
+    "inputId",
+    "sessionKey",
+    "on",
+    "at",
+    "by",
+    "duplicate"
+  ],
+  "properties": {
+    "cursor": {
+      "type": "number"
+    },
+    "of": {
+      "type": "string"
+    },
+    "inputId": {
+      "type": "string"
+    },
+    "sessionKey": {
+      "type": "string"
+    },
+    "agent": {
+      "type": "string"
+    },
+    "on": {
+      "anyOf": [
+        {
+          "const": "dispatch",
+          "type": "string"
+        },
+        {
+          "const": "context",
+          "type": "string"
+        }
+      ]
+    },
+    "launch": {
+      "type": "object",
+      "required": [
+        "envKeys",
+        "outcome"
+      ],
+      "properties": {
+        "cwd": {
+          "type": "string"
+        },
+        "envKeys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "outcome": {
+          "type": "string"
+        }
+      }
+    },
+    "disposition": {
+      "type": "string"
+    },
+    "at": {
+      "type": "number"
+    },
+    "by": {
+      "type": "string"
+    },
+    "duplicate": {
+      "type": "boolean"
+    },
+    "interrupted": {
+      "type": "boolean"
+    }
+  }
+}

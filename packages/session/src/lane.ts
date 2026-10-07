@@ -450,7 +450,7 @@ export class Lane {
       case 'interrupt':
         return this.interrupt(cmd.origin, cmd.turnId, cmd.cancelQueue ?? false);
       case 'resolve':
-        return this.resolveCommand(cmd.requestId, cmd.decision, cmd.origin);
+        return this.resolveCommand(cmd.requestId, cmd.decision, cmd.origin, cmd.onBehalfOf);
       case 'control':
         return { ok: false, reason: 'unsupported' };
       case 'subscribe':
@@ -1075,12 +1075,21 @@ export class Lane {
     return true;
   }
 
-  private async resolveCommand(requestId: string, decision: Decision, origin: Origin): Promise<CommandResult> {
+  private async resolveCommand(requestId: string, decision: Decision, origin: Origin, onBehalfOf?: string): Promise<CommandResult> {
     const p = this.requests.get(requestId);
     if (!p) return { ok: false, reason: this.resolved.has(requestId) ? 'already_resolved' : 'unknown_request' };
     let by: ResolvedBy;
-    // Eligibility is re-checked here, server side, whatever the client showed.
-    if (p.resolver.kind === 'human') {
+    // A host relays a principal's answer: only a host connection may (system origin through the host adapter;
+    // the gateway checks this too), and a human request still checks the principal.
+    if (onBehalfOf !== undefined) {
+      if (origin.kind !== 'system' || origin.adapter !== 'host' || !onBehalfOf) return { ok: false, reason: 'not_eligible' };
+      const via = origin.principal?.id ?? origin.via;
+      if (p.resolver.kind === 'human') {
+        if (!p.resolver.principals.includes(onBehalfOf)) return { ok: false, reason: 'not_eligible' };
+        by = { kind: 'human', id: onBehalfOf, via };
+      } else if (p.resolver.kind === 'host') by = { kind: 'host', id: onBehalfOf, via };
+      else return { ok: false, reason: 'not_awaiting_resolve' };
+    } else if (p.resolver.kind === 'human') {
       const id = origin.principal?.id;
       if (!id || !p.resolver.principals.includes(id)) return { ok: false, reason: 'not_eligible' };
       by = { kind: 'human', id };

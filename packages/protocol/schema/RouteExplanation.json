@@ -209,6 +209,58 @@
     "at": {
       "type": "number"
     },
+    "redispatchOf": {
+      "type": "object",
+      "required": [
+        "inputId",
+        "cursor",
+        "by"
+      ],
+      "properties": {
+        "inputId": {
+          "type": "string"
+        },
+        "cursor": {
+          "type": "number"
+        },
+        "by": {
+          "type": "string"
+        }
+      }
+    },
+    "redispatched": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "cursor",
+          "inputId",
+          "sessionKey",
+          "by",
+          "at"
+        ],
+        "properties": {
+          "cursor": {
+            "type": "number"
+          },
+          "inputId": {
+            "type": "string"
+          },
+          "sessionKey": {
+            "type": "string"
+          },
+          "agent": {
+            "type": "string"
+          },
+          "by": {
+            "type": "string"
+          },
+          "at": {
+            "type": "number"
+          }
+        }
+      }
+    },
     "dropped": {
       "anyOf": [
         {

@@ -293,6 +293,19 @@ describe('Lane: requests', () => {
     await until(() => got.length === 1);
   });
 
+  it('onBehalfOf: only a host connection (system origin through the host adapter) may relay', async () => {
+    const got: Decision[] = [];
+    const { lane, events } = setup({ harness: asking(got), policy: policy({ resolve: async () => ({ kind: 'human', principals: ['fake:alice'], routes: [] }) }) });
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('go'), mode: 'queue' });
+    await until(() => bodies(events(), 'request.opened').length === 1);
+    const cmd = (o: ReturnType<typeof origin>) => lane.command({ type: 'resolve', sessionKey: 's1', requestId: 'r1', decision: { kind: 'allow_once' }, origin: o, onBehalfOf: 'fake:alice' });
+    // Another internal system origin (a watch, a run…) may not answer on a principal's behalf.
+    expect(await cmd(origin('watch', [], 'system'))).toEqual({ ok: false, reason: 'not_eligible' });
+    expect(await cmd({ ...origin('host:xwo', [], 'system'), adapter: 'host', via: 'host:xwo' })).toEqual({ ok: true });
+    await until(() => got.length === 1);
+    expect(bodies(events(), 'request.resolved')[0]).toMatchObject({ by: { kind: 'human', id: 'fake:alice', via: 'host:xwo' } });
+  });
+
   it('model: uses the reviewer; escalation re-opens for a human; no reviewer falls back to human', async () => {
     const run = async (reviewer: ModelReviewer | undefined) => {
       const got: Decision[] = [];

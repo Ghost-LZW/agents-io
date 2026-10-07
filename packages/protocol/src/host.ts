@@ -1,5 +1,8 @@
-import { Type, type Static, type TSchema } from '@sinclair/typebox';
+import { Type, type Static, type TObject, type TSchema } from '@sinclair/typebox';
 import { ContentBlock, Evidence, ReplyRoute, V } from './common.js';
+import { Body } from './events.js';
+import { Resolver } from './requests.js';
+import { RunSpec } from './run.js';
 import { ConversationKind, InboundEnvelope, InputRecord, OriginKind } from './inbound.js';
 import { RenderedMessage } from './channel.js';
 import { ResultFrame } from './wire.js';
@@ -172,6 +175,12 @@ export const RouteExplanation = Type.Object({
   evidence: Evidence,
   /** Unix ms of the routing decision. */
   at: Type.Optional(Type.Number()),
+  /** This input is a host-inbound item redispatched by the host (`inbound.redispatch`): the original input and queue cursor. */
+  redispatchOf: Type.Optional(Type.Object({ inputId: Type.String(), cursor: Type.Number(), by: Type.String() })),
+  /** The host redispatched this (queued) input later: where each redispatch went. */
+  redispatched: Type.Optional(
+    Type.Array(Type.Object({ cursor: Type.Number(), inputId: Type.String(), sessionKey: Type.String(), agent: Type.Optional(Type.String()), by: Type.String(), at: Type.Number() })),
+  ),
   /** Why nothing was delivered, when nothing was. */
   dropped: Type.Optional(Type.Union([Type.Literal('adapter'), Type.Literal('no_match'), Type.Literal('drop_rule')])),
 });
@@ -203,8 +212,13 @@ export const HostHello = Type.Object({
   name: Type.String(),
   /** Push-consume the inbound queue as this consumer (omit to only pull with `aio tail`). */
   consumer: Type.Optional(Type.String()),
-  /** This host answers `route` callouts. */
-  callouts: Type.Optional(Type.Boolean()),
+  /**
+   * Which synchronous hooks this host answers (`policy` frames): `true` = `["route"]`;
+   * a list names them: `route` (rule callouts), `resolve` (who answers a request),
+   * `outbound` (may an agent send there). Unknown names are ignored; the result's
+   * `callouts` lists what was granted. Any hook (or `consumer`) makes this connection the host.
+   */
+  callouts: Type.Optional(Type.Union([Type.Boolean(), Type.Array(Type.String())])),
   /**
    * Presence lease for a pull-only host (one with neither `consumer` nor
    * `callouts`, e.g. a long-running `aio tail`): the host named `name` counts as
@@ -271,7 +285,22 @@ export const Explain = Type.Object({ ...Req('explain'), inputId: Type.String() }
 export const SessionPrepare = Type.Object({ ...Req('session.prepare'), sessionKey: Type.String(), agent: Type.String(), launch: SessionLaunch });
 export type SessionPrepare = Static<typeof SessionPrepare>;
 
-export const HostRequestFrame = Type.Union([HostHello, BindingsPut, BindingsGet, RunStart, RunCancel, Deliver, InputVerify, InboundRead, InboundAck, Explain, SessionPrepare]);
+/**
+ * Deliver a queued host-inbound item (feature `inbound.redispatch`) to a session,
+ * with the origin it was stamped with when it arrived (sender, evidence, route).
+ * Idempotent per cursor. `agent` / `session` resolve the session as a binding's
+ * would (default: the default agent, `per-conversation`); `launch` as in a callout answer.
+ */
+export const InboundRedispatch = Type.Object({
+  ...Req('inbound.redispatch'),
+  cursor: Type.Number(),
+  agent: Type.Optional(Type.String()),
+  session: Type.Optional(SessionScope),
+  launch: Type.Optional(SessionLaunch),
+});
+export type InboundRedispatch = Static<typeof InboundRedispatch>;
+
+export const HostRequestFrame = Type.Union([HostHello, BindingsPut, BindingsGet, RunStart, RunCancel, Deliver, InputVerify, InboundRead, InboundAck, Explain, SessionPrepare, InboundRedispatch]);
 export type HostRequestFrame = Static<typeof HostRequestFrame>;
 
 // ---- daemon → host --------------------------------------------------------
@@ -328,10 +357,47 @@ export const RunEnded = Type.Object({
 });
 export type RunEnded = Static<typeof RunEnded>;
 
-export const HostEventFrame = Type.Union([InboundFrame, RouteCallout, RunEnded, ResultFrame]);
+/** The `request.opened` event body (what `Policy.resolve` gets as `req`). */
+export const RequestOpenedBody = (Body.anyOf as TObject[]).find((b) => (b.properties.t as { const?: unknown }).const === 'request.opened')!;
+
+/** `Policy`'s `TurnContext` on the wire. */
+export const TurnContextView = Type.Object({
+  sessionKey: Type.String(),
+  turnId: Type.String(),
+  run: RunSpec,
+  inputs: Type.Array(InputRecord),
+  replyRoute: Type.Union([ReplyRoute, Type.Null()]),
+  owner: Type.Optional(Type.String()),
+  deliveries: Type.Array(ReplyRoute),
+  provenance: Type.Optional(TurnProvenance),
+});
+
+/**
+ * `Policy.resolve` asked of a host whose hello lists `resolve`: who answers this
+ * request. Answer a `Resolver`. On timeout, error, a bad answer or no host the
+ * daemon's own policy decides (fail closed to built-in behaviour).
+ */
+export const ResolveCallout = Type.Object({
+  ...Req('policy'),
+  hook: Type.Literal('resolve'),
+  args: Type.Object({ request: RequestOpenedBody, ctx: TurnContextView }),
+});
+
+/**
+ * `Policy.outbound` asked of a host whose hello lists `outbound`: may a turn send
+ * to `to` (`from: null` outside a turn). Answer `{ verdict }`; timeout, error or a
+ * bad answer deny.
+ */
+export const OutboundCallout = Type.Object({
+  ...Req('policy'),
+  hook: Type.Literal('outbound'),
+  args: Type.Object({ from: Type.Union([TurnContextView, Type.Null()]), to: ReplyRoute }),
+});
+
+export const HostEventFrame = Type.Union([InboundFrame, RouteCallout, ResolveCallout, OutboundCallout, RunEnded, ResultFrame]);
 export type HostEventFrame = Static<typeof HostEventFrame>;
 
-export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare'] as const;
+export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare', 'inbound.redispatch'] as const;
 export const HOST_EVENT_FRAME_TYPES = ['inbound', 'policy', 'run.ended', 'result'] as const;
 
 // ---- result values --------------------------------------------------------
@@ -370,6 +436,8 @@ export const HostHelloResult = Type.Object({
    * a host must not rely on a feature this list lacks.
    */
   features: Type.Optional(Type.Array(Type.String())),
+  /** The `policy` hooks this connection answers (from the hello's `callouts`). */
+  callouts: Type.Optional(Type.Array(Type.String())),
 });
 export type HostHelloResult = Static<typeof HostHelloResult>;
 
@@ -497,6 +565,40 @@ export const SessionPrepareResult = Type.Object({
 export type SessionPrepareResult = Static<typeof SessionPrepareResult>;
 export type RouteCalloutAnswer = Static<typeof RouteCalloutAnswer>;
 
+/** The host's answer to a `resolve` callout: who answers the request. */
+export const ResolveCalloutAnswer = Resolver;
+export type ResolveCalloutAnswer = Resolver;
+
+/** The host's answer to an `outbound` callout. */
+export const OutboundCalloutAnswer = Type.Object({ verdict: Type.Union([Type.Literal('allow'), Type.Literal('deny')]) });
+export type OutboundCalloutAnswer = Static<typeof OutboundCalloutAnswer>;
+
+/** `inbound.redispatch`: where the item went. `duplicate`: this cursor was redispatched before (nothing was sent now). */
+export const InboundRedispatchResult = Type.Object({
+  cursor: Type.Number(),
+  /** The original input id (as queued; `explain` it to see the redispatch). */
+  of: Type.String(),
+  /** The redispatched input's id: `<original>~r<cursor>`. */
+  inputId: Type.String(),
+  sessionKey: Type.String(),
+  agent: Type.Optional(Type.String()),
+  /** `on: "dispatch"`, or `context` for the deployment's own echo (never a turn). */
+  on: Type.Union([Type.Literal('dispatch'), Type.Literal('context')]),
+  launch: Type.Optional(Type.Object({ cwd: Type.Optional(Type.String()), envKeys: Type.Array(Type.String()), outcome: Type.String() })),
+  /** The lane's disposition (e.g. `started`, `queued`). */
+  disposition: Type.Optional(Type.String()),
+  at: Type.Number(),
+  by: Type.String(),
+  duplicate: Type.Boolean(),
+  /**
+   * With `duplicate`: the first redispatch of this cursor was cut off (the daemon
+   * stopped mid-delivery) before its outcome was recorded. The input may or may
+   * not have reached the session; it is never sent again (at most once).
+   */
+  interrupted: Type.Optional(Type.Boolean()),
+});
+export type InboundRedispatchResult = Static<typeof InboundRedispatchResult>;
+
 /** Result value schema per host request type. */
 export const HOST_RESULT_VALUES = {
   'host.hello': HostHelloResult,
@@ -510,4 +612,5 @@ export const HOST_RESULT_VALUES = {
   'inbound.ack': InboundAckResult,
   explain: ExplainResult,
   'session.prepare': SessionPrepareResult,
+  'inbound.redispatch': InboundRedispatchResult,
 } as const satisfies Record<(typeof HOST_REQUEST_FRAME_TYPES)[number], TSchema>;

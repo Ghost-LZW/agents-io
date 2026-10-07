@@ -456,6 +456,47 @@ export class Router {
     return { deliveries, ...(host ? { host } : {}), explanation };
   }
 
+  /**
+   * Where a host redispatches a queued input (`inbound.redispatch`): the session
+   * a `dispatch` rule for `agent` (default: the default agent) with `session`
+   * (default `per-conversation`) would pick for this envelope, and `launch`
+   * checked as a callout answer's would be. The origin is the one the input was
+   * stamped with when it arrived; the deployment's own echo is recorded as
+   * context, never a turn. Throws `RouterError` for an unknown or task agent, a
+   * bad scope or a task run session key; a refused launch is `{ ok: false }`. Records nothing.
+   */
+  redirect(
+    env: InboundEnvelope,
+    origin: Origin,
+    o: { inputId: string; agent?: string; session?: SessionScope; launch?: SessionLaunch; redispatchOf: NonNullable<Explanation['redispatchOf']> },
+  ): { ok: true; delivery: RouteDelivery; explanation: Explanation } | { ok: false; code: string; message: string } {
+    if (o.session !== undefined && errors(SessionScope, o.session).length) throw new RouterError('invalid', `session ${JSON.stringify(o.session)}`);
+    if (o.launch !== undefined && errors(SessionLaunch, o.launch).length) throw new RouterError('invalid', `launch ${JSON.stringify(Object.keys(o.launch ?? {}))}`);
+    const agent = this.target(o.agent ?? this.o.defaultAgent, 'inbound.redispatch');
+    const r: Resolved = { binding: { id: REDISPATCH_RULE, match: {}, on: 'dispatch' }, source: 'host', on: 'dispatch', agent: agent.name, ...(o.session !== undefined ? { session: o.session } : {}) };
+    const { entry, delivery } = this.place(r, env, origin);
+    if (!delivery) throw new RouterError('invalid', 'redispatch has no target session');
+    if (delivery.sessionKey.startsWith('run:')) throw new RouterError('invalid', `${delivery.sessionKey} is a task run session key (task runs use run.start)`);
+    if (o.launch !== undefined) {
+      const c = this.o.launches
+        ? this.o.launches.check({ sessionKey: delivery.sessionKey, agent: delivery.agent, launch: o.launch })
+        : { ok: false as const, code: 'launch_unsupported', message: 'this router takes no session launches' };
+      if (!c.ok) return c;
+      delivery.launch = c.launch;
+      entry.launch = { ...(o.launch.cwd !== undefined ? { cwd: o.launch.cwd } : {}), envKeys: Object.keys(o.launch.env ?? {}).sort(), outcome: c.outcome };
+    }
+    const explanation: Explanation = {
+      inputId: o.inputId,
+      tableVersions: this.versions(),
+      matched: [entry],
+      principal: origin.principal?.id ?? null,
+      evidence: origin.evidence,
+      at: this.now(),
+      redispatchOf: o.redispatchOf,
+    };
+    return { ok: true, delivery, explanation };
+  }
+
   /** Where one resolved rule puts the input: its explanation entry and, for an action that targets a session, the delivery. */
   private place(r: Resolved, env: InboundEnvelope, origin: Origin): { on: BindingAction; entry: RouteExplanation['matched'][number]; delivery?: RouteDelivery } {
     let on = r.on;
@@ -645,6 +686,9 @@ interface Resolved extends Rule {
 export function topicConversation(env: InboundEnvelope): string {
   return routeKey({ channel: env.channel, account: env.account, conversationId: env.conversation.id });
 }
+
+/** Binding id of an `inbound.redispatch` delivery in `explain`. */
+export const REDISPATCH_RULE = 'host:redispatch';
 
 const targets = (on: BindingAction): on is Effective => on === 'dispatch' || on === 'context' || on === 'digest';
 

@@ -1,5 +1,20 @@
 import { timingSafeEqual } from 'node:crypto';
-import { PROTOCOL_VERSION, type HostHelloResult, type HostRequestFrame, type InboundReadResult, type InboundEnvelope, type InputRecord, type Origin } from '@agents-io/protocol';
+import {
+  OutboundCalloutAnswer,
+  PROTOCOL_VERSION,
+  Resolver,
+  check,
+  errors,
+  type BodyOf,
+  type HostHelloResult,
+  type HostRequestFrame,
+  type InboundReadResult,
+  type InboundEnvelope,
+  type InputRecord,
+  type Origin,
+  type ReplyRoute,
+  type TurnContext,
+} from '@agents-io/protocol';
 import { RouterError, type CalloutAnswer, type HostQueue, type PushSubscription, type Router } from '@agents-io/session';
 import type { LogFn, Outcome } from './gateway.js';
 import type { HostFrames, Peer } from './local-server.js';
@@ -32,6 +47,10 @@ export interface HostServiceDeps {
   deliver(hostName: string, f: Extract<HostRequestFrame, { type: 'deliver' }>): Promise<Outcome>;
   /** `session.prepare`: pin an agent and a launch to a session key (decision 7). */
   prepareSession(f: Extract<HostRequestFrame, { type: 'session.prepare' }>): Outcome;
+  /** `inbound.redispatch`: deliver a queued host-inbound item to a session with its original origin. */
+  redispatch(hostName: string, f: Extract<HostRequestFrame, { type: 'inbound.redispatch' }>): Promise<Outcome>;
+  /** Per-hook timeouts of the `resolve` / `outbound` callouts (config `hostCallouts`). */
+  calloutTimeouts?: { resolve?: number; outbound?: number };
   log: LogFn;
   /** How long a pushed `inbound` waits for the host's result before it is retried (default 30 s). */
   pushTimeoutMs?: number;
@@ -47,7 +66,7 @@ export function hostOrigin(name: string): Origin {
 export const isHostOrigin = (o: Origin) => o.kind === 'system' && o.adapter === 'host';
 
 export class HostService implements HostFrames {
-  private host: { peer: Peer; name: string; consumer?: string; callouts: boolean; push?: PushSubscription } | undefined;
+  private host: { peer: Peer; name: string; consumer?: string; hooks: Set<CalloutHook>; push?: PushSubscription } | undefined;
   private readonly token: Buffer;
 
   constructor(private readonly d: HostServiceDeps) {
@@ -64,9 +83,15 @@ export class HostService implements HostFrames {
   }
 
   /** The connected host's name and role, if any. */
-  info(): { name: string; consumer?: string; callouts: boolean } | undefined {
+  info(): { name: string; consumer?: string; callouts: boolean; hooks: CalloutHook[] } | undefined {
     const h = this.host;
-    return h ? { name: h.name, callouts: h.callouts, ...(h.consumer !== undefined ? { consumer: h.consumer } : {}) } : undefined;
+    return h ? { name: h.name, callouts: h.hooks.size > 0, hooks: [...h.hooks], ...(h.consumer !== undefined ? { consumer: h.consumer } : {}) } : undefined;
+  }
+
+  /** The connected host answers this `policy` hook. */
+  answers(hook: CalloutHook): boolean {
+    const h = this.host;
+    return !!h && h.hooks.has(hook) && !h.peer.signal.aborted;
   }
 
   async handle(peer: Peer, f: HostRequestFrame): Promise<Outcome> {
@@ -111,6 +136,8 @@ export class HostService implements HostFrames {
       }
       case 'session.prepare':
         return this.d.prepareSession(f);
+      case 'inbound.redispatch':
+        return this.d.redispatch(peer.auth!.name, f);
     }
   }
 
@@ -123,15 +150,16 @@ export class HostService implements HostFrames {
     }
     const name = f.name.trim();
     if (!name) return fail('invalid_frame', 'name is empty');
-    const role = f.consumer !== undefined || f.callouts === true;
+    const hooks = calloutHooks(f.callouts);
+    const role = f.consumer !== undefined || hooks.size > 0;
     if (role && this.host && !this.host.peer.signal.aborted) return fail('host_connected', `host ${this.host.name} is connected; at most one host (consumer / callouts) at a time`);
     if (f.consumer !== undefined && !f.consumer) return fail('invalid_frame', 'consumer is empty');
     peer.auth = { name, origin: () => hostOrigin(name) };
     if (role) {
-      this.host = { peer, name, callouts: f.callouts === true, ...(f.consumer !== undefined ? { consumer: f.consumer } : {}) };
+      this.host = { peer, name, hooks, ...(f.consumer !== undefined ? { consumer: f.consumer } : {}) };
       this.d.router.setHostConnected(true);
       if (f.consumer !== undefined) this.host.push = this.startPush(peer, f.consumer);
-      this.d.log('info', `host ${name} connected${f.consumer !== undefined ? `, consuming as ${f.consumer}` : ''}${f.callouts ? ', answering callouts' : ''}`);
+      this.d.log('info', `host ${name} connected${f.consumer !== undefined ? `, consuming as ${f.consumer}` : ''}${hooks.size ? `, answering callouts (${[...hooks].join(', ')})` : ''}`);
     }
     const st = this.d.router.hostTable();
     return ok<HelloResult>({
@@ -141,6 +169,7 @@ export class HostService implements HostFrames {
       bindings: { version: st?.table.version ?? null, active: st?.active ?? false, ...(st?.suspended ? { suspended: st.suspended } : {}) },
       ...(f.consumer !== undefined ? { inbound: { consumer: f.consumer, acked: this.d.queue.cursor(f.consumer), head: this.d.queue.head() } } : {}),
       features: FEATURES,
+      ...(f.callouts !== undefined ? { callouts: role ? [...hooks] : [] } : {}),
     });
   }
 
@@ -169,10 +198,37 @@ export class HostService implements HostFrames {
   async routeCallout(bindingId: string, input: InputRecord, envelope: InboundEnvelope): Promise<CalloutAnswer> {
     const h = this.host;
     if (!h) throw new Error('no host connected');
-    if (!h.callouts) throw new Error(`host ${h.name} does not answer callouts`);
+    if (!h.hooks.has('route')) throw new Error(`host ${h.name} does not answer route callouts`);
     const r = await h.peer.request({ type: 'policy', hook: 'route', args: { bindingId, input, envelope } }, 60_000);
     if (!r.ok) throw new Error(`${r.error?.code ?? 'error'}: ${r.error?.message ?? ''}`);
     return r.value as CalloutAnswer;
+  }
+
+  /**
+   * `Policy.resolve` asked of the host (hook `resolve`). Throws when the host does
+   * not answer it, times out, fails or answers something that is not a Resolver:
+   * the caller falls back to its own policy.
+   */
+  async resolveCallout(request: BodyOf<'request.opened'>, ctx: TurnContext): Promise<Resolver> {
+    const { resolver: _r, ...req } = request;
+    const v = await this.callout('resolve', { request: req, ctx: ctxView(ctx) }, this.d.calloutTimeouts?.resolve ?? 3000);
+    if (!check(Resolver, v)) throw new Error(`bad resolve answer: ${errors(Resolver, v).slice(0, 2).join('; ')}`);
+    return v;
+  }
+
+  /** `Policy.outbound` asked of the host (hook `outbound`). Throws on no answer or a bad one: the caller denies. */
+  async outboundCallout(from: TurnContext | null, to: ReplyRoute): Promise<'allow' | 'deny'> {
+    const v = await this.callout('outbound', { from: from ? ctxView(from) : null, to }, this.d.calloutTimeouts?.outbound ?? 2000);
+    if (!check(OutboundCalloutAnswer, v)) throw new Error(`bad outbound answer: ${errors(OutboundCalloutAnswer, v).slice(0, 2).join('; ')}`);
+    return v.verdict;
+  }
+
+  private async callout(hook: CalloutHook, args: unknown, timeoutMs: number): Promise<unknown> {
+    const h = this.host;
+    if (!h || !h.hooks.has(hook)) throw new Error(`no host answers ${hook}`);
+    const r = await h.peer.request({ type: 'policy', hook, args }, timeoutMs);
+    if (!r.ok) throw new Error(`${r.error?.code ?? 'error'}: ${r.error?.message ?? ''}`);
+    return r.value;
   }
 
   /** Close the host connection's push loop (daemon stop). */
@@ -182,7 +238,32 @@ export class HostService implements HostFrames {
 }
 
 /** Capabilities `host.hello` advertises (a host must not rely on one this list lacks). */
-export const FEATURES = ['session.launch'];
+export const FEATURES = ['session.launch', 'callouts.resolve', 'callouts.outbound', 'resolve.onBehalfOf', 'inbound.redispatch'];
+
+/** The `policy` hooks a host may answer. */
+export type CalloutHook = 'route' | 'resolve' | 'outbound';
+const HOOKS: readonly CalloutHook[] = ['route', 'resolve', 'outbound'];
+
+/** `host.hello.callouts`: `true` = route only; a list names the hooks (unknown names ignored). */
+export function calloutHooks(c: boolean | string[] | undefined): Set<CalloutHook> {
+  if (c === true) return new Set(['route']);
+  if (!Array.isArray(c)) return new Set();
+  return new Set(HOOKS.filter((h) => c.includes(h)));
+}
+
+/** A TurnContext as plain JSON (no undefined fields). */
+function ctxView(c: TurnContext): TurnContext {
+  return {
+    sessionKey: c.sessionKey,
+    turnId: c.turnId,
+    run: c.run,
+    inputs: c.inputs,
+    replyRoute: c.replyRoute,
+    ...(c.owner !== undefined ? { owner: c.owner } : {}),
+    deliveries: c.deliveries,
+    ...(c.provenance ? { provenance: c.provenance } : {}),
+  };
+}
 
 function ok<T>(value: T): Outcome {
   return { ok: true, value };

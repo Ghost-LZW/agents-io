@@ -585,6 +585,9 @@
             }
           ]
         },
+        "onBehalfOf": {
+          "type": "string"
+        },
         "origin": {
           "type": "object",
           "required": [

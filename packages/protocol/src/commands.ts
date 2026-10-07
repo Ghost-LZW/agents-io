@@ -36,6 +36,8 @@ export const Command = Type.Union([
     sessionKey: Type.String(),
     requestId: Type.String(),
     decision: Decision,
+    /** The origin's host relays the answer of this principal (system origins only). */
+    onBehalfOf: Type.Optional(Type.String()),
     origin: Origin,
   }),
   Type.Object({
