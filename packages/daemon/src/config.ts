@@ -145,6 +145,8 @@ const ChannelEntry = Type.Union([
     {
       type: Type.Literal('bridge'),
       ...ChannelCommon,
+      /** The adapter id the peer declares in `hello`; shown (e.g. in status) while the peer has not connected yet. Default `bridge`. */
+      id: Type.Optional(Type.String()),
       command: Type.String(),
       args: Type.Optional(Type.Array(Type.String())),
       env: Type.Optional(Type.Record(Type.String(), Type.String())),
@@ -346,12 +348,34 @@ export const ConfigFile = Type.Object(
           uiUrl: Type.Optional(Type.String()),
           /** Lifetime of console sessions from a login link (default 12 h). */
           sessionTtlMs: Type.Optional(Type.Number({ minimum: 1000 })),
+          /**
+           * WebSocket heartbeat of `/ws`: a ping every `intervalMs` (default 30 s; 0 turns it off);
+           * a connection that has not answered (pong, or any message) within `timeoutMs` after a
+           * ping (default 10 s) is closed, which frees the host role it held.
+           */
+          heartbeat: Type.Optional(
+            Type.Object({ intervalMs: Type.Optional(Type.Integer({ minimum: 0 })), timeoutMs: Type.Optional(Type.Integer({ minimum: 100 })) }, Closed),
+          ),
           /** create-lark-bot invocation for `POST /api/bots/lark` (argv; default npx of the pinned release). */
           larkBotCommand: Type.Optional(Type.Array(Type.String(), { minItems: 1 })),
+          /**
+           * Apply `channels` changes written through the console (`PUT /api/config`, a bot added by
+           * `POST /api/bots/lark`) to the running daemon: start new or changed entries, stop removed
+           * or changed ones, keep the rest. Default false (changes take effect at the next start).
+           */
+          liveChannels: Type.Optional(Type.Boolean()),
         },
         Closed,
       ),
     ),
+    /**
+     * The host connection. `tokenFile`: an operator-set host token, stable across restarts
+     * (relative paths are relative to the config file). Read when the file exists (it must be
+     * ours, 0600-ish, in a directory others cannot write); otherwise generated and written there
+     * (0600). Without it every start makes a fresh token. `aio serve --token-file` wins.
+     * The token is still copied to `<socket>.token` for the CLI.
+     */
+    host: Type.Optional(Type.Object({ tokenFile: Type.Optional(Type.String()) }, Closed)),
     /** Who local socket clients are. */
     local: Type.Optional(
       Type.Object(
@@ -482,6 +506,8 @@ export interface Config {
   local: { principal: Principal; session: string };
   /** The console API server. */
   console: ConsoleConfig;
+  /** The host connection: `tokenFile` is an absolute path when set. */
+  host?: { tokenFile?: string };
   /** Where this config came from (loadConfig): the file (it may not exist) and the env file found for it. */
   source?: { path: string; envFile?: string };
 }
@@ -498,11 +524,17 @@ export interface ConsoleConfig {
   uiUrl?: string;
   sessionTtlMs: number;
   larkBotCommand: string[];
+  /** `/ws` ping interval (0: off) and how long a ping waits for an answer. */
+  heartbeat: { intervalMs: number; timeoutMs: number };
+  /** Apply channel changes written through the console at once. */
+  liveChannels: boolean;
 }
 
 /** create-lark-bot, pinned. */
 export const CREATE_LARK_BOT = ['npx', '-y', 'github:Ghost-LZW/create-lark-bot#v0.2.4'];
 export const DEFAULT_CONSOLE_PORT = 7464;
+export const DEFAULT_WS_HEARTBEAT_MS = 30_000;
+export const DEFAULT_WS_HEARTBEAT_TIMEOUT_MS = 10_000;
 
 /** 127.0.0.0/8, ::1, localhost. */
 export function isLoopbackHost(host: string): boolean {
@@ -547,6 +579,8 @@ function resolveConsole(c: ConfigFile['console']): ConsoleConfig {
     ...(c?.uiUrl !== undefined ? { uiUrl: c.uiUrl.replace(/\/$/, '') } : {}),
     sessionTtlMs: c?.sessionTtlMs ?? 12 * 3_600_000,
     larkBotCommand: c?.larkBotCommand ?? CREATE_LARK_BOT,
+    heartbeat: { intervalMs: c?.heartbeat?.intervalMs ?? DEFAULT_WS_HEARTBEAT_MS, timeoutMs: c?.heartbeat?.timeoutMs ?? DEFAULT_WS_HEARTBEAT_TIMEOUT_MS },
+    liveChannels: c?.liveChannels === true,
   };
 }
 
@@ -695,6 +729,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
       session: localSession,
     },
     console: resolveConsole(c.console),
+    host: c.host?.tokenFile !== undefined ? { tokenFile: path(c.host.tokenFile) } : {},
     ...(warnings.length ? { warnings } : {}),
   };
 }

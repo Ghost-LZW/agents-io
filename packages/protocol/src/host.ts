@@ -228,6 +228,15 @@ export const HostHello = Type.Object({
    * refused with `host_connected`.
    */
   lease: Type.Optional(Type.Object({ ttlMs: Type.Number() })),
+  /**
+   * When another connection holds the host role (`consumer` / `callouts`),
+   * replace it instead of failing with `host_connected`: the daemon closes the
+   * old connection (its unacked pushes are pushed again here) and logs the
+   * takeover. For a host reconnecting while its previous connection is
+   * half-open. Needs the valid token like any hello; a daemon that lists
+   * `host.takeover` in `features` supports it (an older one ignores the flag).
+   */
+  takeover: Type.Optional(Type.Boolean()),
 });
 export type HostHello = Static<typeof HostHello>;
 
@@ -430,6 +439,8 @@ export const HostHelloResult = Type.Object({
   inbound: Type.Optional(Type.Object({ consumer: Type.String(), acked: Type.Number(), head: Type.Number() })),
   /** The granted presence lease, when the hello asked for one. */
   lease: Type.Optional(Type.Object({ ttlMs: Type.Number(), expiresAt: Type.Number() })),
+  /** The host connection this hello replaced (`takeover: true`). */
+  replaced: Type.Optional(Type.Object({ name: Type.String() })),
   /**
    * Capabilities by name, e.g. `session.launch` (callout answers may carry
    * `launch`; `session.prepare`). A daemon without one ignores what it adds, so

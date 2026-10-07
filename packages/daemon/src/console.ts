@@ -8,6 +8,7 @@ import {
   ADMIN_WS_BEARER_PREFIX,
   ADMIN_WS_PATH,
   ADMIN_WS_SUBPROTOCOL,
+  type AdminChannelsApplied,
   AdminConfigPut,
   AdminConfigValidateRequest,
   AdminLarkBotRequest,
@@ -68,6 +69,8 @@ const ProofRequest = Type.Object({ challenge: Type.String({ minLength: 16, maxLe
 const LOGIN_TTL_MS = 5 * 60_000;
 const MAX_BODY = 4 * 1024 * 1024;
 const WS_HIGH_WATER = 4 * 1024 * 1024;
+/** How long a closed /ws connection may take to answer the close frame before its socket is dropped. */
+const WS_CLOSE_GRACE_MS = 1000;
 const STATUS_TEXT: Record<number, string> = { 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found' };
 
 /** What the console needs from the daemon. */
@@ -85,6 +88,8 @@ export interface ConsoleHost {
   /** Absent: the daemon was started without a config file path (`/api/config*` answer 404). */
   readonly configStore?: ConfigStore;
   readonly larkBots?: LarkBotJobs;
+  /** `console.liveChannels`: apply the file's `channels` to the running daemon after a `PUT`. */
+  applyChannels?(): Promise<{ applied: 'live' | 'restart'; channels: AdminChannelsApplied } | undefined>;
 }
 
 type Role = 'host' | 'session';
@@ -336,8 +341,11 @@ export class ConsoleServer {
         const body = await readJson(req, AdminConfigPut);
         const r = store.put(body.config, body.ifRevision);
         if (r.status === 409) throw new HttpError(409, r.code, r.message);
-        if (r.status === 200) this.o.log('info', `console: config written (revision ${r.body.revision}, ${r.body.applied === 'restart' ? 'restart required' : 'unchanged'})`);
-        return { status: r.status, body: r.body };
+        if (r.status !== 200) return { status: r.status, body: r.body };
+        const live = await h.applyChannels?.();
+        const res = live ? { ...r.body, applied: live.applied, channels: live.channels } : r.body;
+        this.o.log('info', `console: config written (revision ${res.revision}, ${res.applied === 'restart' ? 'restart required' : live ? 'applied live' : 'unchanged'})`);
+        return { status: 200, body: res };
       }
     }
     if (p === '/api/bots/lark' || p.startsWith('/api/bots/lark/')) {
@@ -391,11 +399,19 @@ export class ConsoleServer {
       get gone() {
         return ws.readyState !== ws.OPEN;
       },
-      end: () => ws.close(1001, 'closing'),
+      end: () => {
+        ws.close(1001, 'closing');
+        // A half-open peer (host takeover) never answers the close: drop the socket after a short grace.
+        const t = setTimeout(() => ws.terminate(), WS_CLOSE_GRACE_MS);
+        t.unref?.();
+        ws.once('close', () => clearTimeout(t));
+      },
     };
     const c = new FrameConn(transport, this.o.host.local, () => this.conns.delete(c), { origin: (key) => this.o.host.consoleOrigin(key) });
     this.conns.add(c);
+    const beat = this.heartbeat(ws, c.id);
     ws.on('message', (data, isBinary) => {
+      beat.alive();
       if (isBinary) return void c.send({ v: PROTOCOL_VERSION, type: 'result', id: '', ok: false, error: { code: 'bad_json', message: 'frames are text messages' } });
       let raw: unknown;
       try {
@@ -405,8 +421,51 @@ export class ConsoleServer {
       }
       c.receive(raw);
     });
-    ws.on('close', () => c.drop());
-    ws.on('error', () => c.drop());
+    ws.on('close', () => {
+      beat.stop();
+      c.drop();
+    });
+    ws.on('error', () => {
+      beat.stop();
+      c.drop();
+    });
+  }
+
+  /**
+   * `/ws` heartbeat (`console.heartbeat`): a ping every `intervalMs`; no pong (or
+   * other message) within `timeoutMs` after it and the socket is terminated, so a
+   * half-open connection does not keep the host role (or its pushes) forever.
+   */
+  private heartbeat(ws: WebSocket, id: string): { alive(): void; stop(): void } {
+    const { intervalMs, timeoutMs } = this.o.config.heartbeat;
+    if (intervalMs <= 0) return { alive: () => {}, stop: () => {} };
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    const alive = () => {
+      clearTimeout(deadline);
+      deadline = undefined;
+    };
+    ws.on('pong', alive);
+    const tick = setInterval(() => {
+      if (ws.readyState !== ws.OPEN || deadline) return;
+      deadline = setTimeout(() => {
+        this.o.log('warn', `console: /ws connection ${id} did not answer a heartbeat within ${timeoutMs} ms; closing it`);
+        ws.terminate();
+      }, timeoutMs);
+      deadline.unref?.();
+      try {
+        ws.ping();
+      } catch {
+        // closing already
+      }
+    }, intervalMs);
+    tick.unref?.();
+    return {
+      alive,
+      stop: () => {
+        clearInterval(tick);
+        alive();
+      },
+    };
   }
 }
 

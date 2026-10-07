@@ -86,6 +86,17 @@
         }
       }
     },
+    "replaced": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      }
+    },
     "features": {
       "type": "array",
       "items": {

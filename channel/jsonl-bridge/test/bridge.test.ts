@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -188,6 +188,50 @@ describe('robustness', () => {
     await expect(
       spawnChannel({ command: process.execPath, args: ['-e', 'setInterval(()=>{},1000)'], account: 'a', helloTimeoutMs: 100 }),
     ).rejects.toMatchObject({ code: 'timeout' });
+  });
+});
+
+describe('retryFirstConnect', () => {
+  it('opens disconnected when the first hello fails, then connects with backoff once started', async () => {
+    const gate = join(mkdtempSync(join(tmpdir(), 'bridge-')), 'gate');
+    const states: { connected: boolean; error?: string }[] = [];
+    const ch = await rawChild('gated', { retryFirstConnect: true, id: 'expected', backoff: { minMs: 20, maxMs: 40 }, onState: (s: { connected: boolean; error?: string }) => states.push(s) }, { GATE_FILE: gate });
+    expect(ch.state().connected).toBe(false);
+    expect(ch.state().error).toMatch(/exited|peer_closed|closed/);
+    expect(states.at(-1)).toMatchObject({ connected: false });
+    expect(ch.id).toBe('expected');
+    expect(ch.caps().defaultTier).toBe('final');
+    expect(ch.edit).toBeUndefined();
+    await expect(ch.send(route, { text: 'x' } as never, { operationId: 'o1' } as never)).rejects.toMatchObject({ code: 'unavailable', retryable: true });
+    const r = run(ch);
+    // Still failing while the gate is closed: retried, not given up.
+    await waitFor(() => r.logs.filter((l) => l.includes('channel connect failed')).length >= 2);
+    expect(ch.state().connected).toBe(false);
+    writeFileSync(gate, 'open');
+    await waitFor(() => ch.state().connected);
+    expect(ch.id).toBe('raw');
+    expect(ch.state().error).toBeUndefined();
+    expect(states.at(-1)).toEqual({ connected: true });
+    await r.stop();
+  });
+
+  it('a command that cannot be run still rejects open (a config error, not a peer that is not up yet)', async () => {
+    await expect(spawnChannel({ command: join(tmpdir(), 'no-such-channel-binary'), account: 'default', retryFirstConnect: true })).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('without it, a failed first hello still rejects open', async () => {
+    const gate = join(mkdtempSync(join(tmpdir(), 'bridge-')), 'gate');
+    await expect(rawChild('gated', {}, { GATE_FILE: gate })).rejects.toThrow();
+  });
+
+  it('reports a peer that goes away later', async () => {
+    const states: { connected: boolean; error?: string }[] = [];
+    const ch = await rawChild('flap', { retryFirstConnect: true, backoff: { minMs: 500, maxMs: 1000 }, onState: (s: { connected: boolean; error?: string }) => states.push(s) });
+    expect(states[0]).toEqual({ connected: true });
+    const r = run(ch);
+    await waitFor(() => states.some((s) => !s.connected));
+    expect(ch.state()).toMatchObject({ connected: false, error: expect.stringMatching(/exited/) });
+    await r.stop();
   });
 });
 

@@ -6,7 +6,7 @@ import type { HarnessAdapter, Policy } from '@agents-io/protocol';
 import { FakeChannel, FakeHarness, type FakeTurnScript } from '@agents-io/testkit';
 import { LocalClient } from '../src/client.js';
 import { resolveConfig, type Config, type HarnessInstance } from '../src/config.js';
-import { Gateway, InstanceHarness } from '../src/gateway.js';
+import { Gateway, InstanceHarness, type GatewayOptions } from '../src/gateway.js';
 import { readTokenFile, tokenPath } from '../src/token.js';
 
 export const cleanups: (() => Promise<void> | void)[] = [];
@@ -59,6 +59,10 @@ export async function daemon(
     console?: boolean;
     /** The env the console's config store and provisioning children see. */
     consoleEnv?: NodeJS.ProcessEnv;
+    /** Build configured channels' adapters (GatewayOptions.channelAdapter). */
+    channelAdapter?: GatewayOptions['channelAdapter'];
+    /** GatewayOptions.channelStartGraceMs. */
+    channelStartGraceMs?: number;
   } = {},
 ): Promise<World> {
   const dir = o.dir ?? tmp();
@@ -88,6 +92,8 @@ export async function daemon(
     hostPush: { timeoutMs: 300, retryMs: 20 },
     logger: () => {},
     ...(o.console ? { console: true, consoleEnv: o.consoleEnv ?? {} } : {}),
+    ...(o.channelAdapter ? { channelAdapter: o.channelAdapter } : {}),
+    ...(o.channelStartGraceMs !== undefined ? { channelStartGraceMs: o.channelStartGraceMs } : {}),
   });
   let stopped = false;
   const stop = async () => {

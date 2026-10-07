@@ -18,7 +18,7 @@ import { WATCH_SPEC_HELP, formatWatch, parseDuration, parseWatchSpec } from './w
 const USAGE = `aio: the agents-io daemon and its CLI
 
 daemon
-  aio serve     [--harness <instance>]
+  aio serve     [--harness <instance>] [--token-file <path>]   (stable host token: read, or generated 0600)
   aio e2e       [--harness <instance>] [--only <id|name>[,…]] [--data-dir <dir>] [--verbose]
 
 local ends (as the local principal)
@@ -95,6 +95,7 @@ export function parseCli(argv: string[]): CliArgs {
         consumer: { type: 'string' },
         once: { type: 'boolean' },
         limit: { type: 'string' },
+        'token-file': { type: 'string' },
       },
     });
   } catch (e) {
@@ -173,7 +174,15 @@ const print = (v: unknown) => console.log(JSON.stringify(v, null, 2));
 
 async function serve(a: CliArgs): Promise<number> {
   const c = config(a);
-  const gw = await Gateway.start({ config: c, console: c.console.enabled, logger: (level, msg) => console.error(`[aio] ${level}: ${msg}`) });
+  const tokenFile = str(a, 'token-file');
+  let gw: Gateway;
+  try {
+    gw = await Gateway.start({ config: c, console: c.console.enabled, ...(tokenFile ? { tokenFile: resolve(tokenFile) } : {}), logger: (level, msg) => console.error(`[aio] ${level}: ${msg}`) });
+  } catch (e) {
+    // A bad operator token file is a configuration error, not "daemon not running".
+    if (e instanceof TokenError) throw new ConfigError(e.message);
+    throw e;
+  }
   let version = 'not probed';
   try {
     version = (await gw.harness().probe()).version;

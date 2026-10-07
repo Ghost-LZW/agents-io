@@ -74,14 +74,24 @@ see `docs/E2E.md` §0). New:
 ## Host connection
 
 `aio serve` writes a fresh host token to `<socket>.token` (0600) at every start and
-removes it at stop. A connection sends `host.hello { token, name, consumer?, callouts? }`
+removes it at stop. For a token that stays the same across restarts, set
+`host.tokenFile` in the config (relative to the config file) or pass
+`aio serve --token-file <path>` (wins): the file is read when it exists (it must be a
+regular file of this user, not accessible to group / others, in a directory others
+cannot write, holding at least 16 characters without whitespace; otherwise the daemon
+does not start), else a fresh token is generated and written there (0600, a missing
+directory is created 0700). It is still copied to `<socket>.token` for the CLI; the
+daemon never removes or rotates the operator's file. A connection sends `host.hello { token, name, consumer?, callouts? }`
 before any host frame; after it, the connection's client frames carry the origin
 `{ kind: "system", principal: "host:<name>" }`.
 
 - Any number of authenticated connections may use the request frames (the CLI's
   host commands are such connections). A connection whose hello sets `consumer`
   (push-consume the inbound queue) or any callout hook (`callouts`) becomes **the host**: at most
-  one at a time (`host_connected` otherwise). While it is connected the router's
+  one at a time (`host_connected` otherwise; a hello with `takeover: true` and the
+  valid token replaces the current host instead: its connection is closed, the
+  takeover logged, its unacked pushes go to the new host, and the result carries
+  `replaced: { name }`; feature `host.takeover`). While it is connected the router's
   host table is active even with `onHostDown: "suspend"`, `route` callouts go to it,
   and runs whose own connection left report `run.ended` to it.
 - `bindings.put` / `bindings.get`: the host table, persisted in the log's database
@@ -152,7 +162,9 @@ against the protocol alone.
   "origins": ["https://ui.example"],   // CORS for a separately hosted UI; none by default
   "uiUrl": "https://ui.example",       // where login links point (default: the console itself)
   "sessionTtlMs": 43200000,
-  "larkBotCommand": ["npx", "-y", "github:Ghost-LZW/create-lark-bot#v0.2.4"]
+  "larkBotCommand": ["npx", "-y", "github:Ghost-LZW/create-lark-bot#v0.2.4"],
+  "heartbeat": { "intervalMs": 30000, "timeoutMs": 10000 },  // /ws ping; no answer in timeoutMs → closed (0 interval: off)
+  "liveChannels": false       // true: channel changes written through the console start/stop channels at once
 }
 ```
 
@@ -197,8 +209,20 @@ against the protocol alone.
   credential fields (`inline_secret`, 422),
   honor `ifRevision` (409), and write atomically (temp + fsync + rename, 0600).
   The daemon does not reload: `applied: "restart"` unless the file is back to
-  what it started with.
-- **`/ws`**: exactly the local socket's frames. Client frames carry the local
+  what it runs. With `liveChannels: true` the `channels` part is applied at once:
+  entries new or changed (compared after env substitution) start, entries gone or
+  changed stop (stops first), the rest keep running, and sessions already open
+  render to the new ones; the answer's `channels` lists `started` / `stopped` /
+  `failed`, and `applied` is `"live"` when nothing else differs (otherwise the
+  rest still needs a restart). `started` means launched and not failed within a
+  short grace (1 s); a bridge not connected, or a start that failed at once, is in
+  `failed` (and `applied` stays `"restart"`); a failure an adapter only logs while
+  retrying (lark-bot with bad credentials) shows in `GET /api/status` / the log
+  only. Off by default (docs/design/live-channels).
+- **`/ws`**: exactly the local socket's frames. The server pings every
+  `heartbeat.intervalMs`; a connection that answers neither with a pong nor any
+  message within `heartbeat.timeoutMs` is terminated (logged), which frees the host
+  role a half-open remote host held. Client frames carry the local
   principal with `via: "console"`, `adapter: "console"`; host frames work after
   `host.hello` with the host token.
 - **Lark bot provisioning**: `POST /api/bots/lark` runs `larkBotCommand` with
@@ -213,7 +237,9 @@ against the protocol alone.
   references. On success the config gets a `lark-bot` channel for the account
   whose `config` references those names explicitly (unless `addChannel: false`)
   and the verified owner `lark-bot:<union_id>` in `policy.owners`; restart to
-  start it. One job at a time. Refused at start (409, also with `addChannel:
+  start it, or, with `console.liveChannels`, the channel is started before the job
+  turns `succeeded` (`result.channelStarted`, false with the reason in the message
+  when its start failed at once; a new owner still needs the restart). One job at a time. Refused at start (409, also with `addChannel:
   false`, since the env file would be overwritten): a lark-bot channel with the
   same account, the target variables already set (env file or environment), or
   another channel reading them (`proj-a` and `proj_a` share names); a bad

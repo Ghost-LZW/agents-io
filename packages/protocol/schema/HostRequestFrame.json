@@ -55,6 +55,9 @@
               "type": "number"
             }
           }
+        },
+        "takeover": {
+          "type": "boolean"
         }
       }
     },

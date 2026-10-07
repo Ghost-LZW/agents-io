@@ -15,7 +15,7 @@ const names = [
   'ResolveCalloutAnswer', 'OutboundCalloutAnswer', 'TurnContextView', 'InboundRedispatchResult',
   // Console / admin HTTP API
   'AdminError', 'AdminLoginRequest', 'AdminLoginResult', 'AdminStatus', 'AdminConfigDocument', 'AdminConfigPut', 'AdminConfigPutResult',
-  'AdminConfigValidateRequest', 'AdminConfigValidation', 'AdminQueue', 'AdminSessions', 'AdminLarkBotRequest', 'AdminLarkBotStarted', 'AdminLarkBotJob',
+  'AdminChannelsApplied', 'AdminConfigValidateRequest', 'AdminConfigValidation', 'AdminQueue', 'AdminSessions', 'AdminLarkBotRequest', 'AdminLarkBotStarted', 'AdminLarkBotJob',
 ];
 const dir = new URL('../packages/protocol/schema/', import.meta.url);
 mkdirSync(dir, { recursive: true });

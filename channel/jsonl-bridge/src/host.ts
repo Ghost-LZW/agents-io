@@ -41,6 +41,25 @@ export interface BridgeOptions {
   shutdownGraceMs?: number;
   /** Logger used until `start` supplies `ctx.log`. */
   log?: ChannelContext['log'];
+  /**
+   * When the first connect (spawn + `hello`) fails, resolve `open` anyway with a
+   * disconnected bridge instead of rejecting (except when the command cannot be run
+   * at all: ENOENT / EACCES / ENOTDIR still reject); `start` then keeps retrying with the
+   * restart backoff. Until a hello succeeds the adapter reports `id` (below) and
+   * offline caps, and every request fails `unavailable` (retryable). Default false.
+   */
+  retryFirstConnect?: boolean;
+  /** Adapter id before the first successful `hello` (with `retryFirstConnect`). Default `bridge`. */
+  id?: string;
+  /** Called whenever the peer connects, goes away, or a connect attempt fails. */
+  onState?: (s: BridgeState) => void;
+}
+
+/** Connection state of a bridged channel. */
+export interface BridgeState {
+  connected: boolean;
+  /** Why the last connect attempt failed, or why the peer went away. */
+  error?: string;
 }
 
 export interface SpawnChannelOptions extends BridgeOptions {
@@ -56,7 +75,23 @@ export type ConnectChannelOptions = BridgeOptions & ({ path: string } | { host: 
 /** The adapter returned by the host side; `close` stops the peer without needing `start`. */
 export interface BridgedChannel extends ChannelAdapter {
   close(): Promise<void>;
+  /** Connected to a peer that answered `hello`, and why not otherwise. */
+  state(): BridgeState;
 }
+
+/** Caps of a bridge whose peer never answered `hello` (`retryFirstConnect`): plain final text only. */
+export const OFFLINE_CHANNEL_CAPS: ChannelCaps = {
+  text: { maxChars: 4000, markdown: 'none' },
+  edit: false,
+  buttons: false,
+  media: { in: [], out: [] },
+  voiceOut: 'none',
+  threads: false,
+  approvals: 'none',
+  defaultTier: 'final',
+  evidence: [],
+  declaresSender: false,
+};
 
 interface Transport {
   input: Readable;
@@ -99,6 +134,12 @@ export function spawnChannel(opts: SpawnChannelOptions): Promise<BridgedChannel>
   });
 }
 
+/** The child process could not be started at all (ENOENT, EACCES, …): retrying will not help. */
+function isSpawnError(err: unknown): boolean {
+  const e = err as { code?: unknown; syscall?: unknown } | undefined;
+  return typeof e?.syscall === 'string' && e.syscall.startsWith('spawn') && (e.code === 'ENOENT' || e.code === 'EACCES' || e.code === 'ENOTDIR');
+}
+
 /** Attach to an already-running adapter listening on a unix socket (`path`) or TCP (`host`+`port`). */
 export function connectChannel(opts: ConnectChannelOptions): Promise<BridgedChannel> {
   return Bridge.open(opts, () => {
@@ -133,7 +174,10 @@ interface Conn {
 
 class Bridge implements BridgedChannel {
   private conn: Conn | undefined;
-  private hello!: ChannelHello;
+  private hello: ChannelHello | undefined;
+  private lastError: string | undefined;
+  /** `open` returned without a peer (`retryFirstConnect`): `start` waits a backoff step before dialing. */
+  private firstFailed = false;
   private ctx: ChannelContext | undefined;
   private ctxWaiters: (() => void)[] = [];
   private nextId = 0;
@@ -173,31 +217,52 @@ class Bridge implements BridgedChannel {
 
   static async open(opts: BridgeOptions, opener: () => Promise<Transport>): Promise<BridgedChannel> {
     const b = new Bridge(opts, opener);
-    await b.connect();
-    const has = new Set<string>(b.hello.methods);
-    if (has.has('edit'))
-      b.edit = async (route, providerMessageId, msg, op) => void (await b.request('edit', { route, providerMessageId, msg, op }));
-    if (has.has('finalize'))
-      b.finalize = async (route, providerMessageId, msg) => void (await b.request('finalize', { route, providerMessageId, msg }));
-    if (has.has('retract'))
-      b.retract = async (route, providerMessageId, outcome) => void (await b.request('retract', { route, providerMessageId, outcome }));
-    if (has.has('speak')) b.speak = async (route, utterance) => void (await b.request('speak', { route, utterance }));
-    if (has.has('typing')) b.typing = async (route, on) => void (await b.request('typing', { route, on }));
-    if (has.has('reconcile'))
-      b.reconcile = async (route, providerMessageId) => {
-        const v = await b.request('reconcile', { route, providerMessageId });
-        if (v !== 'alive' && v !== 'gone') throw new ChannelBridgeError('bad_result', `reconcile returned ${JSON.stringify(v)}`, false);
-        return v;
-      };
+    try {
+      await b.connect();
+    } catch (err) {
+      // A command that cannot be run at all (missing, not executable) is a config error, not a peer that is not up yet.
+      if (!opts.retryFirstConnect || b.closing || isSpawnError(err)) throw err;
+      b.firstFailed = true;
+      b.failed(err);
+      b.log('warn', `channel connect failed: ${errMsg(err)}; retrying once started`);
+    }
     return b;
   }
 
+  /** Optional methods as the latest `hello` declared them. */
+  private attachMethods(methods: readonly string[]): void {
+    const has = new Set<string>(methods);
+    const set = <K extends 'edit' | 'finalize' | 'retract' | 'speak' | 'typing' | 'reconcile'>(k: K, f: ChannelAdapter[K]) => {
+      if (has.has(k)) this[k] = f as this[K];
+      else delete this[k];
+    };
+    set('edit', async (route, providerMessageId, msg, op) => void (await this.request('edit', { route, providerMessageId, msg, op })));
+    set('finalize', async (route, providerMessageId, msg) => void (await this.request('finalize', { route, providerMessageId, msg })));
+    set('retract', async (route, providerMessageId, outcome) => void (await this.request('retract', { route, providerMessageId, outcome })));
+    set('speak', async (route, utterance) => void (await this.request('speak', { route, utterance })));
+    set('typing', async (route, on) => void (await this.request('typing', { route, on })));
+    set('reconcile', async (route, providerMessageId) => {
+      const v = await this.request('reconcile', { route, providerMessageId });
+      if (v !== 'alive' && v !== 'gone') throw new ChannelBridgeError('bad_result', `reconcile returned ${JSON.stringify(v)}`, false);
+      return v;
+    });
+  }
+
   get id(): string {
-    return this.hello.adapterId;
+    return this.hello?.adapterId ?? this.opts.id ?? 'bridge';
   }
 
   caps(): ChannelCaps {
-    return this.hello.caps;
+    return this.hello?.caps ?? OFFLINE_CHANNEL_CAPS;
+  }
+
+  state(): BridgeState {
+    return { connected: !!this.conn, ...(this.lastError !== undefined ? { error: this.lastError } : {}) };
+  }
+
+  private failed(err: unknown): void {
+    this.lastError = errMsg(err);
+    this.opts.onState?.(this.state());
   }
 
   async send(route: Parameters<ChannelAdapter['send']>[0], msg: Parameters<ChannelAdapter['send']>[1], op: Parameters<ChannelAdapter['send']>[2]) {
@@ -218,12 +283,18 @@ class Bridge implements BridgedChannel {
       else signal.addEventListener('abort', () => r('abort'), { once: true });
     });
     let attempt = 0;
+    if (this.firstFailed) {
+      // `open` just failed to connect: back off before dialing again.
+      this.firstFailed = false;
+      await sleep(this.delay(attempt++), signal);
+    }
     while (!signal.aborted) {
       if (!this.conn) {
         try {
           await this.connect();
         } catch (err) {
           if (signal.aborted) break;
+          this.failed(err);
           const wait = this.delay(attempt++);
           this.log('warn', `channel connect failed: ${errMsg(err)}; retry in ${wait}ms`);
           await sleep(wait, signal);
@@ -293,7 +364,10 @@ class Bridge implements BridgedChannel {
     }
     void transport.closed.then((reason) => {
       conn.gone = true;
-      if (this.conn === conn) this.conn = undefined;
+      if (this.conn === conn) {
+        this.conn = undefined;
+        if (!this.closing) this.failed(`channel peer ${reason}`);
+      }
       for (const [id, p] of conn.pending) {
         clearTimeout(p.timer);
         p.reject(new ChannelBridgeError('peer_closed', `channel peer ${reason}`, true));
@@ -309,6 +383,7 @@ class Bridge implements BridgedChannel {
       const value = await this.call(conn, 'hello', { account: this.opts.account, config: this.opts.config }, this.helloTimeoutMs);
       if (!check(ChannelHello, value)) throw new ChannelBridgeError('bad_hello', `invalid hello: ${errors(ChannelHello, value).slice(0, 3).join('; ')}`, false);
       this.hello = value;
+      this.attachMethods(value.methods);
     } catch (err) {
       transport.kill();
       throw err;
@@ -320,6 +395,8 @@ class Bridge implements BridgedChannel {
       throw new ChannelBridgeError('closed', 'bridge is closing', false);
     }
     this.conn = conn;
+    this.lastError = undefined;
+    this.opts.onState?.(this.state());
   }
 
   private request(type: string, body: Record<string, unknown>): Promise<unknown> {

@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { AdminLarkBotJob, AdminLarkBotJobState, AdminLarkBotRequest } from '@agents-io/protocol';
+import type { AdminChannelsApplied, AdminLarkBotJob, AdminLarkBotJobState, AdminLarkBotRequest } from '@agents-io/protocol';
 import { envRefs, type ConfigStore } from './console-config.js';
 import type { LogFn } from './gateway.js';
 
@@ -18,7 +18,9 @@ import type { LogFn } from './gateway.js';
  * LARK_PROJ_A_APP_ID / …); the daemon never handles them. With `addChannel` the
  * config gets a `lark-bot` channel for the account that references those names
  * explicitly (decision 8: one daemon, several bots), with a verified owner
- * `policy.owners` gets `lark-bot:<union_id>`; both take effect at the next start.
+ * `policy.owners` gets `lark-bot:<union_id>`; both take effect at the next start,
+ * except that with `console.liveChannels` the channel is started at once
+ * (`channelStarted`; the owner still needs the restart).
  * The job may wait minutes for a scan, so the config is checked again, as it is
  * then, before anything is written (same account, variable names, a duplicate
  * app, the startup validation).
@@ -69,6 +71,8 @@ export interface LarkBotJobsOptions {
   /** Private work directory for QR and avatar files (0700). */
   dir: string;
   config: ConfigStore;
+  /** `console.liveChannels`: apply the config's channels after a bot was added (the gateway's `applyChannels`). */
+  applyChannels?: () => Promise<{ channels: AdminChannelsApplied } | undefined>;
   log: LogFn;
   /** Environment of the child (default process.env). */
   env?: NodeJS.ProcessEnv;
@@ -309,19 +313,37 @@ export class LarkBotJobs {
     const incomplete = code === 3 || r.configuration?.ok === false;
     const consoleUrl = `https://open.${domain === 'lark' ? 'larksuite.com' : 'feishu.cn'}/app/${r.appId}`;
     const warnings = r.warnings?.length ? ` (${r.warnings.length} warning${r.warnings.length > 1 ? 's' : ''})` : '';
-    this.finish(job, 'succeeded', {
-      message: incomplete ? `app created; the console configuration is not complete: finish it in the developer console${warnings}` : `app created and configured${warnings}; restart the daemon to start the channel`,
-      result: {
-        appId: r.appId,
-        domain,
-        ...(r.identity?.name ? { botName: r.identity.name } : {}),
-        account,
-        env,
-        ...(owner ? { owner } : {}),
-        channelAdded: addChannel,
-        ...(incomplete ? { consoleUrl } : {}),
+    // started: launched and not failed at once (a later failure shows in GET /api/status only).
+    const done = (started: boolean | undefined, failure?: string) =>
+      this.finish(job, 'succeeded', {
+        message: incomplete
+          ? `app created; the console configuration is not complete: finish it in the developer console${warnings}`
+          : `app created and configured${warnings}; ${started ? 'the channel is started' : failure ? `the channel did not start (${failure}); fix it and save the config again, or restart the daemon` : addChannel ? 'restart the daemon to start the channel' : 'no channel was added'}`,
+        result: {
+          appId: r.appId,
+          domain,
+          ...(r.identity?.name ? { botName: r.identity.name } : {}),
+          account,
+          env,
+          ...(owner ? { owner } : {}),
+          channelAdded: addChannel,
+          ...(started !== undefined ? { channelStarted: started } : {}),
+          ...(incomplete ? { consoleUrl } : {}),
+        },
+      });
+    const apply = addChannel ? this.o.applyChannels : undefined;
+    if (!apply) return done(undefined);
+    // Started live: the job stays `configuring` until the channel runs (or could not start).
+    void apply().then(
+      (a) => {
+        const mine = (c: { type: string; account: string }) => c.type === 'lark-bot' && c.account === account;
+        done(a ? a.channels.started.some(mine) : undefined, a?.channels.failed?.find(mine)?.error);
       },
-    });
+      (e) => {
+        this.o.log('warn', `lark bot job ${job.view.job}: channel not started live: ${(e as Error).message}`);
+        done(false);
+      },
+    );
   }
 
   private set(job: Job, patch: Partial<AdminLarkBotJob>): void {

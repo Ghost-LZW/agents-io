@@ -55,6 +55,73 @@
           "type": "string"
         }
       ]
+    },
+    "channels": {
+      "type": "object",
+      "required": [
+        "started",
+        "stopped"
+      ],
+      "properties": {
+        "started": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "type",
+              "account"
+            ],
+            "properties": {
+              "type": {
+                "type": "string"
+              },
+              "account": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "stopped": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "type",
+              "account"
+            ],
+            "properties": {
+              "type": {
+                "type": "string"
+              },
+              "account": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "failed": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "type",
+              "account",
+              "error"
+            ],
+            "properties": {
+              "type": {
+                "type": "string"
+              },
+              "account": {
+                "type": "string"
+              },
+              "error": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
     }
   }
 }

@@ -1,12 +1,13 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, rmSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve as resolvePath } from 'node:path';
 import {
   PROTOCOL_VERSION,
   routeKey,
   type AdminQueue,
   type AdminSession,
   type AdminSessions,
+  type AdminChannelsApplied,
   type AdminStatus,
   type ChannelAdapter,
   type ContentBlock,
@@ -67,10 +68,10 @@ import { CodexHarness, type CodexProfile } from '@agents-io/harness-codex';
 import { loadChannelModule } from './channel-module.js';
 import { LarkBotAdapter } from '@agents-io/channel-lark-bot';
 import { MailChannel, type MailChannelConfig } from '@agents-io/channel-mail';
-import { spawnChannel } from '@agents-io/channel-jsonl-bridge';
+import { spawnChannel, type BridgeState } from '@agents-io/channel-jsonl-bridge';
 import { ConfigError, agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ResolvedChannel } from './config.js';
 import { ConsoleServer } from './console.js';
-import { ConfigStore } from './console-config.js';
+import { ConfigStore, canonical } from './console-config.js';
 import { LarkBotJobs } from './provision.js';
 import type { ClientCommand, SessionInfo } from './frames.js';
 import { HostService, isHostOrigin } from './host.js';
@@ -80,7 +81,7 @@ import { blobResolvers, type MediaResolvers } from './media.js';
 import { DaemonRecords } from './records.js';
 import { checkLaunch, launchView, sameLaunch, type LaunchCheck } from './launch.js';
 import { Runs } from './runs.js';
-import { consoleUrlPath, removeTokenFile, tokenPath, writeTokenFile } from './token.js';
+import { consoleUrlPath, loadOrCreateTokenFile, removeTokenFile, TokenError, tokenPath, writeTokenFile } from './token.js';
 
 export type LogFn = (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
 
@@ -99,6 +100,8 @@ export interface GatewayOptions {
   buildHarness?: (instance: HarnessInstance) => HarnessAdapter;
   /** In-process channels besides the configured ones. */
   channels?: ExtraChannel[];
+  /** Build a configured channel's adapter with this instead of the built-in one when it returns one (embedding, tests). */
+  channelAdapter?: (ch: ResolvedChannel) => ChannelAdapter | undefined;
   /**
    * Hooks that replace defaultPolicy's. A `Policy.admit` here is legacy: it then
    * routes instead of the default binding table (watches still apply).
@@ -115,14 +118,25 @@ export interface GatewayOptions {
   /** Tee of raw harness events per session (conformance checks). */
   onHarnessEvent?: (sessionKey: string, e: HarnessEvent) => void;
   logger?: LogFn;
-  /** Host token (default: a fresh random one, written next to the socket when listening). */
+  /** Host token (default: from `tokenFile`, else a fresh random one; written next to the socket when listening). */
   token?: string;
+  /**
+   * Operator-set host token file (`aio serve --token-file`; default `config.host.tokenFile`):
+   * read if present, else generated and written (0600). Ignored when `token` is given.
+   */
+  tokenFile?: string;
   /** Inbound push: how long a pushed item waits for the host's result, and the retry delay (tests). */
   hostPush?: { timeoutMs?: number; retryMs?: number };
   /** Serve the console API per `config.console` (default false; `aio serve` turns it on unless `console.enabled` is false). */
   console?: boolean;
   /** Environment of provisioning children (default process.env; tests). */
   consoleEnv?: NodeJS.ProcessEnv;
+  /**
+   * `console.liveChannels`: how long a channel started live may take to fail its
+   * `start` before it is reported `started` (default 1000). Bridges report their first
+   * connect at once and are not waited for.
+   */
+  channelStartGraceMs?: number;
 }
 
 /** Outcome of a local command, mapped 1:1 onto a `result` frame. */
@@ -137,6 +151,12 @@ interface RunningChannel {
   close?: () => Promise<void>;
   state: 'running' | 'stopped' | 'failed';
   error?: string;
+  /** The config entry it was built from (configured channels only). */
+  source?: ResolvedChannel;
+  /** `start` returned or rejected: the channel no longer runs and is not retried. */
+  ended?: boolean;
+  /** A bridge reported its connection state (it has connected or failed a first connect). */
+  reported?: boolean;
 }
 
 const DAEMON_VERSION: string = (() => {
@@ -200,6 +220,10 @@ export class Gateway {
   private readonly launched = new Map<string, LaunchAdapters>();
   private readonly compositors: Compositor[] = [];
   private readonly sessionCompositors = new Map<string, Compositor[]>();
+  /** The channel adapter each compositor renders to (to stop them with a channel removed live). */
+  private readonly compositorAdapter = new WeakMap<Compositor, ChannelAdapter>();
+  /** Live channel applies run one at a time. */
+  private applying: Promise<unknown> = Promise.resolve();
   private readonly channels: RunningChannel[] = [];
   private server: LocalServer | undefined;
   private tokenFile: string | undefined;
@@ -221,6 +245,8 @@ export class Gateway {
     this.harness();
     this.log = o.logger ?? ((level, msg) => console.error(`[aio] ${level}: ${msg}`));
     for (const w of c.warnings ?? []) this.log('warn', `config: ${w}`);
+    // Before anything opens: a bad token file fails the start without leaving handles behind.
+    this.token = o.token ?? this.hostToken(o.tokenFile ?? c.host?.tokenFile);
     if (!o.log && c.logPath !== ':memory:') {
       // Transcripts and tool output: 0600 before SQLite opens it (its -wal/-shm files take the database's mode).
       const warn = (msg: string) => this.log('warn', msg);
@@ -232,7 +258,6 @@ export class Gateway {
     this.hub = new Hub(log);
     this.records = new DaemonRecords(db);
     this.hostQueue = new HostQueue(db);
-    this.token = o.token ?? randomBytes(32).toString('hex');
     // Every topic change is recorded (topic.changed) in the session left and the one now current.
     this.topics = new TopicRegistry({ ...db, hub: this.hub, onChange: (ch) => this.topicChanged(ch) });
     // Agents: the configured ones, or `default` on the default instance with sessions keyed by bare route keys as before.
@@ -389,10 +414,21 @@ export class Gateway {
         command: c.console.larkBotCommand,
         dir: join(c.dataDir, 'provision'),
         config: store,
+        ...(c.console.liveChannels ? { applyChannels: () => this.applyChannels() } : {}),
         log: (level, msg) => this.log(level, msg),
         ...(o.consoleEnv ? { env: o.consoleEnv } : {}),
       });
     }
+  }
+
+  /** The operator's token file (read, or created), else a fresh token for this start only. */
+  private hostToken(file: string | undefined): string {
+    if (file === undefined) return randomBytes(32).toString('hex');
+    // `<socket>.token` is the daemon's copy, rewritten at listen and removed at stop: never the operator's file.
+    if (resolvePath(file) === resolvePath(tokenPath(this.o.config.socketPath))) throw new TokenError(`token file ${file} is the daemon's own copy next to the socket (${tokenPath(this.o.config.socketPath)}); choose another path`);
+    const r = loadOrCreateTokenFile(file);
+    this.log('info', r.created ? `host token generated and written to ${file}` : `host token read from ${file}`);
+    return r.token;
   }
 
   static async start(o: GatewayOptions): Promise<Gateway> {
@@ -445,6 +481,7 @@ export class Gateway {
         consoleOrigin: (key) => this.consoleOrigin(key),
         ...(this.configStore ? { configStore: this.configStore } : {}),
         ...(this.larkBots ? { larkBots: this.larkBots } : {}),
+        ...(this.configStore && c.console.liveChannels ? { applyChannels: () => this.applyChannels() } : {}),
       },
       log: (level, msg) => this.log(level, msg),
     });
@@ -1198,6 +1235,7 @@ ${a.summary}` }],
       onError: (err) => this.log('warn', `render to ${adapter.id} failed: ${(err as Error).message}`),
     });
     c.start();
+    this.compositorAdapter.set(c, adapter);
     this.compositors.push(c);
     const list = this.sessionCompositors.get(sessionKey);
     if (list) list.push(c);
@@ -1205,11 +1243,11 @@ ${a.summary}` }],
   }
 
   private async startChannels(): Promise<void> {
-    const all: { adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }[] = [];
+    const all: BuiltChannel[] = [];
     const closeAll = () => Promise.all(all.map((c) => c.close?.().catch(() => undefined)));
     try {
       let i = 0;
-      for (const ch of this.o.config.channels) all.push(await buildChannel(ch, i++, (l, m, d) => this.log(l, m, d)));
+      for (const ch of this.o.config.channels) all.push(await this.buildConfigChannel(ch, i++));
       for (const x of this.o.channels ?? []) all.push({ adapter: x.adapter, account: x.account ?? 'default', ...(x.tier ? { tier: x.tier } : {}) });
       // Only now is a module channel's id known: one (channel, account) is one route target.
       const seen = new Set<string>();
@@ -1222,34 +1260,208 @@ ${a.summary}` }],
       await closeAll();
       throw e;
     }
-    for (const ch of all) {
-      const ac = new AbortController();
-      const running = ch.adapter
-        .start({
-          account: ch.account,
-          config: ch.config,
-          signal: ac.signal,
-          blobs: this.blobs,
-          emit: async (env) => {
-            const r = await this.accept(env);
-            return { accepted: r.accepted, ...(r.inputId !== undefined ? { inputId: r.inputId } : {}) };
-          },
-          log: (level, msg) => this.log(level, `${ch.adapter.id}: ${msg}`),
-        })
-        .then(
-          () => {
-            entry.state = 'stopped';
-          },
-          (err: Error) => {
-            entry.state = 'failed';
-            entry.error = err.message;
-            this.log('error', `channel ${ch.adapter.id} stopped: ${err.message}`);
-          },
-        );
-      const entry: RunningChannel = { adapter: ch.adapter, account: ch.account, ...(ch.tier ? { tier: ch.tier } : {}), ac, running, state: 'running', ...(ch.close ? { close: ch.close } : {}) };
-      this.channels.push(entry);
-      this.log('info', `channel ${ch.adapter.id} (${ch.account}) started`);
+    for (const b of all) this.launchChannel(b);
+  }
+
+  /**
+   * Build one configured channel (not started yet). A bridge whose first `hello` fails
+   * does not stop the daemon: once launched it is listed `failed` with the reason and
+   * keeps being retried with the bridge's restart backoff; it turns `running` once a
+   * peer answers.
+   */
+  private async buildConfigChannel(cfg: ResolvedChannel, index: number): Promise<BuiltChannel> {
+    let entry: RunningChannel | undefined;
+    let early: BridgeState | undefined;
+    const onState = (st: BridgeState) => {
+      if (!entry) return void (early = st);
+      this.bridgeState(entry, st);
+    };
+    const own = this.o.channelAdapter?.(cfg);
+    const built = own ? { adapter: own, account: cfg.account, ...(cfg.tier ? { tier: cfg.tier } : {}) } : await buildChannel(cfg, index, (l, m, d) => this.log(l, m, d), onState);
+    return {
+      ...built,
+      source: cfg,
+      bind: (e) => {
+        entry = e;
+        if (early) this.bridgeState(e, early);
+      },
+    };
+  }
+
+  private launchChannel(b: BuiltChannel): RunningChannel {
+    const e = this.startChannel(b);
+    if (b.source) e.source = b.source;
+    b.bind?.(e);
+    return e;
+  }
+
+  /** Build and start one configured channel next to the running ones (live apply). */
+  private async startConfigChannel(cfg: ResolvedChannel, index: number): Promise<RunningChannel> {
+    const b = await this.buildConfigChannel(cfg, index);
+    if (this.channels.some((e) => e.adapter.id === b.adapter.id && e.account === b.account)) {
+      await b.close?.().catch(() => undefined);
+      throw new ConfigError(`two channels have the same (channel, account) = (${b.adapter.id}, ${b.account}); give one another account`);
     }
+    return this.launchChannel(b);
+  }
+
+  private bridgeState(entry: RunningChannel, st: BridgeState): void {
+    if (entry.ac.signal.aborted || entry.state === 'stopped') return;
+    entry.reported = true;
+    const was = entry.state;
+    if (st.connected) {
+      entry.state = 'running';
+      delete entry.error;
+      if (was === 'failed') this.log('info', `channel ${entry.adapter.id} (${entry.account}) connected`);
+    } else {
+      entry.state = 'failed';
+      entry.error = `${st.error ?? 'not connected'}; retrying`;
+      if (was !== 'failed') this.log('warn', `channel ${entry.adapter.id} (${entry.account}): ${entry.error}`);
+    }
+  }
+
+  /**
+   * `console.liveChannels`: make the running configured channels match the config file's
+   * `channels` (after `PUT /api/config` or a provisioned bot). Entries are compared as
+   * resolved (env references substituted, so a changed secret counts as a change):
+   * removed and changed ones stop, new and changed ones start (stops first, so an app
+   * moved to another entry never runs twice), unchanged ones keep running (one whose
+   * `start` already ended is started again).
+   *
+   * `started` lists channels launched that had not failed when the answer was made: a
+   * bridge whose first connect failed (it keeps retrying), or a channel whose `start`
+   * rejects within `channelStartGraceMs`, is listed in `failed` instead, and so is an
+   * unchanged one still failing; the file then does not count as applied. A failure
+   * an adapter only logs (it retries internally, as lark-bot does with bad credentials)
+   * or one after the grace shows in `GET /api/status` only. Returns
+   * undefined when it is off, there is no config file, or the file does not resolve.
+   */
+  applyChannels(): Promise<{ applied: 'live' | 'restart'; channels: AdminChannelsApplied } | undefined> {
+    const p = this.applying.then(() => this.applyChannelsNow());
+    this.applying = p.catch(() => undefined);
+    return p;
+  }
+
+  private async applyChannelsNow(): Promise<{ applied: 'live' | 'restart'; channels: AdminChannelsApplied } | undefined> {
+    const store = this.configStore;
+    if (this.stopped || !store || !this.o.config.console.liveChannels) return undefined;
+    const cur = store.read();
+    if (cur.parseError) return undefined;
+    let next: ResolvedChannel[];
+    try {
+      next = store.resolve(cur.raw).channels;
+    } catch (e) {
+      this.log('warn', `config channels not applied: ${(e as Error).message}`);
+      return undefined;
+    }
+    const ref = (c: ResolvedChannel) => ({ type: c.type, account: c.account });
+    const want = next.map((c, index) => ({ c, index, key: canonical(c), kept: false }));
+    const stop: RunningChannel[] = [];
+    for (const e of this.channels) {
+      if (!e.source) continue;
+      if (e.ended) {
+        stop.push(e);
+        continue;
+      }
+      const key = canonical(e.source);
+      const same = want.find((w) => !w.kept && w.key === key);
+      if (same) same.kept = true;
+      else stop.push(e);
+    }
+    const out: AdminChannelsApplied = { started: [], stopped: [] };
+    for (const e of stop) {
+      await this.stopChannel(e);
+      out.stopped.push(ref(e.source!));
+    }
+    const failed: NonNullable<AdminChannelsApplied['failed']> = [];
+    const launched: RunningChannel[] = [];
+    for (const w of want) {
+      if (w.kept) continue;
+      if (this.stopped) break;
+      try {
+        const e = await this.startConfigChannel(w.c, w.index);
+        // Sessions already open render to it too, as if it had been there at their start.
+        for (const key of this.lanes.keys()) this.compose(key, e.adapter, e.tier, e.account);
+        launched.push(e);
+      } catch (err) {
+        failed.push({ ...ref(w.c), error: (err as Error).message });
+        this.log('error', `channel ${w.c.type} (${w.c.account}) not started: ${(err as Error).message}`);
+      }
+    }
+    // A start that fails at once (bad config, unreachable service) is not reported as started.
+    const grace = this.o.channelStartGraceMs ?? 1000;
+    const pending = launched.filter((e) => !e.reported && !e.ended);
+    if (pending.length && grace > 0) await within(Promise.all(pending.map((e) => e.running)), grace);
+    for (const e of launched) {
+      if (e.ended) {
+        // Its start rejected: forget it, so the next apply starts it again.
+        failed.push({ ...ref(e.source!), error: e.error ?? 'the channel stopped' });
+        if (!this.stopped) await this.stopChannel(e);
+      } else if (e.state === 'failed') failed.push({ ...ref(e.source!), error: e.error ?? 'not connected' });
+      else out.started.push(ref(e.source!));
+    }
+    // An unchanged channel that is still failing keeps the file from counting as applied.
+    for (const e of this.channels) if (e.source && !launched.includes(e) && e.state === 'failed') failed.push({ ...ref(e.source), error: e.error ?? 'failed' });
+    if (failed.length) out.failed = failed;
+    else store.channelsApplied(cur.raw);
+    (this.o.config as { channels: ResolvedChannel[] }).channels = this.channels.flatMap((e) => (e.source ? [e.source] : []));
+    if (out.started.length || out.stopped.length || failed.length) {
+      const list = (xs: { type: string; account: string }[]) => xs.map((x) => `${x.type} (${x.account})`).join(', ') || 'none';
+      this.log('info', `channels applied live: started ${list(out.started)}; stopped ${list(out.stopped)}${failed.length ? `; failed ${list(failed)}` : ''}`);
+    }
+    return { applied: store.appliedOf(cur.raw), channels: out };
+  }
+
+  /** Stop one running channel and the compositors rendering to it, and forget it. */
+  private async stopChannel(e: RunningChannel): Promise<void> {
+    e.ac.abort();
+    await within(e.running, 3000);
+    const comps = this.compositors.filter((c) => this.compositorAdapter.get(c) === e.adapter);
+    await within(Promise.all(comps.map((c) => c.stop())), 5000);
+    for (const c of comps) this.compositors.splice(this.compositors.indexOf(c), 1);
+    for (const [key, list] of this.sessionCompositors) {
+      const rest = list.filter((c) => !comps.includes(c));
+      if (rest.length !== list.length) this.sessionCompositors.set(key, rest);
+    }
+    await within(e.close?.().catch(() => undefined), 3000);
+    const i = this.channels.indexOf(e);
+    if (i >= 0) this.channels.splice(i, 1);
+    e.state = 'stopped';
+    delete e.error;
+    this.log('info', `channel ${e.adapter.id} (${e.account}) stopped`);
+  }
+
+  private startChannel(ch: { adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }): RunningChannel {
+    const ac = new AbortController();
+    const running = ch.adapter
+      .start({
+        account: ch.account,
+        config: ch.config,
+        signal: ac.signal,
+        blobs: this.blobs,
+        emit: async (env) => {
+          const r = await this.accept(env);
+          return { accepted: r.accepted, ...(r.inputId !== undefined ? { inputId: r.inputId } : {}) };
+        },
+        log: (level, msg) => this.log(level, `${ch.adapter.id}: ${msg}`),
+      })
+      .then(
+        () => {
+          entry.ended = true;
+          entry.state = 'stopped';
+          delete entry.error;
+        },
+        (err: Error) => {
+          entry.ended = true;
+          entry.state = 'failed';
+          entry.error = err.message;
+          this.log('error', `channel ${ch.adapter.id} stopped: ${err.message}`);
+        },
+      );
+    const entry: RunningChannel = { adapter: ch.adapter, account: ch.account, ...(ch.tier ? { tier: ch.tier } : {}), ac, running, state: 'running', ...(ch.close ? { close: ch.close } : {}) };
+    this.channels.push(entry);
+    this.log('info', `channel ${ch.adapter.id} (${ch.account}) started`);
+    return entry;
   }
 
   /**
@@ -1609,7 +1821,10 @@ export function buildHarness(i: HarnessInstance, media?: MediaResolvers): Instan
   return new InstanceHarness(inst, new ClaudeCodeHarness(config));
 }
 
-async function buildChannel(ch: ResolvedChannel, index: number, log: (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void): Promise<{ adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }> {
+/** A channel built but not started yet. */
+type BuiltChannel = { adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void>; source?: ResolvedChannel; bind?: (e: RunningChannel) => void };
+
+async function buildChannel(ch: ResolvedChannel, index: number, log: (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void, onState?: (s: BridgeState) => void): Promise<{ adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }> {
   const tier = ch.tier ? { tier: ch.tier } : {};
   switch (ch.type) {
     case 'lark-bot':
@@ -1624,6 +1839,10 @@ async function buildChannel(ch: ResolvedChannel, index: number, log: (level: 'de
         ...(ch.env ? { env: ch.env } : {}),
         ...(ch.cwd ? { cwd: ch.cwd } : {}),
         ...(ch.config !== undefined ? { config: ch.config } : {}),
+        // A peer that fails its first hello is retried with the restart backoff instead of failing the daemon.
+        retryFirstConnect: true,
+        ...(ch.id !== undefined ? { id: ch.id } : {}),
+        ...(onState ? { onState } : {}),
       });
       return { adapter: b, account: ch.account, config: ch.config, close: () => b.close(), ...tier };
     }

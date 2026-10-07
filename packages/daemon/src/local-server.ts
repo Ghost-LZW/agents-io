@@ -19,6 +19,8 @@ export interface Peer {
   request(frame: Record<string, unknown>, timeoutMs?: number): Promise<ResultFrame>;
   /** Aborted when the connection is gone. */
   readonly signal: AbortSignal;
+  /** Close the connection (a host taken over); reports it gone. */
+  end?(reason: string): void;
 }
 
 /** Host-protocol frames (docs/HOSTS.md §4), handled by the daemon. */
