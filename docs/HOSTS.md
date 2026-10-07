@@ -106,5 +106,4 @@ x-work-os 核心不依赖 agents-io；换成别的 IO 实现，只需换掉这�
 
 ## 7. 待定
 
-- 上下文被污染时 harness 权限 profile 是否降档（见 DECISIONS.md 决定 4 的备注）。
 - 多宿主、版本协商、宿主重连后对运行中 run 的恢复。
