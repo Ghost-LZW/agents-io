@@ -14,10 +14,10 @@ Provision the app with [create-lark-bot](https://github.com/Ghost-LZW/create-lar
 For example:
 
 ```sh
-npx github:Ghost-LZW/create-lark-bot#v0.2.1 --name "my agent" --avatar ./avatar.png \
+npx github:Ghost-LZW/create-lark-bot#v0.2.3 --name "my agent" --avatar ./avatar.png \
   --preset messaging,contact --write-env .env.live \
   --env-owner-var AGENTS_IO_OWNERS --owner-prefix lark-bot:
-npx github:Ghost-LZW/create-lark-bot#v0.2.1 verify --live
+npx github:Ghost-LZW/create-lark-bot#v0.2.3 verify --live
 ```
 
 `messaging` covers every scope, event and callback in `requirements.ts`; `contact` lets the tool resolve your union_id, which it writes as the owner key.

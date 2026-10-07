@@ -131,10 +131,10 @@ attach 里直接输入文字就是 queue 输入；`/steer <text>`、`/interrupt 
 1. 创建机器人（[create-lark-bot](https://github.com/Ghost-LZW/create-lark-bot) v0.2.1，GitHub 预发布版，不在 npm）。在仓库根目录执行，凭证和主人键写进 `.env.live`：
 
    ```sh
-   npx github:Ghost-LZW/create-lark-bot#v0.2.1 --name "<name>" --avatar ./avatar.png \
+   npx github:Ghost-LZW/create-lark-bot#v0.2.3 --name "<name>" --avatar ./avatar.png \
      --preset messaging,contact --write-env .env.live \
      --env-owner-var AGENTS_IO_OWNERS --owner-prefix lark-bot:
-   npx github:Ghost-LZW/create-lark-bot#v0.2.1 verify --live
+   npx github:Ghost-LZW/create-lark-bot#v0.2.3 verify --live
    ```
 
    它写入 `LARK_APP_ID`、`LARK_APP_SECRET`、`LARK_DOMAIN`，以及经过验证的主人键 `lark-bot:<union_id>` 到 `AGENTS_IO_OWNERS`（逗号列表）。

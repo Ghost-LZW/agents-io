@@ -109,7 +109,7 @@ against the protocol alone.
   "origins": ["https://ui.example"],   // CORS for a separately hosted UI; none by default
   "uiUrl": "https://ui.example",       // where login links point (default: the console itself)
   "sessionTtlMs": 43200000,
-  "larkBotCommand": ["npx", "-y", "github:Ghost-LZW/create-lark-bot#v0.2.2"]
+  "larkBotCommand": ["npx", "-y", "github:Ghost-LZW/create-lark-bot#v0.2.3"]
 }
 ```
 

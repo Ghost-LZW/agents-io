@@ -427,7 +427,7 @@ export interface ConsoleConfig {
 }
 
 /** create-lark-bot, pinned. */
-export const CREATE_LARK_BOT = ['npx', '-y', 'github:Ghost-LZW/create-lark-bot#v0.2.2'];
+export const CREATE_LARK_BOT = ['npx', '-y', 'github:Ghost-LZW/create-lark-bot#v0.2.3'];
 export const DEFAULT_CONSOLE_PORT = 7464;
 
 /** 127.0.0.0/8, ::1, localhost. */
