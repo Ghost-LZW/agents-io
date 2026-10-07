@@ -8,6 +8,7 @@ import { LocalClient } from './client.js';
 import { ConfigError, defaultInstance, loadConfig, type LoadOptions } from './config.js';
 import { runScenarios } from './e2e.js';
 import { Gateway, buildHarness } from './gateway.js';
+import { WATCH_SPEC_HELP, formatWatch, parseWatchSpec } from './watch-spec.js';
 
 const USAGE = `aio-dev: agents-io dev gateway (example)
 
@@ -15,7 +16,12 @@ const USAGE = `aio-dev: agents-io dev gateway (example)
   aio-dev attach    [--session <key>] [--tier full|card|headline|final] [--from <seq>] [--verbose]
   aio-dev send      [--session <key>] [--mode queue|steer|interrupt] [--wait] <text…>
   aio-dev sessions
+  aio-dev watch     add [--session <target>] key=value…
+  aio-dev watch     list [--session <target>]
+  aio-dev watch     remove <id>
   aio-dev e2e       [--harness <instance>] [--only <id|name>[,…]] [--verbose]
+
+watch keys: ${WATCH_SPEC_HELP}
 
 --harness: a name from \`harnesses\` (or claude-code|codex: that kind's first instance)
 
@@ -143,6 +149,40 @@ async function sessions(a: CliArgs): Promise<number> {
   return 0;
 }
 
+async function watch(a: CliArgs): Promise<number> {
+  const c = config(a, { channels: false });
+  const [sub = 'list', ...tokens] = a.rest;
+  const session = a.values.session as string | undefined;
+  const client = await LocalClient.connect(c.socketPath);
+  try {
+    switch (sub) {
+      case 'add': {
+        const w = await client.watchAdd(parseWatchSpec(tokens, session ?? c.local.session));
+        console.log(formatWatch(w));
+        return 0;
+      }
+      case 'list':
+      case 'ls': {
+        const ws = await client.watchList(session);
+        for (const w of ws) console.log(formatWatch(w));
+        if (!ws.length) console.error('no watches');
+        return 0;
+      }
+      case 'remove':
+      case 'rm': {
+        if (!tokens[0]) throw new ConfigError('usage: aio-dev watch remove <id>');
+        const r = await client.watchRemove(tokens[0]);
+        console.log(r.removed ? `removed ${tokens[0]}` : `no watch ${tokens[0]}`);
+        return r.removed ? 0 : 1;
+      }
+      default:
+        throw new ConfigError(`unknown watch command ${sub} (add, list, remove)`);
+    }
+  } finally {
+    client.close();
+  }
+}
+
 async function e2e(a: CliArgs): Promise<number> {
   const c = config(a, { channels: false });
   const inst = defaultInstance(c);
@@ -169,6 +209,8 @@ export async function main(argv: string[]): Promise<number> {
       return sessions(a);
     case 'e2e':
       return e2e(a);
+    case 'watch':
+      return watch(a);
     case 'help':
       console.log(USAGE);
       return 0;

@@ -10,6 +10,7 @@ import {
 } from '@agents-io/protocol';
 import type { CommandResult, Lane } from './lane.js';
 import { conversationRouteKey, withDefaults, type FullPolicy, type SessionPolicy } from './policy.js';
+import type { WatchDelivery, WatchDispatcher } from './watch.js';
 
 const ACTION_PREFIX = 'req:';
 
@@ -48,6 +49,9 @@ export interface IngressOptions {
   newId?: (prefix: string) => string;
   /** How many envelope ids to remember for dedup (default 10 000). */
   dedupWindow?: number;
+  /** Watches: after its own admission an envelope is also delivered to every session watching it. */
+  watches?: WatchDispatcher;
+  onWatchError?: (err: unknown) => void;
 }
 
 export interface IngressResult {
@@ -59,6 +63,8 @@ export interface IngressResult {
   origin?: Origin;
   result?: CommandResult;
   error?: string;
+  /** Deliveries to watching sessions (only when a watch matched). */
+  watched?: WatchDelivery[];
 }
 
 /**
@@ -93,7 +99,34 @@ export class Ingress {
     if (prior) return { ...prior, action: 'duplicate' };
     const r = await this.process(env);
     if (r.accepted) this.remember(key, r);
-    return r;
+    const watched = await this.fanout(env, r);
+    return watched?.length ? { ...r, watched } : r;
+  }
+
+  /**
+   * The watch step, separate from (and after) the envelope's own admission.
+   *
+   * It runs whatever the admission was, including `drop`: a policy drop means
+   * "not for the session it would have gone to" (a stranger's DM, a group
+   * message nobody addressed to the bot), which is exactly what a watch on the
+   * owner's inbox or a group is for. It does not run for what is not a message
+   * at all: an adapter-level drop (`env.admission === 'drop'`: auto-replies,
+   * bounces, bulk mail), card clicks (resolve/interrupt), invalid envelopes and
+   * duplicates. Our own echoes reach it but are filtered by `excludeSelf`
+   * (default true) and can never trigger. A host that wants a sender ignored
+   * everywhere says so in `Policy.triage` as well as in `Policy.admit`.
+   */
+  private async fanout(env: InboundEnvelope, r: IngressResult): Promise<WatchDelivery[] | undefined> {
+    const w = this.o.watches;
+    if (!w || !r.accepted || !r.origin) return undefined;
+    if (r.action !== 'dispatch' && r.action !== 'observe' && r.action !== 'drop') return undefined;
+    if (env.admission === 'drop' || actionClick(env)) return undefined;
+    try {
+      return await w.fanout(env, r.origin, r.action === 'drop' ? undefined : r.sessionKey, channelContext(env));
+    } catch (e) {
+      this.o.onWatchError?.(e);
+      return undefined;
+    }
   }
 
   private remember(key: string, r: IngressResult): void {

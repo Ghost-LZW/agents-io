@@ -1,7 +1,8 @@
 import { chmodSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { dirname } from 'node:path';
-import { FrameDecoder, PROTOCOL_VERSION, encodeFrame, type Origin } from '@agents-io/protocol';
+import { FrameDecoder, PROTOCOL_VERSION, encodeFrame, type Origin, type Watch, type WatchDraft } from '@agents-io/protocol';
+import type { AddWatchResult, RemoveWatchResult } from '@agents-io/session';
 import type { Hub, Subscription } from '@agents-io/session';
 import { parseClientFrame, type ClientCommand, type ClientFrame, type ServerFrame, type SessionInfo } from './frames.js';
 import type { Outcome } from './gateway.js';
@@ -12,6 +13,9 @@ export interface LocalHost {
   localOrigin(sessionKey: string): Origin;
   command(cmd: ClientCommand, origin: Origin): Promise<Outcome>;
   sessions(): SessionInfo[];
+  addWatch(by: Origin, watch: WatchDraft): Promise<AddWatchResult>;
+  removeWatch(by: Origin, id: string): Promise<RemoveWatchResult>;
+  listWatches(sessionKey?: string): Watch[];
 }
 
 /**
@@ -112,6 +116,20 @@ class Conn {
     }
     const f: ClientFrame = p.frame;
     if (f.type === 'sessions') return this.result(f.id, { ok: true, value: this.host.sessions() });
+    try {
+      // The local client is the owner: its origin goes to Policy.watch like any other creator's.
+      if (f.type === 'watch.list') return this.result(f.id, { ok: true, value: this.host.listWatches(f.sessionKey) });
+      if (f.type === 'watch.add') {
+        const r = await this.host.addWatch(this.host.localOrigin(f.watch.target.sessionKey), f.watch);
+        return this.result(f.id, r.ok ? { ok: true, value: r.watch } : { ok: false, code: r.code, message: r.message });
+      }
+      if (f.type === 'watch.remove') {
+        const r = await this.host.removeWatch(this.host.localOrigin(''), f.watchId);
+        return this.result(f.id, r.ok ? { ok: true, value: { removed: r.removed } } : { ok: false, code: r.code, message: r.message });
+      }
+    } catch (e) {
+      return this.result(f.id, { ok: false, code: 'internal', message: (e as Error).message });
+    }
     const cmd = f.command;
     try {
       if (cmd.type === 'subscribe') return this.result(f.id, this.subscribe(cmd));

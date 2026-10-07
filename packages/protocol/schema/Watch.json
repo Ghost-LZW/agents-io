@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/Watch",
+  "type": "object",
+  "required": [
+    "id",
+    "source",
+    "target",
+    "mode",
+    "createdBy",
+    "createdAt"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "source": {
+      "type": "object",
+      "required": [
+        "channel"
+      ],
+      "properties": {
+        "channel": {
+          "type": "string"
+        },
+        "account": {
+          "type": "string"
+        },
+        "conversation": {
+          "type": "string"
+        },
+        "conversationKind": {
+          "anyOf": [
+            {
+              "const": "dm",
+              "type": "string"
+            },
+            {
+              "const": "group",
+              "type": "string"
+            },
+            {
+              "const": "thread",
+              "type": "string"
+            },
+            {
+              "const": "meeting",
+              "type": "string"
+            },
+            {
+              "const": "mail",
+              "type": "string"
+            },
+            {
+              "const": "other",
+              "type": "string"
+            }
+          ]
+        },
+        "senders": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "filter": {
+      "type": "object",
+      "properties": {
+        "keywords": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mentions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "excludeSelf": {
+          "type": "boolean"
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "required": [
+        "sessionKey"
+      ],
+      "properties": {
+        "sessionKey": {
+          "type": "string"
+        }
+      }
+    },
+    "mode": {
+      "anyOf": [
+        {
+          "const": "context",
+          "type": "string"
+        },
+        {
+          "const": "digest",
+          "type": "string"
+        },
+        {
+          "const": "trigger",
+          "type": "string"
+        }
+      ]
+    },
+    "digest": {
+      "type": "object",
+      "required": [
+        "everyMs"
+      ],
+      "properties": {
+        "everyMs": {
+          "type": "number"
+        },
+        "maxItems": {
+          "type": "number"
+        }
+      }
+    },
+    "createdBy": {
+      "type": "string"
+    },
+    "createdAt": {
+      "type": "number"
+    },
+    "expiresAt": {
+      "type": "number"
+    },
+    "note": {
+      "type": "string"
+    }
+  }
+}

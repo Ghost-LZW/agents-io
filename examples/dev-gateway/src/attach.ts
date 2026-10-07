@@ -2,6 +2,7 @@ import { createInterface } from 'node:readline';
 import type { Tier } from '@agents-io/protocol';
 import { CommandError, type LocalClient } from './client.js';
 import { EventRenderer } from './render.js';
+import { WatchSpecError, formatWatch, parseWatchSpec } from './watch-spec.js';
 
 export type AttachAction =
   | { kind: 'input'; text: string }
@@ -10,6 +11,9 @@ export type AttachAction =
   | { kind: 'approve'; requestId: string; always: boolean }
   | { kind: 'deny'; requestId: string; message?: string }
   | { kind: 'sessions' }
+  | { kind: 'watch'; op: 'add'; tokens: string[] }
+  | { kind: 'watch'; op: 'list'; all: boolean }
+  | { kind: 'watch'; op: 'remove'; id: string }
   | { kind: 'help' }
   | { kind: 'quit' }
   | { kind: 'none' }
@@ -22,6 +26,8 @@ export const ATTACH_HELP = [
   '/approve <id>   allow a pending request (/approve <id> always: for the session)',
   '/deny <id> [why]',
   '/sessions       list sessions',
+  '/watch add k=v… watch inputs into this session (e.g. channel=lark-bot conversation=oc_1 mode=digest every=30m)',
+  '/watch list     watches into this session (/watch list all: every watch); /watch remove <id>',
   '/quit           detach (Ctrl-D too); //text sends text starting with /',
 ].join('\n');
 
@@ -51,6 +57,13 @@ export function parseAttachLine(line: string): AttachAction {
     }
     case 'sessions':
       return { kind: 'sessions' };
+    case 'watch': {
+      const [op = 'list', ...more] = rest;
+      if (op === 'add') return more.length ? { kind: 'watch', op: 'add', tokens: more } : { kind: 'error', message: 'usage: /watch add channel=<ch> … (see /help)' };
+      if (op === 'list' || op === 'ls') return { kind: 'watch', op: 'list', all: more[0] === 'all' };
+      if ((op === 'remove' || op === 'rm') && more[0]) return { kind: 'watch', op: 'remove', id: more[0] };
+      return { kind: 'error', message: 'usage: /watch add k=v… | /watch list [all] | /watch remove <id>' };
+    }
     case 'help':
     case '?':
       return { kind: 'help' };
@@ -131,6 +144,18 @@ export async function runAttach(o: AttachOptions): Promise<void> {
         break;
       case 'deny':
         await report('deny', client.command({ type: 'resolve', sessionKey, requestId: a.requestId, decision: { kind: 'deny', ...(a.message ? { message: a.message } : {}) } }));
+        break;
+      case 'watch':
+        try {
+          if (a.op === 'add') out(`   watch ${formatWatch(await client.watchAdd(parseWatchSpec(a.tokens, sessionKey)))}\n`);
+          else if (a.op === 'remove') out(`   ${(await client.watchRemove(a.id)).removed ? `removed ${a.id}` : `no watch ${a.id}`}\n`);
+          else {
+            const ws = await client.watchList(a.all ? undefined : sessionKey);
+            out(ws.length ? ws.map((w) => `   ${formatWatch(w)}\n`).join('') : '   (no watches)\n');
+          }
+        } catch (e) {
+          out(`   (watch failed: ${e instanceof CommandError ? e.message : e instanceof WatchSpecError ? e.message : (e as Error).message})\n`);
+        }
         break;
       case 'sessions':
         try {
