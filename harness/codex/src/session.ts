@@ -463,7 +463,9 @@ export class CodexSession implements HarnessSession {
       }
       case 'thread/tokenUsage/updated': {
         const p = params as ThreadTokenUsageUpdatedNotification;
-        const t = this.turnFor(p.turnId);
+        // Never binds: after thread/resume Codex reports the usage of the thread's last turn (an
+        // earlier one), which can arrive between our turn/start and its answer.
+        const t = this.turnFor(p.turnId, false);
         if (t) t.usage = p.tokenUsage;
         this.emit({ t: 'usage', usage: p.tokenUsage }, { turnId: t?.turnId, level: 'debug', audience: 'internal' });
         return;
@@ -675,11 +677,11 @@ export class CodexSession implements HarnessSession {
   }
 
   /** Our active turn for a Codex turn id. Binds an unbound turn (events can precede the turn/start response). */
-  private turnFor(codexTurnId: string | null | undefined): Turn | undefined {
+  private turnFor(codexTurnId: string | null | undefined, bind = true): Turn | undefined {
     const t = this.active;
     if (!t || t.done || !codexTurnId) return undefined;
     if (t.codexTurnId === codexTurnId) return t;
-    if (t.codexTurnId === undefined) {
+    if (t.codexTurnId === undefined && bind) {
       t.bind(codexTurnId);
       return t;
     }

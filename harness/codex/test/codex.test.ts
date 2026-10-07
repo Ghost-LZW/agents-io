@@ -312,6 +312,27 @@ describe('turn mapping', () => {
     assertConformingStream(c.events);
   });
 
+  it('a resumed thread reporting its last turn usage before turn/start answers does not steal the new turn', async () => {
+    const { fake, harness } = setup();
+    const start = fake.handlers['turn/start']!;
+    fake.handlers['turn/start'] = (p) => {
+      // What Codex does right after thread/resume: the usage of the thread's previous turn.
+      fake.notify('thread/tokenUsage/updated', { threadId: p.threadId, turnId: 'earlier-turn', tokenUsage: { total: { totalTokens: 5 }, last: { totalTokens: 5 }, modelContextWindow: 100 } });
+      return start(p);
+    };
+    fake.onTurnStart = (p, tid) => {
+      fake.echoUser(p.threadId, tid, p.clientUserMessageId);
+      fake.completeTurn(p.threadId, tid, 'completed');
+    };
+    const s = await open(harness, { resume: 'thr-7' });
+    const c = collector(s);
+    await s.startTurn('T1', [input('i1', 'x')]);
+    await c.until((e) => isCompleted(e) && e.turnId === 'T1');
+    expect(c.of('turn.completed')[0]).toMatchObject({ turnId: 'T1', status: 'completed' });
+    expect(c.of('input.consumed')).toEqual([{ t: 'input.consumed', inputIds: ['i1'], turnId: 'T1' }]);
+    expect(c.events.filter((e) => e.body.t === 'native' && e.body.name === 'turn/started')).toHaveLength(0);
+  });
+
   it('maps turns started by another client as foreign turns', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
