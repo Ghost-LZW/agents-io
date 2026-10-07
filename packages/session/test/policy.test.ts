@@ -130,3 +130,22 @@ describe('defaultPolicy.watch', () => {
     expect(await p.triage!({ watch: w({ channel: 'mail' }), input: {} as any })).toBe('context');
   });
 });
+
+describe('defaultPolicy owner evidence', () => {
+  const p = defaultPolicy({ owners: ['mail:i@example.com'] });
+  const args = (evidence: any) => ({ channel: 'mail', account: 'a', channelUserId: 'i@example.com', evidence });
+
+  it('an owner address without evidence is a stranger (forged From)', async () => {
+    expect((await p.identify!(args('none'))).principal).toBeNull();
+  });
+
+  it('a DKIM-verified or platform-signed owner is the owner', async () => {
+    expect((await p.identify!(args('dkim_pass'))).principal).toMatchObject({ id: 'mail:i@example.com', labels: ['owner'] });
+    expect((await p.identify!(args('platform_signed'))).principal).toMatchObject({ id: 'mail:i@example.com' });
+  });
+
+  it('ownerEvidence can widen the accepted evidence', async () => {
+    const q = defaultPolicy({ owners: ['mail:i@example.com'], ownerEvidence: ['dkim_pass', 'none'] });
+    expect((await q.identify!(args('none'))).principal).toMatchObject({ id: 'mail:i@example.com' });
+  });
+});

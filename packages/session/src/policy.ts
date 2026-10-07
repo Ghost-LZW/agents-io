@@ -13,6 +13,7 @@ import {
   type TurnContext,
   type TurnDraft,
   type ControlArgs,
+  type Evidence,
   type InputRecord,
   type Watch,
   type WatchSource,
@@ -41,6 +42,11 @@ export interface DefaultPolicyOptions {
   /** Put every owner DM into this one session instead of one per conversation. */
   ownerSessionKey?: string;
   /**
+   * Evidence an input must carry to be recognised as an owner. Default
+   * `platform_signed` and `dkim_pass`: an unsigned mail claiming the owner's address is a stranger.
+   */
+  ownerEvidence?: Evidence[];
+  /**
    * Sources an agent may watch without asking anyone. Each entry matches when every
    * field it sets equals the watch's source (channel, account, conversation, conversationKind).
    */
@@ -68,6 +74,7 @@ export function defaultPolicy(o: DefaultPolicyOptions): FullPolicy {
   const owners = new Set(o.owners);
   const selfAccounts = new Set(o.selfAccounts ?? []);
   const agentAccounts = new Set(o.agentAccounts ?? []);
+  const ownerEvidence = new Set<Evidence>(o.ownerEvidence ?? ['platform_signed', 'dkim_pass']);
   const routes = new Set(o.routes ?? []);
 
   return {
@@ -83,7 +90,8 @@ export function defaultPolicy(o: DefaultPolicyOptions): FullPolicy {
         return { kind: 'agent', principal: { id: a.declared, labels: ['agent'] }, declared: a.declared, ...(self ? { self } : {}) };
       }
       // A declaration from any other account is a claim we do not accept.
-      if (owners.has(key)) return { kind: 'human', principal: { id: key, labels: [OWNER] } };
+      // An owner address alone proves nothing (a mail From header is trivially forged): require evidence.
+      if (owners.has(key) && ownerEvidence.has(a.evidence)) return { kind: 'human', principal: { id: key, labels: [OWNER] } };
       return { kind: a.isBot ? 'agent' : 'human', principal: null };
     },
 
