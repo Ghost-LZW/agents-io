@@ -5,6 +5,7 @@ export {
   DEFAULT_PROFILES,
   FALLBACK_PROFILE,
   diffStats,
+  CONTEXT_LABEL,
   renderInputs,
   senderPreface,
   summarizeItem,

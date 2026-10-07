@@ -508,6 +508,47 @@ export const SCENARIOS: Scenario[] = [
     },
   },
   {
+    id: 'j',
+    name: 'context-listen',
+    async run(ctx) {
+      const w = await world(ctx);
+      const sk = 'e2e:default:gl';
+      const watch = await w.watch(sk);
+      const conv = { id: 'gl', kind: 'group' as const };
+      const said = ['The quarterly review moved to Friday at 3pm.', 'Also, the new budget code is ORCHID-77.'];
+      const ctxIds: string[] = [];
+      for (const text of said) {
+        // A group message without an @ of the bot (what Lark hints as `observe`).
+        const r = await w.chat.inject({ sender: STRANGER, conversation: conv, text, admission: 'observe' });
+        assert(r.accepted && r.inputId, 'group message not accepted');
+        ctxIds.push(r.inputId);
+      }
+      const recorded = await waitFor('two context inputs', 10_000, () => {
+        const xs = watch.of('input.admitted').filter((b) => b.disposition === 'observe_only');
+        return xs.length === 2 && xs;
+      });
+      assert(recorded.every((b) => b.input?.origin.principal === null), 'context inputs are not logged with their (stranger) record');
+      assert(watch.of('turn.started').length === 0, 'a stranger message started a turn');
+      ctx.progress('2 stranger messages recorded as context; owner asks');
+      const q = await w.chat.inject({ sender: ALICE, conversation: conv, text: '@bot what did they say? Answer in one or two sentences.', admission: 'dispatch' });
+      assert(q.accepted && q.inputId, 'owner message not accepted');
+      const turn = await watch.turnStartedWith(q.inputId);
+      const want = [...ctxIds, q.inputId];
+      assert(JSON.stringify(turn.inputIds) === JSON.stringify(want), `turn inputs ${JSON.stringify(turn.inputIds)}, expected context first then the ask ${JSON.stringify(want)}`);
+      const done = await watch.completed(turn.turnId);
+      assert(done.status === 'completed', `turn ended ${done.status}${done.error ? ` (${done.error.code})` : ''}`);
+      await new Promise((r) => setTimeout(r, 500));
+      assert(watch.of('input.rejected').length === 0, `inputs rejected: ${JSON.stringify(watch.of('input.rejected'))}`);
+      assert(watch.of('turn.started').length === 1, `expected one turn, got ${watch.of('turn.started').length}`);
+      const text = watch.finalText(turn.turnId);
+      const missing = [/friday/i, /orchid-?77/i].filter((re) => !re.test(text));
+      assert(missing.length === 0, `answer misses ${missing.join(', ')}: ${JSON.stringify(text.slice(0, 200))}`);
+      const consumed = new Set(watch.of('input.consumed').filter((b) => b.turnId === turn.turnId).flatMap((b) => b.inputIds));
+      conforms(w, sk, watch);
+      return `2 stranger messages → context (no turn); owner @ → 1 turn handed [ctx, ctx, ask] (harness confirmed ${[...consumed].filter((id) => ctxIds.includes(id)).length}/2 context consumed), completed; answer mentions both: ${JSON.stringify(text.slice(0, 160))}`;
+    },
+  },
+  {
     id: 'm',
     name: 'output-ask-choice',
     skip: (c) => (c.outputTools ? undefined : 'outputTools is off'),

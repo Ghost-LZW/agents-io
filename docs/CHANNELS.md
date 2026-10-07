@@ -63,7 +63,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 |---|---|---|
 | `default:owner-dm` | 主人的私聊 | 开一轮。设了 `ownerSessionKey` 就进那个 session，否则进该会话的 session |
 | `default:owner-<会话类型>` | 主人在私聊以外的会话里对本部署说话（`mentions: ["self"]`） | 在该会话的 session 开一轮 |
-| `default:observe-<会话类型>` | 私聊以外的其他消息 | 记成只观察的输入，不开轮 |
+| `default:observe-<会话类型>` | 私聊以外的其他消息 | 记成只观察的输入，不开轮；该 session 下一轮开始时交给 agent（§1b） |
 
 - "对本部署说话"指：消息 @ 了本部署自己的账号（`policy.selfAccounts`）；或适配器的提示是 `dispatch`（飞书：私聊、@ 机器人、卡片点击）；或适配器不给提示（邮件、私有通道：收到的默认就是发给本部署的）。飞书群里不 @ 机器人的消息提示是 `observe`，所以只记录。
 - 陌生人的私聊、本部署自己的回流（规则的 `includeSelf` 默认关）不命中任何规则，丢弃。即使某条规则包括回流，回流也只会被记录，不会开轮。适配器自己标了 drop 的（自动回复、退信、群发）在匹配之前就丢弃。
@@ -72,7 +72,31 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 - 每条输入的路由解释（命中了哪些规则、表版本、回调结果、主体、证据，没投递时还有原因）写进日志所在的 SQLite，重启后仍能用 `Router.explain(inputId)` 查到。
 - 宿主应用自己实现的 `Policy.admit` 只在没有任何表时生效（dev-gateway 传入 `policy.admit` 时不再生成默认表，监听照常生效）。这是兼容旧接口，新代码请写 Binding 规则。
 
-**来源标记**（决定 4、5：只标记，不拦截，不降档）：每一轮都算出 `TurnProvenance`：触发这一轮的输入的主体；上下文里有没有被监听、汇总或只记录的输入；有没有来自外部（没有主体）的输入；有没有群聊输入。用 `Lane.provenance(turnId)` 读取。harness 子进程的环境变量按 session 设置而不是按轮设置，所以来源标记不放进 `AGENTS_IO_TURN_PROVENANCE`，而是附在输出工具的每次写入上：`agents-io.output` 记录的 `provenance` 字段，以及宿主 MCP `onCall` 事件的 `provenance`。只记录的输入一旦进了某个 session，这个 session 之后的每一轮都标 `watched`。
+**来源标记**（决定 4、5：只标记，不拦截，不降档）：每一轮都算出 `TurnProvenance`：触发这一轮的输入的主体；上下文里有没有被监听、汇总或只记录的输入；有没有来自外部（没有主体）的输入；有没有群聊输入。用 `Lane.provenance(turnId)` 读取。harness 子进程的环境变量按 session 设置而不是按轮设置，所以来源标记不放进 `AGENTS_IO_TURN_PROVENANCE`，而是附在输出工具的每次写入上：`agents-io.output` 记录的 `provenance` 字段，以及宿主 MCP `onCall` 事件的 `provenance`。标记按这一轮**实际交给 harness 的内容**算（见 §1b）：只记录的输入交给了哪一轮，那一轮和这个 session 之后的每一轮都标 `watched`（来自陌生人的再标 `external`，来自群聊的再标 `group`），因为它们留在 harness 的对话里了；被监听开的轮次（digest、trigger）的输入同样延续到之后的轮次。某一轮运行期间才记下的输入不在这一轮里，从下一轮起才算。
+
+## 1b. 只记录的输入怎样交给 agent
+
+规则或监听的动作是 `context` 的输入（群里没 @ 机器人的话、`context` 模式的监听、会议这类只观察的流）不开轮，但不会只停在日志里：这个 session **下一次开轮时**，自上一轮以来记下、还没交出去的这些输入，按到达顺序排在触发这一轮的输入**前面**，一起交给 harness。
+
+- **每条保留自己的来源**：仍是原发送者的 `origin`（陌生人就是 `from=unknown`），所以照常有 §1 的发送者说明行，agent 知道是谁说的。
+- **明确标成"不是对你说的"**：`channelContext` 加 `context=true`（经监听来的还带 `watch=<id>`），渲染时在发送者说明行前多一行：
+
+  ```
+  [agents-io context, not addressed to you: recorded in the conversation; read it, do not reply to it unless the addressed input asks]
+  [agents-io input from=unknown kind=human via=lark-bot:default:oc_7a1… channel=lark-bot conversationKind=group senderName=Eve context=true]
+  发布会改到周四了
+  ```
+
+  Codex 上是 `[context, not addressed to you: …]` 一行再接 `[sender …]`；关掉发送者说明（`preface: false`）时这一行也保留。
+- **有上限**：每轮最多 50 条、正文合计 20000 字符（`LaneOptions.context` 的 `maxItems` / `maxChars`，默认值见 `CONTEXT_DEFAULTS`），超出时保留最新的，最前面加一条系统行 `[N older context messages omitted]`（`channelContext` 为 `context=true contextOmitted=N`）。最新的一条本身就超过字符上限时截断它（`contextClipped=true`），不会丢掉。`maxItems: 0` 关掉交接（仍然记录）。
+- **修订只留最新版**：同一输入 id 的修订（`revisionOf`，例如实时字幕的同一句话被重新识别）在交出去之前只保留最新一版，位置按第一次到达算。某一版已经交给过一轮，之后又来了修订，就作为新的一条在下一轮再交一次（输入 id 为 `<原 id>@<seq>`，带 `contextRevised=true`）。
+- **只交一次**：交给了某一轮（`startTurn` 成功）就不再交；这一轮没开起来（例如 `Policy.plan` 失败）则留到下一轮。
+- **不影响对账**：这些输入在 `turn.started.inputIds` 里（排在前面），harness 报不报它们 consumed 都可以：既不会重新排队，也不会因此把这一轮记成 `ambiguous`。触发输入没被消费而重新排队时，也不会再带一遍已交出的 context。
+- **steer 不带 context**：一轮运行期间记下的输入不 steer 进这一轮，留给下一轮。
+- **digest 不重复**：digest 监听和 `on: "digest"` 规则的条目照常记录，但只在汇总那一轮的系统输入里出现，不会再作为 context 交一次。
+- **重启后不丢**：只记录的输入在日志的 `input.admitted`（`observe_only`）里带着整条输入记录；网关重启后 session 从日志重建"已记录、未交出"的部分，下一轮照样交出；已经交过（或当时因上限被略去）的不会再交。
+
+所以群聊里陌生人说了两句话、主人随后 @ 机器人问"他们说了什么"，agent 在那一轮里能直接看到这两句话（e2e 场景 `context-listen`）。
 
 ## 2. 飞书 / Lark 机器人（`channel/lark-bot`，档位 `card`）
 
@@ -82,7 +106,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 |---|---|
 | 私聊机器人 | 主人：触发一轮。默认配置 `ownerSessionKey: "main"`，主人的私聊都进 session `main`。陌生人：丢弃 |
 | 群里 @ 机器人 | 主人：触发一轮。非主人：只记录，不开轮 |
-| 群里不 @ 机器人 | 只记录（observe），不开轮。需要 `im:message.group_msg` 权限才收得到 |
+| 群里不 @ 机器人 | 只记录（observe），不开轮，下一轮作为 context 交给 agent（§1b）。需要 `im:message.group_msg` 权限才收得到 |
 | 文本 | 原文。@机器人 被去掉，@其他人 变成 `@名字` |
 | 富文本（post） | 拍平成文字，里面的图片、文件变成引用 |
 | 图片 / 文件 / 语音 / 视频（含富文本里的图片） | 用 `im.v1.messageResource.get` 下载进 blob 存储，变成带真实类型和文件名的 `sha256:` 引用（类型取响应头，没有就按文件头识别；语音默认 `audio/opus`，视频 `video/mp4`）。单个上限 20MB（`mediaMaxBytes`），30 秒超时（`mediaTimeoutMs`）。下载失败、超限或没有 blob 存储时保留 `lark-file:` 引用，并在后面加一行 `[image 键 not downloaded: 原因]` 说明 |
@@ -178,9 +202,9 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 
 | 模式 | 目标 session 里发生什么 |
 |---|---|
-| `context` | 记成只观察的输入（`input.admitted`，`observe_only`），不开轮。下一轮 agent 能看到 |
+| `context` | 记成只观察的输入（`input.admitted`，`observe_only`），不开轮。目标 session 下一轮开始时作为 context 交给 agent（§1b） |
 | `trigger` | 作为普通输入排队（queue），每条开一轮或并进下一轮 |
-| `digest` | 每条先记成 context 并缓存；到了 `digest.everyMs`（从缓存里最早一条算起），或攒够 `digest.maxItems` 条，就排一条系统输入，开一轮让 agent 汇总 |
+| `digest` | 每条先记录（不作为 context 交出）并缓存；到了 `digest.everyMs`（从缓存里最早一条算起），或攒够 `digest.maxItems` 条，就排一条系统输入，开一轮让 agent 汇总 |
 
 digest 输入的正文形如：
 

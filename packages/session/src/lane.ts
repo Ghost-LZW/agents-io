@@ -67,6 +67,13 @@ export interface LaneOptions {
   /** Synthetic ephemeral headline right after `turn.started` (default `Thinking…`; null disables). */
   thinkingHeadline?: string | null;
   newId?: (prefix: string) => string;
+  /**
+   * Context-only inputs (binding `context`, watch `context`; revisions latest-wins) are
+   * handed to the next turn ahead of its triggering inputs, at most this many / this many
+   * characters of content (the most recent win; one line says how many older ones were
+   * left out). Defaults: `CONTEXT_DEFAULTS`. `maxItems: 0` turns the hand-over off.
+   */
+  context?: { maxItems?: number; maxChars?: number };
   /** Tee of raw harness events (conformance checks, debugging). */
   onHarnessEvent?: (e: HarnessEvent) => void;
 }
@@ -86,6 +93,27 @@ interface Queued {
   attempts: number;
 }
 
+/** Bounds of the context handed to one turn. */
+export const CONTEXT_DEFAULTS = { maxItems: 50, maxChars: 20_000 } as const;
+
+/** A context-only input recorded but not yet handed to a turn. */
+interface PendingContext {
+  /** Latest revision. */
+  input: InputRecord;
+  /** Input id it is handed under: its own, or `<id>@<seq>` for a revision of one already handed. */
+  handId: string;
+  /** A revision of an input an earlier turn already saw. */
+  revised: boolean;
+}
+
+/** What one turn is handed ahead of its triggering inputs. */
+interface ContextBatch {
+  /** Records as handed (marked `context: true`, the omitted-count line first). */
+  records: InputRecord[];
+  /** The pending entries this batch takes (handed or omitted), by original input id. */
+  taken: [string, PendingContext][];
+}
+
 interface ActiveTurn {
   turnId: string;
   inputs: InputRecord[];
@@ -102,6 +130,11 @@ interface ActiveTurn {
   foreignConsumed: boolean;
   /** Input ids of a turn adopted from a previous host; their records are not in memory. */
   adopted?: Set<string>;
+  /**
+   * Context records handed ahead of the inputs (ids as handed). The harness may report
+   * them consumed or not: neither requeues them nor makes the turn ambiguous.
+   */
+  context: InputRecord[];
 }
 
 /** A turn the log shows open from a previous host process. */
@@ -163,8 +196,18 @@ export class Lane {
   private adoptionChecked = false;
   /** Provenance of recent turns, by turn id (bounded). */
   private provenances = new Map<string, TurnProvenance>();
-  /** What the context-only inputs recorded in this lane so far bring into every later turn. */
+  /**
+   * What context-only and watched inputs handed to earlier turns bring into every later
+   * turn (they stay in the harness conversation).
+   */
   private ctxSeen = { any: false, external: false, group: false };
+  private readonly ctxLimits: { maxItems: number; maxChars: number };
+  /** Context-only inputs recorded but not handed to a turn yet: original input id → entry, in arrival order. */
+  private pendingCtx = new Map<string, PendingContext>();
+  /** Pending context pushed out by `maxItems` before a turn took it (reported in the omitted line). */
+  private ctxDropped = 0;
+  /** Original ids of context inputs already handed to a turn (bounded). */
+  private handedCtx = new Set<string>();
 
   constructor(private readonly o: LaneOptions) {
     this.sessionKey = o.sessionKey;
@@ -177,6 +220,12 @@ export class Lane {
     this.generation = snap.generation;
     this.lastRun = snap.turn?.run;
     this.dangling = snap.turn ?? undefined;
+    this.ctxLimits = {
+      maxItems: Math.max(0, o.context?.maxItems ?? CONTEXT_DEFAULTS.maxItems),
+      maxChars: Math.max(1, o.context?.maxChars ?? CONTEXT_DEFAULTS.maxChars),
+    };
+    // Context recorded but not handed over before the previous host stopped is still handed to the next turn.
+    if (snap.seq > 0) this.rebuildContext(o.hub.log.read(o.sessionKey, 0));
   }
 
   // ---- public API ---------------------------------------------------------
@@ -186,16 +235,24 @@ export class Lane {
     return this.serial(() => this.handle(cmd));
   }
 
-  /** Record an observe-only input (logged, never starts a turn). Same inputId = revision, latest wins. */
+  /**
+   * Record a context-only input: logged with its record (so a restart can rebuild it),
+   * never starts a turn, handed to the next turn that starts here ahead of that turn's
+   * own inputs. Same inputId = revision, latest wins. Digest items are not handed: their
+   * digest turn carries them.
+   */
   observe(input: InputRecord): Promise<CommandResult> {
     return this.serial(async () => {
       this.observedInputs.set(input.inputId, input);
-      this.ctxSeen.any = true;
-      if (isExternal(input)) this.ctxSeen.external = true;
-      if (isGroup(input)) this.ctxSeen.group = true;
-      this.emit({ body: { t: 'input.admitted', inputId: input.inputId, disposition: 'observe_only', ...pid(input) } });
+      const e = this.emit({ body: { t: 'input.admitted', inputId: input.inputId, disposition: 'observe_only', ...pid(input), input } });
+      this.addContext(input, e.seq);
       return { ok: true, disposition: 'observe_only' } as const;
     });
+  }
+
+  /** Context-only inputs the next turn will be handed (latest revisions, arrival order, before the bounds). */
+  pendingContext(): InputRecord[] {
+    return [...this.pendingCtx.values()].map((p) => p.input);
   }
 
   /** Record a `notice` in this session's log (e.g. a watch digest being delivered). */
@@ -236,22 +293,26 @@ export class Lane {
   /**
    * Where a turn's inputs came from (decision 4: tag, never block): who triggered
    * it, and whether its context holds watched / digest / context-only, external or
-   * group content. Default: the running turn. Context-only inputs count for every
-   * turn after they were recorded in this lane (they stay in the session's context).
+   * group content. Default: the running turn. Context-only inputs count for the turn
+   * they are handed to and every later one (they stay in the harness conversation);
+   * so do watched inputs (digests, watch triggers). Context recorded while a turn runs
+   * is not in that turn: it counts from the next turn, which is handed it.
    */
   provenance(turnId?: string): TurnProvenance | undefined {
     const id = turnId ?? this.turn?.turnId;
     return id === undefined ? undefined : this.provenances.get(id);
   }
 
-  private track(turnId: string, inputs: InputRecord[]): void {
+  /** `inputs` triggered the turn; `context` was handed ahead of them. */
+  private track(turnId: string, inputs: InputRecord[], context: InputRecord[] = []): void {
+    const ctx = context.filter((c) => c.channelContext.contextOmitted === undefined);
     const p: TurnProvenance = {
       sessionKey: this.sessionKey,
       turnId,
       triggeredBy: inputs.map((i) => i.origin.principal?.id ?? null),
-      watched: this.ctxSeen.any || inputs.some(isWatched),
-      external: this.ctxSeen.external || inputs.some(isExternal),
-      group: this.ctxSeen.group || inputs.some(isGroup),
+      watched: this.ctxSeen.any || context.length > 0 || inputs.some(isWatched),
+      external: this.ctxSeen.external || ctx.some(isExternal) || inputs.some(isExternal),
+      group: this.ctxSeen.group || ctx.some(isGroup) || inputs.some(isGroup),
     };
     this.provenances.set(turnId, p);
     for (const k of this.provenances.keys()) {
@@ -436,7 +497,7 @@ export class Lane {
     }
     if (res !== 'steered') return degrade(res);
     t.inputs.push(input);
-    this.track(t.turnId, t.inputs);
+    this.track(t.turnId, t.inputs, t.context);
     t.attempts.set(input.inputId, 0);
     this.emit({ turnId: t.turnId, body: { t: 'input.admitted', inputId: input.inputId, disposition: 'steer', ...pid(input) } });
     const extra = input.replyRoute;
@@ -477,6 +538,138 @@ export class Lane {
       return;
     }
     await this.session?.interrupt(t.turnId);
+  }
+
+  // ---- context hand-over --------------------------------------------------
+
+  /** A context-only input joins the pending context (latest revision wins, in its first-arrival position). */
+  private addContext(input: InputRecord, seq: number): void {
+    if (this.ctxLimits.maxItems === 0) return;
+    if (input.channelContext.watchMode === 'digest') return; // the digest turn carries it
+    const id = input.inputId;
+    const prior = this.pendingCtx.get(id);
+    if (prior) {
+      this.pendingCtx.set(id, { ...prior, input });
+      return;
+    }
+    // A revision of one an earlier turn already saw is handed again, under a fresh id
+    // (harnesses key their messages by input id).
+    const revised = this.handedCtx.has(id);
+    this.pendingCtx.set(id, { input, handId: revised ? `${id}@${seq}` : id, revised });
+    for (const k of this.pendingCtx.keys()) {
+      if (this.pendingCtx.size <= this.ctxLimits.maxItems) break;
+      this.pendingCtx.delete(k);
+      this.ctxDropped++;
+    }
+  }
+
+  /**
+   * The context to hand a turn: the most recent pending entries within the bounds, in
+   * arrival order, each marked `context: true` and routed like the turn (adapters take
+   * the turn's reply route from its first input); first a line saying how many older
+   * ones were left out, if any.
+   */
+  private takeContext(turnId: string, route: ReplyRoute | null): ContextBatch {
+    const entries = [...this.pendingCtx];
+    if (!entries.length) return { records: [], taken: [] };
+    const { maxChars } = this.ctxLimits;
+    const kept: InputRecord[] = [];
+    let chars = 0;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const [, p] = entries[i]!;
+      const n = charsOf(p.input.content);
+      if (kept.length && chars + n > maxChars) break;
+      // Only the newest one can be over the limit on its own: it is clipped, never left out.
+      const clip = n > maxChars;
+      kept.unshift({
+        ...p.input,
+        inputId: p.handId,
+        replyRoute: route,
+        content: clip ? clipContent(p.input.content, maxChars) : p.input.content,
+        channelContext: {
+          ...p.input.channelContext,
+          context: true,
+          ...(p.revised ? { contextRevised: true } : {}),
+          ...(clip ? { contextClipped: true } : {}),
+        },
+      });
+      chars += Math.min(n, maxChars);
+    }
+    const omitted = this.ctxDropped + entries.length - kept.length;
+    if (omitted > 0) {
+      kept.unshift({
+        inputId: `ctxo_${turnId}`,
+        origin: { kind: 'system', principal: null, evidence: 'none', via: `session:${this.sessionKey}`, adapter: 'session' },
+        content: [{ type: 'text', text: `[${omitted} older context message${omitted === 1 ? '' : 's'} omitted]` }],
+        replyRoute: route,
+        channelContext: { context: true, contextOmitted: omitted },
+      });
+    }
+    return { records: kept, taken: entries };
+  }
+
+  /** The turn took this context: it is not handed again. */
+  private commitContext(batch: ContextBatch, inputs: InputRecord[]): void {
+    for (const [id, p] of batch.taken) {
+      if (this.pendingCtx.get(id) === p) this.pendingCtx.delete(id);
+      this.markHanded(id);
+    }
+    if (batch.taken.length) this.ctxDropped = 0;
+    for (const r of batch.records) if (r.channelContext.contextOmitted === undefined) this.flagSeen(r);
+    for (const r of inputs) if (isWatched(r)) this.flagSeen(r);
+  }
+
+  private markHanded(id: string): void {
+    this.handedCtx.delete(id);
+    this.handedCtx.add(id);
+    for (const k of this.handedCtx) {
+      if (this.handedCtx.size <= 4096) break;
+      this.handedCtx.delete(k);
+    }
+  }
+
+  private flagSeen(r: InputRecord): void {
+    this.ctxSeen.any = true;
+    if (isExternal(r)) this.ctxSeen.external = true;
+    if (isGroup(r)) this.ctxSeen.group = true;
+  }
+
+  /**
+   * Replay an earlier host's log: context recorded (`input.admitted` observe_only, with
+   * its record) that no turn's inputs took is pending again, and what turns were handed
+   * (context, watched inputs) restores the provenance carried into later turns.
+   */
+  private rebuildContext(events: SessionEvent[]): void {
+    const records = new Map<string, InputRecord>();
+    for (const e of events) {
+      const b = e.body;
+      if (b.t === 'input.admitted' && b.input) {
+        records.set(b.inputId, b.input);
+        if (b.disposition === 'observe_only') {
+          this.observedInputs.set(b.inputId, b.input);
+          this.addContext(b.input, e.seq);
+        }
+      } else if (b.t === 'turn.started' || b.t === 'turn.adopted') {
+        const ids = new Set(b.inputIds);
+        // What a turn kept is the newest part of what was pending: everything up to the
+        // newest entry it was handed was taken (handed, or left out as older).
+        const entries = [...this.pendingCtx];
+        let last = -1;
+        entries.forEach(([, p], i) => {
+          if (ids.has(p.handId)) last = i;
+        });
+        for (const [id, p] of entries.slice(0, last + 1)) {
+          this.pendingCtx.delete(id);
+          this.markHanded(id);
+          if (ids.has(p.handId)) this.flagSeen(p.input);
+        }
+        if (last >= 0 || b.inputIds.some((id) => id.startsWith('ctxo_'))) this.ctxDropped = 0;
+        for (const id of b.inputIds) {
+          const r = records.get(id);
+          if (r && isWatched(r)) this.flagSeen(r);
+        }
+      }
+    }
   }
 
   // ---- turns --------------------------------------------------------------
@@ -569,15 +762,20 @@ export class Lane {
         deliveries: [],
         consumed: new Set(),
         foreignConsumed: false,
+        context: [],
       };
+      // Context recorded since the previous turn goes first: the model reads it before what it is asked.
+      const ctx = this.takeContext(t.turnId, t.replyRoute);
+      t.context = ctx.records;
       this.turn = t;
-      this.track(t.turnId, inputs);
+      this.track(t.turnId, inputs, ctx.records);
       try {
         const run = await this.policy.plan({ sessionKey: this.sessionKey, inputs, ...(this.lastRun ? { previous: this.lastRun } : {}) });
         t.run = run;
         this.lastRun = run;
         const s = await this.ensureSession(run);
-        await s.startTurn(t.turnId, [...inputs], run);
+        await s.startTurn(t.turnId, [...ctx.records, ...inputs], run);
+        this.commitContext(ctx, inputs);
         t.starting = false;
         if (t.interruptRequested) await s.interrupt(t.turnId);
       } catch (err) {
@@ -667,6 +865,7 @@ export class Lane {
             deliveries: d ? [...d.deliveries] : [],
             consumed: new Set(),
             foreignConsumed: false,
+            context: [],
           };
           this.track(b.turnId, []);
         }
@@ -677,6 +876,7 @@ export class Lane {
       case 'input.consumed':
         if (t && t.turnId === b.turnId) {
           for (const id of b.inputIds) {
+            if (t.context.some((c) => c.inputId === id)) continue; // context: consumed or not, nothing to reconcile
             if (t.inputs.some((i) => i.inputId === id) || t.adopted?.has(id)) t.consumed.add(id);
             else t.foreignConsumed = true;
           }
@@ -913,6 +1113,49 @@ const isGroup = (i: InputRecord) => {
   const k = i.channelContext.conversationKind;
   return (typeof k === 'string' && GROUPISH.has(k)) || i.channelContext.watchGroup === true;
 };
+
+/** Characters of content counted against `context.maxChars` (a media block counts as a short label). */
+function charsOf(content: InputRecord['content']): number {
+  let n = 0;
+  for (const b of content) {
+    switch (b.type) {
+      case 'text':
+      case 'quote':
+      case 'transcript':
+        n += b.text.length;
+        break;
+      case 'ref':
+        n += b.uri.length + (b.title?.length ?? 0);
+        break;
+      case 'event':
+        n += b.name.length + JSON.stringify(b.data).length;
+        break;
+      default:
+        n += 32;
+    }
+  }
+  return n;
+}
+
+/** Content cut to `max` characters in all (text-like blocks are clipped, the rest dropped once over). */
+function clipContent(content: InputRecord['content'], max: number): InputRecord['content'] {
+  let left = max;
+  const out: InputRecord['content'] = [];
+  for (const b of content) {
+    if (left <= 0) break;
+    if (b.type === 'text' || b.type === 'quote' || b.type === 'transcript') {
+      const text = b.text.length > left ? `${b.text.slice(0, Math.max(0, left - 1))}…` : b.text;
+      left -= text.length;
+      out.push({ ...b, text });
+    } else {
+      const n = charsOf([b]);
+      if (n > left) break;
+      left -= n;
+      out.push(b);
+    }
+  }
+  return out;
+}
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
