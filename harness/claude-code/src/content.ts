@@ -24,14 +24,18 @@ export type UserBlock = TextBlock | ImageBlock;
 const IMAGE_MIMES = new Set<string>(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 const EVENT_JSON_MAX = 4000;
 
-/** Short structured preface naming who sent the input and from where. */
+/** Label of context-only inputs (`channelContext.context`): seen in the conversation, not said to the agent. */
+export const CONTEXT_LABEL = 'context, not addressed to you: recorded in the conversation; read it, do not reply to it unless the addressed input asks';
+
+/** Short structured preface naming who sent the input and from where (and that it is context, if so). */
 export function preface(input: InputRecord): string {
   const o = input.origin;
   const parts = [`from=${o.principal?.id ?? 'unknown'}`, `kind=${o.kind}`, `via=${o.via}`];
   if (o.declared) parts.push(`declared=${o.declared}`);
   if (o.self) parts.push('self=true');
   for (const [k, v] of Object.entries(input.channelContext)) parts.push(`${k}=${oneLine(String(v))}`);
-  return `[agents-io input ${parts.join(' ')}]`;
+  const head = input.channelContext.context === true ? `[agents-io ${CONTEXT_LABEL}]\n` : '';
+  return `${head}[agents-io input ${parts.join(' ')}]`;
 }
 
 function oneLine(s: string, max = 120): string {

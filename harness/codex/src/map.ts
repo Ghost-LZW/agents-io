@@ -30,6 +30,9 @@ export function senderPreface(input: InputRecord): string {
   return `[sender ${parts.join(' ')}]`;
 }
 
+/** Label of context-only inputs (`channelContext.context`): seen in the conversation, not said to the agent. */
+export const CONTEXT_LABEL = '[context, not addressed to you: recorded in the conversation; read it, do not reply to it unless the addressed input asks]';
+
 function blockText(b: Exclude<ContentBlock, { ref: string; mime: string }>): string {
   switch (b.type) {
     case 'text':
@@ -58,6 +61,8 @@ export async function renderInputs(
   const out: UserInput[] = [];
   for (const input of inputs) {
     const lines: string[] = [];
+    // The context label stays even without the sender preface: the model must not take context as a request.
+    if (input.channelContext.context === true) lines.push(CONTEXT_LABEL);
     if (opts.preface !== false) lines.push(senderPreface(input));
     const flush = () => {
       if (lines.length) out.push(text(lines.splice(0).join('\n')));

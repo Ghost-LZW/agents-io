@@ -70,6 +70,7 @@ e2e 跑的是默认实例（`--harness` 可换），保留它的 `env`、`config
 | f | human-approval | 策略改为 restricted + `human` resolver → `request.opened` 到达第二个（final tier）订阅者，经它 resolve，turn completed，目录确实被创建 |
 | g | reconnect-from-seq | 订阅者断开，带 `fromSeq` 重连 → durable 事件一个不少，没有多余快照 |
 | h | codex-restart-adopt | 仅 codex：unix own app-server；turn 中途停网关（detach），新网关启动后 `turn.adopted` 并 completed，log 里该 turn 只结束一次 |
+| j | context-listen | 陌生人在群里不 @ 机器人发两句话 → 只记录（`observe_only`，带整条记录），不开轮；主人随后 @ 机器人问"他们说了什么" → 一个 turn，`inputIds` 依次是两条 context 和提问（`docs/CHANNELS.md` §1b）；turn completed、无 rejected；回答提到两句话的内容（Friday、ORCHID-77） |
 | m | output-ask-choice | 输出工具：模型调 `ask_choice` → 通道上出现 red/blue 按钮（`choice:` action id），该轮结束；模拟点击 blue → 新一轮的输入是 `choice` 事件，回答含 blue；`delivery.settled` delivered；报告 harness 在 `_meta` 里带了哪些键 |
 | n | output-send-file | 输出工具：工作目录里写 README.md，模型调 `send_file` → 通道收到附件，blob 字节与文件一致，delivery settled |
 | o | output-terminal-choose | 输出工具：本地路由上 `ask_choice` 只写 `agents-io.output` 事件；`/choose <id> <n>` 等价的输入 → 新一轮回答含所选项；越界序号被拒（`bad_choice`） |

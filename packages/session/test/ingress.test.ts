@@ -158,7 +158,7 @@ describe('Ingress', () => {
     expect(await ingress.accept(fakeEnvelope({ sender: stranger }))).toMatchObject({ action: 'drop' });
     const r = await ingress.accept(fakeEnvelope({ sender: stranger, conversation: group }));
     expect(r).toMatchObject({ action: 'observe', sessionKey: 'fake:default:g1' });
-    expect(bodies(hub.log.read('fake:default:g1', 0))).toEqual([{ t: 'input.admitted', inputId: r.inputId, disposition: 'observe_only' }]);
+    expect(bodies(hub.log.read('fake:default:g1', 0))).toEqual([{ t: 'input.admitted', inputId: r.inputId, disposition: 'observe_only', input: expect.objectContaining({ inputId: r.inputId, origin: expect.objectContaining({ principal: null }) }) }]);
   });
 
   it('applies revisionOf latest-wins for observe-only transcripts', async () => {

@@ -734,6 +734,17 @@ describe('helpers', () => {
     ]);
   });
 
+  it('labels context-only inputs as not addressed to the agent (also without the sender preface)', async () => {
+    const stranger = { kind: 'human' as const, principal: null, evidence: 'platform_signed' as const, via: 'lark:a:g1', adapter: 'lark' };
+    const ctx = { ...input('c1', 'the launch moved to Thursday'), origin: stranger, channelContext: { senderName: 'Eve', context: true } };
+    const label = '[context, not addressed to you: recorded in the conversation; read it, do not reply to it unless the addressed input asks]';
+    expect(await renderInputs([ctx, input('i1', 'what did they say?')])).toEqual([
+      { type: 'text', text: `${label}\n[sender from=unknown kind=human via=lark:a:g1 senderName="Eve" context=true]\nthe launch moved to Thursday`, text_elements: [] },
+      { type: 'text', text: '[sender from=owner kind=human via=lark:a:c1 chat="Team"]\nwhat did they say?', text_elements: [] },
+    ]);
+    expect(await renderInputs([ctx], { preface: false })).toEqual([{ type: 'text', text: `${label}\nthe launch moved to Thursday`, text_elements: [] }]);
+  });
+
   it('unwraps login-shell commands and shortens paths under cwd', () => {
     expect(displayCommand("/bin/zsh -lc 'echo '\\''hi'\\'''")).toBe("echo 'hi'");
     expect(displayCommand('/bin/zsh -lc ls')).toBe('ls');

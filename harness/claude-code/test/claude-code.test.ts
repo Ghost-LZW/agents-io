@@ -277,6 +277,22 @@ describe('input writing', () => {
     expect(p).toBe('[agents-io input from=unknown kind=agent via=lark:a:c declared=bot-7]');
   });
 
+  it('labels context-only inputs as not addressed to the agent, keeping their own sender preface', async () => {
+    const { s, q } = await setup();
+    const stranger = { kind: 'human' as const, principal: null, evidence: 'platform_signed' as const, via: 'lark:a:g1', adapter: 'lark' };
+    const ctx = { ...input('c1', 'the launch moved to Thursday'), origin: stranger, channelContext: { senderName: 'Eve', context: true, watch: 'wg' } };
+    await s.startTurn('t1', [ctx, input('i1', 'what did they say?')]);
+    await q.waitWritten(2);
+    const first = q.written[0]!.message.content as { type: string; text: string }[];
+    expect(first[0]!.text).toBe(
+      '[agents-io context, not addressed to you: recorded in the conversation; read it, do not reply to it unless the addressed input asks]\n' +
+        '[agents-io input from=unknown kind=human via=lark:a:g1 senderName=Eve context=true watch=wg]',
+    );
+    expect(first[1]).toEqual({ type: 'text', text: 'the launch moved to Thursday' });
+    const second = q.written[1]!.message.content as { type: string; text: string }[];
+    expect(second[0]!.text).toBe('[agents-io input from=owner kind=human via=fake:a:c1]');
+  });
+
   it('startTurn only when idle', async () => {
     const { s } = await setup();
     await s.startTurn('t1', [input('i1', 'a')]);
