@@ -603,7 +603,8 @@ export class HostTools {
 
 function inside(p: string, dir: string): boolean {
   const r = relative(dir, p);
-  return r === '' || (!r.startsWith('..') && !isAbsolute(r) && !r.startsWith(`..${sep}`));
+  // `..notes` is a name inside `dir`; only `..` itself or a `../` prefix leaves it.
+  return r === '' || (r !== '..' && !r.startsWith(`..${sep}`) && !isAbsolute(r));
 }
 
 function json(v: unknown): string {

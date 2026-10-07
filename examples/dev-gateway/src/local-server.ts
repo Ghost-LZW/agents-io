@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, statSync, unlinkSync, type Stats } from 'node:fs';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { dirname } from 'node:path';
 import { FrameDecoder, PROTOCOL_VERSION, encodeFrame, type Origin, type Watch, type WatchDraft } from '@agents-io/protocol';
@@ -19,13 +19,16 @@ export interface LocalHost {
 }
 
 /**
- * The local client endpoint: a Unix socket (0600, in a 0700 directory) speaking
+ * The local client endpoint: a Unix socket (0600, in a private directory: one it
+ * creates 0700, or an existing one that is already ours and 0700) speaking
  * JSONL frames (frames.ts). Anyone who can open it acts as the configured local
  * principal, so it must stay private to this user.
  */
 export class LocalServer {
   private server: Server | undefined;
   private readonly conns = new Set<Conn>();
+  /** Inode of the socket this server bound (close() removes only that). */
+  private ino: number | undefined;
 
   constructor(
     private readonly host: LocalHost,
@@ -36,10 +39,15 @@ export class LocalServer {
     // sun_path is 104 bytes on macOS, 108 on Linux.
     if (Buffer.byteLength(this.path) > 103) throw new Error(`socket path is too long for a Unix socket (${Buffer.byteLength(this.path)} bytes): ${this.path}; set socketPath`);
     const dir = dirname(this.path);
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    chmodSync(dir, 0o700);
-    if (existsSync(this.path)) {
+    // Only a directory this server creates is made 0700; an existing one (a project dir, $HOME)
+    // is never chmodded, but it must already be private, or anyone could reach the socket.
+    if (mkdirSync(dir, { recursive: true, mode: 0o700 }) !== undefined) chmodSync(dir, 0o700);
+    else assertPrivate(statSync(dir), `socket directory ${dir}`);
+    const old = lstatOrUndefined(this.path);
+    if (old) {
+      if (!old.isSocket()) throw new Error(`${this.path} exists and is not a socket; refusing to remove it (set socketPath to a dedicated path)`);
       if (await canConnect(this.path)) throw new Error(`another gateway is listening on ${this.path}`);
+      assertOwned(old, `stale socket ${this.path}`);
       unlinkSync(this.path); // stale socket from a crashed process
     }
     const server = createServer((socket) => {
@@ -55,18 +63,37 @@ export class LocalServer {
       });
     });
     chmodSync(this.path, 0o600);
+    this.ino = lstatSync(this.path).ino;
   }
 
   close(reason: string): void {
     for (const c of [...this.conns]) c.end(reason);
     this.server?.close();
     this.server = undefined;
-    try {
-      unlinkSync(this.path);
-    } catch {
-      /* already gone */
-    }
+    // Only our own socket: the path may have been replaced since.
+    const st = lstatOrUndefined(this.path);
+    if (st?.isSocket() && st.ino === this.ino) unlinkSync(this.path);
+    this.ino = undefined;
   }
+}
+
+function lstatOrUndefined(path: string): Stats | undefined {
+  try {
+    return lstatSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
+function assertOwned(st: Stats, what: string): void {
+  const uid = process.getuid?.();
+  if (uid !== undefined && st.uid !== uid) throw new Error(`${what} is owned by uid ${st.uid}, not ${uid}`);
+}
+
+/** Ours and not reachable by group/others. */
+function assertPrivate(st: Stats, what: string): void {
+  assertOwned(st, what);
+  if (st.mode & 0o077) throw new Error(`${what} is accessible to other users (mode ${(st.mode & 0o777).toString(8)}); chmod 700 it or use a dedicated directory`);
 }
 
 function canConnect(path: string): Promise<boolean> {

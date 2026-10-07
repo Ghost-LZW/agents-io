@@ -18,7 +18,9 @@ alias aio-dev="node $PWD/examples/dev-gateway/dist/cli.js"
 ```
 
 - 配置文件：`--config <path>`、`$AIO_CONFIG` 或当前目录的 `aio.config.json`（不存在就全用默认值：claude-code + haiku、无通道）。相对路径按配置文件所在目录解析。
-- 密钥只放环境变量或 `.env.live`（KEY=VALUE，已 gitignore）。查找顺序：`--env-file`、配置文件同目录、从当前目录向上最近的一个。进程环境变量优先于文件。通道配置里的字符串 `"env:NAME"` 会替换成该变量。
+- 密钥只放环境变量或 `.env.live`（KEY=VALUE，已 gitignore）。查找顺序：`--env-file`、配置文件同目录、从当前目录向上最近的一个。自动找到的文件必须属于当前用户、别人不可写（否则报错，`chmod 600`），且所在目录不是所有人可写（`/tmp` 这类目录里的 `.env.live` 会被跳过：别的用户能放一个进去给自己加主人身份）；`--env-file` 指定的文件按原样使用。进程环境变量优先于文件。通道配置里的字符串 `"env:NAME"` 会替换成该变量。
+- 会出现在子进程命令行上的设置（`ps` 对本机其他用户可见）不会拿到密钥本身：claude 的 `mcpServers` 里 `"env:NAME"` 写成 `${NAME}`、值放进子进程环境（CLI 自己展开）；内联 `settings` 只允许在 `settings.env` 里用 `"env:"`（移到子进程环境）；codex 的 `config` 里 `"env:"` 会改写成 Codex 按变量名取值的设置（`http_headers.H` → `env_http_headers.H`，`bearer_token` → `bearer_token_env_var`，`experimental_bearer_token` → `env_key`，`mcp_servers.<id>.env.VAR` → `env_vars`），其他位置的 `"env:"` 是配置错误。
+- 会话日志（log.sqlite 及 -wal/-shm）是 0600，网关新建的数据目录是 0700；已有的宽松文件会被收紧，已有目录不会被 chmod，只在日志里警告。本地 socket 的目录若是已有目录，必须已属于当前用户且为 0700，否则拒绝启动；socket 路径上已有的非 socket 文件绝不删除。
 - Harness 是**命名实例**（见下节）：每个实例的子进程只拿到网关自身的环境加上该实例 `env` 里写明的变量（`"env:NAME"` 从环境/`.env.live` 取值，`null` 表示从子进程环境里删掉）。旧的单 `harness` 块仍可用，此时沿用旧行为：`.env.live` 里 `ANTHROPIC_* / CLAUDE_* / OPENAI_* / CODEX_* / *_PROXY` 这些键传给 harness CLI。Lark、邮件密钥始终留在网关进程里。工具从不打印变量的值（`serve` 日志只列实例名和种类）。
 - 模型：实例的 `run.model`，环境变量 `AGENTS_IO_LIVE_CLAUDE_MODEL` / `AGENTS_IO_LIVE_CODEX_MODEL` 只覆盖**默认实例**（同种类的其他实例可能接的是别家模型）；默认 claude 用 `haiku`，codex 用它自己的默认模型。
 

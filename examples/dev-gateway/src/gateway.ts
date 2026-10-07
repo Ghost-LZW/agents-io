@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {
   routeKey,
@@ -43,6 +42,7 @@ import { spawnChannel } from '@agents-io/channel-jsonl-bridge';
 import type { Config, HarnessInstance, ResolvedChannel } from './config.js';
 import type { ClientCommand, SessionInfo } from './frames.js';
 import { LocalServer } from './local-server.js';
+import { privateDb, privateDir } from './private.js';
 import { blobResolvers, type MediaResolvers } from './media.js';
 
 export type LogFn = (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
@@ -131,7 +131,12 @@ export class Gateway {
     // The default instance must be usable (e.g. its env refs set); others fail when a turn names them.
     this.harness();
     this.log = o.logger ?? ((level, msg) => console.error(`[aio] ${level}: ${msg}`));
-    if (!o.log && c.logPath !== ':memory:') mkdirSync(dirname(c.logPath), { recursive: true, mode: 0o700 });
+    if (!o.log && c.logPath !== ':memory:') {
+      // Transcripts and tool output: 0600 before SQLite opens it (its -wal/-shm files take the database's mode).
+      const warn = (msg: string) => this.log('warn', msg);
+      privateDir(dirname(c.logPath), warn);
+      privateDb(c.logPath, warn);
+    }
     const log = o.log ?? new SqliteSessionLog({ path: c.logPath });
     this.hub = new Hub(log);
     this.policy = {

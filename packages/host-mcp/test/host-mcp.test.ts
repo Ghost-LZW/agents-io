@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -144,6 +144,28 @@ describe('HostTools', () => {
     await expect(call(w, 'send_file', { path: 'a.txt' })).rejects.toThrow(/cannot send files/);
   });
 
+  it('send_file in a restricted turn: symlinks and .. cannot escape the working directory', async () => {
+    const w = world({ turn: turnOf(route(), 'restricted') });
+    const other = mkdtempSync(join(tmpdir(), 'aio-out-'));
+    writeFileSync(join(other, 'secret.txt'), 'x');
+    symlinkSync(join(other, 'secret.txt'), join(w.cwd, 'link.txt'));
+    symlinkSync(other, join(w.cwd, 'dirlink'));
+    mkdirSync(join(w.cwd, 'sub'));
+    await expect(call(w, 'send_file', { path: 'link.txt' })).rejects.toThrow(/outside the working directory/);
+    await expect(call(w, 'send_file', { path: 'dirlink/secret.txt' })).rejects.toThrow(/outside the working directory/);
+    await expect(call(w, 'send_file', { path: join(w.cwd, 'dirlink', 'secret.txt') })).rejects.toThrow(/outside the working directory/);
+    await expect(call(w, 'send_file', { path: `sub/../../${join(other, 'secret.txt').split('/').slice(-2).join('/')}` })).rejects.toThrow(/outside the working directory/);
+    await expect(call(w, 'send_file', { path: `../${other.split('/').pop()}/secret.txt` })).rejects.toThrow(/outside the working directory/);
+    expect(w.fake.sent).toEqual([]);
+    // Inside is fine, also through a symlink that stays inside and for names starting with "..".
+    writeFileSync(join(w.cwd, 'sub', 'ok.txt'), 'ok');
+    symlinkSync(join(w.cwd, 'sub', 'ok.txt'), join(w.cwd, 'inner.txt'));
+    writeFileSync(join(w.cwd, '..notes'), 'n');
+    expect((await call(w, 'send_file', { path: 'inner.txt' })).ok).toBe(true);
+    expect((await call(w, 'send_file', { path: 'sub/../..notes' })).ok).toBe(true);
+    expect((await call(w, 'send_file', { path: join(w.cwd, 'sub', 'ok.txt') })).ok).toBe(true);
+  });
+
   it('send_file on the local route is event-only (no adapter), still settled', async () => {
     const local: ReplyRoute = { channel: 'local', account: 'local', conversationId: SK };
     const w = world({ turn: turnOf(local) });
@@ -255,6 +277,16 @@ describe('HostMcpServer (streamable HTTP)', () => {
     await client.connect(transport);
     return client;
   }
+
+  it('listens on loopback only', async () => {
+    const w = world();
+    const s = new HostMcpServer({ tools: w.tools });
+    servers.push(s);
+    expect(new URL(await s.listen()).hostname).toBe('127.0.0.1');
+    for (const host of ['0.0.0.0', '::', '192.168.1.10', 'example.com']) {
+      await expect(new HostMcpServer({ tools: w.tools, host }).listen()).rejects.toThrow(/loopback/);
+    }
+  });
 
   it('rejects requests without a valid token', async () => {
     const w = world();

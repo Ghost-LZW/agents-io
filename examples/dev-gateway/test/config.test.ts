@@ -1,8 +1,9 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { homedir } from 'node:os';
+import { launchFlags } from '@agents-io/harness-codex';
 import { ConfigError, codexStateDir, defaultInstance, findEnvFile, loadConfig, resolveConfig, substituteEnv } from '../src/config.js';
 
 const dirs: string[] = [];
@@ -82,7 +83,7 @@ describe('config', () => {
             use: 'codex',
             home: '~/.codex-aio',
             executable: 'codex',
-            config: { model_reasoning_summary: 'concise', 'mcp_servers.x.url': 'env:GW_URL' },
+            config: { model_reasoning_summary: 'concise', 'mcp_servers.x.url': 'https://x', 'mcp_servers.x.bearer_token': 'env:GW_TOKEN' },
             enable: ['web_search'],
             disable: ['undo'],
             transport: { kind: 'unix', spawn: 'own' },
@@ -99,14 +100,15 @@ describe('config', () => {
       kind: 'claude-code',
       // The env model override only touches the default instance.
       run: { harness: 'claude-gateway', model: 'env-model' },
-      env: { ANTHROPIC_BASE_URL: 'https://gw.example', ANTHROPIC_AUTH_TOKEN: 'tok-secret', ANTHROPIC_API_KEY: undefined, FIXED: 'v' },
+      // Secrets for argv-bound settings (inline settings, mcpServers) ride in the child env.
+      env: { ANTHROPIC_BASE_URL: 'https://gw.example', ANTHROPIC_AUTH_TOKEN: 'tok-secret', ANTHROPIC_API_KEY: undefined, FIXED: 'v', X: 'tok-secret', GW_TOKEN: 'tok-secret' },
       cwd: '/base/work',
       claude: {
         claudePath: '/base/bin/claude',
         configDir: join(homedir(), '.claude-gw'),
-        settings: { permissions: { allow: ['Read'] }, env: { X: 'tok-secret' } },
+        settings: { permissions: { allow: ['Read'] }, env: {} },
         settingSources: ['user'],
-        mcpServers: { docs: { headers: { Authorization: 'tok-secret' } } },
+        mcpServers: { docs: { headers: { Authorization: '${GW_TOKEN}' } } },
         plugins: ['/base/plugins/one'],
         skills: 'all',
         extraArgs: { 'debug-to-stderr': null },
@@ -122,7 +124,7 @@ describe('config', () => {
       codex: {
         bin: 'codex',
         codexHome: join(homedir(), '.codex-aio'),
-        config: { model_reasoning_summary: 'concise', 'mcp_servers.x.url': 'https://gw.example' },
+        config: { model_reasoning_summary: 'concise', 'mcp_servers.x.url': 'https://x', 'mcp_servers.x.bearer_token_env_var': 'GW_TOKEN' },
         enable: ['web_search'],
         disable: ['undo'],
         // Namespaced per instance: restart adoption never crosses instances.
@@ -238,5 +240,129 @@ describe('config', () => {
     expect(defaultInstance(c).kind).toBe('claude-code');
     expect(Object.values(c.harnesses).map((i) => `${i.name}:${i.kind}`)).toEqual(['claude:claude-code', 'claude-gateway:claude-code', 'codex:codex']);
     expect(c.channels.map((ch) => ch.type)).toContain('lark-bot');
+  });
+  describe('.env.live discovery', () => {
+    it('skips a .env.live in a world-writable ancestor (e.g. /tmp): another user could have planted it', () => {
+      const d = tmp();
+      const up = join(d, 'up');
+      mkdirSync(join(up, 'a', 'b'), { recursive: true });
+      writeFileSync(join(up, '.env.live'), 'AGENTS_IO_OWNERS=lark-bot:attacker\n', { mode: 0o600 });
+      chmodSync(up, 0o1777);
+      expect(findEnvFile({ cwd: join(up, 'a', 'b') })).toBeUndefined();
+      const c = loadConfig({ cwd: join(up, 'a', 'b'), env: {} });
+      expect(c.policy.owners).toEqual([]);
+      expect(c.local.principal.id).toBe('local:owner');
+    });
+
+    it('skips a .env.live owned by another user', () => {
+      const d = tmp();
+      mkdirSync(join(d, 'a'));
+      writeFileSync(join(d, '.env.live'), 'X=1\n', { mode: 0o600 });
+      expect(findEnvFile({ cwd: join(d, 'a'), uid: (process.getuid?.() ?? 0) + 1 })).toBeUndefined();
+      expect(findEnvFile({ configDir: d, uid: (process.getuid?.() ?? 0) + 1 })).toBeUndefined();
+    });
+
+    it('refuses our own .env.live when others can write it, naming the fix', () => {
+      const d = tmp();
+      writeFileSync(join(d, '.env.live'), 'X=1\n');
+      chmodSync(join(d, '.env.live'), 0o620);
+      expect(() => findEnvFile({ configDir: d })).toThrow(ConfigError);
+      expect(() => findEnvFile({ cwd: d })).toThrow(/writable by other users.*chmod 600/);
+    });
+
+    it('an explicit --env-file is used as given', () => {
+      const d = tmp();
+      chmodSync(d, 0o1777);
+      writeFileSync(join(d, 'x.env'), 'X=1\n');
+      expect(findEnvFile({ envFile: join(d, 'x.env') })).toBe(join(d, 'x.env'));
+    });
+  });
+
+  describe('env:NAME secrets never reach a child command line', () => {
+    it('claude mcpServers: the value goes to the child env, the server config says ${NAME}', () => {
+      const c = resolve(
+        {
+          harnesses: {
+            a: {
+              use: 'claude-code',
+              mcpServers: {
+                docs: { type: 'http', url: 'https://docs', headers: { Authorization: 'env:GW_TOKEN' } },
+                gh: { command: 'gh-mcp', env: { GITHUB_TOKEN: 'env:GH' } },
+              },
+            },
+          },
+        },
+        { GW_TOKEN: 'tok-secret', GH: 'gh-secret' },
+      );
+      const a = c.harnesses.a!;
+      expect(a.kind === 'claude-code' && a.claude.mcpServers).toEqual({
+        docs: { type: 'http', url: 'https://docs', headers: { Authorization: '${GW_TOKEN}' } },
+        gh: { command: 'gh-mcp', env: { GITHUB_TOKEN: '${GH}' } },
+      });
+      expect(a.env).toEqual({ GW_TOKEN: 'tok-secret', GH: 'gh-secret' });
+      expect(JSON.stringify(a.kind === 'claude-code' && a.claude)).not.toMatch(/secret/);
+    });
+
+    it('claude inline settings: settings.env refs move to the child env; others are refused', () => {
+      const c = resolve({ harnesses: { a: { use: 'claude-code', settings: { model: 'x', env: { X: 'env:T' } } } } }, { T: 'tok-secret' });
+      const a = c.harnesses.a!;
+      expect(a.kind === 'claude-code' && a.claude.settings).toEqual({ model: 'x', env: {} });
+      expect(a.env).toEqual({ X: 'tok-secret' });
+      expect(() => resolve({ harnesses: { a: { use: 'claude-code', settings: { apiKeyHelper: 'env:T' } } } }, { T: 'tok-secret' })).toThrow(
+        /harnesses\.a\.settings\.apiKeyHelper: .*command line/,
+      );
+    });
+
+    it('a routed variable that disagrees with the instance env is an error', () => {
+      expect(() =>
+        resolve({ harnesses: { a: { use: 'claude-code', env: { GH: 'other' }, mcpServers: { gh: { env: { T: 'env:GH' } } } } } }, { GH: 'gh-secret' }),
+      ).toThrow(/harnesses\.a: env\.GH .*mcpServers/);
+      // The same value is fine.
+      expect(resolve({ harnesses: { a: { use: 'claude-code', env: { GH: 'env:GH' }, mcpServers: { gh: { env: { T: 'env:GH' } } } } } }, { GH: 'g' }).harnesses.a!.env).toEqual({ GH: 'g' });
+    });
+
+    it('codex config: env refs become env-var indirection settings with the value in the child env', () => {
+      const c = resolve(
+        {
+          harnesses: {
+            cx: {
+              use: 'codex',
+              config: {
+                'mcp_servers.x': { url: 'https://x', http_headers: { Authorization: 'env:GW_TOKEN', 'X-Plain': 'p' } },
+                'mcp_servers.y.bearer_token': 'env:GW_TOKEN',
+                'model_providers.p': { base_url: 'https://p', experimental_bearer_token: 'env:KEY' },
+                'mcp_servers.gh.env.GITHUB_TOKEN': 'env:GH',
+                mcp_servers: { s: { command: 's', env: { A: 'env:KEY', B: 'b' } } },
+              },
+            },
+          },
+        },
+        { GW_TOKEN: 'tok-secret', KEY: 'key-secret', GH: 'gh-secret' },
+      );
+      const cx = c.harnesses.cx!;
+      if (cx.kind !== 'codex') throw new Error('kind');
+      expect(cx.codex.config).toEqual({
+        'mcp_servers.x': { url: 'https://x', http_headers: { 'X-Plain': 'p' } },
+        'model_providers.p': { base_url: 'https://p' },
+        mcp_servers: { s: { command: 's', env: { B: 'b' } } },
+        'mcp_servers.x.env_http_headers.Authorization': 'GW_TOKEN',
+        'mcp_servers.y.bearer_token_env_var': 'GW_TOKEN',
+        'model_providers.p.env_key': 'KEY',
+        'mcp_servers.gh.env_vars': ['GITHUB_TOKEN'],
+        'mcp_servers.s.env_vars': ['A'],
+      });
+      expect(cx.env).toEqual({ GW_TOKEN: 'tok-secret', KEY: 'key-secret', GITHUB_TOKEN: 'gh-secret', A: 'key-secret' });
+      // What the adapter puts on argv: accepted, and no value in it.
+      const flags = launchFlags(cx.codex).join(' ');
+      expect(flags).not.toMatch(/secret/);
+    });
+
+    it('codex config: an env ref with no env-var setting is a clear error that names the key, not the value', () => {
+      expect(() => resolve({ harnesses: { cx: { use: 'codex', config: { 'mcp_servers.x.url': 'env:GW_URL' } } } }, { GW_URL: 'SECRET-VALUE' })).toThrow(
+        /harnesses\.cx\.config\.mcp_servers\.x\.url: "env:" values would be on the codex app-server command line/,
+      );
+      // A missing variable still only makes the instance unavailable.
+      expect(resolve({ harnesses: { cx: { use: 'codex', config: { 'mcp_servers.y.bearer_token': 'env:NOPE' } } } }).harnesses.cx!.unavailable).toMatch(/NOPE is not set/);
+    });
   });
 });
