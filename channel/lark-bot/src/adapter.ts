@@ -559,6 +559,8 @@ export class LarkBotAdapter implements ChannelAdapter {
     const uuid = uuidFor(this.account, op.operationId, 0);
     let level = this.floorOf(route);
     const st = this.newState(route, p, level);
+    // The bubble goes first so it sits above the reply card; if it fails the card shows the process.
+    if (st.cot) await st.cot.open();
     this.feedCot(st, p, false);
     let id: string | undefined;
     while (id === undefined) {

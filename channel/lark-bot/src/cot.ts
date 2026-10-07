@@ -106,6 +106,24 @@ export class CotBubble {
     return this.idle();
   }
 
+  /**
+   * Open the bubble now, before the reply card is sent, so the bubble sits above
+   * the card in the chat. Resolves once open or failed; never rejects.
+   */
+  async open(): Promise<void> {
+    if (this.state !== 'idle' || this.cotId) return;
+    this.pumping = (async () => {
+      try {
+        await this.start();
+      } catch (err) {
+        await this.fail(err);
+      }
+    })().finally(() => {
+      this.pumping = undefined;
+    });
+    await this.pumping;
+  }
+
   /** Resolves when nothing is in flight. */
   async idle(): Promise<void> {
     while (this.pumping) await this.pumping;
@@ -135,10 +153,20 @@ export class CotBubble {
             if (final) this.state = 'settled';
             continue;
           }
-          await this.create();
-          await this.put([this.ev('RUN_STARTED', { threadId: this.o.route.conversationId, runId: this.o.turnId }), this.ev('REASONING_START', { messageId: this.firstMid() })]);
+          await this.start();
         }
         const events = this.diff(p, final);
+        if (final && !this.lastReasoning) {
+          // Opened before anything happened and nothing did: say so instead of an empty bubble.
+          const mid = this.firstMid();
+          this.firstMidUsed = true;
+          events.push(
+            this.ev('REASONING_MESSAGE_START', { messageId: mid, role: 'reasoning' }),
+            this.ev('REASONING_MESSAGE_CONTENT', { messageId: mid, delta: labels(this.o.locale).cotDone }),
+            this.ev('REASONING_MESSAGE_END', { messageId: mid }),
+          );
+          this.lastReasoning = mid;
+        }
         if (final) {
           events.push(this.ev('REASONING_END', { messageId: this.lastReasoning ?? this.firstMid() }));
           events.push(this.ev('RUN_FINISHED', { threadId: this.o.route.conversationId, runId: this.o.turnId, status: p.status === 'completed' ? 'done' : 'interrupted' }));
@@ -147,13 +175,22 @@ export class CotBubble {
         if (final) this.state = 'settled';
       }
     } catch (err) {
-      const e = err instanceof LarkApiError ? err : new LarkApiError('message_cot', undefined, String(err));
-      const wasCreated = this.cotId !== undefined;
-      this.state = 'failed';
-      this.o.log(`thinking bubble off for turn ${this.o.turnId}: ${e.message}`);
-      if (!wasCreated) this.o.onCreateFailed(e);
-      else await this.complete('error').catch(() => undefined);
+      await this.fail(err);
     }
+  }
+
+  private async start(): Promise<void> {
+    await this.create();
+    await this.put([this.ev('RUN_STARTED', { threadId: this.o.route.conversationId, runId: this.o.turnId }), this.ev('REASONING_START', { messageId: this.firstMid() })]);
+  }
+
+  private async fail(err: unknown): Promise<void> {
+    const e = err instanceof LarkApiError ? err : new LarkApiError('message_cot', undefined, String(err));
+    const wasCreated = this.cotId !== undefined;
+    this.state = 'failed';
+    this.o.log(`thinking bubble off for turn ${this.o.turnId}: ${e.message}`);
+    if (!wasCreated) this.o.onCreateFailed(e);
+    else await this.complete('error').catch(() => undefined);
   }
 
   private firstMid(): string {

@@ -325,15 +325,17 @@ describe('native thinking bubble (message_cot)', () => {
     expect(cot.events.at(-1)!.content.status).toBe('interrupted');
   });
 
-  it('does not open a bubble for a turn without process', async () => {
+  it('opens the bubble before the reply card, and settles it even for a turn without process', async () => {
     const { lark, adapter } = make({ process: 'cot' });
     const t = turn();
     const { providerMessageId: id } = await adapter.send(route, t.msg(), { operationId: 'o' });
+    expect(lark.log.indexOf('cot.create')).toBeGreaterThanOrEqual(0);
+    expect(lark.log.indexOf('cot.create')).toBeLessThan(lark.log.indexOf('card.create'));
     t.p.answer = 'hi';
     t.p.status = 'completed';
     await adapter.finalize(route, id!, t.msg());
     await adapter.settled();
-    expect(lark.cots).toHaveLength(0);
+    expect(lark.cots).toHaveLength(1);
   });
 
   it('auto: bubble create failure shows panels on the card instead, remembered for the chat', async () => {
