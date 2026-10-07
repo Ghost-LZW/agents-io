@@ -55,7 +55,7 @@ function world(o: { turn?: TurnContext | undefined; routes?: string[]; cwd?: str
     outbox,
     policy,
     turn: () => turn,
-    adapter: (ch) => (ch === 'fake' ? fake : ch === 'mail' ? mail : undefined),
+    adapter: (r) => (r.channel === 'fake' ? fake : r.channel === 'mail' ? mail : undefined),
     blobs,
     cwd: () => cwd,
     routes: () => o.routes ?? [],

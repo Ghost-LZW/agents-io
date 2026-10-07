@@ -113,7 +113,7 @@
 | `bindings.put` / `bindings.get` | 宿主 → 守护进程 | 原子替换 / 读取 Binding 表与身份映射 |
 | `run.start` / `run.cancel` | 宿主 → 守护进程 | 用 `mode: task` 的 agent 执行一轮：新的 session `run:<runId>`，结束即关闭；`env` 只进子进程环境 |
 | `run.ended` | 守护进程 → 宿主 | `{ runId, status, exitCode, durationMs?, usage? }`；`status` 含 `timeout`（`timeoutMs` 到期） |
-| `deliver` | 宿主 → 守护进程 | 推送给人，按 `operationId` 幂等；按钮点击按 `actionPrefix` 规则回到宿主 |
+| `deliver` | 宿主 → 守护进程 | 推送给人，按 `operationId` 幂等；按钮点击按 `actionPrefix` 规则回到宿主。由 `route` 的 `(channel, account)` 对应的通道发出；该账号没有通道时，只有当这个通道 id 恰好一个条目才用它发，否则 `unknown_channel`（多个飞书机器人时不会以别的机器人发出，决定 8） |
 | `inbound` | 守护进程 → 宿主 | §2.1 推送消费 |
 | `policy` | 守护进程 → 宿主 | §2.2 回调，以及 `resolve`、`outbound` 等可选的同步钩子（超时 fail closed） |
 | `input.verify` | 宿主 → 守护进程 | §3 |

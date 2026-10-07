@@ -100,6 +100,29 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 
 ## 2. 飞书 / Lark 机器人（`channel/lark-bot`，档位 `card`）
 
+### 凭据，以及一个守护进程跑多个机器人
+
+一个 `lark-bot` 通道条目就是一个飞书应用（机器人），用 `account` 区分（决定 8，`docs/design/multi-lark-bot`）：
+
+```jsonc
+"channels": [
+  // 旧写法：凭据来自 LARK_APP_ID / LARK_APP_SECRET / LARK_DOMAIN，账号 default
+  { "type": "lark-bot" },
+  // 每个机器人在 config 里引用自己的凭据（值或 env:NAME）
+  { "type": "lark-bot", "account": "proj-a",
+    "config": { "appId": "env:LARK_PROJ_A_APP_ID", "appSecret": "env:LARK_PROJ_A_APP_SECRET", "domain": "env:LARK_PROJ_A_DOMAIN" } }
+]
+```
+
+- 整份 `config` 做 `env:NAME` 替换（`encryptKey`、`verificationToken` 等写成 `env:` 也生效）。缺少的变量在启动时报错并点名变量，不打印值。
+- `appId` 与 `appSecret` 要么都写，要么都不写；都不写的条目读 `LARK_APP_*`，这样的条目至多一个。`domain` 取 `feishu`（默认）或 `lark`。
+- **一个应用只跑一个条目**：两个条目解析出同一 `appId`（同一 `domain`）时启动失败。飞书长连接把每个事件只推给同一应用的其中一条连接，两个条目会各自只收到一部分消息。同一应用也不要同时给两个守护进程用。
+- **账号**：同为 `lark-bot` 的条目账号不得重复；有多个条目时，账号只能是字母、数字和 `.` `_` `-`（至多 64 个字符，以字母或数字开头），因为账号进入路由键与会话键（以 `:` 分隔）。只有一个条目时不强制，含 `:` 时启动告警。账号就是机器人在 agents-io 里的名字：出现在 `aio status`、`ReplyRoute.account`、会话键、Binding 的 `match.account`、watch 的 `source.account`、`input.verify` 记录里；改账号名等于换了一个机器人（旧会话键不再命中）。
+- 上面这些错误让整个守护进程启动失败（`aio` 退出码 2），控制台的 `PUT /api/config` 与 `POST /api/config/validate` 在写入前就以 422 报出。运行时某个机器人连不上只把那一个通道标成 `failed`。
+- **谁发消息**：回复卡片、输出工具（`send_file`、`ask_choice` 等）和宿主 `deliver` 都由路由账号对应的机器人发出。路由账号没有对应的机器人时：通道 id 只有一个条目，就用它发（单机器人部署里宿主写了别的账号名照常可用）；有多个条目则不猜，`deliver` 返回 `unknown_channel` 并列出可用的 `(通道, 账号)`。适配器自己也拒绝发往别的账号的路由。
+- 同一条群消息被两个机器人都收到时，变成两条输入、两个会话（会话键含账号）；默认表下只有被 @ 的那个回答，另一个只记入上下文。每个机器人对应哪个 agent 用 Binding 的 `match.account` 表达。
+- 同部署的其他机器人发的群消息，在第一阶段与别家机器人的消息一样处理（发送者是一个 `isBot` 的外部账号），默认表下只记作上下文，不会唤醒。
+
 ### agent 能看到什么
 
 | 场景 | 处理 |

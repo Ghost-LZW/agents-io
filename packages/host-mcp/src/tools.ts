@@ -79,8 +79,8 @@ export interface HostToolsOptions {
   policy: Required<Pick<Policy, 'outbound'>>;
   /** The running turn of a session (`Lane.currentTurn()`), undefined when idle. */
   turn(sessionKey: string): TurnContext | undefined;
-  /** The adapter that sends on a channel. */
-  adapter(channel: string): ChannelAdapter | undefined;
+  /** The adapter that sends to a route: its channel and account (several Lark bots share the channel id). */
+  adapter(route: ReplyRoute): ChannelAdapter | undefined;
   /** Where file bytes go; adapters read attachments back from the same store. */
   blobs: BlobStore;
   /** Working directory relative paths resolve against (the harness session's cwd). */
@@ -240,8 +240,8 @@ export class HostTools {
 
   private caps(route: ReplyRoute): ChannelCaps {
     if (this.eventOnly.has(route.channel)) return EVENT_ONLY_CAPS;
-    const a = this.o.adapter(route.channel);
-    if (!a) throw new ToolError(`no channel adapter for ${route.channel}`);
+    const a = this.o.adapter(route);
+    if (!a) throw new ToolError(`no channel adapter for ${route.channel} (account ${route.account})`);
     return a.caps(route.account);
   }
 
@@ -355,8 +355,8 @@ export class HostTools {
       // The terminal and other stream ends render the output event themselves.
       rec = await this.o.outbox.deliver(d, async () => ({ providerMessageId: operationId }));
     } else {
-      const adapter = this.o.adapter(route.channel);
-      if (!adapter) throw new ToolError(`no channel adapter for ${route.channel}`);
+      const adapter = this.o.adapter(route);
+      if (!adapter) throw new ToolError(`no channel adapter for ${route.channel} (account ${route.account})`);
       const as = this.o.as?.(b.sessionKey);
       rec = await this.o.outbox.send(adapter, { ...d, msg: body, ...(as !== undefined ? { as } : {}) });
     }

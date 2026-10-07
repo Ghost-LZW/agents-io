@@ -321,6 +321,12 @@ export interface CompositorOptions {
   outbox: Outbox;
   /** Override the adapter's default tier. */
   tier?: Tier;
+  /**
+   * The adapter's account: only routes of this account are rendered here (several
+   * accounts of one channel id, e.g. two Lark bots, each render their own). Unset:
+   * every route of the channel id.
+   */
+  account?: string;
   /** Edit interval when the channel declares no native stream limit (default 1000 ms). */
   throttleMs?: number;
   /** Sender identity attached to every send (required when caps.declaresSender). */
@@ -424,7 +430,7 @@ export class Compositor {
   private restore(): void {
     const turn = this.o.hub.snapshot(this.o.sessionKey).turn;
     if (!turn) return;
-    const routes = [turn.replyRoute, ...turn.deliveries].filter((r): r is ReplyRoute => !!r && r.channel === this.o.adapter.id);
+    const routes = [turn.replyRoute, ...turn.deliveries].filter((r): r is ReplyRoute => !!r && this.owns(r));
     if (!routes.length) return;
     const anchors = new Map<string, string>();
     for (const e of this.o.hub.log.read(this.o.sessionKey, 0)) {
@@ -436,9 +442,14 @@ export class Compositor {
     }
   }
 
+  /** A route this compositor renders: the adapter's channel id and, when set, its account. */
+  private owns(r: ReplyRoute): boolean {
+    return r.channel === this.o.adapter.id && (this.o.account === undefined || r.account === this.o.account);
+  }
+
   /** `restored`: the turn's message from an earlier process (null: none was sent); undefined for a new turn. */
   private track(turnId: string, route: ReplyRoute, startedAt: number, restored?: string | null): void {
-    if (route.channel !== this.o.adapter.id) return;
+    if (!this.owns(route)) return;
     const k = this.key(turnId, route);
     if (this.routes.has(k)) return;
     const caps = this.o.adapter.caps(route.account);

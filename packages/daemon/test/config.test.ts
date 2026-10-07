@@ -187,9 +187,56 @@ describe('config', () => {
   it('lark-bot takes credentials from the environment and names a missing one', () => {
     expect(() => resolve({ channels: [{ type: 'lark-bot' }] }, { LARK_APP_ID: 'id' })).toThrow('channel lark-bot needs LARK_APP_SECRET');
     const c = resolve({ channels: [{ type: 'lark-bot', tier: 'card' }] }, { LARK_APP_ID: 'id', LARK_APP_SECRET: 'secret', LARK_DOMAIN: 'lark' });
-    expect(c.channels[0]).toMatchObject({ type: 'lark-bot', account: 'default', tier: 'card', lark: { appId: 'id', appSecret: 'secret', domain: 'lark' } });
+    expect(c.channels[0]).toMatchObject({ type: 'lark-bot', account: 'default', tier: 'card', config: { appId: 'id', appSecret: 'secret', domain: 'lark' } });
     // Clients skip channels, so they need no channel secrets.
     expect(resolve({ channels: [{ type: 'lark-bot' }] }, {}, { channels: false }).channels).toEqual([]);
+  });
+
+  describe('several lark-bot channels (decision 8)', () => {
+    const bot = (account: string | undefined, config?: Record<string, unknown>) => ({ type: 'lark-bot', ...(account !== undefined ? { account } : {}), ...(config ? { config } : {}) });
+    const ENV = { LARK_APP_ID: 'cli_d', LARK_APP_SECRET: 's0', A_ID: 'cli_a', A_SECRET: 'sa-secret', B_ID: 'cli_b', B_SECRET: 'sb-secret', ENC: 'enc-value' };
+
+    it('explicit env: references per entry, the fallback for one, domain default feishu; encryptKey env: is substituted', () => {
+      const c = resolve({ channels: [bot(undefined), bot('proj-a', { appId: 'env:A_ID', appSecret: 'env:A_SECRET', encryptKey: 'env:ENC' }), bot('intl', { appId: 'cli_lit', appSecret: 'env:B_SECRET', domain: 'lark' })] }, ENV);
+      expect(c.channels.map((ch) => [ch.account, ch.config])).toEqual([
+        ['default', { appId: 'cli_d', appSecret: 's0', domain: 'feishu' }],
+        ['proj-a', { appId: 'cli_a', appSecret: 'sa-secret', encryptKey: 'enc-value', domain: 'feishu' }],
+        ['intl', { appId: 'cli_lit', appSecret: 'sb-secret', domain: 'lark' }],
+      ]);
+      // A single entry with env: in its config (the console's credential rule) gets values too.
+      expect(resolve({ channels: [bot(undefined, { encryptKey: 'env:ENC' })] }, ENV).channels[0]!.config).toMatchObject({ appId: 'cli_d', encryptKey: 'enc-value' });
+    });
+
+    it('errors name entries and variables, never values', () => {
+      const msg = (raw: unknown, env: Record<string, string> = ENV) => {
+        try {
+          resolve(raw, env);
+        } catch (e) {
+          expect(e).toBeInstanceOf(ConfigError);
+          const m = (e as Error).message;
+          for (const v of ['s0', 'sa-secret', 'sb-secret', 'enc-value']) expect(m).not.toContain(v);
+          return m;
+        }
+        throw new Error('no error');
+      };
+      expect(msg({ channels: [bot('a'), bot('b')] })).toMatch(/channels\[0\] \(account "a"\) and channels\[1\] \(account "b"\) both read LARK_APP_ID/);
+      expect(msg({ channels: [bot('a', { appId: 'env:MISSING', appSecret: 'x' })] })).toBe('channels[0].config.appId: environment variable MISSING is not set');
+      expect(msg({ channels: [bot('a', { appId: 'cli_a' })] })).toMatch(/give both appId and appSecret/);
+      expect(msg({ channels: [bot('a', { appSecret: 'env:A_SECRET' })] })).toMatch(/give both appId and appSecret/);
+      expect(msg({ channels: [bot('a', { appId: 'cli_a', appSecret: 'x', domain: 'larkk' })] })).toMatch(/domain .*'feishu' or 'lark'/);
+      expect(msg({ channels: [bot('a', { appId: 'env:A_ID', appSecret: 'env:A_SECRET' }), bot('b', { appId: 'cli_a', appSecret: 'env:B_SECRET' })] })).toMatch(/channels\[0\] \(account "a"\) and channels\[1\] \(account "b"\) are the same app cli_a/);
+      expect(msg({ channels: [bot(undefined), bot('x', { appId: 'cli_d', appSecret: 'env:B_SECRET' })] })).toMatch(/same app cli_d/);
+      expect(msg({ channels: [bot('a', { appId: 'cli_a', appSecret: 'x' }), bot('a', { appId: 'cli_b', appSecret: 'y' })] })).toMatch(/same account/);
+      expect(msg({ channels: [bot('a:b', { appId: 'cli_a', appSecret: 'x' }), bot('c', { appId: 'cli_b', appSecret: 'y' })] })).toMatch(/channels\[0\] \(account "a:b"\): with several lark-bot channels, accounts are/);
+    });
+
+    it('the same appId on feishu and lark are two apps; one entry with ":" in its account only warns', () => {
+      const c = resolve({ channels: [bot('f', { appId: 'cli_x', appSecret: 'x' }), bot('l', { appId: 'cli_x', appSecret: 'y', domain: 'lark' })] }, ENV);
+      expect(c.channels).toHaveLength(2);
+      expect(c.warnings).toBeUndefined();
+      const one = resolve({ channels: [bot('team:1', { appId: 'cli_x', appSecret: 'x' })] }, ENV);
+      expect(one.warnings).toEqual([expect.stringContaining('makes route and session keys ambiguous')]);
+    });
   });
 
   it('substitutes env:NAME in mail and bridge config', () => {
@@ -207,10 +254,10 @@ describe('config', () => {
     writeFileSync(join(d, 'aio.config.json'), JSON.stringify({ channels: [{ type: 'lark-bot' }] }));
     writeFileSync(join(d, '.env.live'), 'LARK_APP_ID=a\nLARK_APP_SECRET=b\nANTHROPIC_BASE_URL=http://x\n');
     const c = loadConfig({ cwd: d, env: {} });
-    expect(c.channels[0]).toMatchObject({ lark: { appId: 'a', appSecret: 'b', domain: 'feishu' } });
+    expect(c.channels[0]).toMatchObject({ config: { appId: 'a', appSecret: 'b', domain: 'feishu' } });
     expect(defaultInstance(c).env).toEqual({ ANTHROPIC_BASE_URL: 'http://x' });
     // Process env wins over the file.
-    expect(loadConfig({ cwd: d, env: { LARK_APP_ID: 'z' } }).channels[0]).toMatchObject({ lark: { appId: 'z' } });
+    expect(loadConfig({ cwd: d, env: { LARK_APP_ID: 'z' } }).channels[0]).toMatchObject({ config: { appId: 'z' } });
     // Named instances get only what their `env` names.
     writeFileSync(join(d, 'aio.config.json'), JSON.stringify({ harnesses: { a: { use: 'claude-code' }, g: { use: 'claude-code', env: { ANTHROPIC_BASE_URL: 'env:ANTHROPIC_BASE_URL' } } } }));
     const n = loadConfig({ cwd: d, env: {} });

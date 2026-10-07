@@ -130,6 +130,8 @@ export class LarkBotAdapter implements ChannelAdapter {
   private clientInst: LarkClientLike | undefined;
   private botOpenId: string | undefined;
   private account = 'default';
+  /** `start` ran: `account` is the one this bot receives as (outbound checks routes against it). */
+  private started = false;
   private logFn: ChannelContext['log'] | undefined;
 
   private readonly sends = new Map<string, Promise<SendResult>>();
@@ -210,6 +212,7 @@ export class LarkBotAdapter implements ChannelAdapter {
 
   async start(ctx: ChannelContext): Promise<void> {
     this.account = ctx.account;
+    this.started = true;
     this.logFn = ctx.log;
     this.blobs ??= ctx.blobs;
     if (!this.botOpenId) await this.discoverBot(ctx);
@@ -481,7 +484,22 @@ export class LarkBotAdapter implements ChannelAdapter {
     return { parts, primary };
   }
 
+  /**
+   * This app sends only to routes of its own account: with several bots in one
+   * daemon, a route of another account sent from here would come from the wrong bot
+   * (decision 8). Not retryable; before `start` there is no account to compare.
+   */
+  private ownRoute(op: string, route: ReplyRoute): void {
+    if (!this.started || route.account === this.account) return;
+    throw Object.assign(new LarkApiError(op, undefined, `route of account ${JSON.stringify(route.account)} given to the bot of account ${JSON.stringify(this.account)}`), { retryable: false });
+  }
+
   send(route: ReplyRoute, msg: RenderedMessage, op: SendOp): Promise<SendResult> {
+    try {
+      this.ownRoute('send', route);
+    } catch (e) {
+      return Promise.reject(e);
+    }
     const prior = this.sends.get(op.operationId);
     if (prior) return prior;
     const run = this.useProcess(msg) ? this.sendProcess(route, msg, op) : this.doSend(route, msg, op);
@@ -542,6 +560,7 @@ export class LarkBotAdapter implements ChannelAdapter {
 
   /** Streaming updates: the target must have been sent as a card (`sections`/`actions`/`link`/`channelData`/`progress`). */
   async edit(route: ReplyRoute, providerMessageId: string, msg: RenderedMessage, op: SendOp & { sequence: number }): Promise<void> {
+    this.ownRoute('edit', route);
     const proc = this.isProcessMessage(providerMessageId, msg);
     const gap = this.procs.get(providerMessageId)?.level === 'stream' ? this.cfg.streamTextIntervalMs : this.cfg.editMinIntervalMs;
     await this.serial(
@@ -558,12 +577,14 @@ export class LarkBotAdapter implements ChannelAdapter {
   }
 
   async finalize(route: ReplyRoute, providerMessageId: string, msg: RenderedMessage): Promise<void> {
+    this.ownRoute('finalize', route);
     const proc = this.isProcessMessage(providerMessageId, msg);
     await this.serial(providerMessageId, () => (proc ? this.editProcess(route, providerMessageId, msg, true) : this.patch(providerMessageId, msg)));
     this.forget(providerMessageId);
   }
 
-  async retract(_route: ReplyRoute, providerMessageId: string, outcome: string): Promise<void> {
+  async retract(route: ReplyRoute, providerMessageId: string, outcome: string): Promise<void> {
+    this.ownRoute('retract', route);
     await this.serial(providerMessageId, async () => {
       const st = this.procs.get(providerMessageId);
       if (st?.card && st.level !== 'patch') {

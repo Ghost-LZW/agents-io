@@ -217,6 +217,7 @@ export class Gateway {
     // The default instance must be usable (e.g. its env refs set); others fail when a turn names them.
     this.harness();
     this.log = o.logger ?? ((level, msg) => console.error(`[aio] ${level}: ${msg}`));
+    for (const w of c.warnings ?? []) this.log('warn', `config: ${w}`);
     if (!o.log && c.logPath !== ':memory:') {
       // Transcripts and tool output: 0600 before SQLite opens it (its -wal/-shm files take the database's mode).
       const warn = (msg: string) => this.log('warn', msg);
@@ -306,10 +307,10 @@ export class Gateway {
         policy: this.policy,
         // Only lanes that exist: a tool call always comes from a running harness session.
         turn: (key) => this.lanes.get(key)?.currentTurn(),
-        adapter: (id) => this.channels.find((ch) => ch.adapter.id === id)?.adapter,
+        adapter: (r) => this.channelFor(r)?.adapter,
         blobs: this.blobs,
         cwd: (key) => this.laneInfo.get(key)?.cwd ?? this.instanceOf(this.lanes.get(key)?.harnessId)?.cwd ?? c.cwd,
-        tier: (r) => this.channels.find((ch) => ch.adapter.id === r.channel)?.tier,
+        tier: (r) => this.channelFor(r)?.tier,
         routes: () => c.policy.routes,
         // Agents add watches as themselves (kind agent); Policy.watch decides, the target is pinned to their session.
         watches: { add: (by, d) => this.addWatch(by, d), remove: (by, id) => this.removeWatch(by, id), list: (key) => this.listWatches(key) },
@@ -608,7 +609,7 @@ export class Gateway {
     this.lanes.set(sessionKey, lane);
     this.laneInfo.set(sessionKey, { agent, ...(agent.configured ? { cwd } : {}) });
     if (launched) this.launched.set(sessionKey, launched);
-    for (const ch of this.channels) this.compose(sessionKey, ch.adapter, ch.tier);
+    for (const ch of this.channels) this.compose(sessionKey, ch.adapter, ch.tier, ch.account);
     // A parked topic's lane opened again (an answer to a question it asked): it idles out like any parked one.
     if (this.topics.bySession(sessionKey)?.state === 'parked') this.idleOut(sessionKey);
     return lane;
@@ -827,7 +828,7 @@ export class Gateway {
     });
     this.lanes.set(r.sessionKey, lane);
     this.laneInfo.set(r.sessionKey, { agent: r.agent, cwd: r.cwd });
-    for (const ch of this.channels) this.compose(r.sessionKey, ch.adapter, ch.tier);
+    for (const ch of this.channels) this.compose(r.sessionKey, ch.adapter, ch.tier, ch.account);
     return {
       lane,
       dispose: async () => {
@@ -852,9 +853,10 @@ export class Gateway {
     const operationId = `host:${f.operationId}`;
     const settled = this.outbox.get(operationId);
     if (settled) return { ok: true, value: { ...settled, operationId: f.operationId, duplicate: true } };
-    const ch = this.channels.find((x) => x.adapter.id === f.route.channel && x.account === f.route.account) ?? this.channels.find((x) => x.adapter.id === f.route.channel);
-    if (!ch) return fail('unknown_channel', `no running channel ${f.route.channel} (running: ${this.channels.map((x) => x.adapter.id).join(', ') || 'none'})`);
-    const rec = await this.outbox.send(ch.adapter, { operationId, sessionKey: `host:${hostName}`, route: f.route, msg: f.message });
+    const ch = this.channelFor(f.route);
+    if (!ch) return fail('unknown_channel', `no running channel ${f.route.channel} with account ${f.route.account} (running: ${this.channels.map((x) => `${x.adapter.id} (${x.account})`).join(', ') || 'none'})`);
+    // A single-account fallback sends as that account (the adapter refuses routes of other accounts).
+    const rec = await this.outbox.send(ch.adapter, { operationId, sessionKey: `host:${hostName}`, route: { ...f.route, account: ch.account }, msg: f.message });
     return { ok: true, value: { ...rec, operationId: f.operationId, duplicate: false } };
   }
 
@@ -881,9 +883,9 @@ export class Gateway {
 
   /** A topic command's answer: one plain message on the route, through the outbox (recorded in the topic's session). */
   private async systemReply(a: { route: ReplyRoute; text: string; operationId: string; sessionKey: string }): Promise<void> {
-    const ch = this.channels.find((x) => x.adapter.id === a.route.channel && x.account === a.route.account) ?? this.channels.find((x) => x.adapter.id === a.route.channel);
+    const ch = this.channelFor(a.route);
     if (!ch) return; // local ends read their stream; there is no adapter to send with
-    const { replyToMessageId: _r, ...route } = a.route;
+    const { replyToMessageId: _r, ...route } = { ...a.route, account: ch.account };
     await this.outbox.send(ch.adapter, { operationId: a.operationId, sessionKey: a.sessionKey, route, msg: { text: a.text } });
   }
 
@@ -1059,11 +1061,13 @@ ${a.summary}` }],
     return id;
   }
 
-  private compose(sessionKey: string, adapter: ChannelAdapter, tier: Tier | undefined): void {
+  private compose(sessionKey: string, adapter: ChannelAdapter, tier: Tier | undefined, account: string): void {
     const c = new Compositor({
       hub: this.hub,
       sessionKey,
       adapter,
+      // Each bot renders its own routes only: two Lark bots must not race for one reply.
+      account,
       outbox: this.outbox,
       ...(tier ? { tier } : {}),
       // A stop button on streaming cards; Ingress turns its click into an `interrupt` command.
@@ -1113,9 +1117,20 @@ ${a.summary}` }],
     }
   }
 
+  /**
+   * The channel that sends to a route: the entry of its (id, account), else — only
+   * when that id has a single entry — that one (a host naming the one bot's account
+   * otherwise). With several accounts of an id (several Lark bots) there is no guess:
+   * a message never goes out as another bot (decision 8).
+   */
+  private channelFor(r: { channel: string; account: string }): RunningChannel | undefined {
+    const same = this.channels.filter((x) => x.adapter.id === r.channel);
+    return same.find((x) => x.account === r.account) ?? (same.length === 1 ? same[0] : undefined);
+  }
+
   /** Caps and tier of the running channel that renders replies to (channel, account), for the input's `reply` summary. */
   private replyCaps(channel: string, account: string) {
-    const ch = this.channels.find((c) => c.adapter.id === channel && c.account === account) ?? this.channels.find((c) => c.adapter.id === channel);
+    const ch = this.channelFor({ channel, account });
     if (!ch) return undefined;
     const caps = ch.adapter.caps(account);
     return { caps, tier: ch.tier ?? caps.defaultTier };
@@ -1460,7 +1475,7 @@ async function buildChannel(ch: ResolvedChannel): Promise<{ adapter: ChannelAdap
   const tier = ch.tier ? { tier: ch.tier } : {};
   switch (ch.type) {
     case 'lark-bot':
-      return { adapter: new LarkBotAdapter({ ...(ch.config ?? {}), ...ch.lark }), account: ch.account, ...tier };
+      return { adapter: new LarkBotAdapter(ch.config), account: ch.account, ...tier };
     case 'mail':
       return { adapter: new MailChannel({ account: ch.account, ...ch.config } as MailChannelConfig), account: ch.account, ...tier };
     case 'bridge': {

@@ -131,7 +131,11 @@ const ChannelCommon = {
 };
 
 const ChannelEntry = Type.Union([
-  /** Feishu/Lark bot. App id, secret and domain come from LARK_APP_ID / LARK_APP_SECRET / LARK_DOMAIN. */
+  /**
+   * Feishu/Lark bot, one app per entry. `config.appId` / `config.appSecret` / `config.domain`
+   * (values or "env:NAME"; the whole config is env-substituted) name the app; an entry
+   * without them reads LARK_APP_ID / LARK_APP_SECRET / LARK_DOMAIN (at most one such entry).
+   */
   Type.Object({ type: Type.Literal('lark-bot'), ...ChannelCommon, config: Type.Optional(Type.Record(Type.String(), Type.Unknown())) }, Closed),
   /** IMAP/SMTP mail: a MailChannelConfig (use "env:NAME" for passwords). */
   Type.Object({ type: Type.Literal('mail'), ...ChannelCommon, config: Type.Record(Type.String(), Type.Unknown()) }, Closed),
@@ -407,6 +411,8 @@ export interface SessionParams {
 export const CONFIG_DIR_KEYS = ['CLAUDE_CONFIG_DIR', 'CODEX_HOME'];
 
 export interface Config {
+  /** Not fatal, logged at start (e.g. a lark-bot account with ':'). */
+  warnings?: string[];
   dataDir: string;
   logPath: string;
   socketPath: string;
@@ -511,8 +517,11 @@ function resolveConsole(c: ConfigFile['console']): ConsoleConfig {
   };
 }
 
+/** A lark-bot entry's config after env substitution, with its app resolved. */
+export type LarkChannelConfig = Record<string, unknown> & { appId: string; appSecret: string; domain: 'feishu' | 'lark' };
+
 export type ResolvedChannel =
-  | (Extract<ChannelEntry, { type: 'lark-bot' }> & { account: string; lark: { appId: string; appSecret: string; domain: 'feishu' | 'lark' } })
+  | (Omit<Extract<ChannelEntry, { type: 'lark-bot' }>, 'config'> & { account: string; config: LarkChannelConfig })
   | (Extract<ChannelEntry, { type: 'mail' }> & { account: string })
   | (Extract<ChannelEntry, { type: 'bridge' }> & { account: string });
 
@@ -608,6 +617,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     return isAbsolute(home) || home === ':memory:' ? home : resolve(ctx.baseDir, home);
   };
 
+  const warnings: string[] = [];
   const dataDir = path(c.dataDir ?? join(homedir(), '.agents-io', 'aio'));
   const { harnesses, defaultHarness } = resolveHarnesses(c, ctx, path);
 
@@ -632,7 +642,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     defaultAgent,
     ...(table ? { table } : {}),
     identities,
-    channels: ctx.channels === false ? [] : (c.channels ?? []).map((ch) => resolveChannel(ch, env, path)),
+    channels: ctx.channels === false ? [] : resolveChannels(c.channels ?? [], env, path, warnings),
     outputTools,
     topics: { parkedIdleMs: c.topics?.parkedIdleMs ?? DEFAULT_PARKED_IDLE_MS },
     policy: {
@@ -649,6 +659,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
       session: localSession,
     },
     console: resolveConsole(c.console),
+    ...(warnings.length ? { warnings } : {}),
   };
 }
 
@@ -1068,14 +1079,65 @@ function codexConfigViaEnv(config: Record<string, unknown>, at: string, s: Child
   return out;
 }
 
-function resolveChannel(ch: ChannelEntry, env: Record<string, string | undefined>, path: (p: string) => string): ResolvedChannel {
+/**
+ * Every channel entry, plus the rules across lark-bot entries (decision 8): one
+ * app per entry (two entries of one app would split its events), at most one entry
+ * reading LARK_APP_*, accounts unique and, with several bots, plain names (they
+ * go into route and session keys, separated by ':').
+ */
+function resolveChannels(entries: ChannelEntry[], env: Record<string, string | undefined>, path: (p: string) => string, warnings: string[]): ResolvedChannel[] {
+  const out = entries.map((ch, i) => resolveChannel(ch, env, path, i));
+  const lark = out.map((ch, i) => ({ ch, i })).filter((x): x is { ch: Extract<ResolvedChannel, { type: 'lark-bot' }>; i: number } => x.ch.type === 'lark-bot');
+  const name = (x: { ch: { account: string }; i: number }) => `channels[${x.i}] (account ${JSON.stringify(x.ch.account)})`;
+  const fallback = lark.filter((x) => !hasExplicitApp(entries[x.i]!));
+  if (fallback.length > 1) fail(`lark-bot channels ${fallback.map(name).join(' and ')} both read LARK_APP_ID; give each its own config.appId / config.appSecret`);
+  const seen = new Map<string, (typeof lark)[number]>();
+  const apps = new Map<string, (typeof lark)[number]>();
+  for (const x of lark) {
+    const prior = seen.get(x.ch.account);
+    if (prior) fail(`lark-bot channels ${name(prior)} and channels[${x.i}] have the same account; accounts must differ`);
+    seen.set(x.ch.account, x);
+    const app = `${x.ch.config.domain}:${x.ch.config.appId}`;
+    const same = apps.get(app);
+    // One long connection per app: a second one would get some of its events (Feishu delivers each to one connection).
+    if (same) fail(`lark-bot channels ${name(same)} and ${name(x)} are the same app ${x.ch.config.appId}; run each app in one entry only (two connections split its events)`);
+    apps.set(app, x);
+  }
+  if (lark.length > 1) {
+    for (const x of lark) if (!INSTANCE_NAME.test(x.ch.account)) fail(`${name(x)}: with several lark-bot channels, accounts are letters, digits, '.', '_' and '-' (at most 64, not starting with '.', '_' or '-')`);
+  } else if (lark[0]?.ch.account.includes(':')) warnings.push(`${name(lark[0])}: an account with ':' makes route and session keys ambiguous; use letters, digits, '.', '_' and '-'`);
+  return out;
+}
+
+/** The entry names its app itself (`config.appId` or `config.appSecret`), instead of reading LARK_APP_*. */
+function hasExplicitApp(ch: ChannelEntry): boolean {
+  const c = ch.type === 'lark-bot' ? ch.config : undefined;
+  return c?.appId !== undefined || c?.appSecret !== undefined;
+}
+
+function resolveChannel(ch: ChannelEntry, env: Record<string, string | undefined>, path: (p: string) => string, i: number): ResolvedChannel {
   const account = ch.account ?? 'default';
   switch (ch.type) {
     case 'lark-bot': {
-      const need = (k: string) => env[k] || fail(`channel lark-bot needs ${k} (environment or .env.live)`);
-      const domain = env.LARK_DOMAIN || 'feishu';
-      if (domain !== 'feishu' && domain !== 'lark') fail(`LARK_DOMAIN must be 'feishu' or 'lark'`);
-      return { ...ch, account, lark: { appId: need('LARK_APP_ID'), appSecret: need('LARK_APP_SECRET'), domain: domain as 'feishu' | 'lark' } };
+      const where = `channels[${i}].config`;
+      const config = substituteEnv(ch.config ?? {}, env, where) as Record<string, unknown>;
+      let appId: unknown;
+      let appSecret: unknown;
+      let domain: unknown;
+      if (hasExplicitApp(ch)) {
+        if (config.appId === undefined || config.appSecret === undefined) fail(`${where}: give both appId and appSecret (or neither, to read LARK_APP_ID / LARK_APP_SECRET)`);
+        ({ appId, appSecret } = config);
+        domain = config.domain ?? 'feishu';
+      } else {
+        const need = (k: string) => env[k] || fail(`channel lark-bot needs ${k} (environment or .env.live), or config.appId / config.appSecret`);
+        appId = need('LARK_APP_ID');
+        appSecret = need('LARK_APP_SECRET');
+        domain = config.domain ?? (env.LARK_DOMAIN || 'feishu');
+      }
+      if (typeof appId !== 'string' || !appId) fail(`${where}.appId must be a non-empty string`);
+      if (typeof appSecret !== 'string' || !appSecret) fail(`${where}.appSecret must be a non-empty string`);
+      if (domain !== 'feishu' && domain !== 'lark') fail(`${where}.domain (or LARK_DOMAIN) must be 'feishu' or 'lark'`);
+      return { ...ch, account, config: { ...config, appId, appSecret, domain } };
     }
     case 'mail':
       return { ...ch, account, config: substituteEnv(ch.config, env, 'mail.config') as Record<string, unknown> };

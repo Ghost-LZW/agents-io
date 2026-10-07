@@ -232,3 +232,29 @@ describe('declared sender', () => {
     expect(await adapter.declaredSenderOf('om_1')).toBe('a/b');
   });
 });
+
+describe('routes of another account (several bots in one daemon)', () => {
+  it('send / edit / finalize / retract refuse a route of another account, not retryable, without calling the API', async () => {
+    const { lark, adapter } = make();
+    const run = startAdapter(adapter, { account: 'a' });
+    await tick();
+    const { providerMessageId: id } = await adapter.send({ ...route, account: 'a' }, { text: 'mine' }, { operationId: 'o1' });
+    const before = lark.messages.length;
+    const other = { ...route, account: 'b' };
+    for (const call of [
+      () => adapter.send(other, { text: 'not mine' }, { operationId: 'o2' }),
+      () => adapter.edit(other, id!, { text: 'x' }, { operationId: 'o1', sequence: 1 }),
+      () => adapter.finalize(other, id!, { text: 'x' }),
+      () => adapter.retract(other, id!, 'failed'),
+    ]) {
+      const err = await call().then(() => undefined, (e: unknown) => e);
+      expect(err).toBeInstanceOf(LarkApiError);
+      expect(err).toMatchObject({ retryable: false });
+      expect(String(err)).toContain('account "b"');
+    }
+    expect(lark.messages.length).toBe(before);
+    expect(lark.messages.flatMap((m) => m.patches)).toEqual([]);
+    run.ctl.abort();
+    await run.done;
+  });
+});

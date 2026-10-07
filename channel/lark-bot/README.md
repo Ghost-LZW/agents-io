@@ -22,7 +22,7 @@ npx github:Ghost-LZW/create-lark-bot#v0.2.3 verify --live
 
 `messaging` covers every scope, event and callback in `requirements.ts`; `contact` lets the tool resolve your union_id, which it writes as the owner key.
 
-Then give the adapter the credentials (`LARK_APP_ID`, `LARK_APP_SECRET`, `LARK_DOMAIN`). The owner key that `defaultPolicy({ owners })` from `@agents-io/session` matches is `lark-bot:<union_id>`, because the adapter identifies senders by `union_id` first (falling back to `open_id`).
+Then give the adapter the credentials (`appId`, `appSecret`, `domain` in its config; the aio daemon reads them per channel entry, or from `LARK_APP_ID` / `LARK_APP_SECRET` / `LARK_DOMAIN` for a single entry). An adapter sends only to routes of the account it was started with (several bots in one daemon each have their own account). The owner key that `defaultPolicy({ owners })` from `@agents-io/session` matches is `lark-bot:<union_id>`, because the adapter identifies senders by `union_id` first (falling back to `open_id`).
 
 ## Process rendering
 
