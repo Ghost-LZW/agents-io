@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { Type, type Static } from '@sinclair/typebox';
@@ -11,7 +11,12 @@ import type { CodexTransportOption } from '@agents-io/harness-codex';
  * aio.config.json: what runs. Secrets never go in it: they come from the
  * environment or a gitignored `.env.live` (KEY=VALUE), and any string in a
  * channel's `config` or a harness instance's `env`, `settings`, `mcpServers`
- * or `config` written as "env:NAME" is replaced by that variable.
+ * or `config` written as "env:NAME" is replaced by that variable. Settings
+ * that reach a child's command line (claude `mcpServers` and inline
+ * `settings`, codex `config`) never get the value itself: it goes into the
+ * child's environment and the setting names the variable (`${NAME}`,
+ * `settings.env`, codex `env_http_headers` / `bearer_token_env_var` /
+ * `env_key` / `env_vars`); where that is impossible "env:" is refused.
  *
  * Harnesses are NAMED INSTANCES (`harnesses: { <name>: { use, … } }`): each has
  * its own process environment and config dirs, `RunSpec.harness` is the
@@ -99,7 +104,7 @@ const CodexInstance = Type.Object(
     home: Type.Optional(Type.String()),
     /** The `codex` binary (default `codex` on PATH). */
     executable: Type.Optional(Type.String()),
-    /** Dotted key → value, passed as `-c key=<TOML>` to `codex app-server`. */
+    /** Dotted key → value, passed as `-c key=<TOML>` to `codex app-server` (argv: "env:NAME" only where Codex can name a variable). */
     config: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
     enable: Type.Optional(Type.Array(Type.String())),
     disable: Type.Optional(Type.Array(Type.String())),
@@ -145,7 +150,7 @@ export const ConfigFile = Type.Object(
     dataDir: Type.Optional(Type.String()),
     /** SQLite session log (default <dataDir>/log.sqlite; ":memory:" for none). */
     logPath: Type.Optional(Type.String()),
-    /** Local client socket (default <dataDir>/run/aio.sock; its directory is made 0700). */
+    /** Local client socket (default <dataDir>/run/aio.sock). A missing directory is created 0700; an existing one must already be ours and 0700. */
     socketPath: Type.Optional(Type.String()),
     /**
      * Content-addressed store for inbound media (`sha256:<hex>` refs): Lark images/files and
@@ -313,12 +318,28 @@ const MODEL_ENV: Record<HarnessKind, string> = { 'claude-code': 'AGENTS_IO_LIVE_
 /** `.env.live` keys handed to the harness CLI; everything else (Lark, mail secrets) stays in this process. */
 const HARNESS_ENV = /^(ANTHROPIC_|CLAUDE_|OPENAI_|CODEX_|HTTPS?_PROXY$|NO_PROXY$)/;
 
-/** Where `.env.live` is: an explicit path, next to the config file, or the nearest one up from `cwd`. */
-export function findEnvFile(o: { envFile?: string; configDir?: string; cwd?: string }): string | undefined {
+/**
+ * Where `.env.live` is: an explicit path, next to the config file, or the nearest one up from `cwd`.
+ * A discovered file must be ours, not writable by others, in a directory others cannot write:
+ * anything else (e.g. a `/tmp/.env.live` another user created) is skipped, since its keys can
+ * add owners. Our own file with loose permissions is an error rather than silently ignored.
+ * An explicit `envFile` is taken as given.
+ */
+export function findEnvFile(o: { envFile?: string; configDir?: string; cwd?: string; uid?: number }): string | undefined {
   if (o.envFile) return o.envFile;
-  if (o.configDir && existsSync(join(o.configDir, '.env.live'))) return join(o.configDir, '.env.live');
+  const uid = o.uid ?? process.getuid?.();
+  const usable = (dir: string): boolean => {
+    const p = join(dir, '.env.live');
+    if (!existsSync(p)) return false;
+    if (uid === undefined) return true;
+    const st = statSync(p);
+    if (st.uid !== uid || statSync(dir).mode & 0o002) return false;
+    if (st.mode & 0o022) fail(`${p} is writable by other users (mode ${(st.mode & 0o777).toString(8)}); chmod 600 it`);
+    return true;
+  };
+  if (o.configDir && usable(o.configDir)) return join(o.configDir, '.env.live');
   for (let d = resolve(o.cwd ?? process.cwd()); ; d = dirname(d)) {
-    if (existsSync(join(d, '.env.live'))) return join(d, '.env.live');
+    if (usable(d)) return join(d, '.env.live');
     if (dirname(d) === d) return undefined;
   }
 }
@@ -529,9 +550,24 @@ function resolveInstance(name: string, raw: unknown, env: Record<string, string 
   };
   const envOut: Record<string, string | undefined> = {};
   for (const [k, v] of Object.entries((raw as { env?: Record<string, string | null> }).env ?? {})) {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) fail(`${where}.env: ${JSON.stringify(k)} is not a variable name`);
+    if (!VAR_NAME.test(k)) fail(`${where}.env: ${JSON.stringify(k)} is not a variable name`);
     envOut[k] = v === null ? undefined : sub(v, `env.${k}`);
   }
+  // "env:NAME" in settings that end up on the child's command line (codex `-c`, claude
+  // `--mcp-config` / `--settings`, readable by other local users via ps) never becomes the
+  // value there: the value goes into the child's environment and the setting names the variable.
+  const secrets: ChildSecrets = {
+    value: (name, at) => {
+      if (!VAR_NAME.test(name)) fail(`${at}: ${JSON.stringify(name)} is not a variable name`);
+      const v = env[name];
+      if (v === undefined) unavailable ??= `${at}: environment variable ${name} is not set`;
+      return v;
+    },
+    toChild: (k, v, at) => {
+      if (k in envOut && envOut[k] !== v) fail(`${where}: env.${k} and ${at} set ${k} differently; use one`);
+      envOut[k] = v;
+    },
+  };
   const common = {
     ...base(name, use, raw as Static<typeof CodexInstance>),
     env: envOut,
@@ -550,7 +586,7 @@ function resolveInstance(name: string, raw: unknown, env: Record<string, string 
     const codex: CodexLaunch = {
       ...(x.executable ? { bin: pathish(x.executable) ? path(x.executable) : x.executable } : {}),
       ...(x.home ? { codexHome: path(x.home) } : {}),
-      ...(x.config ? { config: sub(x.config, 'config') } : {}),
+      ...(x.config ? { config: codexConfigViaEnv(x.config, `${where}.config`, secrets) } : {}),
       ...(x.enable ? { enable: x.enable } : {}),
       ...(x.disable ? { disable: x.disable } : {}),
       transport,
@@ -562,15 +598,130 @@ function resolveInstance(name: string, raw: unknown, env: Record<string, string 
   const claude: ClaudeLaunch = {
     ...(x.executable ? { claudePath: pathish(x.executable) ? path(x.executable) : x.executable } : {}),
     ...(x.configDir ? { configDir: path(x.configDir) } : {}),
-    ...(x.settings !== undefined ? { settings: typeof x.settings === 'string' ? path(x.settings) : sub(x.settings, 'settings') } : {}),
+    ...(x.settings !== undefined ? { settings: typeof x.settings === 'string' ? path(x.settings) : claudeSettingsViaEnv(x.settings, `${where}.settings`, secrets) } : {}),
     ...(x.settingSources ? { settingSources: x.settingSources } : {}),
-    ...(x.mcpServers ? { mcpServers: sub(x.mcpServers, 'mcpServers') } : {}),
+    ...(x.mcpServers ? { mcpServers: claudeMcpViaEnv(x.mcpServers, `${where}.mcpServers`, secrets) } : {}),
     ...(x.plugins ? { plugins: x.plugins.map(path) } : {}),
     ...(x.skills !== undefined ? { skills: x.skills } : {}),
     ...(x.extraArgs ? { extraArgs: x.extraArgs } : {}),
     ...(x.additionalDirectories ? { additionalDirectories: x.additionalDirectories.map(path) } : {}),
   };
   return { ...common, kind: 'claude-code', claude, ...(unavailable ? { unavailable } : {}) };
+}
+
+const VAR_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const envRef = (v: unknown): string | undefined => (typeof v === 'string' && v.startsWith('env:') ? v.slice(4) : undefined);
+
+/** How a harness instance hands "env:NAME" values to its child process. */
+interface ChildSecrets {
+  /** The variable's value; undefined (instance unavailable) when it is not set. */
+  value(name: string, at: string): string | undefined;
+  /** Put `k=v` into the child's environment. */
+  toChild(k: string, v: string, at: string): void;
+}
+
+/** Claude `mcpServers`: "env:NAME" becomes `${NAME}` (the CLI expands it in command, args, env, url, headers). */
+function claudeMcpViaEnv<T>(v: T, at: string, s: ChildSecrets): T {
+  const name = envRef(v);
+  if (name !== undefined) {
+    const value = s.value(name, at);
+    if (value !== undefined) s.toChild(name, value, at);
+    return `\${${name}}` as T;
+  }
+  if (Array.isArray(v)) return v.map((x, i) => claudeMcpViaEnv(x, `${at}[${i}]`, s)) as T;
+  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, claudeMcpViaEnv(x, `${at}.${k}`, s)])) as T;
+  return v;
+}
+
+/** Claude inline `settings` (passed as `--settings <json>`): "env:NAME" only under `settings.env`, moved to the child env. */
+function claudeSettingsViaEnv(st: Record<string, unknown>, at: string, s: ChildSecrets): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(st)) {
+    if (k === 'env' && v && typeof v === 'object' && !Array.isArray(v)) {
+      const kept: Record<string, unknown> = {};
+      for (const [vk, vv] of Object.entries(v)) {
+        const name = envRef(vv);
+        if (name === undefined) kept[vk] = vv;
+        else if (!VAR_NAME.test(vk)) fail(`${at}.env: ${JSON.stringify(vk)} is not a variable name`);
+        else {
+          const value = s.value(name, `${at}.env.${vk}`);
+          if (value !== undefined) s.toChild(vk, value, `${at}.env.${vk}`);
+        }
+      }
+      out[k] = kept;
+    } else out[k] = noEnvRefs(v, `${at}.${k}`, 'the claude command line (--settings)', 'set it under settings.env or the instance env');
+  }
+  return out;
+}
+
+function noEnvRefs(v: unknown, at: string, line: string, hint: string): unknown {
+  if (envRef(v) !== undefined) fail(`${at}: "env:" values would be on ${line}, visible to other local users via ps; ${hint}`);
+  if (Array.isArray(v)) v.forEach((x, i) => noEnvRefs(x, `${at}[${i}]`, line, hint));
+  else if (v && typeof v === 'object') for (const [k, x] of Object.entries(v)) noEnvRefs(x, `${at}.${k}`, line, hint);
+  return v;
+}
+
+const TOML_SEG = /[A-Za-z0-9_][A-Za-z0-9_-]*|"[^"\\]*"/g;
+const tomlKey = (segs: string[]) => segs.map((x) => (/^[A-Za-z0-9_-]+$/.test(x) ? x : JSON.stringify(x))).join('.');
+
+/**
+ * Codex `config` (passed as `-c key=value`): each "env:NAME" is replaced by the Codex setting
+ * that names a variable instead of holding the value, with the value in the app-server's env:
+ * `…http_headers.H` → `…env_http_headers.H`, `…bearer_token` → `…bearer_token_env_var`,
+ * `…experimental_bearer_token` → `…env_key`, `mcp_servers.<id>.env.VAR` → `mcp_servers.<id>.env_vars`.
+ * Anywhere else it is an error.
+ */
+function codexConfigViaEnv(config: Record<string, unknown>, at: string, s: ChildSecrets): Record<string, unknown> {
+  const DROP = Symbol('drop');
+  const extra: [string, unknown][] = [];
+  const forward = new Map<string, string[]>();
+  const visit = (v: unknown, segs: string[]): unknown => {
+    const name = envRef(v);
+    if (name !== undefined) {
+      const where = `${at}.${segs.join('.')}`;
+      const [last, parent] = [segs.at(-1)!, segs.at(-2)];
+      const value = s.value(name, where);
+      if (parent === 'env' && segs.length >= 3 && VAR_NAME.test(last)) {
+        // A stdio MCP server's env: forward the variable from the app-server's environment.
+        const server = tomlKey(segs.slice(0, -2));
+        forward.set(server, [...(forward.get(server) ?? []), last]);
+        if (value !== undefined) s.toChild(last, value, where);
+        return DROP;
+      }
+      let key: string[] | undefined;
+      if (parent === 'http_headers') key = [...segs.slice(0, -2), 'env_http_headers', last];
+      else if (last === 'bearer_token') key = [...segs.slice(0, -1), 'bearer_token_env_var'];
+      else if (last === 'experimental_bearer_token') key = [...segs.slice(0, -1), 'env_key'];
+      if (!key)
+        fail(
+          `${where}: "env:" values would be on the codex app-server command line, visible to other local users via ps; ` +
+            'use a setting that names a variable (http_headers → env_http_headers, bearer_token → bearer_token_env_var, ' +
+            'experimental_bearer_token → env_key, mcp_servers.<id>.env.<VAR>) or write a non-secret value literally',
+        );
+      if (value !== undefined) s.toChild(name, value, where);
+      extra.push([tomlKey(key), name]);
+      return DROP;
+    }
+    if (Array.isArray(v)) return v.map((x, i) => visit(x, [...segs, `[${i}]`]));
+    if (v && typeof v === 'object') {
+      const out: Record<string, unknown> = {};
+      for (const [k, x] of Object.entries(v)) {
+        const r = visit(x, [...segs, k]);
+        if (r !== DROP) out[k] = r;
+      }
+      return out;
+    }
+    return v;
+  };
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(config)) {
+    const segs = (k.match(TOML_SEG) ?? [k]).map((x) => x.replace(/^"|"$/g, ''));
+    const r = visit(v, segs);
+    if (r !== DROP) out[k] = r;
+  }
+  for (const [k, v] of extra) out[k] = v;
+  for (const [server, vars] of forward) out[`${server}.env_vars`] = vars;
+  return out;
 }
 
 function resolveChannel(ch: ChannelEntry, env: Record<string, string | undefined>, path: (p: string) => string): ResolvedChannel {

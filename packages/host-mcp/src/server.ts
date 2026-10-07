@@ -103,12 +103,18 @@ export const TOOL_NAMES = Object.keys(TOOL_DEFS) as ToolName[];
 
 export interface HostMcpServerOptions {
   tools: HostTools;
-  /** Listen address (default 127.0.0.1; never expose it beyond loopback). */
+  /** Listen address (default 127.0.0.1); anything but a loopback address is refused. */
   host?: string;
   /** Default 0: an ephemeral port. */
   port?: number;
   /** Called for every tool call (debugging, verifying what harnesses send in `_meta`). */
   onCall?: (e: { binding: ToolBinding; tool: string; meta: Record<string, unknown> | undefined; ok: boolean; error?: string }) => void;
+}
+
+function isLoopback(host: string): boolean {
+  if (host === '::1') return true;
+  const v4 = /^(\d{1,3})\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.exec(host);
+  return v4 !== null && v4[1] === '127';
 }
 
 /** `_meta` keys harnesses put their own tool-call id under. */
@@ -138,10 +144,13 @@ export class HostMcpServer {
 
   async listen(): Promise<string> {
     if (this.base) return this.base;
+    // The tokens are bearer credentials sent in clear text: never reachable off this machine.
+    const bind = this.o.host ?? '127.0.0.1';
+    if (!isLoopback(bind)) throw new Error(`HostMcpServer: host ${JSON.stringify(bind)} is not a loopback address (use 127.0.0.1 or ::1)`);
     const http = createServer((req, res) => void this.handle(req, res));
     await new Promise<void>((resolve, reject) => {
       http.once('error', reject);
-      http.listen(this.o.port ?? 0, this.o.host ?? '127.0.0.1', () => resolve());
+      http.listen(this.o.port ?? 0, bind, () => resolve());
     });
     http.unref();
     this.http = http;
