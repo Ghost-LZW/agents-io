@@ -67,3 +67,19 @@
 - **create-lark-bot**：G1，上游加 `--env-prefix`，控制台对非 `default` 账号传 `--env-prefix LARK_<ACCOUNT>_`；开通写入前复查同账号、变量名冲突、appId 重复、启动校验。
 - **通道条目上的 `agent`**（§11 第 4 项）：暂不做。
 - **第二阶段**（兄弟机器人识别）：不做，等 live 核实飞书是否把机器人的群消息推给同群其他机器人（§11 第 5 项）。
+
+## 决定 9：宿主的 resolve / outbound 回调与代人作答；宿主队列按原 origin 重新派发 —— 采纳
+
+日期：2026-10-07。owner 在对话中同意推进这两项上游事项。方案见 `docs/design/host-callouts/README.md`、`docs/design/inbound-redispatch/README.md`：
+
+- `host.hello.callouts` 接受 `true`（即 `["route"]`）或 hook 列表 `route` / `resolve` / `outbound`；`resolve` 超时或出错时退回本地策略，`outbound` 任何失败都拒绝。宿主连接可用 `resolve { onBehalfOf }` 代被问的人作答，日志记 `by.via: "host:<name>"`。
+- `inbound.redispatch { cursor, agent?, session?, launch? }`：把宿主队列里的条目以原 origin、内容与回复路由派发到指定会话，同一 cursor 至多派发一次，`aio explain` 双向可查。用于宿主离线或回调超时期间进队的输入在之后自动送达，不必请人重发。
+
+## 决定 10：宿主 token 文件、/ws 心跳与接管、bridge 首次握手失败重试、通道变更热生效 —— 采纳
+
+日期：2026-10-07。owner 在对话中同意推进。方案见 `docs/design/host-token-file/`、`docs/design/host-liveness/`、`docs/design/bridge-first-connect/`、`docs/design/live-channels/`：
+
+- `aio serve --token-file` / `host.tokenFile`：存在则读，不存在则生成（0600，权限检查同 `.env.live`），使不与守护进程同机的宿主在重启后仍能认证。
+- `/ws` 服务端心跳；`host.hello { takeover: true }` 在 token 正确时替换半开的旧宿主连接并告警。
+- bridge 通道首次 hello 失败时标为 `failed` 并按退避重试，不再阻止守护进程启动。
+- 经 `PUT /api/config` 的通道增删热生效（`applied: "live"`），只启停变化的通道。
