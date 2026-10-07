@@ -129,6 +129,36 @@ describe('process card: CardKit streaming (panels)', () => {
     expect(card.json.body.elements.at(-1).element_id).toBe('footer');
   });
 
+  it('a retried send after a lost reply reuses its card and bubble (same uuid, same message)', async () => {
+    const lark = new FakeLark();
+    const reply = lark.client.im.v1.message.reply;
+    let lose = true;
+    // The server applies the reply, the client sees a transport error.
+    lark.client.im.v1.message.reply = async (req) => {
+      const r = await reply(req);
+      if (lose && JSON.parse(req.data.content).data?.card_id) {
+        lose = false;
+        throw new Error('socket hang up');
+      }
+      return r;
+    };
+    const { adapter } = make({ process: 'cot' }, lark);
+    const t = turn();
+    t.p.steps.push({ kind: 'reasoning', id: 'r0', text: 'hmm', done: false });
+    await expect(adapter.send(route, t.msg(), { operationId: 'op' })).rejects.toThrow('socket hang up');
+    const { providerMessageId: id } = await adapter.send(route, t.msg(), { operationId: 'op' }); // the outbox retries
+    expect(lark.messages.filter((m) => m.msg_type === 'interactive')).toHaveLength(1);
+    expect(lark.cards.size).toBe(1);
+    expect(lark.cots).toHaveLength(1);
+    t.p.answer = 'HELLO';
+    t.p.status = 'completed';
+    t.p.answerFinal = true;
+    await adapter.finalize(route, id!, t.msg());
+    await adapter.settled();
+    // The card the message shows is the one that got the answer.
+    expect(FakeLark.element(cardOf(lark, id!).json, 'answer').content).toBe('HELLO');
+  });
+
   it('is idempotent per operationId and drops stale edit sequences', async () => {
     const { lark, adapter } = make({ process: 'panels' });
     const t = turn();

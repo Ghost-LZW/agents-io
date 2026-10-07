@@ -96,6 +96,8 @@ interface ProcState {
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const BOUND = 2000;
+/** Emits retried by the adapter after the event was already acked. */
+const EMIT_RETRIES = 5;
 /** Lark codes for a missing scope / app permission: remembered for the whole app, not one chat. */
 const PERMISSION_CODES = new Set([99991672, 99991679, 99991663]);
 
@@ -136,6 +138,12 @@ export class LarkBotAdapter implements ChannelAdapter {
   private readonly lastPatchAt = new Map<string, number>();
   private readonly lastSeq = new Map<string, number>();
   private readonly procs = new Map<string, ProcState>();
+  /**
+   * operationId → the process state (bubble) and CardKit card of a send not yet confirmed. A retry
+   * reuses them: Lark's uuid dedup returns the message first sent, which shows that card, and
+   * the bubble is already open.
+   */
+  private readonly pendingProcs = new Map<string, { st: ProcState; card?: CardKitCard; level?: CardLevel; shown?: ProcessModel }>();
   /** `app` or `chat:<id>` → lowest card level that still works there, until a time. */
   private readonly cardFloor = new Map<string, { level: CardLevel; until: number }>();
   /** `app` or `chat:<id>` → thinking bubble off until a time. */
@@ -243,17 +251,37 @@ export class LarkBotAdapter implements ChannelAdapter {
     }
   }
 
-  /** Wait for the host to take the message, but never past Lark's ack deadline. */
+  /**
+   * Wait for the host to take the message, but never past Lark's ack deadline. A failure
+   * before the deadline rejects (the SDK answers 500, Lark redelivers, the dedup key is
+   * dropped for it); once the deadline acked the event Lark will not redeliver, so the
+   * adapter keeps the dedup key and retries the emit itself.
+   */
   private async deliver(ctx: ChannelContext, key: string, emit: () => Promise<unknown>): Promise<void> {
-    const p = emit();
-    p.catch((err) => {
-      this.dedup.delete(key); // let the platform's redelivery retry it
-      ctx.log('error', `emit failed for ${key}: ${String(err)}`);
-    });
+    let acked = false;
+    const attempt = (n: number): Promise<unknown> =>
+      emit().catch(async (err) => {
+        if (!acked) throw err;
+        if (n >= EMIT_RETRIES || ctx.signal.aborted) {
+          this.dedup.delete(key);
+          ctx.log('error', `emit failed for ${key}, giving up: ${String(err)}`);
+          throw err;
+        }
+        ctx.log('warn', `emit failed for ${key} after ack, retrying: ${String(err)}`);
+        await this.sleep(Math.min(30_000, 1000 * 2 ** n));
+        return attempt(n + 1);
+      });
+    const p = attempt(0);
+    p.catch(() => undefined);
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const deadline = new Promise<void>((resolve) => (timer = setTimeout(resolve, this.cfg.ackTimeoutMs)));
+    const deadline = new Promise<'late'>((resolve) => (timer = setTimeout(() => ((acked = true), resolve('late')), this.cfg.ackTimeoutMs)));
     try {
-      await Promise.race([p.catch(() => undefined), deadline]);
+      const res = await Promise.race([p.then(() => 'done' as const, (err: unknown) => ({ err })), deadline]);
+      if (typeof res === 'object') {
+        this.dedup.delete(key); // let the platform's redelivery retry it
+        ctx.log('error', `emit failed for ${key}: ${String(res.err)}`);
+        throw res.err;
+      }
     } finally {
       clearTimeout(timer);
     }
@@ -270,7 +298,13 @@ export class LarkBotAdapter implements ChannelAdapter {
     this.dedup.add(key);
     this.learnIds(ev);
     const fromBot = ev.sender?.sender_type === 'app' || (!!this.botOpenId && ev.sender?.sender_id?.open_id === this.botOpenId);
-    const declared = fromBot ? await this.store.get(mid) : undefined;
+    let declared: string | undefined;
+    try {
+      declared = fromBot ? await this.store.get(mid) : undefined;
+    } catch (err) {
+      this.dedup.delete(key); // not acked: the redelivery must be processed
+      throw err;
+    }
     const env = mapMessageEvent(ev, { account: ctx.account, botOpenId: this.botOpenId, declared });
     if (!env) {
       this.dedup.delete(key);
@@ -671,15 +705,21 @@ export class LarkBotAdapter implements ChannelAdapter {
   private async sendProcess(route: ReplyRoute, msg: RenderedMessage, op: SendOp): Promise<SendResult> {
     const p = msg.progress!;
     const uuid = uuidFor(this.account, op.operationId, 0);
-    let level = this.floorOf(route);
-    const st = this.newState(route, p, level);
-    // The bubble goes first so it sits above the reply card; if it fails the card shows the process.
-    if (st.cot) await st.cot.open();
+    const prior = this.pendingProcs.get(op.operationId);
+    let level = prior?.level ?? this.floorOf(route);
+    const st = prior?.st ?? this.newState(route, p, level);
+    const pending = prior ?? { st };
+    if (!prior) {
+      bounded(this.pendingProcs, op.operationId, pending);
+      // The bubble goes first so it sits above the reply card; if it fails the card shows the process.
+      if (st.cot) await st.cot.open();
+    }
     this.feedCot(st, p, false);
     let id: string | undefined;
     while (id === undefined) {
       if (level === 'patch') {
         st.level = 'patch';
+        pending.level = 'patch';
         const card = fitProcessCard(this.model(msg, p, st), this.cfg.maxCardBytes);
         st.lastCard = JSON.stringify(card);
         id = await this.sendOne(route, cardMessage(card), uuid);
@@ -689,10 +729,16 @@ export class LarkBotAdapter implements ChannelAdapter {
       st.level = level;
       let card: CardKitCard;
       try {
-        card = await CardKitCard.create(this.client.cardkit!.v1, processCard(this.model(msg, p, st), { streaming: level === 'stream' }), {
-          timeoutMs: this.cfg.processRequestTimeoutMs,
-          sleep: this.sleep,
-        });
+        // A card already sent under this uuid (reply lost in transit) is the one the message shows.
+        if (pending.card && pending.level === level) card = pending.card;
+        else {
+          const shown = this.model(msg, p, st);
+          card = await CardKitCard.create(this.client.cardkit!.v1, processCard(shown, { streaming: level === 'stream' }), {
+            timeoutMs: this.cfg.processRequestTimeoutMs,
+            sleep: this.sleep,
+          });
+          Object.assign(pending, { card, level, shown });
+        }
       } catch (err) {
         this.degrade(route, level, err);
         level = level === 'stream' ? 'update' : 'patch';
@@ -710,11 +756,16 @@ export class LarkBotAdapter implements ChannelAdapter {
       st.card = card;
       if (id) bounded(this.kinds, id, 'cardkit');
     }
-    if (!id) return {};
+    if (!id) {
+      this.pendingProcs.delete(op.operationId);
+      return {};
+    }
     if (op.as) await this.store.set(id, op.as);
     bounded(this.procs, id, st);
-    this.initSent(st, this.model(msg, p, st));
+    // A reused card shows what it was created with, so the first edit sends the differences from that.
+    this.initSent(st, (st.card && st.card === pending.card && pending.shown) || this.model(msg, p, st));
     for (const [i, part] of this.attachmentParts(msg).entries()) await this.sendOne(route, part.out, uuidFor(this.account, op.operationId, i + 1));
+    this.pendingProcs.delete(op.operationId);
     return { providerMessageId: id };
   }
 
