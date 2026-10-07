@@ -1,0 +1,1591 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/HostEventFrame",
+  "anyOf": [
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "item"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "inbound",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "item": {
+          "type": "object",
+          "required": [
+            "cursor",
+            "channelRef",
+            "bindingId",
+            "input",
+            "envelope",
+            "receivedAt"
+          ],
+          "properties": {
+            "cursor": {
+              "type": "number"
+            },
+            "channelRef": {
+              "type": "string"
+            },
+            "bindingId": {
+              "type": "string"
+            },
+            "input": {
+              "type": "object",
+              "required": [
+                "inputId",
+                "origin",
+                "content",
+                "replyRoute",
+                "channelContext"
+              ],
+              "properties": {
+                "inputId": {
+                  "type": "string"
+                },
+                "origin": {
+                  "type": "object",
+                  "required": [
+                    "kind",
+                    "principal",
+                    "evidence",
+                    "via",
+                    "adapter"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "anyOf": [
+                        {
+                          "const": "human",
+                          "type": "string"
+                        },
+                        {
+                          "const": "agent",
+                          "type": "string"
+                        },
+                        {
+                          "const": "channel_event",
+                          "type": "string"
+                        },
+                        {
+                          "const": "system",
+                          "type": "string"
+                        },
+                        {
+                          "const": "peer",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "principal": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "required": [
+                            "id",
+                            "labels"
+                          ],
+                          "properties": {
+                            "id": {
+                              "type": "string"
+                            },
+                            "labels": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "evidence": {
+                      "anyOf": [
+                        {
+                          "const": "platform_signed",
+                          "type": "string"
+                        },
+                        {
+                          "const": "dkim_pass",
+                          "type": "string"
+                        },
+                        {
+                          "const": "device_only",
+                          "type": "string"
+                        },
+                        {
+                          "const": "none",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "declared": {
+                      "type": "string"
+                    },
+                    "self": {
+                      "type": "boolean"
+                    },
+                    "via": {
+                      "type": "string"
+                    },
+                    "adapter": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "content": {
+                  "type": "array",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "text"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "text",
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "ref",
+                          "mime"
+                        ],
+                        "properties": {
+                          "type": {
+                            "anyOf": [
+                              {
+                                "const": "image",
+                                "type": "string"
+                              },
+                              {
+                                "const": "file",
+                                "type": "string"
+                              },
+                              {
+                                "const": "audio",
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          "ref": {
+                            "type": "string"
+                          },
+                          "mime": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "text"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "quote",
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          },
+                          "fromMessageId": {
+                            "type": "string"
+                          },
+                          "declared": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "text",
+                          "startMs",
+                          "endMs",
+                          "stable"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "transcript",
+                            "type": "string"
+                          },
+                          "speaker": {
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          },
+                          "startMs": {
+                            "type": "number"
+                          },
+                          "endMs": {
+                            "type": "number"
+                          },
+                          "stable": {
+                            "type": "boolean"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "name",
+                          "data"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "event",
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "data": {
+                            "type": "object",
+                            "patternProperties": {
+                              "^(.*)$": {}
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "uri"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "ref",
+                            "type": "string"
+                          },
+                          "uri": {
+                            "type": "string"
+                          },
+                          "title": {
+                            "type": "string"
+                          },
+                          "mime": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                },
+                "replyRoute": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "required": [
+                        "channel",
+                        "account",
+                        "conversationId"
+                      ],
+                      "properties": {
+                        "channel": {
+                          "type": "string"
+                        },
+                        "account": {
+                          "type": "string"
+                        },
+                        "conversationId": {
+                          "type": "string"
+                        },
+                        "threadId": {
+                          "type": "string"
+                        },
+                        "replyToMessageId": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "channelContext": {
+                  "type": "object",
+                  "patternProperties": {
+                    "^(.*)$": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "boolean"
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            "envelope": {
+              "type": "object",
+              "required": [
+                "v",
+                "id",
+                "channel",
+                "account",
+                "conversation",
+                "sender",
+                "content",
+                "replyRoute"
+              ],
+              "properties": {
+                "v": {
+                  "const": 1,
+                  "type": "number"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "channel": {
+                  "type": "string"
+                },
+                "account": {
+                  "type": "string"
+                },
+                "conversation": {
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "kind"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "kind": {
+                      "anyOf": [
+                        {
+                          "const": "dm",
+                          "type": "string"
+                        },
+                        {
+                          "const": "group",
+                          "type": "string"
+                        },
+                        {
+                          "const": "thread",
+                          "type": "string"
+                        },
+                        {
+                          "const": "meeting",
+                          "type": "string"
+                        },
+                        {
+                          "const": "call",
+                          "type": "string"
+                        },
+                        {
+                          "const": "mail",
+                          "type": "string"
+                        },
+                        {
+                          "const": "other",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "threadId": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "sender": {
+                  "type": "object",
+                  "required": [
+                    "channelUserId",
+                    "evidence"
+                  ],
+                  "properties": {
+                    "channelUserId": {
+                      "type": "string"
+                    },
+                    "displayName": {
+                      "type": "string"
+                    },
+                    "isBot": {
+                      "type": "boolean"
+                    },
+                    "evidence": {
+                      "anyOf": [
+                        {
+                          "const": "platform_signed",
+                          "type": "string"
+                        },
+                        {
+                          "const": "dkim_pass",
+                          "type": "string"
+                        },
+                        {
+                          "const": "device_only",
+                          "type": "string"
+                        },
+                        {
+                          "const": "none",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "declared": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "content": {
+                  "type": "array",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "text"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "text",
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "ref",
+                          "mime"
+                        ],
+                        "properties": {
+                          "type": {
+                            "anyOf": [
+                              {
+                                "const": "image",
+                                "type": "string"
+                              },
+                              {
+                                "const": "file",
+                                "type": "string"
+                              },
+                              {
+                                "const": "audio",
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          "ref": {
+                            "type": "string"
+                          },
+                          "mime": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "text"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "quote",
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          },
+                          "fromMessageId": {
+                            "type": "string"
+                          },
+                          "declared": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "text",
+                          "startMs",
+                          "endMs",
+                          "stable"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "transcript",
+                            "type": "string"
+                          },
+                          "speaker": {
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          },
+                          "startMs": {
+                            "type": "number"
+                          },
+                          "endMs": {
+                            "type": "number"
+                          },
+                          "stable": {
+                            "type": "boolean"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "name",
+                          "data"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "event",
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "data": {
+                            "type": "object",
+                            "patternProperties": {
+                              "^(.*)$": {}
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "uri"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "ref",
+                            "type": "string"
+                          },
+                          "uri": {
+                            "type": "string"
+                          },
+                          "title": {
+                            "type": "string"
+                          },
+                          "mime": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                },
+                "mentions": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "id"
+                    ],
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "isBot": {
+                        "type": "boolean"
+                      }
+                    }
+                  }
+                },
+                "context": {
+                  "type": "object",
+                  "patternProperties": {
+                    "^(.*)$": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "boolean"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "replyRoute": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "required": [
+                        "channel",
+                        "account",
+                        "conversationId"
+                      ],
+                      "properties": {
+                        "channel": {
+                          "type": "string"
+                        },
+                        "account": {
+                          "type": "string"
+                        },
+                        "conversationId": {
+                          "type": "string"
+                        },
+                        "threadId": {
+                          "type": "string"
+                        },
+                        "replyToMessageId": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "admission": {
+                  "anyOf": [
+                    {
+                      "const": "dispatch",
+                      "type": "string"
+                    },
+                    {
+                      "const": "observe",
+                      "type": "string"
+                    },
+                    {
+                      "const": "drop",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "modeHint": {
+                  "anyOf": [
+                    {
+                      "const": "queue",
+                      "type": "string"
+                    },
+                    {
+                      "const": "steer",
+                      "type": "string"
+                    },
+                    {
+                      "const": "interrupt",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "revisionOf": {
+                  "type": "string"
+                },
+                "sentAt": {
+                  "type": "number"
+                },
+                "raw": {}
+              }
+            },
+            "receivedAt": {
+              "type": "number"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "hook",
+        "args"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "policy",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "hook": {
+          "const": "route",
+          "type": "string"
+        },
+        "args": {
+          "type": "object",
+          "required": [
+            "bindingId",
+            "input",
+            "envelope"
+          ],
+          "properties": {
+            "bindingId": {
+              "type": "string"
+            },
+            "input": {
+              "type": "object",
+              "required": [
+                "inputId",
+                "origin",
+                "content",
+                "replyRoute",
+                "channelContext"
+              ],
+              "properties": {
+                "inputId": {
+                  "type": "string"
+                },
+                "origin": {
+                  "type": "object",
+                  "required": [
+                    "kind",
+                    "principal",
+                    "evidence",
+                    "via",
+                    "adapter"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "anyOf": [
+                        {
+                          "const": "human",
+                          "type": "string"
+                        },
+                        {
+                          "const": "agent",
+                          "type": "string"
+                        },
+                        {
+                          "const": "channel_event",
+                          "type": "string"
+                        },
+                        {
+                          "const": "system",
+                          "type": "string"
+                        },
+                        {
+                          "const": "peer",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "principal": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "required": [
+                            "id",
+                            "labels"
+                          ],
+                          "properties": {
+                            "id": {
+                              "type": "string"
+                            },
+                            "labels": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "evidence": {
+                      "anyOf": [
+                        {
+                          "const": "platform_signed",
+                          "type": "string"
+                        },
+                        {
+                          "const": "dkim_pass",
+                          "type": "string"
+                        },
+                        {
+                          "const": "device_only",
+                          "type": "string"
+                        },
+                        {
+                          "const": "none",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "declared": {
+                      "type": "string"
+                    },
+                    "self": {
+                      "type": "boolean"
+                    },
+                    "via": {
+                      "type": "string"
+                    },
+                    "adapter": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "content": {
+                  "type": "array",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "text"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "text",
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "ref",
+                          "mime"
+                        ],
+                        "properties": {
+                          "type": {
+                            "anyOf": [
+                              {
+                                "const": "image",
+                                "type": "string"
+                              },
+                              {
+                                "const": "file",
+                                "type": "string"
+                              },
+                              {
+                                "const": "audio",
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          "ref": {
+                            "type": "string"
+                          },
+                          "mime": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "text"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "quote",
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          },
+                          "fromMessageId": {
+                            "type": "string"
+                          },
+                          "declared": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "text",
+                          "startMs",
+                          "endMs",
+                          "stable"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "transcript",
+                            "type": "string"
+                          },
+                          "speaker": {
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          },
+                          "startMs": {
+                            "type": "number"
+                          },
+                          "endMs": {
+                            "type": "number"
+                          },
+                          "stable": {
+                            "type": "boolean"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "name",
+                          "data"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "event",
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "data": {
+                            "type": "object",
+                            "patternProperties": {
+                              "^(.*)$": {}
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "uri"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "ref",
+                            "type": "string"
+                          },
+                          "uri": {
+                            "type": "string"
+                          },
+                          "title": {
+                            "type": "string"
+                          },
+                          "mime": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                },
+                "replyRoute": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "required": [
+                        "channel",
+                        "account",
+                        "conversationId"
+                      ],
+                      "properties": {
+                        "channel": {
+                          "type": "string"
+                        },
+                        "account": {
+                          "type": "string"
+                        },
+                        "conversationId": {
+                          "type": "string"
+                        },
+                        "threadId": {
+                          "type": "string"
+                        },
+                        "replyToMessageId": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "channelContext": {
+                  "type": "object",
+                  "patternProperties": {
+                    "^(.*)$": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "boolean"
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            "envelope": {
+              "type": "object",
+              "required": [
+                "v",
+                "id",
+                "channel",
+                "account",
+                "conversation",
+                "sender",
+                "content",
+                "replyRoute"
+              ],
+              "properties": {
+                "v": {
+                  "const": 1,
+                  "type": "number"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "channel": {
+                  "type": "string"
+                },
+                "account": {
+                  "type": "string"
+                },
+                "conversation": {
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "kind"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "kind": {
+                      "anyOf": [
+                        {
+                          "const": "dm",
+                          "type": "string"
+                        },
+                        {
+                          "const": "group",
+                          "type": "string"
+                        },
+                        {
+                          "const": "thread",
+                          "type": "string"
+                        },
+                        {
+                          "const": "meeting",
+                          "type": "string"
+                        },
+                        {
+                          "const": "call",
+                          "type": "string"
+                        },
+                        {
+                          "const": "mail",
+                          "type": "string"
+                        },
+                        {
+                          "const": "other",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "threadId": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "sender": {
+                  "type": "object",
+                  "required": [
+                    "channelUserId",
+                    "evidence"
+                  ],
+                  "properties": {
+                    "channelUserId": {
+                      "type": "string"
+                    },
+                    "displayName": {
+                      "type": "string"
+                    },
+                    "isBot": {
+                      "type": "boolean"
+                    },
+                    "evidence": {
+                      "anyOf": [
+                        {
+                          "const": "platform_signed",
+                          "type": "string"
+                        },
+                        {
+                          "const": "dkim_pass",
+                          "type": "string"
+                        },
+                        {
+                          "const": "device_only",
+                          "type": "string"
+                        },
+                        {
+                          "const": "none",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "declared": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "content": {
+                  "type": "array",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "text"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "text",
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "ref",
+                          "mime"
+                        ],
+                        "properties": {
+                          "type": {
+                            "anyOf": [
+                              {
+                                "const": "image",
+                                "type": "string"
+                              },
+                              {
+                                "const": "file",
+                                "type": "string"
+                              },
+                              {
+                                "const": "audio",
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          "ref": {
+                            "type": "string"
+                          },
+                          "mime": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "text"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "quote",
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          },
+                          "fromMessageId": {
+                            "type": "string"
+                          },
+                          "declared": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "text",
+                          "startMs",
+                          "endMs",
+                          "stable"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "transcript",
+                            "type": "string"
+                          },
+                          "speaker": {
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          },
+                          "startMs": {
+                            "type": "number"
+                          },
+                          "endMs": {
+                            "type": "number"
+                          },
+                          "stable": {
+                            "type": "boolean"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "name",
+                          "data"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "event",
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "data": {
+                            "type": "object",
+                            "patternProperties": {
+                              "^(.*)$": {}
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "uri"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "ref",
+                            "type": "string"
+                          },
+                          "uri": {
+                            "type": "string"
+                          },
+                          "title": {
+                            "type": "string"
+                          },
+                          "mime": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                },
+                "mentions": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "id"
+                    ],
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "isBot": {
+                        "type": "boolean"
+                      }
+                    }
+                  }
+                },
+                "context": {
+                  "type": "object",
+                  "patternProperties": {
+                    "^(.*)$": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "boolean"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "replyRoute": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "required": [
+                        "channel",
+                        "account",
+                        "conversationId"
+                      ],
+                      "properties": {
+                        "channel": {
+                          "type": "string"
+                        },
+                        "account": {
+                          "type": "string"
+                        },
+                        "conversationId": {
+                          "type": "string"
+                        },
+                        "threadId": {
+                          "type": "string"
+                        },
+                        "replyToMessageId": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "admission": {
+                  "anyOf": [
+                    {
+                      "const": "dispatch",
+                      "type": "string"
+                    },
+                    {
+                      "const": "observe",
+                      "type": "string"
+                    },
+                    {
+                      "const": "drop",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "modeHint": {
+                  "anyOf": [
+                    {
+                      "const": "queue",
+                      "type": "string"
+                    },
+                    {
+                      "const": "steer",
+                      "type": "string"
+                    },
+                    {
+                      "const": "interrupt",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "revisionOf": {
+                  "type": "string"
+                },
+                "sentAt": {
+                  "type": "number"
+                },
+                "raw": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "runId",
+        "sessionKey",
+        "status",
+        "exitCode"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "run.ended",
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "sessionKey": {
+          "type": "string"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "const": "completed",
+              "type": "string"
+            },
+            {
+              "const": "interrupted",
+              "type": "string"
+            },
+            {
+              "const": "failed",
+              "type": "string"
+            },
+            {
+              "const": "ambiguous",
+              "type": "string"
+            }
+          ]
+        },
+        "exitCode": {
+          "type": "number"
+        },
+        "error": {
+          "type": "object",
+          "required": [
+            "code"
+          ],
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "ok"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "result",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "value": {},
+        "error": {
+          "type": "object",
+          "required": [
+            "code",
+            "message"
+          ],
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "retryable": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

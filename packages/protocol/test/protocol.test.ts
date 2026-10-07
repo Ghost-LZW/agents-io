@@ -108,3 +108,23 @@ describe('FrameDecoder bytes', () => {
     expect(out).toEqual([{ t: '飞书' }]);
   });
 });
+
+describe('host protocol', () => {
+  it('validates a binding table and host frames', async () => {
+    const { BindingTable, HostRequestFrame, HostEventFrame } = await import('../src/index.js');
+    const table = {
+      version: '1', onHostDown: 'suspend',
+      bindings: [
+        { id: 'owner-dm', match: { channel: 'lark-bot', conversationKind: 'dm', labels: ['owner'] }, on: 'dispatch', agent: 'assistant', session: 'main' },
+        { id: 'xwo-buttons', match: { actionPrefix: 'xwo:' }, on: 'host' },
+        { id: 'triage', match: { channel: 'mail', principal: 'unknown' }, on: 'context', agent: 'assistant', callout: { timeoutMs: 1500, onFailure: 'host' } },
+      ],
+      identities: [{ channel: 'lark-bot', channelUserId: 'on_x', principal: 'member:lzw', labels: ['owner'] }],
+    };
+    expect(errors(BindingTable, table)).toEqual([]);
+    expect(check(BindingTable, { ...table, bindings: [{ id: 'x', match: {}, on: 'wake' }] })).toBe(false);
+    expect(check(HostRequestFrame, { v: 1, type: 'run.start', id: '1', runId: 'r1', agent: 'executor', input: [{ type: 'text', text: 'go' }] })).toBe(true);
+    expect(check(HostRequestFrame, { v: 1, type: 'bindings.put', id: '2', table })).toBe(true);
+    expect(check(HostEventFrame, { v: 1, type: 'run.ended', runId: 'r1', sessionKey: 'run:r1', status: 'completed', exitCode: 0 })).toBe(true);
+  });
+});

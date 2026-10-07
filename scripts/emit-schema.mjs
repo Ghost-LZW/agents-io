@@ -6,7 +6,7 @@ const names = [
   'InboundEnvelope', 'InputRecord', 'Origin', 'SessionEvent', 'HarnessEvent', 'Command', 'RunSpec',
   'HarnessCaps', 'ChannelCaps', 'RenderedMessage', 'Decision', 'Resolver',
   'ChannelHostFrame', 'ChannelAdapterFrame', 'ChannelHello', 'HarnessHostFrame', 'HarnessAdapterFrame',
-  'ClientFrame', 'ServerFrame', 'SessionInfo', 'ProgressView', 'Watch', 'WatchDraft',
+  'ClientFrame', 'ServerFrame', 'SessionInfo', 'ProgressView', 'Watch', 'BindingTable', 'RouteExplanation', 'TurnProvenance', 'InboundItem', 'HostRequestFrame', 'HostEventFrame', 'WatchDraft',
 ];
 const dir = new URL('../packages/protocol/schema/', import.meta.url);
 mkdirSync(dir, { recursive: true });

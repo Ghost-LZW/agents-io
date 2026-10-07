@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/TurnProvenance",
+  "type": "object",
+  "required": [
+    "sessionKey",
+    "turnId",
+    "triggeredBy",
+    "watched",
+    "external",
+    "group"
+  ],
+  "properties": {
+    "sessionKey": {
+      "type": "string"
+    },
+    "turnId": {
+      "type": "string"
+    },
+    "triggeredBy": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "watched": {
+      "type": "boolean"
+    },
+    "external": {
+      "type": "boolean"
+    },
+    "group": {
+      "type": "boolean"
+    }
+  }
+}

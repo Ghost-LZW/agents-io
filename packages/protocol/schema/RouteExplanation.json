@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/RouteExplanation",
+  "type": "object",
+  "required": [
+    "inputId",
+    "tableVersions",
+    "matched",
+    "principal",
+    "evidence"
+  ],
+  "properties": {
+    "inputId": {
+      "type": "string"
+    },
+    "tableVersions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "matched": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "bindingId",
+          "source",
+          "on"
+        ],
+        "properties": {
+          "bindingId": {
+            "type": "string"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "const": "config",
+                "type": "string"
+              },
+              {
+                "const": "host",
+                "type": "string"
+              },
+              {
+                "const": "watch",
+                "type": "string"
+              }
+            ]
+          },
+          "on": {
+            "anyOf": [
+              {
+                "const": "dispatch",
+                "type": "string"
+              },
+              {
+                "const": "context",
+                "type": "string"
+              },
+              {
+                "const": "digest",
+                "type": "string"
+              },
+              {
+                "const": "host",
+                "type": "string"
+              },
+              {
+                "const": "drop",
+                "type": "string"
+              }
+            ]
+          },
+          "agent": {
+            "type": "string"
+          },
+          "sessionKey": {
+            "type": "string"
+          },
+          "callout": {
+            "type": "object",
+            "required": [
+              "outcome",
+              "on"
+            ],
+            "properties": {
+              "outcome": {
+                "anyOf": [
+                  {
+                    "const": "answered",
+                    "type": "string"
+                  },
+                  {
+                    "const": "timeout",
+                    "type": "string"
+                  },
+                  {
+                    "const": "error",
+                    "type": "string"
+                  },
+                  {
+                    "const": "no_host",
+                    "type": "string"
+                  }
+                ]
+              },
+              "on": {
+                "anyOf": [
+                  {
+                    "const": "dispatch",
+                    "type": "string"
+                  },
+                  {
+                    "const": "context",
+                    "type": "string"
+                  },
+                  {
+                    "const": "digest",
+                    "type": "string"
+                  },
+                  {
+                    "const": "host",
+                    "type": "string"
+                  },
+                  {
+                    "const": "drop",
+                    "type": "string"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "principal": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "evidence": {
+      "anyOf": [
+        {
+          "const": "platform_signed",
+          "type": "string"
+        },
+        {
+          "const": "dkim_pass",
+          "type": "string"
+        },
+        {
+          "const": "device_only",
+          "type": "string"
+        },
+        {
+          "const": "none",
+          "type": "string"
+        }
+      ]
+    }
+  }
+}

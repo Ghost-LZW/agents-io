@@ -1,0 +1,288 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/BindingTable",
+  "type": "object",
+  "required": [
+    "version",
+    "bindings",
+    "identities"
+  ],
+  "properties": {
+    "version": {
+      "type": "string"
+    },
+    "bindings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "match",
+          "on"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "match": {
+            "type": "object",
+            "properties": {
+              "channel": {
+                "type": "string"
+              },
+              "account": {
+                "type": "string"
+              },
+              "conversation": {
+                "type": "string"
+              },
+              "conversationKind": {
+                "anyOf": [
+                  {
+                    "const": "dm",
+                    "type": "string"
+                  },
+                  {
+                    "const": "group",
+                    "type": "string"
+                  },
+                  {
+                    "const": "thread",
+                    "type": "string"
+                  },
+                  {
+                    "const": "meeting",
+                    "type": "string"
+                  },
+                  {
+                    "const": "call",
+                    "type": "string"
+                  },
+                  {
+                    "const": "mail",
+                    "type": "string"
+                  },
+                  {
+                    "const": "other",
+                    "type": "string"
+                  }
+                ]
+              },
+              "senders": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "labels": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "principal": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "const": "unknown",
+                    "type": "string"
+                  }
+                ]
+              },
+              "mentions": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "keywords": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "actionPrefix": {
+                "type": "string"
+              },
+              "includeSelf": {
+                "type": "boolean"
+              }
+            }
+          },
+          "on": {
+            "anyOf": [
+              {
+                "const": "dispatch",
+                "type": "string"
+              },
+              {
+                "const": "context",
+                "type": "string"
+              },
+              {
+                "const": "digest",
+                "type": "string"
+              },
+              {
+                "const": "host",
+                "type": "string"
+              },
+              {
+                "const": "drop",
+                "type": "string"
+              }
+            ]
+          },
+          "agent": {
+            "type": "string"
+          },
+          "session": {
+            "anyOf": [
+              {
+                "const": "main",
+                "type": "string"
+              },
+              {
+                "const": "per-conversation",
+                "type": "string"
+              },
+              {
+                "const": "per-thread",
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "key"
+                ],
+                "properties": {
+                  "key": {
+                    "type": "string"
+                  }
+                }
+              }
+            ]
+          },
+          "digest": {
+            "type": "object",
+            "required": [
+              "everyMs"
+            ],
+            "properties": {
+              "everyMs": {
+                "type": "number"
+              },
+              "maxItems": {
+                "type": "number"
+              }
+            }
+          },
+          "callout": {
+            "type": "object",
+            "properties": {
+              "timeoutMs": {
+                "type": "number"
+              },
+              "onFailure": {
+                "anyOf": [
+                  {
+                    "const": "dispatch",
+                    "type": "string"
+                  },
+                  {
+                    "const": "context",
+                    "type": "string"
+                  },
+                  {
+                    "const": "digest",
+                    "type": "string"
+                  },
+                  {
+                    "const": "host",
+                    "type": "string"
+                  },
+                  {
+                    "const": "drop",
+                    "type": "string"
+                  }
+                ]
+              }
+            }
+          },
+          "note": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "identities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "channel",
+          "channelUserId",
+          "principal",
+          "labels"
+        ],
+        "properties": {
+          "channel": {
+            "type": "string"
+          },
+          "channelUserId": {
+            "type": "string"
+          },
+          "principal": {
+            "type": "string"
+          },
+          "labels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "const": "platform_signed",
+                  "type": "string"
+                },
+                {
+                  "const": "dkim_pass",
+                  "type": "string"
+                },
+                {
+                  "const": "device_only",
+                  "type": "string"
+                },
+                {
+                  "const": "none",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "expiresAt": {
+      "type": "number"
+    },
+    "onHostDown": {
+      "anyOf": [
+        {
+          "const": "keep",
+          "type": "string"
+        },
+        {
+          "const": "suspend",
+          "type": "string"
+        }
+      ]
+    }
+  }
+}
