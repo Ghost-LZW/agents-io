@@ -69,6 +69,36 @@ importers:
         specifier: ^7.0.0
         version: 7.0.12
 
+  examples/dev-gateway:
+    dependencies:
+      '@agents-io/channel-jsonl-bridge':
+        specifier: workspace:*
+        version: link:../../channel/jsonl-bridge
+      '@agents-io/channel-lark-bot':
+        specifier: workspace:*
+        version: link:../../channel/lark-bot
+      '@agents-io/channel-mail':
+        specifier: workspace:*
+        version: link:../../channel/mail
+      '@agents-io/harness-claude-code':
+        specifier: workspace:*
+        version: link:../../harness/claude-code
+      '@agents-io/harness-codex':
+        specifier: workspace:*
+        version: link:../../harness/codex
+      '@agents-io/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
+      '@agents-io/session':
+        specifier: workspace:*
+        version: link:../../packages/session
+      '@agents-io/testkit':
+        specifier: workspace:*
+        version: link:../../packages/testkit
+      '@sinclair/typebox':
+        specifier: ^0.34.0
+        version: 0.34.52
+
   harness/claude-code:
     dependencies:
       '@agents-io/protocol':

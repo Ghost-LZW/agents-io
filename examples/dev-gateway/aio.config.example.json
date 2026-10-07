@@ -1,0 +1,36 @@
+{
+  "dataDir": "~/.agents-io/dev-gateway",
+  "harness": {
+    "use": "claude-code",
+    "claude-code": {
+      "run": { "model": "haiku" },
+      "profiles": {
+        "bypass": { "permissionMode": "bypassPermissions" },
+        "restricted": { "permissionMode": "default" }
+      }
+    },
+    "codex": {
+      "run": { "effort": "low" },
+      "profiles": {
+        "bypass": { "approvalPolicy": "never", "sandbox": "workspace-write" },
+        "restricted": { "approvalPolicy": "untrusted", "sandbox": "workspace-write" }
+      },
+      "transport": { "kind": "unix", "spawn": "own" }
+    }
+  },
+  "channels": [
+    { "type": "lark-bot", "tier": "card" },
+    {
+      "type": "bridge",
+      "command": "python3",
+      "args": ["echo_channel.py"],
+      "cwd": "../../channel/jsonl-bridge/examples",
+      "env": { "ECHO_RECORD": "/tmp/aio-echo-sent.jsonl" }
+    }
+  ],
+  "policy": {
+    "owners": [],
+    "ownerSessionKey": "main"
+  },
+  "local": {}
+}
