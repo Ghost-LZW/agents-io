@@ -238,3 +238,22 @@ e2e（`docs/E2E.md`）：加一个场景：同一模板 agent 的两个会话分
 2. **修订决定 6 的最后一条**（本提案成立的前提）。现文："工作区（工作目录与项目级配置）属于 agent 的运行配置；一个项目对应一个工作区，项目配置写在该目录里，由 harness 自行读取。" 拟改为："工作区（工作目录与项目级配置）默认属于 agent 的运行配置；部署方可在 agent 配置里声明允许按会话指定工作区的范围（`sessionParams`），宿主在范围内为会话选定工作区，选定后随会话固定。项目配置仍写在工作区目录里，由 harness 自行读取。" 不同意则本提案只能退回方案 C 或 E。
 3. launch 是否整体不可变。另一种做法是只固定 cwd 和 `CLAUDE_CONFIG_DIR` / `CODEX_HOME` 这类决定续接位置的键，其余 env（例如会轮换的令牌）允许在下一次打开 harness 时更新。本文推荐整体不可变，规则简单；需要轮换的凭据建议放在配置目录里由 harness 自己读取（例如 `apiKeyHelper`），而不是放进 env 值。
 4. 与决定 2 的关系：是否加 `callout.skipWhenPinned`（§5.6），让回调只出现在每个键的首条输入；或者只依靠 `session.prepare`，接受"不能预知键的部署每条输入一次回调"。本文推荐加。
+
+## 11. 实现说明（2026-10-07）
+
+落点：
+
+- 协议：`packages/protocol/src/host.ts`（`SessionLaunch`、`RouteCalloutAnswer.launch`、`SessionPrepare` / `SessionPrepareResult`、`HostHelloResult.features`、`Binding.callout.skipWhenPinned`、`RouteExplanation` 的 `callout.reason` / `skipped_pinned` / `matched[].launch`）、`harness.ts` 与 `wire.ts`（`HarnessOpenArgs.env`）、`client.ts`（`SessionInfo.launch`），schema 已重新生成。
+- 配置与校验：`packages/daemon/src/config.ts`（`sessionParams`，配置目录键强制配根，task agent 拒绝）、`packages/daemon/src/launch.ts`（realpath 根检查、env 键检查、Codex `unix` + env 拒绝）。
+- 持久化：`packages/daemon/src/records.ts`（`daemon_session_launch`，`pin` 在一个事务里写 agent 行与 launch 行）。
+- 路由：`packages/session/src/router.ts`（答复里的 launch 按目标会话检查，被拒走 `onFailure` 并记 `reason`；`skipWhenPinned` 用不建话题的键预判）；`ingress.ts` 把 launch 交给 `lanes`。
+- 守护进程：`packages/daemon/src/gateway.ts`（`lane(key, agent, launch)` 在已有 lane 快速路径之前判冲突；每会话适配器同时经 `harness` 与 `harnessFor` 交给 lane，每个实例一个缓存对象；Codex 带 env 的会话单独起 stdio app-server，随 lane 关闭；`session.prepare`；`topicChanged` 同步复制 launch；`sessions` 显示 cwd 与 env 键）、`host.ts`（`features: ["session.launch"]`）。
+- harness：`harness/claude-code`（`args.env` 为最上层）、`harness/codex`（`CodexHarness.open` 收到非空 env 时拒绝）、`packages/testkit/src/harness-conformance.ts`（`HarnessOpenArgs.env` 一致性检查）。
+- 文档：`docs/HOSTS.md` §2.2、§2.3、§4、§7；`docs/E2E.md` §1.4（手动场景）。
+
+与正文的差异与补充：
+
+- **"已有会话"的日志条件细化**：新话题的会话键在 lane 打开之前，日志里就会有一条 `topic.changed`（`TopicRegistry` 先写事件再调 `onChange`）。若按"日志里有任何条目"判定，首个带 launch 的话题会被误判为冲突。实现里只有 `topic.changed` 以外的事件才算。
+- **plan 选中无法执行该 launch 的实例**：适配器构造时抛错，这一轮按 lane 已有的启动失败路径记为 `input.rejected`，原因为 `start_failed: launch_unsupported: …`，不另发 notice。
+- **§8 第 11 项**（与 `inheritEnv` 叠放）等 `docs/design/harness-env` 落地后再补。
+- §8 的 e2e 场景先写成 `docs/E2E.md` §1.4 的手动场景，没有加入自动 e2e。

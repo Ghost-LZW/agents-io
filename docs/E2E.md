@@ -153,6 +153,22 @@ attach 里直接输入文字就是 queue 输入；`/steer <text>`、`/interrupt 
 - [ ] `/interrupt` 后卡片 finalize 为 `Interrupted`。
 - [ ] Ctrl-C 停 serve 再启动：之前的 session 用 `session.bound` 里的原生 id 续接（claude `--resume` / codex `thread/resume`）。
 
+### 1.4 手动：每会话 launch（决定 7，多租户）
+
+自动 e2e 还没有这个场景（脚本化通道之外还要宿主回调或 `session.prepare`、两个已登录的配置目录），按下面手动跑。单元与集成测试覆盖了校验、固定、续接与泄漏检查（`packages/daemon/test/`）。
+
+1. 准备两个租户：`/srv/t/ws/a`、`/srv/t/ws/b` 两个工作目录，各放一份内容不同的 `CLAUDE.md`（例如"你的口令是 APPLE-1" / "你的口令是 BANANA-2"）；`/srv/t/homes/a`、`/srv/t/homes/b` 两个 `CLAUDE_CONFIG_DIR`，各自登录一次（新配置目录是空的登录态，见"已知缺口"最后一条）。
+2. 配置一个模板 agent：`sessionParams: { cwdRoots: ["/srv/t/ws"], envKeys: ["CLAUDE_CONFIG_DIR"], envPathRoots: { CLAUDE_CONFIG_DIR: ["/srv/t/homes"] } }`。
+3. `aio serve`；用宿主连接（`host.hello` 带 token）确认结果的 `features` 含 `session.launch`，再对两个键 `session.prepare`：`tenant:a` → `{ cwd: "/srv/t/ws/a", env: { CLAUDE_CONFIG_DIR: "/srv/t/homes/a" } }`，`tenant:b` 同理。
+   - [ ] 两次都 `created: true`；同值再 prepare 为 `created: false`；对 `tenant:a` 换 cwd 再 prepare → `launch_conflict`。
+4. `aio attach tenant:a`、`aio attach tenant:b`，各问"你的口令是什么"。
+   - [ ] a 答 APPLE-1，b 答 BANANA-2；问 a "BANANA 开头的口令是什么" 答不出。
+   - [ ] 对话记录分别出现在 `/srv/t/homes/a/projects/…`、`/srv/t/homes/b/projects/…` 下，互不出现。
+   - [ ] `aio sessions` 显示两个会话的 cwd 和 env 键 `CLAUDE_CONFIG_DIR`，不显示值；守护进程日志、`ps` 的 argv 里也没有值。
+5. Ctrl-C 停 serve 再启动，两个会话各发一句"刚才的口令是什么"。
+   - [ ] 各自用原生 id 续接（同一 cwd 与配置目录下），答出自己的口令。
+6. （可选）在租户 a 的对话里 `/new` → 新话题仍在 `/srv/t/ws/a`、仍用 `/srv/t/homes/a`。
+
 ## Tier 3：多端 + 重启
 
 1. 默认实例是 codex 且 `transport: { kind: "unix", spawn: "own" }`（`aio serve --harness codex`；app-server 独立于网关进程运行，状态在 `~/.agents-io/codex.<实例名>`，旧 `harness` 块为 `~/.agents-io/codex`）。

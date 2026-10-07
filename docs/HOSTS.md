@@ -37,11 +37,11 @@
   "agent": "assistant",            // dispatch/context/digest 的目标 agent（命名的运行配置）
   "session": "main",               // main | per-conversation | per-thread | topic（决定 6：平铺对话的当前话题）
   "digest": { "everyMs": 3600000, "maxItems": 50 },
-  "callout": { "timeoutMs": 1500, "onFailure": "host" }   // 可选：显式开启同步回调（§2.2）
+  "callout": { "timeoutMs": 1500, "onFailure": "host", "skipWhenPinned": true }   // 可选：显式开启同步回调（§2.2）
 }
 ```
 
-- **agents**：配置里命名的运行默认值（harness 实例、model、profile、cwd、工具），不含人设。`mode: "task"` 的 agent 只能由 `run.start` 启动，任何规则指向它都在加载时报错。
+- **agents**：配置里命名的运行默认值（harness 实例、model、profile、cwd、工具），不含人设。部署方可以在 agent 上写 `sessionParams`，允许宿主按会话指定工作目录和环境变量（决定 7，§2.3）。`mode: "task"` 的 agent 只能由 `run.start` 启动，任何规则指向它都在加载时报错。
 - **来源**：本地配置，以及宿主推送的整表 `bindings.put { version, bindings, identities, expiresAt?, onHostDown: "keep" | "suspend" }`（宿主推送的默认 `suspend`）。同一输入命中多条规则时全部生效；同一 (agent, session) 取最强的动作。
 - **watch** 就是 agent 在运行时通过输出工具新增的一条规则，仍受 `Policy.watch` 约束。
 - **可解释**：每条输入记下命中的规则 id、表版本、回调结果；`aio explain <inputId>` 列出来。
@@ -55,7 +55,45 @@
 
 ### 2.2 规则级同步回调（`callout`）
 
-只在声明了 `callout` 的规则上，守护进程向宿主发 `policy { hook: "route", args: { rule, input } }`，宿主返回 `{ on, agent?, session? }` 覆盖本条规则。超时或出错按规则的 `onFailure` 处理（默认 `host`：进入入站队列）。宿主不在线时直接走 `onFailure`。
+只在声明了 `callout` 的规则上，守护进程向宿主发 `policy { hook: "route", args: { rule, input } }`，宿主返回 `{ on, agent?, session?, launch? }` 覆盖本条规则。超时或出错按规则的 `onFailure` 处理（默认 `host`：进入入站队列）。宿主不在线时直接走 `onFailure`。
+
+**`launch`（决定 7，feature `session.launch`）**：`launch: { cwd?, env? }` 作用于这条输入最终落到的会话键（无论 `session` 是 `per-conversation`、`topic` 还是 `{ key }`），让这个交互会话在自己的工作目录、带自己的子进程环境变量运行，范围由目标 agent 的 `sessionParams` 限定（§2.3）。
+
+- 只能和指向会话的 `on`（`dispatch` / `context` / `digest`）一起出现；`host`、`drop` 带 `launch` 视为答复错误。
+- launch 随会话键**固定**并持久化（先到者为准）：同一键再收到相同的 launch 通过（`same`），不同的（包括没有 launch 的已有会话收到 launch）一律 `launch_conflict`。被拒的 launch 按答复错误处理，走规则的 `onFailure`（默认 `host`，输入进入持久队列，不丢）。宿主遇到 `launch_conflict` 应**换会话键**，不要重试。
+- 判断是否相同：cwd 比较 realpath，env 比较整张表。要换目录或环境，就换一个会话键（回调答复里给新的 `{ key }`，或对新键 `session.prepare`）。
+- 宿主必须先确认 `host.hello` 结果的 `features` 含 `"session.launch"` 再依赖 launch：旧守护进程会静默忽略答复里的 `launch`，会话就落在 agent 的默认目录和环境里。
+- 话题会话继承 launch：带 launch 的对话里 `/new`、`session_rotate` 新建的话题沿用上一话题的 launch，之后各自固定；切回旧话题用旧话题自己的记录。
+- 守护进程重启、停放话题的 lane 关闭后重开，都按记录的 launch 重建，原生会话照常续接。
+
+**`callout.skipWhenPinned: true`**：规则自身的 `on` 指向会话、且它算出的会话键已有 launch 记录时，不再回调，按规则本身投递。这样回调只出现在每个键的第一条输入（相当于一次"开户"），稳态输入只走本地匹配（决定 2）。代价：键固定以后，宿主不能再逐条把这条规则的输入改判为 `host` 或 `drop`。只能用在 `on` 为 `dispatch` / `context` / `digest` 的规则上，否则加载时报错。
+
+**`aio explain`**：`matched[].callout.outcome` 多了 `skipped_pinned`；答复被判为错误时 `callout.reason` 给出原因（如 `launch_conflict`、`bad_launch`）；答复带了 launch 时 `matched[].launch` 记 `{ cwd?, envKeys, outcome }`：`outcome` 为 `applied`（新会话）、`same`（已固定为同一 launch）或拒绝码。env 只记键，从不记值。
+
+### 2.3 agent 的 `sessionParams`：宿主可以为会话选什么
+
+```jsonc
+"agents": {
+  "dev": {
+    "harness": "claude",
+    "cwd": "/srv/aio/dev-default",
+    "sessionParams": {
+      "cwdRoots": ["/srv/aio/workspaces"],                          // launch.cwd 必须在其中某个根之下
+      "envKeys": ["CLAUDE_CONFIG_DIR", "GIT_AUTHOR_NAME"],          // launch.env 只能出现这些键
+      "envPathRoots": { "CLAUDE_CONFIG_DIR": ["/srv/aio/homes"] }   // 这些键的值是路径，按 cwd 的规则限定在根内
+    }
+  }
+}
+```
+
+- **缺省拒绝**：没写 `sessionParams` 的 agent 拒绝任何 launch（`launch_not_allowed`），行为与没有这项功能时完全相同。未配置 `agents` 时合成的 `default` agent 不能用 launch；`mode: "task"` 的 agent 写 `sessionParams` 加载时报错（它们用 `run.start` 的 `cwd` / `env`）。相对路径相对于配置文件。
+- **cwd**：绝对路径、存在、是目录，取 realpath 后仍在某个 `cwdRoots`（同样取 realpath）之下，防止符号链接逃逸。
+- **env**：键必须是合法变量名且在 `envKeys` 中；`AGENTS_IO_*` 一律拒绝（守护进程自用）。列在 `envPathRoots` 里的键，值按 cwd 的同一规则校验。
+- **配置目录键强制配根**：`CLAUDE_CONFIG_DIR`、`CODEX_HOME` 列进 `envKeys` 却没有对应的 `envPathRoots`，加载配置时报错。
+- **其余路径型变量要自己配根**：把一个值是路径的变量（例如 `HOME`、`XDG_CONFIG_HOME`、`GIT_DIR`）只列进 `envKeys` 而不配 `envPathRoots`，**等于允许宿主为会话指定任意路径**。守护进程无法穷举所有路径型变量，只对已知的配置目录键强制。
+- **env 的执行**：Claude Code 的 launch env 位于最上层（覆盖实例 `env` 和 `configDir`，所以 launch 的 `CLAUDE_CONFIG_DIR` 生效）；Codex `stdio` 实例上带 env 的会话单独起一个 app-server（launch 的 `CODEX_HOME` 替换实例的 `home`），会话关闭时进程退出；Codex `unix` 实例（共享、比守护进程活得久）带 env 的 launch 直接拒绝（`launch_unsupported`），只带 cwd 可以。env 值只进子进程，存在 0600 的私有数据库里，不进事件流、`aio explain`、日志和 argv。
+- **先到者固定这个键**：任何先于 launch 投递到同一会话键、却不带 launch 的规则（例如群里的 `context` / 只记录规则，在回调规则之前命中），都会把这个键固定为"无 launch"，之后带 launch 的答复只会得到 `launch_conflict`。需要 launch 的部署，应让指向这些键的所有规则都经过回调，或者由宿主在任何输入之前对键 `session.prepare`。
+- **这不是隔离边界**：同一 OS 用户下的 harness 子进程仍可读到彼此可读的文件。需要真正隔离的部署要靠 OS sandbox 或独立用户。范围是部署方给宿主划的上限，不替代宿主自己的检查。
 
 ## 3. 身份
 
@@ -79,8 +117,13 @@
 | `inbound` | 守护进程 → 宿主 | §2.1 推送消费 |
 | `policy` | 守护进程 → 宿主 | §2.2 回调，以及 `resolve`、`outbound` 等可选的同步钩子（超时 fail closed） |
 | `input.verify` | 宿主 → 守护进程 | §3 |
+| `session.prepare` | 宿主 → 守护进程 | 为不经渠道路由打开的会话键预先登记 agent 和 launch（§2.2、§2.3） |
 
-`run.start` 可带 `overrides: { model?, effort?, profile? }`，只覆盖本次运行的 agent 默认值。每个请求的 `result.value` 都有 schema（`packages/protocol/src/host.ts` 末尾的 `HOST_RESULT_VALUES`，JSON Schema 见 `packages/protocol/schema/*Result.json`）。
+`run.start` 可带 `overrides: { model?, effort?, profile? }`，只覆盖本次运行的 agent 默认值。
+
+**能力协商**：`host.hello` 的结果带 `features: string[]`，按能力名协商而不是按版本号。目前有 `"session.launch"`：回调答复可带 `launch`、可用 `session.prepare`、规则可用 `callout.skipWhenPinned`。结果里没有某个 feature 时，宿主不得依赖它。
+
+**`session.prepare { sessionKey, agent, launch }`**：用于不经渠道路由打开的会话（宿主连接发的客户端 `input` 帧、本地 `aio input` / `aio attach`、指向该键的 watch），也可以让宿主在键可预知时（如成员入驻时建群）提前登记，规则就不必开回调。它只登记（agent 行与 launch 行在同一事务里写入），不拉起 harness；第一条输入到达时按登记建 lane。结果 `{ sessionKey, agent, launch: { cwd?, envKeys }, created }`：同一键用相同的值再 prepare 幂等（`created: false`）。错误码：`unknown_agent`、`not_interactive_agent`、`launch_not_allowed`（agent 没有 `sessionParams`）、`bad_cwd`、`bad_env`、`launch_unsupported`（Codex `unix` 实例带 env）、`launch_conflict`（键已有不同的 launch，或已是无 launch 的会话）、`agent_conflict`（键已属于另一个 agent）、`invalid_frame`（含 `run:` 前缀的键，task run 用 `run.start`）。遇到 `launch_conflict` 换键，不要重试。每个请求的 `result.value` 都有 schema（`packages/protocol/src/host.ts` 末尾的 `HOST_RESULT_VALUES`，JSON Schema 见 `packages/protocol/schema/*Result.json`）。
 
 **宿主写命令的来源标记**：守护进程为每一轮算出来源摘要（是否含 context/digest/外部/群聊输入），附在输出工具的每次调用上（`agents-io.output` 记录的 `provenance` 字段，宿主 MCP `onCall` 事件的 `provenance`），交互 session 与任务运行都是如此。harness 环境变量 `AGENTS_IO_TURN_PROVENANCE` 只有 `run.start` 的任务运行才有：子进程为这一次运行单独启动，值在启动时定下（`triggeredBy` 为 `["host:<宿主名>"]`（无宿主名时为 `host:cli`），其余标记为 `false`）；交互 session 的子进程跨多轮复用，环境变量不按轮设置，所以没有这个变量（见 CHANNELS.md §1a 的来源标记）。不拦截任何调用（决定 4）。
 
@@ -111,4 +154,5 @@ x-work-os 核心不依赖 agents-io；换成别的 IO 实现，只需换掉这�
 
 ## 7. 待定
 
-- 多宿主、版本协商、宿主重连后对运行中 run 的恢复。
+- 多宿主、宿主重连后对运行中 run 的恢复。
+- 版本协商：已改为按能力名协商（`host.hello` 结果的 `features`，§4）；`PROTOCOL_VERSION` 只在不兼容的改动时变。
