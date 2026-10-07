@@ -29,6 +29,12 @@ export function snapshotEvent(s: SessionSnapshot): SessionEvent {
   };
 }
 
+/** A snapshot as a tier shows it: item details (input, result) only on `full`, like `project`. */
+function projectSnapshot(s: SessionSnapshot, tier: Tier): SessionSnapshot {
+  if (tier === 'full') return s;
+  return { ...s, activeItems: s.activeItems.map(({ inputSummary: _i, result: _r, ...item }) => item) };
+}
+
 export interface SubscribeOptions {
   sessionKey: string;
   /**
@@ -54,9 +60,14 @@ export interface Subscription extends AsyncIterable<SessionEvent> {
   close(): void;
 }
 
+/** How many turn/request ids `Hub.locate` remembers. */
+const LOCATE_WINDOW = 10_000;
+
 /** Fan-out over a `SessionLog`. All writes to a session go through `append`. */
 export class Hub {
   private subs = new Map<string, Set<Sub>>();
+  /** `turn:<id>` / `req:<id>` → session key, from what was appended in this process. */
+  private where = new Map<string, string>();
 
   constructor(
     readonly log: SessionLog,
@@ -65,8 +76,29 @@ export class Hub {
 
   append(sessionKey: string, draft: EventDraft): SessionEvent {
     const e = this.log.append(sessionKey, draft);
+    this.index(e);
     for (const s of this.subs.get(sessionKey) ?? []) s.offer(e);
     return e;
+  }
+
+  /**
+   * The session a turn or request belongs to (a button click names only the id):
+   * turns started or adopted, and requests opened, through this hub.
+   */
+  locate(ref: { turnId: string } | { requestId: string }): string | undefined {
+    return this.where.get('turnId' in ref ? `turn:${ref.turnId}` : `req:${ref.requestId}`);
+  }
+
+  private index(e: SessionEvent): void {
+    const b = e.body;
+    const k = b.t === 'turn.started' || b.t === 'turn.adopted' ? `turn:${b.turnId}` : b.t === 'request.opened' ? `req:${b.requestId}` : undefined;
+    if (!k) return;
+    this.where.delete(k);
+    this.where.set(k, e.sessionKey);
+    for (const old of this.where.keys()) {
+      if (this.where.size <= LOCATE_WINDOW) break;
+      this.where.delete(old);
+    }
   }
 
   snapshot(sessionKey: string): SessionSnapshot {
@@ -104,7 +136,7 @@ class Sub implements Subscription {
     const head = log.head(o.sessionKey);
     if (o.fromSeq === undefined || o.fromSeq < log.floor(o.sessionKey)) {
       const snap = log.snapshot(o.sessionKey);
-      this.queue.push(snapshotEvent(snap));
+      this.queue.push(snapshotEvent(projectSnapshot(snap, this.o.tier)));
       this.cursor = snap.seq;
     } else {
       this.cursor = Math.min(o.fromSeq, head);
@@ -133,6 +165,7 @@ class Sub implements Subscription {
   }
 
   private push(e: SessionEvent): void {
+    if (this.closed) return;
     if (!isSnapshotEvent(e) && !passes(e, this.o.tier, this.o.filter, this.o.visibility)) return;
     const out = isSnapshotEvent(e) ? e : project(e, this.o.tier);
     const w = this.waiter;
@@ -146,7 +179,7 @@ class Sub implements Subscription {
     const key = this.o.sessionKey;
     if (this.cursor < this.log.floor(key)) {
       const snap = this.log.snapshot(key);
-      this.queue.push(snapshotEvent(snap));
+      this.queue.push(snapshotEvent(projectSnapshot(snap, this.o.tier)));
       this.cursor = snap.seq;
     }
     for (const e of this.log.read(key, this.cursor, this.cap)) {
@@ -158,7 +191,7 @@ class Sub implements Subscription {
 
   private next(): Promise<IteratorResult<SessionEvent>> {
     // Filtered-out batches can leave the queue empty while still behind; keep reading.
-    while (this.queue.length === 0 && this.lagging) {
+    while (this.queue.length === 0 && this.lagging && !this.closed) {
       const before = this.cursor;
       this.catchUp();
       if (this.cursor === before) break;
@@ -172,6 +205,7 @@ class Sub implements Subscription {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.lagging = false;
     this.detach();
     this.queue = [];
     const w = this.waiter;

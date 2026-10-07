@@ -444,3 +444,153 @@ describe('Lane: named harness instances', () => {
     expect(bodies(events(), 'input.rejected').at(-1)).toMatchObject({ reason: 'start_failed: no harness nope' });
   });
 });
+
+describe('Lane: robustness', () => {
+  const blocking = () =>
+    new FakeHarness(
+      (t) =>
+        new Promise((_, reject) => {
+          t.signal.addEventListener('abort', () => reject(new Error('aborted')));
+        }),
+    );
+  const guest = (text: string, id: string, who: string) => input(text, { id, principal: who, labels: ['guest'] });
+
+  it('an input that arrives before the harness reports its adoption waits for it instead of settling the turn as ambiguous', async () => {
+    const h1 = new ManualHarness();
+    const a = setup({ harness: h1 });
+    await a.lane.command({ type: 'input', sessionKey: 's1', input: input('long job', { id: 'x' }), mode: 'queue' });
+    await until(() => bodies(a.events(), 'turn.started').length === 1);
+    const turnId = h1.session!.starts[0]!.turnId;
+    a.lane.detach();
+    await h1.session!.close();
+
+    // Like Codex over a socket: the session reports the still-running turn as soon as it opens.
+    class Adopting extends ManualHarness {
+      override async open(args: Parameters<ManualHarness['open']>[0]) {
+        const s = await super.open(args);
+        s.push({ t: 'turn.adopted', turnId, nativeTurnId: 'n1', inputIds: ['x'] }, { turnId });
+        return s;
+      }
+    }
+    const h2 = new Adopting();
+    const lane2 = new Lane({ sessionKey: 's1', harness: h2, hub: a.hub, policy: policy(), thinkingHeadline: null });
+    expect(await lane2.command({ type: 'input', sessionKey: 's1', input: input('next', { id: 'y' }), mode: 'queue' })).toMatchObject({ ok: true });
+    await until(() => lane2.activeTurn()?.turnId === turnId);
+    expect(lane2.activeTurn()).toMatchObject({ owner: 'fake:alice' });
+    expect(bodies(a.events(), 'turn.completed')).toEqual([]);
+    expect(h2.session!.starts).toHaveLength(0);
+    expect(lane2.queued()).toEqual(['y']);
+    h2.session!.complete(turnId, ['x']);
+    await until(() => h2.session!.starts.length === 1);
+    expect(bodies(a.events(), 'turn.completed')).toEqual([{ t: 'turn.completed', turnId, status: 'completed' }]);
+    expect(bodies(a.events(), 'input.rejected')).toEqual([]);
+  });
+
+  it('a throwing policy.escalate after a model escalation denies the request with a notice', async () => {
+    const got: Decision[] = [];
+    const { lane, events } = setup({
+      harness: new FakeHarness(async (t) => {
+        t.emit(req('r1'));
+        got.push(await t.waitDecision('r1'));
+      }),
+      policy: policy({
+        resolve: async () => ({ kind: 'model', model: 'judge' }),
+        escalate: async () => {
+          throw new Error('escalate boom');
+        },
+      }),
+      modelReviewer: async () => ({ escalate: true }),
+    });
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('go'), mode: 'queue' });
+    await until(() => bodies(events(), 'turn.completed').length === 1);
+    expect(got[0]).toMatchObject({ kind: 'deny' });
+    expect(bodies(events(), 'request.resolved')[0]).toMatchObject({ requestId: 'r1', decision: { kind: 'deny' } });
+    expect(bodies(events(), 'notice')).toContainEqual(expect.objectContaining({ message: expect.stringContaining('escalate boom') }));
+  });
+
+  it('a throwing policy.escalate without a reviewer denies the request and keeps the harness session', async () => {
+    const got: Decision[] = [];
+    const h = new FakeHarness(async (t) => {
+      t.emit(req('r1'));
+      got.push(await t.waitDecision('r1'));
+    });
+    const { lane, events } = setup({
+      harness: h,
+      policy: policy({
+        resolve: async () => ({ kind: 'model', model: 'judge' }),
+        escalate: async () => {
+          throw new Error('escalate boom');
+        },
+      }),
+    });
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('go'), mode: 'queue' });
+    await until(() => bodies(events(), 'turn.completed').length === 1);
+    expect(got[0]).toMatchObject({ kind: 'deny' });
+    expect(bodies(events(), 'turn.completed')[0]).toMatchObject({ status: 'completed' });
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('again'), mode: 'queue' });
+    await until(() => bodies(events(), 'turn.completed').length === 2);
+    expect(h.sessions).toHaveLength(1);
+  });
+
+  it('an exception while handling one harness event is logged and consumption continues', async () => {
+    const h = new FakeHarness(async (t) => {
+      t.emit({ t: 'plan.updated', steps: [{ text: 'a', status: 'pending' }] });
+      t.emit({ t: 'text.snapshot', text: 'done', final: true }, { audience: 'answer' });
+    });
+    const { lane, hub, events } = setup({ harness: h });
+    const append = hub.append.bind(hub);
+    let thrown = false;
+    hub.append = (k, d) => {
+      if (d.body.t === 'plan.updated' && !thrown) {
+        thrown = true;
+        throw new Error('disk full');
+      }
+      return append(k, d);
+    };
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('go'), mode: 'queue' });
+    await until(() => bodies(events(), 'turn.completed').length === 1);
+    expect(bodies(events(), 'turn.completed')[0]).toMatchObject({ status: 'completed' });
+    expect(bodies(events(), 'text.snapshot')).toHaveLength(1);
+    expect(bodies(events(), 'notice')).toContainEqual(expect.objectContaining({ message: expect.stringContaining('disk full') }));
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('again'), mode: 'queue' });
+    await until(() => bodies(events(), 'turn.completed').length === 2);
+    expect(h.sessions).toHaveLength(1);
+  });
+
+  it('a request opened while idle is not cancelled by the next turn ending', async () => {
+    const h = new ManualHarness();
+    const { lane, events } = setup({ harness: h, policy: policy({ resolve: async () => ({ kind: 'human', principals: ['fake:alice'], routes: [] }) }) });
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('one', { id: 'a' }), mode: 'queue' });
+    await until(() => h.session?.starts.length === 1);
+    h.session!.complete(h.session!.starts[0]!.turnId, ['a']);
+    await until(() => bodies(events(), 'turn.completed').length === 1);
+    h.session!.push(req('idle1', { kind: 'elicitation' }));
+    await until(() => bodies(events(), 'request.opened').length === 1);
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('two', { id: 'b' }), mode: 'queue' });
+    await until(() => h.session!.starts.length === 2);
+    h.session!.complete(h.session!.starts[1]!.turnId, ['b']);
+    await until(() => bodies(events(), 'turn.completed').length === 2);
+    expect(bodies(events(), 'request.resolved')).toEqual([]);
+    expect(await lane.command({ type: 'resolve', sessionKey: 's1', requestId: 'idle1', decision: { kind: 'allow_once' }, origin: origin('fake:alice') })).toEqual({ ok: true });
+    expect(h.session!.responses).toEqual([{ requestId: 'idle1', decision: { kind: 'allow_once' } }]);
+  });
+
+  it('interrupt with cancelQueue is authorised as cancel_queue: a turn owner who is not an owner cancels only their own queued inputs', async () => {
+    const ops: string[] = [];
+    const base = policy();
+    const { lane, events } = setup({
+      harness: blocking(),
+      policy: { ...base, control: async (a) => (ops.push(a.op), base.control!(a)) },
+    });
+    await lane.command({ type: 'input', sessionKey: 's1', input: guest('busy', 'c1', 'fake:carol'), mode: 'queue' });
+    await until(() => bodies(events(), 'turn.started').length === 1);
+    await lane.command({ type: 'input', sessionKey: 's1', input: guest('dave', 'd1', 'fake:dave'), mode: 'queue' });
+    await lane.command({ type: 'input', sessionKey: 's1', input: guest('mine', 'c2', 'fake:carol'), mode: 'queue' });
+    expect(await lane.command({ type: 'interrupt', sessionKey: 's1', origin: origin('fake:carol', ['guest']), cancelQueue: true })).toEqual({ ok: true });
+    expect(ops).toEqual(['interrupt', 'cancel_queue']);
+    expect(bodies(events(), 'input.cancelled')).toEqual([{ t: 'input.cancelled', inputIds: ['c2'], reason: 'interrupt' }]);
+    await until(() => bodies(events(), 'turn.started').length === 2);
+    expect(turnsOf(events()).at(-1)).toEqual(['d1']);
+    await lane.close();
+  });
+});

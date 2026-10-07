@@ -153,6 +153,7 @@ export class Gateway {
     this.ingress = new Ingress({
       policy: this.policy,
       lanes: (key) => this.lane(key),
+      hub: this.hub,
       watches: this.watches,
       onWatchError: (err) => this.log('warn', `watch fan-out failed: ${(err as Error).message}`),
       replyCaps: (ch, account) => this.replyCaps(ch, account),

@@ -147,6 +147,8 @@ export class Lane {
   private closed = false;
   private detached = false;
   private dangling: Dangling | undefined;
+  /** The harness was opened (once) to give it a chance to adopt `dangling` before a new turn settles it. */
+  private adoptionChecked = false;
 
   constructor(private readonly o: LaneOptions) {
     this.sessionKey = o.sessionKey;
@@ -388,15 +390,21 @@ export class Lane {
   private async interrupt(origin: Origin, turnId: string | undefined, cancelQueue: boolean): Promise<CommandResult> {
     const t = this.turn;
     if (turnId && t?.turnId !== turnId) return { ok: false, reason: 'stale_turn' };
-    const op = t ? 'interrupt' : 'cancel_queue';
     if (!t && !cancelQueue) return { ok: false, reason: 'no_active_turn' };
-    if ((await this.policy.control({ sessionKey: this.sessionKey, op, origin, ...(t ? { turn: this.context() } : {}) })) !== 'allow') {
-      return { ok: false, reason: 'forbidden' };
-    }
-    if (cancelQueue && this.queue.length) {
-      const ids = this.queue.map((q) => q.input.inputId);
-      this.queue = [];
-      this.emit({ body: { t: 'input.cancelled', inputIds: ids, reason: 'interrupt' } });
+    const allowed = async (op: 'interrupt' | 'cancel_queue', turn?: TurnContext) =>
+      (await this.policy.control({ sessionKey: this.sessionKey, op, origin, ...(turn ? { turn } : {}) })) === 'allow';
+    if (t && !(await allowed('interrupt', this.context()))) return { ok: false, reason: 'forbidden' };
+    if (cancelQueue) {
+      // Its own op: owning the running turn says nothing about other principals' queued inputs.
+      // Without it, a caller still cancels the inputs it queued itself.
+      const me = origin.principal?.id;
+      const all = await allowed('cancel_queue');
+      const cancel = all ? this.queue : this.queue.filter((q) => me !== undefined && principalId(q.input) === me);
+      if (!t && !all && cancel.length === 0) return { ok: false, reason: 'forbidden' };
+      if (cancel.length) {
+        this.queue = this.queue.filter((q) => !cancel.includes(q));
+        this.emit({ body: { t: 'input.cancelled', inputIds: cancel.map((q) => q.input.inputId), reason: 'interrupt' } });
+      }
     }
     if (t) await this.interruptTurn(t);
     this.notifyIdle();
@@ -464,8 +472,26 @@ export class Lane {
     });
   }
 
+  /**
+   * Before settling a turn left open by an earlier host, open the harness and let
+   * the events it queued on open (a `turn.adopted`) run first: they are behind this
+   * task in the chain. Returns true when the pump was deferred.
+   */
+  private async awaitAdoption(): Promise<boolean> {
+    if (!this.dangling || this.adoptionChecked) return false;
+    this.adoptionChecked = true;
+    try {
+      await this.ensureSession(this.lastRun ?? (await this.policy.plan({ sessionKey: this.sessionKey, inputs: [] })));
+    } catch {
+      return false; // the turn's own start reports the failure
+    }
+    setTimeout(() => void this.serial(() => this.pump()).catch(() => undefined), 0);
+    return true;
+  }
+
   /** Start the next turn if idle. Loops past batches whose start fails. */
   private async pump(): Promise<void> {
+    if (!this.turn && this.queue.length && !this.closed && (await this.awaitAdoption())) return;
     if (!this.turn && this.queue.length && !this.closed) this.settleDangling();
     while (!this.turn && this.queue.length && !this.closed) {
       const batch = this.takeBatch();
@@ -514,15 +540,24 @@ export class Lane {
     try {
       for await (const e of s.events) {
         if (gen !== this.generation || this.detached) continue; // late event from an older binding
-        this.o.onHarnessEvent?.(e);
-        // Re-checked when it runs: a switch to another harness may have started a new generation meanwhile.
-        await this.serial(async () => (gen === this.generation ? this.onHarnessEvent(e, gen) : undefined));
+        try {
+          this.o.onHarnessEvent?.(e);
+          // Re-checked when it runs: a switch to another harness may have started a new generation meanwhile.
+          await this.serial(async () => (gen === this.generation ? this.onHarnessEvent(e, gen) : undefined));
+        } catch (err) {
+          // One bad event (a throwing hook, a failed log write) must not end the stream: record it and go on.
+          await this.serial(async () => {
+            this.emit({ ...(e.turnId ? { turnId: e.turnId } : {}), level: 'detail', body: { t: 'notice', code: 'other', message: `handling harness event ${e.body.t} failed: ${errMsg(err)}` } });
+          }).catch(() => undefined);
+        }
       }
     } catch (err) {
       if (this.detached) return;
       await this.serial(async () => {
         this.emit({ level: 'detail', body: { t: 'notice', code: 'runtime_restart', message: `harness stream failed: ${errMsg(err)}` } });
-      });
+      }).catch(() => undefined);
+      // The lane gives up on this session: close it rather than leave it running unowned.
+      await s.close('harness stream failed').catch(() => undefined);
     }
     if (this.detached) return; // the turn keeps running natively; the next host adopts it
     await this.serial(() => this.onHarnessClosed(s, gen));
@@ -614,7 +649,7 @@ export class Lane {
 
   private async finishTurn(t: ActiveTurn, b: BodyOf<'turn.completed'>, e: HarnessEvent | undefined, gen: number): Promise<void> {
     for (const [id, p] of [...this.requests]) {
-      if (p.turnId !== undefined && p.turnId !== t.turnId) continue;
+      if (p.turnId !== t.turnId) continue;
       this.dropPending(id, p);
       this.resolved.add(id);
       this.emit({ turnId: t.turnId, audience: p.audience, body: { t: 'request.resolved', requestId: id, decision: null, by: 'runtime_cancelled' } });
@@ -660,9 +695,10 @@ export class Lane {
     } catch (err) {
       resolver = { kind: 'auto', decision: { kind: 'deny', message: `policy error: ${errMsg(err)}` } };
     }
-    if (resolver.kind === 'model' && !this.o.modelReviewer) resolver = await this.policy.escalate(b, ctx);
+    if (resolver.kind === 'model' && !this.o.modelReviewer) resolver = await this.escalate(b, ctx);
 
-    const p: PendingRequest = { body: b, resolver, turnId: e.turnId, audience: audienceFor(resolver, e.audience) };
+    // A request without a turn id opened during a turn belongs to it; one opened while idle to no turn.
+    const p: PendingRequest = { body: b, resolver, turnId: e.turnId ?? this.turn?.turnId, audience: audienceFor(resolver, e.audience) };
     this.requests.set(b.requestId, p);
     this.resolved.delete(b.requestId);
     this.emitHarness(e, gen, { body: { ...b, resolver }, audience: p.audience });
@@ -701,7 +737,7 @@ export class Lane {
           if (this.requests.get(id) !== p) return; // already settled (timeout, harness, turn end)
           if ('escalate' in out) {
             if (p.timer) clearTimeout(p.timer);
-            const next = await this.policy.escalate(p.body, ctx);
+            const next = await this.escalate(p.body, ctx);
             const q: PendingRequest = { body: p.body, resolver: next, turnId: p.turnId, audience: audienceFor(next, 'approval') };
             this.requests.set(id, q);
             // Re-open with the escalated resolver; subscribers upsert by requestId.
@@ -715,7 +751,19 @@ export class Lane {
           }
           await this.settle(id, out, { kind: 'model', id: r.model });
         }),
-      );
+      )
+      .catch(() => undefined); // failures are recorded inside; never an unhandled rejection
+  }
+
+  /** `policy.escalate`, guarded like `resolve`: a throwing hook denies the request (with a notice). */
+  private async escalate(b: BodyOf<'request.opened'>, ctx: TurnContext): Promise<Resolver> {
+    try {
+      return await this.policy.escalate(b, ctx);
+    } catch (err) {
+      const message = `policy error: ${errMsg(err)}`;
+      this.emit({ ...(ctx.turnId ? { turnId: ctx.turnId } : {}), level: 'detail', body: { t: 'notice', code: 'other', message: `escalate failed for ${b.requestId}: ${errMsg(err)}` } });
+      return { kind: 'auto', decision: { kind: 'deny', message } };
+    }
   }
 
   private arm(id: string, p: PendingRequest): void {

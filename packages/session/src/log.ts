@@ -75,12 +75,20 @@ export function emptySnapshot(sessionKey: string): SessionSnapshot {
   };
 }
 
-/** Folds one event into a snapshot in place. Safe for durable and ephemeral events. */
+/** Content a snapshot shows; only `participants` events add it (approvals: anything not `internal`). */
+const SHOWN: ReadonlySet<string> = new Set(['text.delta', 'text.snapshot', 'item.started', 'plan.updated', 'headline', 'request.opened']);
+
+/**
+ * Folds one event into a snapshot in place. Safe for durable and ephemeral events.
+ * Every late joiner gets the same snapshot, so content from `operators`/`internal`
+ * events is left out (lifecycle and removals still apply); replay from a seq for those.
+ */
 export function foldSnapshot(s: SessionSnapshot, e: SessionEvent): void {
   if (!isEphemeral(e)) s.seq = e.seq;
   if (e.harness) s.harness = e.harness;
   if (e.generation) s.generation = e.generation;
   const b = e.body;
+  if (SHOWN.has(b.t) && e.visibility !== 'participants' && !(b.t === 'request.opened' && e.visibility !== 'internal')) return;
   const drop = (ids: string[]) => (s.queued = s.queued.filter((q) => !ids.includes(q)));
   switch (b.t) {
     case 'session.state':

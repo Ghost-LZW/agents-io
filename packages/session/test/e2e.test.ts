@@ -142,4 +142,94 @@ describe('renderTurn', () => {
     expect(renderTurn(v, 'final')).toEqual({ text: 'partial' });
     expect(renderTurn({ ...v, text: 'x'.repeat(50) }, 'card', { caps: { buttons: true, text: { maxChars: 10, markdown: 'none' } } }).text).toHaveLength(10);
   });
+
+  it('final tier: a turn that ends without text still says how it ended', () => {
+    const v = newTurnView('t');
+    v.status = 'failed';
+    expect(renderTurn(v, 'final')).toEqual({ text: 'Failed' });
+    v.status = 'interrupted';
+    expect(renderTurn(v, 'final').text).toBe('Interrupted');
+  });
+});
+
+describe('Compositor', () => {
+  const R = { channel: 'fake', account: 'default', conversationId: 'c1' };
+  const ev = { level: 'primary' as const, audience: 'status' as const, durability: 'durable' as const, turnId: 't1' };
+  const opened = {
+    t: 'request.opened' as const,
+    requestId: 'r1',
+    kind: 'tool_approval' as const,
+    title: 'rm -rf',
+    risk: {},
+    allowedDecisions: ['allow_once' as const, 'deny' as const],
+    allowAlways: false,
+    defaultDeny: true,
+    resolver: { kind: 'human' as const, principals: ['fake:alice'], routes: [] },
+  };
+  type Draft = Parameters<Hub['append']>[1];
+
+  function rig(o: { log?: MemorySessionLog; throttleMs?: number; channel?: FakeChannel } = {}) {
+    const log = o.log ?? new MemorySessionLog();
+    const hub = new Hub(log);
+    const channel = o.channel ?? new FakeChannel('fake', defaultChannelCaps);
+    const errors: unknown[] = [];
+    const c = new Compositor({
+      hub,
+      sessionKey: SESSION,
+      adapter: channel,
+      outbox: new Outbox({ hub, sleep: async () => {} }),
+      throttleMs: o.throttleMs ?? 5,
+      interruptButton: true,
+      onError: (e) => errors.push(e),
+    });
+    c.start();
+    cleanups.push(() => c.stop());
+    const append = (body: Draft['body'], extra: Partial<Draft> = {}) => hub.append(SESSION, { ts: Date.now(), ...ev, ...extra, body });
+    return { log, hub, channel, c, errors, append };
+  }
+  const hasAllow = (ch: FakeChannel) => !!ch.sent[0]?.edits.at(-1)?.actions?.some((a) => a.label === 'Allow');
+
+  it('retries a failed streaming edit, so the approval buttons still appear', async () => {
+    const w = rig();
+    const edit = w.channel.edit.bind(w.channel);
+    let fail = 1;
+    w.channel.edit = async (...a: Parameters<typeof edit>) => {
+      if (fail-- > 0) throw new Error('429 rate limited');
+      return edit(...a);
+    };
+    w.append({ t: 'turn.started', turnId: 't1', inputIds: [], replyRoute: R });
+    await until(() => w.channel.sent.length === 1);
+    w.append(opened, { audience: 'approval' });
+    await until(() => hasAllow(w.channel), 3000);
+    expect(w.errors).toHaveLength(1);
+  });
+
+  it('shows an approval at once even when a throttled edit is already scheduled', async () => {
+    const w = rig({ throttleMs: 1000 });
+    w.append({ t: 'turn.started', turnId: 't1', inputIds: [], replyRoute: R });
+    await until(() => w.channel.sent.length === 1);
+    w.append({ t: 'text.snapshot', text: 'one', final: false }, { audience: 'answer' }); // within the interval: an edit ~1 s out
+    await new Promise((r) => setTimeout(r, 20));
+    const at = Date.now();
+    w.append(opened, { audience: 'approval' });
+    await until(() => hasAllow(w.channel), 3000);
+    expect(Date.now() - at).toBeLessThan(500);
+  });
+
+  it('finalizes the card of a turn that was running when the previous host stopped', async () => {
+    const log = new MemorySessionLog();
+    const channel = new FakeChannel('fake', defaultChannelCaps);
+    const first = rig({ log, channel });
+    first.append({ t: 'turn.started', turnId: 't1', inputIds: [], replyRoute: R });
+    await until(() => bodies(log.read(SESSION, 0), 'render.anchor').length === 1);
+    await first.c.stop(); // the host goes away mid-turn
+
+    const second = rig({ log, channel });
+    second.append({ t: 'turn.completed', turnId: 't1', status: 'ambiguous', error: { code: 'host_restarted', retryable: false } });
+    await until(() => channel.sent[0]!.finalized);
+    expect(channel.sent).toHaveLength(1);
+    const last = channel.sent[0]!.edits.at(-1)!;
+    expect(last.sections).toContainEqual({ kind: 'status', text: 'Outcome unknown' });
+    expect(last.actions).toBeUndefined();
+  });
 });

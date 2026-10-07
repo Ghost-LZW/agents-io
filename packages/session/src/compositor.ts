@@ -267,7 +267,8 @@ export function renderTurn(v: TurnView, tier: Tier, o: RenderOptions = {}): Rend
     }
     case 'final': {
       if (!done && asks.length) return { text: clip(asks.join('\n')), ...(actions.length ? { actions } : {}) };
-      return { text: clip(v.finalText ?? v.text) };
+      // A turn that ended without text (failed, interrupted…) still says how it ended.
+      return { text: clip(v.finalText || v.text || (done ? (STATUS_LABEL[v.status!] ?? '') : '')) };
     }
     case 'card':
     case 'full': {
@@ -317,7 +318,12 @@ interface RouteState {
   chain: Promise<void>;
   sentRequests: Set<string>;
   finished: boolean;
+  /** Consecutive failed edits; the next retry backs off by this. */
+  editFailures: number;
 }
+
+/** Longest wait between retries of a failed streaming edit. */
+const MAX_EDIT_BACKOFF_MS = 30_000;
 
 /**
  * Renders the turns of one session onto one channel adapter: for each turn whose
@@ -330,11 +336,13 @@ export class Compositor {
   private sub: Subscription | undefined;
   private routes = new Map<string, RouteState>();
   private loop: Promise<void> | undefined;
+  private stopped = false;
 
   constructor(private readonly o: CompositorOptions) {}
 
   start(): void {
     if (this.sub) return;
+    this.restore();
     this.sub = this.o.hub.subscribe({ sessionKey: this.o.sessionKey, fromSeq: this.o.hub.log.head(this.o.sessionKey), tier: 'full' });
     const sub = this.sub;
     this.loop = (async () => {
@@ -343,6 +351,7 @@ export class Compositor {
   }
 
   async stop(): Promise<void> {
+    this.stopped = true;
     this.sub?.close();
     await this.loop;
     for (const r of this.routes.values()) if (r.timer) clearTimeout(r.timer);
@@ -378,7 +387,28 @@ export class Compositor {
     }
   }
 
-  private track(turnId: string, route: ReplyRoute, startedAt: number): void {
+  /**
+   * A turn the log shows still open was started by an earlier host process: pick up
+   * its routes (and, from `render.anchor`, the message already sent) so its end, an
+   * ambiguous settle or an adopted turn completing, finalizes the existing card.
+   */
+  private restore(): void {
+    const turn = this.o.hub.snapshot(this.o.sessionKey).turn;
+    if (!turn) return;
+    const routes = [turn.replyRoute, ...turn.deliveries].filter((r): r is ReplyRoute => !!r && r.channel === this.o.adapter.id);
+    if (!routes.length) return;
+    const anchors = new Map<string, string>();
+    for (const e of this.o.hub.log.read(this.o.sessionKey, 0)) {
+      if (e.body.t === 'render.anchor' && e.body.turnId === turn.turnId) anchors.set(routeKey(e.body.route), e.body.providerMessageId);
+    }
+    for (const route of routes) {
+      const messageId = anchors.get(routeKey(route));
+      this.track(turn.turnId, route, Date.now(), messageId ?? null);
+    }
+  }
+
+  /** `restored`: the turn's message from an earlier process (null: none was sent); undefined for a new turn. */
+  private track(turnId: string, route: ReplyRoute, startedAt: number, restored?: string | null): void {
     if (route.channel !== this.o.adapter.id) return;
     const k = this.key(turnId, route);
     if (this.routes.has(k)) return;
@@ -395,10 +425,12 @@ export class Compositor {
       chain: Promise.resolve(),
       sentRequests: new Set(),
       finished: false,
+      editFailures: 0,
+      ...(restored ? { messageId: restored } : {}),
     };
     this.routes.set(k, r);
     // Send right away so the end is never blank while the harness thinks.
-    if (r.streaming) this.enqueue(r, () => this.sendCard(r));
+    if (r.streaming && restored === undefined) this.enqueue(r, () => this.sendCard(r));
   }
 
   private interval(r: RouteState): number {
@@ -463,10 +495,15 @@ export class Compositor {
       }
       return;
     }
-    if (r.timer) return; // an edit is already scheduled and will pick up this change
+    // Approvals skip the throttle, even past an edit already scheduled: they are what a person is waiting to act on.
+    if (r.timer && !openedRequest) return; // an edit is already scheduled and will pick up this change
     const wait = Math.max(0, r.lastEditAt + this.interval(r) - Date.now());
-    // Approvals skip the throttle: they are what a person is waiting to act on.
-    const delay = openedRequest ? 0 : wait;
+    this.schedule(r, openedRequest ? 0 : wait);
+  }
+
+  private schedule(r: RouteState, delay: number): void {
+    if (r.timer) clearTimeout(r.timer);
+    if (this.stopped) return;
     r.timer = setTimeout(() => {
       r.timer = undefined;
       this.enqueue(r, () => this.edit(r));
@@ -478,14 +515,24 @@ export class Compositor {
     const msg = this.render(r);
     const json = JSON.stringify(msg);
     if (json === r.lastRender) return;
-    r.lastRender = json;
     const n = ++r.editSeq;
     r.lastEditAt = Date.now();
-    await this.o.adapter.edit(r.route, r.messageId, msg, {
-      operationId: `${this.base(r)}:edit:${n}`,
-      sequence: n,
-      ...(this.o.as !== undefined ? { as: this.o.as } : {}),
-    });
+    try {
+      await this.o.adapter.edit(r.route, r.messageId, msg, {
+        operationId: `${this.base(r)}:edit:${n}`,
+        sequence: n,
+        ...(this.o.as !== undefined ? { as: this.o.as } : {}),
+      });
+    } catch (err) {
+      // Edits bypass the outbox: retry here (with backoff), or e.g. approval buttons may never show.
+      this.o.onError?.(err);
+      r.editFailures++;
+      if (!r.finished && !r.timer) this.schedule(r, Math.min(this.interval(r) * 2 ** (r.editFailures - 1), MAX_EDIT_BACKOFF_MS));
+      return;
+    }
+    // Only a delivered render counts as sent, so a failed one is never skipped as unchanged.
+    r.lastRender = json;
+    r.editFailures = 0;
   }
 
   private finish(r: RouteState): void {
