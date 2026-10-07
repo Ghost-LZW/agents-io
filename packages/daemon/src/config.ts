@@ -2,8 +2,8 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { Type, type Static } from '@sinclair/typebox';
-import { Tier, WatchDraft, errors, type Principal, type RunSpec, type WatchSource } from '@agents-io/protocol';
-import { DEFAULT_BLOB_MAX_BYTES } from '@agents-io/session';
+import { Binding, IdentityEntry, Tier, WatchDraft, errors, type BindingTable, type Principal, type RunSpec, type WatchSource } from '@agents-io/protocol';
+import { DEFAULT_BLOB_MAX_BYTES, Router, RouterError, checkIdentities, ownerIdentities, ownersTable, type AgentSpec } from '@agents-io/session';
 import { loadEnvFile } from '@agents-io/testkit';
 import type { CodexTransportOption } from '@agents-io/harness-codex';
 
@@ -17,6 +17,13 @@ import type { CodexTransportOption } from '@agents-io/harness-codex';
  * child's environment and the setting names the variable (`${NAME}`,
  * `settings.env`, codex `env_http_headers` / `bearer_token_env_var` /
  * `env_key` / `env_vars`); where that is impossible "env:" is refused.
+ *
+ * Agents (`agents: { <name>: { harness, model?, effort?, profile?, cwd?, mode?,
+ * tools?, instructionsFile? } }`) are named run configurations over the
+ * instances; `bindings` (+ `identities`) is the local binding table
+ * (docs/HOSTS.md §2). Without `bindings` the owners-based default table routes
+ * to the default agent. Without `agents` there is one agent, `default`, on the
+ * default instance (as before).
  *
  * Harnesses are NAMED INSTANCES (`harnesses: { <name>: { use, … } }`): each has
  * its own process environment and config dirs, `RunSpec.harness` is the
@@ -144,9 +151,33 @@ const ChannelEntry = Type.Union([
 ]);
 export type ChannelEntry = Static<typeof ChannelEntry>;
 
+const AgentEntry = Type.Object(
+  {
+    /** Harness instance (a name from `harnesses`). */
+    harness: Type.String(),
+    /** Over the instance's `run.model`. */
+    model: Type.Optional(Type.String()),
+    effort: Type.Optional(Type.String()),
+    /**
+     * Permission profile of every turn. Interactive default: the policy's (`bypass` when only owners
+     * triggered the turn, else `restricted`); task default `restricted`.
+     */
+    profile: Type.Optional(Type.String()),
+    /** Working directory (over the instance's and the top-level `cwd`); a run may name its own. */
+    cwd: Type.Optional(Type.String()),
+    /** `task`: only `run.start` / `aio run` runs it; no binding may target it. Default `interactive`. */
+    mode: Type.Optional(Type.Union([Type.Literal('interactive'), Type.Literal('task')])),
+    /** Mount the host MCP output tools (default: top-level `outputTools`). */
+    tools: Type.Optional(Type.Boolean()),
+    /** Extra system instructions read from this file (Claude: appended to the preset prompt; Codex: developer instructions). */
+    instructionsFile: Type.Optional(Type.String()),
+  },
+  Closed,
+);
+
 export const ConfigFile = Type.Object(
   {
-    /** State directory (default ~/.agents-io/dev-gateway). Relative paths are relative to the config file. */
+    /** State directory (default ~/.agents-io/aio). Relative paths are relative to the config file. */
     dataDir: Type.Optional(Type.String()),
     /** SQLite session log (default <dataDir>/log.sqlite; ":memory:" for none). */
     logPath: Type.Optional(Type.String()),
@@ -175,6 +206,14 @@ export const ConfigFile = Type.Object(
         Closed,
       ),
     ),
+    /** Named run configurations (agents); see AgentEntry. */
+    agents: Type.Optional(Type.Record(Type.String(), AgentEntry)),
+    /** Agent of the owners default table and of rules that name none (default: the first interactive agent). */
+    defaultAgent: Type.Optional(Type.String()),
+    /** The local binding table (docs/HOSTS.md §2). Without it the owners-based default table applies. */
+    bindings: Type.Optional(Type.Array(Binding)),
+    /** Identity map entries (channel identity → principal + labels), next to the ones `policy.owners` makes. */
+    identities: Type.Optional(Type.Array(IdentityEntry)),
     channels: Type.Optional(Type.Array(ChannelEntry)),
     /**
      * Mount the host MCP output tools (send_file, ask_choice, mention, reply_to,
@@ -277,6 +316,24 @@ export interface CodexLaunch {
 
 export type HarnessInstance = InstanceBase & ({ kind: 'claude-code'; claude: ClaudeLaunch } | { kind: 'codex'; codex: CodexLaunch });
 
+/** A named run configuration. */
+export interface AgentConfig {
+  name: string;
+  /** Harness instance name. */
+  harness: string;
+  model?: string;
+  effort?: string;
+  profile?: string;
+  cwd?: string;
+  mode: 'interactive' | 'task';
+  /** Host MCP output tools mounted. */
+  tools: boolean;
+  /** Contents of `instructionsFile`. */
+  instructions?: string;
+  /** From the config file's `agents` (false: the synthesized `default` agent of a config without agents). */
+  configured: boolean;
+}
+
 export interface Config {
   dataDir: string;
   logPath: string;
@@ -288,6 +345,14 @@ export interface Config {
   harnesses: Record<string, HarnessInstance>;
   /** The instance the default policy plans. */
   defaultHarness: string;
+  /** Named agents (without `agents` in the file: one, `default`, on the default instance). */
+  agents: Record<string, AgentConfig>;
+  /** Agent of the default table and of rules naming none; undefined when there is no interactive agent. */
+  defaultAgent: string | undefined;
+  /** The local binding table from `bindings`; undefined: the owners default table (`ownersTable`). */
+  table?: BindingTable;
+  /** `identities` from the config (next to the owners' entries; they win for the same channel identity). */
+  identities: IdentityEntry[];
   channels: ResolvedChannel[];
   policy: {
     owners: string[];
@@ -397,11 +462,17 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     return isAbsolute(home) || home === ':memory:' ? home : resolve(ctx.baseDir, home);
   };
 
-  const dataDir = path(c.dataDir ?? join(homedir(), '.agents-io', 'dev-gateway'));
+  const dataDir = path(c.dataDir ?? join(homedir(), '.agents-io', 'aio'));
   const { harnesses, defaultHarness } = resolveHarnesses(c, ctx, path);
 
   const owners = [...(c.policy?.owners ?? []), ...(env.AGENTS_IO_OWNERS ?? '').split(',').map((s) => s.trim()).filter(Boolean)];
   const ownerSessionKey = c.policy?.ownerSessionKey;
+  const outputTools = c.outputTools ?? true;
+  const { agents, defaultAgent } = resolveAgents(c, harnesses, defaultHarness, outputTools, path);
+  const identities = c.identities ?? [];
+  const localSession = c.local?.session ?? ownerSessionKey ?? 'local:main';
+  const table: BindingTable | undefined = c.bindings ? { version: 'config', bindings: c.bindings, identities: [] } : undefined;
+  checkTable({ agents, defaultAgent, owners, identities, table, ownerSessionKey, localSession });
 
   return {
     dataDir,
@@ -411,8 +482,12 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     cwd: path(c.cwd ?? ctx.cwd ?? process.cwd()),
     harnesses,
     defaultHarness,
+    agents,
+    defaultAgent,
+    ...(table ? { table } : {}),
+    identities,
     channels: ctx.channels === false ? [] : (c.channels ?? []).map((ch) => resolveChannel(ch, env, path)),
-    outputTools: c.outputTools ?? true,
+    outputTools,
     policy: {
       owners,
       selfAccounts: c.policy?.selfAccounts ?? [],
@@ -424,9 +499,108 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     watches: c.watches ?? [],
     local: {
       principal: { id: c.local?.principal ?? owners[0] ?? 'local:owner', labels: c.local?.labels ?? ['owner'] },
-      session: c.local?.session ?? ownerSessionKey ?? 'local:main',
+      session: localSession,
     },
   };
+}
+
+/** The synthesized agent of a config without `agents`: the default instance, bare route-key sessions. */
+export const DEFAULT_AGENT = 'default';
+
+function resolveAgents(
+  c: ConfigFile,
+  harnesses: Record<string, HarnessInstance>,
+  defaultHarness: string,
+  outputTools: boolean,
+  path: (p: string) => string,
+): { agents: Record<string, AgentConfig>; defaultAgent: string | undefined } {
+  if (!c.agents) {
+    if (c.defaultAgent !== undefined && c.defaultAgent !== DEFAULT_AGENT) fail('`defaultAgent` needs `agents`');
+    return { agents: { [DEFAULT_AGENT]: { name: DEFAULT_AGENT, harness: defaultHarness, mode: 'interactive', tools: outputTools, configured: false } }, defaultAgent: DEFAULT_AGENT };
+  }
+  const agents: Record<string, AgentConfig> = {};
+  for (const [name, a] of Object.entries(c.agents)) {
+    const where = `agents.${name}`;
+    if (!INSTANCE_NAME.test(name)) fail(`${where}: agent names are letters, digits, '.', '_' and '-' (at most 64)`);
+    if (!harnesses[a.harness]) fail(`${where}.harness: unknown harness instance ${JSON.stringify(a.harness)} (configured: ${Object.keys(harnesses).join(', ')})`);
+    let instructions: string | undefined;
+    if (a.instructionsFile !== undefined) {
+      const file = path(a.instructionsFile);
+      try {
+        instructions = readFileSync(file, 'utf8');
+      } catch (e) {
+        fail(`${where}.instructionsFile: cannot read ${file}: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`);
+      }
+    }
+    agents[name] = {
+      name,
+      harness: a.harness,
+      ...(a.model !== undefined ? { model: a.model } : {}),
+      ...(a.effort !== undefined ? { effort: a.effort } : {}),
+      ...(a.profile !== undefined ? { profile: a.profile } : {}),
+      ...(a.cwd !== undefined ? { cwd: path(a.cwd) } : {}),
+      mode: a.mode ?? 'interactive',
+      tools: a.tools ?? outputTools,
+      ...(instructions !== undefined ? { instructions } : {}),
+      configured: true,
+    };
+  }
+  if (c.defaultAgent !== undefined) {
+    const d = agents[c.defaultAgent];
+    if (!d) fail(`defaultAgent ${JSON.stringify(c.defaultAgent)} is not one of the agents (${Object.keys(agents).join(', ')})`);
+    if (d.mode === 'task') fail(`defaultAgent ${JSON.stringify(c.defaultAgent)} is a task agent; task agents only run through run.start`);
+  }
+  return { agents, defaultAgent: c.defaultAgent ?? Object.values(agents).find((a) => a.mode === 'interactive')?.name };
+}
+
+/** Router view of an agent: the default agent keeps bare route-key sessions and the local session as `main`. */
+export function agentSpec(a: AgentConfig, c: Pick<Config, 'defaultAgent' | 'local'>): AgentSpec {
+  return a.name === c.defaultAgent ? { name: a.name, mode: a.mode, mainSession: c.local.session, sessionPrefix: '' } : { name: a.name, mode: a.mode };
+}
+
+/**
+ * The local table routing uses: `bindings` when given, else the owners default
+ * table for the default agent; identities are the owners' entries plus the
+ * config's (which win for the same channel identity).
+ */
+export function configTable(c: Pick<Config, 'defaultAgent' | 'identities' | 'table' | 'policy'>): BindingTable | undefined {
+  const extra = new Set(c.identities.map((e) => `${e.channel}:${e.channelUserId}`));
+  const identities = [...ownerIdentities(c.policy.owners).filter((e) => !extra.has(`${e.channel}:${e.channelUserId}`)), ...c.identities];
+  if (c.table) return { ...c.table, identities };
+  if (c.defaultAgent === undefined) return identities.length ? { version: 'config', bindings: [], identities } : undefined;
+  return { ...ownersTable({ owners: [], agent: c.defaultAgent, ...(c.policy.ownerSessionKey ? { ownerSessionKey: c.policy.ownerSessionKey } : {}) }), identities };
+}
+
+/** Check the table at load: rule targets exist and are interactive (task agents can not be targets), digests have periods, no identity conflicts. */
+function checkTable(o: {
+  agents: Record<string, AgentConfig>;
+  defaultAgent: string | undefined;
+  owners: string[];
+  identities: IdentityEntry[];
+  table: BindingTable | undefined;
+  ownerSessionKey: string | undefined;
+  localSession: string;
+}): void {
+  let table: BindingTable | undefined;
+  try {
+    checkIdentities(o.identities);
+    table = configTable({
+      defaultAgent: o.defaultAgent,
+      identities: o.identities,
+      ...(o.table ? { table: o.table } : {}),
+      policy: { owners: o.owners, ...(o.ownerSessionKey ? { ownerSessionKey: o.ownerSessionKey } : {}) } as Config['policy'],
+    });
+  } catch (e) {
+    fail(`identities: ${(e as Error).message}`);
+  }
+  if (!table) return;
+  const at = { defaultAgent: o.defaultAgent, local: { principal: { id: '', labels: [] }, session: o.localSession } };
+  try {
+    new Router({ agents: Object.values(o.agents).map((a) => agentSpec(a, at)), ...(o.defaultAgent ? { defaultAgent: o.defaultAgent } : {}), config: table }).close();
+  } catch (e) {
+    if (e instanceof RouterError) fail(`bindings: ${e.message}`);
+    throw e;
+  }
 }
 
 /** The instance the default policy plans. */

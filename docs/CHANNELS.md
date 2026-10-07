@@ -364,6 +364,5 @@ aio-dev watch remove team-digest
 | 邮件审批没有链接 | 邮件端无法完成审批 |
 | 网关重启时的思维链气泡 | 重启前没结束的气泡会一直转圈 |
 | 监听投递是"至多一次" | 记下"已投递"之后、写进目标 session 之前进程崩溃，这条就丢了；digest 则相反，崩溃时可能重复发一次（同一个输入 id） |
-| dev-gateway 没有宿主入站队列 | `HostQueue` 已在 `packages/session` 里，但 dev-gateway 没接宿主：命中 `on: "host"` 的输入只记日志。守护进程接上后才会进队列 |
 | 两个部署互相监听 | 对方 agent 的消息不算"自己的回流"，两边都开 trigger 时可能来回触发；需要宿主在 `Policy.triage` 里处理 |
 | agent 建监听的身份是 session 级 | `createdBy` 是 `session:<key>`：同一 session 换了 harness 实例也能删自己建的监听；宿主想按 run 区分要自己改 `agentOrigin` |

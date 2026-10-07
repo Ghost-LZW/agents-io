@@ -42,7 +42,7 @@
 ```
 
 - **agents**：配置里命名的运行默认值（harness 实例、model、profile、cwd、工具），不含人设。`mode: "task"` 的 agent 只能由 `run.start` 启动，任何规则指向它都在加载时报错。
-- **来源**：本地配置，以及宿主推送的整表 `bindings.put { version, bindings, identities, ttlMs?, onHostDown: "keep" | "suspend" }`（宿主推送的默认 `suspend`）。同一输入命中多条规则时全部生效；同一 (agent, session) 取最强的动作。
+- **来源**：本地配置，以及宿主推送的整表 `bindings.put { version, bindings, identities, expiresAt?, onHostDown: "keep" | "suspend" }`（宿主推送的默认 `suspend`）。同一输入命中多条规则时全部生效；同一 (agent, session) 取最强的动作。
 - **watch** 就是 agent 在运行时通过输出工具新增的一条规则，仍受 `Policy.watch` 约束。
 - **可解释**：每条输入记下命中的规则 id、表版本、回调结果；`aio explain <inputId>` 列出来。
 
@@ -68,7 +68,7 @@
 
 ## 4. 宿主协议
 
-本地 unix socket（目录 0700、socket 0600），JSONL，请求带 `id`、同 `id` 的 `result` 应答。宿主连接先 `host.hello { token, name, consumer?, inbound, callouts }`；token 由守护进程启动时写入 0600 文件。宿主连接也可以发送所有客户端帧（`subscribe`、`input`、`resolve` 等，见 `packages/protocol/src/client.ts`），`origin` 标记为 `kind: "system"`。
+本地 unix socket（目录 0700、socket 0600），JSONL，请求带 `id`、同 `id` 的 `result` 应答。宿主连接先 `host.hello { token, name, consumer?, callouts? }`；token 由守护进程每次启动时重新生成，写入 socket 旁的 0600 文件 `<socket>.token`。带 token 的连接数量不限（`aio run`、`aio tail` 等命令都是这样的连接）；`hello` 里带 `consumer`（推送消费）或 `callouts: true` 的连接才是**宿主**，同一时刻至多一个。宿主在线时，`onHostDown: "suspend"` 的宿主表生效，回调发给它，发起连接已断开的 run 的 `run.ended` 也发给它。只拉取的宿主没有这样的常驻连接，宿主表应使用 `onHostDown: "keep"`（可配 `expiresAt` 当租约）。宿主连接也可以发送所有客户端帧（`subscribe`、`input`、`resolve` 等，见 `packages/protocol/src/client.ts`），`origin` 标记为 `kind: "system"`。
 
 | 帧 | 方向 | 用途 |
 |---|---|---|
@@ -91,6 +91,9 @@
 | `aio tail --consumer <name>` / `aio ack --consumer <name> <cursor>` | §2.1 拉取 |
 | `aio bindings put < table.json` | `bindings.put` |
 | `aio explain <inputId>` | 路由解释 |
+| `aio verify <channelRef>` | `input.verify` |
+
+`aio run` 的退出码：0 完成、1 失败、3 结果不明（ambiguous）、124 超时、130 被取消；其余命令：2 用法/配置错误，69 守护进程未运行，77 token 错误。
 
 ## 6. x-work-os 怎样用（例子）
 

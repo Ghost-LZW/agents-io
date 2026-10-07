@@ -1,11 +1,31 @@
 import { chmodSync, lstatSync, mkdirSync, statSync, unlinkSync, type Stats } from 'node:fs';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { dirname } from 'node:path';
-import { FrameDecoder, PROTOCOL_VERSION, encodeFrame, type Origin, type Watch, type WatchDraft } from '@agents-io/protocol';
+import { randomUUID } from 'node:crypto';
+import { FrameDecoder, HOST_REQUEST_FRAME_TYPES, HostRequestFrame, PROTOCOL_VERSION, check, encodeFrame, errors, type Origin, type ResultFrame, type Watch, type WatchDraft } from '@agents-io/protocol';
 import type { AddWatchResult, RemoveWatchResult } from '@agents-io/session';
 import type { Hub, Subscription } from '@agents-io/session';
 import { parseClientFrame, type ClientCommand, type ClientFrame, type ServerFrame, type SessionInfo } from './frames.js';
 import type { Outcome } from './gateway.js';
+
+/** One socket connection, as the host protocol sees it. */
+export interface Peer {
+  readonly id: string;
+  /** Set once `host.hello` succeeded: the connection's host name and the origin its client frames carry. */
+  auth?: { name: string; origin: (sessionKey: string) => Origin };
+  /** Write a frame; false when the connection is gone. */
+  send(frame: Record<string, unknown>): boolean;
+  /** Send a request frame (an `id` is added) and wait for the peer's `result`; a closed connection or the timeout answers `ok: false`. */
+  request(frame: Record<string, unknown>, timeoutMs?: number): Promise<ResultFrame>;
+  /** Aborted when the connection is gone. */
+  readonly signal: AbortSignal;
+}
+
+/** Host-protocol frames (docs/HOSTS.md §4), handled by the daemon. */
+export interface HostFrames {
+  handle(peer: Peer, frame: HostRequestFrame): Promise<Outcome>;
+  gone(peer: Peer): void;
+}
 
 /** What the socket server needs from the gateway. */
 export interface LocalHost {
@@ -16,13 +36,19 @@ export interface LocalHost {
   addWatch(by: Origin, watch: WatchDraft): Promise<AddWatchResult>;
   removeWatch(by: Origin, id: string): Promise<RemoveWatchResult>;
   listWatches(sessionKey?: string): Watch[];
+  /** Host protocol; without it host frames are answered `unsupported`. */
+  readonly hostFrames?: HostFrames;
 }
 
+const HOST_TYPES = new Set<string>(HOST_REQUEST_FRAME_TYPES);
+
 /**
- * The local client endpoint: a Unix socket (0600, in a private directory: one it
+ * The local endpoint: a Unix socket (0600, in a private directory: one it
  * creates 0700, or an existing one that is already ours and 0700) speaking
- * JSONL frames (frames.ts). Anyone who can open it acts as the configured local
- * principal, so it must stay private to this user.
+ * JSONL frames: client frames (frames.ts) and host frames (protocol host.ts).
+ * Anyone who can open it acts as the configured local principal, so it must
+ * stay private to this user; host frames additionally need `host.hello` with
+ * the daemon's token, after which client frames carry the host's origin.
  */
 export class LocalServer {
   private server: Server | undefined;
@@ -107,9 +133,16 @@ function canConnect(path: string): Promise<boolean> {
   });
 }
 
-class Conn {
+let connSeq = 0;
+
+class Conn implements Peer {
+  readonly id = `conn_${++connSeq}`;
+  auth?: Peer['auth'];
   private readonly subs = new Map<string, Subscription>();
   private readonly decoder: FrameDecoder;
+  private readonly ac = new AbortController();
+  /** Requests this side sent (inbound pushes, callouts), by id. */
+  private readonly pending = new Map<string, (r: ResultFrame) => void>();
   private closed = false;
 
   constructor(
@@ -125,9 +158,30 @@ class Conn {
     socket.on('error', () => this.gone());
   }
 
-  private send(f: ServerFrame): boolean {
+  get signal(): AbortSignal {
+    return this.ac.signal;
+  }
+
+  send(f: ServerFrame | Record<string, unknown>): boolean {
     if (this.closed || this.socket.destroyed) return false;
     return this.socket.write(encodeFrame(f));
+  }
+
+  request(frame: Record<string, unknown>, timeoutMs = 60_000): Promise<ResultFrame> {
+    const id = `d_${randomUUID()}`;
+    const fail = (code: string, message: string): ResultFrame => ({ v: PROTOCOL_VERSION, type: 'result', id, ok: false, error: { code, message } });
+    if (this.closed) return Promise.resolve(fail('disconnected', 'connection closed'));
+    return new Promise((resolve) => {
+      const t = setTimeout(() => done(fail('timeout', `no answer within ${timeoutMs} ms`)), timeoutMs);
+      t.unref?.();
+      const done = (r: ResultFrame) => {
+        clearTimeout(t);
+        this.pending.delete(id);
+        resolve(r);
+      };
+      this.pending.set(id, done);
+      if (!this.send({ v: PROTOCOL_VERSION, ...frame, id })) done(fail('disconnected', 'connection closed'));
+    });
   }
 
   private result(id: string, o: Outcome): void {
@@ -135,6 +189,14 @@ class Conn {
   }
 
   private async onFrame(raw: unknown): Promise<void> {
+    const type = raw && typeof raw === 'object' ? (raw as { type?: unknown }).type : undefined;
+    if (type === 'result') {
+      // The answer to a request this side sent (an inbound push, a callout).
+      const id = (raw as { id?: unknown }).id;
+      if (typeof id === 'string') this.pending.get(id)?.(raw as ResultFrame);
+      return;
+    }
+    if (typeof type === 'string' && HOST_TYPES.has(type)) return this.onHostFrame(raw);
     const p = parseClientFrame(raw);
     if (!p.ok) {
       // Unknown frame types without an id are ignored, as on the adapter bridges.
@@ -147,11 +209,11 @@ class Conn {
       // The local client is the owner: its origin goes to Policy.watch like any other creator's.
       if (f.type === 'watch.list') return this.result(f.id, { ok: true, value: this.host.listWatches(f.sessionKey) });
       if (f.type === 'watch.add') {
-        const r = await this.host.addWatch(this.host.localOrigin(f.watch.target.sessionKey), f.watch);
+        const r = await this.host.addWatch(this.origin(f.watch.target.sessionKey), f.watch);
         return this.result(f.id, r.ok ? { ok: true, value: r.watch } : { ok: false, code: r.code, message: r.message });
       }
       if (f.type === 'watch.remove') {
-        const r = await this.host.removeWatch(this.host.localOrigin(''), f.watchId);
+        const r = await this.host.removeWatch(this.origin(''), f.watchId);
         return this.result(f.id, r.ok ? { ok: true, value: { removed: r.removed } } : { ok: false, code: r.code, message: r.message });
       }
     } catch (e) {
@@ -165,7 +227,7 @@ class Conn {
         this.subs.delete(cmd.sessionKey);
         return this.result(f.id, { ok: true, value: {} });
       }
-      this.result(f.id, await this.host.command(cmd, this.host.localOrigin(cmd.sessionKey)));
+      this.result(f.id, await this.host.command(cmd, this.origin(cmd.sessionKey)));
     } catch (e) {
       this.result(f.id, { ok: false, code: 'internal', message: (e as Error).message });
     }
@@ -208,11 +270,37 @@ class Conn {
     this.gone();
   }
 
+  /** Origin of this connection's client frames: the host's once it said hello, else the local principal. */
+  private origin(sessionKey: string): Origin {
+    return this.auth ? this.auth.origin(sessionKey) : this.host.localOrigin(sessionKey);
+  }
+
+  private async onHostFrame(raw: unknown): Promise<void> {
+    const id = typeof (raw as { id?: unknown }).id === 'string' ? (raw as { id: string }).id : undefined;
+    if (!check(HostRequestFrame, raw)) {
+      if (id !== undefined) this.result(id, { ok: false, code: 'invalid_frame', message: errors(HostRequestFrame, raw).slice(0, 3).join('; ') || 'invalid frame' });
+      return;
+    }
+    const f = raw as HostRequestFrame;
+    const hf = this.host.hostFrames;
+    if (!hf) return this.result(f.id, { ok: false, code: 'unsupported', message: 'this server does not speak the host protocol' });
+    if (f.type !== 'host.hello' && !this.auth) return this.result(f.id, { ok: false, code: 'unauthorized', message: `${f.type} needs host.hello with the daemon's token first` });
+    try {
+      this.result(f.id, await hf.handle(this, f));
+    } catch (e) {
+      this.result(f.id, { ok: false, code: 'internal', message: (e as Error).message });
+    }
+  }
+
   private gone(): void {
     if (this.closed) return;
     this.closed = true;
+    this.ac.abort();
     for (const s of this.subs.values()) s.close();
     this.subs.clear();
+    for (const [id, r] of [...this.pending]) r({ v: PROTOCOL_VERSION, type: 'result', id, ok: false, error: { code: 'disconnected', message: 'connection closed' } });
+    this.pending.clear();
+    this.host.hostFrames?.gone(this);
     this.onGone();
   }
 }

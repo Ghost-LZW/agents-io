@@ -27,7 +27,8 @@ agents-io 只提供机制。信任、审批、模型选择、任务与记忆都�
 | `channel/lark-bot` | 官方飞书/Lark 机器人（长连接、流式卡片）；应用用 [create-lark-bot](https://github.com/Ghost-LZW/create-lark-bot) 创建 |
 | `channel/mail` | IMAP 收、SMTP 发，DKIM/DMARC 作为身份证据 |
 | `channel/jsonl-bridge` | 进程外通道：任何语言写的私有通道经 stdio/socket 接入 |
-| `examples/dev-gateway` | `aio-dev`：把以上组装成一个进程，含终端端点与端到端场景 |
+| `packages/daemon` | `aio`：守护进程与命令行（通道、Binding 表、宿主协议、task run、宿主入站队列、终端端点、端到端场景） |
+| `examples/dev-gateway` | `aio-dev`：`aio` 的旧名包装 |
 
 ## 开始
 

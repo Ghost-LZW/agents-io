@@ -1,5 +1,5 @@
 {
-  "dataDir": "~/.agents-io/dev-gateway",
+  "dataDir": "~/.agents-io/aio",
   "defaultHarness": "claude",
   "harnesses": {
     "claude": {
@@ -37,6 +37,12 @@
       "transport": { "kind": "unix", "spawn": "own" }
     }
   },
+  "agents": {
+    "assistant": { "harness": "claude" },
+    "executor": { "harness": "claude", "mode": "task", "profile": "bypass" },
+    "executor-codex": { "harness": "codex", "mode": "task", "profile": "bypass" }
+  },
+  "defaultAgent": "assistant",
   "channels": [
     { "type": "lark-bot", "tier": "card" },
     {
