@@ -24,7 +24,7 @@ export const PANEL_ORDER: readonly PanelKey[] = ['thinking', 'tools', 'plan'];
 const L = {
   zh: {
     status: { running: '处理中', requires_action: '等待确认', completed: '已完成', interrupted: '已中断', failed: '失败', ambiguous: '结果未知' },
-    panel: { thinking: '💭 思考过程', tools: '🛠 工具调用', plan: '📋 计划' },
+    panel: { thinking: '思考过程', tools: '工具调用', plan: '计划' },
     working: '处理中…',
     toolsCount: (n: number, shown: number) => (n > shown ? `共 ${n} 次，显示最近 ${shown} 次` : `共 ${n} 次`),
     thinkingCount: (n: number, shown: number) => (n > shown ? `共 ${n} 段，显示最近 ${shown} 段` : ''),
@@ -36,10 +36,11 @@ const L = {
     cotThinking: '思考中…',
     cotDone: '✓ 已完成',
     cotFailed: '✗ 失败',
+    toolStatus: { running: '运行中', completed: '', failed: '失败', declined: '已拒绝', skipped: '已跳过' },
   },
   en: {
     status: { running: 'Working', requires_action: 'Waiting for approval', completed: 'Done', interrupted: 'Interrupted', failed: 'Failed', ambiguous: 'Outcome unknown' },
-    panel: { thinking: '💭 Thinking', tools: '🛠 Tool calls', plan: '📋 Plan' },
+    panel: { thinking: 'Thinking', tools: 'Tool calls', plan: 'Plan' },
     working: 'Working…',
     toolsCount: (n: number, shown: number) => (n > shown ? `${n} calls, last ${shown} shown` : `${n} calls`),
     thinkingCount: (n: number, shown: number) => (n > shown ? `${n} blocks, last ${shown} shown` : ''),
@@ -51,6 +52,7 @@ const L = {
     cotThinking: 'Thinking…',
     cotDone: '✓ Done',
     cotFailed: '✗ Failed',
+    toolStatus: { running: 'running', completed: '', failed: 'failed', declined: 'declined', skipped: 'skipped' },
   },
 } as const;
 
@@ -65,6 +67,10 @@ const TOOL_MARK: Record<Extract<ProgressStep, { kind: 'tool' }>['status'], strin
   declined: '⛔',
   skipped: '⏭',
 };
+/** Decoration the adapter adds; `plain` relies on the card header colour and words instead. */
+export type CardStyle = 'emoji' | 'plain';
+const PANEL_ICON: Record<PanelKey, string> = { thinking: '💭', tools: '🛠', plan: '📋' };
+const NARRATION_ICON = '💬';
 const PLAN_MARK = { pending: '○', in_progress: '◐', completed: '●' } as const;
 
 export interface ProcessModel {
@@ -84,6 +90,8 @@ export interface ProcessModel {
 
 export interface ModelOptions {
   locale: Locale;
+  /** Default `emoji`. */
+  style?: CardStyle;
   /** Leave thinking/tools out of the card (the native thinking bubble shows them). */
   processElsewhere: boolean;
   maxEntries: number;
@@ -114,7 +122,7 @@ function thinkingBody(steps: ProgressStep[], o: ModelOptions): string {
   const per = Math.max(200, Math.floor(o.panelMaxChars / shown.length));
   const parts = shown.map((s) => {
     const t = clipTail(s.text.trim(), per);
-    return s.kind === 'narration' ? `💬 ${t}` : t;
+    return s.kind === 'narration' && o.style !== 'plain' ? `${NARRATION_ICON} ${t}` : t;
   });
   const head = labels(o.locale).thinkingCount(blocks.length, shown.length);
   return clipTail([head, ...parts].filter(Boolean).join('\n\n'), o.panelMaxChars);
@@ -126,7 +134,9 @@ function toolsBody(steps: ProgressStep[], o: ModelOptions): string {
   const shown = tools.slice(-o.maxEntries);
   const lines = shown.map((t) => {
     const indent = t.parentItemId ? '　↳ ' : '';
-    let line = `${indent}${TOOL_MARK[t.status]} ${code(clip(oneLine(t.title), 120))}`;
+    const title = code(clip(oneLine(t.title), 120));
+    const st = labels(o.locale).toolStatus[t.status];
+    let line = o.style === 'plain' ? `${indent}${title}${st ? ` ${st}` : ''}` : `${indent}${TOOL_MARK[t.status]} ${title}`;
     if (t.isError && t.resultPreview) line += `\n${indent}　> ${clip(oneLine(t.resultPreview), 200)}`;
     return line;
   });
@@ -196,17 +206,19 @@ export function buildModel(msg: RenderedMessage, p: ProgressView, o: ModelOption
   const done = status !== 'running' && status !== 'requires_action';
   const statusSection = msg.sections?.find((s) => s.kind === 'status')?.text;
   const current = done ? t.status[status] : (statusSection ?? p.headline ?? t.working);
-  const banner = `${ICON[status]} ${current}`;
+  const plain = o.style === 'plain';
+  const banner = plain ? current : `${ICON[status]} ${current}`;
+  const panelTitle = (k: PanelKey) => (plain ? t.panel[k] : `${PANEL_ICON[k]} ${t.panel[k]}`);
 
   const panels: ProcessModel['panels'] = [];
   if (!o.processElsewhere) {
     const th = thinkingBody(p.steps, o);
-    if (th) panels.push({ key: 'thinking', title: t.panel.thinking, body: th });
+    if (th) panels.push({ key: 'thinking', title: panelTitle('thinking'), body: th });
     const tl = toolsBody(p.steps, o);
-    if (tl) panels.push({ key: 'tools', title: t.panel.tools, body: tl });
+    if (tl) panels.push({ key: 'tools', title: panelTitle('tools'), body: tl });
   }
   const pl = planBody(p);
-  if (pl) panels.push({ key: 'plan', title: t.panel.plan, body: pl });
+  if (pl) panels.push({ key: 'plan', title: panelTitle('plan'), body: pl });
 
   const full = (done ? p.answer || msg.text : p.answer).trim();
   const pages = full ? splitMarkdown(full, o.answerBytes) : [''];
@@ -219,7 +231,7 @@ export function buildModel(msg: RenderedMessage, p: ProgressView, o: ModelOption
   const started = p.startedAt;
   const elapsed = started !== undefined ? formatDuration((p.endedAt ?? o.now) - started) : undefined;
   const footerParts = done
-    ? [`${ICON[status]} ${t.status[status]}`, elapsed ? `${t.elapsed} ${elapsed}` : '', toolCount ? t.tools(toolCount) : '']
+    ? [plain ? t.status[status] : `${ICON[status]} ${t.status[status]}`, elapsed ? `${t.elapsed} ${elapsed}` : '', toolCount ? t.tools(toolCount) : '']
     : [elapsed ? `${t.running} ${elapsed}` : '', toolCount ? t.tools(toolCount) : ''];
   const footer = footerParts.filter(Boolean).join(' · ') || ' ';
 

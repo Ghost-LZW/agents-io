@@ -38,3 +38,7 @@ A message that carries `progress` (the session compositor attaches it on `card`/
 The reply card is a CardKit card in streaming mode (`cardkit:card:write`): the answer streams with the typewriter effect, other parts update on their own element ids. On failure it degrades per chat (per app for permission errors, for `degradeTtlMs`): streaming → full `card.update` → an ordinary card replaced by `im.message.patch`. Thinking-bubble failures are remembered the same way and never affect the reply card. An answer larger than the card continues in follow-up cards when the turn ends. The bubble is opened on the first process step, so in the chat it appears below the reply card; it settles with the turn (`RUN_FINISHED`).
 
 Buttons in `actions` (approvals, and the stop button `turn:<turnId>:interrupt` when the compositor runs with `interruptButton: true`) come back as `action` events, which `Ingress` turns into `resolve` / `interrupt` commands.
+
+## Card style
+
+`style: 'emoji'` (default) decorates the status line, panel titles and tool lines with icons; `style: 'plain'` uses words only and lets the card header colour carry the status. In the dev gateway: `{ "type": "lark-bot", "config": { "style": "plain" } }`. What the agent sees and how its output is rendered on each channel: [docs/CHANNELS.md](../../docs/CHANNELS.md).

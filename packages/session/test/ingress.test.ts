@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { FakeHarness, fakeEnvelope } from '@agents-io/testkit';
 import { Hub, Ingress, Lane, MemorySessionLog, actionId, defaultPolicy, parseActionId, type SessionPolicy } from '../src/index.js';
+import type { InputRecord } from '@agents-io/protocol';
 import { RUN, bodies, until } from './helpers.js';
 
 function world(extra: Partial<SessionPolicy> = {}) {
@@ -10,7 +11,10 @@ function world(extra: Partial<SessionPolicy> = {}) {
     ...extra,
   };
   const lanes = new Map<string, Lane>();
-  const harness = new FakeHarness();
+  const seen: InputRecord[][] = [];
+  const harness = new FakeHarness(async (t) => {
+    seen.push(t.inputs);
+  });
   const ingress = new Ingress({
     policy,
     lanes: (sessionKey) => {
@@ -19,7 +23,7 @@ function world(extra: Partial<SessionPolicy> = {}) {
       return l;
     },
   });
-  return { hub, ingress, lanes };
+  return { hub, ingress, lanes, seen };
 }
 
 const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };
@@ -34,6 +38,13 @@ describe('Ingress', () => {
     // The declaration from a non-agent account is dropped: identity comes from policy only.
     expect(r.origin).toEqual({ kind: 'human', principal: { id: 'fake:alice', labels: ['owner'] }, evidence: 'platform_signed', via: 'fake:default:c1', adapter: 'fake' });
     await until(() => bodies(hub.log.read('fake:default:c1', 0), 'turn.completed').length === 1);
+  });
+
+  it('passes the envelope context (e.g. a mail subject) to the harness as channelContext', async () => {
+    const { ingress, lanes, seen } = world();
+    await ingress.accept(fakeEnvelope({ sender: alice, text: 'hi', context: { subject: 'Weekly report', channel: 'spoofed' } }));
+    await lanes.get('fake:default:c1')!.whenIdle();
+    expect(seen[0]![0]!.channelContext).toMatchObject({ subject: 'Weekly report', channel: 'fake' });
   });
 
   it('dedups by (channel, id)', async () => {

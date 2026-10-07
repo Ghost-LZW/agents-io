@@ -179,6 +179,8 @@ function actionClick(env: InboundEnvelope) {
 
 function channelContext(env: InboundEnvelope): InputRecord['channelContext'] {
   const ctx: InputRecord['channelContext'] = {
+    // Adapter-supplied facts (mail subject, chat name…) first; the core fields below win on clashes.
+    ...env.context,
     channel: env.channel,
     conversationKind: env.conversation.kind,
     conversationId: env.conversation.id,

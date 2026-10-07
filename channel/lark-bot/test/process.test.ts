@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ProgressView, RenderedMessage, ReplyRoute } from '@agents-io/protocol';
 import { LarkBotAdapter, splitMarkdown, type LarkBotConfig } from '../src/index.js';
+import { buildModel } from '../src/process-card.js';
 import { FakeLark } from './fake-lark.js';
 
 const cfg = {
@@ -394,5 +395,33 @@ describe('splitMarkdown', () => {
     expect(pages.some((p) => p.startsWith('```py\n'))).toBe(true);
     expect(pages.join('').replace(/```py\n|```\n?/g, '')).toContain('print(199)');
     expect(splitMarkdown('short', 600)).toEqual(['short']);
+  });
+});
+
+describe('card style', () => {
+  const p: ProgressView = {
+    turnId: 't', status: 'completed', answer: 'ok', answerFinal: true, startedAt: 0, endedAt: 2000,
+    steps: [
+      { kind: 'narration', id: 'n1', text: 'Looking' },
+      { kind: 'tool', itemId: 'i1', type: 'command', title: 'Bash: ls', status: 'completed' },
+      { kind: 'tool', itemId: 'i2', type: 'command', title: 'Bash: false', status: 'failed' },
+    ],
+  };
+  const opts = { locale: 'zh' as const, processElsewhere: false, maxEntries: 8, panelMaxChars: 3000, answerBytes: 10_000, now: 2000 };
+  const emoji = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u;
+
+  it('emoji (default) decorates status, panels and tool lines', () => {
+    const m = buildModel({ text: 'ok', progress: p }, p, opts);
+    expect(m.panels.map((x) => x.title)).toEqual(['💭 思考过程', '🛠 工具调用']);
+    expect(m.panels[1]!.body).toContain('✅ `Bash: ls`');
+    expect(m.footer).toMatch(emoji);
+  });
+
+  it('plain uses words only; the header colour still carries status', () => {
+    const m = buildModel({ text: 'ok', progress: p }, p, { ...opts, style: 'plain' });
+    const all = [m.banner, m.footer, ...m.panels.flatMap((x) => [x.title, x.body])].join('\n');
+    expect(all).not.toMatch(emoji);
+    expect(m.panels[1]!.body).toContain('`Bash: false` 失败');
+    expect(m.template).toBe('green');
   });
 });

@@ -40,6 +40,8 @@ export interface LarkBotConfig {
   process?: ProcessMode;
   /** Language of the labels the adapter adds (status, panel titles). Default `zh` on feishu, `en` on lark. */
   locale?: 'zh' | 'en';
+  /** Decoration the adapter adds to cards: `emoji` (status icons, panel icons) or `plain`. Default `emoji`. */
+  style?: 'emoji' | 'plain';
   /** Entries shown per panel (most recent). Default 8. */
   processMaxEntries?: number;
   /** Characters per panel body. Default 3000. */
@@ -67,6 +69,7 @@ const PROCESS_MODES: readonly ProcessMode[] = ['auto', 'cot', 'panels', 'off'];
 export function resolveConfig(c: LarkBotConfig): ResolvedConfig {
   if (!c.appId || !c.appSecret) throw new Error('lark-bot: appId and appSecret are required');
   if (c.domain !== 'feishu' && c.domain !== 'lark') throw new Error(`lark-bot: domain must be 'feishu' or 'lark'`);
+  if (c.style !== undefined && c.style !== 'emoji' && c.style !== 'plain') throw new Error('lark-bot: style must be emoji or plain');
   if (c.process !== undefined && !PROCESS_MODES.includes(c.process)) {
     throw new Error(`lark-bot: process must be one of ${PROCESS_MODES.join(', ')}`);
   }
@@ -82,6 +85,7 @@ export function resolveConfig(c: LarkBotConfig): ResolvedConfig {
     goneCodes: c.goneCodes ?? [230011, 231003],
     process: c.process ?? 'auto',
     locale: c.locale ?? (c.domain === 'feishu' ? 'zh' : 'en'),
+    style: c.style ?? 'emoji',
     processMaxEntries: c.processMaxEntries ?? 8,
     processPanelMaxChars: c.processPanelMaxChars ?? 3000,
     streamTextIntervalMs: c.streamTextIntervalMs ?? 600,

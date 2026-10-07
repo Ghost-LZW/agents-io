@@ -539,6 +539,7 @@ export class LarkBotAdapter implements ChannelAdapter {
   private model(msg: RenderedMessage, p: ProgressView, st: ProcState): ProcessModel {
     const base = {
       locale: this.cfg.locale,
+      style: this.cfg.style,
       processElsewhere: st.mode === 'cot' || (!!st.cot && !st.cot.failed),
       maxEntries: this.cfg.processMaxEntries,
       panelMaxChars: this.cfg.processPanelMaxChars,
