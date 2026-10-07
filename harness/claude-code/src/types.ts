@@ -36,8 +36,10 @@ export interface ClaudeCodeOptions {
   resolveFile?: FileResolver;
   /** MCP server name for `HarnessOpenArgs.mcp` (default `agents_io`). */
   mcpServerName?: string;
-  /** MCP transport for `HarnessOpenArgs.mcp` (default `http`). */
+  /** MCP transport for `HarnessOpenArgs.mcp` (default: `mcp.transport`, else `http`). */
   mcpTransport?: 'http' | 'sse';
+  /** Add an allow rule `mcp__<mcpServerName>` so host tools never prompt (default true; they enforce Policy.outbound themselves). */
+  mcpAutoAllow?: boolean;
   /** Forward subagent text and thinking (SDK `forwardSubagentText`). */
   forwardSubagentText?: boolean;
   /** Model-generated progress summaries for subagents (SDK `agentProgressSummaries`, costs tokens). */

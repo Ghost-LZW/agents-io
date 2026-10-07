@@ -5,6 +5,7 @@
   "references": [
     { "path": "../../packages/protocol" },
     { "path": "../../packages/session" },
+    { "path": "../../packages/host-mcp" },
     { "path": "../../packages/testkit" },
     { "path": "../../harness/claude-code" },
     { "path": "../../harness/codex" },

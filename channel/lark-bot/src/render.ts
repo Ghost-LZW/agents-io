@@ -134,3 +134,88 @@ export function cardMessage(card: unknown): OutMessage {
 export function outcomeCard(outcome: string): Record<string, unknown> {
   return buildCard({ text: outcome }, outcome);
 }
+
+/*
+ * Neutral `channelData` keys from the host output tools (`@agents-io/host-mcp`
+ * neutral.ts). Duplicated as strings so this adapter does not depend on the host package.
+ */
+export const MENTIONS_KEY = 'agents-io/mentions';
+export const CHOICE_KEY = 'agents-io/choice';
+
+export interface MentionsData {
+  targets: { id: string; name?: string }[];
+  text: string;
+}
+export interface ChoiceData {
+  choiceId: string;
+  question: string;
+  options: string[];
+  multi: boolean;
+}
+
+export function neutral<T>(msg: RenderedMessage, key: string): T | undefined {
+  const d = msg.channelData;
+  if (!d || typeof d !== 'object' || Array.isArray(d)) return undefined;
+  const v = (d as Record<string, unknown>)[key];
+  return v && typeof v === 'object' ? (v as T) : undefined;
+}
+
+const escapeAt = (s: string) => s.replace(/[<>]/g, '');
+
+/**
+ * A text message @-mentioning people. Lark's `<at user_id="…">` takes an open_id (or
+ * user_id); `openId` maps the ids we were given (often union_ids) to one. Unmappable
+ * ids degrade to plain `@name` text.
+ */
+export function mentionMessage(m: MentionsData, openId: (id: string) => string | undefined): OutMessage {
+  const tags = m.targets.map((t) => {
+    const oid = t.id === 'all' ? 'all' : openId(t.id);
+    return oid ? `<at user_id="${oid}">${escapeAt(t.name ?? '')}</at>` : `@${t.name ?? t.id}`;
+  });
+  return { msg_type: 'text', content: JSON.stringify({ text: `${tags.join(' ')} ${m.text}` }) };
+}
+
+/** Card for a multi-select ask_choice: a form with a multi-select and a submit button (`choice:<id>:form`). */
+export function choiceFormCard(c: ChoiceData): Record<string, unknown> {
+  return {
+    schema: '2.0',
+    config: { update_multi: true, summary: { content: c.question.slice(0, 80) } },
+    body: {
+      elements: [
+        md(c.question),
+        {
+          tag: 'form',
+          name: 'choice_form',
+          elements: [
+            {
+              tag: 'multi_select_static',
+              name: 'choice',
+              placeholder: { tag: 'plain_text', content: 'Select…' },
+              options: c.options.map((o, i) => ({ text: { tag: 'plain_text', content: o }, value: String(i + 1) })),
+            },
+            {
+              tag: 'button',
+              name: 'choice_submit',
+              text: { tag: 'plain_text', content: 'Submit' },
+              type: 'primary',
+              form_action_type: 'submit',
+              behaviors: [{ type: 'callback', value: { actionId: `choice:${c.choiceId}:form` } }],
+            },
+          ],
+        },
+      ],
+    },
+  };
+}
+
+/** `im.v1.file.create` file_type for a name/mime. */
+export function larkFileType(name: string, mime: string): 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream' {
+  const ext = name.toLowerCase().split('.').pop() ?? '';
+  if (mime === 'audio/opus' || ext === 'opus') return 'opus';
+  if (mime === 'video/mp4' || ext === 'mp4') return 'mp4';
+  if (ext === 'pdf') return 'pdf';
+  if (ext === 'doc' || ext === 'docx') return 'doc';
+  if (ext === 'xls' || ext === 'xlsx' || ext === 'csv') return 'xls';
+  if (ext === 'ppt' || ext === 'pptx') return 'ppt';
+  return 'stream';
+}

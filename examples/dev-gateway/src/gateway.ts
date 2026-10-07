@@ -4,6 +4,7 @@ import { dirname } from 'node:path';
 import {
   routeKey,
   type ChannelAdapter,
+  type ContentBlock,
   type HarnessAdapter,
   type HarnessCaps,
   type HarnessEvent,
@@ -33,6 +34,7 @@ import {
   type RemoveWatchResult,
   type SessionLog,
 } from '@agents-io/session';
+import { HostMcpServer, HostTools, ToolError } from '@agents-io/host-mcp';
 import { ClaudeCodeHarness, findOnPath, type ClaudeCodeHarnessConfig } from '@agents-io/harness-claude-code';
 import { CodexHarness, type CodexProfile } from '@agents-io/harness-codex';
 import { LarkBotAdapter } from '@agents-io/channel-lark-bot';
@@ -68,6 +70,8 @@ export interface GatewayOptions {
   watches?: WatchRegistry;
   /** Serve the local client socket (default true). */
   listen?: boolean;
+  /** Every host output-tool call (debugging; e2e checks what harnesses send in `_meta`). */
+  onToolCall?: (e: { sessionKey: string; tool: string; meta: Record<string, unknown> | undefined; ok: boolean; error?: string }) => void;
   /** Tee of raw harness events per session (conformance checks). */
   onHarnessEvent?: (sessionKey: string, e: HarnessEvent) => void;
   logger?: LogFn;
@@ -110,6 +114,9 @@ export class Gateway {
   readonly watches: WatchDispatcher;
   /** Inbound media (channels put, harnesses read). */
   readonly blobs: FsBlobStore;
+  /** Host output tools (`config.outputTools`), mounted into every harness binding over MCP. */
+  readonly tools: HostTools | undefined;
+  private readonly mcp: HostMcpServer | undefined;
   /** Built instance adapters, by instance name (lazily, on first use). */
   private readonly instances = new Map<string, HarnessAdapter>();
   private readonly lanes = new Map<string, Lane>();
@@ -150,6 +157,25 @@ export class Gateway {
       replyRoute: (w) => this.homeRoute(w.target.sessionKey),
       onError: (err, id) => this.log('warn', `watch ${id}: ${(err as Error).message}`),
     });
+    if (c.outputTools) {
+      this.tools = new HostTools({
+        hub: this.hub,
+        outbox: this.outbox,
+        policy: this.policy,
+        // Only lanes that exist: a tool call always comes from a running harness session.
+        turn: (key) => this.lanes.get(key)?.currentTurn(),
+        adapter: (id) => this.channels.find((ch) => ch.adapter.id === id)?.adapter,
+        blobs: this.blobs,
+        cwd: (key) => this.instanceOf(this.lanes.get(key)?.harnessId)?.cwd ?? c.cwd,
+        tier: (r) => this.channels.find((ch) => ch.adapter.id === r.channel)?.tier,
+        routes: () => c.policy.routes,
+        // Agents add watches as themselves (kind agent); Policy.watch decides, the target is pinned to their session.
+        watches: { add: (by, d) => this.addWatch(by, d), remove: (by, id) => this.removeWatch(by, id), list: (key) => this.listWatches(key) },
+      });
+      const tools = this.tools;
+      this.mcp = new HostMcpServer({ tools, ...(o.onToolCall ? { onCall: (e) => o.onToolCall!({ sessionKey: e.binding.sessionKey, tool: e.tool, meta: e.meta, ok: e.ok, ...(e.error ? { error: e.error } : {}) }) } : {}) });
+    }
+    const tools = this.tools;
     this.ingress = new Ingress({
       policy: this.policy,
       lanes: (key) => this.lane(key),
@@ -157,12 +183,18 @@ export class Gateway {
       watches: this.watches,
       onWatchError: (err) => this.log('warn', `watch fan-out failed: ${(err as Error).message}`),
       replyCaps: (ch, account) => this.replyCaps(ch, account),
+      // Clicks on ask_choice buttons (and numbered replies) go back to the session that asked.
+      ...(tools ? { rewrite: (a) => tools.rewriteInbound(a) } : {}),
     });
   }
 
   static async start(o: GatewayOptions): Promise<Gateway> {
     const gw = new Gateway(o);
     try {
+      if (gw.mcp) {
+        const url = await gw.mcp.listen();
+        gw.log('info', `host MCP output tools on ${url}`);
+      }
       gw.watches.start();
       await gw.loadConfigWatches();
       await gw.startChannels();
@@ -213,6 +245,7 @@ export class Gateway {
       hub: this.hub,
       policy: this.policy,
       cwd: this.o.config.cwd,
+      ...(this.mcp ? { mcp: (a: { sessionKey: string; generation: number; harnessId: string }) => this.mcp!.mcpFor(a) } : {}),
       onHarnessEvent: (e) => this.o.onHarnessEvent?.(sessionKey, e),
     });
     this.lanes.set(sessionKey, lane);
@@ -342,10 +375,19 @@ export class Gateway {
     const lane = this.lane(cmd.sessionKey);
     switch (cmd.type) {
       case 'input': {
+        let content: ContentBlock[] = cmd.input.content;
+        if (this.tools && content.some((c) => c.type === 'event' && c.name === 'choice')) {
+          // `/choose <id> <n>` from attach: the answer to an ask_choice, checked and filled in.
+          try {
+            content = this.tools.normalizeLocal(content);
+          } catch (e) {
+            return fail('bad_choice', e instanceof ToolError ? e.message : (e as Error).message);
+          }
+        }
         const input: InputRecord = {
           inputId: cmd.input.inputId ?? `in_${randomUUID()}`,
           origin,
-          content: cmd.input.content,
+          content,
           replyRoute: localRoute(cmd.sessionKey),
           channelContext: { channel: 'local', ...cmd.input.channelContext },
         };
@@ -414,6 +456,7 @@ export class Gateway {
     await within(Promise.all(this.compositors.map((c) => c.stop())), 5000);
     for (const ch of this.channels) await within(ch.close?.().catch(() => undefined), 3000);
     await within(this.watches.idle(), 3000);
+    await within(this.mcp?.close(), 2000);
     await within(new Promise(() => {}), 50);
     this.watches.registry.close();
     this.hub.log.close?.();

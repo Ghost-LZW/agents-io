@@ -80,6 +80,11 @@ export interface CodexOpenOptions {
   ephemeral?: boolean;
   /** Name the host MCP endpoint is mounted under (default `agents_io`). */
   mcpServerName?: string;
+  /**
+   * `mcp_servers.<name>.default_tools_approval_mode` for the host endpoint: `approve`
+   * (default; the host checks destinations itself), `auto`, `prompt`, `writes`, or null to leave Codex's default.
+   */
+  mcpApprovalMode?: 'auto' | 'prompt' | 'writes' | 'approve' | null;
 }
 
 interface Turn {

@@ -45,6 +45,8 @@ export class FakeLark {
   readonly foreign = new Map<string, LarkMessageItem>();
   /** `${messageId}/${fileKey}` → resource bytes and headers (`messageResource.get`). */
   readonly resources = new Map<string, { bytes: Buffer; headers?: Record<string, string>; hang?: boolean }>();
+  /** `im.v1.file.create` / `image.create` calls, in order. */
+  readonly uploads: { kind: 'file' | 'image'; fileType?: string; name?: string; bytes: number; key: string }[] = [];
   /** Contact users by id (`contact.v3.user.get`). */
   readonly users = new Map<string, { name: string }>();
   /** Calls of the inbound lookups, e.g. `resource:om_1/img_1:image`, `get:om_p`, `user:on_alice:union_id`. */
@@ -217,6 +219,21 @@ export class FakeLark {
                 ],
               },
             };
+          },
+        },
+        file: {
+          create: async ({ data }) => {
+            const key = `file_v3_${this.uploads.length + 1}`;
+            this.uploads.push({ kind: 'file', fileType: data.file_type, name: data.file_name, bytes: data.file.byteLength, key });
+            // SDK 1.74 resolves upload calls to the unwrapped data.
+            return { file_key: key };
+          },
+        },
+        image: {
+          create: async ({ data }) => {
+            const key = `img_v3_${this.uploads.length + 1}`;
+            this.uploads.push({ kind: 'image', bytes: data.image.byteLength, key });
+            return { image_key: key };
           },
         },
         messageResource: {

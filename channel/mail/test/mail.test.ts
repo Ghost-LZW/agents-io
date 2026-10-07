@@ -233,6 +233,22 @@ describe('inbound', () => {
 });
 
 describe('outbound', () => {
+  it('sends output-tool attachments from the host blob store; a numbered ask_choice is plain text', async () => {
+    const m = new Map<string, { bytes: Uint8Array; mime: string; name?: string }>([['sha256:r', { bytes: new TextEncoder().encode('# hi'), mime: 'text/markdown', name: 'README.md' }]]);
+    const hostBlobs: BlobStore = { put: async () => 'x', get: async (ref) => { const b = m.get(ref); if (!b) throw new Error('missing'); return b; } };
+    const h = await harness({ hostBlobs });
+    const e = await h.next({ uid: 1, raw: raw({ 'Message-ID': '<f@x>', Subject: 'File' }, 'send it') });
+    expect(h.adapter.caps('bot').media.out).toEqual(['file', 'image']);
+    await h.adapter.send(e.replyRoute!, { text: 'here', attachments: [{ ref: 'sha256:r', mime: 'text/markdown', name: 'README.md' }] }, { operationId: 'op1' });
+    const sent = h.transport.sent[0]!;
+    expect(sent.attachments).toEqual([{ filename: 'README.md', content: Buffer.from('# hi'), contentType: 'text/markdown' }]);
+    await expect(h.adapter.send(e.replyRoute!, { text: 'x', attachments: [{ ref: 'sha256:gone', mime: 'text/plain' }] }, { operationId: 'op2' })).rejects.toThrow(/attachment sha256:gone/);
+    expect(h.transport.sent).toHaveLength(1);
+    await h.adapter.send(e.replyRoute!, { text: 'Pick\n\n1. a\n2. b\n\nReply with the number of your choice', channelData: { 'agents-io/choice': { choiceId: 'c', question: 'Pick', options: ['a', 'b'], multi: false } } }, { operationId: 'op3' });
+    expect(h.transport.sent[1]!.text).toContain('1. a\n2. b');
+    await h.stop();
+  });
+
   it('replies with In-Reply-To, References and Re: subject', async () => {
     const h = await harness();
     const e = await h.next({ uid: 1, raw: raw({ 'Message-ID': '<c@x>', 'In-Reply-To': '<b@x>', References: '<a@x> <b@x>', Subject: 'Plan' }, 'q') });

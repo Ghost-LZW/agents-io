@@ -1,6 +1,13 @@
 import type { SessionEvent, Tier } from '@agents-io/protocol';
 import { isSnapshotEvent } from '@agents-io/session';
 
+interface OutputLike {
+  tool: string;
+  route: { channel: string; conversationId: string };
+  msg: { text: string; attachments?: { name?: string; mime: string; ref: string }[] };
+  choice?: { choiceId: string; question: string; options: string[]; multi: boolean };
+}
+
 const oneLine = (s: string, max = 120) => {
   const t = s.replace(/\s+/g, ' ').trim();
   return t.length > max ? t.slice(0, max - 1) + '…' : t;
@@ -91,11 +98,30 @@ export class EventRenderer {
         return this.line(this.paint('33', `   ! ${b.code}: ${oneLine(b.message)}`));
       case 'headline':
         return this.o.verbose || this.o.tier === 'headline' ? this.line(this.paint('2', `   … ${oneLine(b.text)}`)) : '';
+      case 'native':
+        if (b.name === 'agents-io.output') return this.line(this.paint('1;35', this.output(e.native as OutputLike)));
+        return this.o.verbose ? this.line(this.paint('2', `   native ${b.name}`)) : '';
       case 'session.state':
         return this.o.verbose ? this.line(this.paint('2', `   [${b.state}]`)) : '';
       default:
         return this.o.verbose ? this.line(this.paint('2', `   ${b.t}`)) : '';
     }
+  }
+
+  /** A message an agent sent with an output tool (send_file, ask_choice, mention, …). */
+  private output(r: OutputLike): string {
+    if (!r?.msg) return '   ✉ (output)';
+    const where = `${r.route.channel}:${r.route.conversationId}`;
+    const lines: string[] = [];
+    if (r.choice) {
+      lines.push(`   ? ${r.choice.question}  [${r.tool} → ${where}]`);
+      r.choice.options.forEach((o, i) => lines.push(`     ${i + 1}. ${o}`));
+      lines.push(`     answer: /choose ${r.choice.choiceId} <n>${r.choice.multi ? '[,<n>…]' : ''}`);
+      return lines.join('\n');
+    }
+    for (const a of r.msg.attachments ?? []) lines.push(`   📎 ${a.name ?? 'file'} (${a.mime}, ${a.ref})  [${r.tool} → ${where}]`);
+    if (r.msg.text) lines.push(`   ✉ ${r.msg.text}${r.msg.attachments?.length ? '' : `  [${r.tool} → ${where}]`}`);
+    return lines.join('\n') || `   ✉ (empty ${r.tool})`;
   }
 
   private request(id: string, title: string, allowed: string[], preview?: string): string {

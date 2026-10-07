@@ -16,6 +16,8 @@ import {
 
 export interface MailAdapterDeps {
   store?: MailStore;
+  /** Where outbound attachment refs are read from (default: `ChannelContext.blobs` from `start`). */
+  blobStore?: BlobStore;
   blobs?: BlobSink;
   source?: MailSource;
   transport?: MailTransport;
@@ -28,6 +30,7 @@ export class MailChannel implements ChannelAdapter {
   readonly id = 'mail';
   private readonly store: MailStore;
   private blobs: BlobSink;
+  private blobStore: BlobStore | undefined;
   private readonly ownSink: boolean;
   private readonly source: MailSource;
   private readonly transport: MailTransport;
@@ -40,6 +43,7 @@ export class MailChannel implements ChannelAdapter {
   ) {
     this.store = deps.store ?? new MemoryMailStore();
     this.blobs = deps.blobs ?? discardBlobs;
+    this.blobStore = deps.blobStore;
     this.ownSink = deps.blobs !== undefined;
     this.source = deps.source ?? new ImapSource(cfg);
     this.transport = deps.transport ?? (createTransport(cfg.smtp) as MailTransport);
@@ -51,8 +55,8 @@ export class MailChannel implements ChannelAdapter {
       text: { maxChars: 100_000, markdown: 'none' },
       edit: false,
       buttons: false,
-      // Outbound attachments are not implemented yet.
-      media: { in: ['file', 'image'], out: [] },
+      // Outbound attachments are read from the host blob store.
+      media: { in: ['file', 'image'], out: ['file', 'image'] },
       voiceOut: 'none',
       threads: true,
       approvals: 'link',
@@ -66,6 +70,7 @@ export class MailChannel implements ChannelAdapter {
     const mailbox = this.cfg.mailbox ?? 'INBOX';
     // Without a sink of its own, attachments go to the host's blob store (when it has one).
     if (!this.ownSink && ctx.blobs) this.blobs = blobStoreSink(ctx.blobs);
+    this.blobStore ??= ctx.blobs;
     await this.source.watch({
       mailbox,
       signal: ctx.signal,
@@ -101,6 +106,16 @@ export class MailChannel implements ChannelAdapter {
     if (prior?.state === 'sent') return { providerMessageId: messageId };
 
     const target = await this.resolveTarget(route, msg);
+    // Read every attachment before recording the send: a missing blob fails the send, never half-sends it.
+    const attachments = await Promise.all(
+      (msg.attachments ?? []).map(async (a) => {
+        if (!this.blobStore) throw Object.assign(new Error(`mail: no blob store to read attachment ${a.ref}`), { retryable: false });
+        const b = await this.blobStore.get(a.ref).catch((e: Error) => {
+          throw Object.assign(new Error(`mail: attachment ${a.ref}: ${e.message}`), { retryable: false });
+        });
+        return { filename: a.name ?? b.name ?? 'attachment', content: Buffer.from(b.bytes), contentType: a.mime || b.mime };
+      }),
+    );
     // Recorded before sending so an echo can never beat the record; 'pending' is retried with the same Message-ID.
     await this.store.putSent(messageId, { operationId: op.operationId, ...(op.as ? { as: op.as } : {}), state: 'pending' });
 
@@ -114,6 +129,7 @@ export class MailChannel implements ChannelAdapter {
       ...(target.references.length ? { references: target.references } : {}),
       text: renderText(msg),
       html: renderHtml(msg),
+      ...(attachments.length ? { attachments } : {}),
       ...(op.as ? { headers: { 'X-Agents-IO-Sender': op.as } } : {}),
     });
 

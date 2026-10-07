@@ -86,6 +86,9 @@ importers:
       '@agents-io/harness-codex':
         specifier: workspace:*
         version: link:../../harness/codex
+      '@agents-io/host-mcp':
+        specifier: workspace:*
+        version: link:../../packages/host-mcp
       '@agents-io/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
@@ -130,6 +133,25 @@ importers:
       '@types/ws':
         specifier: ^8.18.2
         version: 8.18.2
+
+  packages/host-mcp:
+    dependencies:
+      '@agents-io/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@agents-io/session':
+        specifier: workspace:*
+        version: link:../session
+      '@modelcontextprotocol/sdk':
+        specifier: 1.32.1
+        version: 1.32.1(zod@4.6.5)
+      zod:
+        specifier: ^4.0.0
+        version: 4.6.5
+    devDependencies:
+      '@agents-io/testkit':
+        specifier: workspace:*
+        version: link:../testkit
 
   packages/protocol:
     dependencies:

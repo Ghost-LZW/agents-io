@@ -254,7 +254,19 @@ export function mapCardAction(ev: RawCardActionEvent, ctx: Pick<MapContext, 'acc
     // Group vs DM is not in the callback payload; hosts key policy off conversation.id.
     conversation: { id: chatId, kind: 'other' },
     sender: { channelUserId: sid, ...(ev.operator?.name ? { displayName: ev.operator.name } : {}), evidence: 'platform_signed' },
-    content: [{ type: 'event', name: 'action', data: { actionId, messageId, value: value ?? null } }],
+    content: [
+      {
+        type: 'event',
+        name: 'action',
+        data: {
+          actionId,
+          messageId,
+          value: value ?? null,
+          // A submitted card form (e.g. an ask_choice multi-select): field name → value(s).
+          ...(ev.action?.form_value && typeof ev.action.form_value === 'object' ? { formValue: ev.action.form_value as Record<string, unknown> } : {}),
+        },
+      },
+    ],
     replyRoute: { channel: CHANNEL_ID, account: ctx.account, conversationId: chatId, replyToMessageId: messageId },
     admission: 'dispatch',
     raw: ev,

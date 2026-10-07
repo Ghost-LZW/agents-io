@@ -1,4 +1,5 @@
 import type {
+  BlobStore,
   ChannelAdapter,
   ChannelCaps,
   ChannelContext,
@@ -30,6 +31,14 @@ import {
   type ProcessModel,
 } from './process-card.js';
 import {
+  CHOICE_KEY,
+  MENTIONS_KEY,
+  choiceFormCard,
+  larkFileType,
+  mentionMessage,
+  neutral,
+  type ChoiceData,
+  type MentionsData,
   cardMessage,
   fitCard,
   isLarkCard,
@@ -55,6 +64,8 @@ export interface LarkBotOptions {
   now?: () => number;
   /** Where degradations are reported before `start()` supplies the host's logger. */
   log?: ChannelContext['log'];
+  /** Blob store outbound attachments are read from (default: `ChannelContext.blobs` from `start`). */
+  blobs?: BlobStore;
 }
 
 type MsgKind = 'card' | 'text' | 'post' | 'cardkit';
@@ -130,6 +141,11 @@ export class LarkBotAdapter implements ChannelAdapter {
   /** `app` or `chat:<id>` → thinking bubble off until a time. */
   private readonly cotOff = new Map<string, number>();
   private readonly cotTasks = new Set<Promise<void>>();
+  private blobs: BlobStore | undefined;
+  /** union_id / user_id → open_id, learned from inbound events (at tags need an open_id). */
+  private readonly openIds = new Map<string, string>();
+  /** blob ref → uploaded Lark key, so a retried send does not upload again. */
+  private readonly uploads = new Map<string, { ref: string; mime: string }>();
   private readonly enricher: InboundEnricher;
   /** chat id → enrichment of its previous message, so messages reach the host in order. */
   private readonly inboundTails = new Map<string, Promise<void>>();
@@ -143,6 +159,7 @@ export class LarkBotAdapter implements ChannelAdapter {
     this.dedup = new DedupWindow(this.cfg.dedupWindowMs, 10_000, this.now);
     this.botOpenId = this.cfg.botOpenId;
     this.logFn = opts.log;
+    this.blobs = opts.blobs;
     this.enricher = new InboundEnricher({ client: () => this.client, store: this.store, cfg: this.cfg, now: this.now, log: (l, m) => this.log(l, m) });
   }
 
@@ -186,6 +203,7 @@ export class LarkBotAdapter implements ChannelAdapter {
   async start(ctx: ChannelContext): Promise<void> {
     this.account = ctx.account;
     this.logFn = ctx.log;
+    this.blobs ??= ctx.blobs;
     if (!this.botOpenId) await this.discoverBot(ctx);
 
     const dispatcher = this.deps.createDispatcher(this.params());
@@ -250,6 +268,7 @@ export class LarkBotAdapter implements ChannelAdapter {
       return;
     }
     this.dedup.add(key);
+    this.learnIds(ev);
     const fromBot = ev.sender?.sender_type === 'app' || (!!this.botOpenId && ev.sender?.sender_id?.open_id === this.botOpenId);
     const declared = fromBot ? await this.store.get(mid) : undefined;
     const env = mapMessageEvent(ev, { account: ctx.account, botOpenId: this.botOpenId, declared });
@@ -274,6 +293,67 @@ export class LarkBotAdapter implements ChannelAdapter {
       if (this.inboundTails.get(chatId) === tail) this.inboundTails.delete(chatId);
     });
     return ready.then((e) => ctx.emit(e));
+  }
+
+  /** Remember open_ids behind the union/user ids we hand out, for outbound at tags. */
+  private learnIds(ev: RawMessageEvent): void {
+    const ids = [ev.sender?.sender_id, ...(ev.message?.mentions ?? []).map((m) => m.id)];
+    for (const id of ids) {
+      if (!id?.open_id) continue;
+      if (id.union_id) bounded(this.openIds, id.union_id, id.open_id);
+      if (id.user_id) bounded(this.openIds, id.user_id, id.open_id);
+    }
+  }
+
+  private openIdOf(id: string): string | undefined {
+    if (id.startsWith('ou_')) return id;
+    return this.openIds.get(id);
+  }
+
+  /**
+   * Host blobs among the attachments are uploaded (image.create / file.create) and
+   * replaced by `lark-file:upload/<key>` refs, which `attachmentParts` sends.
+   */
+  private async uploadAttachments(msg: RenderedMessage): Promise<RenderedMessage> {
+    const atts = msg.attachments ?? [];
+    if (!atts.some((a) => !a.ref.startsWith('lark-file:'))) return msg;
+    const out: NonNullable<RenderedMessage['attachments']> = [];
+    for (const a of atts) {
+      if (a.ref.startsWith('lark-file:')) {
+        out.push(a);
+        continue;
+      }
+      const done = this.uploads.get(a.ref);
+      if (done) {
+        out.push({ ...a, ...done });
+        continue;
+      }
+      if (!this.blobs) throw new LarkApiError('upload', undefined, `no blob store to read ${a.ref} from`);
+      const blob = await this.blobs.get(a.ref);
+      const name = a.name ?? blob.name ?? 'file';
+      const bytes = Buffer.from(blob.bytes);
+      const im = this.client.im.v1;
+      const image = a.mime.startsWith('image/') && a.mime !== 'image/svg+xml' && bytes.byteLength <= 10 * 1024 * 1024;
+      let up: { ref: string; mime: string };
+      if (image) {
+        if (!im.image) throw new LarkApiError('image.create', undefined, 'client has no im.v1.image');
+        const r = await this.api('image.create', async () => (await im.image!.create({ data: { image_type: 'message', image: bytes } })) ?? {});
+        const key = r.image_key ?? r.data?.image_key;
+        if (!key) throw new LarkApiError('image.create', undefined, 'no image_key returned');
+        up = { ref: `lark-file:upload/${key}`, mime: a.mime };
+      } else {
+        if (!im.file) throw new LarkApiError('file.create', undefined, 'client has no im.v1.file');
+        const fileType = larkFileType(name, a.mime);
+        const r = await this.api('file.create', async () => (await im.file!.create({ data: { file_type: fileType, file_name: name, file: bytes } })) ?? {});
+        const key = r.file_key ?? r.data?.file_key;
+        if (!key) throw new LarkApiError('file.create', undefined, 'no file_key returned');
+        // Only opus uploads can go out as an audio message; everything else is a file message.
+        up = { ref: `lark-file:upload/${key}`, mime: fileType === 'opus' ? 'audio/opus' : 'application/octet-stream' };
+      }
+      bounded(this.uploads, a.ref, up);
+      out.push({ ...a, ...up });
+    }
+    return { ...msg, attachments: out };
   }
 
   private async onCardAction(ctx: ChannelContext, ev: RawCardActionEvent): Promise<Record<string, never>> {
@@ -338,7 +418,17 @@ export class LarkBotAdapter implements ChannelAdapter {
   /** Render one RenderedMessage into the ordered platform messages; the primary one is the editable body. */
   private plan(msg: RenderedMessage): { parts: { out: OutMessage; kind: MsgKind }[]; primary: number } {
     const parts: { out: OutMessage; kind: MsgKind }[] = [];
-    if (isLarkCard(msg.channelData)) {
+    const mentions = neutral<MentionsData>(msg, MENTIONS_KEY);
+    const choice = neutral<ChoiceData>(msg, CHOICE_KEY);
+    if (!msg.text.trim() && msg.attachments?.length && !needsCard(msg) && !isLarkCard(msg.channelData)) {
+      // A bare file: no empty text message in front of it.
+      const files = this.attachmentParts(msg);
+      return { parts: files, primary: 0 };
+    } else if (choice?.multi && msg.actions?.length) {
+      parts.push({ out: cardMessage(choiceFormCard(choice)), kind: 'card' });
+    } else if (mentions && !needsCard(msg)) {
+      parts.push({ out: mentionMessage(mentions, (id) => this.openIdOf(id)), kind: 'text' });
+    } else if (isLarkCard(msg.channelData)) {
       parts.push({ out: cardMessage(msg.channelData), kind: 'card' });
     } else if (needsCard(msg)) {
       const hasBody = (msg.sections ?? []).some((s) => s.kind === 'body');
@@ -370,7 +460,8 @@ export class LarkBotAdapter implements ChannelAdapter {
     return run;
   }
 
-  private async doSend(route: ReplyRoute, msg: RenderedMessage, op: SendOp): Promise<SendResult> {
+  private async doSend(route: ReplyRoute, input: RenderedMessage, op: SendOp): Promise<SendResult> {
+    const msg = await this.uploadAttachments(input);
     const { parts, primary } = this.plan(msg);
     let providerMessageId: string | undefined;
     for (const [i, p] of parts.entries()) {

@@ -1,9 +1,10 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BodyOf, HarnessEvent, Policy, SessionEvent, Tier } from '@agents-io/protocol';
 import { CodexHarness } from '@agents-io/harness-codex';
 import { isSnapshotEvent, passes } from '@agents-io/session';
+import { CHOICE_KEY, OUTPUT_EVENT, parseChoiceActionId, type ChoiceData, type OutputRecord } from '@agents-io/host-mcp';
 import { FakeChannel, checkEventStream, defaultChannelCaps } from '@agents-io/testkit';
 import type { ClientSubscription } from './client.js';
 import { LocalClient } from './client.js';
@@ -116,6 +117,8 @@ interface World {
   config: Config;
   chat: FakeChannel;
   raw: Map<string, HarnessEvent[]>;
+  /** Host output-tool calls, with the `_meta` the harness sent. */
+  toolCalls: { sessionKey: string; tool: string; meta: Record<string, unknown> | undefined; ok: boolean; error?: string }[];
   client(): Promise<LocalClient>;
   watch(sessionKey: string, o?: { tier?: 'full' | 'card' | 'headline' | 'final'; fromSeq?: number; client?: LocalClient }): Promise<Watch>;
 }
@@ -158,7 +161,12 @@ async function world(ctx: E2EContext, o: { policy?: Partial<Policy>; dir?: strin
   mkdirSync(config.cwd, { recursive: true });
   const chat = new FakeChannel('e2e', defaultChannelCaps);
   const raw = new Map<string, HarnessEvent[]>();
+  const toolCalls: World['toolCalls'] = [];
   const gw = await Gateway.start({
+    onToolCall: (e) => {
+      toolCalls.push(e);
+      ctx.progress(`tool ${e.tool} ${e.ok ? 'ok' : `failed: ${e.error}`}; _meta keys: ${Object.keys(e.meta ?? {}).join(', ') || 'none'}`);
+    },
     config,
     channels: [{ adapter: chat }],
     ...(o.policy ? { policy: o.policy } : {}),
@@ -185,6 +193,7 @@ async function world(ctx: E2EContext, o: { policy?: Partial<Policy>; dir?: strin
     config,
     chat,
     raw,
+    toolCalls,
     client,
     watch: async (sessionKey, w = {}) => new Watch(await (w.client ?? (await client())).subscribe({ sessionKey, tier: w.tier ?? 'full', fromSeq: w.fromSeq ?? 0 })),
   };
@@ -203,6 +212,19 @@ function conforms(w: World, sessionKey: string, watch: Watch | SessionEvent[], a
 }
 
 const sec = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+
+/** Which `_meta` keys the harness sent with its output-tool calls (the idempotency key comes from one). */
+function metaSummary(w: World): string {
+  const keys = new Set(w.toolCalls.flatMap((c) => Object.keys(c.meta ?? {})));
+  const idKey = ['claudecode/toolUseId', 'callId'].find((k) => w.toolCalls.some((c) => typeof c.meta?.[k] === 'string'));
+  return `_meta keys [${[...keys].join(', ') || 'none'}]${idKey ? ` (${idKey} → operationId)` : ' (no call id: JSON-RPC id fallback)'}`;
+}
+
+const outputsOf = (w: World, sk: string) =>
+  w.gw.hub.log
+    .read(sk, 0)
+    .filter((e) => e.body.t === 'native' && e.body.name === OUTPUT_EVENT)
+    .map((e) => e.native as OutputRecord);
 
 export const SCENARIOS: Scenario[] = [
   {
@@ -483,6 +505,91 @@ export const SCENARIOS: Scenario[] = [
       assert(missing.length === 0, `answer misses ${missing.join(', ')}: ${JSON.stringify(text.slice(0, 200))}`);
       conforms(w, target, watch);
       return `3 stranger messages → 3 context inputs → 1 digest turn (system origin, restricted); answer mentions all three: ${JSON.stringify(text.slice(0, 160))}`;
+    },
+  },
+  {
+    id: 'm',
+    name: 'output-ask-choice',
+    skip: (c) => (c.outputTools ? undefined : 'outputTools is off'),
+    async run(ctx) {
+      const w = await world(ctx);
+      const sk = 'e2e:default:c1';
+      const watch = await w.watch(sk);
+      const r = await w.chat.inject({ sender: ALICE, text: 'Use the ask_choice tool to ask me whether I prefer red or blue (options exactly "red" and "blue"). Then stop and wait for my answer. When my answer arrives, reply with exactly: you chose <color>' });
+      assert(r.accepted && r.inputId, 'channel input was not accepted');
+      const first = await watch.turnStartedWith(r.inputId);
+      const sent = await waitFor('the choice message on the channel', TURN_MS, () => w.chat.sent.find((m) => m.msg.actions?.some((a) => parseChoiceActionId(a.id))));
+      const choice = (sent.msg.channelData as Record<string, ChoiceData>)[CHOICE_KEY]!;
+      assert(choice && choice.options.map((o) => o.toLowerCase()).join(',') === 'red,blue', `options were ${JSON.stringify(choice?.options)}`);
+      const done1 = await watch.completed(first.turnId);
+      assert(done1.status === 'completed', `asking turn ended ${done1.status}`);
+      const blue = sent.msg.actions!.find((a) => /blue/i.test(a.label))!;
+      ctx.progress(`clicking ${blue.id}`);
+      // A click arrives like any card action: an `action` event with the button's id.
+      const click = await w.chat.inject({ sender: ALICE, content: [{ type: 'event', name: 'action', data: { actionId: blue.id, messageId: sent.providerMessageId } }] });
+      assert(click.accepted && click.inputId, 'click was not accepted');
+      const second = await watch.turnStartedWith(click.inputId);
+      const done2 = await watch.completed(second.turnId);
+      assert(done2.status === 'completed', `answer turn ended ${done2.status}`);
+      const text = watch.finalText(second.turnId);
+      assert(/blue/i.test(text), `answer does not mention blue: ${JSON.stringify(text.slice(0, 80))}`);
+      const settled = watch.of('delivery.settled').find((d) => d.operationId === outputsOf(w, sk).find((o) => o.tool === 'ask_choice')?.operationId);
+      assert(settled?.result === 'delivered', 'ask_choice delivery was not settled as delivered');
+      return `buttons ${sent.msg.actions!.map((a) => a.label).join('/')} on the channel (choice ${choice.choiceId}); click → new turn → ${JSON.stringify(text.slice(0, 40))}; ${metaSummary(w)}`;
+    },
+  },
+  {
+    id: 'n',
+    name: 'output-send-file',
+    skip: (c) => (c.outputTools ? undefined : 'outputTools is off'),
+    async run(ctx) {
+      const w = await world(ctx);
+      const sk = 'e2e:default:c1';
+      const body = `# e2e file\nmarker ${Math.random().toString(36).slice(2)}\n`;
+      writeFileSync(join(w.config.cwd, 'README.md'), body);
+      const watch = await w.watch(sk);
+      const r = await w.chat.inject({ sender: ALICE, text: 'Send the file README.md to me (use the send_file tool). Then reply with exactly: sent' });
+      assert(r.accepted && r.inputId, 'channel input was not accepted');
+      const turn = await watch.turnStartedWith(r.inputId);
+      const done = await watch.completed(turn.turnId);
+      assert(done.status === 'completed', `turn ended ${done.status}`);
+      const sent = w.chat.sent.find((m) => m.msg.attachments?.length);
+      const mcpStatus = (w.raw.get(sk) ?? []).filter((e) => e.body.t === 'native' && e.body.name === 'mcpServer/startupStatus/updated').map((e) => JSON.stringify(e.native).slice(0, 160));
+      assert(sent, `no attachment reached the channel (tool calls: ${w.toolCalls.map((c) => `${c.tool}:${c.ok ? 'ok' : c.error}`).join(', ') || 'none'}; answer ${JSON.stringify(watch.finalText(turn.turnId).slice(0, 200))}; mcp ${mcpStatus.join(' | ')})`);
+      const att = sent.msg.attachments![0]!;
+      assert(att.name === 'README.md', `attachment name ${att.name}`);
+      const got = new TextDecoder().decode((await w.gw.blobs.get(att.ref)).bytes);
+      assert(got === body, 'attachment bytes differ from README.md');
+      const op = outputsOf(w, sk).find((o) => o.tool === 'send_file');
+      assert(op && watch.of('delivery.settled').some((d) => d.operationId === op.operationId && d.result === 'delivered'), 'send_file delivery not settled');
+      return `README.md (${att.mime}, ${got.length} bytes) arrived as an attachment, bytes match; ${metaSummary(w)}`;
+    },
+  },
+  {
+    id: 'o',
+    name: 'output-terminal-choose',
+    skip: (c) => (c.outputTools ? undefined : 'outputTools is off'),
+    async run(ctx) {
+      const w = await world(ctx);
+      const sk = 'e2e:local';
+      const c = await w.client();
+      const watch = await w.watch(sk, { client: c });
+      const r = await c.input(sk, 'Use the ask_choice tool to ask me: "Which fruit?" with options "apple" and "pear". Then stop and wait. When my answer arrives, reply with exactly: fruit <name>');
+      const first = await watch.turnStartedWith(r.inputId);
+      const out = await waitFor('the ask_choice output event', TURN_MS, () => watch.events.find((e) => e.body.t === 'native' && e.body.name === OUTPUT_EVENT && (e.native as OutputRecord).choice));
+      const choice = (out.native as OutputRecord).choice!;
+      await watch.completed(first.turnId);
+      const pear = choice.options.findIndex((o) => /pear/i.test(o)) + 1;
+      assert(pear > 0, `options ${JSON.stringify(choice.options)}`);
+      // What `/choose <id> <n>` sends.
+      const ans = await c.command<{ inputId: string }>({ type: 'input', sessionKey: sk, mode: 'queue', input: { content: [{ type: 'event', name: 'choice', data: { choiceId: choice.choiceId, selected: [pear] } }] } });
+      const bad = await c.command({ type: 'input', sessionKey: sk, mode: 'queue', input: { content: [{ type: 'event', name: 'choice', data: { choiceId: choice.choiceId, selected: [9] } }] } }).then(() => 'accepted', (e: Error) => e.message);
+      assert(bad !== 'accepted', 'an out-of-range /choose was accepted');
+      const second = await watch.turnStartedWith(ans.inputId);
+      await watch.completed(second.turnId);
+      const text = watch.finalText(second.turnId);
+      assert(/pear/i.test(text), `answer does not mention pear: ${JSON.stringify(text.slice(0, 80))}`);
+      return `choice event on the local stream (event-only), /choose ${choice.choiceId} ${pear} → ${JSON.stringify(text.slice(0, 30))}; bad answer refused (${bad.slice(0, 40)})`;
     },
   },
 ];

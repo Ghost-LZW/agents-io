@@ -14,6 +14,7 @@
     "@agents-io/channel-jsonl-bridge": "workspace:*",
     "@agents-io/channel-lark-bot": "workspace:*",
     "@agents-io/channel-mail": "workspace:*",
+    "@agents-io/host-mcp": "workspace:*",
     "@agents-io/harness-claude-code": "workspace:*",
     "@agents-io/harness-codex": "workspace:*",
     "@agents-io/protocol": "workspace:*",

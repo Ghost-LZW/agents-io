@@ -4,6 +4,7 @@
     { "path": "packages/protocol" },
     { "path": "packages/testkit" },
     { "path": "packages/session" },
+    { "path": "packages/host-mcp" },
     { "path": "channel/jsonl-bridge" },
     { "path": "channel/lark-bot" },
     { "path": "channel/mail" },

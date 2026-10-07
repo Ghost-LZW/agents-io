@@ -172,16 +172,23 @@ export class ClaudeCodeHarness implements HarnessAdapter {
     const env = this.childEnv(options.env);
 
     const mcpServers: Options['mcpServers'] = { ...c.mcpServers, ...options.sdk?.mcpServers };
+    const hostServer = options.mcpServerName ?? 'agents_io';
     if (args.mcp) {
+      const transport = options.mcpTransport ?? args.mcp.transport ?? 'http';
       // The SDK passes mcpServers to the CLI as `--mcp-config <json>` (argv, readable via ps by
       // other local users). The token goes in the CLI's env instead; the CLI expands ${VAR} in headers.
       env[MCP_TOKEN_ENV] = args.mcp.token;
-      mcpServers[options.mcpServerName ?? 'agents_io'] = {
-        type: options.mcpTransport ?? 'http',
+      mcpServers[hostServer] = {
+        type: transport,
         url: args.mcp.url,
         headers: { Authorization: `Bearer \${${MCP_TOKEN_ENV}}` },
-      };
+        // Host output tools are always in the prompt, never deferred behind tool search.
+        ...(transport === 'http' ? { alwaysLoad: true } : {}),
+      } as NonNullable<Options['mcpServers']>[string];
     }
+    // Host tools check their own destinations (Policy.outbound): never ask a person to approve them.
+    const allowedTools =
+      args.mcp && options.mcpAutoAllow !== false ? [...new Set([...(profile.allowedTools ?? []), `mcp__${hostServer}`])] : profile.allowedTools;
 
     const additionalDirectories = [...new Set([...(c.additionalDirectories ?? []), ...(profile.additionalDirectories ?? [])])];
     const sdkOptions: Options = {
@@ -196,7 +203,7 @@ export class ClaudeCodeHarness implements HarnessAdapter {
       ...(isEffort(args.run.effort) ? { effort: args.run.effort } : {}),
       permissionMode,
       ...(permissionMode === 'bypassPermissions' ? { allowDangerouslySkipPermissions: true } : {}),
-      ...(profile.allowedTools ? { allowedTools: profile.allowedTools } : {}),
+      ...(allowedTools ? { allowedTools } : {}),
       ...(profile.disallowedTools ? { disallowedTools: profile.disallowedTools } : {}),
       ...(additionalDirectories.length ? { additionalDirectories } : {}),
       permissionPrompts: profile.permissionPrompts ?? 'host',
