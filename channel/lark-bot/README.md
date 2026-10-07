@@ -11,4 +11,15 @@ Provision the app with [create-lark-bot](https://github.com/Ghost-LZW/create-lar
 
 `scopesJson()` returns the same list in the console's batch-import format. A test fails if the adapter starts registering an event or callback that is not listed in `requirements.ts`, so the list stays in step with the code.
 
+For example:
+
+```sh
+npx github:Ghost-LZW/create-lark-bot#v0.2.1 --name "my agent" --avatar ./avatar.png \
+  --preset messaging,contact --write-env .env.live \
+  --env-owner-var AGENTS_IO_OWNERS --owner-prefix lark-bot:
+npx github:Ghost-LZW/create-lark-bot#v0.2.1 verify --live
+```
+
+`messaging` covers every scope, event and callback in `requirements.ts`; `contact` lets the tool resolve your union_id, which it writes as the owner key.
+
 Then give the adapter the credentials (`LARK_APP_ID`, `LARK_APP_SECRET`, `LARK_DOMAIN`). The owner key that `defaultPolicy({ owners })` from `@agents-io/session` matches is `lark-bot:<union_id>`, because the adapter identifies senders by `union_id` first (falling back to `open_id`).
