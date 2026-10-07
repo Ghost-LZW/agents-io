@@ -20,9 +20,9 @@ import {
 } from '@agents-io/protocol';
 import { main } from '../src/cli.js';
 import { ConfigError, resolveConfig } from '../src/config.js';
-import { ConsoleAuth, CONSOLE_COOKIE } from '../src/console.js';
+import { ConsoleAuth } from '../src/console.js';
 import { consoleUrlPath } from '../src/token.js';
-import { daemon, until, type World } from './helpers.js';
+import { daemon, tmp, until, type World } from './helpers.js';
 
 const FAKE_BOT = fileURLToPath(new URL('./fixtures/fake-create-lark-bot.mjs', import.meta.url));
 const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };
@@ -89,13 +89,13 @@ describe('console auth', () => {
     expect(login.status).toBe(200);
     expect(login.body.expiresAt).toBeGreaterThan(Date.now());
     const cookie = login.headers.get('set-cookie')!;
-    expect(cookie).toMatch(new RegExp(`^${CONSOLE_COOKIE}=${login.body.token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=\\d+$`));
+    expect(cookie).toMatch(new RegExp(`^${w.gw.console!.cookieName}=${login.body.token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=\\d+$`));
     // Used once.
     expect(await w.api('/api/login', { method: 'POST', json: { loginToken }, token: null })).toMatchObject({ status: 401, body: { error: { code: 'unauthorized' } } });
     // The session works as a bearer token and as the cookie.
     expect((await w.api('/api/queue', { token: login.body.token })).status).toBe(200);
-    expect((await w.api('/api/queue', { token: null, headers: { Cookie: `${CONSOLE_COOKIE}=${login.body.token}` } })).status).toBe(200);
-    expect((await w.api('/api/queue', { token: null, headers: { Cookie: `${CONSOLE_COOKIE}=nope` } })).status).toBe(401);
+    expect((await w.api('/api/queue', { token: null, headers: { Cookie: `${w.gw.console!.cookieName}=${login.body.token}` } })).status).toBe(200);
+    expect((await w.api('/api/queue', { token: null, headers: { Cookie: `${w.gw.console!.cookieName}=nope` } })).status).toBe(401);
     expect(await w.api('/api/login-link', { method: 'POST', json: {}, token: login.body.token })).toMatchObject({ status: 403, body: { error: { code: 'forbidden' } } });
     // A malformed body is 400.
     expect(await w.api('/api/login', { method: 'POST', json: { nope: 1 }, token: null })).toMatchObject({ status: 400, body: { error: { code: 'invalid_request' } } });
@@ -150,7 +150,7 @@ describe('console listening and origins', () => {
     expect(resolveConfig({}, base).console).toMatchObject({ enabled: true, host: '127.0.0.1', port: 7464, allowRemote: false, origins: [] });
     expect(() => resolveConfig({ console: { host: '0.0.0.0' } }, base)).toThrow(ConfigError);
     expect(() => resolveConfig({ console: { host: '192.168.1.5' } }, base)).toThrow(/not a loopback address/);
-    expect(resolveConfig({ console: { host: '0.0.0.0', allowRemote: true } }, base).console.host).toBe('0.0.0.0');
+    expect(resolveConfig({ console: { host: '0.0.0.0', allowRemote: true, allowedHosts: ['aio.lan'] } }, base).console.host).toBe('0.0.0.0');
     expect(resolveConfig({ console: { host: '::1' } }, base).console.host).toBe('::1');
     expect(() => resolveConfig({ console: { origins: ['https://ui.example/path'] } }, base)).toThrow(/not an origin/);
   });
@@ -472,5 +472,201 @@ describe('console Lark bot provisioning', () => {
       await new Promise((r) => setTimeout(r, 20));
     }
     expect(cs).toMatchObject({ state: 'failed', error: { code: 'no_result', message: expect.stringContaining('exited with 7') } });
+  });
+
+  it('addChannel:false does not overwrite the credentials of an existing bot (env file or environment): refused, nothing spawned', async () => {
+    const { w, argsOut } = await provisioning();
+    const envFile = join(w.dir, '.env.live');
+    writeFileSync(envFile, 'LARK_APP_ID=cli_old\nLARK_APP_SECRET=old-secret\n', { mode: 0o600 });
+    const r = await w.api('/api/bots/lark', { method: 'POST', json: { name: 'Later', addChannel: false } });
+    expect(r).toMatchObject({ status: 409, body: { error: { code: 'conflict', message: expect.stringContaining('LARK_APP_ID') } } });
+    expect(JSON.stringify(r.body)).not.toContain('old-secret');
+    expect(readFileSync(envFile, 'utf8')).toBe('LARK_APP_ID=cli_old\nLARK_APP_SECRET=old-secret\n');
+    expect(existsSync(argsOut)).toBe(false);
+    // The same through the process environment.
+    const p = await provisioning('ok');
+    const e = await consoleDaemon({ raw: { console: { port: 0, larkBotCommand: [process.execPath, FAKE_BOT] } }, consoleEnv: { FAKE_ARGS_OUT: p.argsOut, LARK_APP_SECRET: 'x', PATH: process.env.PATH } });
+    expect((await e.api('/api/bots/lark', { method: 'POST', json: { name: 'Later', addChannel: false } })).status).toBe(409);
+  });
+});
+
+describe('console config: credentials by schema', () => {
+  // Every value below is a credential; none may come back from GET /api/config.
+  const SECRETS = ['imap-pw-1', 'smtp-pw-2', 'oauth-tok-3', 'ghp_pat4', 'sk-openai5', 'xoxb-slack6', 'mcp-env7', 'Bearer mcp-hdr8', 'settings-env9', 'codex-hdr10', 'codex-bearer11', 'codex-mcp12', 'bridge-env13', 'ARGTOK14', 'lark-secret15', 'lark-enc16', 'hdr-anywhere17', 'env-file-secret18'];
+  /** The repo's example config, plus the shapes real configs carry secrets in (all literal). */
+  const realWorld = (dir: string) => {
+    const ex = JSON.parse(readFileSync(fileURLToPath(new URL('../aio.config.example.json', import.meta.url)), 'utf8'));
+    ex.dataDir = dir;
+    ex.cwd = join(dir, 'work');
+    ex.console = { port: 0 };
+    ex.harnesses.claude.env = { GH_PAT: 'ghp_pat4', OPENAI_KEY: 'sk-openai5', SLACK_BOT: 'xoxb-slack6' };
+    ex.harnesses.claude.mcpServers = { gh: { command: 'gh-mcp', env: { GH: 'mcp-env7' } }, web: { type: 'http', url: 'https://mcp.example', headers: { Authorization: 'Bearer mcp-hdr8' } } };
+    ex.harnesses.claude.settings = { env: { SOME_VAR: 'settings-env9' } };
+    ex.harnesses.codex.config = { 'model_providers.p.http_headers': { 'X-Key': 'codex-hdr10' }, 'mcp_servers.m.bearer_token': 'codex-bearer11', 'mcp_servers.s.env': { TOK: 'codex-mcp12' } };
+    ex.harnesses.codex.options = { client: { headers: { 'X-Api': 'hdr-anywhere17' } } };
+    ex.channels[0].config = { appSecret: 'lark-secret15', encryptKey: 'lark-enc16', maxChars: 4000 };
+    ex.channels[1].env.API = 'bridge-env13';
+    ex.channels[1].args = ['echo_channel.py', '--token', 'ARGTOK14'];
+    ex.channels.push({
+      type: 'mail',
+      account: 'work',
+      config: {
+        account: 'work',
+        from: 'me@example.com',
+        imap: { host: 'imap.example.com', port: 993, secure: true, auth: { user: 'me@example.com', pass: 'imap-pw-1', accessToken: 'oauth-tok-3' } },
+        smtp: { host: 'smtp.example.com', port: 465, secure: true, auth: { user: 'me@example.com', pass: 'smtp-pw-2' } },
+      },
+    });
+    return ex;
+  };
+
+  async function realWorldDaemon() {
+    const w = await consoleDaemon();
+    const path = join(w.dir, 'aio.config.json');
+    writeFileSync(path, JSON.stringify(realWorld(w.dir), null, 2), { mode: 0o600 });
+    writeFileSync(join(w.dir, '.env.live'), 'LARK_APP_ID=cli_x\nLARK_APP_SECRET=env-file-secret18\n', { mode: 0o600 });
+    return { w, path };
+  }
+
+  it('GET of a real-world config (mail pass, env maps, headers, codex config, bridge args, lark config) shows no secret string anywhere', async () => {
+    const { w } = await realWorldDaemon();
+    const r = await w.api('/api/config');
+    expect(r.status).toBe(200);
+    expect(check(AdminConfigDocument, r.body)).toBe(true);
+    const text = JSON.stringify(r.body);
+    for (const s of SECRETS) expect(text, s).not.toContain(s);
+    const cfg = r.body.config as any;
+    expect(cfg.channels[2].config.imap.auth).toEqual({ user: 'me@example.com', pass: ADMIN_REDACTED, accessToken: ADMIN_REDACTED });
+    expect(cfg.channels[2].config.smtp.auth.pass).toBe(ADMIN_REDACTED);
+    expect(cfg.harnesses.claude.env).toEqual({ GH_PAT: ADMIN_REDACTED, OPENAI_KEY: ADMIN_REDACTED, SLACK_BOT: ADMIN_REDACTED });
+    // Non-secret settings stay readable; env: references are shown as written.
+    expect(cfg.channels[2].config.imap.host).toBe('imap.example.com');
+    expect(cfg.channels[0].config.maxChars).toBe(4000);
+    expect(cfg.channels[1].args.slice(0, 2)).toEqual(['echo_channel.py', '--token']);
+    expect(cfg.harnesses['claude-gateway'].env.ANTHROPIC_BASE_URL).toBe('env:GATEWAY_BASE_URL');
+    expect(r.body.issues).toContainEqual(expect.objectContaining({ path: '/channels/2/config/imap/auth/pass', code: 'inline_secret', severity: 'warning' }));
+  });
+
+  it('PUT refuses literals in credential fields whatever their name, keeps stored values for the marker, and honours the marker only on credential fields', async () => {
+    const { w, path } = await realWorldDaemon();
+    const doc = (await w.api('/api/config')).body as AdminConfigDocument;
+    const before = readFileSync(path, 'utf8');
+    for (const [where, set] of [
+      ['/channels/2/config/smtp/auth/pass', (c: any) => (c.channels[2].config.smtp.auth.pass = 'new-pw')],
+      ['/harnesses/claude/env/GH_PAT', (c: any) => (c.harnesses.claude.env.GH_PAT = 'ghp_new')],
+      ['/channels/1/env/OTHER', (c: any) => (c.channels[1].env.OTHER = 'plain')],
+      ['/harnesses/claude/mcpServers/web/headers/X-Extra', (c: any) => (c.harnesses.claude.mcpServers.web.headers['X-Extra'] = 'v')],
+    ] as const) {
+      const next = structuredClone(doc.config) as any;
+      set(next);
+      const r = await w.api('/api/config', { method: 'PUT', json: { config: next, ifRevision: doc.revision } });
+      expect(r.status, where).toBe(422);
+      expect(r.body.issues).toContainEqual(expect.objectContaining({ path: where, code: 'inline_secret', severity: 'error' }));
+      for (const s of SECRETS) expect(JSON.stringify(r.body)).not.toContain(s);
+    }
+    expect(readFileSync(path, 'utf8')).toBe(before);
+    // The marker is not a way to copy a stored secret into a field GET would show.
+    const moved = structuredClone(doc.config) as any;
+    moved.channels[2].config.imap.host = ADMIN_REDACTED;
+    expect((await w.api('/api/config/validate', { method: 'POST', json: { config: moved } })).body.issues).toContainEqual(expect.objectContaining({ path: '/channels/2/config/imap/host', code: 'redacted_without_value' }));
+    // Sent back unchanged (markers everywhere), every stored value is kept.
+    const same = structuredClone(doc.config) as any;
+    same.outputTools = false;
+    const ok = await w.api('/api/config', { method: 'PUT', json: { config: same, ifRevision: doc.revision } });
+    expect(ok.body.issues?.filter((i: any) => i.severity === 'error')).toEqual([]);
+    expect(ok.status).toBe(200);
+    const written = JSON.parse(readFileSync(path, 'utf8'));
+    expect(written.channels[2].config.imap.auth.pass).toBe('imap-pw-1');
+    expect(written.harnesses.claude.env.GH_PAT).toBe('ghp_pat4');
+    expect(written.channels[1].args[2]).toBe('ARGTOK14');
+  });
+});
+
+describe('console URL file and console-link', () => {
+  it('a stale console URL file is removed at start, also when the bind fails', async () => {
+    const a = await consoleDaemon();
+    const port = Number(new URL(a.url).port);
+    const dir = tmp();
+    const sock = join(dir, 'run', 'aio.sock');
+    const { mkdirSync } = await import('node:fs');
+    mkdirSync(join(dir, 'run'), { recursive: true, mode: 0o700 });
+    writeFileSync(consoleUrlPath(sock), 'http://127.0.0.1:1\n', { mode: 0o600 });
+    const b = await daemon({ dir, console: true, raw: { console: { port } } });
+    expect(b.config.socketPath).toBe(sock);
+    expect(b.gw.console).toBeUndefined();
+    expect(existsSync(consoleUrlPath(sock))).toBe(false);
+  });
+
+  it('aio console-link never sends the host token to a listener that is not this daemon', async () => {
+    const w = await consoleDaemon();
+    const { createServer } = await import('node:http');
+    const seen: (string | undefined)[] = [];
+    const foreign = createServer((req, res) => {
+      seen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ url: 'http://evil/#login=x', proof: 'x' }));
+    });
+    await new Promise<void>((r) => foreign.listen(0, '127.0.0.1', () => r()));
+    try {
+      const port = (foreign.address() as { port: number }).port;
+      writeFileSync(consoleUrlPath(w.config.socketPath), `http://127.0.0.1:${port}\n`, { mode: 0o600 });
+      const err = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      try {
+        await expect(main(['console-link', '--socket', w.config.socketPath])).rejects.toThrow(/not this daemon's console; the host token was not sent/);
+      } finally {
+        err.mockRestore();
+        log.mockRestore();
+      }
+      expect(seen.some((a) => a?.includes(w.gw.token))).toBe(false);
+    } finally {
+      foreign.close();
+    }
+  });
+});
+
+describe('console cookie scope', () => {
+  it('the cookie name is per daemon; a session works only through the Host it logged in with', async () => {
+    const a = await consoleDaemon();
+    const b = await consoleDaemon();
+    expect(a.gw.console!.cookieName).toMatch(/^aio_console_[0-9a-f]{12,}$/);
+    expect(a.gw.console!.cookieName).not.toBe(b.gw.console!.cookieName);
+    const link = await a.api('/api/login-link', { method: 'POST', json: {} });
+    const login = await a.api('/api/login', { method: 'POST', json: { loginToken: link.body.url.split('#login=')[1] }, token: null });
+    expect(login.headers.get('set-cookie')).toMatch(new RegExp(`^${a.gw.console!.cookieName}=[\\w-]+; HttpOnly; SameSite=Strict; Path=/; Max-Age=\\d+$`));
+    const port = new URL(a.url).port;
+    expect((await rawGet(a.url, '/api/queue', { Host: `127.0.0.1:${port}`, Authorization: `Bearer ${login.body.token}` })).status).toBe(200);
+    expect((await rawGet(a.url, '/api/queue', { Host: `localhost:${port}`, Authorization: `Bearer ${login.body.token}` })).status).toBe(401);
+    expect((await rawGet(a.url, '/api/queue', { Host: `127.0.0.1:${port}`, Cookie: `aio_console=${login.body.token}` })).status).toBe(401);
+  });
+
+  it('/ws: a valid bearer subprotocol wins over a stale cookie', async () => {
+    const w = await consoleDaemon();
+    const code = await new Promise<number>((resolve) => {
+      const ws = new WebSocket(`${w.url.replace('http', 'ws')}/ws`, [ADMIN_WS_SUBPROTOCOL, ADMIN_WS_BEARER_PREFIX + w.gw.token], { headers: { Cookie: `aio_console=stale; ${w.gw.console!.cookieName ?? "aio_console"}=stale` } });
+      ws.on('unexpected-response', (_q, res) => resolve(res.statusCode!));
+      ws.on('open', () => {
+        ws.close();
+        resolve(101);
+      });
+      ws.on('error', () => undefined);
+    });
+    expect(code).toBe(101);
+  });
+});
+
+describe('console allowed hosts', () => {
+  it('a wildcard bind with allowRemote needs console.allowedHosts, and accepts those Host values', async () => {
+    const base = { env: {}, baseDir: tmp(), cwd: tmp() };
+    expect(() => resolveConfig({ console: { host: '0.0.0.0', allowRemote: true } }, base)).toThrow(/allowedHosts/);
+    expect(resolveConfig({ console: { host: '0.0.0.0', allowRemote: true, allowedHosts: ['aio.lan', '192.168.1.5'] } }, base).console.allowedHosts).toEqual(['aio.lan', '192.168.1.5']);
+    const w = await consoleDaemon({ raw: { console: { host: '0.0.0.0', allowRemote: true, allowedHosts: ['aio.lan', '192.168.1.5'] } } });
+    // The URL (and default login links) never name the wildcard address.
+    expect(w.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+    const port = new URL(w.url).port;
+    const auth = `Bearer ${w.gw.token}`;
+    expect((await rawGet(w.url, '/api/status', { Host: `aio.lan:${port}`, Authorization: auth })).status).toBe(200);
+    expect((await rawGet(w.url, '/api/status', { Host: `192.168.1.5:${port}`, Authorization: auth })).status).toBe(200);
+    expect((await rawGet(w.url, '/api/status', { Host: `evil.example:${port}`, Authorization: auth })).status).toBe(403);
+    expect((await rawGet(w.url, '/api/status', { Host: `0.0.0.0:${port}`, Authorization: auth })).status).toBe(403);
   });
 });

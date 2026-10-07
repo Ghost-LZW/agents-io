@@ -75,13 +75,15 @@ export class LarkBotJobs {
     if (req.avatar !== undefined && !AVATAR.test(req.avatar)) return { ok: false, status: 400, code: 'invalid_request', message: 'avatar must be a data:image/(png|jpeg|webp|gif);base64 URI' };
     if (req.presets?.some((p) => !/^[A-Za-z][\w-]*$/.test(p))) return { ok: false, status: 400, code: 'invalid_request', message: 'presets are names (letters, digits, - and _)' };
     const account = req.account ?? 'default';
-    if (req.addChannel !== false) {
-      const raw = this.o.config.read().raw as { channels?: { type?: string; account?: string }[] };
-      const existing = (raw.channels ?? []).find((c) => c.type === 'lark-bot');
-      // The lark-bot channel reads LARK_APP_ID / LARK_APP_SECRET: a second bot would overwrite the first one's credentials.
-      if (existing)
-        return { ok: false, status: 409, code: 'conflict', message: `a lark-bot channel (account ${existing.account ?? 'default'}) is already configured; its credentials (LARK_APP_ID, LARK_APP_SECRET) would be replaced. Remove it first` };
-    }
+    // create-lark-bot always writes LARK_APP_ID / LARK_APP_SECRET into the daemon's env file, whether or not the
+    // config gets a channel (addChannel): with a bot already there, that would silently replace its credentials.
+    const raw = this.o.config.read().raw as { channels?: { type?: string; account?: string }[] };
+    const existing = (raw.channels ?? []).find((c) => c.type === 'lark-bot');
+    if (existing)
+      return { ok: false, status: 409, code: 'conflict', message: `a lark-bot channel (account ${existing.account ?? 'default'}) is already configured; its credentials (LARK_APP_ID, LARK_APP_SECRET) would be replaced. Remove it first` };
+    const taken = this.o.config.defined(['LARK_APP_ID', 'LARK_APP_SECRET']);
+    if (taken.length)
+      return { ok: false, status: 409, code: 'conflict', message: `${taken.join(' and ')} ${taken.length > 1 ? 'are' : 'is'} already set (env file ${this.o.config.envFilePath()} or the environment); a new bot would replace those credentials. Remove them first` };
     const id = `lark_${randomUUID()}`;
     const dir = join(this.o.dir, id);
     mkdirSync(dir, { recursive: true, mode: 0o700 });

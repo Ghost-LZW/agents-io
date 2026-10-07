@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { readFileSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -8,6 +8,7 @@ import type { ContentBlock, RenderedMessage, ReplyRoute, RunEnded, SessionEvent,
 import { runAttach } from './attach.js';
 import { CommandError, DaemonUnavailable, LocalClient } from './client.js';
 import { ConfigError, defaultInstance, loadConfig, type LoadOptions } from './config.js';
+import { consoleProof } from './console.js';
 import { runScenarios } from './e2e.js';
 import { Gateway, buildHarness } from './gateway.js';
 import { TokenError, consoleUrlPath, readTokenFile, tokenPath } from './token.js';
@@ -493,7 +494,9 @@ async function verify(a: CliArgs): Promise<number> {
 
 /**
  * `aio console-link`: ask the running daemon's console (with the host token)
- * for a one-time login link and print it.
+ * for a one-time login link and print it. The console first proves it knows
+ * the host token (`POST /api/console-proof`, an HMAC over a fresh challenge),
+ * so the token is never sent to another listener on that port.
  */
 async function consoleLink(a: CliArgs): Promise<number> {
   const socket = socketOf(a);
@@ -506,8 +509,17 @@ async function consoleLink(a: CliArgs): Promise<number> {
   }
   let res: Response;
   try {
+    // The URL file may be stale and the port someone else's: the host token goes only to a listener that proves it knows it.
+    const challenge = randomBytes(24).toString('base64url');
+    const p = await fetch(`${url}/api/console-proof`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ challenge }) });
+    const proof = p.ok ? ((await p.json().catch(() => ({}))) as { proof?: unknown }).proof : undefined;
+    const want = Buffer.from(consoleProof(token, challenge));
+    const got = Buffer.from(typeof proof === 'string' ? proof : '');
+    if (got.length !== want.length || !timingSafeEqual(got, want))
+      throw new CommandError('not_this_daemon', `${url} (from ${consoleUrlPath(socket)}) is not this daemon's console; the host token was not sent. Restart \`aio serve\` or check console.port`);
     res = await fetch(`${url}/api/login-link`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: '{}' });
   } catch (e) {
+    if (e instanceof CommandError) throw e;
     throw new DaemonUnavailable(`cannot reach the console at ${url}: ${(e as Error).message}`);
   }
   const body = (await res.json()) as { url?: string; expiresAt?: number; error?: { code: string; message: string } };

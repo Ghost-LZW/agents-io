@@ -104,7 +104,8 @@ against the protocol alone.
 "console": {
   "enabled": true,            // default true for `aio serve`
   "host": "127.0.0.1",        // default; a non-loopback host is refused unless "allowRemote": true (then a warning at start)
-  "port": 7464,               // 0: any free port; the URL is written to <socket>.console (0600)
+  "port": 7464,               // 0: any free port; the URL is written to <socket>.console (0600) after a successful bind
+  "allowedHosts": ["aio.lan"], // extra Host header names (LAN name/address); required with "host": "0.0.0.0" / "::" and allowRemote
   "origins": ["https://ui.example"],   // CORS for a separately hosted UI; none by default
   "uiUrl": "https://ui.example",       // where login links point (default: the console itself)
   "sessionTtlMs": 43200000,
@@ -113,27 +114,44 @@ against the protocol alone.
 ```
 
 - **Auth**: `Authorization: Bearer <token>` with the host token (`<socket>.token`)
-  or a console session token; the session cookie (`aio_console`, HttpOnly,
-  SameSite=Strict); for `/ws` from a browser the subprotocols
-  `["agents-io.v1", "agents-io.bearer.<token>"]`. `aio console-link` prints a
+  or a console session token; for `/ws` from a browser the subprotocols
+  `["agents-io.v1", "agents-io.bearer.<token>"]`; the session cookie
+  (`aio_console_<instance id>`, random per daemon start, HttpOnly,
+  SameSite=Strict, Path=/). Explicit credentials (header, then subprotocol) win
+  over the cookie. Cookies are not port-scoped: the browser sends it to every
+  server on that host name, whatever the port, and any of them could replay it.
+  A session only works through the `Host` it logged in with, but non-browser
+  clients and separately hosted UIs should keep the session token and send it
+  as a bearer token or the subprotocol. `aio console-link` prints a
   one-time login URL (`<uiUrl>/#login=<token>`, 5 minutes, single use);
   `POST /api/login { loginToken }` exchanges it for a session (cookie + token).
   Missing, wrong or expired credentials → 401. Sessions live in memory (gone at
   restart). Login links are made with the host token only
-  (`POST /api/login-link`).
+  (`POST /api/login-link`); `aio console-link` first has the console answer
+  `POST /api/console-proof { challenge }` with an HMAC keyed by the host token,
+  so a stale `<socket>.console` pointing at someone else's listener never gets
+  the token. The daemon removes that file at start, writes it only once bound,
+  and removes it at stop.
 - **Origins**: requests with an `Origin` that is neither the console's own nor in
-  `origins` → 403; requests whose `Host` is not loopback / the configured host →
-  403 (DNS rebinding). Bodies must be `application/json`.
+  `origins` → 403; requests whose `Host` is not loopback, the configured
+  (concrete) host or in `allowedHosts` → 403 (DNS rebinding). A wildcard bind is
+  advertised as `http://127.0.0.1:<port>`. Bodies must be `application/json`.
 - **Endpoints**: `GET /api/status`, `GET|PUT /api/config`,
   `POST /api/config/validate`, `GET /api/explain/:inputId`, `GET /api/queue`,
   `GET /api/sessions`, `POST /api/bots/lark`, `GET /api/bots/lark/:job`; `GET /`
   is a minimal page that completes a login link opened on the console itself.
-- **Config**: `GET` shows `env:NAME` references as written and every other
-  string under a secret-looking key (`password`, `secret`, `token`, `apiKey`,
-  `authorization`, …) as `<redacted>`, plus each referenced variable as set /
-  unset (never its value). `PUT` (and `validate`) run the startup validation
-  (`resolveConfig`, with the env file read afresh), keep stored values where the
-  document says `<redacted>`, refuse new literal secrets (`inline_secret`, 422),
+- **Config**: credential fields follow the config schema: every value of an
+  `env` map (harness instance, `mcpServers.<id>.env`, `settings.env`, bridge
+  channel, codex `mcp_servers.<id>.env`), every header (`headers`,
+  `http_headers`), codex `bearer_token`s, mail `imap|smtp.auth.pass` /
+  `accessToken`, lark-bot `appSecret` / `encryptKey` / `verificationToken`, a
+  bridge argument after a secret-looking flag, and in free-form parts any string
+  under a secret-looking key. `GET` shows them only as `env:NAME` references or
+  `<redacted>`, plus each referenced variable as set / unset (never its value).
+  `PUT` (and `validate`) run the startup validation (`resolveConfig`, with the
+  env file read afresh), keep stored values where a credential field says
+  `<redacted>` (elsewhere the marker is an error), refuse new literals in
+  credential fields (`inline_secret`, 422),
   honor `ifRevision` (409), and write atomically (temp + fsync + rename, 0600).
   The daemon does not reload: `applied: "restart"` unless the file is back to
   what it started with.
@@ -149,7 +167,9 @@ against the protocol alone.
   references. On success the config gets a `lark-bot` channel (unless
   `addChannel: false`) and the verified owner `lark-bot:<union_id>` in
   `policy.owners`; restart to start it. One job at a time, and one lark-bot
-  channel per daemon (409 otherwise).
+  channel per daemon: a lark-bot channel in the config, or `LARK_APP_ID` /
+  `LARK_APP_SECRET` already set in the env file or environment, is 409 (also
+  with `addChannel: false`, since the env file would be overwritten).
 
 ## CLI
 

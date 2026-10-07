@@ -270,6 +270,12 @@ export const ConfigFile = Type.Object(
           /** 0: any free port (the URL is written next to the socket, `<socket>.console`). */
           port: Type.Optional(Type.Integer({ minimum: 0, maximum: 65535 })),
           allowRemote: Type.Optional(Type.Boolean()),
+          /**
+           * Extra names the `Host` header may carry (anti DNS rebinding), e.g. the LAN name or
+           * address remote browsers use. Loopback names and a concrete `host` are always accepted.
+           * Required with a wildcard `host` (0.0.0.0, ::) and `allowRemote`.
+           */
+          allowedHosts: Type.Optional(Type.Array(Type.String())),
           /** Origins of separately hosted UIs allowed to call the API (CORS); none by default. */
           origins: Type.Optional(Type.Array(Type.String())),
           /** Where the UI is; login links point there (default: the console URL itself). */
@@ -403,6 +409,8 @@ export interface ConsoleConfig {
   host: string;
   port: number;
   allowRemote: boolean;
+  /** Lowercased host names (no port, no brackets) the `Host` header may carry besides loopback and `host`. */
+  allowedHosts: string[];
   /** Normalized origins (`scheme://host[:port]`). */
   origins: string[];
   uiUrl?: string;
@@ -420,10 +428,23 @@ export function isLoopbackHost(host: string): boolean {
   return h === 'localhost' || h === '::1' || /^127(\.\d{1,3}){3}$/.test(h);
 }
 
+/** 0.0.0.0, ::, [::]: every interface. */
+export function isWildcardHost(host: string): boolean {
+  const h = host.replace(/^\[|\]$/g, '');
+  return h === '0.0.0.0' || h === '::' || h === '';
+}
+
 function resolveConsole(c: ConfigFile['console']): ConsoleConfig {
   const host = c?.host ?? '127.0.0.1';
   if (!isLoopbackHost(host) && c?.allowRemote !== true)
     fail(`console.host ${JSON.stringify(host)} is not a loopback address; the console only listens on loopback unless console.allowRemote is true`);
+  const allowedHosts = (c?.allowedHosts ?? []).map((h, i) => {
+    const n = h.replace(/^\[|\]$/g, '').toLowerCase();
+    if (!/^[a-z0-9.:-]+$/.test(n) || isWildcardHost(n)) fail(`console.allowedHosts[${i}]: ${JSON.stringify(h)} is not a host name or address (no port, no wildcard)`);
+    return n;
+  });
+  if (isWildcardHost(host) && c?.allowRemote === true && allowedHosts.length === 0)
+    fail(`console.host ${JSON.stringify(host)} listens on every interface: list the names remote browsers use in console.allowedHosts (the Host header is checked against them)`);
   const origins = (c?.origins ?? []).map((o, i) => {
     try {
       const u = new URL(o);
@@ -439,6 +460,7 @@ function resolveConsole(c: ConfigFile['console']): ConsoleConfig {
     host,
     port: c?.port ?? DEFAULT_CONSOLE_PORT,
     allowRemote: c?.allowRemote === true,
+    allowedHosts,
     origins,
     ...(c?.uiUrl !== undefined ? { uiUrl: c.uiUrl.replace(/\/$/, '') } : {}),
     sessionTtlMs: c?.sessionTtlMs ?? 12 * 3_600_000,

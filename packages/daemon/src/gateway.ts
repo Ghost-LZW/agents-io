@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
   PROTOCOL_VERSION,
@@ -375,6 +375,9 @@ export class Gateway {
       },
       log: (level, msg) => this.log(level, msg),
     });
+    // A file left by a daemon that died must not point `aio console-link` at whoever holds that port now.
+    const urlFile = consoleUrlPath(c.socketPath);
+    if (this.tokenFile) rmSync(urlFile, { force: true });
     try {
       await server.listen();
     } catch (e) {
@@ -385,7 +388,7 @@ export class Gateway {
     this.log('info', `console API on ${server.url}`);
     if (this.tokenFile) {
       // Next to the token file (same private directory), so `aio console-link` finds the port.
-      this.consoleFile = consoleUrlPath(c.socketPath);
+      this.consoleFile = urlFile;
       writeTokenFile(this.consoleFile, server.url);
     }
   }

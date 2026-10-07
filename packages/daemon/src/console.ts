@@ -1,8 +1,8 @@
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { Duplex } from 'node:stream';
-import type { Static, TSchema } from '@sinclair/typebox';
+import { Type, type Static, type TSchema } from '@sinclair/typebox';
 import { WebSocketServer, type WebSocket } from 'ws';
 import {
   ADMIN_WS_BEARER_PREFIX,
@@ -23,7 +23,7 @@ import {
   type AdminStatus,
   type Origin,
 } from '@agents-io/protocol';
-import { isLoopbackHost, type ConsoleConfig } from './config.js';
+import { isLoopbackHost, isWildcardHost, type ConsoleConfig } from './config.js';
 import type { ConfigStore } from './console-config.js';
 import type { LogFn } from './gateway.js';
 import { FrameConn, type FrameTransport, type LocalHost } from './local-server.js';
@@ -36,13 +36,21 @@ import type { LarkBotJobs } from './provision.js';
  * - Listens on loopback unless the config allows otherwise (config.ts refuses
  *   a non-loopback host without `console.allowRemote`).
  * - Auth: `Authorization: Bearer <token>` (the daemon's host token, or a
- *   console session token), the session cookie a login sets (HttpOnly,
- *   SameSite=Strict), or for `/ws` the subprotocol pair
- *   `[ADMIN_WS_SUBPROTOCOL, ADMIN_WS_BEARER_PREFIX + token]`. A login link
+ *   console session token), for `/ws` the subprotocol pair
+ *   `[ADMIN_WS_SUBPROTOCOL, ADMIN_WS_BEARER_PREFIX + token]`, or the session
+ *   cookie a login sets (HttpOnly, SameSite=Strict, Path=/). Explicit
+ *   credentials (header, then subprotocol) win over the cookie. A login link
  *   carries a one-time token (5 min, single use) that `POST /api/login`
  *   exchanges for a session (cookie + token in the body). Login links are made
  *   with the host token only (`POST /api/login-link`, what `aio console-link`
- *   calls).
+ *   calls after `POST /api/console-proof` showed it talks to this daemon).
+ * - Cookies are not port-scoped: a browser sends the console cookie to every
+ *   server on the same host name, whatever its port, and any of them can
+ *   replay it. The cookie name carries a random per-daemon instance id (so
+ *   daemons on one host do not clobber each other), and a session only works
+ *   through the `Host` it logged in with; still, non-browser clients and
+ *   separately hosted UIs should keep the session token themselves and send it
+ *   as a bearer token or the subprotocol, not rely on the cookie.
  * - Requests with an `Origin` other than the console's own or a configured one
  *   are refused (403); the configured ones get CORS headers (no credentials:
  *   a separately hosted UI uses bearer tokens). Requests whose `Host` is not
@@ -52,7 +60,11 @@ import type { LarkBotJobs } from './provision.js';
  *   `host.hello` with the host token.
  */
 
-export const CONSOLE_COOKIE = 'aio_console';
+/** Prefix of the session cookie's name; the full name adds the daemon's instance id (`ConsoleServer.cookieName`). */
+export const CONSOLE_COOKIE_PREFIX = 'aio_console_';
+/** What `POST /api/console-proof` answers: HMAC-SHA256(host token, PROOF_LABEL + challenge), base64url. */
+export const consoleProof = (hostToken: string, challenge: string) => createHmac('sha256', hostToken).update(`aio-console-proof:${challenge}`).digest('base64url');
+const ProofRequest = Type.Object({ challenge: Type.String({ minLength: 16, maxLength: 256 }) });
 const LOGIN_TTL_MS = 5 * 60_000;
 const MAX_BODY = 4 * 1024 * 1024;
 const WS_HIGH_WATER = 4 * 1024 * 1024;
@@ -80,7 +92,7 @@ type Role = 'host' | 'session';
 /** One-time login tokens and console sessions, in memory (gone at restart). Stored hashed. */
 export class ConsoleAuth {
   private readonly logins = new Map<string, number>();
-  private readonly sessions = new Map<string, number>();
+  private readonly sessions = new Map<string, { exp: number; host?: string }>();
   private readonly host: Buffer;
 
   constructor(
@@ -100,36 +112,38 @@ export class ConsoleAuth {
     return { token, expiresAt };
   }
 
-  /** Exchange a one-time token (single use) for a session. */
-  login(loginToken: string): AdminLoginResult | undefined {
+  /** Exchange a one-time token (single use) for a session, bound to the `Host` it was made through. */
+  login(loginToken: string, host?: string): AdminLoginResult | undefined {
     const k = hash(loginToken);
     const exp = this.logins.get(k);
     this.logins.delete(k);
     if (exp === undefined || exp <= this.now()) return undefined;
     const token = randomBytes(32).toString('base64url');
     const expiresAt = this.now() + this.sessionTtlMs;
-    this.sessions.set(hash(token), expiresAt);
+    this.sessions.set(hash(token), { exp: expiresAt, ...(host !== undefined ? { host: host.toLowerCase() } : {}) });
     return { token, expiresAt };
   }
 
-  /** Who a token is: the host, a live session, or nobody (with why). */
-  check(token: string | undefined): { ok: true; role: Role } | { ok: false; why: string } {
+  /** Who a token is (presented through `host`): the host, a live session, or nobody (with why). */
+  check(token: string | undefined, host?: string): { ok: true; role: Role } | { ok: false; why: string } {
     if (!token) return { ok: false, why: 'missing credentials (Authorization: Bearer <token>, the console cookie, or the bearer subprotocol)' };
     const given = Buffer.from(token);
     if (given.length === this.host.length && timingSafeEqual(given, this.host)) return { ok: true, role: 'host' };
     const k = hash(token);
-    const exp = this.sessions.get(k);
-    if (exp === undefined) return { ok: false, why: 'wrong token' };
-    if (exp <= this.now()) {
+    const s = this.sessions.get(k);
+    if (s === undefined) return { ok: false, why: 'wrong token' };
+    if (s.exp <= this.now()) {
       this.sessions.delete(k);
       return { ok: false, why: 'session expired; open a new login link (aio console-link)' };
     }
+    if (s.host !== undefined && host?.toLowerCase() !== s.host) return { ok: false, why: 'this session was made through another Host; log in through this one' };
     return { ok: true, role: 'session' };
   }
 
   private sweep(): void {
     const t = this.now();
-    for (const m of [this.logins, this.sessions]) for (const [k, exp] of m) if (exp <= t) m.delete(k);
+    for (const [k, exp] of this.logins) if (exp <= t) this.logins.delete(k);
+    for (const [k, s] of this.sessions) if (s.exp <= t) this.sessions.delete(k);
   }
 }
 
@@ -154,6 +168,8 @@ export interface ConsoleServerOptions {
 
 export class ConsoleServer {
   readonly auth: ConsoleAuth;
+  /** The session cookie's name: random per daemon start. */
+  readonly cookieName = CONSOLE_COOKIE_PREFIX + randomBytes(8).toString('hex');
   private server: Server | undefined;
   private readonly wss = new WebSocketServer({ noServer: true, handleProtocols: (protocols) => (protocols.has(ADMIN_WS_SUBPROTOCOL) ? ADMIN_WS_SUBPROTOCOL : false) });
   private readonly conns = new Set<FrameConn>();
@@ -167,7 +183,9 @@ export class ConsoleServer {
   get url(): string {
     const a = this.address;
     if (!a) throw new Error('console is not listening');
-    const host = a.family === 'IPv6' ? `[${a.address}]` : a.address;
+    // A wildcard bind is reached locally through loopback; remote users get `uiUrl` / allowedHosts names.
+    const addr = isWildcardHost(a.address) ? (a.family === 'IPv6' ? '::1' : '127.0.0.1') : a.address;
+    const host = addr.includes(':') ? `[${addr}]` : addr;
     return `http://${host}:${a.port}`;
   }
 
@@ -202,7 +220,7 @@ export class ConsoleServer {
     this.server = undefined;
   }
 
-  /** The `Host` header names this server (anti DNS-rebinding): a loopback name, or the configured host. */
+  /** The `Host` header names this server (anti DNS-rebinding): a loopback name, the configured (concrete) host, or one of `allowedHosts`. */
   private hostOk(req: IncomingMessage): boolean {
     const h = req.headers.host;
     if (!h) return false;
@@ -212,7 +230,10 @@ export class ConsoleServer {
     } catch {
       return false;
     }
-    return isLoopbackHost(name) || name.replace(/^\[|\]$/g, '') === this.o.config.host.replace(/^\[|\]$/g, '');
+    const bare = name.replace(/^\[|\]$/g, '').toLowerCase();
+    const c = this.o.config;
+    if (isLoopbackHost(bare) || c.allowedHosts.includes(bare)) return true;
+    return !isWildcardHost(c.host) && bare === c.host.replace(/^\[|\]$/g, '').toLowerCase();
   }
 
   /** undefined: no Origin (not a browser, or same-origin GET); 'self'; 'allowed' (configured, gets CORS); 'forbidden'. */
@@ -229,13 +250,14 @@ export class ConsoleServer {
     return 'forbidden';
   }
 
-  private credentials(req: IncomingMessage): string | undefined {
+  /** The credentials presented: the Authorization header, else the `/ws` bearer subprotocol, else the cookie. */
+  private credentials(req: IncomingMessage, bearer?: string): string | undefined {
     const a = req.headers.authorization;
     if (a) {
       const m = /^Bearer\s+(\S+)\s*$/i.exec(a);
       return m ? m[1] : '';
     }
-    return cookie(req, CONSOLE_COOKIE);
+    return bearer ?? cookie(req, this.cookieName);
   }
 
   private async onRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -268,7 +290,7 @@ export class ConsoleServer {
   }
 
   private authorize(req: IncomingMessage): Role {
-    const r = this.auth.check(this.credentials(req));
+    const r = this.auth.check(this.credentials(req), req.headers.host);
     if (!r.ok) throw new HttpError(401, 'unauthorized', r.why);
     return r.role;
   }
@@ -279,11 +301,16 @@ export class ConsoleServer {
     const p = url.pathname;
     if (m === 'POST' && p === '/api/login') {
       const body = await readJson(req, AdminLoginRequest);
-      const r = this.auth.login(body.loginToken);
+      const r = this.auth.login(body.loginToken, req.headers.host);
       if (!r) throw new HttpError(401, 'unauthorized', 'the login token is wrong, used or expired; open a new login link (aio console-link)');
       const maxAge = Math.max(1, Math.floor((r.expiresAt - Date.now()) / 1000));
-      res.setHeader('Set-Cookie', `${CONSOLE_COOKIE}=${r.token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}`);
+      res.setHeader('Set-Cookie', `${this.cookieName}=${r.token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}`);
       return { status: 200, body: r };
+    }
+    // Lets `aio console-link` check it talks to this daemon before it sends the host token.
+    if (m === 'POST' && p === '/api/console-proof') {
+      const body = await readJson(req, ProofRequest);
+      return { status: 200, body: { proof: consoleProof(h.token, body.challenge) } };
     }
     const role = this.authorize(req);
     if (m === 'POST' && p === '/api/login-link') {
@@ -346,7 +373,7 @@ export class ConsoleServer {
       .filter(Boolean);
     const bearer = protocols.find((p) => p.startsWith(ADMIN_WS_BEARER_PREFIX))?.slice(ADMIN_WS_BEARER_PREFIX.length);
     if (protocols.length && !protocols.includes(ADMIN_WS_SUBPROTOCOL)) return refuse(400, 'invalid_request', `subprotocol ${ADMIN_WS_SUBPROTOCOL} is required`);
-    const r = this.auth.check(this.credentials(req) ?? bearer);
+    const r = this.auth.check(this.credentials(req, bearer), req.headers.host);
     if (!r.ok) return refuse(401, 'unauthorized', r.why);
     this.wss.handleUpgrade(req, socket, head, (ws) => this.onSocket(ws));
   }
