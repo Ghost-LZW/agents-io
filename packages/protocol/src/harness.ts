@@ -14,6 +14,12 @@ export interface HarnessOpenArgs {
   mcp?: { url: string; token: string; transport?: 'http' | 'sse' };
   /** Harness-specific options from deployment config. */
   options?: Record<string, unknown>;
+  /**
+   * Extra child-process environment for this session (a session launch, decision 7),
+   * over the adapter's own. Never logged or put on argv. Adapters that cannot apply
+   * it per session must not be given it.
+   */
+  env?: Record<string, string>;
 }
 
 export type SteerResult = 'steered' | 'stale' | 'not_steerable' | 'no_active_turn' | 'unsupported';

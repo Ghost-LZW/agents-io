@@ -273,6 +273,7 @@ export class Gateway {
       records: this.records,
       runs: this.runs,
       deliver: (name, f) => this.deliver(name, f),
+      prepareSession: () => fail('unsupported', 'session.prepare is not implemented yet'),
       log: (level, msg, data) => this.log(level, msg, data),
       ...(o.hostPush?.timeoutMs !== undefined ? { pushTimeoutMs: o.hostPush.timeoutMs } : {}),
       ...(o.hostPush?.retryMs !== undefined ? { pushRetryMs: o.hostPush.retryMs } : {}),

@@ -85,6 +85,12 @@
           "type": "number"
         }
       }
+    },
+    "features": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     }
   }
 }

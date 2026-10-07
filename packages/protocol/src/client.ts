@@ -122,6 +122,8 @@ export const SessionInfo = Type.Object({
   pendingRequests: Type.Array(Type.String()),
   /** A lane (harness binding) exists in this process. */
   live: Type.Boolean(),
+  /** The session's pinned launch (decision 7): its cwd and env keys, never values. */
+  launch: Type.Optional(Type.Object({ cwd: Type.Optional(Type.String()), envKeys: Type.Array(Type.String()) })),
 });
 export type SessionInfo = Static<typeof SessionInfo>;
 

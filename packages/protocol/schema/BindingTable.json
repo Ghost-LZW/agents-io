@@ -207,6 +207,9 @@
                     "type": "string"
                   }
                 ]
+              },
+              "skipWhenPinned": {
+                "type": "boolean"
               }
             }
           },

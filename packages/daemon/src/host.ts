@@ -30,6 +30,8 @@ export interface HostServiceDeps {
   records: DaemonRecords;
   runs: Runs;
   deliver(hostName: string, f: Extract<HostRequestFrame, { type: 'deliver' }>): Promise<Outcome>;
+  /** `session.prepare`: pin an agent and a launch to a session key (decision 7). */
+  prepareSession(f: Extract<HostRequestFrame, { type: 'session.prepare' }>): Outcome;
   log: LogFn;
   /** How long a pushed `inbound` waits for the host's result before it is retried (default 30 s). */
   pushTimeoutMs?: number;
@@ -107,6 +109,8 @@ export class HostService implements HostFrames {
         const e = this.d.router.explain(f.inputId);
         return e ? ok(e) : fail('unknown_input', `no routing record for ${f.inputId} (unknown, or older than the retention)`);
       }
+      case 'session.prepare':
+        return this.d.prepareSession(f);
     }
   }
 
@@ -136,6 +140,7 @@ export class HostService implements HostFrames {
       host: role,
       bindings: { version: st?.table.version ?? null, active: st?.active ?? false, ...(st?.suspended ? { suspended: st.suspended } : {}) },
       ...(f.consumer !== undefined ? { inbound: { consumer: f.consumer, acked: this.d.queue.cursor(f.consumer), head: this.d.queue.head() } } : {}),
+      features: FEATURES,
     });
   }
 
@@ -175,6 +180,9 @@ export class HostService implements HostFrames {
     this.host?.push?.close();
   }
 }
+
+/** Capabilities `host.hello` advertises (a host must not rely on one this list lacks). */
+export const FEATURES = ['session.launch'];
 
 function ok<T>(value: T): Outcome {
   return { ok: true, value };

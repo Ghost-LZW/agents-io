@@ -1,43 +1,19 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "agents-io/v1/SessionInfo",
+  "$id": "agents-io/v1/SessionPrepareResult",
   "type": "object",
   "required": [
     "sessionKey",
-    "harness",
-    "state",
-    "head",
-    "queued",
-    "pendingRequests",
-    "live"
+    "agent",
+    "launch",
+    "created"
   ],
   "properties": {
     "sessionKey": {
       "type": "string"
     },
-    "harness": {
+    "agent": {
       "type": "string"
-    },
-    "state": {
-      "type": "string"
-    },
-    "head": {
-      "type": "number"
-    },
-    "turnId": {
-      "type": "string"
-    },
-    "queued": {
-      "type": "number"
-    },
-    "pendingRequests": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "live": {
-      "type": "boolean"
     },
     "launch": {
       "type": "object",
@@ -55,6 +31,9 @@
           }
         }
       }
+    },
+    "created": {
+      "type": "boolean"
     }
   }
 }

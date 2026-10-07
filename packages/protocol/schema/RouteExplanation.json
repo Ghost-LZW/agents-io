@@ -102,6 +102,10 @@
                   {
                     "const": "no_host",
                     "type": "string"
+                  },
+                  {
+                    "const": "skipped_pinned",
+                    "type": "string"
                   }
                 ]
               },
@@ -128,6 +132,30 @@
                     "type": "string"
                   }
                 ]
+              },
+              "reason": {
+                "type": "string"
+              }
+            }
+          },
+          "launch": {
+            "type": "object",
+            "required": [
+              "envKeys",
+              "outcome"
+            ],
+            "properties": {
+              "cwd": {
+                "type": "string"
+              },
+              "envKeys": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "outcome": {
+                "type": "string"
               }
             }
           },

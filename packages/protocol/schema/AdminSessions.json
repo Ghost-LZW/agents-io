@@ -47,6 +47,23 @@
           "live": {
             "type": "boolean"
           },
+          "launch": {
+            "type": "object",
+            "required": [
+              "envKeys"
+            ],
+            "properties": {
+              "cwd": {
+                "type": "string"
+              },
+              "envKeys": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "agent": {
             "type": "string"
           },

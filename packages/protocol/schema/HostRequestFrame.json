@@ -275,6 +275,9 @@
                             "type": "string"
                           }
                         ]
+                      },
+                      "skipWhenPinned": {
+                        "type": "boolean"
                       }
                     }
                   },
@@ -1181,6 +1184,52 @@
         },
         "inputId": {
           "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "sessionKey",
+        "agent",
+        "launch"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "session.prepare",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "sessionKey": {
+          "type": "string"
+        },
+        "agent": {
+          "type": "string"
+        },
+        "launch": {
+          "type": "object",
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "env": {
+              "type": "object",
+              "patternProperties": {
+                "^(.*)$": {
+                  "type": "string"
+                }
+              }
+            }
+          }
         }
       }
     }

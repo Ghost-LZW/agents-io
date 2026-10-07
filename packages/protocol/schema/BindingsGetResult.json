@@ -217,6 +217,9 @@
                             "type": "string"
                           }
                         ]
+                      },
+                      "skipWhenPinned": {
+                        "type": "boolean"
                       }
                     }
                   },
@@ -517,6 +520,9 @@
                                 "type": "string"
                               }
                             ]
+                          },
+                          "skipWhenPinned": {
+                            "type": "boolean"
                           }
                         }
                       },

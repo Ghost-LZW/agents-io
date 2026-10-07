@@ -101,6 +101,8 @@ export const HarnessHostFrame = Type.Union([
     run: RunSpec,
     mcp: Type.Optional(Type.Object({ url: Type.String(), token: Type.String() })),
     options: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+    /** Extra child-process environment for this session (`HarnessOpenArgs.env`). */
+    env: Type.Optional(Type.Record(Type.String(), Type.String())),
   }),
   Type.Object({
     ...Req('startTurn'),

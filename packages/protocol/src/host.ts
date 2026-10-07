@@ -76,10 +76,35 @@ export const Binding = Type.Object({
    * Opt-in synchronous callout to the host for this rule only (Envoy ext_authz style).
    * The host may replace `on` / `agent` / `session`; on timeout, error or no host, `onFailure` applies.
    */
-  callout: Type.Optional(Type.Object({ timeoutMs: Type.Optional(Type.Number()), onFailure: Type.Optional(BindingAction) })),
+  callout: Type.Optional(
+    Type.Object({
+      timeoutMs: Type.Optional(Type.Number()),
+      onFailure: Type.Optional(BindingAction),
+      /**
+       * Skip the callout once the rule's own target session is pinned (has a
+       * recorded `launch`): later inputs of that session are routed by the rule
+       * alone, so the host is asked once per session key (decision 7). Only for
+       * rules whose own `on` targets a session.
+       */
+      skipWhenPinned: Type.Optional(Type.Boolean()),
+    }),
+  ),
   note: Type.Optional(Type.String()),
 });
 export type Binding = Static<typeof Binding>;
+
+/**
+ * How one interactive session's harness is launched (decision 7): its working
+ * directory and extra child-process environment, within the bounds the agent's
+ * `sessionParams` sets. Fixed with the session once accepted.
+ */
+export const SessionLaunch = Type.Object({
+  /** Absolute; must be under one of the agent's `sessionParams.cwdRoots` (after realpath). */
+  cwd: Type.Optional(Type.String()),
+  /** Child-process environment only; never logged, never on argv. Keys must be in `sessionParams.envKeys`. */
+  env: Type.Optional(Type.Record(Type.String(), Type.String())),
+});
+export type SessionLaunch = Static<typeof SessionLaunch>;
 
 /** Channel identity → host principal. The host guarantees one member per channel identity (e.g. x-work-os 0010). */
 export const IdentityEntry = Type.Object({
@@ -115,8 +140,26 @@ export const RouteExplanation = Type.Object({
       agent: Type.Optional(Type.String()),
       sessionKey: Type.Optional(Type.String()),
       callout: Type.Optional(
-        Type.Object({ outcome: Type.Union([Type.Literal('answered'), Type.Literal('timeout'), Type.Literal('error'), Type.Literal('no_host')]), on: BindingAction }),
+        Type.Object({
+          outcome: Type.Union([
+            Type.Literal('answered'),
+            Type.Literal('timeout'),
+            Type.Literal('error'),
+            Type.Literal('no_host'),
+            /** `callout.skipWhenPinned`: the rule's session is pinned, the host was not asked. */
+            Type.Literal('skipped_pinned'),
+          ]),
+          on: BindingAction,
+          /** Why an answer counted as an error, e.g. `launch_conflict`. */
+          reason: Type.Optional(Type.String()),
+        }),
       ),
+      /**
+       * The callout answer carried a `launch` for this session: its cwd and env
+       * keys (never values), and what became of it: `applied` (new session),
+       * `same` (already pinned to it), or the refusal code.
+       */
+      launch: Type.Optional(Type.Object({ cwd: Type.Optional(Type.String()), envKeys: Type.Array(Type.String()), outcome: Type.String() })),
       /**
        * The target session refused the delivery before it reached a lane, with a
        * stable code, e.g. `agent_unavailable`: the agent the session is pinned to is
@@ -219,7 +262,16 @@ export const InboundAck = Type.Object({ ...Req('inbound.ack'), consumer: Type.St
 
 export const Explain = Type.Object({ ...Req('explain'), inputId: Type.String() });
 
-export const HostRequestFrame = Type.Union([HostHello, BindingsPut, BindingsGet, RunStart, RunCancel, Deliver, InputVerify, InboundRead, InboundAck, Explain]);
+/**
+ * Pin an agent and a launch to a session key before any input opens it (inputs
+ * from the host connection, `aio input`, `aio attach`, watches). Records only; the
+ * harness opens with the first input. The same values again are a no-op
+ * (`created: false`); different ones fail `launch_conflict` / `agent_conflict`.
+ */
+export const SessionPrepare = Type.Object({ ...Req('session.prepare'), sessionKey: Type.String(), agent: Type.String(), launch: SessionLaunch });
+export type SessionPrepare = Static<typeof SessionPrepare>;
+
+export const HostRequestFrame = Type.Union([HostHello, BindingsPut, BindingsGet, RunStart, RunCancel, Deliver, InputVerify, InboundRead, InboundAck, Explain, SessionPrepare]);
 export type HostRequestFrame = Static<typeof HostRequestFrame>;
 
 // ---- daemon → host --------------------------------------------------------
@@ -279,7 +331,7 @@ export type RunEnded = Static<typeof RunEnded>;
 export const HostEventFrame = Type.Union([InboundFrame, RouteCallout, RunEnded, ResultFrame]);
 export type HostEventFrame = Static<typeof HostEventFrame>;
 
-export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'input.verify', 'inbound.read', 'inbound.ack', 'explain'] as const;
+export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare'] as const;
 export const HOST_EVENT_FRAME_TYPES = ['inbound', 'policy', 'run.ended', 'result'] as const;
 
 // ---- result values --------------------------------------------------------
@@ -312,6 +364,12 @@ export const HostHelloResult = Type.Object({
   inbound: Type.Optional(Type.Object({ consumer: Type.String(), acked: Type.Number(), head: Type.Number() })),
   /** The granted presence lease, when the hello asked for one. */
   lease: Type.Optional(Type.Object({ ttlMs: Type.Number(), expiresAt: Type.Number() })),
+  /**
+   * Capabilities by name, e.g. `session.launch` (callout answers may carry
+   * `launch`; `session.prepare`). A daemon without one ignores what it adds, so
+   * a host must not rely on a feature this list lacks.
+   */
+  features: Type.Optional(Type.Array(Type.String())),
 });
 export type HostHelloResult = Static<typeof HostHelloResult>;
 
@@ -421,8 +479,22 @@ export type ExplainResult = RouteExplanation;
 export const InboundAnswer = Type.Object({ accepted: Type.Boolean() });
 export type InboundAnswer = Static<typeof InboundAnswer>;
 
-/** The host's answer to a `route` callout: replaces the rule's `on` / `agent` / `session`. */
-export const RouteCalloutAnswer = Type.Object({ on: BindingAction, agent: Type.Optional(Type.String()), session: Type.Optional(SessionScope) });
+/**
+ * The host's answer to a `route` callout: replaces the rule's `on` / `agent` / `session`.
+ * `launch` (feature `session.launch`) applies to the session the input lands in;
+ * only with an `on` that targets a session.
+ */
+export const RouteCalloutAnswer = Type.Object({ on: BindingAction, agent: Type.Optional(Type.String()), session: Type.Optional(SessionScope), launch: Type.Optional(SessionLaunch) });
+
+/** `session.prepare`: the pinned agent and launch (env keys only, never values). */
+export const SessionPrepareResult = Type.Object({
+  sessionKey: Type.String(),
+  agent: Type.String(),
+  launch: Type.Object({ cwd: Type.Optional(Type.String()), envKeys: Type.Array(Type.String()) }),
+  /** false: the key was already prepared with these values. */
+  created: Type.Boolean(),
+});
+export type SessionPrepareResult = Static<typeof SessionPrepareResult>;
 export type RouteCalloutAnswer = Static<typeof RouteCalloutAnswer>;
 
 /** Result value schema per host request type. */
@@ -437,4 +509,5 @@ export const HOST_RESULT_VALUES = {
   'inbound.read': InboundReadResult,
   'inbound.ack': InboundAckResult,
   explain: ExplainResult,
+  'session.prepare': SessionPrepareResult,
 } as const satisfies Record<(typeof HOST_REQUEST_FRAME_TYPES)[number], TSchema>;
