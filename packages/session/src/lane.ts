@@ -538,6 +538,8 @@ export class Lane {
   // ---- requests -----------------------------------------------------------
 
   private async openRequest(e: HarnessEvent, b: BodyOf<'request.opened'>, gen: number): Promise<void> {
+    // Harnesses replay pending requests after a reconnect; the original is still waiting on its resolver.
+    if (this.requests.has(b.requestId)) return;
     const ctx = this.context(e.turnId);
     const owner = this.turn?.owner ?? null;
     let resolver: Resolver;

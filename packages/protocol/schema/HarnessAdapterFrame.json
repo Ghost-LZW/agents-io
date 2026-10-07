@@ -711,6 +711,54 @@
                   "required": [
                     "t",
                     "turnId",
+                    "inputIds"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "turn.adopted",
+                      "type": "string"
+                    },
+                    "turnId": {
+                      "type": "string"
+                    },
+                    "nativeTurnId": {
+                      "type": "string"
+                    },
+                    "inputIds": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "run": {
+                      "type": "object",
+                      "required": [
+                        "harness",
+                        "model",
+                        "profile"
+                      ],
+                      "properties": {
+                        "harness": {
+                          "type": "string"
+                        },
+                        "model": {
+                          "type": "string"
+                        },
+                        "effort": {
+                          "type": "string"
+                        },
+                        "profile": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "turnId",
                     "route",
                     "reason"
                   ],

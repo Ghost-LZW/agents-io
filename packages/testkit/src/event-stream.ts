@@ -52,7 +52,7 @@ export function checkEventStream(events: readonly unknown[], opts: CheckOptions 
       v(i, 'ephemeral', `${b.t} must be durable`);
     }
 
-    if (b.t === 'turn.started') {
+    if (b.t === 'turn.started' || b.t === 'turn.adopted') {
       if (started.has(b.turnId)) v(i, 'turn.once', `turn ${b.turnId} started twice`);
       if (active) v(i, 'turn.overlap', `turn ${b.turnId} started while ${active} is active`);
       if (e.turnId && e.turnId !== b.turnId) v(i, 'turn.id', 'envelope turnId differs from body turnId');

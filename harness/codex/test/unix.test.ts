@@ -173,9 +173,9 @@ describe('unix socket transport', () => {
     expect(c2.of('turn.completed')[0]).toMatchObject({ turnId: 'T1', status: 'completed' });
     expect(c2.of('turn.started')).toHaveLength(0);
     expect(existsSync(join(dir, 'turns', 'thr-1.json'))).toBe(false);
-    // The two halves form one conforming stream (the first one's open request is re-opened by the replay).
-    const joined = [...c1.events, ...c2.events].filter((e) => !(e.body.t === 'request.opened' && e === c1.events.find((x) => x.body.t === 'request.opened')));
-    assertConformingStream(joined, { turnInputs: { T1: ['i1'] } });
+    // The new host's stream opens the turn with turn.adopted and conforms on its own.
+    expect(c2.of('turn.adopted')[0]).toMatchObject({ turnId: 'T1', inputIds: ['i1'] });
+    assertConformingStream(c2.events, { turnInputs: { T1: ['i1'] } });
   });
 
   it('settles an adopted turn that finished while no host was attached', async () => {

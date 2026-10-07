@@ -92,6 +92,17 @@ export const Body = Type.Union([
     run: Type.Optional(RunSpec),
     owner: Type.Optional(Type.String()),
   }),
+  /**
+   * A freshly opened harness session took over a turn that was already running
+   * natively (e.g. after the host restarted). Opens the turn in this stream like
+   * turn.started; events during the gap were not seen.
+   */
+  T('turn.adopted', {
+    turnId: Type.String(),
+    nativeTurnId: Type.Optional(Type.String()),
+    inputIds: Type.Array(Type.String()),
+    run: Type.Optional(RunSpec),
+  }),
   T('turn.delivery_added', {
     turnId: Type.String(),
     route: ReplyRoute,

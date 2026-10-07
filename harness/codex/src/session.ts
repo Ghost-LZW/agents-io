@@ -171,6 +171,10 @@ export class CodexSession implements HarnessSession {
       for (const ids of [adopt.startInputs, ...adopt.steerInputs.map((i) => [i])]) this.clientIds.set(encodeClientId(ids), ids);
       t.gap = true;
       this.active = t;
+      this.emit(
+        { t: 'turn.adopted', turnId: adopt.turnId, nativeTurnId: adopt.codexTurnId, inputIds: [...adopt.startInputs, ...adopt.steerInputs], ...(adopt.run ? { run: adopt.run } : {}) },
+        { turnId: adopt.turnId },
+      );
     }
   }
 
