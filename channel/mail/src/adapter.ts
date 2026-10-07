@@ -1,5 +1,5 @@
 import { createTransport } from 'nodemailer';
-import type { ChannelAdapter, ChannelCaps, ChannelContext, RenderedMessage, ReplyRoute, SendOp, SendResult } from '@agents-io/protocol';
+import type { BlobStore, ChannelAdapter, ChannelCaps, ChannelContext, RenderedMessage, ReplyRoute, SendOp, SendResult } from '@agents-io/protocol';
 import { mailauthVerifier } from './auth.js';
 import { ImapSource } from './imap.js';
 import { SENDER_HEADER, parseInbound } from './inbound.js';
@@ -27,7 +27,8 @@ const discardBlobs: BlobSink = { async put() {} };
 export class MailChannel implements ChannelAdapter {
   readonly id = 'mail';
   private readonly store: MailStore;
-  private readonly blobs: BlobSink;
+  private blobs: BlobSink;
+  private readonly ownSink: boolean;
   private readonly source: MailSource;
   private readonly transport: MailTransport;
   private readonly verify: MailVerifier;
@@ -39,6 +40,7 @@ export class MailChannel implements ChannelAdapter {
   ) {
     this.store = deps.store ?? new MemoryMailStore();
     this.blobs = deps.blobs ?? discardBlobs;
+    this.ownSink = deps.blobs !== undefined;
     this.source = deps.source ?? new ImapSource(cfg);
     this.transport = deps.transport ?? (createTransport(cfg.smtp) as MailTransport);
     this.verify = deps.verify ?? mailauthVerifier;
@@ -62,6 +64,8 @@ export class MailChannel implements ChannelAdapter {
 
   async start(ctx: ChannelContext): Promise<void> {
     const mailbox = this.cfg.mailbox ?? 'INBOX';
+    // Without a sink of its own, attachments go to the host's blob store (when it has one).
+    if (!this.ownSink && ctx.blobs) this.blobs = blobStoreSink(ctx.blobs);
     await this.source.watch({
       mailbox,
       signal: ctx.signal,
@@ -131,6 +135,11 @@ export class MailChannel implements ChannelAdapter {
     if (!refs.includes(meta.threadRoot)) refs.unshift(meta.threadRoot);
     return { to: meta.replyTo, subject: replySubject(meta.subject), inReplyTo, references: refs };
   }
+}
+
+/** A BlobSink backed by a host BlobStore: attachments become `image`/`file` blocks with its refs. */
+export function blobStoreSink(store: BlobStore): BlobSink {
+  return { put: (b) => store.put(b.content, { mime: b.contentType || 'application/octet-stream', ...(b.filename ? { name: b.filename } : {}) }) };
 }
 
 export { SENDER_HEADER };

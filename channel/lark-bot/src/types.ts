@@ -16,7 +16,41 @@ export interface LarkMessageApi {
     data: { msg_type: string; content: string };
     path: { message_id: string };
   }): Promise<LarkApiResponse>;
-  get(payload: { path: { message_id: string } }): Promise<LarkApiResponse<{ items?: { deleted?: boolean; message_id?: string }[] }>>;
+  get(payload: {
+    path: { message_id: string };
+    /** `card_msg_content_type: 'user_card_content'` returns a card's real JSON (the default is an "upgrade your client" stub for CardKit cards). */
+    params?: { user_id_type?: 'user_id' | 'union_id' | 'open_id'; card_msg_content_type?: string };
+  }): Promise<LarkApiResponse<{ items?: LarkMessageItem[] }>>;
+}
+
+/** One item of `im.v1.message.get` (fields the adapter reads). */
+export interface LarkMessageItem {
+  message_id?: string;
+  msg_type?: string;
+  deleted?: boolean;
+  chat_id?: string;
+  sender?: { id: string; id_type: string; sender_type: string };
+  body?: { content: string };
+  mentions?: { key: string; id: string; id_type: string; name: string }[];
+}
+
+/**
+ * `im.v1.messageResource.get` as typed by `@larksuiteoapi/node-sdk` 1.74: `type` is
+ * `image` (images) or `file` (files, audio, video). The response is a byte stream.
+ */
+export interface LarkMessageResourceApi {
+  get(payload: {
+    params: { type: string };
+    path: { message_id: string; file_key: string };
+  }): Promise<{ getReadableStream: () => NodeJS.ReadableStream & { destroy?(): void }; headers: any }>;
+}
+
+/** `contact.v3.user.get` (only what the adapter reads; needs contact:user.base:readonly). */
+export interface LarkContactUserApi {
+  get(payload: {
+    path: { user_id: string };
+    params?: { user_id_type?: 'user_id' | 'union_id' | 'open_id' };
+  }): Promise<LarkApiResponse<{ user?: { name?: string; en_name?: string; nickname?: string } }>>;
 }
 
 export interface LarkApiResponse<T = unknown> {
@@ -63,7 +97,10 @@ export interface LarkCardKitApi {
 }
 
 export interface LarkClientLike {
-  im: { v1: { message: LarkMessageApi } };
+  /** `messageResource` is optional so narrow test clients need not provide it (media then keep `lark-file:` refs). */
+  im: { v1: { message: LarkMessageApi; messageResource?: LarkMessageResourceApi } };
+  /** Contact lookups for sender names; absent → names stay unset. */
+  contact?: { v3: { user: LarkContactUserApi } };
   /** CardKit. Absent on a client that predates it: process cards then use message patch. */
   cardkit?: { v1: LarkCardKitApi };
   /**

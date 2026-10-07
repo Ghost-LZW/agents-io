@@ -1,5 +1,6 @@
 import type { ChannelContext, InboundEnvelope } from '@agents-io/protocol';
-import type { LarkApiResponse, LarkClientLike, LarkDeps, LarkDispatcherLike, LarkEventHandler, LarkWsLike } from '../src/types.js';
+import { Readable } from 'node:stream';
+import type { LarkApiResponse, LarkClientLike, LarkMessageItem, LarkDeps, LarkDispatcherLike, LarkEventHandler, LarkWsLike } from '../src/types.js';
 
 export interface PlatformMessage {
   id: string;
@@ -40,6 +41,14 @@ export class FakeLark {
   /** Every CardKit / CoT call in order, for asserting sequences. */
   readonly log: string[] = [];
   botOpenId = 'ou_bot';
+  /** Messages other users sent, as `message.get` returns them (for quote lookups). */
+  readonly foreign = new Map<string, LarkMessageItem>();
+  /** `${messageId}/${fileKey}` → resource bytes and headers (`messageResource.get`). */
+  readonly resources = new Map<string, { bytes: Buffer; headers?: Record<string, string>; hang?: boolean }>();
+  /** Contact users by id (`contact.v3.user.get`). */
+  readonly users = new Map<string, { name: string }>();
+  /** Calls of the inbound lookups, e.g. `resource:om_1/img_1:image`, `get:om_p`, `user:on_alice:union_id`. */
+  readonly lookups: string[] = [];
   wsStarts = 0;
   wsFailuresLeft = 0;
   private seq = 0;
@@ -188,10 +197,46 @@ export class FakeLark {
             m.updates.push(data);
             return { code: 0, data: {} };
           },
-          get: async ({ path }): Promise<LarkApiResponse<{ items?: { deleted?: boolean; message_id?: string }[] }>> => {
+          get: async ({ path }): Promise<LarkApiResponse<{ items?: LarkMessageItem[] }>> => {
+            this.lookups.push(`get:${path.message_id}`);
+            const other = this.foreign.get(path.message_id);
+            if (other) return { code: 0, data: { items: [other] } };
             const m = this.find(path.message_id);
             if (!m) return { code: 230011, msg: 'recalled' };
-            return { code: 0, data: { items: [{ message_id: m.id, deleted: !!m.deleted }] } };
+            return {
+              code: 0,
+              data: {
+                items: [
+                  {
+                    message_id: m.id,
+                    deleted: !!m.deleted,
+                    msg_type: m.msg_type,
+                    body: { content: m.content },
+                    sender: { id: 'cli_x', id_type: 'app_id', sender_type: 'app' },
+                  },
+                ],
+              },
+            };
+          },
+        },
+        messageResource: {
+          get: async ({ params, path }) => {
+            this.lookups.push(`resource:${path.message_id}/${path.file_key}:${params.type}`);
+            const r = this.resources.get(`${path.message_id}/${path.file_key}`);
+            if (!r) throw Object.assign(new Error('Request failed with status code 400'), { response: { status: 400 } });
+            const stream = r.hang ? new Readable({ read() {} }) : Readable.from([r.bytes.subarray(0, 3), r.bytes.subarray(3)]);
+            return { getReadableStream: () => stream, headers: { 'content-length': String(r.bytes.length), ...r.headers } };
+          },
+        },
+      },
+    },
+    contact: {
+      v3: {
+        user: {
+          get: async ({ path, params }) => {
+            this.lookups.push(`user:${path.user_id}:${params?.user_id_type}`);
+            const u = this.users.get(path.user_id);
+            return u ? { code: 0, data: { user: { name: u.name } } } : { code: 41050, msg: 'no user authority' };
           },
         },
       },
@@ -254,7 +299,10 @@ export class FakeLark {
   }
 }
 
-export function startAdapter(adapter: { start(ctx: ChannelContext): Promise<void> }, opts: { emit?: ChannelContext['emit']; account?: string } = {}) {
+export function startAdapter(
+  adapter: { start(ctx: ChannelContext): Promise<void> },
+  opts: { emit?: ChannelContext['emit']; account?: string; blobs?: ChannelContext['blobs'] } = {},
+) {
   const ctl = new AbortController();
   const envs: InboundEnvelope[] = [];
   const logs: string[] = [];
@@ -262,6 +310,7 @@ export function startAdapter(adapter: { start(ctx: ChannelContext): Promise<void
     account: opts.account ?? 'acct',
     config: {},
     signal: ctl.signal,
+    ...(opts.blobs ? { blobs: opts.blobs } : {}),
     emit: opts.emit ?? (async (env) => (envs.push(env), { accepted: true, inputId: `i${envs.length}` })),
     log: (l, m) => logs.push(`${l}: ${m}`),
   };

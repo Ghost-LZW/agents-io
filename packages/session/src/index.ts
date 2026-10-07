@@ -8,3 +8,4 @@ export * from './ingress.js';
 export * from './outbox.js';
 export * from './compositor.js';
 export * from './watch.js';
+export * from './blobs.js';

@@ -19,6 +19,7 @@ import {
 } from '@agents-io/protocol';
 import {
   Compositor,
+  FsBlobStore,
   Hub,
   Ingress,
   Lane,
@@ -40,6 +41,7 @@ import { spawnChannel } from '@agents-io/channel-jsonl-bridge';
 import type { Config, HarnessInstance, ResolvedChannel } from './config.js';
 import type { ClientCommand, SessionInfo } from './frames.js';
 import { LocalServer } from './local-server.js';
+import { blobResolvers, type MediaResolvers } from './media.js';
 
 export type LogFn = (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
 
@@ -106,6 +108,8 @@ export class Gateway {
   readonly outbox: Outbox;
   /** Watches: sessions subscribed to inputs not addressed to them. */
   readonly watches: WatchDispatcher;
+  /** Inbound media (channels put, harnesses read). */
+  readonly blobs: FsBlobStore;
   /** Built instance adapters, by instance name (lazily, on first use). */
   private readonly instances = new Map<string, HarnessAdapter>();
   private readonly lanes = new Map<string, Lane>();
@@ -136,6 +140,7 @@ export class Gateway {
       ...o.policy,
     } as FullPolicy;
     this.outbox = new Outbox({ hub: this.hub, policy: this.policy });
+    this.blobs = new FsBlobStore(c.blobs);
     // Watches live next to the log (same SQLite file), so they and their digest buffers survive a restart.
     const registry = o.watches ?? new WatchRegistry(log instanceof SqliteSessionLog ? { db: log.db } : {});
     this.watches = new WatchDispatcher({
@@ -150,6 +155,7 @@ export class Gateway {
       lanes: (key) => this.lane(key),
       watches: this.watches,
       onWatchError: (err) => this.log('warn', `watch fan-out failed: ${(err as Error).message}`),
+      replyCaps: (ch, account) => this.replyCaps(ch, account),
     });
   }
 
@@ -185,7 +191,7 @@ export class Gateway {
     if (a) return a;
     const inst = this.o.config.harnesses[name];
     if (!inst) throw new Error(`unknown harness instance ${JSON.stringify(name)} (configured: ${Object.keys(this.o.config.harnesses).join(', ')})`);
-    a = this.o.buildHarness?.(inst) ?? buildHarness(inst);
+    a = this.o.buildHarness?.(inst) ?? buildHarness(inst, blobResolvers(this.blobs));
     this.instances.set(name, a);
     return a;
   }
@@ -248,6 +254,7 @@ export class Gateway {
           account: ch.account,
           config: ch.config,
           signal: ac.signal,
+          blobs: this.blobs,
           emit: this.ingress.emitter(),
           log: (level, msg) => this.log(level, `${ch.adapter.id}: ${msg}`),
         })
@@ -255,6 +262,14 @@ export class Gateway {
       this.channels.push({ adapter: ch.adapter, account: ch.account, ...(ch.tier ? { tier: ch.tier } : {}), ac, running, ...(ch.close ? { close: ch.close } : {}) });
       this.log('info', `channel ${ch.adapter.id} (${ch.account}) started`);
     }
+  }
+
+  /** Caps and tier of the running channel that renders replies to (channel, account), for the input's `reply` summary. */
+  private replyCaps(channel: string, account: string) {
+    const ch = this.channels.find((c) => c.adapter.id === channel && c.account === account) ?? this.channels.find((c) => c.adapter.id === channel);
+    if (!ch) return undefined;
+    const caps = ch.adapter.caps(account);
+    return { caps, tier: ch.tier ?? caps.defaultTier };
   }
 
   /**
@@ -439,8 +454,11 @@ export class InstanceHarness implements HarnessAdapter {
   }
 }
 
-/** The adapter for one instance. Environment values are handed to the child process only, never logged. */
-export function buildHarness(i: HarnessInstance): InstanceHarness {
+/**
+ * The adapter for one instance. Environment values are handed to the child process only, never logged.
+ * `media` resolves stored blob refs for the harness (Claude: inline image / file path; Codex: local path).
+ */
+export function buildHarness(i: HarnessInstance, media?: MediaResolvers): InstanceHarness {
   if (i.unavailable) throw new Error(`harness instance ${i.name} is unavailable: ${i.unavailable}`);
   if (i.kind === 'codex') {
     const x = i.codex;
@@ -455,6 +473,7 @@ export function buildHarness(i: HarnessInstance): InstanceHarness {
         ...(x.config ? { config: x.config } : {}),
         ...(x.enable ? { enable: x.enable } : {}),
         ...(x.disable ? { disable: x.disable } : {}),
+        ...(media ? { resolveMedia: media.resolveMedia } : {}),
       }),
     );
   }
@@ -472,7 +491,9 @@ export function buildHarness(i: HarnessInstance): InstanceHarness {
     ...(x.extraArgs ? { extraArgs: x.extraArgs } : {}),
     ...(x.additionalDirectories ? { additionalDirectories: x.additionalDirectories } : {}),
   };
-  return new InstanceHarness(i, new ClaudeCodeHarness(config));
+  // Resolvers ride in the instance's open options; explicit options in the config win.
+  const inst = media ? { ...i, options: { resolveImage: media.resolveImage, resolveFile: media.resolveFile, ...i.options } } : i;
+  return new InstanceHarness(inst, new ClaudeCodeHarness(config));
 }
 
 async function buildChannel(ch: ResolvedChannel): Promise<{ adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }> {

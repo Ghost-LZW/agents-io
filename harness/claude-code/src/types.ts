@@ -23,12 +23,17 @@ export type ImageResolver = (
   mime: string,
 ) => Promise<{ base64: string; mime?: string } | undefined>;
 
+/** Resolves a file/audio `ref` to a local path the agent can read with its tools; undefined keeps the ref as text. */
+export type FileResolver = (ref: string, mime: string, name?: string) => Promise<{ path: string } | undefined>;
+
 /** `HarnessOpenArgs.options` understood by this adapter. Everything is optional. */
 export interface ClaudeCodeOptions {
   /** Profile name → native permission settings. Unknown profiles fall back to the defaults below. */
   profiles?: Record<string, ClaudeProfile>;
   /** Image refs are skipped (with a notice) when absent. */
   resolveImage?: ImageResolver;
+  /** File and audio refs are shown as a ref line when absent (or when it returns nothing). */
+  resolveFile?: FileResolver;
   /** MCP server name for `HarnessOpenArgs.mcp` (default `agents_io`). */
   mcpServerName?: string;
   /** MCP transport for `HarnessOpenArgs.mcp` (default `http`). */

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { ContentBlock, InputRecord } from '@agents-io/protocol';
-import type { ImageResolver, SDKUserMessage } from './types.js';
+import type { FileResolver, ImageResolver, SDKUserMessage } from './types.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -51,7 +51,7 @@ export interface ConvertResult {
 }
 
 /** Converts one ContentBlock to Messages API user blocks. */
-export async function convertBlock(b: ContentBlock, resolveImage?: ImageResolver): Promise<ConvertResult> {
+export async function convertBlock(b: ContentBlock, resolveImage?: ImageResolver, resolveFile?: FileResolver): Promise<ConvertResult> {
   switch (b.type) {
     case 'text':
       return { blocks: [{ type: 'text', text: b.text }], notices: [] };
@@ -97,17 +97,22 @@ export async function convertBlock(b: ContentBlock, resolveImage?: ImageResolver
       }
     }
     case 'file':
-    case 'audio':
+    case 'audio': {
+      const label = [b.type, b.name, b.mime].filter(Boolean).join(' ');
+      // A local copy lets the agent open the file with its own tools.
+      const local = resolveFile ? await resolveFile(b.ref, b.mime, b.name).catch(() => undefined) : undefined;
       return {
-        blocks: [{ type: 'text', text: `[${[b.type, b.name, b.mime, b.ref].filter(Boolean).join(' ')}]` }],
+        blocks: [{ type: 'text', text: local ? `[${label} at ${local.path}]` : `[${label} ${b.ref}]` }],
         notices: [],
       };
+    }
   }
 }
 
 export interface UserMessageOpts {
   priority: 'next' | 'later';
   resolveImage?: ImageResolver;
+  resolveFile?: FileResolver;
   clientComposed?: boolean;
 }
 
@@ -119,7 +124,7 @@ export async function toUserMessage(
   const blocks: UserBlock[] = [{ type: 'text', text: preface(input) }];
   const notices: string[] = [];
   for (const c of input.content) {
-    const r = await convertBlock(c, opts.resolveImage);
+    const r = await convertBlock(c, opts.resolveImage, opts.resolveFile);
     blocks.push(...r.blocks);
     notices.push(...r.notices);
   }

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { HarnessEvent, HarnessOpenArgs, HarnessSession, InputRecord } from '@agents-io/protocol';
-import { assertConformingStream, checkEventStream } from '@agents-io/testkit';
+import { FakeChannel, assertConformingStream, checkEventStream, defaultChannelCaps } from '@agents-io/testkit';
+import { Compositor, Hub, Ingress, Lane, MemorySessionLog, Outbox, defaultPolicy } from '@agents-io/session';
 import { CodexHarness, UnsupportedCodexVersionError, diffStats, renderInputs, summarizeItem, type CodexHarnessOptions } from '../src/index.js';
 import { displayCommand } from '../src/map.js';
 import { FakeAppServer, FakeRpcError } from './fake-app-server.js';
@@ -179,7 +180,7 @@ describe('turn mapping', () => {
     expect(c.of('item.completed')[4]!.item.result?.preview).toBe('sent');
     const deltas = c.events.filter((e) => e.body.t === 'text.delta').map((e) => [(e.body as any).stream, e.audience, e.durability]);
     expect(deltas).toEqual([
-      ['reasoning', 'internal', 'ephemeral'],
+      ['reasoning', 'commentary', 'ephemeral'],
       ['answer', 'commentary', 'ephemeral'],
       ['command_output', 'status', 'ephemeral'],
       ['answer', 'answer', 'ephemeral'],
@@ -196,6 +197,47 @@ describe('turn mapping', () => {
     expect(c.of('session.state').map((b) => b.state)).toEqual(['running', 'idle']);
     const done = c.of('turn.completed')[0]!;
     expect(done).toMatchObject({ status: 'completed', usage: { total: { totalTokens: 10 } } });
+  });
+
+  it('shows reasoning in the ProgressView like Claude thinking (one stream per item, parts as paragraphs)', async () => {
+    const { fake, harness } = setup();
+    fake.onTurnStart = (p, tid) => {
+      const th = p.threadId;
+      const n = (method: string, params: object) => fake.notify(method, { threadId: th, turnId: tid, ...params });
+      fake.echoUser(th, tid, p.clientUserMessageId);
+      n('item/started', { item: { type: 'reasoning', id: 'r1', summary: [], content: [] }, startedAtMs: 1 });
+      n('item/reasoning/summaryTextDelta', { itemId: 'r1', delta: 'Plan A', summaryIndex: 0 });
+      n('item/reasoning/textDelta', { itemId: 'r1', delta: 'raw duplicate', contentIndex: 0 });
+      n('item/reasoning/summaryTextDelta', { itemId: 'r1', delta: 'Plan B', summaryIndex: 1 });
+      n('item/completed', { item: { type: 'reasoning', id: 'r1', summary: ['Plan A', 'Plan B'], content: [] }, completedAtMs: 1 });
+      const msg = { type: 'agentMessage', id: 'm1', phase: 'final_answer', memoryCitation: null, delivery: null, questions: null };
+      n('item/started', { item: { ...msg, text: '' }, startedAtMs: 1 });
+      n('item/completed', { item: { ...msg, text: 'Done' }, completedAtMs: 1 });
+      fake.completeTurn(th, tid, 'completed');
+    };
+    const hub = new Hub(new MemorySessionLog());
+    const policy = defaultPolicy({ owners: ['fake:alice'], run });
+    const lane = new Lane({ sessionKey: 'fake:default:c1', harness, hub, policy, cwd: '/work' });
+    const ingress = new Ingress({ policy, lanes: () => lane });
+    const channel = new FakeChannel('fake', defaultChannelCaps);
+    const compositor = new Compositor({ hub, sessionKey: 'fake:default:c1', adapter: channel, outbox: new Outbox({ hub, sleep: async () => {} }), throttleMs: 1 });
+    compositor.start();
+    const ac = new AbortController();
+    void channel.start({ account: 'default', config: {}, signal: ac.signal, emit: ingress.emitter(), log: () => {} });
+    try {
+      await channel.inject({ sender: { channelUserId: 'alice', evidence: 'platform_signed' }, text: 'think' });
+      for (let i = 0; i < 200 && channel.sent[0]?.finalized !== true; i++) await tick();
+      const card = channel.sent[0]!;
+      const fin = card.edits.at(-1) ?? card.msg;
+      expect(fin.progress!.steps).toEqual([{ kind: 'reasoning', id: 'r1', text: 'Plan A\n\nPlan B', done: true }]);
+      expect(fin.progress!.answer).toBe('Done');
+      const delta = hub.log.read('fake:default:c1', 0).filter((e) => e.body.t === 'item.completed' && e.body.item.type === 'reasoning');
+      expect(delta[0]).toMatchObject({ audience: 'commentary', visibility: 'participants' });
+    } finally {
+      ac.abort();
+      await compositor.stop();
+      await lane.close();
+    }
   });
 
   it('sends per-turn overrides only when the RunSpec changes', async () => {

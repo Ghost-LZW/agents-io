@@ -56,6 +56,24 @@ export interface LarkBotConfig {
   degradeTtlMs?: number;
   /** Timeout of each CardKit / thinking-bubble request. Default 15000. */
   processRequestTimeoutMs?: number;
+
+  // Inbound enrichment. Media are downloaded into the host's blob store (`ChannelContext.blobs`)
+  // only when it has one; the event is acked within `ackTimeoutMs` regardless (enrichment
+  // continues after the ack, in message order per chat).
+  /** Largest attachment downloaded (bytes); larger ones keep their `lark-file:` ref. Default 20 MiB. */
+  mediaMaxBytes?: number;
+  /** Time budget of one attachment download. Default 30000. */
+  mediaTimeoutMs?: number;
+  /** Fetch the text of a replied-to message for its quote block (`im.v1.message.get`). Default true. */
+  fetchQuotes?: boolean;
+  /** Longest quote text kept. Default 500. */
+  quoteMaxChars?: number;
+  /** Resolve sender display names (`contact.v3.user.get`, needs contact:user.base:readonly). Default true. */
+  resolveSenderNames?: boolean;
+  /** How long a resolved name is cached. Default 21600000 (6 h). */
+  senderNameTtlMs?: number;
+  /** Timeout of each message.get / contact lookup. Default 5000. */
+  lookupTimeoutMs?: number;
 }
 
 export interface ResolvedConfig extends Required<Omit<LarkBotConfig, 'encryptKey' | 'verificationToken' | 'botOpenId'>> {
@@ -93,5 +111,12 @@ export function resolveConfig(c: LarkBotConfig): ResolvedConfig {
     maxCardKitBytes: c.maxCardKitBytes ?? 100_000,
     degradeTtlMs: c.degradeTtlMs ?? 1_800_000,
     processRequestTimeoutMs: c.processRequestTimeoutMs ?? 15_000,
+    mediaMaxBytes: c.mediaMaxBytes ?? 20 * 1024 * 1024,
+    mediaTimeoutMs: c.mediaTimeoutMs ?? 30_000,
+    fetchQuotes: c.fetchQuotes ?? true,
+    quoteMaxChars: c.quoteMaxChars ?? 500,
+    resolveSenderNames: c.resolveSenderNames ?? true,
+    senderNameTtlMs: c.senderNameTtlMs ?? 21_600_000,
+    lookupTimeoutMs: c.lookupTimeoutMs ?? 5000,
   };
 }

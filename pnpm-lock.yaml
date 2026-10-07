@@ -121,6 +121,9 @@ importers:
         specifier: ^8.22.0
         version: 8.22.0
     devDependencies:
+      '@agents-io/session':
+        specifier: workspace:*
+        version: link:../../packages/session
       '@agents-io/testkit':
         specifier: workspace:*
         version: link:../../packages/testkit

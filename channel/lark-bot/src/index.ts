@@ -1,6 +1,7 @@
 export { LarkBotAdapter, LarkApiError, type CardLevel, type LarkBotOptions } from './adapter.js';
 export { resolveConfig, type LarkBotConfig, type ProcessMode, type ResolvedConfig } from './config.js';
-export { CHANNEL_ID, larkFileRef, mapCardAction, mapMessageEvent, senderId } from './inbound.js';
+export { CHANNEL_ID, larkFileRef, mapCardAction, mapMessageEvent, messageText, senderId } from './inbound.js';
+export { InboundEnricher, dispositionName, sniffMime } from './enrich.js';
 export { buildCard, fitCard, isLarkCard, splitText, uuidFor } from './render.js';
 export { buildModel, fitProcessCard, processCard, splitMarkdown, type ProcessModel } from './process-card.js';
 export { CardKitCard } from './cardkit.js';

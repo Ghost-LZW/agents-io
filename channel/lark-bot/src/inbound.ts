@@ -3,7 +3,7 @@ import type { RawCardActionEvent, RawMessageEvent } from './types.js';
 
 export const CHANNEL_ID = 'lark-bot';
 
-/** `lark-file:<message_id>/<file_key>` — resolved by the host via the message-resource API, never by the adapter. */
+/** `lark-file:<message_id>/<file_key>`: the platform ref of a message resource. With a host blob store the adapter downloads it (enrich.ts) and emits a `sha256:` ref instead; this one remains only when that is not possible. */
 export const larkFileRef = (messageId: string, key: string) => `lark-file:${messageId}/${key}`;
 
 type Mention = NonNullable<RawMessageEvent['message']['mentions']>[number];
@@ -94,6 +94,54 @@ function flattenPost(
     lines.push(line);
   }
   return { text: lines.join('\n').trim(), media };
+}
+
+/** Strings under `text`/`content`/`title` keys of a card's JSON, in order (nested JSON strings included). */
+function cardText(v: unknown, out: string[] = [], depth = 0): string[] {
+  if (depth > 12) return out;
+  if (Array.isArray(v)) for (const x of v) cardText(x, out, depth + 1);
+  else if (v && typeof v === 'object') {
+    for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
+      if (typeof x === 'string' && (k === 'text' || k === 'content' || k === 'title')) {
+        const t = x.trim();
+        if (t.startsWith('{') || t.startsWith('[')) cardText(safeParse(t), out, depth + 1);
+        else if (t && out.at(-1) !== t) out.push(t);
+      } else if (typeof x === 'object') cardText(x, out, depth + 1);
+    }
+  }
+  return out;
+}
+
+/**
+ * Plain text of a message as `im.v1.message.get` returns it, for a quote block:
+ * text and post bodies flattened (mention placeholders become `@name`), cards reduced to
+ * their visible strings, media as a bracketed placeholder.
+ */
+export function messageText(msgType: string | undefined, rawContent: string | undefined, mentions: { key: string; name?: string }[] = []): string {
+  const c = safeParse(rawContent ?? '');
+  const named = (t: string) => mentions.reduce((acc, m) => acc.split(m.key).join(`@${m.name ?? 'user'}`), t);
+  switch (msgType) {
+    case 'text':
+      return named(String(c.text ?? '')).trim();
+    case 'post': {
+      const { text, media } = flattenPost(c, '', [], undefined);
+      return [named(text), ...media.map((m) => `[${m.type}]`)].filter(Boolean).join('\n');
+    }
+    case 'interactive':
+      return cardText(c).join('\n');
+    case 'image':
+      return '[image]';
+    case 'file':
+      return `[file${c.file_name ? ` ${c.file_name}` : ''}]`;
+    case 'audio':
+      return '[audio]';
+    case 'media':
+      return `[video${c.file_name ? ` ${c.file_name}` : ''}]`;
+    case 'sticker':
+      return '[sticker]';
+    default:
+      return `[${msgType ?? 'unknown'} message]`;
+  }
 }
 
 export function mapMessageEvent(ev: RawMessageEvent, ctx: MapContext): InboundEnvelope | undefined {

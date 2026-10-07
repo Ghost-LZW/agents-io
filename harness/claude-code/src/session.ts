@@ -355,6 +355,7 @@ export class ClaudeCodeSession implements HarnessSession {
       const { message, notices } = await toUserMessage(input, {
         priority,
         resolveImage: this.init.options.resolveImage,
+        resolveFile: this.init.options.resolveFile,
         clientComposed: this.init.options.clientComposed,
       });
       for (const n of notices) this.emit({ t: 'notice', code: 'other', message: n });

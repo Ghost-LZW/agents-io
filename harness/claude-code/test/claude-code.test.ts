@@ -249,6 +249,8 @@ describe('input writing', () => {
     const withRes = await t({ type: 'image', ref: 'sha256:aa', mime: 'image/png' }, async () => ({ base64: 'QUJD' }));
     expect(withRes.blocks[0]).toEqual({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'QUJD' } });
     expect((await t({ type: 'file', ref: 'sha256:bb', mime: 'application/pdf', name: 'a.pdf' })).blocks[0]).toEqual({ type: 'text', text: '[file a.pdf application/pdf sha256:bb]' });
+    const local = await convertBlock({ type: 'file', ref: 'sha256:bb', mime: 'application/pdf', name: 'a.pdf' }, undefined, async () => ({ path: '/blobs/bb.pdf' }));
+    expect(local.blocks[0]).toEqual({ type: 'text', text: '[file a.pdf application/pdf at /blobs/bb.pdf]' });
   });
 
   it('skipped images surface as a notice event', async () => {

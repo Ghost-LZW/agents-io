@@ -6,7 +6,9 @@ import {
   type Command,
   type DecisionKind,
   type InputRecord,
+  type ChannelCaps,
   type Origin,
+  type Tier,
 } from '@agents-io/protocol';
 import type { CommandResult, Lane } from './lane.js';
 import { conversationRouteKey, withDefaults, type FullPolicy, type SessionPolicy } from './policy.js';
@@ -52,6 +54,12 @@ export interface IngressOptions {
   /** Watches: after its own admission an envelope is also delivered to every session watching it. */
   watches?: WatchDispatcher;
   onWatchError?: (err: unknown) => void;
+  /**
+   * Capabilities of the adapter that renders replies to a route, and the tier it renders
+   * at (default `caps.defaultTier`). When given, inputs with a reply route carry a
+   * `reply` summary in channelContext (see {@link replySummary}).
+   */
+  replyCaps?: (channel: string, account: string) => { caps: ChannelCaps; tier?: Tier } | undefined;
 }
 
 export interface IngressResult {
@@ -122,7 +130,7 @@ export class Ingress {
     if (r.action !== 'dispatch' && r.action !== 'observe' && r.action !== 'drop') return undefined;
     if (env.admission === 'drop' || actionClick(env)) return undefined;
     try {
-      return await w.fanout(env, r.origin, r.action === 'drop' ? undefined : r.sessionKey, channelContext(env));
+      return await w.fanout(env, r.origin, r.action === 'drop' ? undefined : r.sessionKey, channelContext(env, undefined)); // no reply summary: it would describe the watched source, not where the reply goes
     } catch (e) {
       this.o.onWatchError?.(e);
       return undefined;
@@ -189,7 +197,7 @@ export class Ingress {
       origin,
       content: env.content,
       replyRoute: env.replyRoute,
-      channelContext: channelContext(env),
+      channelContext: channelContext(env, this.replyOf(env)),
     };
     const lane = await this.o.lanes(sessionKey);
     if (observe) {
@@ -199,6 +207,29 @@ export class Ingress {
     const result = await lane.command({ type: 'input', sessionKey, input, mode: admission.mode ?? env.modeHint ?? 'queue' });
     return { accepted: true, action: 'dispatch', inputId, sessionKey, origin, result };
   }
+
+  private replyOf(env: InboundEnvelope): string | undefined {
+    if (!env.replyRoute || !this.o.replyCaps) return undefined;
+    try {
+      const c = this.o.replyCaps(env.replyRoute.channel, env.replyRoute.account);
+      return c ? replySummary(c.caps, c.tier ?? c.caps.defaultTier) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+}
+
+/**
+ * How a reply to this input will be shown, as one compact line (`channelContext.reply`):
+ * `<tier> markdown=<none|basic|full> maxChars=<n> buttons=<yes|no> media=<kinds|none>`,
+ * e.g. `card markdown=basic maxChars=4000 buttons=yes media=image,file,audio`.
+ * `tier` is the rendering tier (`card` streams one editable message with process;
+ * `final` sends only the final answer once the turn ends; `full`/`headline` likewise
+ * by name); `media` lists the kinds the adapter can send. Key names are stable.
+ */
+export function replySummary(caps: ChannelCaps, tier: Tier): string {
+  const media = caps.media.out.length ? caps.media.out.join(',') : 'none';
+  return `${tier} markdown=${caps.text.markdown} maxChars=${caps.text.maxChars} buttons=${caps.buttons ? 'yes' : 'no'} media=${media}`;
 }
 
 function actionClick(env: InboundEnvelope) {
@@ -210,7 +241,7 @@ function actionClick(env: InboundEnvelope) {
   return parseActionId(c.data.actionId);
 }
 
-function channelContext(env: InboundEnvelope): InputRecord['channelContext'] {
+function channelContext(env: InboundEnvelope, reply: string | undefined): InputRecord['channelContext'] {
   const ctx: InputRecord['channelContext'] = {
     // Adapter-supplied facts (mail subject, chat name…) first; the core fields below win on clashes.
     ...env.context,
@@ -221,5 +252,6 @@ function channelContext(env: InboundEnvelope): InputRecord['channelContext'] {
   if (env.sender.displayName !== undefined) ctx.senderName = env.sender.displayName;
   if (env.sender.isBot !== undefined) ctx.senderIsBot = env.sender.isBot;
   if (env.sentAt !== undefined) ctx.sentAt = env.sentAt;
+  if (reply !== undefined) ctx.reply = reply;
   return ctx;
 }
