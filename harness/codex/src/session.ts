@@ -758,6 +758,7 @@ export class CodexSession implements HarnessSession {
 
   private async liveStart(a: LiveStartArgs): Promise<{ answerSdp: string }> {
     if (this.closed) throw new Error('codex session is closed');
+    if (a.transport.type !== 'webrtc') throw new Error(`codex realtime takes the webrtc transport, not ${a.transport.type}`);
     if (this.liveState && !this.liveState.ended) throw new Error(`live ${this.liveState.liveId} is already running on this thread`);
     const st: LiveState = { liveId: a.liveId, ended: false };
     this.liveState = st;

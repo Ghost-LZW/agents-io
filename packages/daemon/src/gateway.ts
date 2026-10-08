@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, rmSync } from 'node:fs';
 import { dirname, join, resolve as resolvePath } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   PROTOCOL_VERSION,
   routeKey,
@@ -20,6 +21,8 @@ import {
   type InboundEnvelope,
   type InputRecord,
   type LiveEndpoint,
+  type LiveStartArgs,
+  type HarnessFactory,
   type Origin,
   type Policy,
   type ReplyRoute,
@@ -44,6 +47,7 @@ import {
   Ingress,
   Lane,
   LaneUnavailableError,
+  LiveTransportError,
   Outbox,
   Router,
   SqliteSessionLog,
@@ -70,7 +74,7 @@ import { loadChannelModule } from './channel-module.js';
 import { LarkBotAdapter } from '@agents-io/channel-lark-bot';
 import { MailChannel, type MailChannelConfig } from '@agents-io/channel-mail';
 import { spawnChannel, type BridgeState } from '@agents-io/channel-jsonl-bridge';
-import { ConfigError, agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ResolvedChannel } from './config.js';
+import { ConfigError, agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type ResolvedChannel } from './config.js';
 import { ConsoleServer } from './console.js';
 import { ConfigStore, canonical } from './console-config.js';
 import { LarkBotJobs } from './provision.js';
@@ -212,6 +216,8 @@ export class Gateway {
   readonly token: string;
   /** Built instance adapters, by instance name (lazily, on first use). */
   private readonly instances = new Map<string, HarnessAdapter>();
+  /** What the factories of `use: "module"` instances returned, by instance name (loaded at start). */
+  private readonly moduleAdapters = new Map<string, HarnessAdapter>();
   /** Adapters of configured agents (their cwd and instructions over the instance's). */
   private readonly agentAdapters = new Map<string, HarnessAdapter>();
   private readonly lanes = new Map<string, Lane>();
@@ -245,7 +251,8 @@ export class Gateway {
   private constructor(private readonly o: GatewayOptions) {
     const c = o.config;
     // The default instance must be usable (e.g. its env refs set); others fail when a turn names them.
-    this.harness();
+    // A module default is checked in `start`, once its module is loaded.
+    if (o.harness || o.buildHarness || c.harnesses[c.defaultHarness]?.kind !== 'module') this.harness();
     this.log = o.logger ?? ((level, msg) => console.error(`[aio] ${level}: ${msg}`));
     for (const w of c.warnings ?? []) this.log('warn', `config: ${w}`);
     // Before anything opens: a bad token file fails the start without leaving handles behind.
@@ -449,6 +456,8 @@ export class Gateway {
   static async start(o: GatewayOptions): Promise<Gateway> {
     const gw = new Gateway(o);
     try {
+      await gw.loadHarnessModules();
+      gw.harness();
       if (gw.mcp) {
         const url = await gw.mcp.listen();
         gw.log('info', `host MCP output tools on ${url}`);
@@ -631,9 +640,45 @@ export class Gateway {
     if (a) return a;
     const inst = this.o.config.harnesses[name];
     if (!inst) throw new Error(`unknown harness instance ${JSON.stringify(name)} (configured: ${Object.keys(this.o.config.harnesses).join(', ')})`);
-    a = this.o.buildHarness?.(inst) ?? buildHarness(inst, blobResolvers(this.blobs));
+    a = this.build(inst);
     this.instances.set(name, a);
     return a;
+  }
+
+  /** An instance's adapter, built now: a module instance wraps what its factory returned at start. */
+  private build(inst: HarnessInstance): HarnessAdapter {
+    const own = this.o.buildHarness?.(inst);
+    if (own) return own;
+    if (inst.kind !== 'module') return buildHarness(inst, blobResolvers(this.blobs));
+    const a = this.moduleAdapters.get(inst.name);
+    if (!a) throw new Error(inst.unavailable ? `harness instance ${inst.name} is unavailable: ${inst.unavailable}` : `harness instance ${inst.name}: its module was not loaded`);
+    return new InstanceHarness(inst, a);
+  }
+
+  /**
+   * Import the `use: "module"` instances' modules and run their factories, in config order.
+   * A failure fails the start (a config error naming the instance). `init.harness(name)`
+   * hands out another instance by name; it is built when first used, so the order of the
+   * entries does not matter.
+   */
+  private async loadHarnessModules(): Promise<void> {
+    if (this.o.harness || this.o.buildHarness) return;
+    const c = this.o.config;
+    for (const inst of Object.values(c.harnesses)) {
+      if (inst.kind !== 'module' || inst.unavailable) continue;
+      const adapter = await loadHarnessModule({
+        name: inst.name,
+        module: inst.module,
+        log: (level, msg, data) => this.log(level, `harness ${inst.name}: ${msg}`, data),
+        harness: (name) => {
+          if (!c.harnesses[name]) throw new Error(`unknown harness instance ${JSON.stringify(name)} (configured: ${Object.keys(c.harnesses).join(', ')})`);
+          return { id: name, probe: () => this.harness(name).probe(), open: (args) => this.harness(name).open(args) };
+        },
+      }).catch((e: Error) => {
+        throw new ConfigError(e.message);
+      });
+      this.moduleAdapters.set(inst.name, adapter);
+    }
   }
 
   private instanceOf(harnessId: string | undefined): HarnessInstance | undefined {
@@ -912,7 +957,7 @@ export class Gateway {
             env: { ...inst.env, ...env },
             codex: { ...inst.codex, transport: { kind: 'stdio' as const }, ...(env.CODEX_HOME !== undefined ? { codexHome: env.CODEX_HOME } : {}) },
           } as HarnessInstance;
-          base = this.o.buildHarness?.(own) ?? buildHarness(own, blobResolvers(this.blobs));
+          base = this.build(own);
           owned.push(base);
           perOpen = undefined;
         } else base = this.harness(name);
@@ -978,7 +1023,7 @@ export class Gateway {
         env: { ...inst.env, ...env },
         ...(inst.kind === 'codex' ? { codex: { ...inst.codex, transport: { kind: 'stdio' as const } } } : {}),
       } as HarnessInstance;
-      own = this.o.buildHarness?.(runInst) ?? buildHarness(runInst, blobResolvers(this.blobs));
+      own = this.build(runInst);
       adapter = withAgent(own, r.agent, r.cwd);
     }
     const spec: RunSpec = { ...agentRun(r.agent, inst), profile: r.agent.profile ?? 'restricted' };
@@ -1127,11 +1172,27 @@ export class Gateway {
     const liveId = `live_${randomUUID().slice(0, 8)}`;
     this.lives.set(sessionKey, { liveId, endpoint });
     try {
-      const { answerSdp } = await lane.startLive(
-        { liveId, title: endpoint.title, route: endpoint.route, controlRoute: turn.replyRoute },
-        { transport: { type: 'webrtc', sdp: endpoint.offer.sdp }, instructions: a.instructions ?? DEFAULT_LIVE_INSTRUCTIONS, ...(a.voice ? { voice: a.voice } : {}) },
-      );
-      await endpoint.answer(answerSdp);
+      const offer = endpoint.offer;
+      let transport: LiveStartArgs['transport'];
+      if (offer.type === 'webrtc') transport = offer;
+      else {
+        if (!endpoint.media) throw new ToolError(`channel ${ch.adapter.id} opened a frames endpoint without media`);
+        transport = { ...offer, media: endpoint.media };
+      }
+      // The lane refuses a transport the harness's live does not list, before `start`.
+      const { answerSdp } = await lane
+        .startLive(
+          { liveId, title: endpoint.title, route: endpoint.route, controlRoute: turn.replyRoute },
+          { transport, instructions: a.instructions ?? DEFAULT_LIVE_INSTRUCTIONS, ...(a.voice ? { voice: a.voice } : {}) },
+        )
+        .catch((e: Error) => {
+          throw e instanceof LiveTransportError ? new ToolError(`${e.message}; ${endpoint.title} is a ${offer.type} endpoint`) : e;
+        });
+      if (offer.type === 'webrtc') {
+        if (answerSdp === undefined) throw new Error(`harness ${lane.harnessId} gave no SDP answer`);
+        if (!endpoint.answer) throw new Error(`channel ${ch.adapter.id} opened a webrtc endpoint that cannot take an answer`);
+        await endpoint.answer(answerSdp);
+      }
     } catch (e) {
       if (this.lives.get(sessionKey)?.liveId === liveId) this.lives.delete(sessionKey);
       await lane.stopLive().catch(() => undefined);
@@ -1870,8 +1931,11 @@ export class InstanceHarness implements HarnessAdapter {
 
   open(args: HarnessOpenArgs): Promise<HarnessSession> {
     const i = this.instance;
-    const options = i.kind === 'claude-code' ? { ...i.options, profiles: i.profiles } : i.options;
-    return this.inner.open({ ...args, ...(i.cwd ? { cwd: i.cwd } : {}), options: { ...options, ...args.options }, ...(this.env ? { env: { ...args.env, ...this.env } } : {}) });
+    const options = i.kind === 'claude-code' || i.kind === 'module' ? { ...i.options, profiles: i.profiles } : i.options;
+    // A module harness runs in the daemon's process: the instance's env reaches it through the open args.
+    const instEnv = i.kind === 'module' ? definedEnv(i.env) : undefined;
+    const env = instEnv || this.env ? { ...instEnv, ...args.env, ...this.env } : undefined;
+    return this.inner.open({ ...args, ...(i.cwd ? { cwd: i.cwd } : {}), options: { ...options, ...args.options }, ...(env ? { env } : {}) });
   }
 }
 
@@ -1881,6 +1945,7 @@ export class InstanceHarness implements HarnessAdapter {
  */
 export function buildHarness(i: HarnessInstance, media?: MediaResolvers): InstanceHarness {
   if (i.unavailable) throw new Error(`harness instance ${i.name} is unavailable: ${i.unavailable}`);
+  if (i.kind === 'module') throw new Error(`harness instance ${i.name} is a module harness; the gateway loads it at start`);
   if (i.kind === 'codex') {
     const x = i.codex;
     return new InstanceHarness(
@@ -1916,6 +1981,38 @@ export function buildHarness(i: HarnessInstance, media?: MediaResolvers): Instan
   // Resolvers ride in the instance's open options; explicit options in the config win.
   const inst = media ? { ...i, options: { resolveImage: media.resolveImage, resolveFile: media.resolveFile, ...i.options } } : i;
   return new InstanceHarness(inst, new ClaudeCodeHarness(config));
+}
+
+/** The variables an env map sets (`undefined` removes one from a child's env; in-process there is nothing to remove). */
+function definedEnv(env: Record<string, string | undefined>): Record<string, string> | undefined {
+  const out = Object.fromEntries(Object.entries(env).filter((e): e is [string, string] => e[1] !== undefined));
+  return Object.keys(out).length ? out : undefined;
+}
+
+/** Import a harness module, run its factory, and check the adapter's shape. */
+async function loadHarnessModule(o: {
+  name: string;
+  module: ModuleLaunch;
+  log: (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
+  harness: (name: string) => HarnessAdapter;
+}): Promise<HarnessAdapter> {
+  const where = `harnesses.${o.name} (module ${o.module.file})`;
+  const name = o.module.export ?? 'createHarness';
+  const mod = (await import(pathToFileURL(o.module.file).href).catch((e: Error) => {
+    throw new Error(`${where}: cannot import: ${e.message}`);
+  })) as Record<string, unknown>;
+  const factory = o.module.export !== undefined ? mod[name] : (mod[name] ?? mod.default);
+  if (typeof factory !== 'function') throw new Error(`${where}: export ${JSON.stringify(name)}${o.module.export !== undefined ? '' : ' (or default)'} is not a function`);
+  let adapter: HarnessAdapter;
+  try {
+    adapter = await (factory as HarnessFactory)({ name: o.name, config: o.module.config, log: o.log, harness: o.harness });
+  } catch (e) {
+    throw new Error(`${where}: factory failed: ${(e as Error).message}`);
+  }
+  const a = adapter as unknown as Partial<Record<string, unknown>> | null;
+  const bad = !a || typeof a.id !== 'string' || !a.id ? 'id (a non-empty string)' : (['probe', 'open'] as const).find((k) => typeof a[k] !== 'function');
+  if (bad) throw new Error(`${where}: the factory did not return a HarnessAdapter (bad ${bad})`);
+  return adapter;
 }
 
 /** What a live's voice is told when the agent gives no instructions (decision 11). */

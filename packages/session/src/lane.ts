@@ -10,6 +10,7 @@ import {
   type HarnessSession,
   type InputMode,
   type InputRecord,
+  type LiveFrame,
   type LiveStartArgs,
   type Origin,
   type ReplyRoute,
@@ -375,19 +376,26 @@ export class Lane {
 
   /**
    * Start realtime voice on this session's harness thread (decision 11). Opens the
-   * harness when needed. Resolves with the harness's SDP answer for the far side.
+   * harness when needed. Refuses a transport the harness's live does not list, before
+   * `start`. A frames transport's video reaches only a live that declares `video`.
+   * Resolves with the harness's SDP answer for the far side (webrtc).
    */
-  async startLive(info: LiveInfo, args: Omit<LiveStartArgs, 'liveId'>): Promise<{ answerSdp: string }> {
+  async startLive(info: LiveInfo, args: Omit<LiveStartArgs, 'liveId'>): Promise<{ answerSdp?: string }> {
     const s = await this.serial(async () => {
       if (this.closed) throw new Error('session is closed');
       if (this.live) throw new Error(`a live (${this.live.title}) is already running in this session`);
       const s = await this.ensureSession(this.lastRun ?? (await this.policy.plan({ sessionKey: this.sessionKey, inputs: [] })));
       if (!s.live) throw new Error(`harness ${this.adapter.id} has no realtime voice (live)`);
+      const takes = s.live.transports ?? ['webrtc'];
+      if (!takes.includes(args.transport.type))
+        throw new LiveTransportError(`harness ${this.adapter.id}'s live does not take the ${args.transport.type} transport (it takes: ${takes.join(', ')})`);
       this.live = info;
       return s;
     });
+    const t = args.transport;
+    const transport = t.type === 'frames' && !s.live!.video ? { ...t, media: { frames: audioOnly(t.media.frames), send: (f: LiveFrame) => t.media.send(f) } } : t;
     try {
-      const r = await s.live!.start({ liveId: info.liveId, ...args });
+      const r = await s.live!.start({ liveId: info.liveId, ...args, transport });
       await this.serial(async () => {
         this.emit({ body: { t: 'live.started', liveId: info.liveId, title: info.title, route: info.route, controlRoute: info.controlRoute } });
       });
@@ -1300,4 +1308,14 @@ function clipContent(content: InputRecord['content'], max: number): InputRecord[
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** A frames transport's inbound frames without the video ones (for a live that does not take video). */
+async function* audioOnly(frames: AsyncIterable<LiveFrame>): AsyncIterable<LiveFrame> {
+  for await (const f of frames) if (f.kind !== 'video') yield f;
+}
+
+/** `startLive` was given a transport the harness's live does not take (nothing was started). */
+export class LiveTransportError extends Error {
+  override name = 'LiveTransportError';
 }
