@@ -95,3 +95,9 @@
 - **日志**：`live.started` / `live.transcript`（双方，每句一条）/ `live.handoff` / `live.ended`，都进 session 日志。
 - **工具**（宿主 MCP）：`live_join { target, instructions?, voice? }`（在当前 turn 的通道上打开对端，target 由通道解释，例如会议号）、`live_say { text }`（让语音端说一段话）、`live_leave`。委托 turn 里同样可用，所以会里说"挂了吧"能离会。语音转述不可靠：要紧的结果应另用 `send_message` 落成文字（工具说明里写明）。
 - **结束**：任一端结束（对端离会、harness 关闭、`live_leave`、守护进程停止）都关闭另一端并记 `live.ended`。守护进程重启不恢复 live。
+
+### 决定 11 补记：模块 harness 与 frames 传输
+
+- **模块 harness**：`harnesses.<name>` 可写 `{ use: 'module', module, export?, config?, env?, cwd?, run?, profiles?, options? }`（封闭 schema）。`module` 的解析同通道模块（相对配置文件、绝对路径、包目录或裸说明符），`config` 做 `env:NAME` 替换；模块不存在或有未知键是配置错误。模块导出一个 `HarnessFactory`（默认 `createHarness`，否则 `default`，或 `export` 指定的名字），收到 `HarnessFactoryInit = { name, config, log, harness(name) }`；`harness(name)` 给出另一个已配置实例的 adapter，语音 harness 可以把委派回合交给文本 harness。网关在启动时导入模块、运行工厂；导出不是函数、工厂抛错或返回的不是 adapter 都使启动失败，错误里有实例名。实例仍包在 `InstanceHarness` 里。
+- **frames 传输**：`LiveEndpoint.offer` 与 `LiveStartArgs.transport` 都是 webrtc 或 frames 的联合；frames 带 `audio: { encoding: 'pcm16', rate }`、可选 `video: { encodings }` 和 `media: LiveMedia`（`frames` 为对端采集的 `LiveFrame`，`send` 播给对端）。`HarnessLive` 增加 `transports?`（缺省 `['webrtc']`）和 `video?`，`start` 返回 `{ answerSdp? }`，只有 webrtc 需要答复。`live_join` 在 `start` 之前拒绝 live 不支持的传输（错误里有传输名），并关闭端点、不留登记；frames 端点的 `media` 直接交给 harness，live 未声明 `video` 时滤掉视频帧，只对 webrtc 调 `endpoint.answer`。其余流程（`live.started` / `live.transcript` / `live.handoff` / `live.ended`，对端结束即结束语音，`live_leave` 与网关停止两头都结束）不变。`MediaKind` 增加 `video`。
+- 视频按静态帧传，因为 WebSocket 类实时服务收的是图片输入；以后需要时可以再扩展。

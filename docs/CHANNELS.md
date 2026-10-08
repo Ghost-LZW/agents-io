@@ -411,6 +411,8 @@ agent 自己以语音进一个会议或通话：听得到所有人，用自己�
 - **结束**：对端离会/会议结束、`live_leave`、harness 关闭、守护进程停止，任一发生都关闭另一端并记 `live.ended`。守护进程重启不恢复 live。
 - **已知限制**：语音转述可能出错（实测把"目录是空的"说成"有个文件"），要紧的结果另发文字；几乎每句实质性的话都委托，回答延迟约 10–20 秒；`appendText` 注入的文字不会触发委托，只有真实语音会。
 
+**frames 端点**（决定 11 补记）：`openLive` 也可以返回 `offer: { type: 'frames', audio: { encoding: 'pcm16', rate }, video?: { encodings: ['image/jpeg' | 'image/png' | 'image/webp'] } }` 的端点，并带上 `media: LiveMedia`：`media.frames` 是对端采集到的帧（`{ kind: 'audio', pcm }` 为单声道 PCM16LE、采样率为 `audio.rate`；`{ kind: 'video', data, mimeType }` 为一张静态图），`media.send(frame)` 把 harness 的音频放给对端。frames 端点不需要 `answer`。harness 的 live 不支持该传输（`HarnessLive.transports`，缺省只有 `webrtc`）时，网关在调用 `start` 之前拒绝并关闭端点；live 未声明 `video` 时，网关滤掉视频帧。要声明能收发视频，在 `caps.media` 里写 `video`。
+
 ## 8. 已知缺口
 
 | 缺口 | 影响 |

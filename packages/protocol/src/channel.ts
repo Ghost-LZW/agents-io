@@ -3,7 +3,7 @@ import { Evidence, ReplyRoute } from './common.js';
 import { InboundEnvelope } from './inbound.js';
 import { ItemSummary, Tier } from './events.js';
 
-const MediaKind = Type.Union([Type.Literal('image'), Type.Literal('file'), Type.Literal('audio')]);
+const MediaKind = Type.Union([Type.Literal('image'), Type.Literal('file'), Type.Literal('audio'), Type.Literal('video')]);
 
 export const ChannelCaps = Type.Object({
   text: Type.Object({
@@ -178,6 +178,26 @@ export interface ChannelAdapter {
   close?(): Promise<void>;
 }
 
+/** Still-image encodings a frames transport carries video in. */
+export type LiveVideoEncoding = 'image/jpeg' | 'image/png' | 'image/webp';
+
+/** One frame of a frames live: mono PCM16LE audio at the transport's rate, or one still image. */
+export type LiveFrame = { kind: 'audio'; pcm: Uint8Array } | { kind: 'video'; data: Uint8Array; mimeType: LiveVideoEncoding };
+
+/** Frames in from the far side, frames out to it. */
+export interface LiveMedia {
+  readonly frames: AsyncIterable<LiveFrame>;
+  send(frame: LiveFrame): void;
+}
+
+/** The audio and (optional) video formats of a frames transport. */
+export interface LiveFramesFormat {
+  audio: { encoding: 'pcm16'; rate: number };
+  video?: { encodings: LiveVideoEncoding[] };
+}
+
+export type LiveOffer = { type: 'webrtc'; sdp: string } | ({ type: 'frames' } & LiveFramesFormat);
+
 /** A live media peer a channel opened (`ChannelAdapter.openLive`). */
 export interface LiveEndpoint {
   /** Channel-side id (e.g. the meeting participant). */
@@ -186,9 +206,12 @@ export interface LiveEndpoint {
   readonly title: string;
   /** Where the live happens, as a route (transcripts and provenance name it). */
   readonly route: ReplyRoute;
-  readonly offer: { type: 'webrtc'; sdp: string };
-  /** Hand the harness's answer to the far side. */
-  answer(sdp: string): Promise<void>;
+  /** WebRTC: the harness answers the SDP. Frames: media flows as `LiveFrame`s through `media`. */
+  readonly offer: LiveOffer;
+  /** A frames endpoint's media: `frames` is what the far side captured, `send` plays to the far side. */
+  readonly media?: LiveMedia;
+  /** Hand the harness's answer to the far side (webrtc only). */
+  answer?(sdp: string): Promise<void>;
   /** Leave. Idempotent. */
   close(reason: string): Promise<void>;
   /** Resolves with a reason when the far side ends it (left, removed, meeting over), or after `close`. */
