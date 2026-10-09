@@ -1,6 +1,6 @@
 # 运维设定的宿主令牌（`aio serve --token-file` / `host.tokenFile`）
 
-> 状态：已实现（分支 `feat/ops-token-heartbeat-live-channels`），待合并时记入决定。可选开启，不配置时行为不变。
+> 状态：已采纳并合入 main（决定 10）。可选开启，不配置时行为不变。
 > 依据：`docs/POSITIONING.md` §2（机制不是策略）；`docs/HOSTS.md` §4（`host.hello`）；`packages/daemon/README.md`「Host connection」。
 
 ## 1. 问题

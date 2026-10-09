@@ -1,6 +1,6 @@
 # 宿主入站补投：`inbound.redispatch`
 
-> 状态：提案已实现（2026-10-07，分支 `feat/host-resolve-redispatch`），待 owner 拍板后记入 `docs/design/locus/DECISIONS.md`。
+> 状态：已采纳并合入 main（2026-10-07，决定 9）。
 > 依据：`docs/POSITIONING.md` §2（机制与策略的判据）；`docs/HOSTS.md` §2.1（宿主入站队列）、§2.2（回调 `onFailure`）；`docs/design/locus/DECISIONS.md` 决定 1–8（尤其决定 7：会话 launch 随键固定）。
 
 ## 1. 一句话

@@ -1,6 +1,6 @@
 # 通道变更在线生效：`console.liveChannels`
 
-> 状态：已实现（分支 `feat/ops-token-heartbeat-live-channels`），待合并时记入决定。显式开启：`console.liveChannels: true`，默认关闭（行为与以前相同）。
+> 状态：已采纳并合入 main（决定 10）。显式开启：`console.liveChannels: true`，默认关闭（行为与以前相同）。
 > 依据：`docs/POSITIONING.md` §2（机制而非策略）；决定 8（一个守护进程多个 Lark 机器人，按 (channel, account) 出站）。
 
 ## 1. 问题

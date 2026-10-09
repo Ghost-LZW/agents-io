@@ -1,6 +1,6 @@
 # 宿主同步钩子：`resolve` 与 `outbound` 回调，宿主代答
 
-> 状态：提案已实现（2026-10-07，分支 `feat/host-resolve-redispatch`），待 owner 拍板后记入 `docs/design/locus/DECISIONS.md`。
+> 状态：已采纳并合入 main（2026-10-07，决定 9）。
 > 依据：`docs/POSITIONING.md` §2（机制与策略的判据）、§4（`Policy` 钩子）；`docs/HOSTS.md` §4（"`resolve`、`outbound` 等可选的同步钩子（超时 fail closed）"）；`docs/design/locus/DECISIONS.md` 决定 1–8。
 
 ## 1. 一句话

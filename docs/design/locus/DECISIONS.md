@@ -101,3 +101,12 @@
 - **模块 harness**：`harnesses.<name>` 可写 `{ use: 'module', module, export?, config?, env?, cwd?, run?, profiles?, options? }`（封闭 schema）。`module` 的解析同通道模块（相对配置文件、绝对路径、包目录或裸说明符），`config` 做 `env:NAME` 替换；模块不存在或有未知键是配置错误。模块导出一个 `HarnessFactory`（默认 `createHarness`，否则 `default`，或 `export` 指定的名字），收到 `HarnessFactoryInit = { name, config, log, harness(name) }`；`harness(name)` 给出另一个已配置实例的 adapter，语音 harness 可以把委派回合交给文本 harness。网关在启动时导入模块、运行工厂；导出不是函数、工厂抛错或返回的不是 adapter 都使启动失败，错误里有实例名。实例仍包在 `InstanceHarness` 里。
 - **frames 传输**：`LiveEndpoint.offer` 与 `LiveStartArgs.transport` 都是 webrtc 或 frames 的联合；frames 带 `audio: { encoding: 'pcm16', rate }`、可选 `video: { encodings }` 和 `media: LiveMedia`（`frames` 为对端采集的 `LiveFrame`，`send` 播给对端）。`HarnessLive` 增加 `transports?`（缺省 `['webrtc']`）和 `video?`，`start` 返回 `{ answerSdp? }`，只有 webrtc 需要答复。`live_join` 在 `start` 之前拒绝 live 不支持的传输（错误里有传输名），并关闭端点、不留登记；frames 端点的 `media` 直接交给 harness，live 未声明 `video` 时滤掉视频帧，只对 webrtc 调 `endpoint.answer`。其余流程（`live.started` / `live.transcript` / `live.handoff` / `live.ended`，对端结束即结束语音，`live_leave` 与网关停止两头都结束）不变。`MediaKind` 增加 `video`。
 - 视频按静态帧传，因为 WebSocket 类实时服务收的是图片输入；以后需要时可以再扩展。
+
+## 决定 12：核心原则；全模态进核心；agent 之间的通信只做 IO
+
+日期：2026-10-10。讨论记录见 `docs/ROADMAP.md`。
+
+- **核心原则**：日志是唯一真相，各端是可升级到全保真的投影；模型只看文本与来源，工具按需开启；承诺写成可检验的不变量；守护进程升级不丢对话与 turn；只做 IO，不做真相。全文见 `docs/ROADMAP.md` §1。
+- **全模态进核心**（owner）：输入输出覆盖文本、图片、文件、音频、视频；实时语音是核心能力，不是通道插件。修订 `docs/design/thin-bridge.md` 的"不统一语音、不进核心"。
+- **agent 之间的通信**：对话方（消息）与调用方（任务）两种形态都做，另有发现、观察与控制、因果链与防循环（`docs/ROADMAP.md` §2）。**x-work-os 是协调的真相来源，agents-io 只负责 IO**（owner）：不记任务状态、分工、验收。
+- **代为审批**（owner）：agent 可以代另一个 agent 的请求作答，作为新的 Resolver 种类提供；与 `onBehalfOf` 一样须显式开启，日志记 `by.via`。

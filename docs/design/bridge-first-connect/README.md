@@ -1,6 +1,6 @@
 # bridge 通道首次 `hello` 失败：标记 failed 并重试，而不是让守护进程启动失败
 
-> 状态：已实现（分支 `feat/ops-token-heartbeat-live-channels`），待合并时记入决定。对守护进程配置里的 `bridge` 通道生效；库调用方经 `retryFirstConnect` 显式开启。
+> 状态：已采纳并合入 main（决定 10）。对守护进程配置里的 `bridge` 通道生效；库调用方经 `retryFirstConnect` 显式开启。
 > 依据：`docs/POSITIONING.md` §2（机制而非策略）；决定 1（宿主/对端不在线只变慢、不丢输入）。
 
 ## 1. 问题

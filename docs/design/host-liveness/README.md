@@ -1,6 +1,6 @@
 # 宿主连接存活：`/ws` 心跳与 `host.hello { takeover }`
 
-> 状态：已实现（分支 `feat/ops-token-heartbeat-live-channels`），待合并时记入决定。`takeover` 由宿主显式开启；心跳默认开启（见 §3.1 的理由），可配置关闭。
+> 状态：已采纳并合入 main（决定 10）。`takeover` 由宿主显式开启；心跳默认开启（见 §3.1 的理由），可配置关闭。
 > 依据：`docs/POSITIONING.md` §2；`docs/HOSTS.md` §4；决定 1（宿主不在线只变慢、不丢输入）。
 
 ## 1. 问题
