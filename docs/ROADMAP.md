@@ -16,6 +16,7 @@ agents-io 要在任何通道、任何模态上给出同样的可信度，健壮�
 4. **承诺可检验。** agents-io 的不变量集中写成一张清单（§3），每条都有测试；`aio explain` 能从任何副作用追溯到触发它的输入。
 5. **能自我升级。** 守护进程重启或升级不丢对话、不丢正在跑的 turn（或确定地续上）。这是让 agent 维护 agents-io 的门槛。
 6. **只做 IO，不做真相。** 任务、分工、验收、记忆、成员目录的真相在宿主（x-work-os 等）。agents-io 负责送达、观察与因果记录（POSITIONING §2）。
+7. **宿主的业务交互走工作区，不走 agents-io。** 宿主有两个面：控制面（告诉 agents-io 怎么做 IO：身份映射、Binding 表与回调、launch、入站队列、审批、出站、任务运行）经过 agents-io；环境面（agent 的工作目录、CLAUDE.md / AGENTS.md、`x` 命令行、凭据、brief）是 agent 自己的世界，agents-io 只在启动时设 cwd/env。判断方法：这件事需要碰通道、碰人或需要投递吗？不需要就不该经过 agents-io。
 
 ## 2. agent 之间的通信
 
@@ -32,12 +33,12 @@ agents-io 要在任何通道、任何模态上给出同样的可信度，健壮�
 
 给模型的工具压到三四个，按 agent 配置开启：`agents_list`、`agent_send`、`agent_run`、`agent_status`（含控制）。不在 agents-io 上的 agent 通过一个 MCP 端点（之后可能加 A2A）使用同一组原语，进来时带外部来源。跨机器守护进程互联不做，等有需要再说。
 
-## 3. 不变量清单（待集中）
+## 3. 不变量清单
 
-现散在各设计文档里，下一步汇总到 `docs/INVARIANTS.md` 并逐条对应测试：
+全文与测试对照见 `docs/INVARIANTS.md`。摘要：
 
 - 每条输入要么被消费（`input.consumed`），要么被明确拒绝（`input.rejected`），不会静默消失。
-- 每次投递都以 `delivery.settled` 结束（成功、失败或 `ambiguous`），按 operationId 幂等。
+- 每次投递都以 `delivery.settled` 结束（成功、失败或 `unknown`），按 operationId 幂等。
 - 交给宿主的输入在 ack 之前不丢（持久队列，至少一次）；redispatch 至多一次。
 - 每条输入都带来源（主体、来源类型、路由、是否经 watch、证据），模型可见。
 - 任何副作用（发消息、写宿主命令、审批）都能由 `aio explain` 追溯到触发它的轮次与输入。
@@ -47,8 +48,14 @@ agents-io 要在任何通道、任何模态上给出同样的可信度，健壮�
 
 ### 现在
 
-1. **不变量清单**（§3）：汇总、补缺失的测试。
-2. **agent 通信第一步：寻址、身份、因果链**（§2 第 1、6 项）。地基，不增加模型负担。
+1. **不变量清单**（§3，已汇总为 `docs/INVARIANTS.md`：58 条，29 有测试 / 19 部分 / 9 没有，21 条代码路径不成立）。先修最危险的缺口：
+   - 通道可冒充别的通道与主人（ID-3，`gateway.ts:1594` 不核对 `env.channel/account`）→ 落地 channel-stamping；
+   - lane 关闭或重启时排队输入静默丢失（IN-1 / RS-6）；
+   - `aio explain` 不能从副作用反查（EX-2）；系统回复、宿主 `deliver`、`live_say` 无痕；
+   - outbox 只在结算时落记录，崩溃后重发（Lark 上传、邮件真的会发两次）；多机器人时停掉的账号被改写成另一个账号发出；
+   - 守护进程从不设 `SendOp.as`（agent 身份未随附）。
+   宿主接口复查见 `docs/design/host-surface-review/`（删 `lease`、删 `AGENTS_IO_TURN_PROVENANCE`、冻结 resolve/outbound 回调、来源行加 `ref=`）。
+2. **agent 通信第一步：寻址、身份、因果链**（§2 第 1、6 项），提案见 `docs/design/agent-messaging/`。地基，不增加模型负担。
 3. **飞书会议通道 v1（文本）**：`docs/research/meeting.md`，在 `channel/lark-bot` 里做；先在真实会议里做 go/no-go（灰度，可能 20017）。
 4. **飞书手工检查清单**：图片 / 文件、`ask_choice` 按钮、@、`send_file`，待 owner 确认。
 
