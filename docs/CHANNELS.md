@@ -214,7 +214,17 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 - **agent 看到什么**：完全取决于私有适配器发出的入站信封，经过 §1 的同样转换。
 - **输出怎么处理**：适配器收到 `RenderedMessage`，其中包含 `progress`（结构化过程视图），以及它在 hello 里声明过的方法（edit、finalize 等）。能渲染到什么程度，由适配器自己决定。
 - **档位**：由配置决定。
-- **对端起不来**：首次 `hello` 失败不会让守护进程启动失败。通道显示为 `failed`（`GET /api/status` 给出原因，后缀 `; retrying`），按 `backoff` 重试，连上后变回 `running`（之后对端离开、重连期间同样显示 `failed`）；命令本身无法执行（`ENOENT` / `EACCES`）仍让启动失败。未连接时请求以 `unavailable`（可重试）失败。可选的 `id` 写对端 `hello` 会声明的 adapter id，用于未连接时的显示与路由（默认 `bridge`）。见 `docs/design/bridge-first-connect`。
+- **对端起不来**：首次 `hello` 失败不会让守护进程启动失败。通道显示为 `failed`（`GET /api/status` 给出原因，后缀 `; retrying`），按 `backoff` 重试，连上后变回 `running`（之后对端离开、重连期间同样显示 `failed`）；命令本身无法执行（`ENOENT` / `EACCES`）仍让启动失败。未连接时请求以 `unavailable`（可重试）失败。见 `docs/design/bridge-first-connect`。
+- **通道 id**：可选的 `id` 是这个通道的 id，每次 `hello` 声明的 `adapterId` 都必须等于它，否则按 `bad_hello` 拒绝、杀掉子进程并按 `backoff` 重启（状态 `failed`，原因写明）；未连接时也用它显示与路由。不写 `id` 时第一次成功 `hello` 的 id 被固定，之后的 hello 不许换。见下文"通道盖章"。
+
+### 通道盖章（channel-stamping，决定 13）
+
+适用于所有通道（内置、bridge、module、嵌入方传入的适配器）：
+
+- **信封属于发出它的通道。** 守护进程按"它是从哪个通道实例发出来的"核对信封：`channel`、`account` 必须是该通道的 id 与配置账号，`replyRoute`（若有）也必须指向同一 `(channel, account)`。不符即拒收：`emit` 返回 `{ accepted: false }`（bridge 收到 `result ok:true value {accepted:false}`），不进任何 session、不进去重表、不写 `input.verify`，日志 `warn`（同一通道同一原因每分钟一条），`aio status` / `GET /api/status` 的通道上 `rejected` 计数。**`accepted:false` 是终态，适配器不应重试**；要重试的瞬时故障用抛错（bridge 侧 `ok:false`、`retryable:true`）表达。不支持信封自带跨通道回复路由：在 A 收、在 B 答用 Binding 的 `replyTo` 或宿主 `deliver`。
+- **一个通道 id 只属于一种适配器，只有账号不同。** 内置 id `lark-bot`、`mail`、`local` 保留，bridge 与 module 不得使用；同 id 的 bridge 条目必须是同一程序（`command`/`args` 相同）；同 id 的 module 条目必须是同一模块与导出；嵌入方传入的适配器按类区分。冲突在配置校验（bridge 的 `id`）或启动时（module 的 id、已连上的 bridge 的 hello id）报配置错误；live apply 时进 `failed`；bridge 运行中 hello 换成冲突的 id 按 `bad_hello` 拒绝。
+- **证据按通道封顶。** 通道条目可写 `"evidence": ["platform_signed"]` 等（任何通道类型都可写）。适配器能提交的证据 = 条目的 `evidence` ∩ `caps.evidence`，外加 `none`；不写时 lark-bot、mail 与嵌入方适配器取 `caps.evidence`，**bridge 与 module 只有 `device_only`**（强证据必须显式授予）。超出上限的证据降为 `none`（消息照收，按外部来源处理，决定 3），`aio explain` 里 `claimedEvidence` 记原本声明的值，通道上 `evidenceCapped` 计数；`input.verify` 与宿主入站队列看到的是封顶后的值。授予了 caps 没有的证据会在启动（bridge：连上时）告警并忽略。`caps.declaresSender` 为 false 的通道，入站的 `sender.declared` 被丢弃。
+- 一致性套件（`packages/testkit` `runChannelConformance`）检查 `inbound.channel_id`、`inbound.account`、`inbound.evidence_in_caps`，适配器作者在本地就能发现问题。
 
 ### 私有/外部通道插件（`type: "module"`）
 
@@ -241,7 +251,8 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 
 - 包目录按 `package.json` 的 `exports["."]`（`import`/`default` 条件）或 `main` 解析，ESM 包即可。
 - 模块缺失（路径不存在、包名解析不到）在配置校验阶段就报错；导出不是函数、工厂抛错、返回值缺 `id`/`caps`/`start`/`send` 则在启动时失败，均按配置错误退出（退出码 2）。
-- 适配器的 `id` 要等工厂返回后才知道：两个条目（含内置通道）的 `(id, account)` 相同时启动失败。
+- 适配器的 `id` 要等工厂返回后才知道：两个条目（含内置通道）的 `(id, account)` 相同、id 与别的适配器相同或是内置 id 时启动失败（见上文"通道盖章"）。
+- module 通道默认只能提交 `device_only` 证据；要让它的 `platform_signed` 等被采信，在条目上写 `"evidence": [...]`。
 
 ## 6. 监听（watch）
 

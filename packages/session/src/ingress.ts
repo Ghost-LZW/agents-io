@@ -8,6 +8,7 @@ import {
   type DecisionKind,
   type InputRecord,
   type ChannelCaps,
+  type Evidence,
   type Origin,
   type ReplyRoute,
   type Tier,
@@ -159,6 +160,32 @@ export interface DeliveryOutcome {
   unavailable?: { code: string; message: string };
 }
 
+/**
+ * The configured channel instance an envelope was emitted by, as the caller (the
+ * daemon) knows it — not as the envelope says. Passed to `Ingress.accept`, it binds
+ * the envelope to that instance (channel-stamping, decision 13):
+ * - `env.channel` / `env.account` (and the reply route's, when there is one) must be
+ *   this channel and account, else the envelope is refused (`SOURCE_MISMATCH`);
+ * - the sender's evidence is capped to `evidence` (anything else becomes `none`);
+ * - `sender.declared` is dropped unless `declaresSender`.
+ */
+export interface EmitSource {
+  /** Channel id: the adapter's id (a bridge's pinned hello id). */
+  channel: string;
+  /** The configured account. */
+  account: string;
+  /** Evidence this channel may give (deployment grant ∩ caps); `none` is always allowed. */
+  evidence: readonly Evidence[];
+  /** `caps.declaresSender`: whether it may attach a declared identity to inbound messages. */
+  declaresSender: boolean;
+}
+
+/**
+ * Stable prefix of `IngressResult.error` for an envelope that claims another channel,
+ * account or reply route than the source that emitted it (refused, `action: "invalid"`).
+ */
+export const SOURCE_MISMATCH = 'source_mismatch:';
+
 export interface IngressResult {
   /** The host durably took the envelope (also true for a deliberate drop). */
   accepted: boolean;
@@ -179,6 +206,14 @@ export interface IngressResult {
   explanation?: Explanation;
   /** A topic command was answered instead of delivering the input. */
   command?: { name: TopicCommand['name']; ok: boolean; reply: string; topic?: string };
+  /**
+   * The envelope as processed: with an `EmitSource`, evidence capped and `declared`
+   * dropped. What the input, the host queue and records hold. The caller's object
+   * is never changed; when nothing was capped this is that object.
+   */
+  envelope?: InboundEnvelope;
+  /** The source capped the sender's evidence: what the envelope claimed. */
+  claimedEvidence?: Evidence;
 }
 
 /**
@@ -209,27 +244,37 @@ export class Ingress {
       });
   }
 
-  /** A `ChannelContext.emit` implementation for one adapter. */
-  emitter(): (env: InboundEnvelope) => Promise<{ accepted: boolean; inputId?: string }> {
+  /** A `ChannelContext.emit` implementation for one adapter, bound to `source` when given (see {@link EmitSource}). */
+  emitter(source?: EmitSource): (env: InboundEnvelope) => Promise<{ accepted: boolean; inputId?: string }> {
     return async (env) => {
-      const r = await this.accept(env);
+      const r = await this.accept(env, source);
       return { accepted: r.accepted, ...(r.inputId !== undefined ? { inputId: r.inputId } : {}) };
     };
   }
 
-  async accept(env: InboundEnvelope): Promise<IngressResult> {
+  /**
+   * Stamp and route one envelope. With `source` it is bound to the channel instance
+   * that emitted it ({@link EmitSource}); without one the caller is trusted as is
+   * (an embedder feeding envelopes it built itself, tests).
+   */
+  async accept(env: InboundEnvelope, source?: EmitSource): Promise<IngressResult> {
     const errs = errors(InboundEnvelope, env);
     if (errs.length) return { accepted: false, action: 'invalid', error: errs.slice(0, 3).join('; ') };
+    // Before dedup: a forged envelope must not get a real message's input id back as a duplicate.
+    const bad = source && sourceMismatch(env, source);
+    if (bad) return { accepted: false, action: 'invalid', error: `${SOURCE_MISMATCH} ${bad}` };
+    const norm = source ? capEnvelope(env, source) : env;
+    const capped = norm.sender.evidence !== env.sender.evidence ? { claimedEvidence: env.sender.evidence } : {};
     // Per account too: a platform message id is shared by every bot account that receives it.
-    const key = envKey(env.channel, env.account, env.id);
+    const key = envKey(norm.channel, norm.account, norm.id);
     const prior = this.seen.get(key);
-    if (prior) return { ...prior, action: 'duplicate' };
+    if (prior) return { ...prior, action: 'duplicate', envelope: norm, ...capped };
     const running = this.inflight.get(key);
     if (running) {
       const first = await running.catch(() => undefined);
-      return first?.accepted ? { ...first, action: 'duplicate' } : this.accept(env);
+      return first?.accepted ? { ...first, action: 'duplicate', envelope: norm, ...capped } : this.accept(env, source);
     }
-    const p = this.process(env);
+    const p = this.process(norm, capped.claimedEvidence).then((r) => ({ ...r, envelope: norm, ...capped }));
     this.inflight.set(key, p);
     try {
       const r = await p;
@@ -250,7 +295,7 @@ export class Ingress {
     }
   }
 
-  private async process(env: InboundEnvelope): Promise<IngressResult> {
+  private async process(env: InboundEnvelope, claimedEvidence?: Evidence): Promise<IngressResult> {
     const identity = await this.policy.identify({
       channel: env.channel,
       account: env.account,
@@ -307,7 +352,7 @@ export class Ingress {
     // a dispatched input may already be running, so its revision is a new input.
     if (revisionOf && own.some((d) => d.on === 'dispatch')) input = { ...input, inputId: this.newId('in') };
     this.inputIds.set(envKey(env.channel, env.account, env.id), input.inputId);
-    const explanation: Explanation = { ...decision.explanation, inputId: input.inputId };
+    const explanation: Explanation = { ...decision.explanation, inputId: input.inputId, ...(claimedEvidence !== undefined ? { claimedEvidence } : {}) };
     this.router.record(explanation);
 
     // The strongest table delivery is the input's own place (where a click on a choice is rewritten to).
@@ -597,6 +642,24 @@ function ago(ms: number): string {
 }
 
 const envKey = (channel: string, account: string, id: string) => `${channel}:${account}:${id}`;
+
+/** Why an envelope does not belong to the source that emitted it, if it does not. */
+function sourceMismatch(env: InboundEnvelope, s: EmitSource): string | undefined {
+  const at = `emitted by (${s.channel}, ${s.account})`;
+  if (env.channel !== s.channel || env.account !== s.account) return `envelope claims (${env.channel}, ${env.account}), ${at}`;
+  const r = env.replyRoute;
+  if (r && (r.channel !== s.channel || r.account !== s.account)) return `reply route names (${r.channel}, ${r.account}), ${at}`;
+  return undefined;
+}
+
+/** The envelope with the sender capped to what the source may claim: a copy when anything changes, else `env` itself. */
+function capEnvelope(env: InboundEnvelope, s: EmitSource): InboundEnvelope {
+  const evidence = env.sender.evidence === 'none' || s.evidence.includes(env.sender.evidence) ? env.sender.evidence : 'none';
+  const dropDeclared = env.sender.declared !== undefined && !s.declaresSender;
+  if (evidence === env.sender.evidence && !dropDeclared) return env;
+  const { declared, ...sender } = env.sender;
+  return { ...env, sender: { ...sender, ...(declared !== undefined && !dropDeclared ? { declared } : {}), evidence } };
+}
 
 function actionClick(env: InboundEnvelope) {
   if (env.content.length !== 1) return undefined;

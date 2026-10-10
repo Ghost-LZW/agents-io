@@ -49,8 +49,19 @@ export interface BridgeOptions {
    * offline caps, and every request fails `unavailable` (retryable). Default false.
    */
   retryFirstConnect?: boolean;
-  /** Adapter id before the first successful `hello` (with `retryFirstConnect`). Default `bridge`. */
+  /** Adapter id before the first successful `hello` (with `retryFirstConnect`). Default `expectId`, else `bridge`. */
   id?: string;
+  /**
+   * The adapter id every `hello` must declare. A peer declaring another is refused
+   * (`bad_hello`: killed, and restarted with backoff by `start`). Without it the first
+   * successful hello's id is pinned: a later hello (after a restart) may not change it.
+   */
+  expectId?: string;
+  /**
+   * Asked before a `hello`'s adapter id is taken (each connect): a reason refuses the
+   * peer as `bad_hello`, e.g. an id that belongs to another channel of the host.
+   */
+  acceptId?: (adapterId: string) => string | undefined;
   /** Called whenever the peer connects, goes away, or a connect attempt fails. */
   onState?: (s: BridgeState) => void;
 }
@@ -249,7 +260,7 @@ class Bridge implements BridgedChannel {
   }
 
   get id(): string {
-    return this.hello?.adapterId ?? this.opts.id ?? 'bridge';
+    return this.hello?.adapterId ?? this.opts.id ?? this.opts.expectId ?? 'bridge';
   }
 
   caps(): ChannelCaps {
@@ -382,6 +393,11 @@ class Bridge implements BridgedChannel {
     try {
       const value = await this.call(conn, 'hello', { account: this.opts.account, config: this.opts.config }, this.helloTimeoutMs);
       if (!check(ChannelHello, value)) throw new ChannelBridgeError('bad_hello', `invalid hello: ${errors(ChannelHello, value).slice(0, 3).join('; ')}`, false);
+      // The channel id is fixed: configured (`expectId`), else the first hello's.
+      const pinned = this.opts.expectId ?? this.hello?.adapterId;
+      if (pinned !== undefined && value.adapterId !== pinned) throw new ChannelBridgeError('bad_hello', `hello declares adapter id ${JSON.stringify(value.adapterId)}, this channel is ${JSON.stringify(pinned)}`, false);
+      const refused = this.opts.acceptId?.(value.adapterId);
+      if (refused !== undefined) throw new ChannelBridgeError('bad_hello', `hello adapter id ${JSON.stringify(value.adapterId)} refused: ${refused}`, false);
       this.hello = value;
       this.attachMethods(value.methods);
     } catch (err) {

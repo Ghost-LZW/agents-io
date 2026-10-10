@@ -2,7 +2,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { Type, type Static } from '@sinclair/typebox';
-import { Binding, IdentityEntry, Tier, WatchDraft, errors, type BindingTable, type Principal, type RunSpec, type WatchSource } from '@agents-io/protocol';
+import { Binding, Evidence, IdentityEntry, Tier, WatchDraft, errors, type BindingTable, type Principal, type RunSpec, type WatchSource } from '@agents-io/protocol';
 import { DEFAULT_BLOB_MAX_BYTES, Router, RouterError, checkIdentities, ownerIdentities, ownersTable, type AgentSpec } from '@agents-io/session';
 import { resolveChannelModule } from './channel-module.js';
 import { loadEnvFile } from '@agents-io/testkit';
@@ -149,7 +149,19 @@ const ChannelCommon = {
   account: Type.Optional(Type.String()),
   /** Rendering tier for this channel (default: the adapter's `caps.defaultTier`). */
   tier: Type.Optional(Tier),
+  /**
+   * Sender evidence this channel may give (channel-stamping): the cap is this ∩ the
+   * adapter's `caps.evidence`, and stronger claims become `none`. Default: lark-bot and
+   * mail `caps.evidence`; bridge and module channels only `device_only` (never
+   * `platform_signed` / `dkim_pass` unless granted here).
+   */
+  evidence: Type.Optional(Type.Array(Evidence)),
 };
+
+/** Channel ids of the built-in adapters (and local ends): no bridge or module channel may use them. */
+export const RESERVED_CHANNEL_IDS: readonly string[] = ['lark-bot', 'mail', 'local'];
+/** Evidence a bridge or module channel may give without an `evidence` grant. */
+export const UNGRANTED_EVIDENCE: readonly Evidence[] = ['device_only', 'none'];
 
 const ChannelEntry = Type.Union([
   /**
@@ -165,8 +177,13 @@ const ChannelEntry = Type.Union([
     {
       type: Type.Literal('bridge'),
       ...ChannelCommon,
-      /** The adapter id the peer declares in `hello`; shown (e.g. in status) while the peer has not connected yet. Default `bridge`. */
-      id: Type.Optional(Type.String()),
+      /**
+       * The channel id: every `hello` must declare it as `adapterId`, else the peer is refused
+       * (`bad_hello`) and restarted with backoff. Not a built-in id (`lark-bot`, `mail`, `local`);
+       * bridge entries sharing an id must run the same `command` / `args` (one program, several
+       * accounts). Without it the first hello's id is pinned (and checked the same way).
+       */
+      id: Type.Optional(Type.String({ minLength: 1 })),
       command: Type.String(),
       args: Type.Optional(Type.Array(Type.String())),
       env: Type.Optional(Type.Record(Type.String(), Type.String())),
@@ -1219,6 +1236,17 @@ function resolveChannels(entries: ChannelEntry[], env: Record<string, string | u
   if (lark.length > 1) {
     for (const x of lark) if (!INSTANCE_NAME.test(x.ch.account)) fail(`${name(x)}: with several lark-bot channels, accounts are letters, digits, '.', '_' and '-' (at most 64, not starting with '.', '_' or '-')`);
   } else if (lark[0]?.ch.account.includes(':')) warnings.push(`${name(lark[0])}: an account with ':' makes route and session keys ambiguous; use letters, digits, '.', '_' and '-'`);
+  // One channel id belongs to one adapter, only accounts differ (channel-stamping F4). Module ids and
+  // a bridge's id without `id` are only known once loaded / connected; the gateway checks those.
+  const bridges = new Map<string, { program: string; i: number }>();
+  out.forEach((ch, i) => {
+    if (ch.type !== 'bridge' || ch.id === undefined) return;
+    if (RESERVED_CHANNEL_IDS.includes(ch.id)) fail(`channels[${i}]: bridge id ${JSON.stringify(ch.id)} is a built-in channel id; a bridge cannot use it`);
+    const program = JSON.stringify([ch.command, ch.args ?? []]);
+    const prior = bridges.get(ch.id);
+    if (prior && prior.program !== program) fail(`channels[${prior.i}] and channels[${i}] run different programs under one channel id ${JSON.stringify(ch.id)}; one channel id belongs to one adapter (entries sharing it differ only in account)`);
+    bridges.set(ch.id, { program, i });
+  });
   return out;
 }
 

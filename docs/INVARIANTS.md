@@ -227,17 +227,26 @@
 ### ID-3 Origin 由网关盖章，客户端不能设置
 
 - **承诺**：`Origin` "由网关盖章，客户端不能设置"（`inbound.ts:74`）；适配器只提交本命名空间内的 `channelUserId` 与证据（RECOMMENDATION §3.5 第 1 条，POSITIONING §2）。
-- **实现**：只有一半。Origin 的字段确实由 `ingress.process` 计算，但输入全部来自信封自报：每个通道的 `emit` 直接调 `Gateway.accept(env)`（`gateway.ts:1594-1597`），不比较 `env.channel` / `env.account` 与发出它的通道；`evidence`、`declared` 原样采信（`ingress.ts:254-260`）；`Origin.adapter = env.channel`（`ingress.ts:270`）；`ChannelCaps.evidence` 运行时没人读；bridge 的通道 id 来自子进程自己的 hello（`channel/jsonl-bridge/src/host.ts:252`、`:383-385`）。本地 socket 与宿主连接的 origin 由连接决定（`packages/daemon/src/local-server.ts:343-347`、`host.ts:63`、`:178`），这部分成立。
-- **测试**：只有一致性套件要求 `env.channel === adapter.id`（`packages/testkit/src/channel-conformance.ts:73-74`），运行时没有测试。
-- **状态**：没有测试。
-- **不成立**：任何一个通道进程（JSONL bridge、模块通道）发出 `channel: 'lark-bot'`、主人的 `channelUserId`、`evidence: 'platform_signed'`，就被盖章为主人、进主人的会话、按决定 5 走放行 profile，自报的 `replyRoute` 还能通过默认 `Policy.outbound`（`packages/session/src/policy.ts:111-116`）。方案在 `docs/design/channel-stamping/`（提案，待拍板，ROADMAP §4）。
+- **实现**（channel-stamping，决定 13，`docs/design/channel-stamping/`）：
+  1. **来源绑定（C）**：网关为每个通道的 `emit` 构造 `EmitSource`（`gateway.ts` `startChannel` 的 `emit`、`emitSource`），`Ingress.accept(env, source)` 在去重之前核对 `env.channel/account` 与 `replyRoute` 的 `channel/account`，不符即 `accepted:false`、`error` 以 `SOURCE_MISMATCH`（`source_mismatch:`）开头，不进去重表、不写 `input.verify`（`ingress.ts` `accept`、`sourceMismatch`）；网关记日志（每通道每原因每分钟一条）并计 `AdminChannel.rejected`（`gateway.ts` `stamped`）。
+  2. **id 归属（F4）**：一个通道 id 只属于一种适配器（`gateway.ts` `channelOwner`、`idConflict`）；内置 id `lark-bot`/`mail`/`local` 不许 bridge、module 使用；不同 bridge 程序共用 `id` 在配置校验时失败（`config.ts` `resolveChannels`），module、嵌入方适配器与已连上 bridge 的冲突在启动时失败（`startChannels`），live apply 时进 `failed`；bridge 的 id 由配置 `id`（`expectId`）或第一次 hello 固定，换 id 或 hello 的 id 被网关拒绝（`acceptId`）都是 `bad_hello`（`channel/jsonl-bridge/src/host.ts` `connect`）。
+  3. **证据封顶（E3）**：上限 = 条目 `evidence` ∩ `caps.evidence` ∪ `none`，不写时 bridge、module 只有 `device_only`（`config.ts` `UNGRANTED_EVIDENCE`、`gateway.ts` `emitSource`）；超出降为 `none`、`caps.declaresSender` 为 false 时丢 `declared`，在浅拷贝上做，调用方对象不变（`ingress.ts` `capEnvelope`）；`identify`、`Origin`、宿主入站队列、watch 与 `input.verify`（`Gateway.accept` 记 `r.envelope`）都只看封顶后的信封；`RouteExplanation.claimedEvidence` 记原声明，`AdminChannel.evidenceCapped` 计数。
+
+  本地 socket 与宿主连接的 origin 由连接决定（`packages/daemon/src/local-server.ts:343-347`、`host.ts:63`、`:178`）。
+- **测试**：`packages/session/test/ingress.test.ts` "refuses an envelope claiming another channel, account or reply route, without remembering it"、"checks the source before dedup: a forged copy of a seen (channel, account, id) is invalid, not a duplicate"、"caps evidence beyond the source to none: the owner is a stranger, the explanation keeps the claim, the caller object is untouched"、"drops sender.declared when the source may not declare senders, also from a trusted agent account"、"emitter(source) answers like accept(env, source); without a source nothing is checked or capped"；`packages/daemon/test/channel-stamping.test.ts` "a channel claiming another channel as the owner is refused: no lane, no input.verify record, counted"、"a bridge whose hello claims a built-in id is failed: its inbound is never taken, it routes nothing as lark-bot"、"a bridge whose hello takes the id of another running adapter fails the start (F4)"、"one bridge program under one id runs several accounts"、"a bridge may not use a built-in channel id"、"two different bridge programs may not share a channel id; one program with two accounts may"、"parses an evidence grant on any channel entry; entries without one are unchanged"、"a bridge without a grant gives no platform_signed: the owner is a stranger, recorded as none, counted"、"a granted bridge gives it (∩ caps); a grant beyond caps is warned about and ignored"、"an in-process adapter is capped by its caps"；`packages/daemon/test/module-channel.test.ts` "fails when two entries give the same (channel, account), also against another channel"、"without an evidence grant its platform_signed is capped to none (stranger, counted in status, recorded as none)"；`channel/jsonl-bridge/test/bridge.test.ts` "expectId: a hello declaring another id is bad_hello; with retryFirstConnect the peer is restarted and stays refused"、"without expectId the first hello pins the id: a restarted peer declaring another is refused"、"acceptId can refuse a hello id (bad_hello)"、"a refused inbound is answered ok:true with {accepted:false}"；一致性套件 `inbound.channel_id`、`inbound.account`、`inbound.evidence_in_caps`（`packages/testkit/src/channel-conformance.ts`）。
+- **状态**：有测试。
+- **边界**（有意如此，不算不成立）：
+  1. 不传 `source` 的 `Ingress.accept(env)` / `Gateway.accept(env)` 把调用方当受信方（嵌入方自己构造信封、测试），行为与盖章前相同。
+  2. 嵌入方经 `GatewayOptions.channels` 传入的适配器按类归属：同类的多个对象（多个机器人）可共用 id；嵌入方代码与守护进程同等受信。
+  3. 身份键不含账号（`identity.ts` `identityKey`）：F4 之后只有同一种适配器的多个账号共享身份命名空间，不再能跨通道冒充（提案 §10 第 4 项）。
+  4. 出站按 id 退回（DL-4）不属于本条。
 
 ### ID-4 证据不足的主人按陌生人处理
 
 - **承诺**：身份映射命中但证据不在接受集合（默认 `platform_signed`、`dkim_pass`）里时 `principal: null`；文本或 `declared` 里的自称不能冒充主人（决定 3，POSITIONING §4）。
 - **实现**：`packages/session/src/identity.ts:21`、`:109-112`。
 - **测试**：`packages/session/test/policy.test.ts` "an owner address without evidence is a stranger (forged From)"、"a DKIM-verified or platform-signed owner is the owner"、"never accepts a declared identity that names an owner, even from a trusted agent account"；`router.test.ts` "stamps principal and labels only with accepted evidence (default platform_signed, dkim_pass)"、"owners config is the minimal map; a host map overrides it per channel identity and is suspended with its table"。
-- **状态**：有测试（前提是证据本身可信，见 ID-3）。
+- **状态**：有测试。证据本身由 ID-3 保证可信：只可能来自有资格给出它的通道（条目授予 ∩ caps），否则降为 `none`，测试见 ID-3（`channel-stamping.test.ts` "a bridge without a grant gives no platform_signed: the owner is a stranger, recorded as none, counted"）。
 
 ### ID-5 本部署的回流不开轮
 
@@ -557,7 +566,7 @@
 
 按风险从高到低。"不成立"指读代码确认、与文档承诺相反；"未测"指承诺可能成立但没有测试守着。
 
-1. **通道可以冒充别的通道与主人（ID-3，不成立）。** `gateway.ts:1594-1597` 不核对信封的 `channel/account` 与发出它的通道，证据原样采信。任何 bridge 或模块通道都能以主人身份、放行 profile 开轮，并借自报的回复路由以合法机器人发消息。决定 4、5"只标来源、不拦截"的前提因此不成立。修法已有提案（channel-stamping），需要拍板。
+1. ~~**通道可以冒充别的通道与主人（ID-3）。**~~ 已修（channel-stamping，决定 13）：信封的 `channel/account`/回复路由按发出它的通道实例核对，不符拒收；一个通道 id 只属于一种适配器；证据按条目授予 ∩ caps 封顶。见 ID-3。
 2. ~~**排队中的输入在停止或重启时静默丢失（IN-1 / RS-6）。**~~ 已修（决定 13）：停止时拒掉并在原路由通知，崩溃遗留在启动时拒掉，遗留 turn 结算时拒掉它的输入，开轮失败在通道上可见。剩下 IN-1 不成立第 1–5 条（策略钩子抛错、live 委托溢出、被接管输入、开轮途中 detach、关闭后到达）。
 3. **`aio explain` 不能从副作用反查（EX-2，不成立）。** 只接受 inputId，返回路由记录；系统回复、宿主 `deliver`、`live_say` 连手工串的线索都没有。原则 4 与决定 4 都以它为"不拦截"的配套。
 4. **重启丢 turn（RS-3 / RS-4，不成立于原则 5）。** Claude Code 的 turn 被打断；Codex stdio 的 turn 既不接管也不结束，挂到下一条输入才记 ambiguous（RS-5），没有新输入就一直显示运行中。三者都没有测试。

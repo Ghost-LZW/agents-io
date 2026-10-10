@@ -1,6 +1,6 @@
 # 入站信封的渠道与账号由守护进程盖章，证据按通道声明封顶
 
-> 状态：提案（2026-10-07，按评审意见修订），未实现，待负责人决定后记入 `docs/design/locus/DECISIONS.md`。
+> 状态：已采纳（决定 13）并实现（2026-10-10）。实现与本文的出入、§10 各项的决定见 §12。提案正文（§1–§11）保留原样，§2 描述的是实现前的代码。
 > 依据：`docs/POSITIONING.md` §2、§4，`docs/RECOMMENDATION.md` §3.5 第 1 条，`docs/critique/ops-security.md` §2，决定 3、4、5；
 > 代码：`packages/session/src/{ingress,identity,policy,host-queue}.ts`、`packages/daemon/src/{gateway,config,records}.ts`、`packages/protocol/src/admin.ts`、`channel/jsonl-bridge/src/{host,serve}.ts`、`packages/testkit/src/channel-conformance.ts`。
 
@@ -248,3 +248,35 @@ allowed = (entry.evidence ?? 默认) ∩ caps.evidence ∪ {'none'}
 - 配置：两个字段。
 - bridge：hello 时比较 id。
 - 协议：`RouteExplanation` 一个可选字段，`AdminChannel` 两个可选字段。
+
+## 12. 实现记录（2026-10-10）
+
+按决定 13 采纳 C + F4 + E3。代码：`packages/session/src/ingress.ts`（`EmitSource`、`SOURCE_MISMATCH`、`sourceMismatch`、`capEnvelope`）、`packages/daemon/src/gateway.ts`（`emitSource`、`stamped`、`channelOwner`、`idConflict`）、`packages/daemon/src/config.ts`（`evidence` 字段、`RESERVED_CHANNEL_IDS`、`UNGRANTED_EVIDENCE`、bridge `id` 的 F4 检查）、`channel/jsonl-bridge/src/host.ts`（`expectId`、`acceptId`、hello id 固定）、`packages/protocol`（`claimedEvidence`、`rejected`、`evidenceCapped`）、`packages/testkit`（`inbound.evidence_in_caps`）。测试名见 `docs/INVARIANTS.md` ID-3。
+
+### 12.1 与提案的出入
+
+| 项 | 提案 | 实现 | 依据（ROADMAP §1） |
+|---|---|---|---|
+| 证据迁移（§8） | 第一版 bridge 仍取自报 caps 并告警，下一版翻转 | **直接翻转**：bridge 与 module 不写 `evidence` 时只有 `device_only`（+`none`） | 原则 4：告警窗口内 ID-3 仍不成立，承诺不可检验；决定 13 的 E3 已写明"bridge 的强证据必须由部署方显式授予" |
+| module 的默认上限 | 只讨论了 bridge | module 与 bridge 同样默认弱证据 | E2 的理由（"自己给自己封顶等于没封"）对 module 同样成立：caps 是插件自己报的 |
+| bridge `id` | 第二阶段必填 | 保持可选，不告警"将必填" | 第一次 hello 的 id 被固定并走同样的归属检查，安全性相同；原则 4：不留没有计划兑现的承诺 |
+| F4 冲突的处理 | 后来者进 `failed` | 启动时（配置里 bridge 的 `id` 冲突、module id、已连上 bridge 的 hello id）是配置错误，启动失败；live apply 进 `failed` 列表；运行中 bridge 的 hello 冲突是 `bad_hello`（`failed` + 退避重启） | 与现有 `(id, account)` 重复的处理一致；冲突是配置错误，不应带病运行 |
+| 嵌入方适配器的归属 | 同一个对象 | 同一个类（`adapter.constructor`）；内置 id 不对它们保留 | 嵌入方传多个机器人时是同类的多个对象（`multi-lark` 测试）；嵌入方代码与守护进程同等受信，id 保留只防配置加载的第三方代码 |
+| 保留 id | `lark-bot`、`mail` | 加上 `local`（本地端的回复路由，`localRoute`） | 同 F4 的理由：`local` 路由由守护进程自己处理 |
+| `Origin.adapter` | 有 source 时取 `source.channel` | 仍取信封的 `channel` | 第 2 步之后二者必然相等；少一处分支 |
+| 告警限流 | 每分钟一条 | 每通道每原因（拒收 / 证据封顶）每分钟一条，计数不受限流影响 | — |
+
+### 12.2 §10 待定项的决定
+
+1. **bridge / module 默认上限保留 `device_only`。** 它不会命中默认身份条目（`identity.ts` 默认只接受 `platform_signed`、`dkim_pass`），只是更准确的来源信息。依据：原则 2（模型看到的来源越准确越好），原则 4（不影响可检验的身份结论）。
+2. **不支持信封自带跨通道 `replyRoute`，不加 `replyChannels`。** 需要在 A 收、在 B 答的，用 Binding 的 `replyTo` 或宿主 `deliver`。依据：原则 6、7（往哪里答是策略，属于绑定表或宿主，不由信封自称）；原则 4（没有使用者的口子不开）。会议转写这类用例在 `channel/lark-bot` 内部，通道 id 相同，不受影响。
+3. **被拒信封不进宿主入站队列。** 只记 `warn` 日志与 `rejected` 计数，不写任何 session 日志。依据：原则 1（日志按 session 组织，被拒的信封不属于任何 session）、原则 6（它不属于任何绑定，宿主没有要做的业务）；可见性由原则 4 的计数与日志满足。
+4. **身份键暂不含账号。** F4 之后同一个 id 只属于一种适配器，问题只剩"同一种适配器的多个账号共享身份命名空间"，不再是冒充。改身份映射格式（如飞书多应用以 union_id 为键）归多机器人第二阶段一起决定。依据：原则 6（身份结论与映射内容是宿主的真相；宿主映射已可按通道逐条写）。
+5. **出站按 id 退回**：已由决定 13（"多机器人时停掉的账号被改写为另一账号发出 → 拒绝 `unknown_channel`，不退回"，决定 8）定下，在出站一侧单独实现，不在本次改动内。F4 已保证退回最多落到同一种适配器。
+
+### 12.3 配置的不兼容变化
+
+- bridge、module 通道提交的 `platform_signed` / `dkim_pass` 不写 `"evidence": [...]` 时降为 `none`：依赖它识别主人的部署要在条目上显式授予。
+- bridge 的 `id` 不得是 `lark-bot`、`mail`、`local`；同一 `id` 的 bridge 条目必须是同一 `command`/`args`；module 的 id 同理不得与其他适配器重复或使用内置 id。违反即配置错误。
+- bridge 的 `id` 现在是约束而不只是显示名：hello 的 `adapterId` 与它不符的对端被拒绝。
+- 信封的 `channel`/`account`/`replyRoute` 与通道实例不符的被拒收（一致性套件一直这样要求）。
