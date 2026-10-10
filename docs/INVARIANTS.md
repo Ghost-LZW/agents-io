@@ -3,6 +3,7 @@
 > 状态：2026-10-10 初版，对应 `docs/ROADMAP.md` §1 原则 4（承诺可检验）与 §3。来源：各设计文档、决定 1–12、代码注释与行为。代码位置以写作时的 `main` 为准（`c52bad5` 加上未提交的文档改动），行号会漂移，以函数名为准。
 > 2026-10-11：决定 14 加入 18 个编号（PR、CN、HC、SE、CT、RQ-5、OB、RT、RN、IN-7、TP、MD、LA-3，来源 `docs/design/test-suite-review/` §3.2），代码位置按当日 `main` 读过；实施时又加了 CF-7（监听的授权）、CF-8（飞书平台需求清单），两组测试原来守着它们却没有编号。每条"不成立"都有带编号的 `it.fails`（LN-4 只有 `it.todo`，假 harness 复现不了）。
 > 2026-10-11：agent 通信地基（`docs/design/agent-messaging/`，决定 13）加入 ID-7、ID-8、EX-5、EX-6、IN-8、CF-9；ID-2、EX-2 改为成立（EX-2 仍有 `live_say` 一条不成立）。
+> 2026-10-11：agent-messaging 合并评审的修复：DL-5（默认外发按输入是否全来自主人）、IN-8（live 委托过检查点、只有有主体的人清零、邮件自动回复标 bot）、EX-5（上下文输入带过来的标记、发送时取来源）、ID-3（保留 `agent` id）、ID-2（Claude Code 说明行 JSON 引号）、ID-8（多条发送全部索引）、EX-6（cause 按 session 存）；未修的记在 §15 第 17 条。
 > 用途：改动 agents-io 的人或 agent 用它判断"这个改动有没有打破某个承诺"。新增承诺先写进这里，再写测试；测试改名时同步改这里。
 
 ## 0. 怎么读
@@ -99,7 +100,7 @@
 - **实现**：`packages/session/src/loop-guard.ts` `LoopGuard.check`（`delegation`）、`isPersonHere`、`peerKey`、`loopGuardMessage`；`packages/session/src/lane.ts` `input`（`known` 去重之后、`trySteer` / 打断 / `enqueue` 之前）、`guarded`、`onHarnessEvent` 的 `live.handoff` 与 `turn.started { initiator: "harness" }`（`stoppedHandoffs`、`interruptStopped`）；邮件的自动回复、退信、群发标 `isBot`（`channel/mail/src/inbound.ts` `parseInbound`，同时 `admission: drop`）；`packages/daemon/src/gateway.ts` `causeHooks`、`loopGuarded`（发送方 notice、cause 记录、explain）、`explain`（合并 cause 记录里的截停）；配置 `packages/daemon/src/config.ts` `policy.loopGuard`。
 - **测试**：标签 `#IN-8`；`packages/session/test/agent-messaging.test.ts` "hop = maxHops starts a turn; maxHops + 1 is kept as context labelled loopGuard, with a loop_guard notice, never a turn"、"the stopped input is handed to the next turn a person starts, still labelled"、"same pair: the peer is stopped after maxTurns; a person writing clears it; another peer is not affected; broken chains count too"、"the pair window passes: the peer may start turns again"、"every entry reaches the checkpoint: a channel dispatch and a watch trigger are stopped alike"、"only a person writing here lifts a pair stop: a system digest, a host input or a stranger does not; an identified person does"；`packages/session/test/live.test.ts` "delegations reach the loop checkpoint: past the pair limit one is context labelled loopGuard, and the turn the harness runs for it is interrupted"；`channel/mail/test/mail.test.ts` "auto-replies, bounces and bulk mail are marked as a bot sender (and dropped); ordinary mail is not"；`packages/daemon/test/agent-messaging.test.ts` "a trip leaves a loop_guard notice in the receiving and the sending session, explain shows it (also after a restart), nothing goes to a channel"、"inbound.redispatch goes through the same checkpoint: a queued over-hop agent message stays context"。
 - **状态**：有测试。
-- **注意**：成对计数在内存里，重启清零（跳数上限随持久化的 cause 仍然有效）；合批按最大跳数算，一句人话也会开一条新链。第一步里本部署的 agent 输入只有"回流"一条来路，而回流是 `self`、永远不开轮（ID-5），所以跳数上限现在实际只拦受信 agent 账号声明了跳数的输入；`agent_send` / `agent_run`（ROADMAP §2 第 3、4 项）接上后直接适用。宿主 `input` 帧是 `kind: system`，不开链、不计数、也不清零；本地客户端的输入是有主体的 `human`，清零成对计数。
+- **注意**：成对计数在内存里，重启、lane 关闭再打开（话题停放、空闲回收）都清零（跳数上限随持久化的 cause 仍然有效）；成对上限之下的慢循环不被截停（§15 第 17 条）；合批按最大跳数算，一句人话也会开一条新链。第一步里本部署的 agent 输入只有"回流"一条来路，而回流是 `self`、永远不开轮（ID-5），所以跳数上限现在实际只拦受信 agent 账号声明了跳数的输入；`agent_send` / `agent_run`（ROADMAP §2 第 3、4 项）接上后直接适用。宿主 `input` 帧是 `kind: system`，不开链、不计数、也不清零；本地客户端的输入是有主体的 `human`，清零成对计数。
 - **决定（2026-10-11 合并评审，依原则 4 自决）**：
   1. **谁能清零**：只有"有人在这里写"——`kind: "human"` 且有主体（主人或宿主映射的成员）。原来任何非 agent 输入都清零，系统 digest、宿主输入、陌生人插一句就能让一对 agent 无限来回；没有主体的发送者可能是平台没标出来的机器人，按 fail closed 不算。邮件自动回复本来就丢弃（CHANNELS 邮件一节），现在另标 `isBot`，即使哪天被放进来也是 agent 一侧。
   2. **live 委托**：决定 11 让委托轮次由 harness 自己开，绕过了 `Lane.input`。委托计入成对计数（peer = 会议路由），因为说话者没有证据、会议另一端可能是另一个语音 agent；截停时 harness 已经开工，只能打断，不另外降档（决定 11 的同权限不变）。代价：一场会里 15 分钟内超过 `pair.maxTurns` 次委托、其间没人在会话里写，会被截停；可调参数。
@@ -822,3 +823,9 @@
     - ~~**停止期间的入站被确认后丢失（IN-7，不成立）**~~（已修，`EmitResult.permanent`）：停止时 `Gateway.accept` 答 `accepted: false`（`gateway stopping`）而不抛错，飞书照常 ack 并保留去重键、邮件照常前移 checkpoint，消息不再交给下一个进程。
     - ~~**路径型 launch 变量被拒时错误带原值（SE-1，不成立，轻微）**~~：已修，`bad_env` 只写键名。
     - **未测**：`runChannelConformance` 抓违规（CN-1）。~~`emit` 返回 `accepted: false` 时的确认（IN-7）~~ 已有测试。
+17. **agent-messaging 合并评审遗留（2026-10-11）**，按原则 4 记下，未修（修了的见 DL-5、IN-8、EX-5、EX-6、ID-2、ID-3、ID-8 的"已修"与"决定"）：
+    - **慢循环**：两边来回的速度低于成对上限（默认 15 分钟 10 轮）、跳数又不可知（`basis: none`，跨部署）时，截停永远不触发；跳数可知的链仍受 `maxHops` 约束。
+    - **计数在内存里**：成对计数随 lane 存在；lane 关闭再打开（话题停放、空闲回收、话题切换换了 session）和守护进程重启都清零（IN-8 注意）。
+    - **被接管的轮次跨重启丢链**：`lastCause` 在内存里，重启后由 harness 接管（`turn.adopted`）、没有输入记录的一轮没有 `cause`，它产生的输入从 hop 1 重新开始、chain 断开（EX-5）。
+    - **只在启动时清理**：`daemon_outbound`、`daemon_outbound_parts`、`daemon_causes`、`daemon_inputs` 的保留期清理只在 `DaemonRecords` 构造时跑，长期不重启的守护进程不清理。
+    - **日志增长**：agent 输入与 watch 输入的 `input.admitted` 带完整 `InputRecord`（`lane.ts` `pid`，为了跨重启重建与 `explain --chain`），内容大的消息会让日志增长更快；等日志压缩一起处理。
