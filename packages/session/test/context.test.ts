@@ -165,7 +165,7 @@ describe('context hand-over', () => {
     await m.lane.observe(said('c1', 'a'));
     await m.send(ask('q1'));
     await m.lane.whenIdle();
-    expect(bodies(m.events(), 'input.rejected')).toEqual([{ t: 'input.rejected', inputIds: ['q1'], reason: 'start_failed: no plan' }]);
+    expect(bodies(m.events(), 'input.rejected')).toEqual([{ t: 'input.rejected', inputIds: ['q1'], reason: 'start_failed: no plan', replyRoute: expect.objectContaining({ conversationId: 'g1' }) }]);
     fail = false;
     await m.send(ask('q2'));
     await until(() => m.starts().length === 1);

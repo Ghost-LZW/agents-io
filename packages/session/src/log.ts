@@ -126,6 +126,7 @@ export function foldSnapshot(s: SessionSnapshot, e: SessionEvent): void {
         s.activeItems = [];
         s.plan = null;
       }
+      drop(b.inputIds); // the harness runs them: they are not waiting any more
       s.state = 'running';
       break;
     case 'turn.delivery_added':

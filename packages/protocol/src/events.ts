@@ -78,7 +78,13 @@ export const Body = Type.Union([
   /** Reconciled from the harness (Claude user_message_uuids / Codex userMessage.clientId). */
   T('input.consumed', { inputIds: Type.Array(Type.String()), turnId: Type.String() }),
   T('input.cancelled', { inputIds: Type.Array(Type.String()), reason: Type.String() }),
-  T('input.rejected', { inputIds: Type.Array(Type.String()), reason: Type.String() }),
+  /**
+   * `reason` is a code, optionally `code: detail` (e.g. `start_failed: …`, `lane_closed: …`).
+   * `replyRoute`: set when the inputs never reached a turn a renderer shows (still queued,
+   * the turn failed to start): renderers tell the sender there. Unset when a turn's own
+   * rendering already says how it ended, or the route is not known (`host_restarted`).
+   */
+  T('input.rejected', { inputIds: Type.Array(Type.String()), reason: Type.String(), replyRoute: Type.Optional(ReplyRoute) }),
   T('turn.started', {
     turnId: Type.String(),
     inputIds: Type.Array(Type.String()),

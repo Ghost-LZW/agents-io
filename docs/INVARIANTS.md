@@ -23,17 +23,21 @@
 
 ### IN-1 每条被接纳的输入都有终态
 
-- **承诺**：进入 lane 的每条输入（`input.admitted`）最终有 `input.consumed`、`input.rejected` 或 `input.cancelled` 之一，不会静默消失。
-- **实现**：`packages/session/src/lane.ts:1066-1081`（`finishTurn`：未消费的重排一次，否则 `input.rejected`）；`lane.ts:864-868`（开轮失败 `start_failed`）；`lane.ts:913-915`（harness 中途断开，`ambiguous` 并拒掉未消费的）；`lane.ts:306`、`:610`（`take` / `cancelQueue` 记 `input.cancelled`）；`packages/daemon/src/gateway.ts:1088-1093`（`refuseUnavailable`：还没有 lane 时由网关写 `input.rejected`）。
-- **测试**：`packages/session/test/lane.test.ts` "re-queues admitted-but-unconsumed inputs once, then rejects them"、"closes the turn as ambiguous when the harness stream ends mid-turn"、"interrupts the active turn and optionally clears the queue"、"interrupt-mode input stops the turn and runs next"；`packages/session/test/context.test.ts` "a turn that fails to start leaves the context pending for the next one"；`packages/daemon/test/runs.test.ts` "a session whose recorded agent is gone refuses input with agent_unavailable, never falling back to the default agent"；`packages/daemon/test/topics.test.ts` "a follow-up queued in the old topic while its turn rotates moves to the new topic"。
-- **状态**：部分覆盖。
+- **承诺**：进入 lane 的每条输入（`input.admitted`）最终有 `input.consumed`、`input.rejected` 或 `input.cancelled` 之一，不会静默消失；lane 关闭、detach、守护进程停止或崩溃都不例外（决定 13）。
+- **实现**：`packages/session/src/lane.ts` `finishTurn`（未消费的重排一次，否则 `input.rejected`）；`pump` 的开轮失败（`start_failed`）；`onHarnessClosed`（harness 中途断开，`ambiguous` 并拒掉未消费的）；`take` / `cancelQueue` 记 `input.cancelled`；`stopTimers` → `rejectQueue`（`close` / `detach` 时拒掉排队的，之后 `pump` 和 `handle` 再遇到排队的也拒：关闭中结束的轮次重排的、admission 正等策略钩子的）；`settleDangling`（遗留 turn 结算时拒掉它没被消费的输入，含 steer 进去的）；`settleLeftoverInputs`（启动时拒掉上一个进程留下的 `snapshot.queued`，`gateway.ts` `settleLeftoverInputs` 在任何 lane 打开前对每个非 run session 调用）；`packages/session/src/log.ts` `foldSnapshot`（`turn.adopted` 也把它的输入移出 `queued`）；`packages/daemon/src/gateway.ts` `refuseUnavailable`（还没有 lane 时由网关写 `input.rejected`）。
+- **测试**：`packages/session/test/lane.test.ts` "re-queues admitted-but-unconsumed inputs once, then rejects them"、"closes the turn as ambiguous when the harness stream ends mid-turn"、"interrupts the active turn and optionally clears the queue"、"interrupt-mode input stops the turn and runs next"、"close rejects queued inputs (lane_closed) and the interrupted turn's; nothing stays queued"、"an input requeued as the turn ends during close is rejected, not stranded"、"an input whose admission was awaiting a policy hook when the lane closed is rejected"、"detach rejects the inputs queued behind the running turn (lane_closed, with their route), never the turn's own; the next lane still adopts it"、"crash leftovers: inputs a previous process admitted and never settled are rejected (host_restarted) at startup; the open turn is left to adoption"、"settles a turn nobody adopted as ambiguous before the next turn starts, rejecting its unconsumed inputs"；`packages/session/test/e2e.test.ts` "stop with queued inputs: rejected (lane_closed) and the sender gets a notice on the route; the running turn ends on its own card"；`packages/daemon/test/stop-inputs.test.ts` "stop with queued inputs: they are rejected (lane_closed) and the sender is told on the chat; after a restart nothing stays queued"、"crash leftovers: inputs admitted but never settled by the previous process are rejected (host_restarted) at startup, and the snapshot lists none queued"；`packages/session/test/context.test.ts` "a turn that fails to start leaves the context pending for the next one"；`packages/daemon/test/runs.test.ts` "a session whose recorded agent is gone refuses input with agent_unavailable, never falling back to the default agent"；`packages/daemon/test/topics.test.ts` "a follow-up queued in the old topic while its turn rotates moves to the new topic"。
+- **状态**：部分覆盖（停止、detach、崩溃遗留、遗留 turn 有测试；下面几条仍不成立）。
+- **决定（决定 13，依据原则 1 与 §3 第一条）**：
+  1. **拒绝原因码**：`lane_closed: <关闭原因>`（lane 关闭或 detach 时还在排队，含停止期间重排的；守护进程停止时原因是 `gateway stopping`）；`host_restarted`（上一个进程留下的：启动时的排队遗留，和没人接管的遗留 turn 里没被消费的输入，与该 turn 的 `error.code` 相同）；`start_failed: <错误>` 不变。格式统一为"代码"或"代码: 细节"，渲染端只看冒号前的代码。
+  2. **通知**：只在输入还没进任何一轮渲染时通知（排队中被关闭、开轮失败）：这类 `input.rejected` 带 `replyRoute`（按路由分组，每组一条事件），compositor 在该路由上经 outbox 回一句（`rejectionNotice`，operationId `<session>:rejected:<首个 input id>:<路由>`，幂等）。冒号后的细节不发到通道（可能含路径、主机）。已经有卡片的轮次（`interrupted`、`ambiguous`、`not_consumed`）不带路由、不另发，卡片状态行已经说明。停止时通道已停收，通知是尽力而为（channel 在 compositor 停止之后才 `close`）。
+  3. **崩溃遗留不通知**：`input.admitted` 不带记录（也不带路由），启动时的 `host_restarted` 只落日志、`aio sessions` 排队数归零，不发通道提示。不重放（重放属于 claude-persistence）。
+  4. **接管路径不受影响**：`detach` 只拒排队的，不碰当前 turn 的输入；启动清理跳过日志里仍开着的 turn 的输入（它们不在 `queued`，由接管或 `settleDangling` 结算）；`settleDangling` 只在没人接管时运行（`turn.adopted` 先清掉 `dangling`）。run session（`run:`）的启动清理留给 `Runs`。
 - **不成立**：
-  1. **lane 关闭、detach、守护进程停止时，排队中的输入没有终态。** `stopTimers()` 只置 `closed = true`（`lane.ts:445-446`），`pump()` 之后不再运行（`lane.ts:833` 的 `!this.closed`），队列里的输入不拒也不取消。停止期间 `finishTurn` 重排的输入同样如此（`lane.ts:1080-1081` 先记 `input.admitted queued` 再 `unshift`）。`gateway.stop()` 的 `whenIdle` 只是 3 s 后超时（`gateway.ts:1821`）。
-  2. **重启后也不重放。** `Lane` 构造函数（`lane.ts:229-245`）只恢复 generation、`lastRun`、遗留 turn 和待交 context；排队输入的 `input.admitted` 不带完整记录（`lane.ts:542`、`:554` 只有 `pid()`），无从重建。这些 id 永远留在 `snapshot.queued`（`packages/session/src/log.ts:97-114`），`aio sessions` 的排队数随之虚高（`gateway.ts:1771`）。
-  3. **遗留 turn 结算时不拒它的输入。** `settleDangling`（`lane.ts:802-810`）只写 `turn.completed ambiguous host_restarted`，不为 `inputIds` 写 `input.rejected`（对比 `onHarnessClosed` 会拒）。
-  4. **策略钩子抛错丢输入。** `known.add(inputId)` 在前（`lane.ts:532`），随后无保护地 await `policy.control`（interrupt 模式，`lane.ts:539`）或 `policy.plan`（steer，`lane.ts:573`）。抛错时什么都没记，同 id 重试答 `duplicate`（`lane.ts:531`）。
-  5. **live 委托溢出。** `handoffs` 上限 32（`lane.ts:944-947`），被挤出的、或 harness 一直没开 turn 的委托只有 `input.admitted new_turn`（`lane.ts:939`）。
-  6. 被接管（`turn.adopted`）的 turn 以 `inputs: []` 开始（`lane.ts:997`），harness 没报 consumed 的被接管输入没有终态。
+  1. **策略钩子抛错丢输入。** `known.add(inputId)` 在前（`lane.ts` `input`），随后无保护地 await `policy.control`（interrupt 模式）或 `policy.plan`（steer）。抛错时什么都没记，同 id 重试答 `duplicate`。
+  2. **live 委托溢出。** `handoffs` 上限 32（`onHarnessEvent` 的 `live.handoff`），被挤出的、或 harness 一直没开 turn 的委托只有 `input.admitted new_turn`。
+  3. 被接管（`turn.adopted`）的 turn 以 `inputs: []` 开始，harness 没报 consumed 的被接管输入没有终态（不能凭本进程的 `consumed` 判断：之前的进程可能已记过）。
+  4. **detach 发生在开轮途中（可能）。** 输入已 `startTurn` 交给 Codex unix、`turn.started` 还没记下时停机：日志里它仍在 `queued`、没有开着的 turn，下次启动记为 `host_restarted`，而 Codex 可能已经在跑它（应为 ambiguous）。没有测试复现。
+  5. lane 关闭后到达的输入答 `{ ok: false, reason: 'closed' }`，没进 lane、没有 `input.admitted`；调用方（ingress）是否在原路由上说明不在本条范围内。
 
 ### IN-2 未消费的输入重排一次，再拒绝
 
@@ -363,10 +367,9 @@
 ### FC-2 harness 起不来时明确拒绝
 
 - **承诺**：开轮失败时本轮输入 `input.rejected start_failed: …`，context 留给下一轮。
-- **实现**：`lane.ts:864-868`。
-- **测试**：`lane.test.ts` "opens the adapter the turn names, attributes events to it, and switches generations when the plan changes it"（断言 `start_failed: no harness nope`）；`context.test.ts` "a turn that fails to start leaves the context pending for the next one"。
-- **状态**：部分覆盖。
-- **不成立**：拒绝只在日志里。compositor 不渲染 `input.rejected`（只有终端渲染器 `packages/daemon/src/render.ts:94` 渲染），飞书或邮件里的发送者收不到任何提示，对他来说消息静默消失。对比 FC-1 会在路由上回一条。
+- **实现**：`lane.ts` `pump`（`input.rejected start_failed: …`，带本批的 `replyRoute`）；`compositor.ts` `notifyRejected` / `rejectionNotice`（在路由上回"the agent could not start"，不带错误细节）。
+- **测试**：`lane.test.ts` "opens the adapter the turn names, attributes events to it, and switches generations when the plan changes it"（断言 `start_failed: no harness nope`）；`context.test.ts` "a turn that fails to start leaves the context pending for the next one"；`e2e.test.ts` "start_failed is visible: the sender gets a notice instead of silence (no detail from the error)"、"a rejection without a route (its turn's card tells the story, or the route is unknown) sends nothing"。
+- **状态**：有测试。
 
 ### FC-3 没有可用的交互 agent 时明确拒绝
 
@@ -456,16 +459,18 @@
 
 - **承诺**：上一个进程留下的、没被接管的 turn，在下一轮开始前记 `turn.completed ambiguous host_restarted`。任务 run 在启动时就结算（exit 3）。
 - **实现**：`lane.ts:801-833`；`packages/daemon/src/runs.ts:175-192`。
-- **测试**：`lane.test.ts` "settles a turn nobody adopted as ambiguous before the next turn starts"；`runs.test.ts` "a run an earlier daemon left mid-turn is ambiguous (exit 3) after the restart"。
+- **测试**：`runs.test.ts` "a run an earlier daemon left mid-turn is ambiguous (exit 3) after the restart"。
+- **测试（续）**：`lane.test.ts` "settles a turn nobody adopted as ambiguous before the next turn starts, rejecting its unconsumed inputs"（结算时它没被消费的输入记 `input.rejected host_restarted`，不带路由：卡片收尾为 Outcome unknown）。
 - **状态**：部分覆盖。
-- **不成立**：交互 session 只在有新输入时才结算（`lane.ts:832` 要求 `queue.length`），没有新输入的会话的 turn 一直开着（快照、`aio sessions` 显示运行中）；结算时不拒它的输入（IN-1 第 3 条）。
+- **不成立**：交互 session 只在有新输入时才结算（`pump` 要求 `queue.length`），没有新输入的会话的 turn 一直开着（快照、`aio sessions` 显示运行中）。启动时不提前结算，是为了让 compositor 在 lane 打开时接管旧卡片再收尾（RS-1"遗留卡片收尾"）。
 
-### RS-6 排队未开始的输入在重启时丢失
+### RS-6 排队未开始的输入在停止或重启时明确拒绝，不重放
 
-- **现状**：见 IN-1 第 1、2 条。停止时没有任何事件，启动后不重放，`snapshot.queued` 留下幽灵 id。
-- **测试**：无。
-- **状态**：没有测试。
-- **不成立**：IN-1 与原则 5"不丢对话"。
+- **承诺**：停止（含 Codex 的 detach）时排队的输入记 `input.rejected lane_closed: gateway stopping` 并在原路由上通知发送者；崩溃留下的在下次启动时记 `input.rejected host_restarted`；`snapshot.queued` 不留幽灵 id。不重放（决定 13，重放属于 claude-persistence）。
+- **实现**：见 IN-1（`rejectQueue`、`settleLeftoverInputs`、`foldSnapshot`）；`gateway.ts` `stop` 调 `detach('gateway stopping')` / `close('gateway stopping')`，`start` 在接管之前调 `settleLeftoverInputs`。
+- **测试**：`packages/daemon/test/stop-inputs.test.ts` 两条（见 IN-1）；`lane.test.ts` "detach rejects the inputs queued behind the running turn …"、"crash leftovers: …"；`e2e.test.ts` "stop with queued inputs: …"。
+- **状态**：有测试。
+- **与原则不符**：原则 5"不丢对话"仍只做到"不静默丢"：发送者要自己重发。
 
 ### RS-7 不跨重启的状态（按设计或已知）
 
@@ -482,7 +487,7 @@
 - **承诺**：`stop()` 每一步都有上限（通道 3 s、lane 关闭 8 s、`whenIdle` 3 s、compositor 5 s 等），不会因为某个 harness 或通道卡住而挂住。
 - **实现**：`gateway.ts:1785-1834`（`within(...)`）。
 - **测试**：`gateway.test.ts` "socket is private, rejects bad frames, and tells subscribers when the gateway stops"；`daemon/test/live.test.ts` "live_leave ends the live; the gateway stopping ends a running one"。
-- **状态**：部分覆盖（有界本身没有测试；有界的代价是 DL-1 第 3 条、LN-4、IN-1 第 1 条）。
+- **状态**：部分覆盖（有界本身没有测试；有界的代价是 DL-1 第 3 条、LN-4；超时没报完的 turn 留到下次启动按 RS-5 结算）。
 
 ### RS-9 持久化以 SQLite 日志为前提
 
@@ -544,7 +549,7 @@
 按风险从高到低。"不成立"指读代码确认、与文档承诺相反；"未测"指承诺可能成立但没有测试守着。
 
 1. **通道可以冒充别的通道与主人（ID-3，不成立）。** `gateway.ts:1594-1597` 不核对信封的 `channel/account` 与发出它的通道，证据原样采信。任何 bridge 或模块通道都能以主人身份、放行 profile 开轮，并借自报的回复路由以合法机器人发消息。决定 4、5"只标来源、不拦截"的前提因此不成立。修法已有提案（channel-stamping），需要拍板。
-2. **排队中的输入在停止或重启时静默丢失（IN-1 / RS-6，不成立）。** `lane.ts:445-446` 关闭后队列不拒不重放，`input.admitted queued` 不带记录无法重建，`snapshot.queued` 留下幽灵 id。这是 ROADMAP §3 第一条不变量，也是原则 5 的直接反例，且和 RS-5 的"遗留 turn 结算时不拒输入"、FC-2 的"拒绝了但发送者看不到"叠在一起：从发送者看，消息就是没了。最小修法：`close` / `stop` 时对队列写 `input.rejected`（或带记录写 `queued` 并在构造时重放），`settleDangling` 同时拒掉未消费的输入。
+2. ~~**排队中的输入在停止或重启时静默丢失（IN-1 / RS-6）。**~~ 已修（决定 13）：停止时拒掉并在原路由通知，崩溃遗留在启动时拒掉，遗留 turn 结算时拒掉它的输入，开轮失败在通道上可见。剩下 IN-1 不成立第 1–5 条（策略钩子抛错、live 委托溢出、被接管输入、开轮途中 detach、关闭后到达）。
 3. **`aio explain` 不能从副作用反查（EX-2，不成立）。** 只接受 inputId，返回路由记录；系统回复、宿主 `deliver`、`live_say` 连手工串的线索都没有。原则 4 与决定 4 都以它为"不拦截"的配套。
 4. **重启丢 turn（RS-3 / RS-4，不成立于原则 5）。** Claude Code 的 turn 被打断；Codex stdio 的 turn 既不接管也不结束，挂到下一条输入才记 ambiguous（RS-5），没有新输入就一直显示运行中。三者都没有测试。
 5. **outbox 结算前崩溃会重复发送；停止时投递可能既不结算也不记录（DL-1、DL-2，不成立）。** `outbox.ts:132` 只在结算时写记录；`stop()` 不等 outbox 就关库；单次尝试无超时。飞书上传与邮件在重放时会真的重复。
@@ -553,7 +558,7 @@
 8. **宿主 outbound 在宿主离线时退回本地策略（DL-5，不成立于"fail closed"）；`live_join` 目标不过 outbound 检查。**
 9. **并发 `live_join` 停掉已有 live 并泄漏端点（LN-3，不成立）。** 需要在 `gateway.ts:1168` 检查后同步占位。
 10. **入站去重只在内存，部分失败重试会重复进会话（IN-5，不成立）。**
-11. **没有可用交互 agent 时 `accept` 直接抛错（FC-3，不成立）**；harness 起不来时只在日志里拒绝（FC-2）。
+11. **没有可用交互 agent 时 `accept` 直接抛错（FC-3，不成立）**。（harness 起不来时只在日志里拒绝的 FC-2 已修。）
 12. **`closeLane` 窗口可能出现同一键两个 lane（LN-2，可能）**；**监听回复可能回到被监听的群（CF-5，可能）**：都需要先写测试复现。
 13. **未测的承诺**：live 传输拒绝与视频过滤（LN-5）、模块 harness 启动失败（CF-4）、Claude Code 停止时的行为（RS-3）、非 SQLite 持久化（RS-9）、模型输入里的 watch 标记（ID-2）。
 14. **文档本身的出入**：ROADMAP §3 的 `ambiguous` 在投递里叫 `unknown`；决定 12 说 `onBehalfOf` "须显式开启"而它没有开关（RQ-3）；工具默认开启与原则 2 相反（CF-6，ROADMAP 已列复查）；`docs/E2E.md` 的"已知缺口"仍写 outbox 在内存、compositor 不接管旧卡片、没有宿主 MCP 工具，三条都已过时。
