@@ -203,6 +203,10 @@
         {
           "const": "none",
           "type": "string"
+        },
+        {
+          "const": "daemon",
+          "type": "string"
         }
       ]
     },
@@ -296,6 +300,128 @@
           "type": "string"
         }
       ]
+    },
+    "cause": {
+      "type": "object",
+      "required": [
+        "peer",
+        "basis"
+      ],
+      "properties": {
+        "peer": {
+          "type": "string"
+        },
+        "basis": {
+          "anyOf": [
+            {
+              "const": "internal",
+              "type": "string"
+            },
+            {
+              "const": "recovered",
+              "type": "string"
+            },
+            {
+              "const": "declared",
+              "type": "string"
+            },
+            {
+              "const": "none",
+              "type": "string"
+            }
+          ]
+        },
+        "hop": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "chain": {
+          "type": "string"
+        },
+        "from": {
+          "type": "object",
+          "required": [
+            "sessionKey",
+            "turnId"
+          ],
+          "properties": {
+            "sessionKey": {
+              "type": "string"
+            },
+            "turnId": {
+              "type": "string"
+            }
+          }
+        },
+        "rootPrincipal": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "carried": {
+          "type": "object",
+          "required": [
+            "external",
+            "watched",
+            "group"
+          ],
+          "properties": {
+            "external": {
+              "type": "boolean"
+            },
+            "watched": {
+              "type": "boolean"
+            },
+            "group": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "loopGuard": {
+      "type": "object",
+      "required": [
+        "tripped",
+        "limit"
+      ],
+      "properties": {
+        "tripped": {
+          "anyOf": [
+            {
+              "const": "hops",
+              "type": "string"
+            },
+            {
+              "const": "pair",
+              "type": "string"
+            }
+          ]
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "hop": {
+          "type": "integer"
+        },
+        "peer": {
+          "type": "string"
+        },
+        "count": {
+          "type": "integer"
+        },
+        "windowMs": {
+          "type": "integer"
+        },
+        "sessionKey": {
+          "type": "string"
+        }
+      }
     }
   }
 }

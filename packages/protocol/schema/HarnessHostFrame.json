@@ -230,6 +230,10 @@
                       {
                         "const": "none",
                         "type": "string"
+                      },
+                      {
+                        "const": "daemon",
+                        "type": "string"
                       }
                     ]
                   },
@@ -437,6 +441,89 @@
               },
               "channelRef": {
                 "type": "string"
+              },
+              "cause": {
+                "type": "object",
+                "required": [
+                  "peer",
+                  "basis"
+                ],
+                "properties": {
+                  "peer": {
+                    "type": "string"
+                  },
+                  "basis": {
+                    "anyOf": [
+                      {
+                        "const": "internal",
+                        "type": "string"
+                      },
+                      {
+                        "const": "recovered",
+                        "type": "string"
+                      },
+                      {
+                        "const": "declared",
+                        "type": "string"
+                      },
+                      {
+                        "const": "none",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "hop": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "chain": {
+                    "type": "string"
+                  },
+                  "from": {
+                    "type": "object",
+                    "required": [
+                      "sessionKey",
+                      "turnId"
+                    ],
+                    "properties": {
+                      "sessionKey": {
+                        "type": "string"
+                      },
+                      "turnId": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "rootPrincipal": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "carried": {
+                    "type": "object",
+                    "required": [
+                      "external",
+                      "watched",
+                      "group"
+                    ],
+                    "properties": {
+                      "external": {
+                        "type": "boolean"
+                      },
+                      "watched": {
+                        "type": "boolean"
+                      },
+                      "group": {
+                        "type": "boolean"
+                      }
+                    }
+                  }
+                }
               },
               "channelContext": {
                 "type": "object",
@@ -599,6 +686,10 @@
                       {
                         "const": "none",
                         "type": "string"
+                      },
+                      {
+                        "const": "daemon",
+                        "type": "string"
                       }
                     ]
                   },
@@ -806,6 +897,89 @@
               },
               "channelRef": {
                 "type": "string"
+              },
+              "cause": {
+                "type": "object",
+                "required": [
+                  "peer",
+                  "basis"
+                ],
+                "properties": {
+                  "peer": {
+                    "type": "string"
+                  },
+                  "basis": {
+                    "anyOf": [
+                      {
+                        "const": "internal",
+                        "type": "string"
+                      },
+                      {
+                        "const": "recovered",
+                        "type": "string"
+                      },
+                      {
+                        "const": "declared",
+                        "type": "string"
+                      },
+                      {
+                        "const": "none",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "hop": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "chain": {
+                    "type": "string"
+                  },
+                  "from": {
+                    "type": "object",
+                    "required": [
+                      "sessionKey",
+                      "turnId"
+                    ],
+                    "properties": {
+                      "sessionKey": {
+                        "type": "string"
+                      },
+                      "turnId": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "rootPrincipal": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "carried": {
+                    "type": "object",
+                    "required": [
+                      "external",
+                      "watched",
+                      "group"
+                    ],
+                    "properties": {
+                      "external": {
+                        "type": "boolean"
+                      },
+                      "watched": {
+                        "type": "boolean"
+                      },
+                      "group": {
+                        "type": "boolean"
+                      }
+                    }
+                  }
+                }
               },
               "channelContext": {
                 "type": "object",

@@ -13,6 +13,8 @@ const names = [
   'HostHelloResult', 'BindingsPutResult', 'BindingsGetResult', 'RunStartResult', 'RunCancelResult', 'RunEnded', 'DeliverResult',
   'InputVerifyResult', 'InboundReadResult', 'InboundAckResult', 'InboundAnswer', 'RouteCalloutAnswer', 'SessionPrepareResult',
   'ResolveCalloutAnswer', 'OutboundCalloutAnswer', 'TurnContextView', 'InboundRedispatchResult',
+  // Agent messaging: cause chain and explain of side effects / chains
+  'InputCause', 'EffectExplanation', 'ChainExplanation', 'ExplainResult', 'ContactCalloutAnswer',
   // Console / admin HTTP API
   'AdminError', 'AdminLoginRequest', 'AdminLoginResult', 'AdminStatus', 'AdminConfigDocument', 'AdminConfigPut', 'AdminConfigPutResult',
   'AdminChannelsApplied', 'AdminConfigValidateRequest', 'AdminConfigValidation', 'AdminQueue', 'AdminSessions', 'AdminLarkBotRequest', 'AdminLarkBotStarted', 'AdminLarkBotJob',

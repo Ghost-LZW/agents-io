@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/EffectExplanation",
+  "type": "object",
+  "required": [
+    "operationId",
+    "sessionKey",
+    "inputIds",
+    "route",
+    "result",
+    "at"
+  ],
+  "properties": {
+    "operationId": {
+      "type": "string"
+    },
+    "sessionKey": {
+      "type": "string"
+    },
+    "turnId": {
+      "type": "string"
+    },
+    "inputIds": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "route": {
+      "type": "object",
+      "required": [
+        "channel",
+        "account",
+        "conversationId"
+      ],
+      "properties": {
+        "channel": {
+          "type": "string"
+        },
+        "account": {
+          "type": "string"
+        },
+        "conversationId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "replyToMessageId": {
+          "type": "string"
+        }
+      }
+    },
+    "result": {
+      "anyOf": [
+        {
+          "const": "delivered",
+          "type": "string"
+        },
+        {
+          "const": "rejected",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "type": "string"
+        }
+      ]
+    },
+    "providerMessageId": {
+      "type": "string"
+    },
+    "at": {
+      "type": "number"
+    }
+  }
+}

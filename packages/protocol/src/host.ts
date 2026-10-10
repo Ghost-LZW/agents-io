@@ -1,9 +1,9 @@
 import { Type, type Static, type TObject, type TSchema } from '@sinclair/typebox';
-import { ContentBlock, Evidence, ReplyRoute, V } from './common.js';
+import { ContentBlock, Evidence, OriginEvidence, ReplyRoute, V } from './common.js';
 import { Body } from './events.js';
 import { Resolver } from './requests.js';
 import { RunSpec } from './run.js';
-import { ConversationKind, InboundEnvelope, InputRecord, OriginKind } from './inbound.js';
+import { ConversationKind, InboundEnvelope, InputCause, InputRecord, OriginKind } from './inbound.js';
 import { RenderedMessage } from './channel.js';
 import { ResultFrame } from './wire.js';
 
@@ -131,6 +131,24 @@ export const BindingTable = Type.Object({
 });
 export type BindingTable = Static<typeof BindingTable>;
 
+/**
+ * An agent-originated input that was stopped from starting a turn at the lane
+ * (docs/design/agent-messaging §4.4): `hops` — its hop is over `limit`; `pair` — the
+ * same peer started `count` turns in this session within `windowMs` (`limit` = the
+ * maximum). It was recorded as context instead.
+ */
+export const LoopGuardTrip = Type.Object({
+  tripped: Type.Union([Type.Literal('hops'), Type.Literal('pair')]),
+  limit: Type.Integer(),
+  hop: Type.Optional(Type.Integer()),
+  peer: Type.Optional(Type.String()),
+  count: Type.Optional(Type.Integer()),
+  windowMs: Type.Optional(Type.Integer()),
+  /** The session it was stopped in. */
+  sessionKey: Type.Optional(Type.String()),
+});
+export type LoopGuardTrip = Static<typeof LoopGuardTrip>;
+
 /** Why an input went where it went (`aio explain`). */
 export const RouteExplanation = Type.Object({
   inputId: Type.String(),
@@ -172,7 +190,7 @@ export const RouteExplanation = Type.Object({
     }),
   ),
   principal: Type.Union([Type.String(), Type.Null()]),
-  evidence: Evidence,
+  evidence: OriginEvidence,
   /**
    * The evidence the envelope claimed, when the emitting channel may not give it and
    * it was capped to `none` (channel-stamping): `evidence` is what identity saw.
@@ -188,6 +206,10 @@ export const RouteExplanation = Type.Object({
   ),
   /** Why nothing was delivered, when nothing was. */
   dropped: Type.Optional(Type.Union([Type.Literal('adapter'), Type.Literal('no_match'), Type.Literal('drop_rule')])),
+  /** An agent-originated input: the chain it is part of (`InputRecord.cause`). */
+  cause: Type.Optional(InputCause),
+  /** The loop guard stopped it from starting a turn (it was recorded as context). */
+  loopGuard: Type.Optional(LoopGuardTrip),
 });
 export type RouteExplanation = Static<typeof RouteExplanation>;
 
@@ -203,6 +225,12 @@ export const TurnProvenance = Type.Object({
   external: Type.Boolean(),
   /** Some input came from a group conversation. */
   group: Type.Boolean(),
+  /**
+   * Where the turn sits in a chain of agent messages: the highest hop among its triggering
+   * inputs (0 = a human, host or system input started it), that input's chain id and root
+   * principal. A tag, never used to grant or block anything.
+   */
+  cause: Type.Optional(Type.Object({ hop: Type.Integer({ minimum: 0 }), chain: Type.String(), rootPrincipal: Type.Union([Type.String(), Type.Null()]) })),
 });
 export type TurnProvenance = Static<typeof TurnProvenance>;
 
@@ -220,7 +248,8 @@ export const HostHello = Type.Object({
   /**
    * Which synchronous hooks this host answers (`policy` frames): `true` = `["route"]`;
    * a list names them: `route` (rule callouts), `resolve` (who answers a request),
-   * `outbound` (may an agent send there). Unknown names are ignored; the result's
+   * `outbound` (may an agent send there), `contact` (may one agent contact another; nothing
+   * asks it yet). Unknown names are ignored; the result's
    * `callouts` lists what was granted. Any hook (or `consumer`) makes this connection the host.
    */
   callouts: Type.Optional(Type.Union([Type.Boolean(), Type.Array(Type.String())])),
@@ -279,7 +308,12 @@ export const InboundRead = Type.Object({
 });
 export const InboundAck = Type.Object({ ...Req('inbound.ack'), consumer: Type.String(), cursor: Type.Number() });
 
-export const Explain = Type.Object({ ...Req('explain'), inputId: Type.String() });
+/**
+ * `explain`: `inputId` is an input id (its routing record), or the operationId of a
+ * delivery (the turn that made it and that turn's inputs). `chain: true` with an input id:
+ * walk the input's cause back to the root of its chain.
+ */
+export const Explain = Type.Object({ ...Req('explain'), inputId: Type.String(), chain: Type.Optional(Type.Boolean()) });
 
 /**
  * Pin an agent and a launch to a session key before any input opens it (inputs
@@ -399,7 +433,30 @@ export const OutboundCallout = Type.Object({
   args: Type.Object({ from: Type.Union([TurnContextView, Type.Null()]), to: ReplyRoute }),
 });
 
-export const HostEventFrame = Type.Union([InboundFrame, RouteCallout, ResolveCallout, OutboundCallout, RunEnded, ResultFrame]);
+const AgentAddressView = Type.Object({ agent: Type.String(), sessionKey: Type.String() });
+
+/**
+ * `Policy.contact` asked of a host whose hello lists `contact`: may agent session `from`
+ * list / send to / run / observe / control `to` (agent-messaging §4.6). Answer `{ verdict }`;
+ * timeout, error or a bad answer: the daemon's own policy decides (`policy.agentContacts`,
+ * default deny). Nothing asks it yet: the agent-messaging tools will.
+ */
+export const ContactCallout = Type.Object({
+  ...Req('policy'),
+  hook: Type.Literal('contact'),
+  args: Type.Object({
+    from: AgentAddressView,
+    to: Type.Union([AgentAddressView, Type.Object({ agent: Type.String() })]),
+    op: Type.Union(['list', 'send', 'run', 'observe', 'control'].map((x) => Type.Literal(x))),
+    turn: Type.Union([TurnContextView, Type.Null()]),
+  }),
+});
+
+/** The host's answer to a `contact` callout. */
+export const ContactCalloutAnswer = Type.Object({ verdict: Type.Union([Type.Literal('allow'), Type.Literal('deny')]) });
+export type ContactCalloutAnswer = Static<typeof ContactCalloutAnswer>;
+
+export const HostEventFrame = Type.Union([InboundFrame, RouteCallout, ResolveCallout, OutboundCallout, ContactCallout, RunEnded, ResultFrame]);
 export type HostEventFrame = Static<typeof HostEventFrame>;
 
 export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare', 'inbound.redispatch'] as const;
@@ -544,9 +601,54 @@ export type InboundReadResult = Static<typeof InboundReadResult>;
 export const InboundAckResult = Type.Object({ consumer: Type.String(), acked: Type.Number() });
 export type InboundAckResult = Static<typeof InboundAckResult>;
 
-/** `explain`: the persisted routing record (error `unknown_input` when there is none). */
-export const ExplainResult = RouteExplanation;
-export type ExplainResult = RouteExplanation;
+/**
+ * `explain` of a side effect: a delivery's operationId (as its `delivery.settled` names it)
+ * → the session and turn that made it → that turn's triggering inputs (`explain` each for
+ * its routing record and chain).
+ */
+export const EffectExplanation = Type.Object({
+  operationId: Type.String(),
+  sessionKey: Type.String(),
+  /** Absent for a delivery no turn made (a host `deliver`, a system reply). */
+  turnId: Type.Optional(Type.String()),
+  inputIds: Type.Array(Type.String()),
+  route: ReplyRoute,
+  result: Type.Union([Type.Literal('delivered'), Type.Literal('rejected'), Type.Literal('unknown')]),
+  providerMessageId: Type.Optional(Type.String()),
+  at: Type.Number(),
+});
+export type EffectExplanation = Static<typeof EffectExplanation>;
+
+/** One input on the way from an agent-originated input back to its root (`explain { chain: true }`). */
+export const ChainLink = Type.Object({
+  inputId: Type.String(),
+  /** 0 = the root (a human, host or system input). Absent where the chain is broken. */
+  hop: Type.Optional(Type.Integer({ minimum: 0 })),
+  /** The session it was delivered to, and its address `<agent>/<sessionKey>` when the agent is known. */
+  sessionKey: Type.Optional(Type.String()),
+  address: Type.Optional(Type.String()),
+  principal: Type.Union([Type.String(), Type.Null()]),
+  /** The turn it triggered in that session, if any. */
+  turnId: Type.Optional(Type.String()),
+  basis: Type.Optional(InputCause.properties.basis),
+  /** It was stopped by the loop guard. */
+  loopGuard: Type.Optional(LoopGuardTrip),
+});
+export type ChainLink = Static<typeof ChainLink>;
+
+/** `explain { chain: true }`: from the input (first) back to the root (last); `end` says why the walk stopped. */
+export const ChainExplanation = Type.Object({
+  inputId: Type.String(),
+  chain: Type.Optional(Type.String()),
+  links: Type.Array(ChainLink),
+  /** `root`: reached hop 0; `broken`: a `basis: none` link (the sender's turn is unknown); `unknown`: a record is gone (retention, another machine). */
+  end: Type.Union([Type.Literal('root'), Type.Literal('broken'), Type.Literal('unknown')]),
+});
+export type ChainExplanation = Static<typeof ChainExplanation>;
+
+/** `explain`: a routing record (error `unknown_input` when there is none and no delivery has that id), a side effect, or a chain. */
+export const ExplainResult = Type.Union([RouteExplanation, EffectExplanation, ChainExplanation]);
+export type ExplainResult = Static<typeof ExplainResult>;
 
 /** The host's answer to an `inbound` push: `accepted: true` once durably taken; anything else is retried. */
 export const InboundAnswer = Type.Object({ accepted: Type.Boolean() });

@@ -188,6 +188,8 @@ export const Body = Type.Union([
       Type.Literal('runtime_restart'),
       Type.Literal('auto_review'),
       Type.Literal('continuity'),
+      /** An agent-originated input was stopped from starting a turn (hop or same-pair limit); recorded as context. */
+      Type.Literal('loop_guard'),
       Type.Literal('other'),
     ]),
     message: Type.String(),

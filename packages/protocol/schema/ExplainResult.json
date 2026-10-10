@@ -1,0 +1,635 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/ExplainResult",
+  "anyOf": [
+    {
+      "type": "object",
+      "required": [
+        "inputId",
+        "tableVersions",
+        "matched",
+        "principal",
+        "evidence"
+      ],
+      "properties": {
+        "inputId": {
+          "type": "string"
+        },
+        "tableVersions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "matched": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "bindingId",
+              "source",
+              "on"
+            ],
+            "properties": {
+              "bindingId": {
+                "type": "string"
+              },
+              "source": {
+                "anyOf": [
+                  {
+                    "const": "config",
+                    "type": "string"
+                  },
+                  {
+                    "const": "host",
+                    "type": "string"
+                  },
+                  {
+                    "const": "watch",
+                    "type": "string"
+                  }
+                ]
+              },
+              "on": {
+                "anyOf": [
+                  {
+                    "const": "dispatch",
+                    "type": "string"
+                  },
+                  {
+                    "const": "context",
+                    "type": "string"
+                  },
+                  {
+                    "const": "digest",
+                    "type": "string"
+                  },
+                  {
+                    "const": "host",
+                    "type": "string"
+                  },
+                  {
+                    "const": "drop",
+                    "type": "string"
+                  }
+                ]
+              },
+              "agent": {
+                "type": "string"
+              },
+              "sessionKey": {
+                "type": "string"
+              },
+              "callout": {
+                "type": "object",
+                "required": [
+                  "outcome",
+                  "on"
+                ],
+                "properties": {
+                  "outcome": {
+                    "anyOf": [
+                      {
+                        "const": "answered",
+                        "type": "string"
+                      },
+                      {
+                        "const": "timeout",
+                        "type": "string"
+                      },
+                      {
+                        "const": "error",
+                        "type": "string"
+                      },
+                      {
+                        "const": "no_host",
+                        "type": "string"
+                      },
+                      {
+                        "const": "skipped_pinned",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "on": {
+                    "anyOf": [
+                      {
+                        "const": "dispatch",
+                        "type": "string"
+                      },
+                      {
+                        "const": "context",
+                        "type": "string"
+                      },
+                      {
+                        "const": "digest",
+                        "type": "string"
+                      },
+                      {
+                        "const": "host",
+                        "type": "string"
+                      },
+                      {
+                        "const": "drop",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                }
+              },
+              "launch": {
+                "type": "object",
+                "required": [
+                  "envKeys",
+                  "outcome"
+                ],
+                "properties": {
+                  "cwd": {
+                    "type": "string"
+                  },
+                  "envKeys": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "outcome": {
+                    "type": "string"
+                  }
+                }
+              },
+              "rejected": {
+                "type": "object",
+                "required": [
+                  "code"
+                ],
+                "properties": {
+                  "code": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "principal": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidence": {
+          "anyOf": [
+            {
+              "const": "platform_signed",
+              "type": "string"
+            },
+            {
+              "const": "dkim_pass",
+              "type": "string"
+            },
+            {
+              "const": "device_only",
+              "type": "string"
+            },
+            {
+              "const": "none",
+              "type": "string"
+            },
+            {
+              "const": "daemon",
+              "type": "string"
+            }
+          ]
+        },
+        "claimedEvidence": {
+          "anyOf": [
+            {
+              "const": "platform_signed",
+              "type": "string"
+            },
+            {
+              "const": "dkim_pass",
+              "type": "string"
+            },
+            {
+              "const": "device_only",
+              "type": "string"
+            },
+            {
+              "const": "none",
+              "type": "string"
+            }
+          ]
+        },
+        "at": {
+          "type": "number"
+        },
+        "redispatchOf": {
+          "type": "object",
+          "required": [
+            "inputId",
+            "cursor",
+            "by"
+          ],
+          "properties": {
+            "inputId": {
+              "type": "string"
+            },
+            "cursor": {
+              "type": "number"
+            },
+            "by": {
+              "type": "string"
+            }
+          }
+        },
+        "redispatched": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "cursor",
+              "inputId",
+              "sessionKey",
+              "by",
+              "at"
+            ],
+            "properties": {
+              "cursor": {
+                "type": "number"
+              },
+              "inputId": {
+                "type": "string"
+              },
+              "sessionKey": {
+                "type": "string"
+              },
+              "agent": {
+                "type": "string"
+              },
+              "by": {
+                "type": "string"
+              },
+              "at": {
+                "type": "number"
+              }
+            }
+          }
+        },
+        "dropped": {
+          "anyOf": [
+            {
+              "const": "adapter",
+              "type": "string"
+            },
+            {
+              "const": "no_match",
+              "type": "string"
+            },
+            {
+              "const": "drop_rule",
+              "type": "string"
+            }
+          ]
+        },
+        "cause": {
+          "type": "object",
+          "required": [
+            "peer",
+            "basis"
+          ],
+          "properties": {
+            "peer": {
+              "type": "string"
+            },
+            "basis": {
+              "anyOf": [
+                {
+                  "const": "internal",
+                  "type": "string"
+                },
+                {
+                  "const": "recovered",
+                  "type": "string"
+                },
+                {
+                  "const": "declared",
+                  "type": "string"
+                },
+                {
+                  "const": "none",
+                  "type": "string"
+                }
+              ]
+            },
+            "hop": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "chain": {
+              "type": "string"
+            },
+            "from": {
+              "type": "object",
+              "required": [
+                "sessionKey",
+                "turnId"
+              ],
+              "properties": {
+                "sessionKey": {
+                  "type": "string"
+                },
+                "turnId": {
+                  "type": "string"
+                }
+              }
+            },
+            "rootPrincipal": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "carried": {
+              "type": "object",
+              "required": [
+                "external",
+                "watched",
+                "group"
+              ],
+              "properties": {
+                "external": {
+                  "type": "boolean"
+                },
+                "watched": {
+                  "type": "boolean"
+                },
+                "group": {
+                  "type": "boolean"
+                }
+              }
+            }
+          }
+        },
+        "loopGuard": {
+          "type": "object",
+          "required": [
+            "tripped",
+            "limit"
+          ],
+          "properties": {
+            "tripped": {
+              "anyOf": [
+                {
+                  "const": "hops",
+                  "type": "string"
+                },
+                {
+                  "const": "pair",
+                  "type": "string"
+                }
+              ]
+            },
+            "limit": {
+              "type": "integer"
+            },
+            "hop": {
+              "type": "integer"
+            },
+            "peer": {
+              "type": "string"
+            },
+            "count": {
+              "type": "integer"
+            },
+            "windowMs": {
+              "type": "integer"
+            },
+            "sessionKey": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "operationId",
+        "sessionKey",
+        "inputIds",
+        "route",
+        "result",
+        "at"
+      ],
+      "properties": {
+        "operationId": {
+          "type": "string"
+        },
+        "sessionKey": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "inputIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "route": {
+          "type": "object",
+          "required": [
+            "channel",
+            "account",
+            "conversationId"
+          ],
+          "properties": {
+            "channel": {
+              "type": "string"
+            },
+            "account": {
+              "type": "string"
+            },
+            "conversationId": {
+              "type": "string"
+            },
+            "threadId": {
+              "type": "string"
+            },
+            "replyToMessageId": {
+              "type": "string"
+            }
+          }
+        },
+        "result": {
+          "anyOf": [
+            {
+              "const": "delivered",
+              "type": "string"
+            },
+            {
+              "const": "rejected",
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "type": "string"
+            }
+          ]
+        },
+        "providerMessageId": {
+          "type": "string"
+        },
+        "at": {
+          "type": "number"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "inputId",
+        "links",
+        "end"
+      ],
+      "properties": {
+        "inputId": {
+          "type": "string"
+        },
+        "chain": {
+          "type": "string"
+        },
+        "links": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "inputId",
+              "principal"
+            ],
+            "properties": {
+              "inputId": {
+                "type": "string"
+              },
+              "hop": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "sessionKey": {
+                "type": "string"
+              },
+              "address": {
+                "type": "string"
+              },
+              "principal": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "turnId": {
+                "type": "string"
+              },
+              "basis": {
+                "anyOf": [
+                  {
+                    "const": "internal",
+                    "type": "string"
+                  },
+                  {
+                    "const": "recovered",
+                    "type": "string"
+                  },
+                  {
+                    "const": "declared",
+                    "type": "string"
+                  },
+                  {
+                    "const": "none",
+                    "type": "string"
+                  }
+                ]
+              },
+              "loopGuard": {
+                "type": "object",
+                "required": [
+                  "tripped",
+                  "limit"
+                ],
+                "properties": {
+                  "tripped": {
+                    "anyOf": [
+                      {
+                        "const": "hops",
+                        "type": "string"
+                      },
+                      {
+                        "const": "pair",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "limit": {
+                    "type": "integer"
+                  },
+                  "hop": {
+                    "type": "integer"
+                  },
+                  "peer": {
+                    "type": "string"
+                  },
+                  "count": {
+                    "type": "integer"
+                  },
+                  "windowMs": {
+                    "type": "integer"
+                  },
+                  "sessionKey": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "end": {
+          "anyOf": [
+            {
+              "const": "root",
+              "type": "string"
+            },
+            {
+              "const": "broken",
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
