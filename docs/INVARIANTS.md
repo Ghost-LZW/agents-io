@@ -117,9 +117,9 @@
   1. 进行中记录按尝试更新（记 `attempts`、`startedAt`、`turnId`），退避等待期间也在；死在退避里同样记 `unknown`（上一次尝试的结果本来就不明）。
   2. 进行中记录不随 30 天清理删除：下次启动总会结算它。
   3. 不自动重发：`unknown` 交给宿主或人决定（原则 6），代价是可能少发一次；重复发送（飞书上传、邮件 SMTP）不可撤回，少发可补。
+  4. **结算记录不删，30 天后压成墓碑**（2026-10-11，依原则 1、4 自决）：`records.ts` `outPrune`（`:48-51`）把超过保留期的行改成 `at = 0`、去掉 `error` 与 `providerMessageId`，结果（`status`、`attempts`、路由）留下；同一 operationId 任何时候再来都得到它（`duplicate: true`），不再发。没有选"拒收早于保留期的 operationId"：operationId 由调用方取名，不带时间，看不出新旧。代价是每个 operationId 永久一小行（不含消息内容）。测试：`packages/daemon/test/host.test.ts` "after the 30-day prune of settled outbox records, the same operationId is not sent again"（原 `it.fails`，已修）。
 - **不成立**：
-  1. 结算记录 30 天后清理（`records.ts` `outPrune`），之后同一 operationId 会再发。测试：`it.fails` `packages/daemon/test/host.test.ts` "after the 30-day prune of settled outbox records, the same operationId is not sent again #DL-2"。
-  2. 嵌入方不传持久 store 时（`MemoryOutboxStore`）跨进程不成立，见 RS-9。
+  1. 嵌入方不传持久 store 时（`MemoryOutboxStore`）跨进程不成立，见 RS-9。
 
 ### DL-3 回复只回到来源
 

@@ -45,7 +45,10 @@ export class DaemonRecords implements OutboxStore {
       inPrune: p('DELETE FROM daemon_inputs WHERE at < ?'),
       outGet: p('SELECT json FROM daemon_outbox WHERE operation_id = ?'),
       outPut: p('INSERT INTO daemon_outbox (operation_id, at, json) VALUES (?, ?, ?) ON CONFLICT(operation_id) DO UPDATE SET json = excluded.json'),
-      outPrune: p('DELETE FROM daemon_outbox WHERE at < ?'),
+      // Settled outcomes are never deleted (DL-2: an operationId is sent at most once, ever).
+      // Past the retention window a row is compacted to a tombstone (`at = 0`): the
+      // outcome stays, the error text and the provider message id go.
+      outPrune: p("UPDATE daemon_outbox SET at = 0, json = json_remove(json, '$.error', '$.providerMessageId') WHERE at > 0 AND at < ?"),
       // In-flight marks are never pruned: the next start settles each one (as unknown).
       flyPut: p('INSERT INTO daemon_outbox_inflight (operation_id, at, json) VALUES (?, ?, ?) ON CONFLICT(operation_id) DO UPDATE SET at = excluded.at, json = excluded.json'),
       flyGet: p('SELECT json FROM daemon_outbox_inflight WHERE operation_id = ? AND operation_id NOT IN (SELECT operation_id FROM daemon_outbox)'),
