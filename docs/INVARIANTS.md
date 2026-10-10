@@ -2,6 +2,7 @@
 
 > 状态：2026-10-10 初版，对应 `docs/ROADMAP.md` §1 原则 4（承诺可检验）与 §3。来源：各设计文档、决定 1–12、代码注释与行为。代码位置以写作时的 `main` 为准（`c52bad5` 加上未提交的文档改动），行号会漂移，以函数名为准。
 > 2026-10-11：决定 14 加入 18 个编号（PR、CN、HC、SE、CT、RQ-5、OB、RT、RN、IN-7、TP、MD、LA-3，来源 `docs/design/test-suite-review/` §3.2），代码位置按当日 `main` 读过；实施时又加了 CF-7（监听的授权）、CF-8（飞书平台需求清单），两组测试原来守着它们却没有编号。每条"不成立"都有带编号的 `it.fails`（LN-4 只有 `it.todo`，假 harness 复现不了）。
+> 2026-10-11：agent 通信地基（`docs/design/agent-messaging/`，决定 13）加入 ID-7、ID-8、EX-5、EX-6、IN-8、CF-9；ID-2、EX-2 改为成立（EX-2 仍有 `live_say` 一条不成立）。
 > 用途：改动 agents-io 的人或 agent 用它判断"这个改动有没有打破某个承诺"。新增承诺先写进这里，再写测试；测试改名时同步改这里。
 
 ## 0. 怎么读
@@ -91,6 +92,14 @@
   1. **停止期间收到的消息被确认后丢失。** `Gateway.stop` 先置 `refusingInbound`，通道还要再连着一段时间（等拒绝提示与收尾卡片发出）；这期间 `Gateway.accept` 答 `{ accepted: false, error: 'gateway stopping' }`，不抛错。飞书 `deliver` 只把抛错当失败，于是 ack 并保留去重键，飞书不再重投；邮件 `onMessage` 照常前移 checkpoint。两者都不会交给下一个进程。测试：`it.fails` `channel/lark-bot/test/inbound.test.ts` "an emit answering accepted:false is not acked and leaves no dedup key, so the redelivery gets in #IN-7"；`it.fails` `channel/mail/test/mail.test.ts` "does not move the checkpoint past a message the host answered accepted:false #IN-7"。
   2. 期限之后重试用尽（`EMIT_RETRIES`）或通道被中止时，飞书已经 ack，这条消息丢失（CHANNELS.md §8 已记）。
 
+### IN-8 agent 之间不无限来回：lane 入口唯一检查点截停
+
+- **承诺**：每条要开轮或并入轮次的输入（`queue` / `steer` / `interrupt`，不论来自通道规则、watch trigger、宿主 `input` 帧、本地客户端还是 `inbound.redispatch`）都经过 `Lane.input` 的同一个检查：`origin.kind === "agent"` 且 `cause.hop > policy.loopGuard.maxHops`（默认 8）→ 截停；同一 peer（本部署 agent 按 agent 名，外部按渠道身份）在一个 session 里、自上次非 agent 输入以来、`pair.windowMs`（默认 15 分钟）内已开了 `pair.maxTurns`（默认 10）轮 → 截停，直到有非 agent 输入或窗口过去（不知道跳数的 `basis: none` 输入同样计数）。截停的输入不开轮，记成上下文（`input.admitted observe_only`，带记录，`channelContext.loopGuard: "hops" | "pair"`），交给下一轮；接收 session 记 `notice { code: "loop_guard" }`（`visibility: operators`），产生它的本部署 session（已知时）也记一条；explain 带 `loopGuard`；不往任何通道发东西。非 agent 输入不受影响。
+- **实现**：`packages/session/src/loop-guard.ts` `LoopGuard.check`、`peerKey`、`loopGuardMessage`；`packages/session/src/lane.ts` `input`（`known` 去重之后、`trySteer` / 打断 / `enqueue` 之前）、`guarded`；`packages/daemon/src/gateway.ts` `causeHooks`、`loopGuarded`（发送方 notice、cause 记录、explain）、`explain`（合并 cause 记录里的截停）；配置 `packages/daemon/src/config.ts` `policy.loopGuard`。
+- **测试**：标签 `#IN-8`；`packages/session/test/agent-messaging.test.ts` "hop = maxHops starts a turn; maxHops + 1 is kept as context labelled loopGuard, with a loop_guard notice, never a turn"、"the stopped input is handed to the next turn a person starts, still labelled"、"same pair: the peer is stopped after maxTurns; a person writing clears it; another peer is not affected; broken chains count too"、"the pair window passes: the peer may start turns again"、"every entry reaches the checkpoint: a channel dispatch and a watch trigger are stopped alike"；`packages/daemon/test/agent-messaging.test.ts` "a trip leaves a loop_guard notice in the receiving and the sending session, explain shows it (also after a restart), nothing goes to a channel"、"inbound.redispatch goes through the same checkpoint: a queued over-hop agent message stays context"。
+- **状态**：有测试。
+- **注意**：成对计数在内存里，重启清零（跳数上限随持久化的 cause 仍然有效）；合批按最大跳数算，一句人话也会开一条新链。第一步里本部署的 agent 输入只有"回流"一条来路，而回流是 `self`、永远不开轮（ID-5），所以跳数上限现在实际只拦受信 agent 账号声明了跳数的输入；`agent_send` / `agent_run`（ROADMAP §2 第 3、4 项）接上后直接适用。宿主 `input` 帧与本地客户端的输入是 `kind: system` / `human`，只会清零成对计数。
+
 ---
 
 ## 2. 投递（DL）
@@ -140,7 +149,7 @@
 - **承诺**：会话的卡片（compositor）和输出工具发出的每条消息都带 `as = session:<sessionKey>`（`agentIdentity`，与来源 `declared`、watch 的 `createdBy` 同一格式），适配器记下它，回流时作为 `declared` 读回（POSITIONING §2 身份表明）。宿主 `deliver` 与系统回复不是 agent 写的，不带 `as`。
 - **实现**：`gateway.ts` `compose`（`as`）与 `HostTools.as`。
 - **测试**：`multi-lark.test.ts` "every agent-authored message carries the agent identity (SendOp.as); host deliveries and system replies carry none #DL-4b"。
-- **状态**：已覆盖。回流时 `agentAccounts` 里的账号声明本部署的 `session:<key>` 即认作 self（守护进程接 `isSelfDeclared`，按会话日志、lane、登记判断），不触发任何规则；测试 "an agent account's message declaring one of our sessions is our own echo: never a turn #ID-5"。
+- **状态**：已覆盖。同进程兄弟机器人的回流由出站索引认出（ID-8），不再依赖适配器各自的发送记录或 `selfAccounts`。回流时 `agentAccounts` 里的账号声明本部署的 `session:<key>` 即认作 self（守护进程接 `isSelfDeclared`，按会话日志、lane、登记判断），不触发任何规则；测试 "an agent account's message declaring one of our sessions is our own echo: never a turn #ID-5"。
 
 ### DL-5 外发目的地检查；宿主 outbound 回调失败即拒
 
@@ -227,15 +236,11 @@
 
 ### ID-2 模型看得到来源
 
-- **承诺**：交给 harness 的每条输入前面有发送者说明（主体、来源类型、经由的路由、是否经 watch），被监听与外部内容明确标注（决定 5）。
-- **实现**：`harness/claude-code/src/content.ts:31-38`、`:128`；`harness/codex/src/map.ts:25-30`。
-- **测试**：`harness/claude-code/test/claude-code.test.ts` "one SDKUserMessage per input, uuid bound to inputId, explicit priority, preface #ID-2"、"preface marks unknown senders and agents #ID-2"、"labels context-only inputs as not addressed to the agent, keeping their own sender preface #ID-2"；`harness/codex/test/codex.test.ts` "labels context-only inputs as not addressed to the agent (also without the sender preface) #ID-2"。
-- **状态**：部分覆盖。
-- **不成立**：
-  1. 两个 harness 的说明都不含 `origin.evidence`（`content.ts:33`、`map.ts:27`）；决定 5 列的"证据"模型看不到。Codex 还不显示 `self`。测试：`it.fails` `harness/claude-code/test/claude-code.test.ts` "the sender preface names the origin evidence #ID-2"；`it.fails` `harness/codex/test/codex.test.ts` "the sender preface names the origin evidence #ID-2"。
-  2. Codex 的 `preface: false`（`harness/codex/src/session.ts:79`、`map.ts:65`）整个关掉发送者说明，连 watch 标记一起没了。测试：`it.fails` `harness/codex/test/codex.test.ts` "preface: false still marks a watched input as watched #ID-2"。
-  3. ~~没有测试断言 `watch=` 标记出现在模型输入里。~~ 已补（决定 14）：`claude-code.test.ts`、`codex.test.ts` 各一条 "a watched input reaches the model with the watch= marker in its sender preface #ID-2"。
-  4. 模块 harness 自己渲染输入，核心不保证有说明。
+- **承诺**：交给 harness 的每条输入前面有发送者说明（主体、来源类型、证据、经由的路由、是否经 watch、`self`），被监听与外部内容明确标注（决定 5）；agent 产生的输入带已知跳数时多一项 `hop=N`（链 id、turnId、`carried` 不给模型，agent-messaging §4.5），被截停后作为上下文交出的带 `loopGuard=`（IN-8）。两个 harness 字段一致；Codex 的 `preface: false` 仍保留 watch 与 `loopGuard` 标记。
+- **实现**：`harness/claude-code/src/content.ts` `preface`；`harness/codex/src/map.ts` `senderPreface`、`renderInputs`（`MARK_KEYS`）。
+- **测试**：`harness/claude-code/test/claude-code.test.ts` "one SDKUserMessage per input, uuid bound to inputId, explicit priority, preface #ID-2"、"preface marks unknown senders and agents #ID-2"、"labels context-only inputs as not addressed to the agent, keeping their own sender preface #ID-2"、"the sender preface names the origin evidence #ID-2"、"an agent message shows hop=N only (chain and turn ids stay out); a loop-guarded one shows loopGuard= #ID-2"、"a watched input reaches the model with the watch= marker in its sender preface #ID-2"；`harness/codex/test/codex.test.ts` "labels context-only inputs as not addressed to the agent (also without the sender preface) #ID-2"、"the sender preface names the origin evidence (and self, like Claude Code) #ID-2"、"preface: false still marks a watched input as watched #ID-2"、"an agent message shows hop=N only (chain and turn ids stay out), like Claude Code #ID-2"、"a watched input reaches the model with the watch= marker in its sender preface #ID-2"。
+- **状态**：有测试（两个内置 harness）。原来的"不成立"1、2（不含证据、Codex 不显示 `self`；`preface: false` 连 watch 标记一起关掉）已修（agent-messaging，决定 13）。
+- **边界**：模块 harness 自己渲染输入，核心不保证有说明。
 
 ### ID-3 Origin 由网关盖章，客户端不能设置
 
@@ -264,7 +269,7 @@
 ### ID-5 本部署的回流不开轮
 
 - **承诺**：本部署自己发出的消息回流时标 `self`，默认丢弃；即使规则或监听设了包含回流，也只记作 context，永远不开轮。
-- **实现**：`ingress.ts:262`、`:276`；`router.ts:503`；watch 的 `excludeSelf`。
+- **实现**：`ingress.ts:262`、`:276`；`router.ts:503`；watch 的 `excludeSelf`。认出"本部署自己的"有三条：`selfAccounts`、受信 agent 账号声明本部署的 `session:<key>`（DL-4b）、出站索引（ID-8）。
 - **测试**：`ingress.test.ts` "drops self echoes and unknown DMs; observes strangers in groups #ID-5 #ID-1"；`watch.test.ts` "own echoes: excluded by default; with excludeSelf false only ever context, never a turn (no loops) #ID-5"。
 - **状态**：有测试。
 
@@ -275,6 +280,22 @@
 - **测试**：`policy.test.ts` "bypass only when every input is from an owner #ID-6"；`watch.test.ts` "a trigger turn keeps the original sender: restricted for a stranger, bypass for the owner #ID-6 #ID-1 #CF-5"；`lane.test.ts` "auto: answers immediately per policy (bypass → allow) #ID-6 #RQ-1"、"auto deny for a restricted turn #ID-6"；`routing.test.ts` "the owner @-ing in a group after strangers talked: tagged watched + external + group (never blocked or downgraded) #EX-3 #ID-6"；`context.test.ts` "stranger messages in the context do not change the plan: the same run as without them #ID-6"；`lane.test.ts` "a steer that would change the turn's profile is queued instead (the profile comes from the turn's own inputs) #ID-6"。
 - **状态**：有测试。
 - **注意**：live 委托 turn 不调 `plan`，沿用 `lastRun`（`lane.ts:968`），所以主人放行的一轮之后，会议里任何人的委托都按 `bypass` 自动放行审批（`policy.ts:106`）。这是决定 11"与文字会话同权限"的字面结果，不算违反，但值得在决定 11 里写明这个后果。
+
+### ID-7 agent 产生的输入由守护进程盖章；agent 主体永远不是主人
+
+- **承诺**：本部署 agent 产生的输入（`agentInput`，供 `agent_send` / `agent_run` 用）由守护进程盖章：`kind: "agent"`、主体默认 `agent:<agent>`（标签 `agent`；宿主身份映射可把 `{ channel: "agent", channelUserId: <agent> }` 映射成自己的成员）、证据 `daemon`、`via` = 发送 session 的地址 `agent:<agent>:<sessionKey>`，带 `cause`（`basis: internal`）。agent 主体不能带 `owner` 标签：本地配置的 `identities` / `owners` 里出现即启动失败，宿主表 `bindings.put` 被拒。`InputRecord.cause` 只由守护进程得出：本地客户端、宿主连接的 `input` 帧带的 `cause` 不生效，`channelContext.loopGuard` 被去掉（适配器的 `context` 与客户端的 `channelContext` 都是）；适配器只能经 `sender.cause` 声明跳数，只有 `agentAccounts` 里的账号、带 `platform_signed` / `dkim_pass` 证据、且通道允许声明发送者（`caps.declaresSender`）时才采信（`basis: declared`），否则外部 agent 是 `basis: none`；`daemon` 证据不在适配器可声明的 `Evidence` 里。
+- **实现**：`packages/protocol/src/address.ts` `agentInputOrigin`；`packages/protocol/src/common.ts` `OriginEvidence`；`packages/session/src/loop-guard.ts` `agentInput`、`causeFrom`；`packages/session/src/identity.ts` `checkIdentities`（agent 通道的条目不得带 `owner`）、`IdentityMap.agentPrincipal`、`identify`（`trustedAgent`）；`packages/session/src/ingress.ts` `process`（`cause` 判定）、`capEnvelope`、`channelContext`（去掉 `loopGuard`）；`packages/daemon/src/gateway.ts` `command`（本地 / 宿主输入逐字段构造，去掉 `loopGuard`）；`packages/host-mcp/src/tools.ts` `agentOrigin`（建监听时的来源：`via` 为 session 地址，证据 `daemon`，主体仍为空、`createdBy` 仍是 `session:<key>`）。
+- **测试**：标签 `#ID-7`；`packages/session/test/agent-messaging.test.ts` "agentInput: kind agent, principal agent:<agent>, evidence daemon, via = the sending session, one hop past its turn"、"agent principals can never carry the owner label: a config map fails, a host table is refused"、"a hit without platform evidence is not ours (a forged copy of a mail Message-ID); a miss from a bot is a broken chain"、"clients and adapters cannot set a cause: a declared hop counts only from a trusted agent account with platform evidence; channelContext.loopGuard is stripped"；`packages/daemon/test/agent-messaging.test.ts` "a local or host client cannot set a cause or the loopGuard label on its input"、"a config identity giving an agent the owner label fails the start"。
+- **状态**：有测试。第一步还没有调用 `agentInput` 的工具（`agent_send` 是第二步）。
+- **注意**：`SendOp.as` 仍是 `session:<sessionKey>`（DL-4b 现行），没有按提案 §4.2 改成 `agent:<agent>`，见 `docs/design/agent-messaging/` 状态行的偏差说明。
+
+### ID-8 本部署的消息经通道回来，由出站索引认出
+
+- **承诺**：本部署某个 turn 投递成功、有平台消息 id 的消息，经任何通道账号回来时（同部署的兄弟机器人、邮件回声），只要信封带 `platform_signed` / `dkim_pass` 证据，就按 `(channel, 消息 id)` 在出站索引里认出：`self: true`、`kind: "agent"`、主体为发出它的 agent（同 ID-7 的主体规则）、证据保持通道的、`cause = { basis: "recovered", hop: 那一轮 + 1, chain, from: { sessionKey, turnId }, rootPrincipal, carried }`；不需要手写 `selfAccounts`。路由不变：`self` 永远不开轮（ID-5）。证据不够的同 id 信封（收件人伪造的邮件 Message-ID）不算。
+- **实现**：`packages/daemon/src/records.ts` `daemon_outbound`（`putOutbound`、`outboundByMessage`，保留 30 天）；`packages/session/src/outbox.ts` `onSettled`；`packages/daemon/src/gateway.ts` `indexOutbound`（每次结算都记，带 turn 的来源与链）、`recoverSend`；`packages/session/src/ingress.ts` `process`（`recover`，在 `identify` 之后、路由之前）。
+- **测试**：标签 `#ID-8`；`packages/session/test/agent-messaging.test.ts` "a hit is self, from the agent that sent it, with a recovered cause one hop on — whatever account received it"、"a hit without platform evidence is not ours (a forged copy of a mail Message-ID); a miss from a bot is a broken chain"；`packages/daemon/test/agent-messaging.test.ts` "bot a's reply delivered into a group comes back through bot b: self, from the agent that wrote it, recovered — no selfAccounts needed"。
+- **状态**：有测试（假通道）。飞书是否把机器人的群消息推给同群其他机器人仍待 live 核实（ROADMAP §4）；不推则飞书上这条路径不出现。
+- **边界**：适配器把长消息拆成多条时只报最后一条的 id，前面几条找不回；出站索引过了保留期、或另一台机器发的，都找不回，落回身份规则。
 
 ---
 
@@ -290,16 +311,18 @@
 
 ### EX-2 从任何副作用追溯到触发它的轮次与输入
 
-- **承诺**：发消息、宿主写命令、审批等任何副作用都能由 `aio explain` 追溯到触发它的轮次与输入（ROADMAP §1 原则 4、决定 4）。
-- **实现**：没有。`explain` 只接受 inputId（`cli.ts:512-517`，协议 `Explain = { inputId }` 在 `packages/protocol/src/host.ts:286`），只返回路由记录（`router.ts:662-665`）；没有按 operationId、providerMessageId、requestId、turnId 的查询。能手工从日志串起来的：输出工具与卡片的 `delivery.settled` 带 `turnId`，`render.anchor` 把平台消息 id 映射到 turn，`turn.started.inputIds` 再到输入。串不起来的：系统回复（`gateway.ts:1104-1109`，只有 `${code}:${inputId}` 形式的 operationId，没有 turn）、宿主 `deliver`（`sessionKey: host:<name>`）、卡片流式编辑、`live_say`（什么都不记）。本轮来源摘要（`lane.ts:338-353`）不含 inputIds，只在内存里保留最近 256 轮。
-- **测试**：`it.fails` `packages/daemon/test/host.test.ts` "explain by the operationId of an output-tool send returns the turnId and that turn's inputIds #EX-2"（今天 `explain` 只认 inputId，答 `unknown_input`）。
-- **状态**：不成立（只有 `it.fails`）。
-- **不成立**：原则 4 后半句与决定 4"`aio explain` 能从任意写入追溯到触发它的轮次与输入"目前都没有实现。
+- **承诺**：发消息、宿主写命令、审批等任何副作用都能由 `aio explain` 追溯到触发它的轮次与输入（ROADMAP §1 原则 4、决定 4）。投递：`aio explain <operationId>`（`delivery.settled` 里的那个）答 `EffectExplanation`：哪个 session、哪个 turn、那一轮的触发输入（不含交给它的上下文）、路由、结果、平台消息 id；系统回复没有 turn，答它回应的输入；宿主 `deliver` 答 `sessionKey: host:<name>`、没有 turn 与输入（宿主自己说的话）。跨重启可查（SQLite）。
+- **实现**：`packages/daemon/src/records.ts` `daemon_outbound`（每次投递结算一行，`outboundByOperation`）；`packages/session/src/outbox.ts` `onSettled`；`packages/daemon/src/gateway.ts` `indexOutbound`、`systemReply`（记 `inputIds`）、`explain`（inputId 没有路由记录时按 operationId 查）、`explainEffect`、`turnInputs`；`packages/daemon/src/host.ts` `explain` 帧；协议 `packages/protocol/src/host.ts` `EffectExplanation`、`ExplainResult`。卡片流式编辑沿用开卡那次投递的 operationId。宿主写命令（`x` 等）不经 agents-io，按 EX-4 的 `ref=` 核验。
+- **测试**：`packages/daemon/test/host.test.ts` "explain by the operationId of an output-tool send returns the turnId and that turn's inputIds #EX-2"；`packages/daemon/test/agent-messaging.test.ts` "explain by the operationId of a reply card: its turn and that turn's inputs; explain --chain walks a recovered input back to the root #EX-2 #EX-6"、"a system reply (a topic command) names the input it answers; a host delivery names no turn #EX-2"。
+- **状态**：部分覆盖（投递成立；`live_say` 不成立）。
+- **不成立**：
+  1. `live_say` 不经 outbox，什么都不记（没有 operationId，日志里也没有）。测试：`it.fails` `packages/daemon/test/live.test.ts` "live_say is traceable: explain by its tool operationId returns the turn #EX-2"。
+- **注意**：按 requestId（审批）、turnId 直接查还没有；审批事件本身在 session 日志里带 turnId。记录保留 30 天（同 outbox）。
 
 ### EX-3 宿主写请求附带本轮来源标记
 
 - **承诺**：输出工具的每次调用附带本轮来源摘要（是否含 context / digest / 外部 / 群聊），不拦截（决定 4，HOSTS.md §宿主写命令的来源标记）。
-- **实现**：`tools.ts:404-405`（`provenance` 写进 `agents-io.output` 记录）；`lane.ts:338-353`。来源不进 harness 子进程环境：任务运行只带 `AGENTS_IO_RUN_ID`（`gateway.ts` `openRunLane`），`AGENTS_IO_TURN_PROVENANCE` 已删除（决定 13）。
+- **实现**：`tools.ts:404-405`（`provenance` 写进 `agents-io.output` 记录）；`lane.ts` `track`。来源摘要还带本轮所在的链 `cause: { hop, chain, rootPrincipal }`（EX-5），agent 转来的输入带过来的 `external/watched/group` 也并进去。来源不进 harness 子进程环境：任务运行只带 `AGENTS_IO_RUN_ID`（`gateway.ts` `openRunLane`），`AGENTS_IO_TURN_PROVENANCE` 已删除（决定 13）。
 - **测试**：`host-mcp.test.ts` "tags every write with the turn provenance (never blocks it) #EX-3"；`packages/daemon/test/runs.test.ts` "env goes into the run child only: the instance built for the run has it; the log, explain records and other instances do not #SE-1 #EX-3"（带 `AGENTS_IO_RUN_ID`、不带 `AGENTS_IO_TURN_PROVENANCE`）；`context.test.ts` "provenance: flags come from the context actually handed, and stay for later turns #IN-6 #EX-3"；`routing.test.ts` "an owner DM: triggered by the owner, nothing watched, external or group #EX-3"、"a watch trigger from a stranger: triggered by null, watched, external #EX-3"。
 - **状态**：有测试（输出工具的写入）。agent 在工作区里直接调 `x` 这类宿主命令时不经 agents-io，按决定 4 的修订（决定 13）由 EX-4 兑现。
 
@@ -310,6 +333,21 @@
 - **测试**：`packages/daemon/test/channel-stamping.test.ts` "the harness gets channelRef = channel:<channel>/<message id>, the key aio verify answers with the stamped author #EX-4"；`harness/claude-code/test/claude-code.test.ts` "preface carries ref=channel:<channel>/<message id> only for a channel message, verbatim (never truncated) #EX-4"；`harness/codex/test/codex.test.ts` "sender preface carries ref=channel:<channel>/<message id> only for a channel message, bare like Claude Code #EX-4"。
 - **状态**：部分覆盖（watch、补投路径的 `channelRef` 没有单独的测试）。
 - **注意**：`ref` 只证明"这个人发过这条消息"，不证明它就是触发这次宿主命令的那条；agent 可以带会话里更早一条消息的 `ref`。宿主要靠 `verify` 结果里的 `conversation` / `receivedAt` / `inputId` 自己加约束。
+
+### EX-5 cause 链从一轮传到它产生的每条输入
+
+- **承诺**：一轮的链是它的触发输入里跳数最大的那条（没有跳数的算 0、自成一条链的根，chain = 它的 inputId；上下文输入不参与；steer 进来更大的跳数会更新本轮），写进 `TurnProvenance.cause`；被接管、没有输入的轮次沿用上一轮。这一轮产生的输入 `hop = 本轮 + 1`、同一 chain、`from = { sessionKey, turnId }`、`rootPrincipal` 不变、`carried` = 本轮的 `external/watched/group`，接收方那一轮的来源把 `carried` 并进去（转话不洗白，决定 4/5）。同一条输入换地方时原样保留、不加跳：watch 转投、话题换手（`session_rotate` / `session_switch`）、`inbound.redispatch`。本部署的 agent 发出的消息（设了 `as`）在能带外夹带的通道上带 `SendOp.cause = { hop: 本轮 + 1, chain: 不透明 id }`：邮件写 `X-Agents-IO-Hop: <hop>; chain=<id>`，收件侧只在 DKIM 通过时读出（采信与否见 ID-7）；飞书不带。带 cause 的输入的记录写进日志（`input.admitted.input`）与 cause 索引。
+- **实现**：`packages/session/src/loop-guard.ts` `turnCause`、`causeFrom`；`packages/session/src/lane.ts` `track`、`pid`；`packages/session/src/watch.ts` `deliver`（`cause` 参数）；`packages/session/src/ingress.ts` `redispatch`（展开原 `InputRecord`）；`packages/daemon/src/gateway.ts` `handOver`（展开原记录）、`sendCause`、`opaqueChain`；`packages/session/src/outbox.ts` `send`（`causeOf`）；`channel/mail/src/adapter.ts` `doSend`、`channel/mail/src/inbound.ts` `parseHopHeader`。
+- **测试**：标签 `#EX-5`；`packages/session/test/agent-messaging.test.ts` "agentInput: kind agent, principal agent:<agent>, evidence daemon, via = the sending session, one hop past its turn"、"a turn's chain is its highest-hop triggering input; context does not count; relayed flags are carried (never laundered)"、"a human input is the root of its own chain (hop 0, chain = its input id)"、"watch forwarding keeps the cause unchanged (no extra hop)"；`packages/daemon/test/agent-messaging.test.ts` "an agent-authored send carries its chain position out-of-band (SendOp.cause); host deliveries carry none"、"inbound.redispatch goes through the same checkpoint: a queued over-hop agent message stays context"（补投保留 cause）；`channel/mail/test/mail.test.ts` "agent-authored mail carries X-Agents-IO-Hop; a hop claim is read only from DKIM-signed mail"；`packages/session/test/routing.test.ts` "an owner DM: triggered by the owner, nothing watched, external or group"（来源里的 `cause`）。
+- **状态**：部分覆盖（话题换手保留 cause 没有单独的测试：`handOver` 展开原记录，与 `channelRef` 同一条路径）。
+- **注意**：链 id 对外是 `sha256` 截断的不透明 id，另一部署 `explain --chain` 走到这里就停（`basis: declared`）。
+
+### EX-6 `aio explain --chain` 从一条 agent 输入走回链的根
+
+- **承诺**：`aio explain --chain <inputId>`（宿主帧 `explain { chain: true }`）沿 `cause.from` 往回走：这条输入 → 产生它的 turn → 那一轮跳数最大的触发输入 → …，直到跳数为 0 的根；每一级列 inputId、hop、session 与地址 `<agent>/<sessionKey>`、主体、它触发的 turnId、`basis`、是否被截停（`loopGuard`）；`end` 为 `root`、`broken`（`basis: none`，或另一部署声明的 `declared`）或 `unknown`（记录过了保留期）。重启后可用。不认识的 id 答 `unknown_input`。
+- **实现**：`packages/daemon/src/gateway.ts` `explainChain`、`turnOfInput`、`turnInputs`；`packages/daemon/src/records.ts` `daemon_causes`（`putCause`、`causeOf`，保留 7 天，同 explain）；路由记录里的 `cause`（`packages/session/src/ingress.ts`，回流输入不进 lane 时由它找到）；`packages/daemon/src/cli.ts` `explain`（`--chain`）。
+- **测试**：标签 `#EX-6`；`packages/daemon/test/agent-messaging.test.ts` "explain by the operationId of a reply card: its turn and that turn's inputs; explain --chain walks a recovered input back to the root"、"a trip leaves a loop_guard notice in the receiving and the sending session, explain shows it (also after a restart), nothing goes to a channel"。
+- **状态**：部分覆盖（只测了两跳；按 chain id 列出整条链——提案 §4.8 的"往前走"——没有做，`daemon_causes` 已按 chain 存）。
 
 ---
 
@@ -611,6 +649,13 @@
 - **测试**：标签 `#CF-8`；`channel/lark-bot/test/requirements.test.ts` "lists every handler the adapter registers #CF-8"、"source scan: every key passed to dispatcher.register is declared #CF-8"。
 - **状态**：部分覆盖（权限 scope 一栏只是文档，没有测试能核对代码调用的 API 与 `TENANT_SCOPES` 一致）。
 
+### CF-9 agent 之间的联系默认拒绝
+
+- **承诺**：`Policy.contact({ from, to, op })`（op：`list` / `send` / `run` / `observe` / `control`）默认拒绝；`policy.agentContacts` 的条目（`from` / `to` 为 agent 名或 `*`，`ops` 缺省为全部）才放行。宿主 hello 的 `callouts` 列了 `contact` 时由宿主决定；宿主超时、出错、答复不合 schema 时退回本地答案（同 `resolve`，决定 9）。第一步没有任何东西调用它（`agents_list` / `agent_send` 等是第二步）。
+- **实现**：`packages/protocol/src/policy.ts` `contact`、`ContactArgs`；`packages/session/src/policy.ts` `contactAllowed`、`defaultPolicy.contact`、`withDefaults`；`packages/daemon/src/gateway.ts` 的 `policy.contact`；`packages/daemon/src/host.ts` `contactCallout`、`HOOKS`；协议 `ContactCallout`、`ContactCalloutAnswer`。
+- **测试**：标签 `#CF-9`；`packages/session/test/agent-messaging.test.ts` "denies by default; policy.agentContacts allows by agent name or *, per op"；`packages/daemon/test/agent-messaging.test.ts` "Policy.contact: denied without policy.agentContacts; a host listing the contact callout decides, a failing host falls back to the local answer"。
+- **状态**：有测试（钩子本身）。
+
 ---
 
 ## 12. 协议与一致性（PR、CN、HC）
@@ -744,7 +789,7 @@
 
 1. ~~**通道可以冒充别的通道与主人（ID-3）。**~~ 已修（channel-stamping，决定 13）：信封的 `channel/account`/回复路由按发出它的通道实例核对，不符拒收；一个通道 id 只属于一种适配器；证据按条目授予 ∩ caps 封顶。见 ID-3。
 2. ~~**排队中的输入在停止或重启时静默丢失（IN-1 / RS-6）。**~~ 已修（决定 13）：停止时拒掉并在原路由通知，崩溃遗留在启动时拒掉，遗留 turn 结算时拒掉它的输入，开轮失败在通道上可见。剩下 IN-1 不成立第 1–5 条（策略钩子抛错、live 委托溢出、被接管输入、开轮途中 detach、关闭后到达）。
-3. **`aio explain` 不能从副作用反查（EX-2，不成立）。** 只接受 inputId，返回路由记录；系统回复、宿主 `deliver`、`live_say` 连手工串的线索都没有。原则 4 与决定 4 都以它为"不拦截"的配套。
+3. ~~**`aio explain` 不能从副作用反查（EX-2，不成立）。**~~ 已修（agent-messaging）：按投递的 operationId 查到 turn 与输入，系统回复查到它回应的输入，宿主 `deliver` 查到宿主；`aio explain --chain` 跨 agent 走回根（EX-6）。剩 `live_say` 不留记录（EX-2 不成立第 1 条）。
 4. **重启丢 turn（RS-3 / RS-4，不成立于原则 5）。** Claude Code 的 turn 被打断；Codex stdio 的 turn 既不接管也不结束，挂到下一条输入才记 ambiguous（RS-5），没有新输入就一直显示运行中。三者都没有测试。
 5. ~~outbox 结算前崩溃会重复发送；停止时投递可能既不结算也不记录（DL-1、DL-2）。~~ 已修（决定 13）：发送前写进行中记录，重启后结算为 `unknown` 不重发；`stop()` 有界等待 outbox；单次尝试有超时。
 6. **多机器人退回仍会发生（DL-4，不成立）。** 机器人 b 停掉或启动失败后，`channelFor` 只看到 a，发给 b 的 `deliver` / `systemReply` / `live_join` 改写成 a 发出。决定 8 的本意是"不以别的机器人发出"。
@@ -759,7 +804,7 @@
 15. **A 组合并评审（2026-10-11）遗留**，按原则 4 记下，未修：
     - **启动时为每个会话折叠全量日志**（`settleLeftoverInputs` 调 `hub.snapshot`）：没有压缩时随日志线性增长；等日志压缩一起做。
     - **崩溃后同一输入两种结局（IN-1）**：digest flush 的 `input.admitted` 落盘后、`endFlush` 前崩溃，重启时 `settleLeftoverInputs` 拒掉该 id，watch 的 redo 又以同一 id 收下并消费（`watch.ts:450`、`:671`）。决定 14 已复现（`it.fails`，见 IN-1 不成立第 6 条）。
-    - **同进程兄弟机器人的回流认不出 self（DL-4b）**：lark-bot 的 `declared` 只来自本适配器实例的发送记录，兄弟机器人各有一份，所以兄弟的消息回来不带 `declared`，仍要靠 `selfAccounts`。agent-messaging 提案的出站索引解决它。
+    - ~~**同进程兄弟机器人的回流认不出 self（DL-4b）**~~：已由出站索引解决（ID-8）：按平台消息 id 认出，不看哪个账号收到、不需要 `selfAccounts`。
     - **热更新时启动失败的模块通道**按 `type` 记为已配置（模块 id 加载后才知道），同 id 的另一账号仍可能被退回使用（DL-4）。bridge 写了 `id` 时已按 id 记。
     - 已修：bridge 类通道收不到停止提示（停止时先拒入站、最后才中止通道）；拒绝提示不再带 `as`；`startChannel` 同步 emit 读到未赋值的 `entry`；邮件 `config.account` 覆盖条目账号；停止期间完成的 `live_join` 未关闭。
 16. **决定 14 新编号读代码时发现的（2026-10-11）**，未修：

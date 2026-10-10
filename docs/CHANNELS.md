@@ -31,7 +31,7 @@ harness 事件 ──▶ SessionLog（seq）──▶ Compositor（读全量，�
 每条输入在发给 harness 前，前面加一行发送者说明，后面是转换过的内容块：
 
 ```
-[agents-io input from=lark-bot:on_bc38… kind=human via=lark-bot:default:oc_7a1… ref=channel:lark-bot/om_5f2… channel=lark-bot conversationKind=dm conversationId=oc_7a1… senderName=张三 sentAt=1791… reply=card markdown=basic maxChars=4000 buttons=yes media=image,file,audio]
+[agents-io input from=lark-bot:on_bc38… kind=human evidence=platform_signed via=lark-bot:default:oc_7a1… ref=channel:lark-bot/om_5f2… channel=lark-bot conversationKind=dm conversationId=oc_7a1… senderName=张三 sentAt=1791… reply=card markdown=basic maxChars=4000 buttons=yes media=image,file,audio]
 列出当前目录下的文件，然后用一句话总结
 ```
 
@@ -39,7 +39,10 @@ harness 事件 ──▶ SessionLog（seq）──▶ Compositor（读全量，�
 
 - `from`：宿主策略认定的主体。认不出的发送者是 `unknown`。
 - `kind`：`human`、`agent`、`channel_event` 等。
-- `via`：来源路由，格式为 `通道:账号:会话[:线程]`。
+- `evidence`：通道能证明的（`platform_signed`、`dkim_pass`、`device_only`、`none`），或 `daemon`：本部署 agent 产生的输入（agent 通信）。
+- `via`：来源路由，格式为 `通道:账号:会话[:线程]`；本部署 agent 发来的是它的会话地址 `agent:<agent>:<sessionKey>`。
+- `self=true`：本部署自己发出的消息回流（只作上下文，永远不开轮）。
+- `hop`：agent 发来的输入在 agent 之间转了几跳（只在跳数已知时出现）；链 id、轮次 id 不给模型。被防循环截停、作为上下文交出的输入另有 `loopGuard=hops|pair`。
 - `declared`：只有发送账号可信、且通过适配器控制的元数据表明身份时才出现，消息正文里的自称不算。
 - `ref`：这条输入对应的渠道消息引用 `channel:<通道>/<消息 id>`（决定 13），与宿主入站队列的幂等键、`input.verify` / `aio verify` 的参数同一格式。网关按核对过的信封盖章（`InputRecord.channelRef`），适配器和客户端都不能设置；不截断，含空白或引号时整体加 JSON 引号。只有来自渠道消息的输入才有：本地（`aio input` / `attach`）、宿主 `input` 帧、任务运行、系统输入（汇总、话题摘要、live 委托）都没有。agent 调宿主命令做敏感写操作（确认、作答）时把它原样带上，宿主用 `aio verify <ref>` 自己核验作者与证据（HOSTS §4.1）。
 - 后面的 `key=value` 来自适配器提供的上下文（如邮件主题、发送者名字），网关自己的字段同名时以网关为准。
@@ -179,7 +182,8 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 - 自动回复、退信、群发（`Auto-Submitted`、`Precedence: bulk`、`MAILER-DAEMON`）直接丢弃。
 - 身份证据：只有发件域的 DKIM/DMARC 对齐通过才算 `dkim_pass`，否则是 `none`。
   - 可选的 `internalDelivery: { domains: [...] }`：发件域在列表里、且邮件完全没有 `Received` 和 `Authentication-Results` 头（即在邮件服务商内部投递，外部来信必然经过服务商 MX 而带上这两种头）时，证据记为 `platform_signed`。默认关闭；只在腾讯企业邮上核实过，换服务商前需重新确认。用于同一企业邮域内部互发、没有 DKIM 签名的情况。认不认这个人，由宿主策略决定。
-- 自己发出的邮件回流时只记录不触发，`declared` 只在 Message-ID 是我们发出的那封时才采信。
+- 自己发出的邮件回流时只记录不触发，`declared` 只在 Message-ID 是我们发出的那封时才采信。DKIM 通过的回声还由出站索引认出是哪一轮发的（`self`、带回流的 cause，见 §5 下"本部署的回流"）。
+- agent 写的邮件（带 `X-Agents-IO-Sender`）同时带 `X-Agents-IO-Hop: <跳数>; chain=<不透明 id>`。收到别的部署的邮件时，只有 DKIM 通过才把这个头读成跳数声明，网关又只在发件账号属于 `policy.agentAccounts` 时采信（`cause.basis: declared`），两套部署之间的来回因此也受跳数上限约束。
 
 ### agent 的输出怎么处理
 
@@ -226,6 +230,10 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 - **一个通道 id 只属于一种适配器，只有账号不同。** 内置 id `lark-bot`、`mail`、`local` 保留，bridge 与 module 不得使用；同 id 的 bridge 条目必须是同一程序（`command`/`args` 相同）；同 id 的 module 条目必须是同一模块与导出；嵌入方传入的适配器按类区分。冲突在配置校验（bridge 的 `id`）或启动时（module 的 id、已连上的 bridge 的 hello id）报配置错误；live apply 时进 `failed`；bridge 运行中 hello 换成冲突的 id 按 `bad_hello` 拒绝。
 - **证据按通道封顶。** 通道条目可写 `"evidence": ["platform_signed"]` 等（任何通道类型都可写）。适配器能提交的证据 = 条目的 `evidence` ∩ `caps.evidence`，外加 `none`；不写时 lark-bot、mail 与嵌入方适配器取 `caps.evidence`，**bridge 与 module 只有 `device_only`**（强证据必须显式授予）。超出上限的证据降为 `none`（消息照收，按外部来源处理，决定 3），`aio explain` 里 `claimedEvidence` 记原本声明的值，通道上 `evidenceCapped` 计数；`input.verify` 与宿主入站队列看到的是封顶后的值。授予了 caps 没有的证据会在启动（bridge：连上时）告警并忽略。`caps.declaresSender` 为 false 的通道，入站的 `sender.declared` 被丢弃。
 - 一致性套件（`packages/testkit` `runChannelConformance`）检查 `inbound.channel_id`、`inbound.account`、`inbound.evidence_in_caps`，适配器作者在本地就能发现问题。
+
+### 本部署的回流（出站索引）
+
+守护进程记下每次投递是哪个会话、哪一轮发的（`daemon_outbound`，保留 30 天）。入站信封带 `platform_signed` / `dkim_pass` 证据且 `(通道, 消息 id)` 命中索引时，它就是本部署自己的消息回来了：`self: true`、主体是发出它的 agent、cause 记回流（跳数 = 那一轮 + 1），不管是哪个账号收到的。所以同一守护进程里的两个飞书机器人不必再把对方写进 `selfAccounts`。适配器把长消息拆成多条时只报最后一条的 id，前面几条认不出，仍落到身份规则（`selfAccounts` 等）。飞书是否把机器人的群消息推给同群的其他机器人还没有 live 核实；不推则这条路径不出现。
 
 ### 私有/外部通道插件（`type: "module"`）
 
@@ -402,7 +410,7 @@ aio-dev watch remove team-digest
 
 `watch_add(source, mode, keywords?, mentions?, digest_every_minutes?, digest_max_items?, expires_in_minutes?, note?, id?)`、`watch_remove(id)`、`watch_list()`，规则：
 
-- 以 agent 身份创建：origin 是 `kind: 'agent'`、没有主体、`declared: "session:<sessionKey>"`，所以 `createdBy` 是 `session:<sessionKey>`。
+- 以 agent 身份创建：origin 是 `kind: 'agent'`、证据 `daemon`、`via` 为会话地址 `agent:<agent>:<sessionKey>`、没有主体、`declared: "session:<sessionKey>"`，所以 `createdBy` 是 `session:<sessionKey>`。
 - **目标永远是调用者自己的 session**，参数里不能给 target（给了就报错）。
 - 只能删自己建的监听（主人或别的 session 建的会被拒）。`watch_list` 列出投到自己 session 的所有监听，`mine` 标出自己建的。
 - 是否允许由 `Policy.watch` 决定，默认只放行 `policy.watchAllowlist` 里的来源；被拒时错误写明"这个来源不在主人的监听白名单里"。

@@ -1,6 +1,6 @@
 # agent 之间的通信：地址、身份、因果链与防循环（地基）
 
-> 状态：提案（2026-10-10），待 owner 拍板。
+> 状态：已采纳（决定 13）并实现（2026-10-11）。§11 待拍板 1–8 全部按推荐（默认跳数 8、同一对 15 分钟 10 轮）。承诺与测试见 `docs/INVARIANTS.md` ID-2、ID-7、ID-8、EX-2、EX-5、EX-6、IN-8、CF-9；与下文不同的地方见 §12。
 > 依据：`docs/ROADMAP.md` §1（原则 2、4、6、7）、§2（第 1、6 项为本提案采纳范围；第 2、3、4、5 项只说明怎样接上）、§4 "现在"第 2 项；`docs/design/locus/DECISIONS.md` 决定 3、4、5、9、11、12；`docs/POSITIONING.md` §2、§4；`docs/HOSTS.md` §3。代码以当前 `main`（c52bad5）为准，下文的行号都已对照代码核实。
 
 ## 1. 一句话
@@ -336,3 +336,29 @@ e2e（`aio e2e`，`packages/daemon/src/e2e.ts` 加场景 `agent-loop-guard`）�
 6. **新证据档的名字与位置**：`daemon`，排在 `platform_signed` 之上；或者不加新档，用 `adapter: "agent"` + `platform_signed` 表达（不推荐，见 §6）。
 7. **兄弟机器人自动 `self`**（§4.3.3、§10）：推荐采纳；这会关掉"同部署机器人在群里互相 @ 开 turn"的可能，以后要时再显式开启。
 8. **`contact` 的本地默认**：推荐未配置即全部拒绝；另一种是"同部署的 agent 互相可见"，对单人自用更省事，但与"工具默认关、按配置开启"的口径不一致。
+
+## 12. 实现与偏差（2026-10-11）
+
+按 §8 的文件表实现；以下与正文不同，按原则自决（决定 13 的规则）：
+
+| 正文 | 实现 | 依据 |
+|---|---|---|
+| `Evidence` 加 `daemon`（§4.2、§8） | 新类型 `OriginEvidence = Evidence ∪ daemon`，只用在 `Origin.evidence` 与 `RouteExplanation.evidence`；信封、`ChannelCaps.evidence`、通道条目的 `evidence` 授予仍是 `Evidence` | 原则 4：`daemon` 是"守护进程自己产生的"，适配器从 schema 上就不能声明它，不必靠封顶（ID-3）兜底 |
+| 回流命中出站索引即 `self`（§4.2、§4.3.3） | 另要求信封证据是 `platform_signed` / `dkim_pass` | 决定 3、ID-4：邮件的 Message-ID 收件人都看得到，伪造一封同 id 的信不能借到本部署 agent 的主体与链 |
+| `SendOp.as = agent:<agent>`（§4.2） | 保持 DL-4b 现行的 `session:<sessionKey>`，没有改 | 守护进程已经设置 `as`（A 组），且 `agentAccounts` 声明本部署 `session:<key>` 即认作 self 的规则依赖它；出站索引让本机找回不再依赖 `as` 的格式。邮件头带出 sessionKey 的问题仍在，留作后续（改格式要同时迁移飞书适配器的发送记录与 `isSelfDeclared`） |
+| 跨部署的跳数头 `X-Agents-IO-Hop`（§4.3.4） | 适配器只在 DKIM 通过时把它读成 `InboundEnvelope.sender.cause`（任何发件人，不只本部署的回声）；网关只在 `Identity.trustedAgent`（`agentAccounts`）、证据为 `platform_signed` / `dkim_pass`、通道 `caps.declaresSender` 时采信为 `basis: declared`。链 id 对外是 `sha256` 截断的 16 位十六进制 | 与 `declared` 同一信任规则；对外不暴露本部署的 inputId（原则 2、7） |
+| 成对计数"由这个 peer 的 agent 输入触发的 turn 数"（§4.4.2） | 每条到达 `Lane.input`、本会开轮或并入轮次的 agent 输入计一次（在入口计，不在开轮时计）；任何非 agent 输入到达即清零 | 入口计数是保守的一侧：排队中的一串输入在开轮之前就被拦住，不会一次放过 `maxTurns` 条以上 |
+| `policy.loopGuard.announce`（§4.4.3、待拍板 3） | 没有做 | 待拍板 3 推荐默认不说；没有使用者的开关不留（原则 4，决定 13 删 `lease` 同理） |
+| explain 的 `loopGuard`（§4.4.3） | 截停记在 cause 索引（`daemon_causes`）里，`explain` 时并进路由记录 | 截停发生在投递途中，路由记录可能稍后才（重）写（`inbound.redispatch`） |
+| `aio explain --chain` 按 chain id 列出整条链（§4.8 "往前走"） | 没有做；`daemon_causes` 已按 chain 存，查询留到有使用者时 | 原则 4：先兑现"从副作用追溯到根"的那一半 |
+| 宿主帧 `explain` 加 `chain: true`（§4.8） | 做了；另外 `explain` 的 `inputId` 不是输入时按投递的 operationId 查（INVARIANTS EX-2），结果是 `RouteExplanation`、`EffectExplanation`、`ChainExplanation` 三者之一；`features` 列 `explain.chain` | 决定 13 的 EX-2 一行；不另开帧，命令行 `aio explain <id>` 一个入口 |
+| `contact` 回调超时（§4.6） | 固定 2000 ms，没有配置项 | 没有调用方之前不加配置（原则 4） |
+| `agentOrigin`（watch 的来源，§8） | `via` 改为 `agent:<agent>:<sessionKey>`、证据 `daemon`、`adapter: "agent"`；主体仍为空，`createdBy` 仍是 `session:<key>` | §10 第 3 条：已有监听不受影响 |
+| `aio e2e` 场景 `agent-loop-guard`（§9） | 没有加；同样的断言写成 core 测试（假 harness）：跳数与成对截停、两边日志的 `loop_guard`、`explain --chain`、没有出站 | 第一步里本部署 agent 产生输入的唯一来路是回流，而回流是 `self`、永远不开轮（§4.3.3 自己写明"这一步不做"），场景的"第 1–3 跳开轮"在第一步不可能发生；`aio e2e` 跑真实 harness，属 live 一层。真实飞书两个机器人的手动步骤写进了 `docs/E2E.md` Tier 2 |
+
+另外做了正文没写的两件：
+
+- **前言**：两个 harness 的发送者说明都加了 `evidence=`，Codex 补上 `self=true`，`preface: false` 时仍保留 watch 与 `loopGuard` 标记（INVARIANTS ID-2 原来的两条"不成立"）。
+- **客户端不能贴 `loopGuard` 标签**：适配器的 `context` 与本地 / 宿主客户端的 `channelContext` 里的 `loopGuard` 都被去掉，只有 lane 截停时会写。
+
+测试（§9 各条）：1、2、3、4、5、6（watch 转投、`inbound.redispatch`；话题换手只靠代码路径，同 `channelRef`）、7、8、9（通道规则、watch trigger、`inbound.redispatch`；宿主 `input` 帧与本地输入是 system / human，只清零成对计数）、10、11、12（cause 与 explain 跨重启；成对计数清零未单独测）、13（两跳）、14（`SendOp.cause`；`as` 见上表）、16 都有 core 测试，带 `#ID-7`、`#ID-8`、`#EX-5`、`#EX-6`、`#IN-8`、`#CF-9`。15（`announce`）没有做。

@@ -156,6 +156,7 @@ attach 里直接输入文字就是 queue 输入；`/steer <text>`、`/interrupt 
 - [ ] 审批：把 `policy` 换成 restricted + human（可参考 e2e 场景 f 的写法在代码里覆盖），卡片出现"Allow / Deny"按钮；别人点无效，主人点有效，卡片按钮消失。
 - [ ] `/interrupt` 后卡片 finalize 为 `Interrupted`。
 - [ ] Ctrl-C 停 serve 再启动：之前的 session 用 `session.bound` 里的原生 id 续接（claude `--resume` / codex `thread/resume`）。
+- [ ] 两个机器人（同一守护进程，决定 8；`policy.selfAccounts` 里**不写**对方）进同一个群，主人 @ 机器人 a 说一句：先核实飞书是否把 a 的回复卡片推给 b（b 的 `lark-bot:b:<群>` 会话日志里有没有那条 `input.admitted`）。推的话，那条输入应是 `self`、主体 `agent:<agent>`、`aio explain <它的 inputId>` 里 `cause.basis: "recovered"`、`hop: 1`；`aio explain --chain <它>` 走回主人那条消息（`end: "root"`）；b 不开轮（agent-messaging，INVARIANTS ID-8）。不推的话，在 ROADMAP §4"被外部条件挡住"记下结论。
 
 ### 1.4 手动：每会话 launch（决定 7，多租户）
 
