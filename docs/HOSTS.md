@@ -109,7 +109,7 @@
 
 ## 4. 宿主协议
 
-本地 unix socket（目录 0700、socket 0600），JSONL，请求带 `id`、同 `id` 的 `result` 应答。宿主连接先 `host.hello { token, name, consumer?, callouts? }`；token 由守护进程每次启动时重新生成，写入 socket 旁的 0600 文件 `<socket>.token`；运维可用 `aio serve --token-file <path>` 或配置 `host.tokenFile` 指定一个跨重启不变的令牌文件（存在则读、不存在则生成，见 `docs/design/host-token-file`）。带 token 的连接数量不限（`aio run`、`aio tail` 等命令都是这样的连接）；`hello` 里带 `consumer`（推送消费）或开启任一回调钩子（`callouts`）的连接才是**宿主**，同一时刻至多一个。宿主在线时，`onHostDown: "suspend"` 的宿主表生效，回调发给它，发起连接已断开的 run 的 `run.ended` 也发给它。只拉取的宿主没有这样的常驻连接：可以在 `hello` 里带 `lease: { ttlMs }` 声明在线（该名字的任一连接每发一帧就续期，到期视为宿主下线，`onHostDown` 据此生效），或者让宿主表使用 `onHostDown: "keep"`（可配 `expiresAt` 当租约）。已有宿主时再来一个带角色的 `hello` 默认得到 `host_connected`；带 `takeover: true`（且 token 正确）则顶替旧连接：守护进程关闭旧连接、记日志，旧连接未确认的推送改推给新连接，结果里带 `replaced: { name }`（宿主断线重连而旧连接半开时用）。控制台 `/ws` 有心跳（`console.heartbeat`，默认每 30 s ping，10 s 内无应答即断开），半开的远程宿主连接会被及时清掉（见 `docs/design/host-liveness`）。宿主连接也可以发送所有客户端帧（`subscribe`、`input`、`resolve` 等，见 `packages/protocol/src/client.ts`），`origin` 标记为 `kind: "system"`。
+本地 unix socket（目录 0700、socket 0600），JSONL，请求带 `id`、同 `id` 的 `result` 应答。宿主连接先 `host.hello { token, name, consumer?, callouts? }`；token 由守护进程每次启动时重新生成，写入 socket 旁的 0600 文件 `<socket>.token`；运维可用 `aio serve --token-file <path>` 或配置 `host.tokenFile` 指定一个跨重启不变的令牌文件（存在则读、不存在则生成，见 `docs/design/host-token-file`）。带 token 的连接数量不限（`aio run`、`aio tail` 等命令都是这样的连接）；`hello` 里带 `consumer`（推送消费）或开启任一回调钩子（`callouts`）的连接才是**宿主**，同一时刻至多一个。宿主在线时，`onHostDown: "suspend"` 的宿主表生效，回调发给它，发起连接已断开的 run 的 `run.ended` 也发给它。只拉取的宿主（`aio tail` / `inbound.read`）没有这样的常驻连接，守护进程始终视它为不在线：它的表要用 `onHostDown: "keep"`，并定期重推（`bindings.put`）、每次给一个新的 `expiresAt` 当租约（例如每隔 T 重推一次，`expiresAt = now + 2T`），宿主停止重推后表到点挂起；否则默认的 `suspend` 表一直不生效（§6）。协议里曾有的 `host.hello.lease` 守护进程从未实现，已删除（决定 13）；旧宿主仍带这个字段不会被拒，只是被忽略。已有宿主时再来一个带角色的 `hello` 默认得到 `host_connected`；带 `takeover: true`（且 token 正确）则顶替旧连接：守护进程关闭旧连接、记日志，旧连接未确认的推送改推给新连接，结果里带 `replaced: { name }`（宿主断线重连而旧连接半开时用）。控制台 `/ws` 有心跳（`console.heartbeat`，默认每 30 s ping，10 s 内无应答即断开），半开的远程宿主连接会被及时清掉（见 `docs/design/host-liveness`）。宿主连接也可以发送所有客户端帧（`subscribe`、`input`、`resolve` 等，见 `packages/protocol/src/client.ts`），`origin` 标记为 `kind: "system"`。
 
 | 帧 | 方向 | 用途 |
 |---|---|---|
@@ -158,7 +158,7 @@
 |---|---|
 | start-executor 适配器（0003） | Go 薄客户端或直接 `aio run`：`StartRequest` → `aio run --agent executor --run-id <run 引用> --cwd <workdir> --env XWO_CREDENTIAL_FILE=…`，退出码即 `exit_code` |
 | to-human 适配器（0003 / 0006） | `aio send`：按 0010 的绑定把成员映射成路由；提问、审批渲染为带按钮的卡片，按钮 id 以 `xwo:` 开头 |
-| 接收程序（0008）与经渠道回答（0010） | 长期运行的 `aio tail --consumer xwo`：每条记录变成 `x input add` 或 `x answer`（带渠道凭证和渠道引用），成功后 ack |
+| 接收程序（0008）与经渠道回答（0010） | 长期运行的 `aio tail --consumer xwo`：每条记录变成 `x input add` 或 `x answer`（带渠道凭证和渠道引用），成功后 ack。`aio tail` 只拉取，不让连接成为宿主，所以 x-work-os 推的表必须用 `onHostDown: "keep"`，并定期重推、每次带新的 `expiresAt`（如每 5 分钟重推，`expiresAt = now + 10 min`）；不这样做，表一直按 `host_down` 挂起，规则不生效（§4）。改用推送消费（`host.hello { consumer }`）则可用默认的 `suspend` |
 | 身份 | x-work-os 把 0010 的渠道身份绑定转成身份映射，随 `bindings.put` 推送 |
 | 讨论会话（0005 F） | 一条 `dispatch` 规则把主人的私聊交给交互 agent；确认时 agent 调 x-work-os 命令，附来源标记；x-work-os 可用 `input.verify` 核验确认者 |
 

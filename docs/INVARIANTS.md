@@ -178,12 +178,12 @@
 
 ### HQ-5 宿主推送的表带版本，宿主下线时按 onHostDown 生效
 
-- **承诺**：`bindings.put` 整表原子替换，同版本同内容是空操作；宿主推送的表默认 `suspend`，宿主下线期间不生效；重启后保留最后一张表，挂起到宿主重连（`keep` 除外）；只拉取的宿主可用 `hello.lease` 声明在线（HOSTS.md §4）。
+- **承诺**：`bindings.put` 整表原子替换，同版本同内容是空操作；宿主推送的表默认 `suspend`，宿主下线期间不生效；重启后保留最后一张表，挂起到宿主重连（`keep` 除外）；只拉取的宿主（`aio tail`）始终视为不在线，它的表用 `onHostDown: "keep"` 加定期重推、每次刷新 `expiresAt` 当租约（HOSTS.md §4、§6；`host.hello.lease` 已删除，决定 13）。
 - **实现**：`router.ts:269-279`、`:312-318`、`:237-247`。
-- **测试**：`router.test.ts` "atomic replace with version; the same version again is a no-op"、"suspends while the host is down (default) or keeps routing with onHostDown: keep"、"persists: a restart keeps the last table, suspended until the host reconnects (unless keep)"；`host.test.ts` "installs the host table (routing follows it), persists it, and suspends it while the host is away"、"onHostDown keep stays active without a host"。
+- **测试**：`router.test.ts` "atomic replace with version; the same version again is a no-op"、"suspends while the host is down (default) or keeps routing with onHostDown: keep"、"persists: a restart keeps the last table, suspended until the host reconnects (unless keep)"、"expires at expiresAt"、"pull-only host lease: onHostDown keep + a periodic re-push with a fresh expiresAt routes without a host connection, and lapses when the re-push stops"；`packages/protocol/test/admin-topics.test.ts` "host.hello has no presence lease (decision 13): pull-only hosts use onHostDown keep + expiresAt"；`host.test.ts` "installs the host table (routing follows it), persists it, and suspends it while the host is away"、"onHostDown keep stays active without a host"。
 - **状态**：部分覆盖。
 - **不成立**：
-  1. **`lease` 没有实现。** 协议里有（`packages/protocol/src/host.ts:222-230`、`:440-441`），HOSTS.md:111 写明了行为，但 `HostService.hello`（`packages/daemon/src/host.ts:153-200`）不读 `lease`，`packages/daemon/src` 里没有任何租约代码。只拉取的宿主（`aio tail`）推的默认 `suspend` 表永远不生效。
+  1. ~~**`lease` 没有实现。**~~ 已删（决定 13）：`host.hello.lease`、`HostHelloResult.lease`、`AdminHostState.leaseExpiresAt` 从协议与 schema 删除；租约的正式做法是 `onHostDown: "keep"` + 重推刷新 `expiresAt`。旧宿主仍带 `lease` 不会被拒（对象 schema 允许多余字段），只是被忽略。
   2. 版本不比较先后：任何版本都替换当前表（`router.ts:270-275`），迟到的旧推送会覆盖新表。文档只说"带版本号"，没说单调；若宿主依赖单调，这里不成立。
 
 ### HQ-6 同一时刻至多一个宿主；接管要 token；/ws 有心跳
@@ -572,7 +572,7 @@
 4. **重启丢 turn（RS-3 / RS-4，不成立于原则 5）。** Claude Code 的 turn 被打断；Codex stdio 的 turn 既不接管也不结束，挂到下一条输入才记 ambiguous（RS-5），没有新输入就一直显示运行中。三者都没有测试。
 5. ~~outbox 结算前崩溃会重复发送；停止时投递可能既不结算也不记录（DL-1、DL-2）。~~ 已修（决定 13）：发送前写进行中记录，重启后结算为 `unknown` 不重发；`stop()` 有界等待 outbox；单次尝试有超时。
 6. **多机器人退回仍会发生（DL-4，不成立）。** 机器人 b 停掉或启动失败后，`channelFor` 只看到 a，发给 b 的 `deliver` / `systemReply` / `live_join` 改写成 a 发出。决定 8 的本意是"不以别的机器人发出"。
-7. **宿主 `lease` 未实现（HQ-5，不成立）。** HOSTS.md:111 与协议都有，守护进程不读。只拉取的宿主推的默认 `suspend` 表永远不生效。
+7. ~~**宿主 `lease` 未实现（HQ-5，不成立）。**~~ 已删（决定 13）：只拉取的宿主用 `onHostDown: "keep"` + 定期重推刷新 `expiresAt`，HOSTS §4、§6 写明。
 8. **宿主 outbound 在宿主离线时退回本地策略（DL-5，不成立于"fail closed"）；`live_join` 目标不过 outbound 检查。**
 9. **并发 `live_join` 停掉已有 live 并泄漏端点（LN-3，不成立）。** 需要在 `gateway.ts:1168` 检查后同步占位。
 10. **入站去重只在内存，部分失败重试会重复进会话（IN-5，不成立）。**

@@ -603,6 +603,31 @@
                     },
                     "reason": {
                       "type": "string"
+                    },
+                    "replyRoute": {
+                      "type": "object",
+                      "required": [
+                        "channel",
+                        "account",
+                        "conversationId"
+                      ],
+                      "properties": {
+                        "channel": {
+                          "type": "string"
+                        },
+                        "account": {
+                          "type": "string"
+                        },
+                        "conversationId": {
+                          "type": "string"
+                        },
+                        "threadId": {
+                          "type": "string"
+                        },
+                        "replyToMessageId": {
+                          "type": "string"
+                        }
+                      }
                     }
                   }
                 },
@@ -2007,6 +2032,162 @@
                           "type": "string"
                         }
                       ]
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "liveId",
+                    "title",
+                    "route",
+                    "controlRoute"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "live.started",
+                      "type": "string"
+                    },
+                    "liveId": {
+                      "type": "string"
+                    },
+                    "title": {
+                      "type": "string"
+                    },
+                    "route": {
+                      "type": "object",
+                      "required": [
+                        "channel",
+                        "account",
+                        "conversationId"
+                      ],
+                      "properties": {
+                        "channel": {
+                          "type": "string"
+                        },
+                        "account": {
+                          "type": "string"
+                        },
+                        "conversationId": {
+                          "type": "string"
+                        },
+                        "threadId": {
+                          "type": "string"
+                        },
+                        "replyToMessageId": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "controlRoute": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "required": [
+                            "channel",
+                            "account",
+                            "conversationId"
+                          ],
+                          "properties": {
+                            "channel": {
+                              "type": "string"
+                            },
+                            "account": {
+                              "type": "string"
+                            },
+                            "conversationId": {
+                              "type": "string"
+                            },
+                            "threadId": {
+                              "type": "string"
+                            },
+                            "replyToMessageId": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "liveId",
+                    "role",
+                    "text"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "live.transcript",
+                      "type": "string"
+                    },
+                    "liveId": {
+                      "type": "string"
+                    },
+                    "role": {
+                      "anyOf": [
+                        {
+                          "const": "user",
+                          "type": "string"
+                        },
+                        {
+                          "const": "assistant",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "text": {
+                      "type": "string"
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "liveId",
+                    "inputId",
+                    "text"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "live.handoff",
+                      "type": "string"
+                    },
+                    "liveId": {
+                      "type": "string"
+                    },
+                    "inputId": {
+                      "type": "string"
+                    },
+                    "text": {
+                      "type": "string"
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "t",
+                    "liveId",
+                    "reason"
+                  ],
+                  "properties": {
+                    "t": {
+                      "const": "live.ended",
+                      "type": "string"
+                    },
+                    "liveId": {
+                      "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
                     }
                   }
                 },

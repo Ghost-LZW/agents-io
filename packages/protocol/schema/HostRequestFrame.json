@@ -45,17 +45,6 @@
             }
           ]
         },
-        "lease": {
-          "type": "object",
-          "required": [
-            "ttlMs"
-          ],
-          "properties": {
-            "ttlMs": {
-              "type": "number"
-            }
-          }
-        },
         "takeover": {
           "type": "boolean"
         }

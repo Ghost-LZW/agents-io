@@ -290,6 +290,24 @@ describe('host tables', () => {
     expect(r.hostTable()).toMatchObject({ active: false, suspended: 'expired' });
   });
 
+  it('pull-only host lease: onHostDown keep + a periodic re-push with a fresh expiresAt routes without a host connection, and lapses when the re-push stops', async () => {
+    let now = 1000;
+    const r = router({ now: () => now }); // never connected: an `aio tail` consumer is not the host
+    expect(r.putHostTable(hostRule('1', { onHostDown: 'keep', expiresAt: now + 2000 })).changed).toBe(true);
+    expect((await route(r, env)).deliveries).toHaveLength(1);
+    now = 2000; // re-push the same version with a fresh lease: a real change, not a no-op
+    expect(r.putHostTable(hostRule('1', { onHostDown: 'keep', expiresAt: now + 2000 })).changed).toBe(true);
+    now = 3500;
+    expect((await route(r, env)).deliveries).toHaveLength(1);
+    now = 4000; // the host stopped re-pushing
+    expect((await route(r, env)).deliveries).toHaveLength(0);
+    expect(r.hostTable()).toMatchObject({ active: false, suspended: 'expired' });
+    // without keep the same pull-only host's table never routes
+    const s = router({ now: () => now });
+    s.putHostTable(hostRule('2', { expiresAt: now + 2000 }));
+    expect(s.hostTable()).toMatchObject({ active: false, suspended: 'host_down' });
+  });
+
   it('suspends while the host is down (default) or keeps routing with onHostDown: keep', async () => {
     const r = router({ hostConnected: true });
     r.putHostTable(hostRule('1'));

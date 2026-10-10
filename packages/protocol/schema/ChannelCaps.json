@@ -89,6 +89,10 @@
               {
                 "const": "audio",
                 "type": "string"
+              },
+              {
+                "const": "video",
+                "type": "string"
               }
             ]
           }
@@ -107,6 +111,10 @@
               },
               {
                 "const": "audio",
+                "type": "string"
+              },
+              {
+                "const": "video",
                 "type": "string"
               }
             ]

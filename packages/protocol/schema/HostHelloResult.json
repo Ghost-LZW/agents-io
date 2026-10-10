@@ -71,21 +71,6 @@
         }
       }
     },
-    "lease": {
-      "type": "object",
-      "required": [
-        "ttlMs",
-        "expiresAt"
-      ],
-      "properties": {
-        "ttlMs": {
-          "type": "number"
-        },
-        "expiresAt": {
-          "type": "number"
-        }
-      }
-    },
     "replaced": {
       "type": "object",
       "required": [

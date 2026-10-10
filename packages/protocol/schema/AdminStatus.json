@@ -60,9 +60,6 @@
         "callouts": {
           "type": "boolean"
         },
-        "leaseExpiresAt": {
-          "type": "number"
-        },
         "table": {
           "type": "object",
           "required": [
@@ -130,6 +127,12 @@
           },
           "error": {
             "type": "string"
+          },
+          "rejected": {
+            "type": "number"
+          },
+          "evidenceCapped": {
+            "type": "number"
           }
         }
       }
