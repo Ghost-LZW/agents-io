@@ -111,3 +111,23 @@
 - **agent 之间的通信**：对话方（消息）与调用方（任务）两种形态都做，另有发现、观察与控制、因果链与防循环（`docs/ROADMAP.md` §2）。**x-work-os 是协调的真相来源，agents-io 只负责 IO**（owner）：不记任务状态、分工、验收。
 - **宿主的两个面**（owner 认可，2026-10-10）：宿主的业务交互走 agent 的工作区（环境面），agents-io 只承载宿主对 IO 的控制（控制面）。现有宿主协议按此复查，能改成 agent 在工作区里直接调宿主命令的，收窄。见 `docs/ROADMAP.md` §1 第 7 条。
 - **代为审批**（owner）：agent 可以代另一个 agent 的请求作答，作为新的 Resolver 种类提供；与 `onBehalfOf` 一样须显式开启，日志记 `by.via`。
+
+## 决定 13：按原则自决的一批事项
+
+日期：2026-10-10。owner 指示：能由 `docs/ROADMAP.md` §1 原则推出的细节由维护者（agent）自行决定并在此记录依据；只有改原则、原则冲突、只有 owner 能做的事、仓库外不可逆的动作才上报。依据见 `docs/INVARIANTS.md`、`docs/design/host-surface-review/`、`docs/design/agent-messaging/`。
+
+| 事项 | 决定 | 依据 |
+|---|---|---|
+| 通道冒充（INVARIANTS ID-3） | 采纳 `docs/design/channel-stamping/` 推荐方案（C 校验拒收、F4 一个 id 一种适配器、E3 证据 = 配置 ∩ caps） | 原则 4：`Origin` "客户端不能设置"的承诺必须成立 |
+| 排队输入在停止 / 重启时丢失（IN-1、RS-6） | 停止时把排队与悬挂轮次的输入明确记 `input.rejected` 并通知渠道；重放留给 claude-persistence | 原则 1、§3 第一条不变量 |
+| outbox 崩溃后重发 | 发送前落"进行中"记录；重启后遇到即结算为 `unknown`，不自动重发 | 原则 1、4 |
+| 多机器人时停掉的账号被改写为另一账号发出 | 拒绝（`unknown_channel`），不退回 | 决定 8 |
+| `SendOp.as` 未接线；`live_join` 并发泄漏端点 | 接线；并发 `live_join` 第二个拒绝 | 原则 4（POSITIONING §2 身份表明）；决定 11"同时至多一个 live" |
+| `aio explain` 不能从副作用反查（EX-2） | 增加按 operationId / 事件反查到轮次与输入；系统回复、`deliver`、`live_say` 记痕 | 原则 4 |
+| `host.hello.lease` | 删除；HOSTS §6 改为 `onHostDown: "keep"` + 定期刷新 `expiresAt` | 原则 4（未实现的承诺不留） |
+| `AGENTS_IO_TURN_PROVENANCE` | 删除，保留 `AGENTS_IO_RUN_ID` | 原则 2、7（值恒定，无信息） |
+| `resolve` / `outbound` 回调 | 冻结，不再扩展 | 原则 6、7（无使用者） |
+| 来源行加 `ref=channel:<通道>/<消息 id>` | 加；决定 4 的"写命令来源标记"改为宿主经 `aio verify` 核验引用 | 原则 2、7 |
+| 输出工具默认开启（`config.ts:727`） | 改为默认关闭，按 agent 配置开启；dev-gateway 配置同步 | 原则 2 |
+| `onBehalfOf` 与 agent 代批 | 共用一个显式开关，默认关 | 决定 12 |
+| agent 通信地基（agent-messaging 提案 §待拍板 1–8） | 全部按提案推荐；默认跳数 8、同一对 15 分钟 10 轮，属可调参数 | 原则 1、4、6；决定 4/5/12 |
