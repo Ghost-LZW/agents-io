@@ -251,6 +251,22 @@ describe('loop guard at the lane', () => {
     expect(g.check(i)).toBeUndefined();
   });
 
+  it('only a person writing here lifts a pair stop: a system digest, a host input or a stranger does not; an identified person does #IN-8', () => {
+    const g = new LoopGuard({ pair: { maxTurns: 1 } });
+    const i = agentIn(1);
+    expect(g.check(i)).toBeUndefined();
+    expect(g.check(i)).toMatchObject({ tripped: 'pair' });
+    const digest: InputRecord = { ...input('3 new messages'), origin: { kind: 'system', principal: null, evidence: 'none', via: 'watch:w1', adapter: 'watch' } };
+    const host: InputRecord = { ...input('from the host'), origin: { kind: 'system', principal: null, evidence: 'device_only', via: 'host:xwo', adapter: 'host' } };
+    const stranger = input('hello', { principal: null });
+    for (const x of [digest, host, stranger]) {
+      expect(g.check(x)).toBeUndefined();
+      expect(g.check(i)).toMatchObject({ tripped: 'pair' });
+    }
+    expect(g.check(input('carry on', { principal: 'fake:bob', labels: [] }))).toBeUndefined();
+    expect(g.check(i)).toBeUndefined();
+  });
+
   it('every entry reaches the checkpoint: a channel dispatch and a watch trigger are stopped alike #IN-8', async () => {
     const w = world({ agentAccounts: ['fake:peerbot'], extra: BOTS_DISPATCH });
     const claim = (id: string) => fakeEnvelope({ id, sender: { channelUserId: 'peerbot', isBot: true, evidence: 'platform_signed', cause: { hop: 4 } }, text: 'again' });

@@ -241,6 +241,12 @@ export class Lane {
   private live: LiveInfo | undefined;
   /** Delegations (live.handoff) waiting for the turn the harness starts for them. */
   private handoffs = new Map<string, InputRecord>();
+  /**
+   * Delegations the loop guard stopped (bounded): recorded as context, but the harness has
+   * them already, so a turn that carries one is interrupted and its consumed reports are
+   * not this turn's inputs.
+   */
+  private stoppedHandoffs = new Set<string>();
   private readonly guard: LoopGuard | undefined;
   /** The chain of the last turn: an adopted turn (no inputs in memory) keeps it. */
   private lastCause: TurnCause | undefined;
@@ -728,6 +734,21 @@ export class Lane {
     return { ok: true };
   }
 
+  /**
+   * A turn the harness runs carries delegations the loop guard stopped: interrupt it (the
+   * stop is in the log already as a `loop_guard` notice). Nothing is said on the live or
+   * any channel: a breaker that talks may feed the agent on the other side; the voice side
+   * learns the delegation ended from the interrupted turn.
+   */
+  private async interruptStopped(turnId: string, inputIds: string[]): Promise<void> {
+    this.emit({ turnId, level: 'detail', visibility: 'operators', body: { t: 'notice', code: 'loop_guard', message: `loop guard: turn ${turnId} carries stopped delegation ${inputIds.join(', ')}; interrupted` } });
+    try {
+      await this.session?.interrupt(turnId);
+    } catch {
+      // the harness reports how the turn ended
+    }
+  }
+
   private async interruptTurn(t: ActiveTurn): Promise<void> {
     if (t.starting) {
       t.interruptRequested = true;
@@ -1057,6 +1078,21 @@ export class Lane {
           replyRoute: live?.controlRoute ?? null,
           channelContext: { live: true, liveId: b.liveId, conversationKind: 'meeting', ...(live ? { liveTitle: live.title } : {}) },
         };
+        // The same loop checkpoint as `input` (IN-8). The harness has started (or merged) the
+        // delegation already: a stopped one is recorded as context like any stopped input, and
+        // the turn that carries it is interrupted (here, or when the harness starts it).
+        const trip = this.guard?.check(record, { delegation: true });
+        if (trip) {
+          this.stoppedHandoffs.add(b.inputId);
+          for (const k of this.stoppedHandoffs) {
+            if (this.stoppedHandoffs.size <= 64) break;
+            this.stoppedHandoffs.delete(k);
+          }
+          this.guarded(record, trip);
+          this.emitHarness(e, gen);
+          if (t) await this.interruptStopped(t.turnId, [b.inputId]);
+          return;
+        }
         this.emit({ body: { t: 'input.admitted', inputId: b.inputId, disposition: t ? 'steer' : 'new_turn', input: record } });
         this.emitHarness(e, gen);
         if (t) t.inputs.push(record);
@@ -1097,6 +1133,8 @@ export class Lane {
           this.track(b.turnId, inputs);
           this.emitHarness(e, gen);
           this.refreshState();
+          const stopped = b.inputIds.filter((id) => this.stoppedHandoffs.has(id));
+          if (stopped.length) await this.interruptStopped(b.turnId, stopped);
           return;
         }
         const ours = t && t.turnId === b.turnId;
@@ -1138,6 +1176,7 @@ export class Lane {
         if (t && t.turnId === b.turnId) {
           for (const id of b.inputIds) {
             if (t.context.some((c) => c.inputId === id)) continue; // context: consumed or not, nothing to reconcile
+            if (this.stoppedHandoffs.has(id)) continue; // a stopped delegation is context too
             if (t.inputs.some((i) => i.inputId === id) || t.adopted?.has(id)) t.consumed.add(id);
             else t.foreignConsumed = true;
           }

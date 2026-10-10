@@ -347,7 +347,7 @@ e2e（`aio e2e`，`packages/daemon/src/e2e.ts` 加场景 `agent-loop-guard`）�
 | 回流命中出站索引即 `self`（§4.2、§4.3.3） | 另要求信封证据是 `platform_signed` / `dkim_pass` | 决定 3、ID-4：邮件的 Message-ID 收件人都看得到，伪造一封同 id 的信不能借到本部署 agent 的主体与链 |
 | `SendOp.as = agent:<agent>`（§4.2） | 保持 DL-4b 现行的 `session:<sessionKey>`，没有改 | 守护进程已经设置 `as`（A 组），且 `agentAccounts` 声明本部署 `session:<key>` 即认作 self 的规则依赖它；出站索引让本机找回不再依赖 `as` 的格式。邮件头带出 sessionKey 的问题仍在，留作后续（改格式要同时迁移飞书适配器的发送记录与 `isSelfDeclared`） |
 | 跨部署的跳数头 `X-Agents-IO-Hop`（§4.3.4） | 适配器只在 DKIM 通过时把它读成 `InboundEnvelope.sender.cause`（任何发件人，不只本部署的回声）；网关只在 `Identity.trustedAgent`（`agentAccounts`）、证据为 `platform_signed` / `dkim_pass`、通道 `caps.declaresSender` 时采信为 `basis: declared`。链 id 对外是 `sha256` 截断的 16 位十六进制 | 与 `declared` 同一信任规则；对外不暴露本部署的 inputId（原则 2、7） |
-| 成对计数"由这个 peer 的 agent 输入触发的 turn 数"（§4.4.2） | 每条到达 `Lane.input`、本会开轮或并入轮次的 agent 输入计一次（在入口计，不在开轮时计）；任何非 agent 输入到达即清零 | 入口计数是保守的一侧：排队中的一串输入在开轮之前就被拦住，不会一次放过 `maxTurns` 条以上 |
+| 成对计数"由这个 peer 的 agent 输入触发的 turn 数"（§4.4.2） | 每条到达 `Lane.input`、本会开轮或并入轮次的 agent 输入计一次（在入口计，不在开轮时计）；任何非 agent 输入到达即清零（2026-10-11 合并评审改为：只有有主体的 `human` 输入清零；live 委托也计数，见 INVARIANTS IN-8 的决定） | 入口计数是保守的一侧：排队中的一串输入在开轮之前就被拦住，不会一次放过 `maxTurns` 条以上 |
 | `policy.loopGuard.announce`（§4.4.3、待拍板 3） | 没有做 | 待拍板 3 推荐默认不说；没有使用者的开关不留（原则 4，决定 13 删 `lease` 同理） |
 | explain 的 `loopGuard`（§4.4.3） | 截停记在 cause 索引（`daemon_causes`）里，`explain` 时并进路由记录 | 截停发生在投递途中，路由记录可能稍后才（重）写（`inbound.redispatch`） |
 | `aio explain --chain` 按 chain id 列出整条链（§4.8 "往前走"） | 没有做；`daemon_causes` 已按 chain 存，查询留到有使用者时 | 原则 4：先兑现"从副作用追溯到根"的那一半 |
