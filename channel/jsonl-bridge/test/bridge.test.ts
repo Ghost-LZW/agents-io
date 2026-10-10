@@ -380,3 +380,47 @@ describe.skipIf(!hasPython)('python adapter', () => {
     expect(lines).toEqual([{ providerMessageId: a.providerMessageId, text: 'echo: hello from python', operationId: 'py-op' }]);
   });
 });
+
+describe('channel id pinning (channel-stamping)', () => {
+  it('expectId: a hello declaring another id is bad_hello; with retryFirstConnect the peer is restarted and stays refused', async () => {
+    await expect(rawChild('', { expectId: 'other' })).rejects.toMatchObject({ code: 'bad_hello', message: expect.stringMatching(/declares adapter id "raw", this channel is "other"/) });
+    const { file, pids } = pidLog();
+    const ch = await rawChild('', { expectId: 'other', retryFirstConnect: true, backoff: { minMs: 20, maxMs: 40 } }, { PIDS_FILE: file });
+    expect(ch.id).toBe('other');
+    expect(ch.state()).toMatchObject({ connected: false, error: expect.stringMatching(/this channel is "other"/) });
+    const r = run(ch);
+    await waitFor(() => pids().length >= 3);
+    expect(ch.state().connected).toBe(false);
+    expect(ch.id).toBe('other');
+    await r.stop();
+  });
+
+  it('without expectId the first hello pins the id: a restarted peer declaring another is refused', async () => {
+    const idFile = join(mkdtempSync(join(tmpdir(), 'bridge-')), 'id');
+    const ch = await rawChild('flap', { backoff: { minMs: 20, maxMs: 40 } }, { ID_FILE: idFile, ADAPTER_ID_LATER: 'lark-bot' });
+    expect(ch.id).toBe('raw');
+    const r = run(ch);
+    await r.until(() => r.logs.some((l) => l.includes('declares adapter id "lark-bot", this channel is "raw"')));
+    expect(ch.id).toBe('raw');
+    await r.stop();
+  });
+
+  it('acceptId can refuse a hello id (bad_hello)', async () => {
+    await expect(rawChild('', { acceptId: (id: string) => (id === 'raw' ? 'taken by another channel' : undefined) })).rejects.toMatchObject({
+      code: 'bad_hello',
+      message: expect.stringMatching(/refused: taken by another channel/),
+    });
+    const ok = await rawChild('', { acceptId: () => undefined });
+    expect(ok.id).toBe('raw');
+  });
+
+  it('a refused inbound is answered ok:true with {accepted:false}', async () => {
+    const ch = await rawChild('', {}, { INBOUND: JSON.stringify({ channel: 'lark-bot' }) });
+    const logs: string[] = [];
+    const ctl = new AbortController();
+    const started = ch.start({ account: 'default', config: undefined, signal: ctl.signal, emit: async () => ({ accepted: false }), log: (l, m) => logs.push(`${l}: ${m}`) });
+    await waitFor(() => logs.some((l) => l.includes('got-result forged ok=true code=undefined accepted=false')));
+    ctl.abort();
+    await started;
+  });
+});

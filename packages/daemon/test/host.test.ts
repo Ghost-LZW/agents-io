@@ -210,6 +210,40 @@ describe('deliver, input.verify, explain', () => {
     expect(w2.chat.sent).toHaveLength(0);
   });
 
+  it('a send in flight when the daemon died is settled unknown on the next start (logged in its session) and not sent again', async () => {
+    const w = await daemon();
+    const route = { channel: 'fake', account: 'default', conversationId: 'dm-alice' };
+    // What a crash between the in-flight mark and the settlement leaves behind.
+    w.gw.records.begin({ operationId: 'host:op-c', sessionKey: 'host:xwo', route, attempts: 1, startedAt: Date.now() });
+    await w.stop();
+    const w2 = await daemon({ dir: w.dir });
+    expect(w2.gw.outbox.get('host:op-c')).toMatchObject({ status: 'unknown', attempts: 1 });
+    expect(w2.gw.hub.log.read('host:xwo', 0).map((e) => e.body)).toContainEqual({ t: 'delivery.settled', operationId: 'host:op-c', route, result: 'unknown' });
+    const h = await w2.host();
+    expect(await h.deliver({ operationId: 'op-c', route, message: { text: 'maybe sent' } })).toMatchObject({ status: 'unknown', duplicate: true });
+    expect(w2.chat.sent).toHaveLength(0);
+  });
+
+  it('stop waits for a send in flight: it settles before the records close', async () => {
+    const w = await daemon();
+    const route = { channel: 'fake', account: 'default', conversationId: 'dm-alice' };
+    const send = w.chat.send.bind(w.chat);
+    let started = false;
+    w.chat.send = async (r, m, op) => {
+      started = true;
+      await new Promise((res) => setTimeout(res, 300));
+      return send(r, m, op);
+    };
+    const h = await w.host();
+    void h.deliver({ operationId: 'op-s', route, message: { text: 'slow' } }).catch(() => undefined);
+    await until(() => started);
+    await w.stop();
+    expect(w.chat.sent).toHaveLength(1);
+    const w2 = await daemon({ dir: w.dir });
+    expect(w2.gw.outbox.get('host:op-s')).toMatchObject({ status: 'delivered' });
+    expect(w2.gw.records.allInFlight()).toEqual([]);
+  });
+
   it('input.verify answers the platform author and evidence the channel reported, and the principal it was stamped with; unknown refs are not found', async () => {
     const w = await daemon();
     await w.chat.inject({ id: 'v1', sender: { ...alice, displayName: 'Alice' }, text: 'confirm' });

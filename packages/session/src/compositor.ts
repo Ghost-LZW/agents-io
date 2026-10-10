@@ -240,6 +240,23 @@ export function progressOf(v: TurnView): ProgressView {
 const DECISION_LABEL: Record<string, string> = { allow_once: 'Allow', allow_session: 'Always allow', deny: 'Deny' };
 const STATUS_LABEL: Record<string, string> = { completed: 'Done', interrupted: 'Interrupted', failed: 'Failed', ambiguous: 'Outcome unknown' };
 
+/**
+ * What a sender is told when their message is rejected before any turn showed it
+ * (`input.rejected` with a reply route). The detail after `code:` stays in the log
+ * (`aio explain`, the session stream): it may name hosts, paths or harness errors.
+ */
+export function rejectionNotice(reason: string): string {
+  const code = reason.split(':', 1)[0]!.trim();
+  switch (code) {
+    case 'lane_closed':
+      return 'This message was not processed: the agent stopped or restarted before it got to it. Please send it again.';
+    case 'start_failed':
+      return 'This message was not processed: the agent could not start. Try again later, or ask the operator.';
+    default:
+      return `This message was not processed (${code}).`;
+  }
+}
+
 export interface RenderOptions {
   route?: ReplyRoute;
   caps?: Pick<ChannelCaps, 'buttons' | 'text'>;
@@ -372,6 +389,8 @@ export class Compositor {
   private routes = new Map<string, RouteState>();
   private loop: Promise<void> | undefined;
   private stopped = false;
+  /** Rejection notices being sent (they belong to no turn's route state). */
+  private notices: Promise<void> = Promise.resolve();
 
   constructor(private readonly o: CompositorOptions) {}
 
@@ -395,7 +414,7 @@ export class Compositor {
 
   /** Wait for every queued send/edit/finalize. */
   async flush(): Promise<void> {
-    await Promise.all([...this.routes.values()].map((r) => r.chain));
+    await Promise.all([...this.routes.values()].map((r) => r.chain).concat(this.notices));
   }
 
   private key(turnId: string, route: ReplyRoute) {
@@ -412,6 +431,10 @@ export class Compositor {
       this.track(b.turnId, b.route, e.ts);
       return;
     }
+    if (b.t === 'input.rejected') {
+      if (b.replyRoute && this.owns(b.replyRoute)) this.notifyRejected(b, b.replyRoute);
+      return;
+    }
     const turnId = e.turnId ?? (b.t === 'turn.completed' ? b.turnId : undefined);
     if (!turnId) return;
     for (const r of this.routes.values()) {
@@ -420,6 +443,20 @@ export class Compositor {
       if (b.t === 'turn.completed') this.finish(r);
       else this.changed(r, b.t === 'request.opened' ? b.requestId : undefined);
     }
+  }
+
+  /**
+   * Inputs rejected before any turn showed them here (still queued when the lane closed,
+   * or their turn failed to start): one short message on their route, so the sender
+   * knows the message went nowhere. Once per (event's first input, route), via the outbox.
+   */
+  private notifyRejected(b: BodyOf<'input.rejected'>, route: ReplyRoute): void {
+    const msg: RenderedMessage = { text: rejectionNotice(b.reason) };
+    // A system notice, not the agent's words: no `as` (an echo must not read as agent output).
+    const op = { operationId: `${this.o.sessionKey}:rejected:${b.inputIds[0] ?? ''}:${routeKey(route)}`, sessionKey: this.o.sessionKey, route, msg };
+    this.notices = this.notices.then(async () => {
+      await this.o.outbox.send(this.o.adapter, op);
+    }).catch((err) => this.o.onError?.(err));
   }
 
   /**

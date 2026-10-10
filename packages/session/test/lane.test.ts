@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { FakeHarness, assertConformingStream, fakeHarnessCaps } from '@agents-io/testkit';
 import type { BodyOf, Decision } from '@agents-io/protocol';
-import { Lane, type ModelReviewer } from '../src/index.js';
+import { Lane, settleLeftoverInputs, type ModelReviewer } from '../src/index.js';
 import { ManualHarness, SteerableHarness, bodies, gate, input, origin, policy, route, setup, until } from './helpers.js';
 
 const turnsOf = (evs: ReturnType<ReturnType<typeof setup>['events']>) =>
@@ -399,14 +399,121 @@ describe('Lane: host restart', () => {
     assertConformingStream(a.events(), { allowTrailing: true });
   });
 
-  it('settles a turn nobody adopted as ambiguous before the next turn starts', async () => {
+  it('settles a turn nobody adopted as ambiguous before the next turn starts, rejecting its unconsumed inputs', async () => {
     const a = await firstHost();
     const h2 = new ManualHarness();
     const lane2 = nextLane(a.hub, h2);
     await lane2.command({ type: 'input', sessionKey: 's1', input: input('next', { id: 'y' }), mode: 'queue' });
     await until(() => h2.session?.starts.length === 1);
     expect(bodies(a.events(), 'turn.completed')[0]).toMatchObject({ turnId: a.turnId, status: 'ambiguous', error: { code: 'host_restarted' } });
+    // No reply route: the turn's card, finalized as ambiguous, already tells the sender.
+    expect(bodies(a.events(), 'input.rejected')).toEqual([{ t: 'input.rejected', inputIds: ['x'], reason: 'host_restarted' }]);
     expect(a.hub.snapshot('s1').turn?.turnId).toBe(h2.session!.starts[0]!.turnId);
+  });
+
+  it('detach rejects the inputs queued behind the running turn (lane_closed, with their route), never the turn\'s own; the next lane still adopts it', async () => {
+    const h1 = new ManualHarness();
+    const a = setup({ harness: h1 });
+    const send = (i: ReturnType<typeof input>) => a.lane.command({ type: 'input', sessionKey: 's1', input: i, mode: 'queue' });
+    await send(input('long job', { id: 'x' }));
+    await until(() => bodies(a.events(), 'turn.started').length === 1);
+    const turnId = h1.session!.starts[0]!.turnId;
+    await send(input('next', { id: 'y' }));
+    await send(input('other chat', { id: 'z', route: route('c2') }));
+    a.lane.detach('gateway stopping');
+    await h1.session!.close();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(bodies(a.events(), 'input.rejected')).toEqual([
+      { t: 'input.rejected', inputIds: ['y'], reason: 'lane_closed: gateway stopping', replyRoute: route() },
+      { t: 'input.rejected', inputIds: ['z'], reason: 'lane_closed: gateway stopping', replyRoute: route('c2') },
+    ]);
+    expect(a.hub.snapshot('s1')).toMatchObject({ queued: [], turn: { turnId, inputIds: ['x'] } });
+    expect(settleLeftoverInputs(a.hub, 's1')).toEqual([]);
+
+    const h2 = new ManualHarness();
+    const lane2 = nextLane(a.hub, h2);
+    await lane2.open();
+    h2.session!.push({ t: 'turn.adopted', turnId, nativeTurnId: 'n1', inputIds: ['x'] }, { turnId });
+    await until(() => lane2.activeTurn()?.turnId === turnId);
+    h2.session!.complete(turnId, ['x']);
+    await until(() => bodies(a.events(), 'turn.completed').length === 1);
+    expect(bodies(a.events(), 'turn.completed')).toEqual([{ t: 'turn.completed', turnId, status: 'completed' }]);
+    expect(bodies(a.events(), 'input.rejected').flatMap((b) => (b as BodyOf<'input.rejected'>).inputIds)).toEqual(['y', 'z']);
+  });
+
+  it('crash leftovers: inputs a previous process admitted and never settled are rejected (host_restarted) at startup; the open turn is left to adoption', async () => {
+    const h1 = new ManualHarness();
+    const a = setup({ harness: h1 });
+    await a.lane.command({ type: 'input', sessionKey: 's1', input: input('long job', { id: 'x' }), mode: 'queue' });
+    await until(() => bodies(a.events(), 'turn.started').length === 1);
+    await a.lane.command({ type: 'input', sessionKey: 's1', input: input('next', { id: 'y' }), mode: 'queue' });
+    // The process dies here: no close, no detach.
+    expect(a.hub.snapshot('s1').queued).toEqual(['y']);
+
+    expect(settleLeftoverInputs(a.hub, 's1')).toEqual(['y']);
+    expect(bodies(a.events(), 'input.rejected')).toEqual([{ t: 'input.rejected', inputIds: ['y'], reason: 'host_restarted' }]);
+    expect(a.hub.snapshot('s1').queued).toEqual([]);
+    expect(a.hub.snapshot('s1').turn?.inputIds).toEqual(['x']);
+    expect(settleLeftoverInputs(a.hub, 's1')).toEqual([]); // idempotent
+  });
+});
+
+describe('Lane: close', () => {
+  it('close rejects queued inputs (lane_closed) and the interrupted turn\'s; nothing stays queued', async () => {
+    const h = new ManualHarness();
+    const { lane, events, hub } = setup({ harness: h });
+    const send = (i: ReturnType<typeof input>) => lane.command({ type: 'input', sessionKey: 's1', input: i, mode: 'queue' });
+    await send(input('long job', { id: 'x' }));
+    await until(() => bodies(events(), 'turn.started').length === 1);
+    const turnId = h.session!.starts[0]!.turnId;
+    await send(input('q1', { id: 'q1' }));
+    await send(input('q2', { id: 'q2' }));
+    h.session!.complete(turnId, [], 'interrupted'); // what the harness reports as it closes (handled after close begins)
+    await lane.close('gateway stopping');
+    await lane.whenIdle();
+    expect(bodies(events(), 'input.rejected')).toEqual([
+      { t: 'input.rejected', inputIds: ['q1', 'q2'], reason: 'lane_closed: gateway stopping', replyRoute: route() },
+      { t: 'input.rejected', inputIds: ['x'], reason: 'interrupted' },
+    ]);
+    expect(hub.snapshot('s1').queued).toEqual([]);
+    expect(await send(input('late', { id: 'late' }))).toEqual({ ok: false, reason: 'closed' });
+  });
+
+  it('an input requeued as the turn ends during close is rejected, not stranded', async () => {
+    const h = new ManualHarness();
+    const { lane, events, hub } = setup({ harness: h });
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('x', { id: 'x' }), mode: 'queue' });
+    await until(() => bodies(events(), 'turn.started').length === 1);
+    const turnId = h.session!.starts[0]!.turnId;
+    h.session!.complete(turnId, []); // completed without consuming x (normally re-queued once), handled after close begins
+    await lane.close('gateway stopping');
+    await lane.whenIdle();
+    expect(bodies(events(), 'input.rejected')).toEqual([{ t: 'input.rejected', inputIds: ['x'], reason: 'lane_closed: gateway stopping', replyRoute: route() }]);
+    expect(hub.snapshot('s1').queued).toEqual([]);
+    expect(h.session!.starts).toHaveLength(1);
+  });
+
+  it('an input whose admission was awaiting a policy hook when the lane closed is rejected', async () => {
+    const h = new ManualHarness();
+    const g = gate();
+    const { lane, events, hub } = setup({
+      harness: h,
+      policy: policy({
+        control: async () => {
+          await g.promise;
+          return 'deny';
+        },
+      }),
+    });
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('x', { id: 'x' }), mode: 'queue' });
+    await until(() => bodies(events(), 'turn.started').length === 1);
+    const pending = lane.command({ type: 'input', sessionKey: 's1', input: input('stop!', { id: 'i' }), mode: 'interrupt' });
+    await new Promise((r) => setTimeout(r, 5));
+    lane.detach('gateway stopping');
+    g.open();
+    expect(await pending).toEqual({ ok: true, disposition: 'queued' });
+    expect(bodies(events(), 'input.rejected')).toEqual([{ t: 'input.rejected', inputIds: ['i'], reason: 'lane_closed: gateway stopping', replyRoute: route() }]);
+    expect(hub.snapshot('s1').queued).toEqual([]);
   });
 });
 

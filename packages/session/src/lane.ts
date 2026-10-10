@@ -204,6 +204,7 @@ export class Lane {
   private chain: Promise<unknown> = Promise.resolve();
   private idleWaiters: (() => void)[] = [];
   private closed = false;
+  private closeReason = 'lane closed';
   private detached = false;
   private dangling: Dangling | undefined;
   /** The harness was opened (once) to give it a chance to adopt `dangling` before a new turn settles it. */
@@ -364,8 +365,15 @@ export class Lane {
     return new Promise((r) => this.idleWaiters.push(r));
   }
 
+  /**
+   * Close the harness session (its running turn is interrupted and recorded). Inputs
+   * still queued are rejected right away (`lane_closed: <reason>`, with their reply
+   * route so renderers tell the sender), and so is anything queued after this (a
+   * requeue as the turn ends, an input whose admission was in flight): a closed lane
+   * never runs another turn and its queue is in memory only.
+   */
   async close(reason = 'lane closed'): Promise<void> {
-    this.stopTimers();
+    this.stopTimers(reason);
     await this.session?.close(reason);
   }
 
@@ -437,17 +445,39 @@ export class Lane {
    * (Codex over a Unix socket): call the adapter's own detach afterwards, and the
    * running turn stays open in the log for the next host to adopt.
    */
-  detach(): void {
+  detach(reason = 'detached'): void {
     this.detached = true;
-    this.stopTimers();
+    this.stopTimers(reason);
   }
 
-  private stopTimers(): void {
+  /**
+   * Inputs queued behind the running turn (or the adopted one) are not: the queue is in
+   * memory only, and no later host could run them. They are rejected like on `close`.
+   */
+  private stopTimers(reason: string): void {
     this.closed = true;
+    this.closeReason = reason;
     for (const p of this.requests.values()) {
       if (p.timer) clearTimeout(p.timer);
       p.abort?.abort();
     }
+    this.rejectQueue();
+  }
+
+  /**
+   * A closed lane's queue: `input.rejected lane_closed: <reason>`, one event per reply
+   * route (in queue order) so a renderer can tell each sender. Never the running turn's
+   * inputs: its end (or the next host adopting it) settles them.
+   */
+  private rejectQueue(): void {
+    if (!this.queue.length) return;
+    const queued = this.queue;
+    this.queue = [];
+    const reason = `${LANE_CLOSED}: ${this.closeReason}`;
+    for (const g of byRoute(queued.map((q) => q.input))) {
+      this.emit({ body: { t: 'input.rejected', inputIds: g.ids, reason, ...(g.route ? { replyRoute: g.route } : {}) } });
+    }
+    this.notifyIdle();
   }
 
   // ---- serialisation ------------------------------------------------------
@@ -513,8 +543,12 @@ export class Lane {
     if (this.closed) return { ok: false, reason: 'closed' };
     if (cmd.sessionKey !== this.sessionKey) return { ok: false, reason: 'wrong_session' };
     switch (cmd.type) {
-      case 'input':
-        return this.input(cmd.input, cmd.mode, cmd.expectedTurnId);
+      case 'input': {
+        const r = await this.input(cmd.input, cmd.mode, cmd.expectedTurnId);
+        // Closed while its admission awaited a policy hook: it queued behind a lane that never runs again.
+        if (this.closed) this.rejectQueue();
+        return r;
+      }
       case 'interrupt':
         return this.interrupt(cmd.origin, cmd.turnId, cmd.cancelQueue ?? false);
       case 'resolve':
@@ -798,7 +832,11 @@ export class Lane {
     return s;
   }
 
-  /** A turn left open by an earlier host that no harness adopted: its outcome is unknown. */
+  /**
+   * A turn left open by an earlier host that no harness adopted: its outcome is unknown,
+   * and its inputs the harness did not report consumed are rejected (`host_restarted`,
+   * no route: the turn's card, finalized as ambiguous, already tells the sender).
+   */
   private settleDangling(): void {
     const d = this.dangling;
     if (!d) return;
@@ -807,6 +845,8 @@ export class Lane {
       turnId: d.turnId,
       body: { t: 'turn.completed', turnId: d.turnId, status: 'ambiguous', error: { code: 'host_restarted', retryable: false, message: 'turn was running when the previous host stopped' } },
     });
+    const left = unsettledInputsOf(this.o.hub.log.read(this.sessionKey, 0), d.turnId, d.inputIds);
+    if (left.length) this.emit({ body: { t: 'input.rejected', inputIds: left, reason: HOST_RESTARTED } });
   }
 
   /**
@@ -828,6 +868,7 @@ export class Lane {
 
   /** Start the next turn if idle. Loops past batches whose start fails. */
   private async pump(): Promise<void> {
+    if (this.closed) this.rejectQueue();
     if (!this.turn && this.queue.length && !this.closed && (await this.awaitAdoption())) return;
     if (!this.turn && this.queue.length && !this.closed) this.settleDangling();
     while (!this.turn && this.queue.length && !this.closed) {
@@ -863,8 +904,9 @@ export class Lane {
         if (t.interruptRequested) await s.interrupt(t.turnId);
       } catch (err) {
         this.turn = undefined;
+        // No turn.started, so no card: the reply route lets renderers tell the sender (one batch, one route).
         this.emit({
-          body: { t: 'input.rejected', inputIds: inputs.map((i) => i.inputId), reason: `start_failed: ${errMsg(err)}` },
+          body: { t: 'input.rejected', inputIds: inputs.map((i) => i.inputId), reason: `start_failed: ${errMsg(err)}`, ...(t.replyRoute ? { replyRoute: t.replyRoute } : {}) },
         });
       }
     }
@@ -1247,6 +1289,54 @@ function visibilityOf(e: HarnessEvent): Visibility {
  * Principal of an admitted input; inputs that arrived via a watch also carry the
  * record itself, so the target session's log shows what arrived and from where.
  */
+/** `input.rejected` reason prefix: the lane closed (stop, restart, detach) with the input still queued. */
+export const LANE_CLOSED = 'lane_closed';
+/** `input.rejected` reason: an earlier host process left the input unsettled (a crash, or its turn was never adopted). */
+export const HOST_RESTARTED = 'host_restarted';
+
+/** Records grouped by reply route, in order of first appearance. */
+function byRoute(inputs: InputRecord[]): { route: ReplyRoute | null; ids: string[] }[] {
+  const groups = new Map<string, { route: ReplyRoute | null; ids: string[] }>();
+  for (const i of inputs) {
+    const k = i.replyRoute ? routeKey(i.replyRoute) : '-';
+    const g = groups.get(k) ?? { route: i.replyRoute, ids: [] };
+    g.ids.push(i.inputId);
+    groups.set(k, g);
+  }
+  return [...groups.values()];
+}
+
+/** Inputs of `turnId` (started with `inputIds`, plus any steered into it) with no consumed / rejected / cancelled record. */
+function unsettledInputsOf(events: SessionEvent[], turnId: string, inputIds: string[]): string[] {
+  const ids = new Set(inputIds);
+  for (const e of events) {
+    const b = e.body;
+    if (b.t === 'input.admitted' && b.disposition === 'steer' && e.turnId === turnId) ids.add(b.inputId);
+  }
+  for (const e of events) {
+    const b = e.body;
+    if (b.t === 'input.consumed' || b.t === 'input.rejected' || b.t === 'input.cancelled') for (const id of b.inputIds) ids.delete(id);
+  }
+  return [...ids];
+}
+
+/**
+ * Inputs an earlier host process admitted and never started, consumed, rejected or
+ * cancelled (`snapshot.queued`): it stopped without settling them (a crash; a clean stop
+ * rejects its queue). Their records are not in the log, so they cannot be replayed:
+ * records `input.rejected host_restarted` for them. Inputs of the turn the log shows open
+ * are left to that turn (adopted, or settled by the next lane). Call once per process,
+ * before any lane of the session exists (a lane closing in this process settles its own).
+ * Returns the ids rejected.
+ */
+export function settleLeftoverInputs(hub: Hub, sessionKey: string): string[] {
+  const snap = hub.snapshot(sessionKey);
+  const ids = snap.queued.filter((id) => !snap.turn?.inputIds.includes(id));
+  if (!ids.length) return [];
+  hub.append(sessionKey, { ts: Date.now(), level: 'primary', audience: 'status', durability: 'durable', body: { t: 'input.rejected', inputIds: ids, reason: HOST_RESTARTED } });
+  return ids;
+}
+
 function pid(i: InputRecord): { principalId?: string; input?: InputRecord } {
   const id = principalId(i);
   return { ...(id === undefined ? {} : { principalId: id }), ...(i.channelContext.watch !== undefined ? { input: i } : {}) };

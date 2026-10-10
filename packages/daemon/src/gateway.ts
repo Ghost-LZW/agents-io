@@ -12,6 +12,7 @@ import {
   type AdminStatus,
   type ChannelAdapter,
   type ContentBlock,
+  type Evidence,
   type HarnessAdapter,
   type HarnessCaps,
   type HarnessEvent,
@@ -51,6 +52,7 @@ import {
   Outbox,
   Router,
   SqliteSessionLog,
+  SOURCE_MISMATCH,
   TOPIC_TOOLS_HINT,
   TopicError,
   TopicRegistry,
@@ -58,6 +60,7 @@ import {
   WatchRegistry,
   defaultPolicy,
   type AddWatchResult,
+  type EmitSource,
   type FullPolicy,
   type IngressResult,
   type RemoveWatchResult,
@@ -66,15 +69,16 @@ import {
   type TopicRecord,
   topicContext,
   topicView,
+  settleLeftoverInputs,
 } from '@agents-io/session';
-import { HostMcpServer, HostTools, ToolError, type TopicHandover } from '@agents-io/host-mcp';
+import { HostMcpServer, HostTools, ToolError, agentIdentity, type TopicHandover } from '@agents-io/host-mcp';
 import { ClaudeCodeHarness, findOnPath, type ClaudeCodeHarnessConfig } from '@agents-io/harness-claude-code';
 import { CodexHarness, type CodexProfile } from '@agents-io/harness-codex';
 import { loadChannelModule } from './channel-module.js';
 import { LarkBotAdapter } from '@agents-io/channel-lark-bot';
 import { MailChannel, type MailChannelConfig } from '@agents-io/channel-mail';
-import { spawnChannel, type BridgeState } from '@agents-io/channel-jsonl-bridge';
-import { ConfigError, agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type ResolvedChannel } from './config.js';
+import { spawnChannel, type BridgedChannel, type BridgeState } from '@agents-io/channel-jsonl-bridge';
+import { ConfigError, RESERVED_CHANNEL_IDS, UNGRANTED_EVIDENCE, agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type ResolvedChannel } from './config.js';
 import { ConsoleServer } from './console.js';
 import { ConfigStore, canonical } from './console-config.js';
 import { LarkBotJobs } from './provision.js';
@@ -162,7 +166,41 @@ interface RunningChannel {
   ended?: boolean;
   /** A bridge reported its connection state (it has connected or failed a first connect). */
   reported?: boolean;
+  /** Which adapter its channel id belongs to (channel-stamping F4, {@link channelOwner}). */
+  owner: ChannelOwner;
+  /** Envelopes refused for claiming another (channel, account) or reply route. */
+  rejected: number;
+  /** Envelopes whose evidence was capped to `none`. */
+  evidenceCapped: number;
+  /** Last warn per reason (rate limit: one a minute). */
+  warnedAt?: Map<string, number>;
 }
+
+/**
+ * Who a channel id belongs to: the built-in type (`lark-bot`, `mail`), one bridge
+ * program (`bridge:` command and args), one module (`module:` file and export), or, for
+ * an adapter the embedder passes (`GatewayOptions.channels`), its class (several bots
+ * of one adapter class are several objects). Channels sharing an id must share an
+ * owner; only their accounts differ.
+ */
+type ChannelOwner = string | Function;
+
+function channelOwner(cfg: ResolvedChannel): string {
+  switch (cfg.type) {
+    case 'lark-bot':
+    case 'mail':
+      return cfg.type;
+    case 'bridge':
+      return `bridge:${JSON.stringify([cfg.command, cfg.args ?? []])}`;
+    case 'module':
+      return `module:${JSON.stringify([cfg.module, cfg.export ?? null])}`;
+  }
+}
+
+const ownerName = (o: ChannelOwner) => (typeof o === 'string' ? o : `embedded adapter ${o.name || '(anonymous class)'}`);
+
+/** Bridge and module channels give strong evidence only when the entry grants it. */
+const grantedByDefault = (o: ChannelOwner) => typeof o !== 'string' || o === 'lark-bot' || o === 'mail';
 
 const DAEMON_VERSION: string = (() => {
   try {
@@ -222,6 +260,8 @@ export class Gateway {
   private readonly agentAdapters = new Map<string, HarnessAdapter>();
   private readonly lanes = new Map<string, Lane>();
   /** Running lives (decision 11), by session: the channel's media peer of each. */
+  /** Sessions with a live_join still opening its endpoint (the claim that keeps it to one live). */
+  private readonly joining = new Set<string>();
   private readonly lives = new Map<string, { liveId: string; endpoint: LiveEndpoint }>();
   /** Agent and working directory of each live lane. */
   private readonly laneInfo = new Map<string, { agent: AgentConfig; cwd?: string }>();
@@ -234,6 +274,8 @@ export class Gateway {
   /** Live channel applies run one at a time. */
   private applying: Promise<unknown> = Promise.resolve();
   private readonly channels: RunningChannel[] = [];
+  /** Every (channel id, account) configured or injected and not removed from the config: stays when its instance failed or stopped. */
+  private readonly configured = new Map<string, { id: string; account: string }>();
   private server: LocalServer | undefined;
   private tokenFile: string | undefined;
   /** The console API server (`GatewayOptions.console`). */
@@ -280,6 +322,8 @@ export class Gateway {
       watches: { list: () => this.watches.list() },
       selfAccounts: c.policy.selfAccounts,
       agentAccounts: c.policy.agentAccounts,
+      // An agent account's message declaring one of our sessions (SendOp.as) is our own echo.
+      isSelfDeclared: (declared) => declared.startsWith('session:') && this.isOurSession(declared.slice('session:'.length)),
       routeCallout: (bindingId, input, envelope) => this.host.routeCallout(bindingId, input, envelope),
       topics: this.topics,
       // Decision 7: callout answers may launch the session they land in; pinned sessions may skip the callout.
@@ -374,6 +418,7 @@ export class Gateway {
         // Only lanes that exist: a tool call always comes from a running harness session.
         turn: (key) => this.lanes.get(key)?.currentTurn(),
         adapter: (r) => this.channelFor(r)?.adapter,
+        as: (key) => agentIdentity(key),
         blobs: this.blobs,
         cwd: (key) => this.laneInfo.get(key)?.cwd ?? this.instanceOf(this.lanes.get(key)?.harnessId)?.cwd ?? c.cwd,
         tier: (r) => this.channelFor(r)?.tier,
@@ -464,6 +509,9 @@ export class Gateway {
       }
       gw.watches.start();
       gw.runs.settleAllDangling();
+      // Sends an earlier process left in flight: unknown, never resent (decision 13).
+      for (const r of gw.outbox.recover()) gw.log('warn', `delivery ${r.operationId} was in flight when the previous daemon stopped; settled unknown, not resent`);
+      gw.settleLeftoverInputs();
       await gw.loadConfigWatches();
       await gw.startChannels();
       await gw.adoptRunningTurns();
@@ -552,7 +600,7 @@ export class Gateway {
         ...(h ? { name: h.name, callouts: h.callouts, ...(h.consumer !== undefined ? { consumer: h.consumer } : {}) } : {}),
         ...(st ? { table: { version: st.table.version, active: st.active, ...(st.suspended ? { suspended: st.suspended } : {}) } } : {}),
       },
-      channels: this.channels.map((ch) => ({ id: ch.adapter.id, account: ch.account, state: ch.state, ...(ch.error ? { error: ch.error } : {}) })),
+      channels: this.channels.map((ch) => ({ id: ch.adapter.id, account: ch.account, state: ch.state, ...(ch.error ? { error: ch.error } : {}), ...(ch.rejected ? { rejected: ch.rejected } : {}), ...(ch.evidenceCapped ? { evidenceCapped: ch.evidenceCapped } : {}) })),
       agents: Object.values(c.agents).map((a) => ({
         name: a.name,
         harness: a.harness,
@@ -616,13 +664,16 @@ export class Gateway {
 
   /**
    * Accept one envelope from a channel: route it (Ingress) and remember who sent
-   * it as the channel reported it, so `input.verify` can answer later.
+   * it as stamped, so `input.verify` can answer later. Channels started by the
+   * gateway pass their `source` (channel-stamping); without one the caller is trusted.
    */
-  async accept(env: InboundEnvelope): Promise<IngressResult> {
-    const r = await this.ingress.accept(env);
+  async accept(env: InboundEnvelope, source?: EmitSource): Promise<IngressResult> {
+    if (this.refusingInbound) return { accepted: false, action: 'invalid', error: 'gateway stopping' };
+    const r = await this.ingress.accept(env, source);
     if (r.accepted && r.origin && r.action !== 'duplicate') {
       try {
-        this.records.recordInput(env, r.origin, r.inputId);
+        // As stamped (evidence capped), not as claimed: hosts verify authors with it.
+        this.records.recordInput(r.envelope ?? env, r.origin, r.inputId);
       } catch (e) {
         this.log('warn', `recording input ${r.inputId ?? env.id} failed: ${(e as Error).message}`);
       }
@@ -1073,8 +1124,9 @@ export class Gateway {
     const settled = this.outbox.get(operationId);
     if (settled) return { ok: true, value: { ...settled, operationId: f.operationId, duplicate: true } };
     const ch = this.channelFor(f.route);
-    if (!ch) return fail('unknown_channel', `no running channel ${f.route.channel} with account ${f.route.account} (running: ${this.channels.map((x) => `${x.adapter.id} (${x.account})`).join(', ') || 'none'})`);
-    // A single-account fallback sends as that account (the adapter refuses routes of other accounts).
+    if (!ch) return fail('unknown_channel', this.noChannelMessage(f.route));
+    // A single-entry fallback sends as that entry's account (the adapter refuses routes of other accounts).
+    // Not agent-authored (the host speaks): no `as`.
     const rec = await this.outbox.send(ch.adapter, { operationId, sessionKey: `host:${hostName}`, route: { ...f.route, account: ch.account }, msg: f.message });
     return { ok: true, value: { ...rec, operationId: f.operationId, duplicate: false } };
   }
@@ -1103,7 +1155,11 @@ export class Gateway {
   /** A topic command's answer: one plain message on the route, through the outbox (recorded in the topic's session). */
   private async systemReply(a: { route: ReplyRoute; text: string; operationId: string; sessionKey: string }): Promise<void> {
     const ch = this.channelFor(a.route);
-    if (!ch) return; // local ends read their stream; there is no adapter to send with
+    if (!ch) {
+      // Local ends read their stream; a channel route with no instance is never sent as another account (decision 8).
+      if (a.route.channel !== 'local') this.log('warn', `system reply not sent: ${this.noChannelMessage(a.route)}`);
+      return;
+    }
     const { replyToMessageId: _r, ...route } = { ...a.route, account: ch.account };
     await this.outbox.send(ch.adapter, { operationId: a.operationId, sessionKey: a.sessionKey, route, msg: { text: a.text } });
   }
@@ -1167,10 +1223,25 @@ export class Gateway {
     if (!lane) throw new ToolError(`no session ${sessionKey}`);
     const cur = this.lives.get(sessionKey);
     if (cur) throw new ToolError(`already in a live (${cur.endpoint.title}); live_leave first`);
-    const ch = this.liveChannel(turn, a.channel);
-    const endpoint = await ch.adapter.openLive!(ch.account, a.target);
+    // Decision 11: one live per session. Claimed before the first await, so a concurrent join is refused
+    // without touching the running one and without opening an endpoint of its own.
+    if (this.joining.has(sessionKey)) throw new ToolError('another live_join is in progress for this session; at most one live per session');
+    this.joining.add(sessionKey);
+    let endpoint: LiveEndpoint;
+    let ch: RunningChannel;
     const liveId = `live_${randomUUID().slice(0, 8)}`;
-    this.lives.set(sessionKey, { liveId, endpoint });
+    try {
+      ch = this.liveChannel(turn, a.channel);
+      endpoint = await ch.adapter.openLive!(ch.account, a.target);
+      // stop() already left the lives it knew of: a join that lands after that is closed here.
+      if (this.stopped) {
+        await endpoint.close('gateway stopping').catch(() => undefined);
+        throw new ToolError('the gateway is stopping');
+      }
+      this.lives.set(sessionKey, { liveId, endpoint });
+    } finally {
+      this.joining.delete(sessionKey);
+    }
     try {
       const offer = endpoint.offer;
       let transport: LiveStartArgs['transport'];
@@ -1198,6 +1269,10 @@ export class Gateway {
       await lane.stopLive().catch(() => undefined);
       await endpoint.close(`join failed: ${(e as Error).message}`).catch(() => undefined);
       throw e;
+    }
+    if (this.stopped) {
+      await this.leaveLive(sessionKey, 'gateway stopping');
+      throw new ToolError('the gateway is stopping');
     }
     this.log('info', `${sessionKey}: live ${liveId} joined ${endpoint.title}`);
     // The far side ended it (left, removed, meeting over): stop the voice; its live.ended closes the rest.
@@ -1374,6 +1449,8 @@ ${a.summary}` }],
       // Each bot renders its own routes only: two Lark bots must not race for one reply.
       account,
       outbox: this.outbox,
+      // Every message the session's agent produces says who wrote it (POSITIONING §2 identity declaration).
+      as: agentIdentity(sessionKey),
       ...(tier ? { tier } : {}),
       // A stop button on streaming cards; Ingress turns its click into an `interrupt` command.
       interruptButton: true,
@@ -1395,13 +1472,15 @@ ${a.summary}` }],
     try {
       let i = 0;
       for (const ch of this.o.config.channels) all.push(await this.buildConfigChannel(ch, i++));
-      for (const x of this.o.channels ?? []) all.push({ adapter: x.adapter, account: x.account ?? 'default', ...(x.tier ? { tier: x.tier } : {}) });
-      // Only now is a module channel's id known: one (channel, account) is one route target.
-      const seen = new Set<string>();
+      for (const x of this.o.channels ?? []) all.push({ adapter: x.adapter, account: x.account ?? 'default', owner: x.adapter.constructor, ...(x.tier ? { tier: x.tier } : {}) });
+      // Only now is a module channel's id known: one channel id belongs to one adapter, one (channel, account)
+      // is one route target. A bridge without `id` that has not connected yet is checked at its hello.
+      const known: BuiltChannel[] = [];
       for (const c of all) {
-        const k = `${c.adapter.id}\0${c.account}`;
-        if (seen.has(k)) throw new ConfigError(`two channels have the same (channel, account) = (${c.adapter.id}, ${c.account}); give one another account`);
-        seen.add(k);
+        if (!idKnown(c)) continue;
+        const why = idConflict(c.adapter.id, c.owner, c.account, known);
+        if (why) throw new ConfigError(why);
+        known.push(c);
       }
     } catch (e) {
       await closeAll();
@@ -1423,10 +1502,14 @@ ${a.summary}` }],
       if (!entry) return void (early = st);
       this.bridgeState(entry, st);
     };
+    const owner = channelOwner(cfg);
+    // Each hello's id is checked against the running channels (a bridge without `id` learns its id there).
+    const acceptId = (id: string) => idConflict(id, owner, cfg.account, this.channels.filter((e) => e !== entry));
     const own = this.o.channelAdapter?.(cfg);
-    const built = own ? { adapter: own, account: cfg.account, ...(cfg.tier ? { tier: cfg.tier } : {}) } : await buildChannel(cfg, index, (l, m, d) => this.log(l, m, d), onState);
+    const built = own ? { adapter: own, account: cfg.account, ...(cfg.tier ? { tier: cfg.tier } : {}) } : await buildChannel(cfg, index, (l, m, d) => this.log(l, m, d), onState, acceptId);
     return {
       ...built,
+      owner,
       source: cfg,
       bind: (e) => {
         entry = e;
@@ -1439,7 +1522,47 @@ ${a.summary}` }],
     const e = this.startChannel(b);
     if (b.source) e.source = b.source;
     b.bind?.(e);
+    // A bridge's caps are its peer's: checked once it connects (bridgeState).
+    if (idKnown(b) && !isBridge(b.adapter)) this.checkGrant(e);
     return e;
+  }
+
+  /**
+   * The source a channel's envelopes are stamped against: its id and account, and
+   * the evidence it may give — the entry's `evidence` grant (default: caps for
+   * built-in and embedded adapters, `device_only` for bridges and modules) ∩ the
+   * adapter's current `caps.evidence` (a bridge's change with each hello), plus `none`.
+   */
+  private emitSource(e: RunningChannel): EmitSource {
+    const caps = e.adapter.caps(e.account);
+    const grant = e.source?.evidence ?? (grantedByDefault(e.owner) ? caps.evidence : UNGRANTED_EVIDENCE);
+    const evidence: Evidence[] = [...caps.evidence.filter((x) => grant.includes(x)), 'none'];
+    return { channel: e.adapter.id, account: e.account, evidence, declaresSender: caps.declaresSender };
+  }
+
+  /** Warn about an `evidence` grant the adapter cannot give (it is only intersected with caps). */
+  private checkGrant(e: RunningChannel): void {
+    const caps = e.adapter.caps(e.account).evidence;
+    const extra = (e.source?.evidence ?? []).filter((x) => x !== 'none' && !caps.includes(x));
+    if (extra.length) this.log('warn', `channel ${e.adapter.id} (${e.account}): evidence ${extra.join(', ')} granted in the config, but the adapter cannot give it (caps.evidence: ${caps.join(', ') || 'none'}); ignored`);
+  }
+
+  /** Count and log (one per reason a minute) what stamping did to an envelope from `e`. */
+  private stamped(e: RunningChannel, env: InboundEnvelope, r: IngressResult): void {
+    const warn = (reason: string, msg: string) => {
+      const now = Date.now();
+      const at = (e.warnedAt ??= new Map()).get(reason);
+      if (at !== undefined && now - at < 60_000) return;
+      e.warnedAt.set(reason, now);
+      this.log('warn', `channel ${e.adapter.id} (${e.account}): ${msg} (status counts every one)`);
+    };
+    if (!r.accepted && r.error?.startsWith(SOURCE_MISMATCH)) {
+      e.rejected++;
+      warn('source', `refused envelope ${env.id}: ${r.error.slice(SOURCE_MISMATCH.length).trim()}`);
+    } else if (r.claimedEvidence !== undefined && r.action !== 'duplicate') {
+      e.evidenceCapped++;
+      warn('evidence', `envelope ${env.id} claims evidence ${r.claimedEvidence}, beyond this channel's cap (grant it with "evidence" on the channel entry); taken as none`);
+    }
   }
 
   /** Build and start one configured channel next to the running ones (live apply). */
@@ -1450,9 +1573,10 @@ ${a.summary}` }],
       await b.close?.().catch(() => undefined);
       throw new Error('gateway stopping');
     }
-    if (this.channels.some((e) => e.adapter.id === b.adapter.id && e.account === b.account)) {
+    const why = idKnown(b) ? idConflict(b.adapter.id, b.owner, b.account, this.channels) : undefined;
+    if (why) {
       await b.close?.().catch(() => undefined);
-      throw new ConfigError(`two channels have the same (channel, account) = (${b.adapter.id}, ${b.account}); give one another account`);
+      throw new ConfigError(why);
     }
     return this.launchChannel(b);
   }
@@ -1465,6 +1589,7 @@ ${a.summary}` }],
       entry.state = 'running';
       delete entry.error;
       if (was === 'failed') this.log('info', `channel ${entry.adapter.id} (${entry.account}) connected`);
+      this.checkGrant(entry);
     } else {
       entry.state = 'failed';
       entry.error = `${st.error ?? 'not connected'}; retrying`;
@@ -1537,6 +1662,9 @@ ${a.summary}` }],
         launched.push(e);
       } catch (err) {
         failed.push({ ...ref(w.c), error: (err as Error).message });
+        // Under its channel id when the entry names one (a bridge's `id`); a module's id is only known once loaded.
+        const id = 'id' in w.c && typeof w.c.id === 'string' ? w.c.id : w.c.type;
+        this.configured.set(`${id}\0${w.c.account}`, { id, account: w.c.account });
         this.log('error', `channel ${w.c.type} (${w.c.account}) not started: ${(err as Error).message}`);
       }
     }
@@ -1548,7 +1676,7 @@ ${a.summary}` }],
       if (e.ended) {
         // Its start rejected: forget it, so the next apply starts it again.
         failed.push({ ...ref(e.source!), error: e.error ?? 'the channel stopped' });
-        if (!this.stopped) await this.stopChannel(e);
+        if (!this.stopped) await this.stopChannel(e, false);
       } else if (e.state === 'failed') failed.push({ ...ref(e.source!), error: e.error ?? 'not connected' });
       else out.started.push(ref(e.source!));
     }
@@ -1565,8 +1693,10 @@ ${a.summary}` }],
   }
 
   /** Stop one running channel and the compositors rendering to it, and forget it. */
-  private async stopChannel(e: RunningChannel): Promise<void> {
+  private async stopChannel(e: RunningChannel, forget = true): Promise<void> {
     e.ac.abort();
+    // Removed from the config: no longer configured. A start that failed stays configured (it is just not running).
+    if (forget) this.configured.delete(`${e.adapter.id}\0${e.account}`);
     await within(e.running, 3000);
     const comps = this.compositors.filter((c) => this.compositorAdapter.get(c) === e.adapter);
     await within(Promise.all(comps.map((c) => c.stop())), 5000);
@@ -1583,16 +1713,20 @@ ${a.summary}` }],
     this.log('info', `channel ${e.adapter.id} (${e.account}) stopped`);
   }
 
-  private startChannel(ch: { adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }): RunningChannel {
+  private startChannel(ch: { adapter: ChannelAdapter; account: string; owner: ChannelOwner; tier?: Tier; config?: unknown; close?: () => Promise<void> }): RunningChannel {
     const ac = new AbortController();
-    const running = ch.adapter
+    // Built before start(): an adapter may emit synchronously, before its first await.
+    const entry: RunningChannel = { adapter: ch.adapter, account: ch.account, ...(ch.tier ? { tier: ch.tier } : {}), ac, running: Promise.resolve(), state: 'running', owner: ch.owner, rejected: 0, evidenceCapped: 0, ...(ch.close ? { close: ch.close } : {}) };
+    entry.running = ch.adapter
       .start({
         account: ch.account,
         config: ch.config,
         signal: ac.signal,
         blobs: this.blobs,
+        // Stamped against this instance: an envelope claiming another (channel, account) is refused.
         emit: async (env) => {
-          const r = await this.accept(env);
+          const r = await this.accept(env, this.emitSource(entry));
+          this.stamped(entry, env, r);
           return { accepted: r.accepted, ...(r.inputId !== undefined ? { inputId: r.inputId } : {}) };
         },
         log: (level, msg) => this.log(level, `${ch.adapter.id}: ${msg}`),
@@ -1610,8 +1744,8 @@ ${a.summary}` }],
           this.log('error', `channel ${ch.adapter.id} stopped: ${err.message}`);
         },
       );
-    const entry: RunningChannel = { adapter: ch.adapter, account: ch.account, ...(ch.tier ? { tier: ch.tier } : {}), ac, running, state: 'running', ...(ch.close ? { close: ch.close } : {}) };
     this.channels.push(entry);
+    this.configured.set(`${ch.adapter.id}\0${ch.account}`, { id: ch.adapter.id, account: ch.account });
     this.log('info', `channel ${ch.adapter.id} (${ch.account}) started`);
     return entry;
   }
@@ -1623,8 +1757,24 @@ ${a.summary}` }],
    * a message never goes out as another bot (decision 8).
    */
   private channelFor(r: { channel: string; account: string }): RunningChannel | undefined {
-    const same = this.channels.filter((x) => x.adapter.id === r.channel);
-    return same.find((x) => x.account === r.account) ?? (same.length === 1 ? same[0] : undefined);
+    const same = this.channels.filter((x) => x.adapter.id === r.channel && !x.ended);
+    const own = same.find((x) => x.account === r.account);
+    if (own) return own;
+    // The fallback counts configured entries, not running ones: a stopped or failed bot b must not turn a into the one bot.
+    return same.length === 1 && this.configuredAccounts(r.channel).length <= 1 ? same[0] : undefined;
+  }
+
+  /** Accounts of the entries configured (or injected) for a channel id, running or not. */
+  private configuredAccounts(channel: string): string[] {
+    return [...this.configured.values()].filter((x) => x.id === channel).map((x) => x.account);
+  }
+
+  /** Why no instance sends to this route: configured but not running, or not configured; and what is available. */
+  private noChannelMessage(r: { channel: string; account: string }): string {
+    const avail = this.channels.filter((x) => !x.ended).map((x) => `${x.adapter.id} (${x.account})`).join(', ') || 'none';
+    const configured = this.configured.has(`${r.channel}\0${r.account}`);
+    const why = configured ? `channel ${r.channel} with account ${r.account} is configured but not running` : `no channel ${r.channel} with account ${r.account} is configured`;
+    return `${why}; never sent as another account (available: ${avail})`;
   }
 
   /** Caps and tier of the running channel that renders replies to (channel, account), for the input's `reply` summary. */
@@ -1633,6 +1783,19 @@ ${a.summary}` }],
     if (!ch) return undefined;
     const caps = ch.adapter.caps(account);
     return { caps, tier: ch.tier ?? caps.defaultTier };
+  }
+
+  /**
+   * Inputs a previous process admitted but never settled (it crashed): rejected
+   * (`host_restarted`), so no id stays queued in a snapshot (`aio sessions`). Before
+   * any lane opens. Runs are settled by `Runs.settleAllDangling`.
+   */
+  private settleLeftoverInputs(): void {
+    for (const key of this.hub.log.sessions()) {
+      if (key.startsWith('run:')) continue;
+      const ids = settleLeftoverInputs(this.hub, key);
+      if (ids.length) this.log('warn', `${key}: ${ids.length} input(s) a previous process left unsettled rejected (host_restarted)`);
+    }
   }
 
   /**
@@ -1756,6 +1919,11 @@ ${a.summary}` }],
     }
   }
 
+  /** A session this daemon has run or registered: its log, a lane, or a pinned agent or launch. */
+  private isOurSession(key: string): boolean {
+    return this.lanes.has(key) || this.hub.log.head(key) > 0 || this.records.agentOf(key) !== undefined || this.records.launchOf(key) !== undefined;
+  }
+
   sessions(): SessionInfo[] {
     // Prepared sessions (session.prepare) are listed before their first input.
     const keys = new Set([...this.hub.log.sessions(), ...this.lanes.keys(), ...this.records.launchedSessions()]);
@@ -1781,6 +1949,9 @@ ${a.summary}` }],
    * running and the next gateway adopts them. Other harnesses are closed (their
    * running turn is interrupted and recorded).
    */
+  /** Set by stop(): no new inbound while the last sends go out. */
+  private refusingInbound = false;
+
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
@@ -1800,14 +1971,15 @@ ${a.summary}` }],
     // A live channel apply in progress finishes (it sees `stopped` and launches nothing more)
     // before the channels are aborted, so none starts after the snapshot below.
     await within(this.applying, 5000);
-    for (const ch of this.channels) ch.ac.abort();
-    await within(Promise.all(this.channels.map((c) => c.running)), 3000);
+    // Inbound is refused from here; channels stay connected until the last sends (rejection
+    // notices, finals) are out: a bridge's start() closes its peer as soon as it is aborted.
+    this.refusingInbound = true;
     // A launched session's own app-server (stdio) ends with it: its lane is closed, not detached.
     const own = new Set([...this.launched].filter(([, x]) => x.owns()).map(([k]) => k));
     const codex = (l: Lane) => !own.has(l.sessionKey) && codexOf(this.o.harness ?? this.instances.get(l.harnessId));
     const detached = [...this.lanes.values()].filter(codex);
     const closed = [...this.lanes.values()].filter((l) => !codex(l));
-    for (const l of detached) l.detach();
+    for (const l of detached) l.detach('gateway stopping');
     const adapters = this.o.harness ? [this.o.harness] : [...this.instances.values()];
     // Bounded by a timer that holds the event loop: harness close() may wait on unref'd timers only.
     await within(
@@ -1821,12 +1993,18 @@ ${a.summary}` }],
     await within(Promise.all(closed.map((l) => l.whenIdle())), 3000);
     await within(Promise.all([...this.launched.values()].map((x) => x.dispose())), 3000);
     await within(Promise.all(this.compositors.map((c) => c.stop())), 5000);
+    // Sends still running settle while their channel and the records are open; no more retries.
+    await this.outbox.drain(5000);
+    for (const ch of this.channels) ch.ac.abort();
+    await within(Promise.all(this.channels.map((c) => c.running)), 3000);
     for (const ch of this.channels) await within(ch.close?.().catch(() => undefined), 3000);
     await within(this.watches.idle(), 3000);
     await within(this.mcp?.close(), 2000);
     await within(new Promise(() => {}), 50);
     this.watches.registry.close();
     this.hostQueue.close();
+    // Anything still sending keeps its in-flight mark; the next start settles it as unknown.
+    this.outbox.close();
     this.records.close();
     this.router.close();
     this.topics.close();
@@ -2020,15 +2198,43 @@ const DEFAULT_LIVE_INSTRUCTIONS =
   'You take part by voice in a live session (a meeting or a call) as this deployment\'s assistant. Speak briefly and naturally, in the language people use. Stay quiet unless someone addresses you. For anything that needs facts, files, tools or actions, delegate it, then report the result accurately, without adding details.';
 
 /** A channel built but not started yet. */
-type BuiltChannel = { adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void>; source?: ResolvedChannel; bind?: (e: RunningChannel) => void };
+type BuiltChannel = { adapter: ChannelAdapter; account: string; owner: ChannelOwner; tier?: Tier; config?: unknown; close?: () => Promise<void>; source?: ResolvedChannel; bind?: (e: RunningChannel) => void };
 
-async function buildChannel(ch: ResolvedChannel, index: number, log: (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void, onState?: (s: BridgeState) => void): Promise<{ adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }> {
+const isBridge = (a: ChannelAdapter): a is BridgedChannel => typeof (a as Partial<BridgedChannel>).state === 'function' && typeof (a as Partial<BridgedChannel>).close === 'function';
+
+/** Its channel id is settled: anything but a bridge without `id` whose peer has not said hello yet. */
+function idKnown(b: { adapter: ChannelAdapter; source?: ResolvedChannel }): boolean {
+  return !(b.source?.type === 'bridge' && b.source.id === undefined && isBridge(b.adapter) && !b.adapter.state().connected);
+}
+
+/**
+ * Why a channel (`id`, `owner`, `account`) cannot run next to `others`, if it cannot:
+ * one channel id belongs to one adapter, only accounts differ (channel-stamping F4), and
+ * bridges and modules never take a built-in id.
+ */
+function idConflict(id: string, owner: ChannelOwner, account: string, others: Iterable<{ adapter: ChannelAdapter; owner: ChannelOwner; account: string }>): string | undefined {
+  if (typeof owner === 'string' && owner !== 'lark-bot' && owner !== 'mail' && RESERVED_CHANNEL_IDS.includes(id)) return `channel id ${JSON.stringify(id)} is a built-in channel id; ${ownerName(owner)} cannot use it`;
+  for (const o of others) {
+    if (o.adapter.id !== id) continue;
+    if (o.owner !== owner) return `channel id ${JSON.stringify(id)} belongs to ${ownerName(o.owner)}; ${ownerName(owner)} cannot use it too (one channel id is one adapter, only accounts differ)`;
+    if (o.account === account) return `two channels have the same (channel, account) = (${id}, ${account}); give one another account`;
+  }
+  return undefined;
+}
+
+async function buildChannel(
+  ch: ResolvedChannel,
+  index: number,
+  log: (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void,
+  onState?: (s: BridgeState) => void,
+  acceptId?: (id: string) => string | undefined,
+): Promise<{ adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }> {
   const tier = ch.tier ? { tier: ch.tier } : {};
   switch (ch.type) {
     case 'lark-bot':
       return { adapter: new LarkBotAdapter(ch.config), account: ch.account, ...tier };
     case 'mail':
-      return { adapter: new MailChannel({ account: ch.account, ...ch.config } as MailChannelConfig), account: ch.account, ...tier };
+      return { adapter: new MailChannel({ ...ch.config, account: ch.account } as MailChannelConfig), account: ch.account, ...tier };
     case 'bridge': {
       const b = await spawnChannel({
         command: ch.command,
@@ -2039,8 +2245,9 @@ async function buildChannel(ch: ResolvedChannel, index: number, log: (level: 'de
         ...(ch.config !== undefined ? { config: ch.config } : {}),
         // A peer that fails its first hello is retried with the restart backoff instead of failing the daemon.
         retryFirstConnect: true,
-        ...(ch.id !== undefined ? { id: ch.id } : {}),
+        ...(ch.id !== undefined ? { id: ch.id, expectId: ch.id } : {}),
         ...(onState ? { onState } : {}),
+        ...(acceptId ? { acceptId } : {}),
       });
       return { adapter: b, account: ch.account, config: ch.config, close: () => b.close(), ...tier };
     }

@@ -178,7 +178,9 @@ attach 里直接输入文字就是 queue 输入；`/steer <text>`、`/interrupt 
 4. 再 `aio serve`；B、C 用 `aio attach --from <最后的 seq>` 重连。
    - [ ] 日志 `reopened to adopt turn …`；终端看到 `── turn … adopted after restart`，随后 `completed`，答案 `done`。
    - [ ] 飞书卡片：重启后 compositor 不接管旧卡片（见缺口），答案只在终端/日志里。
-5. claude-code 下重复第 3 步：停网关会 interrupt 当前轮，应记为 `interrupted`（e2e 未自动覆盖）；重启后下一次输入续接同一 claude 会话。若进程被 kill -9，log 里残留的未结束 turn 在下一轮开始前被记为 `ambiguous`（`host_restarted`）。
+   - [ ] 第 3 步 Ctrl-C 之前在飞书里再发一条（排在长任务后面）：停机时它记 `input.rejected lane_closed: gateway stopping`，飞书里收到 "This message was not processed: the agent stopped or restarted…"；被接管的那一轮的输入不受影响；重启后 `aio sessions` 的排队数为 0。
+5. claude-code 下重复第 3 步：停网关会 interrupt 当前轮，应记为 `interrupted`，它的输入记 `input.rejected interrupted`（卡片显示 Interrupted，不另发提示）；排队中的消息同第 4 步收到提示。重启后下一次输入续接同一 claude 会话。若进程被 kill -9，log 里残留的未结束 turn 在下一轮开始前被记为 `ambiguous`（`host_restarted`），它没被消费的输入记 `input.rejected host_restarted`；排队中的输入在启动时即记 `input.rejected host_restarted`（不发提示，日志里没有路由）。
+6. 把默认实例的命令改成不存在的路径后发一条消息：飞书里收到 "This message was not processed: the agent could not start…"（`start_failed`），不是一片沉默。
 
 ## 已知缺口
 

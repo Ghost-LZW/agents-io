@@ -13,7 +13,7 @@
 - **状态**：`有测试`（主路径与已知边界都有测试）/ `部分覆盖`（主路径有测试，某些路径没有，或某些路径不成立）/ `没有测试`。
 - **不成立**：代码里找到的、与承诺相反的路径。只写读代码确认过的；"可能"表示读代码得出、没有用测试复现。
 
-术语：投递结算的取值是 `delivered` / `rejected` / `unknown`（`packages/protocol/src/events.ts:189-193`），ROADMAP §3 写的 `ambiguous` 在代码里叫 `unknown`；`ambiguous` 是 turn 与 run 的状态。
+术语：投递结算的取值是 `delivered` / `rejected` / `unknown`（`packages/protocol/src/events.ts:189-193`）；`ambiguous` 是 turn 与 run 的状态，不用于投递。
 
 除特别说明，"跨重启"都以守护进程默认的 SQLite 日志为前提（见 RS-9）。
 
@@ -23,17 +23,21 @@
 
 ### IN-1 每条被接纳的输入都有终态
 
-- **承诺**：进入 lane 的每条输入（`input.admitted`）最终有 `input.consumed`、`input.rejected` 或 `input.cancelled` 之一，不会静默消失。
-- **实现**：`packages/session/src/lane.ts:1066-1081`（`finishTurn`：未消费的重排一次，否则 `input.rejected`）；`lane.ts:864-868`（开轮失败 `start_failed`）；`lane.ts:913-915`（harness 中途断开，`ambiguous` 并拒掉未消费的）；`lane.ts:306`、`:610`（`take` / `cancelQueue` 记 `input.cancelled`）；`packages/daemon/src/gateway.ts:1088-1093`（`refuseUnavailable`：还没有 lane 时由网关写 `input.rejected`）。
-- **测试**：`packages/session/test/lane.test.ts` "re-queues admitted-but-unconsumed inputs once, then rejects them"、"closes the turn as ambiguous when the harness stream ends mid-turn"、"interrupts the active turn and optionally clears the queue"、"interrupt-mode input stops the turn and runs next"；`packages/session/test/context.test.ts` "a turn that fails to start leaves the context pending for the next one"；`packages/daemon/test/runs.test.ts` "a session whose recorded agent is gone refuses input with agent_unavailable, never falling back to the default agent"；`packages/daemon/test/topics.test.ts` "a follow-up queued in the old topic while its turn rotates moves to the new topic"。
-- **状态**：部分覆盖。
+- **承诺**：进入 lane 的每条输入（`input.admitted`）最终有 `input.consumed`、`input.rejected` 或 `input.cancelled` 之一，不会静默消失；lane 关闭、detach、守护进程停止或崩溃都不例外（决定 13）。
+- **实现**：`packages/session/src/lane.ts` `finishTurn`（未消费的重排一次，否则 `input.rejected`）；`pump` 的开轮失败（`start_failed`）；`onHarnessClosed`（harness 中途断开，`ambiguous` 并拒掉未消费的）；`take` / `cancelQueue` 记 `input.cancelled`；`stopTimers` → `rejectQueue`（`close` / `detach` 时拒掉排队的，之后 `pump` 和 `handle` 再遇到排队的也拒：关闭中结束的轮次重排的、admission 正等策略钩子的）；`settleDangling`（遗留 turn 结算时拒掉它没被消费的输入，含 steer 进去的）；`settleLeftoverInputs`（启动时拒掉上一个进程留下的 `snapshot.queued`，`gateway.ts` `settleLeftoverInputs` 在任何 lane 打开前对每个非 run session 调用）；`packages/session/src/log.ts` `foldSnapshot`（`turn.adopted` 也把它的输入移出 `queued`）；`packages/daemon/src/gateway.ts` `refuseUnavailable`（还没有 lane 时由网关写 `input.rejected`）。
+- **测试**：`packages/session/test/lane.test.ts` "re-queues admitted-but-unconsumed inputs once, then rejects them"、"closes the turn as ambiguous when the harness stream ends mid-turn"、"interrupts the active turn and optionally clears the queue"、"interrupt-mode input stops the turn and runs next"、"close rejects queued inputs (lane_closed) and the interrupted turn's; nothing stays queued"、"an input requeued as the turn ends during close is rejected, not stranded"、"an input whose admission was awaiting a policy hook when the lane closed is rejected"、"detach rejects the inputs queued behind the running turn (lane_closed, with their route), never the turn's own; the next lane still adopts it"、"crash leftovers: inputs a previous process admitted and never settled are rejected (host_restarted) at startup; the open turn is left to adoption"、"settles a turn nobody adopted as ambiguous before the next turn starts, rejecting its unconsumed inputs"；`packages/session/test/e2e.test.ts` "stop with queued inputs: rejected (lane_closed) and the sender gets a notice on the route; the running turn ends on its own card"；`packages/daemon/test/stop-inputs.test.ts` "stop with queued inputs: they are rejected (lane_closed) and the sender is told on the chat; after a restart nothing stays queued"、"crash leftovers: inputs admitted but never settled by the previous process are rejected (host_restarted) at startup, and the snapshot lists none queued"；`packages/session/test/context.test.ts` "a turn that fails to start leaves the context pending for the next one"；`packages/daemon/test/runs.test.ts` "a session whose recorded agent is gone refuses input with agent_unavailable, never falling back to the default agent"；`packages/daemon/test/topics.test.ts` "a follow-up queued in the old topic while its turn rotates moves to the new topic"。
+- **状态**：部分覆盖（停止、detach、崩溃遗留、遗留 turn 有测试；下面几条仍不成立）。
+- **决定（决定 13，依据原则 1 与 §3 第一条）**：
+  1. **拒绝原因码**：`lane_closed: <关闭原因>`（lane 关闭或 detach 时还在排队，含停止期间重排的；守护进程停止时原因是 `gateway stopping`）；`host_restarted`（上一个进程留下的：启动时的排队遗留，和没人接管的遗留 turn 里没被消费的输入，与该 turn 的 `error.code` 相同）；`start_failed: <错误>` 不变。格式统一为"代码"或"代码: 细节"，渲染端只看冒号前的代码。
+  2. **通知**：只在输入还没进任何一轮渲染时通知（排队中被关闭、开轮失败）：这类 `input.rejected` 带 `replyRoute`（按路由分组，每组一条事件），compositor 在该路由上经 outbox 回一句（`rejectionNotice`，operationId `<session>:rejected:<首个 input id>:<路由>`，幂等）。冒号后的细节不发到通道（可能含路径、主机）。已经有卡片的轮次（`interrupted`、`ambiguous`、`not_consumed`）不带路由、不另发，卡片状态行已经说明。停止时通道已停收，通知是尽力而为（channel 在 compositor 停止之后才 `close`）。
+  3. **崩溃遗留不通知**：`input.admitted` 不带记录（也不带路由），启动时的 `host_restarted` 只落日志、`aio sessions` 排队数归零，不发通道提示。不重放（重放属于 claude-persistence）。
+  4. **接管路径不受影响**：`detach` 只拒排队的，不碰当前 turn 的输入；启动清理跳过日志里仍开着的 turn 的输入（它们不在 `queued`，由接管或 `settleDangling` 结算）；`settleDangling` 只在没人接管时运行（`turn.adopted` 先清掉 `dangling`）。run session（`run:`）的启动清理留给 `Runs`。
 - **不成立**：
-  1. **lane 关闭、detach、守护进程停止时，排队中的输入没有终态。** `stopTimers()` 只置 `closed = true`（`lane.ts:445-446`），`pump()` 之后不再运行（`lane.ts:833` 的 `!this.closed`），队列里的输入不拒也不取消。停止期间 `finishTurn` 重排的输入同样如此（`lane.ts:1080-1081` 先记 `input.admitted queued` 再 `unshift`）。`gateway.stop()` 的 `whenIdle` 只是 3 s 后超时（`gateway.ts:1821`）。
-  2. **重启后也不重放。** `Lane` 构造函数（`lane.ts:229-245`）只恢复 generation、`lastRun`、遗留 turn 和待交 context；排队输入的 `input.admitted` 不带完整记录（`lane.ts:542`、`:554` 只有 `pid()`），无从重建。这些 id 永远留在 `snapshot.queued`（`packages/session/src/log.ts:97-114`），`aio sessions` 的排队数随之虚高（`gateway.ts:1771`）。
-  3. **遗留 turn 结算时不拒它的输入。** `settleDangling`（`lane.ts:802-810`）只写 `turn.completed ambiguous host_restarted`，不为 `inputIds` 写 `input.rejected`（对比 `onHarnessClosed` 会拒）。
-  4. **策略钩子抛错丢输入。** `known.add(inputId)` 在前（`lane.ts:532`），随后无保护地 await `policy.control`（interrupt 模式，`lane.ts:539`）或 `policy.plan`（steer，`lane.ts:573`）。抛错时什么都没记，同 id 重试答 `duplicate`（`lane.ts:531`）。
-  5. **live 委托溢出。** `handoffs` 上限 32（`lane.ts:944-947`），被挤出的、或 harness 一直没开 turn 的委托只有 `input.admitted new_turn`（`lane.ts:939`）。
-  6. 被接管（`turn.adopted`）的 turn 以 `inputs: []` 开始（`lane.ts:997`），harness 没报 consumed 的被接管输入没有终态。
+  1. **策略钩子抛错丢输入。** `known.add(inputId)` 在前（`lane.ts` `input`），随后无保护地 await `policy.control`（interrupt 模式）或 `policy.plan`（steer）。抛错时什么都没记，同 id 重试答 `duplicate`。
+  2. **live 委托溢出。** `handoffs` 上限 32（`onHarnessEvent` 的 `live.handoff`），被挤出的、或 harness 一直没开 turn 的委托只有 `input.admitted new_turn`。
+  3. 被接管（`turn.adopted`）的 turn 以 `inputs: []` 开始，harness 没报 consumed 的被接管输入没有终态（不能凭本进程的 `consumed` 判断：之前的进程可能已记过）。
+  4. **detach 发生在开轮途中（可能）。** 输入已 `startTurn` 交给 Codex unix、`turn.started` 还没记下时停机：日志里它仍在 `queued`、没有开着的 turn，下次启动记为 `host_restarted`，而 Codex 可能已经在跑它（应为 ambiguous）。没有测试复现。
+  5. lane 关闭后到达的输入答 `{ ok: false, reason: 'closed' }`，没进 lane、没有 `input.admitted`；调用方（ingress）是否在原路由上说明不在本条范围内。
 
 ### IN-2 未消费的输入重排一次，再拒绝
 
@@ -80,25 +84,29 @@
 
 ### DL-1 每次投递以一条 delivery.settled 结束
 
-- **承诺**：经 outbox 的每次投递恰好写一条 `delivery.settled`（`delivered` / `rejected` / `unknown`）；不可重试的错误是 `rejected`，重试用尽是 `unknown`，`unknown` 不再重放。
-- **实现**：`packages/session/src/outbox.ts:101-128`（重试循环）、`:131-147`（先写 store 再写日志）、`:87-88`。
-- **测试**：`packages/session/test/outbox.test.ts` "delivers each operationId once, even when called again or concurrently"、"retries with backoff, then settles"、"settles as rejected on a non-retryable error and unknown when retries run out"；`packages/host-mcp/test/host-mcp.test.ts` "send_file on the local route is event-only (no adapter), still settled"。
-- **状态**：部分覆盖。
-- **不成立**：
-  1. `policy.outbound` 在 try 之外 await（`outbox.ts:108-111`），抛错时既不结算也不记录。守护进程自己的包装会接住宿主回调的错误（`gateway.ts:326-334`），但自定义 `policy.outbound` 抛错时成立。
-  2. 单次尝试没有超时：适配器的 `send` 永不返回时永不结算，`inflight` 一直占着（`outbox.ts:89-92`）。
-  3. 守护进程停止不等 outbox：`Gateway.stop()`（`gateway.ts:1790-1834`）先停通道再关 `records` 与日志，正在退避重试的投递随后 `settle` 到已关闭的库上抛错（`outbox.ts:132`），没有结算事件也没有记录。
-  4. 不在承诺范围内（按设计）：卡片流式编辑不经 outbox（`packages/session/src/compositor.ts:562-569`，RECOMMENDATION §3.1"progress 可以丢中间帧"）；宿主 `deliver` 找不到通道直接答 `unknown_channel`（`gateway.ts:1076`）。
+- **承诺**：经 outbox 的每次投递恰好写一条 `delivery.settled`（`delivered` / `rejected` / `unknown`）；不可重试的错误是 `rejected`，重试用尽是 `unknown`，`unknown` 不再重放。单次尝试有上限（`attemptTimeoutMs`，默认 60 s），超时即 `unknown`、不重试（平台可能已收到）。外发检查抛错即 `rejected`（fail closed）。守护进程停止时最多等 5 s 让正在发的投递结算（通道与库都还开着），等待重试的立刻结算为 `unknown`；5 s 后仍在发的保留进行中记录，由下次启动结算（DL-2）。
+- **实现**：`packages/session/src/outbox.ts` `Outbox.run`（政策检查、重试循环、`withTimeout`）、`settle`（先写 store 再写日志）、`drain` / `close`；`Gateway.stop()`（`gateway.ts:1827` 在 compositor 停止之后、通道关闭之前 `outbox.drain(5000)`，`:1835` 在关库之前 `outbox.close()`）。
+- **测试**：`packages/session/test/outbox.test.ts` "delivers each operationId once, even when called again or concurrently"、"retries with backoff, then settles"、"settles as rejected on a non-retryable error and unknown when retries run out"、"an attempt that times out settles unknown and is not retried (the platform may have it)"、"an outbound check that throws rejects (fail closed) and is settled"、"drain waits for running attempts, stops retries; close leaves what still runs in flight for the next recover"；`packages/daemon/test/host.test.ts` "stop waits for a send in flight: it settles before the records close"；`packages/host-mcp/test/host-mcp.test.ts` "send_file on the local route is event-only (no adapter), still settled"。
+- **状态**：有测试。
+- **细节（按原则自决，决定 13）**：
+  1. 超时默认 60 s（飞书上传大文件也够），嵌入方可经 `OutboxOptions.attemptTimeoutMs` 改；超时后的迟到结果被忽略。
+  2. 停止时不再重试：重试前的错误多半表示没发出，但停止后无从确认，记 `unknown` 比留到下次启动更早进日志（原则 1）。
+  3. `close()` 之后新投递答 `rejected`（`outbox closed`，确实没发，不写库），之后的结算不写库也不写日志，进行中记录留给下次启动。
+- **不在承诺范围内（按设计）**：卡片流式编辑不经 outbox（`packages/session/src/compositor.ts:562-569`，RECOMMENDATION §3.1"progress 可以丢中间帧"）；宿主 `deliver` 找不到通道直接答 `unknown_channel`（`gateway.ts:1076`）。
 
 ### DL-2 operationId 幂等，跨重启
 
-- **承诺**：同一 operationId 至多一次平台发送，重复调用返回第一次的结果；结算记录持久，重启后仍幂等。通道再各自做一层（飞书请求 uuid、邮件 Message-ID）。
-- **实现**：`outbox.ts:86-94`；SQLite 表 `daemon_outbox`（`packages/daemon/src/records.ts:34`、`:90-97`，接线 `gateway.ts:336`）；宿主 `deliver` 用 `host:` 命名空间（`gateway.ts:1072-1074`）；飞书 `adapter.ts:503-521`；邮件 `channel/mail/src/outbound.ts:17-21`、`channel/mail/src/adapter.ts:106-138`。输出工具的 operationId 是 `tool:<sessionKey>:<调用 id>`（CHANNELS.md §输出工具）。
-- **测试**：`outbox.test.ts` "delivers each operationId once, even when called again or concurrently"；`packages/daemon/test/host.test.ts` "deliver is idempotent per operationId, across a restart too; an unknown channel is an error"；`channel/lark-bot/test/outbound.test.ts` "is idempotent: same operationId gives one platform message and a stable uuid"、"retries a failed operation under the same uuid"；`channel/mail/test/mail.test.ts` "is idempotent: same operationId, same Message-ID, one transport call"、"retries a pending send with the same Message-ID"；`host-mcp.test.ts` "is idempotent per tool call id"。
-- **状态**：部分覆盖（已结算的有测试；结算前崩溃没有测试）。
+- **承诺**：同一 operationId 至多一次平台发送，重复调用返回第一次的结果；每次尝试在调用适配器**之前**写进行中记录，结算时在同一 savepoint 里写结果并删掉进行中记录。进程在两者之间死掉，下次启动把留下的进行中记录结算为 `unknown`（会话日志写 `delivery.settled`，守护进程日志一条 warn），**不自动重发**；同一 operationId 再来（还没恢复时也一样）直接得到这个 `unknown`。通道再各自做一层（飞书请求 uuid、邮件 Message-ID）。
+- **实现**：`outbox.ts` `Outbox.deliver`（已结算 / 本进程在发 / 上个进程留下的进行中记录，三种都不再发）、`run` 里的 `store.begin`、`recover`；`OutboxStore` 接口加 `begin` / `inFlight` / `allInFlight`，内存实现 `MemoryOutboxStore`；SQLite 表 `daemon_outbox` 与 `daemon_outbox_inflight`（`packages/daemon/src/records.ts:35-36`、`DaemonRecords.put` / `begin`，接线 `gateway.ts:336`），启动时 `gw.outbox.recover()`（`gateway.ts:468`，在通道启动之前）；宿主 `deliver` 用 `host:` 命名空间（`gateway.ts:1072-1074`）；飞书 `adapter.ts:503-521`；邮件 `channel/mail/src/outbound.ts:17-21`、`channel/mail/src/adapter.ts:106-138`。输出工具的 operationId 是 `tool:<sessionKey>:<调用 id>`（CHANNELS.md §输出工具）。
+- **测试**：`outbox.test.ts` "delivers each operationId once, even when called again or concurrently"、"a crash between the in-flight mark and the settlement: the next process settles it unknown and never resends"、"the same operationId is not sent again while an earlier process has it in flight, even before recover"、"marks each attempt in flight before calling the adapter, and settling clears the mark"；`packages/daemon/test/host.test.ts` "deliver is idempotent per operationId, across a restart too; an unknown channel is an error"、"a send in flight when the daemon died is settled unknown on the next start (logged in its session) and not sent again"；`channel/lark-bot/test/outbound.test.ts` "is idempotent: same operationId gives one platform message and a stable uuid"、"retries a failed operation under the same uuid"；`channel/mail/test/mail.test.ts` "is idempotent: same operationId, same Message-ID, one transport call"、"retries a pending send with the same Message-ID"；`host-mcp.test.ts` "is idempotent per tool call id"。
+- **状态**：部分覆盖。
+- **细节（按原则自决，决定 13）**：
+  1. 进行中记录按尝试更新（记 `attempts`、`startedAt`、`turnId`），退避等待期间也在；死在退避里同样记 `unknown`（上一次尝试的结果本来就不明）。
+  2. 进行中记录不随 30 天清理删除：下次启动总会结算它。
+  3. 不自动重发：`unknown` 交给宿主或人决定（原则 6），代价是可能少发一次；重复发送（飞书上传、邮件 SMTP）不可撤回，少发可补。
 - **不成立**：
-  1. 记录只在 `settle` 时写（`outbox.ts:132`），尝试开始前不记。进程在发送与结算之间死掉（或 DL-1 第 3 条的停止），重启后同一 operationId 会再调适配器：飞书只靠请求 uuid 在平台去重窗口内挡住，上传（`image.create` / `file.create`，`adapter.ts:377`、`:384`）没有 uuid 会重复；邮件对 `pending` 记录重跑 SMTP（同一 Message-ID，但 SMTP 不去重）。
-  2. 结算记录 30 天后清理（`records.ts:52-55`），之后同一 operationId 会再发。
+  1. 结算记录 30 天后清理（`records.ts` `outPrune`），之后同一 operationId 会再发。
+  2. 嵌入方不传持久 store 时（`MemoryOutboxStore`）跨进程不成立，见 RS-9。
 
 ### DL-3 回复只回到来源
 
@@ -109,11 +117,17 @@
 
 ### DL-4 多个飞书机器人时不以别的机器人发出
 
-- **承诺**：多账号时 `deliver` / `systemReply` / `replyCaps` / 输出工具按 `(channel, account)` 选实例，只有该通道 id 恰好一个条目时才退回；飞书适配器拒绝发往别的账号的路由（决定 8）。
-- **实现**：`gateway.ts:1625-1628`（`channelFor`）；`compositor.ts:445-448`；`channel/lark-bot/src/adapter.ts:492-495`（`ownRoute`，用于 send / edit / finalize / retract）。
-- **测试**：`multi-lark.test.ts` "a DM to bot b is answered by b only, and its output-tool messages go out through b"、"host deliver: to its own account; an account that is not running is unknown_channel (no fallback with several bots)"、"one bot only: a delivery naming another account still goes out, as that bot's account"、"a binding with match.account only takes that bot's inputs"；`compositor-accounts.test.ts` "a route of account b is rendered by b only"、"restore: only the route's account picks up the open turn and finalizes its card"；`outbound.test.ts` "send / edit / finalize / retract refuse a route of another account, not retryable, without calling the API"。
-- **状态**：部分覆盖。
-- **不成立**：`channelFor` 数的是**当前在跑的条目**，不是配置的条目。机器人 b 被热生效停掉（`gateway.ts:1579-1580`）或启动失败被移除（`gateway.ts:1548-1551`）后只剩 a，`deliver` 与 `systemReply` 把路由改写成 `account: ch.account`（`gateway.ts:1078`、`:1107`），改写后能通过 `ownRoute`，发给 b 的消息以 a 的身份发出。`live_join` 不指定通道时同样（`gateway.ts:1224`、`:1171`）。没有测试。
+- **承诺**：多账号时 `deliver` / `systemReply` / `replyCaps` / 输出工具按 `(channel, account)` 选实例，只有该通道 id 恰好一个**配置条目**时才退回（数配置，不数在跑的：b 停掉或启动失败后 a 不会变成唯一的机器人）；找不到实例时 `deliver` 答 `unknown_channel`，区分“已配置但未运行”与“未配置”，并列出可用的 `(通道, 账号)`；`systemReply` 记 warn 不发；飞书适配器拒绝发往别的账号的路由（决定 8）。
+- **实现**：`gateway.ts` `channelFor` / `configured` / `noChannelMessage`；`compositor.ts:445-448`；`channel/lark-bot/src/adapter.ts:492-495`（`ownRoute`，用于 send / edit / finalize / retract）。
+- **测试**：`multi-lark.test.ts` "a bot that failed to start is configured but not running: its messages are never sent as the other bot"、"a DM to bot b is answered by b only, and its output-tool messages go out through b"、"host deliver: to its own account; an account that is not running is unknown_channel (no fallback with several bots)"、"one bot only: a delivery naming another account still goes out, as that bot's account"、"a binding with match.account only takes that bot's inputs"；`compositor-accounts.test.ts` "a route of account b is rendered by b only"、"restore: only the route's account picks up the open turn and finalizes its card"；`outbound.test.ts` "send / edit / finalize / retract refuse a route of another account, not retryable, without calling the API"。
+- **状态**：已覆盖（停掉或启动失败的账号不退回，已修）。
+
+### DL-4b agent 写出的每条消息带 agent 身份（`SendOp.as`）
+
+- **承诺**：会话的卡片（compositor）和输出工具发出的每条消息都带 `as = session:<sessionKey>`（`agentIdentity`，与来源 `declared`、watch 的 `createdBy` 同一格式），适配器记下它，回流时作为 `declared` 读回（POSITIONING §2 身份表明）。宿主 `deliver` 与系统回复不是 agent 写的，不带 `as`。
+- **实现**：`gateway.ts` `compose`（`as`）与 `HostTools.as`。
+- **测试**：`multi-lark.test.ts` "every agent-authored message carries the agent identity (SendOp.as); host deliveries and system replies carry none"。
+- **状态**：已覆盖。回流时 `agentAccounts` 里的账号声明本部署的 `session:<key>` 即认作 self（守护进程接 `isSelfDeclared`，按会话日志、lane、登记判断），不触发任何规则；测试 "an agent account's message declaring one of our sessions is our own echo: never a turn"。
 
 ### DL-5 外发目的地检查；宿主 outbound 回调失败即拒
 
@@ -213,17 +227,26 @@
 ### ID-3 Origin 由网关盖章，客户端不能设置
 
 - **承诺**：`Origin` "由网关盖章，客户端不能设置"（`inbound.ts:74`）；适配器只提交本命名空间内的 `channelUserId` 与证据（RECOMMENDATION §3.5 第 1 条，POSITIONING §2）。
-- **实现**：只有一半。Origin 的字段确实由 `ingress.process` 计算，但输入全部来自信封自报：每个通道的 `emit` 直接调 `Gateway.accept(env)`（`gateway.ts:1594-1597`），不比较 `env.channel` / `env.account` 与发出它的通道；`evidence`、`declared` 原样采信（`ingress.ts:254-260`）；`Origin.adapter = env.channel`（`ingress.ts:270`）；`ChannelCaps.evidence` 运行时没人读；bridge 的通道 id 来自子进程自己的 hello（`channel/jsonl-bridge/src/host.ts:252`、`:383-385`）。本地 socket 与宿主连接的 origin 由连接决定（`packages/daemon/src/local-server.ts:343-347`、`host.ts:63`、`:178`），这部分成立。
-- **测试**：只有一致性套件要求 `env.channel === adapter.id`（`packages/testkit/src/channel-conformance.ts:73-74`），运行时没有测试。
-- **状态**：没有测试。
-- **不成立**：任何一个通道进程（JSONL bridge、模块通道）发出 `channel: 'lark-bot'`、主人的 `channelUserId`、`evidence: 'platform_signed'`，就被盖章为主人、进主人的会话、按决定 5 走放行 profile，自报的 `replyRoute` 还能通过默认 `Policy.outbound`（`packages/session/src/policy.ts:111-116`）。方案在 `docs/design/channel-stamping/`（提案，待拍板，ROADMAP §4）。
+- **实现**（channel-stamping，决定 13，`docs/design/channel-stamping/`）：
+  1. **来源绑定（C）**：网关为每个通道的 `emit` 构造 `EmitSource`（`gateway.ts` `startChannel` 的 `emit`、`emitSource`），`Ingress.accept(env, source)` 在去重之前核对 `env.channel/account` 与 `replyRoute` 的 `channel/account`，不符即 `accepted:false`、`error` 以 `SOURCE_MISMATCH`（`source_mismatch:`）开头，不进去重表、不写 `input.verify`（`ingress.ts` `accept`、`sourceMismatch`）；网关记日志（每通道每原因每分钟一条）并计 `AdminChannel.rejected`（`gateway.ts` `stamped`）。
+  2. **id 归属（F4）**：一个通道 id 只属于一种适配器（`gateway.ts` `channelOwner`、`idConflict`）；内置 id `lark-bot`/`mail`/`local` 不许 bridge、module 使用；不同 bridge 程序共用 `id` 在配置校验时失败（`config.ts` `resolveChannels`），module、嵌入方适配器与已连上 bridge 的冲突在启动时失败（`startChannels`），live apply 时进 `failed`；bridge 的 id 由配置 `id`（`expectId`）或第一次 hello 固定，换 id 或 hello 的 id 被网关拒绝（`acceptId`）都是 `bad_hello`（`channel/jsonl-bridge/src/host.ts` `connect`）。
+  3. **证据封顶（E3）**：上限 = 条目 `evidence` ∩ `caps.evidence` ∪ `none`，不写时 bridge、module 只有 `device_only`（`config.ts` `UNGRANTED_EVIDENCE`、`gateway.ts` `emitSource`）；超出降为 `none`、`caps.declaresSender` 为 false 时丢 `declared`，在浅拷贝上做，调用方对象不变（`ingress.ts` `capEnvelope`）；`identify`、`Origin`、宿主入站队列、watch 与 `input.verify`（`Gateway.accept` 记 `r.envelope`）都只看封顶后的信封；`RouteExplanation.claimedEvidence` 记原声明，`AdminChannel.evidenceCapped` 计数。
+
+  本地 socket 与宿主连接的 origin 由连接决定（`packages/daemon/src/local-server.ts:343-347`、`host.ts:63`、`:178`）。
+- **测试**：`packages/session/test/ingress.test.ts` "refuses an envelope claiming another channel, account or reply route, without remembering it"、"checks the source before dedup: a forged copy of a seen (channel, account, id) is invalid, not a duplicate"、"caps evidence beyond the source to none: the owner is a stranger, the explanation keeps the claim, the caller object is untouched"、"drops sender.declared when the source may not declare senders, also from a trusted agent account"、"emitter(source) answers like accept(env, source); without a source nothing is checked or capped"；`packages/daemon/test/channel-stamping.test.ts` "a channel claiming another channel as the owner is refused: no lane, no input.verify record, counted"、"a bridge whose hello claims a built-in id is failed: its inbound is never taken, it routes nothing as lark-bot"、"a bridge whose hello takes the id of another running adapter fails the start (F4)"、"one bridge program under one id runs several accounts"、"a bridge may not use a built-in channel id"、"two different bridge programs may not share a channel id; one program with two accounts may"、"parses an evidence grant on any channel entry; entries without one are unchanged"、"a bridge without a grant gives no platform_signed: the owner is a stranger, recorded as none, counted"、"a granted bridge gives it (∩ caps); a grant beyond caps is warned about and ignored"、"an in-process adapter is capped by its caps"；`packages/daemon/test/module-channel.test.ts` "fails when two entries give the same (channel, account), also against another channel"、"without an evidence grant its platform_signed is capped to none (stranger, counted in status, recorded as none)"；`channel/jsonl-bridge/test/bridge.test.ts` "expectId: a hello declaring another id is bad_hello; with retryFirstConnect the peer is restarted and stays refused"、"without expectId the first hello pins the id: a restarted peer declaring another is refused"、"acceptId can refuse a hello id (bad_hello)"、"a refused inbound is answered ok:true with {accepted:false}"；一致性套件 `inbound.channel_id`、`inbound.account`、`inbound.evidence_in_caps`（`packages/testkit/src/channel-conformance.ts`）。
+- **状态**：有测试。
+- **边界**（有意如此，不算不成立）：
+  1. 不传 `source` 的 `Ingress.accept(env)` / `Gateway.accept(env)` 把调用方当受信方（嵌入方自己构造信封、测试），行为与盖章前相同。
+  2. 嵌入方经 `GatewayOptions.channels` 传入的适配器按类归属：同类的多个对象（多个机器人）可共用 id；嵌入方代码与守护进程同等受信。
+  3. 身份键不含账号（`identity.ts` `identityKey`）：F4 之后只有同一种适配器的多个账号共享身份命名空间，不再能跨通道冒充（提案 §10 第 4 项）。
+  4. 出站按 id 退回（DL-4）不属于本条。
 
 ### ID-4 证据不足的主人按陌生人处理
 
 - **承诺**：身份映射命中但证据不在接受集合（默认 `platform_signed`、`dkim_pass`）里时 `principal: null`；文本或 `declared` 里的自称不能冒充主人（决定 3，POSITIONING §4）。
 - **实现**：`packages/session/src/identity.ts:21`、`:109-112`。
 - **测试**：`packages/session/test/policy.test.ts` "an owner address without evidence is a stranger (forged From)"、"a DKIM-verified or platform-signed owner is the owner"、"never accepts a declared identity that names an owner, even from a trusted agent account"；`router.test.ts` "stamps principal and labels only with accepted evidence (default platform_signed, dkim_pass)"、"owners config is the minimal map; a host map overrides it per channel identity and is suspended with its table"。
-- **状态**：有测试（前提是证据本身可信，见 ID-3）。
+- **状态**：有测试。证据本身由 ID-3 保证可信：只可能来自有资格给出它的通道（条目授予 ∩ caps），否则降为 `none`，测试见 ID-3（`channel-stamping.test.ts` "a bridge without a grant gives no platform_signed: the owner is a stranger, recorded as none, counted"）。
 
 ### ID-5 本部署的回流不开轮
 
@@ -288,11 +311,10 @@
 
 ### LN-3 一个 session 至多一个 live
 
-- **承诺**：同一 session 同时至多一个 live；已有 live 时 `live_join` 报错（决定 11）。
-- **实现**：`gateway.ts:1168-1169`；`lane.ts:386`。
-- **测试**：`live.test.ts`（session）"starts the harness live, records live.started, refuses a second one, and needs a harness that has it"；`packages/daemon/test/live.test.ts` "live_join pairs the channel peer with the harness voice; the far side hanging up ends both; live_say / live_leave"。
-- **状态**：部分覆盖（只测了先后两次）。
-- **不成立**：并发的两个 `live_join`（harness 并行调工具时可能发生）都通过 `gateway.ts:1168` 的检查，然后各自 await `openLive`、各自 `lives.set`（`:1173`），B 覆盖 A；lane 拒绝 B（`lane.ts:386`）；B 的 catch 删掉自己的登记并调 `lane.stopLive()`（`gateway.ts:1196-1199`），停掉的是 **A 的**语音；A 的 `live.ended` 到达时表里已没有它（`gateway.ts:1242-1243`），A 的通道端点不会关闭。结果是零个 live 加一个泄漏的会议端点。
+- **承诺**：同一 session 同时至多一个 live；已有 live 时 `live_join` 报错；并发的第二个 `live_join` 在 `await openLive` 之前就被 `joining` 占位拒绝，不碰正在跑的 live，也不为它开端点（决定 11）。
+- **实现**：`gateway.ts` `joinLive`（`joining` 占位）；`lane.ts:386`。
+- **测试**：`live.test.ts`（session）"starts the harness live, records live.started, refuses a second one, and needs a harness that has it"；`packages/daemon/test/live.test.ts` "two concurrent live_join: one wins, the other is refused without touching the running live or opening an endpoint"、"live_join pairs the channel peer with the harness voice; the far side hanging up ends both; live_say / live_leave"。
+- **状态**：已覆盖（先后两次与并发两次）。
 
 ### LN-4 live 任一端结束，两端都结束并记 live.ended
 
@@ -363,10 +385,9 @@
 ### FC-2 harness 起不来时明确拒绝
 
 - **承诺**：开轮失败时本轮输入 `input.rejected start_failed: …`，context 留给下一轮。
-- **实现**：`lane.ts:864-868`。
-- **测试**：`lane.test.ts` "opens the adapter the turn names, attributes events to it, and switches generations when the plan changes it"（断言 `start_failed: no harness nope`）；`context.test.ts` "a turn that fails to start leaves the context pending for the next one"。
-- **状态**：部分覆盖。
-- **不成立**：拒绝只在日志里。compositor 不渲染 `input.rejected`（只有终端渲染器 `packages/daemon/src/render.ts:94` 渲染），飞书或邮件里的发送者收不到任何提示，对他来说消息静默消失。对比 FC-1 会在路由上回一条。
+- **实现**：`lane.ts` `pump`（`input.rejected start_failed: …`，带本批的 `replyRoute`）；`compositor.ts` `notifyRejected` / `rejectionNotice`（在路由上回"the agent could not start"，不带错误细节）。
+- **测试**：`lane.test.ts` "opens the adapter the turn names, attributes events to it, and switches generations when the plan changes it"（断言 `start_failed: no harness nope`）；`context.test.ts` "a turn that fails to start leaves the context pending for the next one"；`e2e.test.ts` "start_failed is visible: the sender gets a notice instead of silence (no detail from the error)"、"a rejection without a route (its turn's card tells the story, or the route is unknown) sends nothing"。
+- **状态**：有测试。
 
 ### FC-3 没有可用的交互 agent 时明确拒绝
 
@@ -422,7 +443,7 @@
 | 话题表 | `packages/session/src/topics.ts:135` | `packages/session/test/topics.test.ts` "switches back, persists across reopen (same database as the log), and keeps native ids"；`daemon/test/topics.test.ts` "chat commands answer with a system reply; switching back after a restart resumes the native session" |
 | 宿主入站队列与游标 | `host-queue.ts:76-87` | `host-queue.test.ts` "push: unacked items are redelivered after a reconnect (at least once), also across a restart" |
 | launch 记录 | `records.ts:36` | `session-launch.test.ts` "a restart reopens the session with its launch and resumes it" |
-| outbox 结算记录 | `records.ts:34` | `host.test.ts` "deliver is idempotent per operationId, across a restart too; an unknown channel is an error" |
+| outbox 结算与进行中记录 | `records.ts:35-36` | `host.test.ts` "deliver is idempotent per operationId, across a restart too; an unknown channel is an error"、"a send in flight when the daemon died is settled unknown on the next start (logged in its session) and not sent again" |
 | 监听与 digest 缓冲 | `watch.ts:124-134` | `watch.test.ts` "buffered items and the watch survive a restart, and flush afterwards"、"is idempotent per (watch, envelope), also across a restart"；`daemon/test/watch.test.ts` "a digest buffered before a gateway restart is delivered after it; it replies to the target home route" |
 | 宿主表与路由解释 | `router.ts:223-247` | `router.test.ts` "persists: a restart keeps the last table, suspended until the host reconnects (unless keep)"、"are persisted: explain(inputId) works across a restart" |
 | 待交出的 context | `lane.ts:245`、`:725` | `context.test.ts` "context recorded but not handed before the restart goes to the next turn; handed context does not" |
@@ -456,16 +477,18 @@
 
 - **承诺**：上一个进程留下的、没被接管的 turn，在下一轮开始前记 `turn.completed ambiguous host_restarted`。任务 run 在启动时就结算（exit 3）。
 - **实现**：`lane.ts:801-833`；`packages/daemon/src/runs.ts:175-192`。
-- **测试**：`lane.test.ts` "settles a turn nobody adopted as ambiguous before the next turn starts"；`runs.test.ts` "a run an earlier daemon left mid-turn is ambiguous (exit 3) after the restart"。
+- **测试**：`runs.test.ts` "a run an earlier daemon left mid-turn is ambiguous (exit 3) after the restart"。
+- **测试（续）**：`lane.test.ts` "settles a turn nobody adopted as ambiguous before the next turn starts, rejecting its unconsumed inputs"（结算时它没被消费的输入记 `input.rejected host_restarted`，不带路由：卡片收尾为 Outcome unknown）。
 - **状态**：部分覆盖。
-- **不成立**：交互 session 只在有新输入时才结算（`lane.ts:832` 要求 `queue.length`），没有新输入的会话的 turn 一直开着（快照、`aio sessions` 显示运行中）；结算时不拒它的输入（IN-1 第 3 条）。
+- **不成立**：交互 session 只在有新输入时才结算（`pump` 要求 `queue.length`），没有新输入的会话的 turn 一直开着（快照、`aio sessions` 显示运行中）。启动时不提前结算，是为了让 compositor 在 lane 打开时接管旧卡片再收尾（RS-1"遗留卡片收尾"）。
 
-### RS-6 排队未开始的输入在重启时丢失
+### RS-6 排队未开始的输入在停止或重启时明确拒绝，不重放
 
-- **现状**：见 IN-1 第 1、2 条。停止时没有任何事件，启动后不重放，`snapshot.queued` 留下幽灵 id。
-- **测试**：无。
-- **状态**：没有测试。
-- **不成立**：IN-1 与原则 5"不丢对话"。
+- **承诺**：停止（含 Codex 的 detach）时排队的输入记 `input.rejected lane_closed: gateway stopping` 并在原路由上通知发送者；崩溃留下的在下次启动时记 `input.rejected host_restarted`；`snapshot.queued` 不留幽灵 id。不重放（决定 13，重放属于 claude-persistence）。
+- **实现**：见 IN-1（`rejectQueue`、`settleLeftoverInputs`、`foldSnapshot`）；`gateway.ts` `stop` 调 `detach('gateway stopping')` / `close('gateway stopping')`，`start` 在接管之前调 `settleLeftoverInputs`。
+- **测试**：`packages/daemon/test/stop-inputs.test.ts` 两条（见 IN-1）；`lane.test.ts` "detach rejects the inputs queued behind the running turn …"、"crash leftovers: …"；`e2e.test.ts` "stop with queued inputs: …"。
+- **状态**：有测试。
+- **与原则不符**：原则 5"不丢对话"仍只做到"不静默丢"：发送者要自己重发。
 
 ### RS-7 不跨重启的状态（按设计或已知）
 
@@ -482,7 +505,7 @@
 - **承诺**：`stop()` 每一步都有上限（通道 3 s、lane 关闭 8 s、`whenIdle` 3 s、compositor 5 s 等），不会因为某个 harness 或通道卡住而挂住。
 - **实现**：`gateway.ts:1785-1834`（`within(...)`）。
 - **测试**：`gateway.test.ts` "socket is private, rejects bad frames, and tells subscribers when the gateway stops"；`daemon/test/live.test.ts` "live_leave ends the live; the gateway stopping ends a running one"。
-- **状态**：部分覆盖（有界本身没有测试；有界的代价是 DL-1 第 3 条、LN-4、IN-1 第 1 条）。
+- **状态**：部分覆盖（有界本身没有测试；有界的代价是 LN-4；outbox 在关库前最多等 5 s，超出的留进行中记录，见 DL-1；超时没报完的 turn 留到下次启动按 RS-5 结算）。
 
 ### RS-9 持久化以 SQLite 日志为前提
 
@@ -543,17 +566,23 @@
 
 按风险从高到低。"不成立"指读代码确认、与文档承诺相反；"未测"指承诺可能成立但没有测试守着。
 
-1. **通道可以冒充别的通道与主人（ID-3，不成立）。** `gateway.ts:1594-1597` 不核对信封的 `channel/account` 与发出它的通道，证据原样采信。任何 bridge 或模块通道都能以主人身份、放行 profile 开轮，并借自报的回复路由以合法机器人发消息。决定 4、5"只标来源、不拦截"的前提因此不成立。修法已有提案（channel-stamping），需要拍板。
-2. **排队中的输入在停止或重启时静默丢失（IN-1 / RS-6，不成立）。** `lane.ts:445-446` 关闭后队列不拒不重放，`input.admitted queued` 不带记录无法重建，`snapshot.queued` 留下幽灵 id。这是 ROADMAP §3 第一条不变量，也是原则 5 的直接反例，且和 RS-5 的"遗留 turn 结算时不拒输入"、FC-2 的"拒绝了但发送者看不到"叠在一起：从发送者看，消息就是没了。最小修法：`close` / `stop` 时对队列写 `input.rejected`（或带记录写 `queued` 并在构造时重放），`settleDangling` 同时拒掉未消费的输入。
+1. ~~**通道可以冒充别的通道与主人（ID-3）。**~~ 已修（channel-stamping，决定 13）：信封的 `channel/account`/回复路由按发出它的通道实例核对，不符拒收；一个通道 id 只属于一种适配器；证据按条目授予 ∩ caps 封顶。见 ID-3。
+2. ~~**排队中的输入在停止或重启时静默丢失（IN-1 / RS-6）。**~~ 已修（决定 13）：停止时拒掉并在原路由通知，崩溃遗留在启动时拒掉，遗留 turn 结算时拒掉它的输入，开轮失败在通道上可见。剩下 IN-1 不成立第 1–5 条（策略钩子抛错、live 委托溢出、被接管输入、开轮途中 detach、关闭后到达）。
 3. **`aio explain` 不能从副作用反查（EX-2，不成立）。** 只接受 inputId，返回路由记录；系统回复、宿主 `deliver`、`live_say` 连手工串的线索都没有。原则 4 与决定 4 都以它为"不拦截"的配套。
 4. **重启丢 turn（RS-3 / RS-4，不成立于原则 5）。** Claude Code 的 turn 被打断；Codex stdio 的 turn 既不接管也不结束，挂到下一条输入才记 ambiguous（RS-5），没有新输入就一直显示运行中。三者都没有测试。
-5. **outbox 结算前崩溃会重复发送；停止时投递可能既不结算也不记录（DL-1、DL-2，不成立）。** `outbox.ts:132` 只在结算时写记录；`stop()` 不等 outbox 就关库；单次尝试无超时。飞书上传与邮件在重放时会真的重复。
+5. ~~outbox 结算前崩溃会重复发送；停止时投递可能既不结算也不记录（DL-1、DL-2）。~~ 已修（决定 13）：发送前写进行中记录，重启后结算为 `unknown` 不重发；`stop()` 有界等待 outbox；单次尝试有超时。
 6. **多机器人退回仍会发生（DL-4，不成立）。** 机器人 b 停掉或启动失败后，`channelFor` 只看到 a，发给 b 的 `deliver` / `systemReply` / `live_join` 改写成 a 发出。决定 8 的本意是"不以别的机器人发出"。
 7. **宿主 `lease` 未实现（HQ-5，不成立）。** HOSTS.md:111 与协议都有，守护进程不读。只拉取的宿主推的默认 `suspend` 表永远不生效。
 8. **宿主 outbound 在宿主离线时退回本地策略（DL-5，不成立于"fail closed"）；`live_join` 目标不过 outbound 检查。**
 9. **并发 `live_join` 停掉已有 live 并泄漏端点（LN-3，不成立）。** 需要在 `gateway.ts:1168` 检查后同步占位。
 10. **入站去重只在内存，部分失败重试会重复进会话（IN-5，不成立）。**
-11. **没有可用交互 agent 时 `accept` 直接抛错（FC-3，不成立）**；harness 起不来时只在日志里拒绝（FC-2）。
+11. **没有可用交互 agent 时 `accept` 直接抛错（FC-3，不成立）**。（harness 起不来时只在日志里拒绝的 FC-2 已修。）
 12. **`closeLane` 窗口可能出现同一键两个 lane（LN-2，可能）**；**监听回复可能回到被监听的群（CF-5，可能）**：都需要先写测试复现。
 13. **未测的承诺**：live 传输拒绝与视频过滤（LN-5）、模块 harness 启动失败（CF-4）、Claude Code 停止时的行为（RS-3）、非 SQLite 持久化（RS-9）、模型输入里的 watch 标记（ID-2）。
-14. **文档本身的出入**：ROADMAP §3 的 `ambiguous` 在投递里叫 `unknown`；决定 12 说 `onBehalfOf` "须显式开启"而它没有开关（RQ-3）；工具默认开启与原则 2 相反（CF-6，ROADMAP 已列复查）；`docs/E2E.md` 的"已知缺口"仍写 outbox 在内存、compositor 不接管旧卡片、没有宿主 MCP 工具，三条都已过时。
+14. **文档本身的出入**：决定 12 说 `onBehalfOf` "须显式开启"而它没有开关（RQ-3）；工具默认开启与原则 2 相反（CF-6，ROADMAP 已列复查）；`docs/E2E.md` 的"已知缺口"仍写 outbox 在内存、compositor 不接管旧卡片、没有宿主 MCP 工具，三条都已过时。
+15. **A 组合并评审（2026-10-11）遗留**，按原则 4 记下，未修：
+    - **启动时为每个会话折叠全量日志**（`settleLeftoverInputs` 调 `hub.snapshot`）：没有压缩时随日志线性增长；等日志压缩一起做。
+    - **崩溃后同一输入两种结局（IN-1，可能）**：digest flush 的 `input.admitted` 落盘后、`endFlush` 前崩溃，重启时 `settleLeftoverInputs` 拒掉该 id，watch 的 redo 又以同一 id 收下并消费（`watch.ts:450`、`:671`）。需先写测试复现。
+    - **同进程兄弟机器人的回流认不出 self（DL-4b）**：lark-bot 的 `declared` 只来自本适配器实例的发送记录，兄弟机器人各有一份，所以兄弟的消息回来不带 `declared`，仍要靠 `selfAccounts`。agent-messaging 提案的出站索引解决它。
+    - **热更新时启动失败的模块通道**按 `type` 记为已配置（模块 id 加载后才知道），同 id 的另一账号仍可能被退回使用（DL-4）。bridge 写了 `id` 时已按 id 记。
+    - 已修：bridge 类通道收不到停止提示（停止时先拒入站、最后才中止通道）；拒绝提示不再带 `as`；`startChannel` 同步 emit 读到未赋值的 `entry`；邮件 `config.account` 覆盖条目账号；停止期间完成的 `live_join` 未关闭。

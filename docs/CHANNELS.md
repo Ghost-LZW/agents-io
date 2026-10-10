@@ -17,6 +17,15 @@ harness 事件 ──▶ SessionLog（seq）──▶ Compositor（读全量，�
 
 **回复只回到来源**：一轮的正式回复只投递到发起它的那个路由。在飞书里发起的轮次，回复只出现在飞书；在终端发起的轮次，飞书不会收到。其他端想看，可以订阅同一个 session 的事件流。
 
+**没被处理的消息会告诉发送者**：一条消息还没进任何一轮就被拒（日志里 `input.rejected` 带 `replyRoute`），compositor 在它的路由上回一句短消息（经 outbox，每条拒绝一次）。目前两种情况：
+
+| 原因（`reason`） | 什么时候 | 发送者看到 |
+|---|---|---|
+| `lane_closed: <原因>` | 守护进程停止 / 重启（或 session 的 lane 关闭）时，这条还在排队 | This message was not processed: the agent stopped or restarted before it got to it. Please send it again. |
+| `start_failed: <错误>` | 这一轮起不来（harness 启动失败、策略出错） | This message was not processed: the agent could not start. Try again later, or ask the operator. |
+
+冒号后的细节只在日志里（可能含路径、主机名），不发到通道。已经开了卡片的轮次（被打断、结果不明）由卡片自己的状态行说明，不再另发。停机时通道已停收，这句提示是尽力而为。进程崩溃（没有正常停止）留下的排队输入在下次启动时记为 `input.rejected host_restarted`，日志里没有它们的路由，不发提示。停机前排队的消息**不会**在重启后重放，需要重发。
+
 ## 1. agent 实际收到的输入长什么样
 
 每条输入在发给 harness 前，前面加一行发送者说明，后面是转换过的内容块：
@@ -119,7 +128,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 - **一个应用只跑一个条目**：两个条目解析出同一 `appId`（同一 `domain`）时启动失败。飞书长连接把每个事件只推给同一应用的其中一条连接，两个条目会各自只收到一部分消息。同一应用也不要同时给两个守护进程用。
 - **账号**：同为 `lark-bot` 的条目账号不得重复；有多个条目时，账号只能是字母、数字和 `.` `_` `-`（至多 64 个字符，以字母或数字开头），因为账号进入路由键与会话键（以 `:` 分隔）。只有一个条目时不强制，含 `:` 时启动告警。账号就是机器人在 agents-io 里的名字：出现在 `aio status`、`ReplyRoute.account`、会话键、Binding 的 `match.account`、watch 的 `source.account`、`input.verify` 记录里；改账号名等于换了一个机器人（旧会话键不再命中）。
 - 上面这些错误让整个守护进程启动失败（`aio` 退出码 2），控制台的 `PUT /api/config` 与 `POST /api/config/validate` 在写入前就以 422 报出。运行时某个机器人连不上只把那一个通道标成 `failed`。
-- **谁发消息**：回复卡片、输出工具（`send_file`、`ask_choice` 等）和宿主 `deliver` 都由路由账号对应的机器人发出。路由账号没有对应的机器人时：通道 id 只有一个条目，就用它发（单机器人部署里宿主写了别的账号名照常可用）；有多个条目则不猜，`deliver` 返回 `unknown_channel` 并列出可用的 `(通道, 账号)`。适配器自己也拒绝发往别的账号的路由。
+- **谁发消息**：回复卡片、输出工具（`send_file`、`ask_choice` 等）和宿主 `deliver` 都由路由账号对应的机器人发出。路由账号没有对应的机器人时：通道 id 只有一个条目，就用它发（单机器人部署里宿主写了别的账号名照常可用）；“只有一个条目”指**配置**的条目：多个条目里的某个机器人停掉或启动失败后，发给它的消息不会改由剩下的那个发出。有多个条目则不猜，`deliver` 返回 `unknown_channel`，区分“已配置但未运行”与“未配置”，并列出可用的 `(通道, 账号)`；系统回复只记 warn。agent 写的消息（卡片、输出工具）带发送身份 `session:<会话键>`（`SendOp.as`），宿主 `deliver` 与系统回复不带。适配器自己也拒绝发往别的账号的路由。
 - 同一条群消息被两个机器人都收到时，变成两条输入、两个会话（会话键含账号）；默认表下只有被 @ 的那个回答，另一个只记入上下文。每个机器人对应哪个 agent 用 Binding 的 `match.account` 表达。
 - 同部署的其他机器人发的群消息，在第一阶段与别家机器人的消息一样处理（发送者是一个 `isBot` 的外部账号），默认表下只记作上下文，不会唤醒。
 
@@ -205,7 +214,17 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 - **agent 看到什么**：完全取决于私有适配器发出的入站信封，经过 §1 的同样转换。
 - **输出怎么处理**：适配器收到 `RenderedMessage`，其中包含 `progress`（结构化过程视图），以及它在 hello 里声明过的方法（edit、finalize 等）。能渲染到什么程度，由适配器自己决定。
 - **档位**：由配置决定。
-- **对端起不来**：首次 `hello` 失败不会让守护进程启动失败。通道显示为 `failed`（`GET /api/status` 给出原因，后缀 `; retrying`），按 `backoff` 重试，连上后变回 `running`（之后对端离开、重连期间同样显示 `failed`）；命令本身无法执行（`ENOENT` / `EACCES`）仍让启动失败。未连接时请求以 `unavailable`（可重试）失败。可选的 `id` 写对端 `hello` 会声明的 adapter id，用于未连接时的显示与路由（默认 `bridge`）。见 `docs/design/bridge-first-connect`。
+- **对端起不来**：首次 `hello` 失败不会让守护进程启动失败。通道显示为 `failed`（`GET /api/status` 给出原因，后缀 `; retrying`），按 `backoff` 重试，连上后变回 `running`（之后对端离开、重连期间同样显示 `failed`）；命令本身无法执行（`ENOENT` / `EACCES`）仍让启动失败。未连接时请求以 `unavailable`（可重试）失败。见 `docs/design/bridge-first-connect`。
+- **通道 id**：可选的 `id` 是这个通道的 id，每次 `hello` 声明的 `adapterId` 都必须等于它，否则按 `bad_hello` 拒绝、杀掉子进程并按 `backoff` 重启（状态 `failed`，原因写明）；未连接时也用它显示与路由。不写 `id` 时第一次成功 `hello` 的 id 被固定，之后的 hello 不许换。见下文"通道盖章"。
+
+### 通道盖章（channel-stamping，决定 13）
+
+适用于所有通道（内置、bridge、module、嵌入方传入的适配器）：
+
+- **信封属于发出它的通道。** 守护进程按"它是从哪个通道实例发出来的"核对信封：`channel`、`account` 必须是该通道的 id 与配置账号，`replyRoute`（若有）也必须指向同一 `(channel, account)`。不符即拒收：`emit` 返回 `{ accepted: false }`（bridge 收到 `result ok:true value {accepted:false}`），不进任何 session、不进去重表、不写 `input.verify`，日志 `warn`（同一通道同一原因每分钟一条），`aio status` / `GET /api/status` 的通道上 `rejected` 计数。**`accepted:false` 是终态，适配器不应重试**；要重试的瞬时故障用抛错（bridge 侧 `ok:false`、`retryable:true`）表达。不支持信封自带跨通道回复路由：在 A 收、在 B 答用 Binding 的 `replyTo` 或宿主 `deliver`。
+- **一个通道 id 只属于一种适配器，只有账号不同。** 内置 id `lark-bot`、`mail`、`local` 保留，bridge 与 module 不得使用；同 id 的 bridge 条目必须是同一程序（`command`/`args` 相同）；同 id 的 module 条目必须是同一模块与导出；嵌入方传入的适配器按类区分。冲突在配置校验（bridge 的 `id`）或启动时（module 的 id、已连上的 bridge 的 hello id）报配置错误；live apply 时进 `failed`；bridge 运行中 hello 换成冲突的 id 按 `bad_hello` 拒绝。
+- **证据按通道封顶。** 通道条目可写 `"evidence": ["platform_signed"]` 等（任何通道类型都可写）。适配器能提交的证据 = 条目的 `evidence` ∩ `caps.evidence`，外加 `none`；不写时 lark-bot、mail 与嵌入方适配器取 `caps.evidence`，**bridge 与 module 只有 `device_only`**（强证据必须显式授予）。超出上限的证据降为 `none`（消息照收，按外部来源处理，决定 3），`aio explain` 里 `claimedEvidence` 记原本声明的值，通道上 `evidenceCapped` 计数；`input.verify` 与宿主入站队列看到的是封顶后的值。授予了 caps 没有的证据会在启动（bridge：连上时）告警并忽略。`caps.declaresSender` 为 false 的通道，入站的 `sender.declared` 被丢弃。
+- 一致性套件（`packages/testkit` `runChannelConformance`）检查 `inbound.channel_id`、`inbound.account`、`inbound.evidence_in_caps`，适配器作者在本地就能发现问题。
 
 ### 私有/外部通道插件（`type: "module"`）
 
@@ -232,7 +251,8 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 
 - 包目录按 `package.json` 的 `exports["."]`（`import`/`default` 条件）或 `main` 解析，ESM 包即可。
 - 模块缺失（路径不存在、包名解析不到）在配置校验阶段就报错；导出不是函数、工厂抛错、返回值缺 `id`/`caps`/`start`/`send` 则在启动时失败，均按配置错误退出（退出码 2）。
-- 适配器的 `id` 要等工厂返回后才知道：两个条目（含内置通道）的 `(id, account)` 相同时启动失败。
+- 适配器的 `id` 要等工厂返回后才知道：两个条目（含内置通道）的 `(id, account)` 相同、id 与别的适配器相同或是内置 id 时启动失败（见上文"通道盖章"）。
+- module 通道默认只能提交 `device_only` 证据；要让它的 `platform_signed` 等被采信，在条目上写 `"evidence": [...]`。
 
 ## 6. 监听（watch）
 

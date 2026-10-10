@@ -72,6 +72,9 @@ export async function runChannelConformance(driver: ChannelConformanceDriver): P
         const e = env as InboundEnvelope;
         e.channel === adapter.id ? ok('inbound.channel_id') : fail('inbound.channel_id', `channel ${e.channel} != adapter ${adapter.id}`);
         e.account === driver.account ? ok('inbound.account') : fail('inbound.account', `account ${e.account} != ${driver.account}`);
+        // The daemon caps anything else to `none` (channel-stamping): claim only what caps say.
+        const ev = adapter.caps(driver.account).evidence;
+        e.sender?.evidence === 'none' || ev.includes(e.sender?.evidence) ? ok('inbound.evidence_in_caps') : fail('inbound.evidence_in_caps', `evidence ${e.sender?.evidence} not in caps.evidence [${ev.join(', ')}]`);
       }
     } else ok('inbound (skipped)');
 

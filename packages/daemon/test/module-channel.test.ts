@@ -63,7 +63,8 @@ describe('module channel config', () => {
 
 describe('module channel gateway', () => {
   it('start() gets account, substituted config and the blob store; its inbound is accepted; close() runs at stop', async () => {
-    const gw = await start([{ type: 'module', module: './fixtures/chan-pkg', account: 'lan', config: { id: 'plug', token: 'env:PLUG_TOKEN' } }], { env: { PLUG_TOKEN: 's3' } });
+    // A module gives platform_signed only when the entry grants it (channel-stamping E3).
+    const gw = await start([{ type: 'module', module: './fixtures/chan-pkg', account: 'lan', evidence: ['platform_signed'], config: { id: 'plug', token: 'env:PLUG_TOKEN' } }], { env: { PLUG_TOKEN: 's3' } });
     const r = recs()['plug:lan']!;
     expect(r.via).toBe('createChannel');
     expect(r.init).toMatchObject({ account: 'lan', config: { token: 's3' } });
@@ -105,6 +106,26 @@ describe('module channel gateway', () => {
       { type: 'module', module: './fixtures/chan-pkg', account: 'a', config: { id: 'dup2' } },
       { type: 'module', module: './fixtures/chan-pkg', account: 'b', config: { id: 'dup2' } },
     ]);
-    await expect(start([{ type: 'module', module: './fixtures/chan-pkg', config: { id: 'fake' } }], { extra: [{ adapter: new FakeChannel('fake') }] })).rejects.toThrow(/same \(channel, account\)/);
+    // One channel id is one adapter (F4): a module may not share an id with another adapter, whatever the account.
+    await expect(start([{ type: 'module', module: './fixtures/chan-pkg', config: { id: 'fake' } }], { extra: [{ adapter: new FakeChannel('fake') }] })).rejects.toThrow(/channel id "fake" belongs to module:.*embedded adapter FakeChannel cannot use it too/);
+    await expect(start([{ type: 'module', module: './fixtures/chan-pkg', config: { id: 'fake' } }], { extra: [{ adapter: new FakeChannel('fake'), account: 'other' }] })).rejects.toThrow(/one channel id is one adapter/);
+    await expect(
+      start([
+        { type: 'module', module: './fixtures/chan-pkg', account: 'a', config: { id: 'dup3' } },
+        { type: 'module', module: './fixtures/chan-default-only.mjs', account: 'b', config: { id: 'dup3' } },
+      ]),
+    ).rejects.toThrow(/channel id "dup3" belongs to module:/);
+    // Nor take a built-in id.
+    await expect(start([{ type: 'module', module: './fixtures/chan-pkg', config: { id: 'lark-bot' } }])).rejects.toThrow(/"lark-bot" is a built-in channel id/);
+  });
+
+  it('without an evidence grant its platform_signed is capped to none (stranger, counted in status, recorded as none)', async () => {
+    const gw = await start([{ type: 'module', module: './fixtures/chan-pkg', account: 'cap', config: { id: 'plug' } }]);
+    const r = recs()['plug:cap']!;
+    await until(() => r.inject);
+    const res = await r.inject!({ id: 'cap-1', sender: { channelUserId: 'alice', evidence: 'platform_signed' }, text: 'hi' });
+    expect(res.accepted).toBe(true);
+    expect(gw.records.verify('channel:plug/cap-1').records).toEqual([expect.objectContaining({ evidence: 'none', principal: null })]);
+    expect(gw.adminStatus().channels.find((c) => c.id === 'plug')).toMatchObject({ evidenceCapped: 1 });
   });
 });

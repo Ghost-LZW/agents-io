@@ -166,6 +166,8 @@ describe('topics in the daemon', () => {
     release();
     const b = await until(() => w.gw.topics.list({ conversation: CONV }).find((t) => t.title === 'Tokyo trip'));
     await until(() => turnsIn(w, b.sessionKey).length === 2);
+    // The tool's reply can arrive after the handover has already run in B.
+    await until(() => tools.length === 1);
     expect(tools).toEqual([expect.objectContaining({ isError: false })]);
     // The follow-up left A's queue and is answered in B, after the handed message, with what B knows.
     const inB = of(read(w, b.sessionKey), 'turn.started').flatMap((x) => x.inputIds);
