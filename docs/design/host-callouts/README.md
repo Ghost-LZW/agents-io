@@ -1,6 +1,6 @@
 # 宿主同步钩子：`resolve` 与 `outbound` 回调，宿主代答
 
-> 状态：已采纳并合入 main（2026-10-07，决定 9）。
+> 状态：已采纳并合入 main（2026-10-07，决定 9）。**2026-10-11 起冻结**（决定 13）：`resolve` / `outbound` 两个钩子保留现有行为，不再加钩子种类、不再扩展参数；后续需求（如决定 12 的代为审批）走静态数据或 `Resolver` 新种类，不走同步钩子。代答 `onBehalfOf` 另需部署方显式开启 `policy.answerOnBehalf`（HOSTS §4.1）。
 > 依据：`docs/POSITIONING.md` §2（机制与策略的判据）、§4（`Policy` 钩子）；`docs/HOSTS.md` §4（"`resolve`、`outbound` 等可选的同步钩子（超时 fail closed）"）；`docs/design/locus/DECISIONS.md` 决定 1–8。
 
 ## 1. 一句话

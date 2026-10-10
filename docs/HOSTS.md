@@ -129,6 +129,8 @@
 
 `host.hello.callouts` 是 `boolean | string[]`：`true` 等于 `["route"]`；列表可含 `route`、`resolve`、`outbound`，未知名字忽略，结果的 `callouts` 列出实际开启的钩子。方案见 `docs/design/host-callouts`。
 
+**`resolve` 与 `outbound` 两个钩子已冻结**（决定 13）：行为不变、照常可用，但不再增加钩子种类或参数，没有使用者之前也不为它们做新设计；新宿主不应依赖它们去表达本可以随表推送的静态规则。
+
 - **`resolve`**：`policy { hook: "resolve", args: { request, ctx } }`（`request.opened` 的事件体与 `TurnContext`，与 `Policy.resolve` 参数相同），答复一个 `Resolver`。超时（配置 `hostCallouts.resolve.timeoutMs`，默认 3000 ms）、出错、答复不合 schema 或宿主不在线时，按守护进程本地策略决定。
 - **`outbound`**：`policy { hook: "outbound", args: { from, to } }`，答复 `{ verdict: "allow" | "deny" }`。开启后超时（`hostCallouts.outbound.timeoutMs`，默认 2000 ms）、出错、答复不合 schema 一律 `deny`；没有开启的宿主时按本地策略。**注意两个方向不同**：宿主在线时失败即拒绝，宿主断开后则回到本地策略，本地允许的去向（如预注册的 `routes`）照常放行——宿主靠 `outbound` 施加的限制在它离线期间不生效。需要离线也受限的部署，应把限制同时写进本地策略（离线时一律拒绝的选项列为后续工作，见 `docs/design/host-callouts` §8）。
 - **代答**：宿主连接（`origin.kind = "system"` 且 `origin.adapter = "host"`；网关与会话 lane 各查一次）发 `resolve` 时可带 `onBehalfOf: "<成员 id>"`。`human` 请求要求该成员在 `principals` 里；日志记 `request.resolved.by = { kind, id: <成员>, via: "host:<名字>" }`。非宿主连接带 `onBehalfOf` 答 `not_eligible`。
