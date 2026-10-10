@@ -141,3 +141,15 @@
 - **`ref` 是 `InputRecord` 的独立字段 `channelRef`，不放进 `channelContext`**：`channelContext` 有适配器与本地客户端可写的部分，`ref` 是供宿主核验的事实，只能由网关按核对过的信封盖章（原则 4）。来源路径：直接派发、只记录、watch；补投与话题转交沿用原输入的引用。说明行里原样输出、不截断（邮件 Message-ID 可能很长），含空白或引号时整体加 JSON 引号；Codex 头里也不加引号，与 Claude Code 一致，方便 agent 原样复制。
 - **输出工具开关的层次**：顶层 `outputTools` 保留，含义收窄为各 agent `tools` 的缺省值，缺省 `false`；有任一 agent 开启时网关才起 MCP 服务。e2e 的场景 agent 跟随配置里默认 agent 的 `tools`（或顶层 `outputTools`），示例配置给 `assistant` 开启。
 - **代答开关名 `policy.answerOnBehalf`，错误码 `on_behalf_not_allowed`**：与 `launch_not_allowed`（部署方没有授权该能力）同一形式；非宿主连接仍先得到 `not_eligible`；未开启时 `features` 不列 `resolve.onBehalfOf`，宿主可按能力名判断。
+
+## 决定 14：测试集按不变量组织
+
+日期：2026-10-11。复查见 `docs/design/test-suite-review/`。按决定 13 的规则由维护者依原则决定。
+
+| 事项 | 决定 | 依据 |
+|---|---|---|
+| 四层（core / local / e2e / live）与测试名里的 `#编号` 标签 | 采用；第一步只做不改行为的三件事：`projects` 配置、给已点名的测试加标签、`check` 脚本 | 原则 4、5：改动能按承诺选测试，维护者（含 agent）知道红了的是哪条承诺 |
+| §3.2 新编号（PR、CN、HC、SE、CT、RQ-5、OB、RT、RN、IN-7、TP、MD、LA-3） | 写进 `docs/INVARIANTS.md` | 原则 4：安全边界等真实契约要有承诺统领 |
+| c2（无承诺的功能测试） | 移入 `local` 层；坏了就删或重写，不机械改断言；本次不批量删 | 原则 2（呈现是投影）、原则 4 |
+| c1（重复、钉实现细节、测已删除的东西） | 删除 | 原则 4 |
+| "不成立"条目 | 每条都要有 `it.fails`；`check` 先警告，补齐后改为报错 | 原则 4：修好时测试变红，承诺状态自动可见 |
