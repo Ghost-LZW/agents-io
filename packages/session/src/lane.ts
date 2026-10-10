@@ -522,6 +522,16 @@ export class Lane {
    */
   detach(reason = 'detached'): void {
     this.detached = true;
+    // Detached while its start was in flight: the harness may already run it, and its own
+    // `turn.started` will not reach the log any more. Recorded open, so the next host adopts it
+    // or settles it as ambiguous, never rejects its inputs as if they never ran (IN-1).
+    const t = this.turn;
+    if (t?.starting) {
+      this.emit({
+        turnId: t.turnId,
+        body: { t: 'turn.started', turnId: t.turnId, inputIds: t.inputs.map((i) => i.inputId), replyRoute: t.replyRoute, initiator: 'host', ...(t.run ? { run: t.run } : {}), ...(t.owner !== null ? { owner: t.owner } : {}) },
+      });
+    }
     this.stopTimers(reason);
   }
 
@@ -645,11 +655,21 @@ export class Lane {
     this.indexCause(input);
 
     if (mode === 'steer') {
-      const r = await this.trySteer(input, expectedTurnId);
+      let r: CommandResult | undefined;
+      try {
+        r = await this.trySteer(input, expectedTurnId);
+      } catch (err) {
+        return this.hookFailed(input, err);
+      }
       if (r) return r;
     } else if (mode === 'interrupt' && this.turn) {
       const t = this.turn;
-      const allowed = (await this.policy.control({ sessionKey: this.sessionKey, op: 'interrupt', origin: input.origin, turn: this.context() })) === 'allow';
+      let allowed: boolean;
+      try {
+        allowed = (await this.policy.control({ sessionKey: this.sessionKey, op: 'interrupt', origin: input.origin, turn: this.context() })) === 'allow';
+      } catch (err) {
+        return this.hookFailed(input, err);
+      }
       if (allowed) {
         this.queue.unshift({ input, attempts: 0 });
         this.emit({ body: { t: 'input.admitted', inputId: input.inputId, disposition: 'queued', ...pid(input) } });
@@ -658,6 +678,17 @@ export class Lane {
       }
     }
     return this.enqueue(input);
+  }
+
+  /**
+   * A policy hook threw while admitting `input` (before it was queued or steered): it is
+   * settled at once (`input.rejected policy_error`, with its route so the sender is told,
+   * like a turn that fails to start), and its id is forgotten so a retry is not a duplicate.
+   */
+  private hookFailed(input: InputRecord, err: unknown): CommandResult {
+    this.known.delete(input.inputId);
+    this.emit({ body: { t: 'input.rejected', inputIds: [input.inputId], reason: `policy_error: ${errMsg(err)}`, ...(input.replyRoute ? { replyRoute: input.replyRoute } : {}) } });
+    return { ok: false, reason: 'policy_error' };
   }
 
   private async enqueue(input: InputRecord): Promise<CommandResult> {
@@ -1193,6 +1224,13 @@ export class Lane {
       const attempts = t.attempts.get(i.inputId) ?? 0;
       if (retry && attempts < limit) requeue.push({ input: i, attempts: attempts + 1 });
       else rejected.push(i.inputId);
+    }
+    // Adopted from an earlier host: no records to requeue, and an earlier process may already have
+    // recorded some consumed, so the log (not this process's `consumed`) says which are still open.
+    if (t.adopted?.size) {
+      const open = [...t.adopted].filter((id) => !t.consumed.has(id));
+      const mine = new Set(t.inputs.map((i) => i.inputId)); // steered in by this process: settled above
+      if (open.length) rejected.push(...unsettledInputsOf(this.o.hub.log.read(this.sessionKey, 0), t.turnId, open).filter((id) => !mine.has(id)));
     }
     if (rejected.length) {
       const reason = status === 'completed' || status === 'failed' ? 'not_consumed' : status;
