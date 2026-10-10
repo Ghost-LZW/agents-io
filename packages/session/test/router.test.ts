@@ -280,13 +280,17 @@ describe('host tables', () => {
     expect((await route(r, env)).deliveries).toEqual([]);
   });
 
-  // INVARIANTS HQ-5 不成立 2: versions are not compared, any version replaces the table, so a late older push wins (the promise leaves monotonicity open: versions are opaque strings with no defined order; written as if they were monotonic); turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('a late older version does not replace a newer table #HQ-5', async () => {
+  it('a late older version does not replace a newer table #HQ-5', async () => {
     const r = router({ hostConnected: true });
     r.putHostTable(hostRule('2'));
-    r.putHostTable(hostRule('1')); // pushed before '2', delivered after it
+    // pushed before '2', delivered after it
+    expect(() => r.putHostTable(hostRule('1'))).toThrow(expect.objectContaining({ code: 'stale_version' }));
     expect(r.hostTable()?.table.version).toBe('2');
     expect((await route(r, env)).deliveries.map((d) => d.sessionKey)).toEqual(['S-2']);
+    // Numerically ordered, not as strings; versions that are not decimal integers are opaque labels.
+    expect(r.putHostTable(hostRule('10')).changed).toBe(true);
+    expect(r.putHostTable(hostRule('b')).changed).toBe(true);
+    expect(r.putHostTable(hostRule('a')).changed).toBe(true);
   });
 
   it('expires at expiresAt #HQ-5', async () => {

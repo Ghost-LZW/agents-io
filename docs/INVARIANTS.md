@@ -194,13 +194,14 @@
 
 ### HQ-5 宿主推送的表带版本，宿主下线时按 onHostDown 生效
 
-- **承诺**：`bindings.put` 整表原子替换，同版本同内容是空操作；宿主推送的表默认 `suspend`，宿主下线期间不生效；重启后保留最后一张表，挂起到宿主重连（`keep` 除外）；只拉取的宿主（`aio tail`）始终视为不在线，它的表用 `onHostDown: "keep"` 加定期重推、每次刷新 `expiresAt` 当租约（HOSTS.md §4、§6；`host.hello.lease` 已删除，决定 13）。
-- **实现**：`router.ts:269-279`、`:312-318`、`:237-247`。
-- **测试**：`router.test.ts` "atomic replace with version; the same version again is a no-op #HQ-5"、"suspends while the host is down (default) or keeps routing with onHostDown: keep #HQ-5"、"persists: a restart keeps the last table, suspended until the host reconnects (unless keep) #HQ-5 #RS-1"、"expires at expiresAt #HQ-5"、"pull-only host lease: onHostDown keep + a periodic re-push with a fresh expiresAt routes without a host connection, and lapses when the re-push stops #HQ-5"；`packages/protocol/test/admin-topics.test.ts` "host.hello has no presence lease (decision 13): pull-only hosts use onHostDown keep + expiresAt #HQ-5"；`host.test.ts` "installs the host table (routing follows it), persists it, and suspends it while the host is away #HQ-5"、"onHostDown keep stays active without a host #HQ-5"。
-- **状态**：部分覆盖。
+- **承诺**：`bindings.put` 整表原子替换，同版本同内容是空操作；新旧版本都是十进制整数时，比当前小的推送被拒（`stale_version`），不替换；宿主推送的表默认 `suspend`，宿主下线期间不生效；重启后保留最后一张表，挂起到宿主重连（`keep` 除外）；只拉取的宿主（`aio tail`）始终视为不在线，它的表用 `onHostDown: "keep"` 加定期重推、每次刷新 `expiresAt` 当租约（HOSTS.md §4、§6；`host.hello.lease` 已删除，决定 13）。
+- **实现**：`router.ts` `putHostTable`（`olderVersion`）、`:312-318`、`:237-247`。
+- **测试**：`router.test.ts` "atomic replace with version; the same version again is a no-op #HQ-5"、"suspends while the host is down (default) or keeps routing with onHostDown: keep #HQ-5"、"persists: a restart keeps the last table, suspended until the host reconnects (unless keep) #HQ-5 #RS-1"、"expires at expiresAt #HQ-5"、"pull-only host lease: onHostDown keep + a periodic re-push with a fresh expiresAt routes without a host connection, and lapses when the re-push stops #HQ-5"；`packages/protocol/test/admin-topics.test.ts` "host.hello has no presence lease (decision 13): pull-only hosts use onHostDown keep + expiresAt #HQ-5"；`host.test.ts` "installs the host table (routing follows it), persists it, and suspends it while the host is away #HQ-5"、"onHostDown keep stays active without a host #HQ-5"；`router.test.ts` "a late older version does not replace a newer table"（原 `it.fails`，已修）。
+- **状态**：有测试。
+- **决定（2026-10-11，依原则 4 自决）**：版本只在两边都是十进制整数时比较（数值比较，不按字符串），覆盖计数器与时间戳两种常见做法；其他形式（哈希、标签）没有可推断的先后，照旧替换，否则用哈希做版本的宿主会被随机拒绝。被拒时错误里写当前版本，宿主重置计数器后推一个更大的版本即可恢复（宿主没有删表的帧）。
 - **不成立**：
   1. ~~**`lease` 没有实现。**~~ 已删（决定 13）：`host.hello.lease`、`HostHelloResult.lease`、`AdminHostState.leaseExpiresAt` 从协议与 schema 删除；租约的正式做法是 `onHostDown: "keep"` + 重推刷新 `expiresAt`。旧宿主仍带 `lease` 不会被拒（对象 schema 允许多余字段），只是被忽略。
-  2. 版本不比较先后：任何版本都替换当前表（`router.ts:270-275`），迟到的旧推送会覆盖新表。文档只说"带版本号"，没说单调；若宿主依赖单调，这里不成立。测试：`it.fails` `packages/session/test/router.test.ts` "a late older version does not replace a newer table #HQ-5"（以"单调"为准写的；若决定版本不保证单调，删掉它并在承诺里写明）。
+  2. ~~版本不比较先后~~：已修，见上面的决定。
 
 ### HQ-6 同一时刻至多一个宿主；接管要 token；/ws 有心跳
 
