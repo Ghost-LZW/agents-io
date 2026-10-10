@@ -230,13 +230,28 @@ describe('who may watch', () => {
     await w.close();
   });
 
-  // INVARIANTS CF-5 不成立 (可能, now reproduced): neither Policy.watch nor WatchDispatcher.add compares the source with the target's home route; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails("a watch whose source is the target session's home route is refused #CF-5", async () => {
+  it("a watch whose source is the target session's home route is refused #CF-5", async () => {
     // A group's @-session watching the same group: its trigger turns would answer in the group it watches.
     const w = world({ home: { channel: 'fake', account: 'default', conversationId: 'g1' } });
     const r = await w.watches.add(OWNER, draft({ mode: 'trigger', source: { channel: 'fake', conversation: 'g1' } }));
     await w.close();
     expect(r).toMatchObject({ ok: false });
+  });
+
+  it("a broader trigger watch covering the target's home conversation records that conversation's messages as context, never a turn there #CF-5", async () => {
+    const w = world({ home: { channel: 'fake', account: 'default', conversationId: 'g1' } });
+    expect((await w.watches.add(OWNER, draft({ mode: 'trigger', source: { channel: 'fake', conversationKind: 'group' } }))).ok).toBe(true);
+    // A context watch of the home conversation starts no turn: allowed.
+    expect((await w.watches.add(OWNER, draft({ id: 'w2', source: { channel: 'fake', conversation: 'g1' } }))).ok).toBe(true);
+    const home = await w.ingress.accept(fakeEnvelope({ id: 'h1', sender: eve, conversation: group, text: 'in the home group' }));
+    expect(home.watched?.find((x) => x.watchId === 'w1')).toMatchObject({ action: 'context' });
+    const other = await w.ingress.accept(fakeEnvelope({ id: 'o1', sender: eve, conversation: { id: 'g2', kind: 'group' }, text: 'elsewhere' }));
+    expect(other.watched?.find((x) => x.watchId === 'w1')).toMatchObject({ action: 'trigger' });
+    await w.idle();
+    // One turn, started by the other group; the home group's message only rides along as context (IN-6).
+    expect(w.turns).toHaveLength(1);
+    expect(w.turns[0]!.at(-1)!.content).toEqual([{ type: 'text', text: 'elsewhere' }]);
+    await w.close();
   });
 
   it('expired watches stop matching and are removed #RT-1', async () => {

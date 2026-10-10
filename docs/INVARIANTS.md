@@ -590,11 +590,11 @@
 
 ### CF-5 监听开的轮次永远不回到被监听的会话
 
-- **承诺**：trigger 与 digest 开的轮次回复到目标 session 的主路由，永远不回到被监听的那个会话（CHANNELS.md:275，`watch.ts:405-409` 注释）。
-- **实现**：`gateway.ts:368`（`replyRoute: homeRoute(target)`）、`:1672-1675`。没有任何地方比较主路由与 `w.source`。
-- **测试**：`watch.test.ts` "never delivers into the session the input already went to #CF-5"（只覆盖"输入本身已进目标 session"的情况）。
-- **状态**：部分覆盖。
-- **不成立**（决定 14 已复现）：群 G 的 @ 会话自己建一个监听 G 中非 @ 消息的 watch 时，目标的主路由就是 G，trigger 开的轮次会回到 G。`Policy.watch`（`policy.ts:135`）与 `add`（`watch.ts:485-486`）都不拒绝 source 与目标主路由相同。测试：`it.fails` `packages/session/test/watch.test.ts` "a watch whose source is the target session's home route is refused #CF-5"。
+- **承诺**：trigger 与 digest 开的轮次回复到目标 session 的主路由，永远不回到被监听的那个会话（CHANNELS.md 监听一节，`watch.ts` 注释）。
+- **实现**：`gateway.ts`（`replyRoute: homeRoute(target)`）；`packages/session/src/watch.ts` `add`（不是 `context` 的监听，source 按 id 点名目标主路由所在的会话即拒，`invalid`）、`deliver`（`fromHome`：来自主路由会话的消息 trigger 降为 context、不进 digest 缓冲，覆盖按类型匹配的宽 source）。
+- **测试**：`watch.test.ts` "never delivers into the session the input already went to #CF-5"、"a watch whose source is the target session's home route is refused"（原 `it.fails`，已修）、"a broader trigger watch covering the target's home conversation records that conversation's messages as context, never a turn there #CF-5"。
+- **状态**：有测试。
+- **决定（2026-10-11，依原则 4 与本条承诺自决）**：建监听时能判断的（source 点名这个会话）直接拒，错误说明原因并提示改用 `context`；宽 source 不拒（主人从私聊监听"所有群"是正常用法），按消息降级。`context` 监听不开轮，不受限制。主路由随最近一轮变化，建监听时的判断只是当时的主路由；之后变成被监听会话的情况由按消息的检查兜住。
 
 ### CF-6 给模型的工具默认关闭，按 agent 开启
 

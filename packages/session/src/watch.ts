@@ -3,6 +3,7 @@ import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import {
   Watch,
   errors,
+  routeKey,
   type ContentBlock,
   type InboundEnvelope,
   type InputRecord,
@@ -317,6 +318,11 @@ export class WatchRegistry {
   }
 }
 
+/** `source` names the conversation of `route` by id (the account, when given, must match). */
+function namesRoute(source: WatchSource, route: ReplyRoute): boolean {
+  return source.channel === route.channel && (source.account === undefined || source.account === route.account) && source.conversation === route.conversationId;
+}
+
 /** Throws `WatchError('invalid')` naming the first problems. */
 export function validateWatch(w: unknown): asserts w is Watch {
   const errs = errors(Watch, w);
@@ -488,6 +494,15 @@ export class WatchDispatcher {
     } catch (e) {
       return { ok: false, code: 'invalid', message: (e as Error).message };
     }
+    // CF-5: a watch that starts turns answers on the target's home route; watching that very
+    // conversation would answer in the conversation it watches. (Broader sources that cover it
+    // are caught per message in `deliver`.)
+    if (watch.mode !== 'context') {
+      const home = await this.route(watch);
+      if (home && namesRoute(watch.source, home)) {
+        return { ok: false, code: 'invalid', message: `${describeSource(watch.source)} is where session ${watch.target.sessionKey} answers (${routeKey(home)}): a ${watch.mode} watch would reply into the conversation it watches; use mode "context" or another target` };
+      }
+    }
     const existing = this.registry.raw(watch.id);
     if (existing && !(await this.mayRemove(by, existing))) return { ok: false, code: 'forbidden', message: `watch ${watch.id} exists and belongs to ${existing.createdBy}` };
     if ((await this.policy.watch({ watch, by })) !== 'allow') return { ok: false, code: 'forbidden', message: `not allowed to watch ${describeSource(watch.source)}` };
@@ -608,6 +623,9 @@ export class WatchDispatcher {
     let verdict = await this.policy.triage({ watch: w, input });
     // Our own echoes may be recorded, never start a turn: a watch can not loop on its own output.
     if (origin.self && verdict === 'trigger') verdict = 'context';
+    // CF-5: a message from the conversation the target answers in never starts a turn (or a digest) there.
+    const fromHome = w.mode !== 'context' && verdict !== 'drop' && (await this.fromHome(w, env));
+    if (fromHome && verdict === 'trigger') verdict = 'context';
     if (verdict === 'drop') return { watchId: w.id, sessionKey, action: 'drop', inputId: input.inputId };
     // A trigger input is a new input even for a revision (the earlier one may already have run).
     const trigger = async (): Promise<InputRecord> => ({ ...input, inputId: env.revisionOf !== undefined ? watchInputId(w.id, envKey) : input.inputId, replyRoute: await this.route(w) });
@@ -628,7 +646,7 @@ export class WatchDispatcher {
       return { watchId: w.id, sessionKey, action: 'trigger', inputId: trig.inputId, result };
     }
     const result = await lane.observe(input);
-    if (w.mode === 'digest' && !origin.self) {
+    if (w.mode === 'digest' && !origin.self && !fromHome) {
       const sender = typeof base.senderName === 'string' ? base.senderName : (origin.principal?.id ?? env.sender.channelUserId);
       const n = this.registry.buffer(w.id, {
         envKey,
@@ -647,6 +665,12 @@ export class WatchDispatcher {
 
   private async route(w: Watch): Promise<ReplyRoute | null> {
     return (await this.o.replyRoute?.(w)) ?? null;
+  }
+
+  /** The envelope comes from the conversation the watch's turns answer in. */
+  private async fromHome(w: Watch, env: InboundEnvelope): Promise<boolean> {
+    const home = await this.route(w);
+    return !!home && home.channel === env.channel && home.account === env.account && home.conversationId === env.conversation.id;
   }
 
   private schedule(id: string): void {
