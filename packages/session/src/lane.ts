@@ -436,6 +436,24 @@ export class Lane {
     return this.serial(async () => {
       if (this.closed) return;
       await this.ensureSession(run ?? this.lastRun ?? (await this.policy.plan({ sessionKey: this.sessionKey, inputs: [] })));
+      // RS-5: a turn left open by an earlier host gets this open as its chance to be adopted
+      // (the events the harness queued on open run first); if it is not, it is settled now,
+      // not when some later input arrives.
+      if (this.dangling && !this.adoptionChecked) {
+        this.adoptionChecked = true;
+        setTimeout(() => void this.settleLeftover().catch(() => undefined), 0);
+      }
+    });
+  }
+
+  /**
+   * Settle a turn an earlier host left open and nobody adopted (`turn.completed ambiguous
+   * host_restarted`), without opening the harness: for a host that knows its harness cannot
+   * adopt (its process died with the previous host). No-op when there is none or one runs.
+   */
+  settleLeftover(): Promise<void> {
+    return this.serial(async () => {
+      if (!this.turn && !this.closed && !this.detached) this.settleDangling();
     });
   }
 

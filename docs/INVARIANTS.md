@@ -506,21 +506,22 @@
 - **状态**：有测试（现状如实；与原则 5 不符的部分见下）。
 - **与原则不符**：原则 5。已列入 ROADMAP §4 第 6 项（`docs/design/claude-persistence.md`）。
 
-### RS-4 Codex（stdio）正在跑的 turn 在重启时丢失，且日志里不结束
+### RS-4 Codex（stdio）正在跑的 turn 在重启时丢失，下次启动时结算
 
-- **现状**：停止时网关按 harness 类型挑出 Codex lane 一律 detach（`gateway.ts:1808-1816`），但 stdio 的 app-server 随守护进程退出（`harness/codex/src/harness.ts:415-427` 注释"over stdio it dies with us"）。turn 既没被接管也没被结束，留在日志里，直到 RS-5。
-- **测试**：`it.fails` `packages/daemon/test/stop-inputs.test.ts` "Codex over stdio mid-turn at stop: after the next start, with no new input, the turn is settled (ambiguous host_restarted) and the snapshot no longer shows it running #RS-4 #RS-5"。
-- **状态**：不成立（只有 `it.fails`）。
-- **不成立**（决定 14 已复现：停止时所有 Codex lane 都 detach，`adoptRunningTurns` 只重开 unix 的）：与"确定地续上"相反，且比 Claude Code 更差：后者至少记了 `interrupted`。
+- **现状**：停止时网关按 harness 类型挑出 Codex lane 一律 detach（`gateway.ts` `stop`），但 stdio 的 app-server 随守护进程退出（`harness/codex/src/harness.ts` 注释"over stdio it dies with us"），turn 不能续上。
+- **承诺**：下次启动时不等新输入就结算：`turn.completed ambiguous host_restarted`，快照不再显示它在跑，旧卡片按 RS-1 收尾。
+- **实现**：`gateway.ts` `adoptRunningTurns`（不是 Codex unix 的遗留 turn：建 lane、`Lane.settleLeftover()`，不打开 harness）；`lane.ts` `settleLeftover` → `settleDangling`。
+- **测试**：`packages/daemon/test/stop-inputs.test.ts` "Codex over stdio mid-turn at stop: after the next start, with no new input, the turn is settled (ambiguous host_restarted) and the snapshot no longer shows it running"（原 `it.fails`，已修）。
+- **状态**：有测试。
+- **与原则不符（仍然）**：原则 5"确定地续上"：stdio 的 turn 仍然丢失，只是结局确定、可见。续上要 app-server 比守护进程活得久（unix 传输，RS-2）。
 
-### RS-5 遗留 turn 在下一条输入时记 ambiguous
+### RS-5 遗留 turn 不等新输入就结算
 
-- **承诺**：上一个进程留下的、没被接管的 turn，在下一轮开始前记 `turn.completed ambiguous host_restarted`。任务 run 在启动时就结算（exit 3）。
-- **实现**：`lane.ts:801-833`；`packages/daemon/src/runs.ts:175-192`。
-- **测试**：`runs.test.ts` "a run an earlier daemon left mid-turn is ambiguous (exit 3) after the restart #RS-5 #RN-1"。
-- **测试（续）**：`lane.test.ts` "settles a turn nobody adopted as ambiguous before the next turn starts, rejecting its unconsumed inputs #IN-1 #RS-5"（结算时它没被消费的输入记 `input.rejected host_restarted`，不带路由：卡片收尾为 Outcome unknown）。
-- **状态**：部分覆盖。
-- **不成立**：交互 session 只在有新输入时才结算（`pump` 要求 `queue.length`），没有新输入的会话的 turn 一直开着（快照、`aio sessions` 显示运行中）。启动时不提前结算，是为了让 compositor 在 lane 打开时接管旧卡片再收尾（RS-1"遗留卡片收尾"）。测试：`it.fails` `packages/session/test/lane.test.ts` "a leftover turn nobody adopts is settled ambiguous once the lane opens, without waiting for a new input #RS-5"（修的时候要在 compositor 接管旧卡片之后再结算）。
+- **承诺**：上一个进程留下的、没被接管的 turn，记 `turn.completed ambiguous host_restarted`：harness 可能接管的（Codex unix），在 lane 打开、harness 有机会接管之后；不能接管的，在启动时（RS-4）；都不等新输入。有新输入时仍在开轮之前结算。任务 run 在启动时就结算（exit 3）。
+- **实现**：`lane.ts` `open`（打开后、harness 开时排的事件处理完再 `settleLeftover`）、`settleLeftover`、`pump`（`awaitAdoption` / `settleDangling`）；`gateway.ts` `adoptRunningTurns`；`packages/daemon/src/runs.ts` `settleAllDangling`。
+- **测试**：`runs.test.ts` "a run an earlier daemon left mid-turn is ambiguous (exit 3) after the restart #RS-5 #RN-1"；`lane.test.ts` "settles a turn nobody adopted as ambiguous before the next turn starts, rejecting its unconsumed inputs #IN-1 #RS-5"（结算时它没被消费的输入记 `input.rejected host_restarted`，不带路由：卡片收尾为 Outcome unknown）、"a leftover turn nobody adopts is settled ambiguous once the lane opens, without waiting for a new input"（原 `it.fails`，已修）；`stop-inputs.test.ts` RS-4 那条。
+- **状态**：有测试。
+- **决定（2026-10-11，依原则 1、5 自决）**：结算经 lane 发出（不在启动时直接写日志），这样 compositor 先在 lane 建起时接管旧卡片、再按 ambiguous 收尾（RS-1"遗留卡片收尾"）。启动时只为 Codex unix 打开 harness；其余不打开（Claude Code、Codex stdio 的进程已随上个守护进程退出，打开只会白起一个进程）。会话的 agent 已不在（FC-1）时建不了 lane，turn 留着，守护进程记 warn。
 
 ### RS-6 排队未开始的输入在停止或重启时明确拒绝，不重放
 
@@ -752,7 +753,7 @@
 1. ~~**通道可以冒充别的通道与主人（ID-3）。**~~ 已修（channel-stamping，决定 13）：信封的 `channel/account`/回复路由按发出它的通道实例核对，不符拒收；一个通道 id 只属于一种适配器；证据按条目授予 ∩ caps 封顶。见 ID-3。
 2. ~~**排队中的输入在停止或重启时静默丢失（IN-1 / RS-6）。**~~ 已修（决定 13）：停止时拒掉并在原路由通知，崩溃遗留在启动时拒掉，遗留 turn 结算时拒掉它的输入，开轮失败在通道上可见。剩下 IN-1 不成立第 1–5 条（策略钩子抛错、live 委托溢出、被接管输入、开轮途中 detach、关闭后到达）。
 3. **`aio explain` 不能从副作用反查（EX-2，不成立）。** 只接受 inputId，返回路由记录；系统回复、宿主 `deliver`、`live_say` 连手工串的线索都没有。原则 4 与决定 4 都以它为"不拦截"的配套。
-4. **重启丢 turn（RS-3 / RS-4，不成立于原则 5）。** Claude Code 的 turn 被打断；Codex stdio 的 turn 既不接管也不结束，挂到下一条输入才记 ambiguous（RS-5），没有新输入就一直显示运行中。三者都没有测试。
+4. **重启丢 turn（RS-3 / RS-4，不成立于原则 5）。** Claude Code 的 turn 被打断；Codex stdio 的 turn 不能接管，~~挂到下一条输入才记 ambiguous~~ 现在下次启动时就记 ambiguous（RS-4、RS-5 已修，2026-10-11）。turn 本身仍然丢失。
 5. ~~outbox 结算前崩溃会重复发送；停止时投递可能既不结算也不记录（DL-1、DL-2）。~~ 已修（决定 13）：发送前写进行中记录，重启后结算为 `unknown` 不重发；`stop()` 有界等待 outbox；单次尝试有超时。
 6. **多机器人退回仍会发生（DL-4，不成立）。** 机器人 b 停掉或启动失败后，`channelFor` 只看到 a，发给 b 的 `deliver` / `systemReply` / `live_join` 改写成 a 发出。决定 8 的本意是"不以别的机器人发出"。
 7. ~~**宿主 `lease` 未实现（HQ-5，不成立）。**~~ 已删（决定 13）：只拉取的宿主用 `onHostDown: "keep"` + 定期重推刷新 `expiresAt`，HOSTS §4、§6 写明。

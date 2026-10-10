@@ -126,8 +126,7 @@ describe('inputs left when the daemon stops or crashes (INVARIANTS IN-1, RS-6)',
     expect(w2.harness.sessions[0]!.args.resume).toBe('native-1');
   });
 
-  // INVARIANTS RS-4 不成立 1: a Codex stdio lane is detached at stop like a unix one, and nothing settles its turn at start without new input; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('Codex over stdio mid-turn at stop: after the next start, with no new input, the turn is settled (ambiguous host_restarted) and the snapshot no longer shows it running #RS-4 #RS-5', async () => {
+  it('Codex over stdio mid-turn at stop: after the next start, with no new input, the turn is settled (ambiguous host_restarted) and the snapshot no longer shows it running #RS-4 #RS-5', async () => {
     const dir = tmp();
     const raw = {
       dataDir: dir,

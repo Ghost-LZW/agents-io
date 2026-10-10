@@ -1868,19 +1868,29 @@ ${a.summary}` }],
   /**
    * Sessions the log shows mid-turn were left by a previous process. A Codex
    * app-server on a Unix socket may still be running that turn: open the session
-   * now so the harness adopts it (turn.adopted) instead of waiting for input.
+   * now so the harness adopts it (turn.adopted; if it does not, the lane settles it).
+   * Any other harness died with the previous process (Codex over stdio, Claude Code
+   * killed mid-turn): the turn is settled now (ambiguous, host_restarted; RS-4, RS-5)
+   * through its lane, so the compositor takes over the old card and finalizes it,
+   * without opening a harness session and without waiting for a new input.
    */
   private async adoptRunningTurns(): Promise<void> {
     for (const key of this.hub.log.sessions()) {
       if (key.startsWith('run:')) continue; // runs are settled at start (Runs.settleAllDangling)
       const snap = this.hub.snapshot(key);
+      if (!snap.turn) continue;
       const inst = this.instanceOf(snap.harness);
-      if (!snap.turn || inst?.kind !== 'codex' || inst.codex.transport.kind !== 'unix') continue;
+      const adoptable = inst?.kind === 'codex' && inst.codex.transport.kind === 'unix';
       try {
-        await this.lane(key).open();
-        this.log('info', `${key}: reopened to adopt turn ${snap.turn.turnId}`);
+        if (adoptable) {
+          await this.lane(key).open();
+          this.log('info', `${key}: reopened to adopt turn ${snap.turn.turnId}`);
+        } else {
+          await this.lane(key).settleLeftover();
+          this.log('warn', `${key}: turn ${snap.turn.turnId} was running when the previous daemon stopped and its harness cannot resume it; settled ambiguous (host_restarted)`);
+        }
       } catch (e) {
-        this.log('warn', `${key}: could not reopen: ${(e as Error).message}`);
+        this.log('warn', `${key}: could not ${adoptable ? 'reopen' : 'settle the turn it left'}: ${(e as Error).message}`);
       }
     }
   }

@@ -487,8 +487,7 @@ describe('Lane: host restart', () => {
     expect(terminalOf(a.events(), 'x')).not.toEqual([]);
   });
 
-  // INVARIANTS RS-5 不成立: an interactive session settles a leftover turn only when a new input arrives (`pump` needs `queue.length`); without one the turn stays open; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('a leftover turn nobody adopts is settled ambiguous once the lane opens, without waiting for a new input #RS-5', async () => {
+  it('a leftover turn nobody adopts is settled ambiguous once the lane opens, without waiting for a new input #RS-5', async () => {
     const a = await firstHost();
     const lane2 = nextLane(a.hub, new ManualHarness());
     await lane2.open();
