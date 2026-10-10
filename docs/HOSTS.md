@@ -105,6 +105,10 @@
 - 一个渠道身份至多对应一个成员、多人共用账号不得绑定，由宿主保证；冲突时守护进程报错。
 - 无宿主时，本地 `owners` 配置是映射的最简形式。
 - 渠道与证据由守护进程盖章（channel-stamping，决定 13）：信封的 `channel/account` 必须是发出它的通道实例，否则拒收；证据以该通道条目的 `evidence` ∩ 适配器 caps 为上限（bridge、module 默认只有 `device_only`），超出的降为 `none`。宿主看到的身份证据因此只可能来自有资格给出它的通道，见 `docs/CHANNELS.md` §5"通道盖章"。
+- **agent 的身份**（agent 通信地基，`docs/design/agent-messaging/`）：每个 agent 的地址是它的名字，每个会话是 `<agent>/<sessionKey>`（路由形式 `agent:<agent>:<sessionKey>`）。本部署 agent 产生的输入由守护进程盖章：`kind: "agent"`、主体默认 `agent:<agent>`（标签 `agent`）、证据 `daemon`（新的一档：守护进程自己产生的记录，适配器不能声明）、`via` 为发送会话的地址。宿主可以用身份映射把 `{ channel: "agent", channelUserId: "<agent>" }` 映射成自己的成员 id 与标签；**agent 主体不能带 `owner` 标签**，映射里出现即配置错误（本地表启动失败，`bindings.put` 被拒）。所以 agent 转话不会让默认 `plan`（全主人输入才 `bypass`）、默认 `control` 或审批资格升级。
+- **cause 链**：agent 产生的输入带 `InputRecord.cause`（`peer`、`basis`、`hop`、`chain`、`from`、`rootPrincipal`、`carried`），只由守护进程得出，客户端与适配器都不能设置；同一条输入换地方（watch 转投、话题换手、`inbound.redispatch`）时不变。每轮的 `TurnProvenance` 多了可选的 `cause: { hop, chain, rootPrincipal }`，随宿主写请求与 `agents-io.output` 事件出去；`rootPrincipal` 只是来源标记，守护进程不用它决定权限，宿主要放行"主人开的链上的 agent 转话"时在自己的 `Policy.plan` 里决定。本部署发出的消息经通道回来（同部署的另一个飞书机器人、邮件回声）时由出站索引按平台消息 id 认出，标 `self`、主体为发出它的 agent，不需要再手写 `selfAccounts`。
+- **防循环**：要开轮的 agent 输入在会话 lane 入口受两道上限（`policy.loopGuard`）：跳数超过 `maxHops`（默认 8），或同一对 agent 自上次有人说话以来在 15 分钟内来回超过 10 轮（`pair: { maxTurns, windowMs }`）。截停的输入记成上下文（下一次有人触发的轮次会看到，带 `loopGuard=`），接收与发送会话的日志各有一条 `notice { code: "loop_guard" }`，`aio explain` 带 `loopGuard`；通道上什么都不发。宿主经已有途径看到：会话事件、`inbound.redispatch` 的 `disposition: "observe_only"`。
+- **对严格校验的宿主可见的协议变化**（2026-10-11）：`Origin.evidence` 多了 `daemon`；`InputRecord.cause`、`TurnProvenance.cause`、`RouteExplanation.cause` / `loopGuard` 是新的可选字段；`notice.code` 多了 `loop_guard`；`explain` 的结果可能是 `EffectExplanation` 或 `ChainExplanation`（JSON Schema 见 `packages/protocol/schema/ExplainResult.json`）；`policy` 帧多了 `hook: "contact"`（只发给 `callouts` 列了它的宿主）。
 - `input.verify { channelRef }`：宿主可以查询某条渠道消息的平台作者与证据（例如 x-work-os 0010 §4.8 核验"确认消息的作者"）。记录的是**封顶后**的证据；宿主入站队列 `InboundItem.envelope` 同样。被拒收的信封查不到记录。
 
 ## 4. 宿主协议
@@ -118,7 +122,8 @@
 | `run.ended` | 守护进程 → 宿主 | `{ runId, status, exitCode, durationMs?, usage? }`；`status` 含 `timeout`（`timeoutMs` 到期） |
 | `deliver` | 宿主 → 守护进程 | 推送给人，按 `operationId` 幂等；按钮点击按 `actionPrefix` 规则回到宿主。由 `route` 的 `(channel, account)` 对应的通道发出；该账号没有通道时，只有当这个通道 id 恰好一个条目才用它发，否则 `unknown_channel`（多个飞书机器人时不会以别的机器人发出，决定 8） |
 | `inbound` | 守护进程 → 宿主 | §2.1 推送消费 |
-| `policy` | 守护进程 → 宿主 | §2.2 回调（`hook: "route"`），以及按 `hello.callouts` 开启的 `resolve`、`outbound` 同步钩子（§4.1，超时 fail closed） |
+| `policy` | 守护进程 → 宿主 | §2.2 回调（`hook: "route"`），以及按 `hello.callouts` 开启的 `resolve`、`outbound`、`contact` 同步钩子（§4.1，超时 fail closed） |
+| `explain { inputId, chain? }` | 宿主 → 守护进程 | 一条输入的路由记录；`inputId` 不是输入而是某次投递的 operationId 时，答产生它的会话、轮次与该轮的触发输入；`chain: true` 时沿 cause 链走回根（§5 `aio explain`） |
 | `input.verify` | 宿主 → 守护进程 | §3 |
 | `session.prepare` | 宿主 → 守护进程 | 为不经渠道路由打开的会话键预先登记 agent 和 launch（§2.2、§2.3） |
 | `inbound.redispatch` | 宿主 → 守护进程 | 把宿主入站队列里的一条输入按原始来源投递到指定会话（§2.1） |
@@ -127,15 +132,16 @@
 
 ### 4.1 回调钩子与代答
 
-`host.hello.callouts` 是 `boolean | string[]`：`true` 等于 `["route"]`；列表可含 `route`、`resolve`、`outbound`，未知名字忽略，结果的 `callouts` 列出实际开启的钩子。方案见 `docs/design/host-callouts`。
+`host.hello.callouts` 是 `boolean | string[]`：`true` 等于 `["route"]`；列表可含 `route`、`resolve`、`outbound`、`contact`，未知名字忽略，结果的 `callouts` 列出实际开启的钩子。方案见 `docs/design/host-callouts`。
 
 **`resolve` 与 `outbound` 两个钩子已冻结**（决定 13）：行为不变、照常可用，但不再增加钩子种类或参数，没有使用者之前也不为它们做新设计；新宿主不应依赖它们去表达本可以随表推送的静态规则。
 
 - **`resolve`**：`policy { hook: "resolve", args: { request, ctx } }`（`request.opened` 的事件体与 `TurnContext`，与 `Policy.resolve` 参数相同），答复一个 `Resolver`。超时（配置 `hostCallouts.resolve.timeoutMs`，默认 3000 ms）、出错、答复不合 schema 或宿主不在线时，按守护进程本地策略决定。
 - **`outbound`**：`policy { hook: "outbound", args: { from, to } }`，答复 `{ verdict: "allow" | "deny" }`。开启后超时（`hostCallouts.outbound.timeoutMs`，默认 2000 ms）、出错、答复不合 schema 一律 `deny`；没有开启的宿主时按本地策略。**宿主离线时也 fail closed**（2026-10-11，INVARIANTS DL-5）：开启过 `outbound` 的宿主断开后（守护进程重启后也一样，名字记在本地库里），只放行本轮自己的回复路由，本地策略额外允许的去向（预注册的 `routes`）一律拒绝，守护进程记一条 warn；直到它重新连上，或另一个宿主以不含 `outbound` 的 `callouts` 连上（把外发交还本地策略）。
+- **`contact`**（agent 通信，`docs/design/agent-messaging/` §4.6）：`policy { hook: "contact", args: { from, to, op, turn } }`，`from` 是 `{ agent, sessionKey }`，`to` 是 `{ agent, sessionKey }` 或 `{ agent }`，`op` 为 `list` / `send` / `run` / `observe` / `control`；答复 `{ verdict: "allow" | "deny" }`。超时（2000 ms）、出错、答复不合 schema 时按本地策略：`policy.agentContacts: [{ from, to, ops? }]`（agent 名或 `*`），**不写就是全部拒绝**。钩子已定义，第一步还没有调用它的东西（`agents_list` / `agent_send` 等工具是第二步）。
 - **代答**：宿主连接（`origin.kind = "system"` 且 `origin.adapter = "host"`；网关与会话 lane 各查一次）发 `resolve` 时可带 `onBehalfOf: "<成员 id>"`。`human` 请求要求该成员在 `principals` 里；日志记 `request.resolved.by = { kind, id: <成员>, via: "host:<名字>" }`。非宿主连接带 `onBehalfOf` 答 `not_eligible`。**须部署方显式开启**（决定 13）：配置 `"policy": { "answerOnBehalf": true }`，缺省 `false`；未开启时宿主连接带 `onBehalfOf` 的 `resolve` 答 `on_behalf_not_allowed`（请求保持打开，宿主仍可不带 `onBehalfOf` 以自己的名义作答），`host.hello` 的 `features` 也不列 `"resolve.onBehalfOf"`。这是"以别人的名义作答"的唯一开关，决定 12 的 agent 代为审批以后也挂在它下面，不另设开关。**行为变化（2026-10-11）**：此前任何带 token 的宿主都能代答；依赖代答的部署升级后要加这一项。
 
-**能力协商**：`host.hello` 的结果带 `features: string[]`，按能力名协商而不是按版本号。目前有 `"session.launch"`：回调答复可带 `launch`、可用 `session.prepare`、规则可用 `callout.skipWhenPinned`；`"callouts.resolve"`、`"callouts.outbound"`、`"resolve.onBehalfOf"`（§4.1，只在 `policy.answerOnBehalf` 开启时列出）；`"inbound.redispatch"`（§2.1）；`"host.takeover"`：`host.hello` 支持 `takeover: true`（§2）。旧守护进程的 `callouts` 只接受布尔。推荐做法：直接发钩子列表，收到 `invalid_frame` 再用 `callouts: true` 重发（旧守护进程只有 `route`）。不要先用 `callouts: true` 握手探测 features：那次握手已让这条连接成为**唯一的**宿主、只开了 `route`，想换成列表必须断开重连，期间占着宿主位置。结果里没有某个 feature 时，宿主不得依赖它。
+**能力协商**：`host.hello` 的结果带 `features: string[]`，按能力名协商而不是按版本号。目前有 `"session.launch"`：回调答复可带 `launch`、可用 `session.prepare`、规则可用 `callout.skipWhenPinned`；`"callouts.resolve"`、`"callouts.outbound"`、`"resolve.onBehalfOf"`（§4.1，只在 `policy.answerOnBehalf` 开启时列出）；`"inbound.redispatch"`（§2.1）；`"host.takeover"`：`host.hello` 支持 `takeover: true`（§2）；`"callouts.contact"`（§4.1）；`"explain.chain"`：`explain` 接受 operationId 与 `chain: true`（§5）。旧守护进程的 `callouts` 只接受布尔。推荐做法：直接发钩子列表，收到 `invalid_frame` 再用 `callouts: true` 重发（旧守护进程只有 `route`）。不要先用 `callouts: true` 握手探测 features：那次握手已让这条连接成为**唯一的**宿主、只开了 `route`，想换成列表必须断开重连，期间占着宿主位置。结果里没有某个 feature 时，宿主不得依赖它。
 
 **`session.prepare { sessionKey, agent, launch }`**：用于不经渠道路由打开的会话（宿主连接发的客户端 `input` 帧、本地 `aio input` / `aio attach`、指向该键的 watch），也可以让宿主在键可预知时（如成员入驻时建群）提前登记，规则就不必开回调。它只登记（agent 行与 launch 行在同一事务里写入），不拉起 harness；第一条输入到达时按登记建 lane。结果 `{ sessionKey, agent, launch: { cwd?, envKeys }, created }`：同一键用相同的值再 prepare 幂等（`created: false`）。错误码：`unknown_agent`、`not_interactive_agent`、`launch_not_allowed`（agent 没有 `sessionParams`）、`bad_cwd`、`bad_env`、`launch_unsupported`（Codex `unix` 实例带 env）、`launch_conflict`（键已有不同的 launch，或已是无 launch 的会话）、`agent_conflict`（键已属于另一个 agent）、`invalid_frame`（含 `run:` 前缀的键，task run 用 `run.start`）。遇到 `launch_conflict` 换键，不要重试。每个请求的 `result.value` 都有 schema（`packages/protocol/src/host.ts` 末尾的 `HOST_RESULT_VALUES`，JSON Schema 见 `packages/protocol/schema/*Result.json`）。
 
@@ -151,7 +157,9 @@
 | `aio send --route <json> --operation-id <id> < message.json` | `deliver` |
 | `aio tail --consumer <name>` / `aio ack --consumer <name> <cursor>` | §2.1 拉取 |
 | `aio bindings put < table.json` | `bindings.put` |
-| `aio explain <inputId>` | 路由解释 |
+| `aio explain <inputId>` | 路由解释（agent 输入另有 `cause`，被截停的有 `loopGuard`） |
+| `aio explain <operationId>` | 某次投递（`delivery.settled` 里的 operationId）：会话、轮次与该轮的触发输入；系统回复给出它回应的输入，宿主 `deliver` 给出宿主 |
+| `aio explain --chain <inputId>` | 一条 agent 输入沿 cause 链走回根：每一级的 inputId、跳数、会话地址、主体、触发的轮次、是否截停；链断（另一部署、不认识的机器人）处注明 |
 | `aio verify <channelRef>` | `input.verify` |
 
 `aio run` 的退出码：0 完成、1 失败、3 结果不明（ambiguous）、124 超时、130 被取消；其余命令：2 用法/配置错误，69 守护进程未运行，77 token 错误。

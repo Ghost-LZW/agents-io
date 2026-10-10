@@ -70,6 +70,15 @@ export const Evidence = Type.Union([
 ]);
 export type Evidence = Static<typeof Evidence>;
 
+/**
+ * Evidence on a stamped `Origin`: what the channel proved (`Evidence`), or `daemon` —
+ * the record was produced by this daemon itself (a turn of an agent it runs), never
+ * through an external platform. The strongest level on this machine. Adapters cannot
+ * claim it: it is not an `Evidence` an envelope or `ChannelCaps` can carry.
+ */
+export const OriginEvidence = Type.Union([...Evidence.anyOf, Type.Literal('daemon')]);
+export type OriginEvidence = Static<typeof OriginEvidence>;
+
 /** A host-side subject. `labels` are defined by the host; agents-io never interprets them. */
 export const Principal = Type.Object({ id: Type.String(), labels: Type.Array(Type.String()) });
 export type Principal = Static<typeof Principal>;

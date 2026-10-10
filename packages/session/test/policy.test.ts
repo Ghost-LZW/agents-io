@@ -29,8 +29,9 @@ describe('defaultPolicy.identify', () => {
       kind: 'agent',
       principal: { id: 'runner:other/run:1', labels: ['agent'] },
       declared: 'runner:other/run:1',
+      trustedAgent: true,
     });
-    expect(await id('peerbot')).toEqual({ kind: 'agent', principal: null });
+    expect(await id('peerbot')).toEqual({ kind: 'agent', principal: null, trustedAgent: true });
   });
 
   it('never accepts a declared identity that names an owner, even from a trusted agent account #ID-4 #CT-1', async () => {

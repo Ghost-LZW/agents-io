@@ -30,9 +30,12 @@ export const CONTEXT_LABEL = 'context, not addressed to you: recorded in the con
 /** Short structured preface naming who sent the input and from where (and that it is context, if so). */
 export function preface(input: InputRecord): string {
   const o = input.origin;
-  const parts = [`from=${o.principal?.id ?? 'unknown'}`, `kind=${o.kind}`, `via=${o.via}`];
+  // Evidence is part of the source (decision 5): what the channel proved, or `daemon` for this daemon's own agents.
+  const parts = [`from=${o.principal?.id ?? 'unknown'}`, `kind=${o.kind}`, `evidence=${o.evidence}`, `via=${o.via}`];
   if (o.declared) parts.push(`declared=${o.declared}`);
   if (o.self) parts.push('self=true');
+  // Agent messages: only how far down a chain of agents this is (agent-messaging §4.5); chain ids and turn ids are not for the model.
+  if (input.cause?.hop !== undefined) parts.push(`hop=${input.cause.hop}`);
   // Stamped, never truncated: the agent passes it verbatim to a host command, which checks it with `aio verify`.
   if (input.channelRef) parts.push(`ref=${refToken(input.channelRef)}`);
   for (const [k, v] of Object.entries(input.channelContext)) parts.push(`${k}=${oneLine(String(v))}`);

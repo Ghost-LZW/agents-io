@@ -13,7 +13,7 @@ import {
   type RenderedMessage,
   type ReplyRoute,
   type ResultFrame,
-  type RouteExplanation,
+  type ExplainResult,
   type RunEnded,
   type SessionEvent,
   type Tier,
@@ -268,8 +268,12 @@ export class LocalClient {
     return this.call('inbound.redispatch', o);
   }
 
-  explain(inputId: string): Promise<RouteExplanation> {
-    return this.call('explain', { inputId });
+  /**
+   * An input's routing record; given a delivery's operationId, the turn that made it and that
+   * turn's inputs; with `chain`, an agent input's way back to the root of its chain.
+   */
+  explain(inputId: string, o: { chain?: boolean } = {}): Promise<ExplainResult> {
+    return this.call('explain', { inputId, ...(o.chain ? { chain: true } : {}) });
   }
 
   /** One subscription per session per connection; subscribing again replaces it. */

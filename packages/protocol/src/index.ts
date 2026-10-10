@@ -1,4 +1,5 @@
 export * from './common.js';
+export * from './address.js';
 export * from './inbound.js';
 export * from './run.js';
 export * from './requests.js';

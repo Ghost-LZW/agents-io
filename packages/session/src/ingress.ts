@@ -16,7 +16,9 @@ import {
   type SessionLaunch,
   type SessionScope,
   type InboundItem,
+  type InputCause,
 } from '@agents-io/protocol';
+import { causeFrom, type ProducingTurn } from './loop-guard.js';
 import { channelRefOf, type HostQueue } from './host-queue.js';
 import type { Hub } from './hub.js';
 import type { CommandResult, Lane } from './lane.js';
@@ -129,7 +131,7 @@ export interface IngressOptions {
    * is recorded); `operationId` is stable per command input. Without it the
    * command still acts, the reply is only in the result.
    */
-  systemReply?: (a: { route: ReplyRoute; text: string; operationId: string; sessionKey: string }) => Promise<void>;
+  systemReply?: (a: { route: ReplyRoute; text: string; operationId: string; sessionKey: string; inputId?: string }) => Promise<void>;
   /**
    * One line added to inputs routed to a conversation's current topic
    * (`channelContext.topicTools`), telling the model how to move between topics, e.g.
@@ -138,7 +140,18 @@ export interface IngressOptions {
    */
   topicHint?: string | ((agent: string | undefined) => string | undefined);
   onReplyError?: (err: unknown) => void;
+  /**
+   * The outbound index (docs/design/agent-messaging §4.3.3): the turn of this deployment
+   * that sent the platform message `(channel, messageId)`, if one did. A hit on an
+   * authenticated envelope (`platform_signed` / `dkim_pass`) is this deployment's own
+   * message back: `self`, from that turn's agent, with a `recovered` cause — whatever
+   * account received it, so sibling bots need no `selfAccounts` entry.
+   */
+  recover?: (channel: string, messageId: string) => ProducingTurn | undefined;
 }
+
+/** Evidence an envelope needs before its message id is trusted to name our own message (a forged copy of a mail Message-ID is not). */
+const RECOVERABLE: readonly Evidence[] = ['platform_signed', 'dkim_pass'];
 
 export interface InboundRewrite {
   /** Deliver to this session instead (the one that asked the question). */
@@ -306,7 +319,7 @@ export class Ingress {
       ...(env.sender.isBot !== undefined ? { isBot: env.sender.isBot } : {}),
       ...(env.sender.declared !== undefined ? { declared: env.sender.declared } : {}),
     });
-    const origin: Origin = {
+    let origin: Origin = {
       kind: identity.kind,
       principal: identity.principal,
       evidence: env.sender.evidence,
@@ -315,6 +328,19 @@ export class Ingress {
       via: env.replyRoute ? routeKey(env.replyRoute) : conversationRouteKey(env),
       adapter: env.channel,
     };
+    // Our own message back through a channel: found in the outbound index, never by what the envelope says.
+    const sent = RECOVERABLE.includes(env.sender.evidence) ? this.o.recover?.(env.channel, env.id) : undefined;
+    let cause: InputCause | undefined;
+    if (sent) {
+      const { declared: _d, ...rest } = origin;
+      origin = { ...rest, kind: 'agent', principal: this.router.agentPrincipal(sent.from.agent), self: true };
+      cause = causeFrom(sent, 'recovered');
+    } else if (origin.kind === 'agent') {
+      // Another agent: the chain does not come along a channel, unless a trusted agent account declared its hop.
+      const peer = `${env.channel}:${env.sender.channelUserId}`;
+      const claim = identity.trustedAgent && RECOVERABLE.includes(env.sender.evidence) ? env.sender.cause : undefined;
+      cause = claim ? { peer, basis: 'declared', hop: claim.hop, ...(claim.chain !== undefined ? { chain: claim.chain } : {}) } : { peer, basis: 'none' };
+    }
 
     // A click on an approval or stop button acts on a request or turn: it goes to the session that
     // owns it (Hub index), which re-checks who may act (resolver eligibility, Policy.control, still
@@ -347,6 +373,7 @@ export class Ingress {
       content: env.content,
       replyRoute: env.replyRoute,
       channelRef: channelRefOf(env),
+      ...(cause ? { cause } : {}),
       channelContext: channelContext(env, this.replyOf(env)),
     };
     const decision = await this.router.route(env, origin, input);
@@ -355,7 +382,7 @@ export class Ingress {
     // a dispatched input may already be running, so its revision is a new input.
     if (revisionOf && own.some((d) => d.on === 'dispatch')) input = { ...input, inputId: this.newId('in') };
     this.inputIds.set(envKey(env.channel, env.account, env.id), input.inputId);
-    const explanation: Explanation = { ...decision.explanation, inputId: input.inputId, ...(claimedEvidence !== undefined ? { claimedEvidence } : {}) };
+    const explanation: Explanation = { ...decision.explanation, inputId: input.inputId, ...(claimedEvidence !== undefined ? { claimedEvidence } : {}), ...(cause ? { cause } : {}) };
     this.router.record(explanation);
 
     // The strongest table delivery is the input's own place (where a click on a choice is rewritten to).
@@ -399,7 +426,7 @@ export class Ingress {
       if (d.source !== 'watch' || !this.o.watches || d.watchId === undefined) continue;
       try {
         // No reply summary: it would describe the watched source, not where the reply goes.
-        const w = await this.o.watches.deliverWatch(d.watchId, env, origin, channelContext(env, undefined));
+        const w = await this.o.watches.deliverWatch(d.watchId, env, origin, channelContext(env, undefined), cause);
         watched.push(w);
         const u = w.unavailable;
         // The target session refused it (FC-3): recorded and explained like a table delivery.
@@ -501,6 +528,7 @@ export class Ingress {
         env,
         origin,
         channelContext(env, undefined),
+        input.cause,
       );
       return { ...base, ...(w.inputId ? { inputId: w.inputId } : {}), ...(w.result ? { result: w.result } : {}), watch: w };
     }
@@ -563,7 +591,7 @@ export class Ingress {
     }
     if (env.replyRoute && this.o.systemReply) {
       try {
-        await this.o.systemReply({ route: env.replyRoute, text: reply, operationId: `topic-cmd:${input.inputId}`, sessionKey: now?.sessionKey ?? d.sessionKey });
+        await this.o.systemReply({ route: env.replyRoute, text: reply, operationId: `topic-cmd:${input.inputId}`, sessionKey: now?.sessionKey ?? d.sessionKey, inputId: input.inputId });
       } catch (e) {
         this.o.onReplyError?.(e);
       }
@@ -661,10 +689,11 @@ function sourceMismatch(env: InboundEnvelope, s: EmitSource): string | undefined
 /** The envelope with the sender capped to what the source may claim: a copy when anything changes, else `env` itself. */
 function capEnvelope(env: InboundEnvelope, s: EmitSource): InboundEnvelope {
   const evidence = env.sender.evidence === 'none' || s.evidence.includes(env.sender.evidence) ? env.sender.evidence : 'none';
-  const dropDeclared = env.sender.declared !== undefined && !s.declaresSender;
+  // A declared hop is an out-of-band sender claim like `declared`: only from sources that may declare senders.
+  const dropDeclared = (env.sender.declared !== undefined || env.sender.cause !== undefined) && !s.declaresSender;
   if (evidence === env.sender.evidence && !dropDeclared) return env;
-  const { declared, ...sender } = env.sender;
-  return { ...env, sender: { ...sender, ...(declared !== undefined && !dropDeclared ? { declared } : {}), evidence } };
+  const { declared, cause, ...sender } = env.sender;
+  return { ...env, sender: { ...sender, ...(declared !== undefined && !dropDeclared ? { declared } : {}), ...(cause !== undefined && !dropDeclared ? { cause } : {}), evidence } };
 }
 
 function actionClick(env: InboundEnvelope) {
@@ -684,6 +713,8 @@ function channelContext(env: InboundEnvelope, reply: string | undefined): InputR
     conversationKind: env.conversation.kind,
     conversationId: env.conversation.id,
   };
+  // Set by the lane when the loop guard stops an input; an adapter can not claim it.
+  delete ctx.loopGuard;
   if (env.sender.displayName !== undefined) ctx.senderName = env.sender.displayName;
   if (env.sender.isBot !== undefined) ctx.senderIsBot = env.sender.isBot;
   if (env.sentAt !== undefined) ctx.sentAt = env.sentAt;

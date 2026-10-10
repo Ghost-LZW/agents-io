@@ -242,6 +242,26 @@ describe('sender declaration', () => {
     await h.stop();
   });
 
+  it('agent-authored mail carries X-Agents-IO-Hop; a hop claim is read only from DKIM-signed mail #EX-5', async () => {
+    const verify: MailVerifier = async (r, domain) => ({ evidence: r.includes('X-Test-Signed: peer.test') && domain === 'peer.test' ? 'dkim_pass' : 'none' });
+    const h = await harness({ verify });
+    const e = await h.next({ uid: 1, raw: raw({ 'Message-ID': '<a@x>' }, 'q') });
+    await h.adapter.send(e.replyRoute!, { text: 'hi' }, { operationId: 'o1', as: 'session:dev:main', cause: { hop: 3, chain: 'c0ffee' } });
+    expect(h.transport.sent[0]!.headers).toEqual({ 'X-Agents-IO-Sender': 'session:dev:main', 'X-Agents-IO-Hop': '3; chain=c0ffee' });
+    // Not agent-authored (no `as`): no header, whatever the op says.
+    await h.adapter.send(e.replyRoute!, { text: 'sys' }, { operationId: 'o2', cause: { hop: 3, chain: 'c0ffee' } });
+    expect(h.transport.sent[1]!.headers).toBeUndefined();
+    // Another deployment's signed agent mail: the claim comes along (the gateway decides whether to take it).
+    const signed = await h.next({ uid: 2, raw: raw({ 'Message-ID': '<p1@peer.test>', From: 'agent@peer.test', 'X-Agents-IO-Hop': '4; chain=abc', 'X-Test-Signed': 'peer.test' }, 'next') });
+    expect(signed.sender.cause).toEqual({ hop: 4, chain: 'abc' });
+    // Unsigned, or malformed: nothing.
+    const unsigned = await h.next({ uid: 3, raw: raw({ 'Message-ID': '<p2@peer.test>', From: 'agent@peer.test', 'X-Agents-IO-Hop': '4; chain=abc' }, 'next') });
+    expect(unsigned.sender.cause).toBeUndefined();
+    const bad = await h.next({ uid: 4, raw: raw({ 'Message-ID': '<p3@peer.test>', From: 'agent@peer.test', 'X-Agents-IO-Hop': '0; chain=a b', 'X-Test-Signed': 'peer.test' }, 'next') });
+    expect(bad.sender.cause).toBeUndefined();
+    await h.stop();
+  });
+
   it('omits the header when no sender is given #DL-4b', async () => {
     const h = await harness();
     const e = await h.next({ uid: 1, raw: raw({ 'Message-ID': '<a@x>' }, 'q') });

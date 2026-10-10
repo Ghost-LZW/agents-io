@@ -38,6 +38,33 @@
     },
     "group": {
       "type": "boolean"
+    },
+    "cause": {
+      "type": "object",
+      "required": [
+        "hop",
+        "chain",
+        "rootPrincipal"
+      ],
+      "properties": {
+        "hop": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "chain": {
+          "type": "string"
+        },
+        "rootPrincipal": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
     }
   }
 }

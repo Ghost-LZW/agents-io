@@ -1,17 +1,22 @@
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, rmSync } from 'node:fs';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   PROTOCOL_VERSION,
+  formatAddress,
   routeKey,
   type AdminQueue,
   type AdminSession,
   type AdminSessions,
   type AdminChannelsApplied,
   type AdminStatus,
+  type ChainExplanation,
+  type ChainLink,
   type ChannelAdapter,
+  type ContactArgs,
   type ContentBlock,
+  type EffectExplanation,
   type Evidence,
   type HarnessAdapter,
   type HarnessCaps,
@@ -23,6 +28,7 @@ import {
   type InputRecord,
   type LiveEndpoint,
   type LiveStartArgs,
+  type LoopGuardTrip,
   type HarnessFactory,
   type Origin,
   type Policy,
@@ -60,7 +66,10 @@ import {
   WatchRegistry,
   defaultPolicy,
   type AddWatchResult,
+  type DeliveryRecord,
   type EmitSource,
+  type LaneOptions,
+  type ProducingTurn,
   type FullPolicy,
   type IngressResult,
   type RemoveWatchResult,
@@ -87,7 +96,7 @@ import { HostService, isHostOrigin } from './host.js';
 import { LocalServer } from './local-server.js';
 import { privateDb, privateDir } from './private.js';
 import { blobResolvers, type MediaResolvers } from './media.js';
-import { DaemonRecords } from './records.js';
+import { DaemonRecords, type CauseRecord } from './records.js';
 import { checkLaunch, launchView, sameLaunch, type LaunchCheck } from './launch.js';
 import { Runs } from './runs.js';
 import { consoleUrlPath, loadOrCreateTokenFile, removeTokenFile, TokenError, tokenPath, writeTokenFile } from './token.js';
@@ -353,6 +362,7 @@ export class Gateway {
       agentAccounts: c.policy.agentAccounts,
       routes: c.policy.routes,
       watchAllowlist: c.policy.watchAllowlist,
+      agentContacts: c.policy.agentContacts,
       run: c.harnesses[c.defaultHarness]!.run,
     });
     const local = {
@@ -378,6 +388,17 @@ export class Gateway {
           return local.resolve(req, ctx);
         }
       },
+      // A connected host whose hello lists `contact` decides which agent may contact which; when it
+      // cannot answer, the local policy does (`policy.agentContacts`, default deny), as for resolve.
+      contact: async (a: ContactArgs) => {
+        if (!this.host.answers('contact')) return local.contact(a);
+        try {
+          return await this.host.contactCallout(a);
+        } catch (e) {
+          this.log('warn', `host contact callout ${formatAddress(a.from)} → ${a.to.agent} (${a.op}) failed (${(e as Error).message}); the local policy decides`);
+          return local.contact(a);
+        }
+      },
       // A connected host whose hello lists `outbound` decides where agents may send; no answer denies.
       // While that host is away (also after a restart, until it or a host without the hook
       // connects) only the turn's own routes stay open: the local policy's wider allowances
@@ -400,7 +421,15 @@ export class Gateway {
         }
       },
     };
-    this.outbox = new Outbox({ hub: this.hub, policy: this.policy, store: this.records });
+    this.outbox = new Outbox({
+      hub: this.hub,
+      policy: this.policy,
+      store: this.records,
+      // Which turn sent which platform message (the outbound index), and explain of a side effect by operationId.
+      onSettled: (d, rec) => this.indexOutbound(d, rec),
+      // Agent-authored sends carry their hop out-of-band where the channel can (mail X-Agents-IO-Hop).
+      causeOf: (d) => this.sendCause(d.sessionKey, d.turnId),
+    });
     this.runs = new Runs({
       hub: this.hub,
       agents: () => c.agents,
@@ -419,6 +448,7 @@ export class Gateway {
       prepareSession: (f) => this.prepareSession(f),
       redispatch: (name, f) => this.redispatch(name, f),
       calloutTimeouts: { resolve: c.hostCallouts.resolveTimeoutMs, outbound: c.hostCallouts.outboundTimeoutMs },
+      explain: (id, chain) => this.explain(id, chain),
       answerOnBehalf: c.policy.answerOnBehalf,
       log: (level, msg, data) => this.log(level, msg, data),
       ...(o.hostPush?.timeoutMs !== undefined ? { pushTimeoutMs: o.hostPush.timeoutMs } : {}),
@@ -444,6 +474,7 @@ export class Gateway {
         turn: (key) => this.lanes.get(key)?.currentTurn(),
         adapter: (r) => this.channelFor(r)?.adapter,
         as: (key) => agentIdentity(key),
+        agentOf: (key) => this.agentOfSession(key),
         blobs: this.blobs,
         cwd: (key) => this.laneInfo.get(key)?.cwd ?? this.instanceOf(this.lanes.get(key)?.harnessId)?.cwd ?? c.cwd,
         tier: (r) => this.channelFor(r)?.tier,
@@ -498,6 +529,8 @@ export class Gateway {
       // A session whose agent is gone refuses the input: its log says so, and the route
       // too when the message was addressed to it (observe-only messages stay silent).
       onUnavailable: (a) => this.refuseUnavailable(a.sessionKey, a.code, a.message, a.input.inputId, a.on === 'dispatch' ? a.input.replyRoute : null),
+      // Our own messages back through a channel (any bot account): found by platform message id, marked self.
+      recover: (channel, id) => this.recoverSend(channel, id),
     });
     if (c.source) {
       this.configStore = new ConfigStore({ path: c.source.path, ...(c.source.envFile ? { envFile: c.source.envFile } : {}), ...(o.consoleEnv ? { env: o.consoleEnv } : {}) });
@@ -809,6 +842,7 @@ export class Gateway {
       cwd,
       ...(this.mcp && agent.tools ? { mcp: (a: { sessionKey: string; generation: number; harnessId: string }) => this.mcp!.mcpFor(a, agent.toolNames) } : {}),
       onLiveEnded: (liveId, reason) => this.liveEnded(sessionKey, liveId, reason),
+      ...this.causeHooks(),
       onHarnessEvent: (e) => {
         // A topic remembers its harness session id (switching back resumes it; the lane resumes from the log).
         if (e.body.t === 'session.bound') this.topics.setNativeId(sessionKey, e.body.nativeId);
@@ -1127,6 +1161,7 @@ export class Gateway {
         return `${p}_${randomUUID()}`;
       },
       ...(this.mcp && r.agent.tools ? { mcp: (a: { sessionKey: string; generation: number; harnessId: string }) => this.mcp!.mcpFor(a, r.agent.toolNames) } : {}),
+      ...this.causeHooks(),
       onHarnessEvent: (e) => this.o.onHarnessEvent?.(r.sessionKey, e),
     });
     this.lanes.set(r.sessionKey, lane);
@@ -1146,6 +1181,201 @@ export class Gateway {
         await within(codexOf(own)?.dispose(), 3000);
       },
     };
+  }
+
+  // ---- agent messaging: cause chains, the outbound index, explain (docs/design/agent-messaging) ----
+
+  /** Lane options every session gets: the loop guard (`policy.loopGuard`) and the cause index. */
+  private causeHooks(): Pick<LaneOptions, 'loopGuard' | 'onLoopGuard' | 'onCause'> {
+    return {
+      loopGuard: this.o.config.policy.loopGuard,
+      onCause: ({ sessionKey, input }) => this.records.putCause(causeRecord(sessionKey, input)),
+      onLoopGuard: (a) => this.loopGuarded(a.sessionKey, a.input, a.trip),
+    };
+  }
+
+  /**
+   * An input was stopped by the loop guard in `sessionKey` (that session's log has the
+   * context record and a notice): its cause record and routing explanation say so, and the
+   * session whose turn produced it (when this daemon knows it) gets a notice too. Nothing
+   * is sent to any channel: a breaker that talks may feed the agent on the other side.
+   */
+  private loopGuarded(sessionKey: string, input: InputRecord, trip: LoopGuardTrip): void {
+    if (input.cause) this.records.putCause({ ...causeRecord(sessionKey, input), loopGuard: trip });
+    const e = this.router.explain(input.inputId);
+    if (e) this.router.record({ ...e, loopGuard: trip });
+    const what = trip.tripped === 'hops' ? `hop ${trip.hop} over the limit of ${trip.limit}` : `${trip.peer} started ${trip.count} turns there (limit ${trip.limit})`;
+    this.log('warn', `loop guard: input ${input.inputId} in ${sessionKey} did not start a turn (${what}); recorded as context`);
+    const from = input.cause?.from;
+    if (!from || from.sessionKey === sessionKey || !this.isOurSession(from.sessionKey)) return;
+    this.hub.append(from.sessionKey, {
+      ts: Date.now(),
+      level: 'primary',
+      audience: 'status',
+      durability: 'durable',
+      visibility: 'operators',
+      body: { t: 'notice', code: 'loop_guard', message: `loop guard: what turn ${from.turnId} sent reached ${sessionKey} as input ${input.inputId} and did not start a turn there (${what}); recorded as context` },
+    });
+  }
+
+  /** The agent a session runs (its lane's, else the one recorded for it). */
+  private agentOfSession(sessionKey: string): string | undefined {
+    return this.laneInfo.get(sessionKey)?.agent.name ?? this.records.agentOf(sessionKey);
+  }
+
+  /** Outbox `onSettled`: every settled delivery, with the turn and the turn's chain when a turn made it. */
+  private indexOutbound(d: { sessionKey: string; turnId?: string }, rec: DeliveryRecord): void {
+    const p = d.turnId !== undefined ? this.lanes.get(d.sessionKey)?.provenance(d.turnId) : undefined;
+    const agent = this.agentOfSession(d.sessionKey);
+    this.records.putOutbound({
+      operationId: rec.operationId,
+      channel: rec.route.channel,
+      ...(rec.providerMessageId !== undefined ? { providerMessageId: rec.providerMessageId } : {}),
+      sessionKey: d.sessionKey,
+      ...(d.turnId !== undefined ? { turnId: d.turnId } : {}),
+      ...(agent !== undefined ? { agent } : {}),
+      route: rec.route,
+      result: rec.status,
+      ...(p ? { provenance: { external: p.external, watched: p.watched, group: p.group, ...(p.cause ? { cause: p.cause } : {}) } } : {}),
+      at: Date.now(),
+    });
+  }
+
+  /** The outbound index: the turn of ours that sent `(channel, message id)`. */
+  private recoverSend(channel: string, id: string): ProducingTurn | undefined {
+    const r = this.records.outboundByMessage(channel, id);
+    if (!r?.turnId) return undefined;
+    const agent = r.agent ?? this.o.config.defaultAgent ?? 'default';
+    return { from: { agent, sessionKey: r.sessionKey }, turnId: r.turnId, ...(r.provenance ? { provenance: r.provenance } : {}) };
+  }
+
+  /** `SendOp.cause` of an agent-authored send: the hop a recipient sees, and the chain as an opaque id. */
+  private sendCause(sessionKey: string, turnId: string | undefined): { hop: number; chain: string } | undefined {
+    if (turnId === undefined) return undefined;
+    const c = this.lanes.get(sessionKey)?.provenance(turnId)?.cause;
+    return { hop: (c?.hop ?? 0) + 1, chain: opaqueChain(c?.chain ?? turnId) };
+  }
+
+  /**
+   * `explain`: an input's routing record; else, given a delivery's operationId, the turn that
+   * made it and that turn's inputs (EX-2); with `chain`, an agent input back to its root.
+   */
+  explain(id: string, chain = false): Outcome {
+    if (chain) {
+      const c = this.explainChain(id);
+      return c ? { ok: true, value: c } : fail('unknown_input', `no record of input ${id} (unknown, or older than the retention)`);
+    }
+    const e = this.router.explain(id);
+    // A loop-guard trip is recorded by the lane, possibly before the routing record is (re)written: the cause index keeps it.
+    const trip = e && !e.loopGuard ? this.records.causeOf(id)?.loopGuard : undefined;
+    if (e) return { ok: true, value: trip ? { ...e, loopGuard: trip } : e };
+    const fx = this.explainEffect(id);
+    return fx ? { ok: true, value: fx } : fail('unknown_input', `no routing record or delivery for ${id} (unknown, or older than the retention)`);
+  }
+
+  /** A side effect by its operationId (as `delivery.settled` names it): session, turn, and the turn's triggering inputs. */
+  explainEffect(operationId: string): EffectExplanation | undefined {
+    const r = this.records.outboundByOperation(operationId);
+    if (!r) return undefined;
+    return {
+      operationId,
+      sessionKey: r.sessionKey,
+      ...(r.turnId !== undefined ? { turnId: r.turnId } : {}),
+      inputIds: r.turnId !== undefined ? this.turnInputs(r.sessionKey, r.turnId) : (r.inputIds ?? []),
+      route: r.route,
+      result: r.result,
+      ...(r.providerMessageId !== undefined ? { providerMessageId: r.providerMessageId } : {}),
+      at: r.at,
+    };
+  }
+
+  /** The inputs that triggered a turn (started with, or steered in), without the context handed ahead of them. */
+  private turnInputs(sessionKey: string, turnId: string): string[] {
+    const events = this.hub.log.read(sessionKey, 0);
+    const context = new Set<string>();
+    const ids: string[] = [];
+    for (const e of events) {
+      const b = e.body;
+      if (b.t === 'input.admitted' && b.disposition === 'observe_only') context.add(b.inputId);
+      else if ((b.t === 'turn.started' || b.t === 'turn.adopted') && b.turnId === turnId) ids.push(...b.inputIds);
+      else if (b.t === 'input.admitted' && b.disposition === 'steer' && e.turnId === turnId) ids.push(b.inputId);
+    }
+    return [...new Set(ids)].filter((id) => !context.has(id) && !id.startsWith('ctxo_') && !isHandedContext(id, context));
+  }
+
+  /** The turn an input triggered in a session, if one did. */
+  private turnOfInput(sessionKey: string, inputId: string): string | undefined {
+    for (const e of this.hub.log.read(sessionKey, 0)) {
+      const b = e.body;
+      if ((b.t === 'turn.started' || b.t === 'turn.adopted') && b.inputIds.includes(inputId)) return b.turnId;
+      if (b.t === 'input.admitted' && b.disposition === 'steer' && b.inputId === inputId && e.turnId) return e.turnId;
+    }
+    return undefined;
+  }
+
+  /**
+   * `explain --chain`: from an input along `cause.from` (the turn that produced it, that
+   * turn's highest-hop triggering input, …) back to the root at hop 0. Stops where the chain
+   * is broken (`basis: none`, or `declared` by another deployment) or a record is gone.
+   */
+  explainChain(inputId: string): ChainExplanation | undefined {
+    const links: ChainLink[] = [];
+    let cur = inputId;
+    let session: string | undefined;
+    let end: ChainExplanation['end'] = 'unknown';
+    for (let n = 0; n < 64; n++) {
+      const ex = this.router.explain(cur);
+      const rec: Omit<CauseRecord, 'at'> | undefined =
+        this.records.causeOf(cur) ??
+        (ex?.cause ? { inputId: cur, sessionKey: session ?? ex.matched[0]?.sessionKey ?? '', principal: ex.principal, cause: ex.cause, ...(ex.loopGuard ? { loopGuard: ex.loopGuard } : {}) } : undefined);
+      const sessionKey = rec?.sessionKey || session || ex?.matched.find((m) => m.sessionKey)?.sessionKey;
+      if (!rec) {
+        // No cause: a human, host or system input — the root — when we know of it at all.
+        if (!ex && links.length === 0) return undefined;
+        const turnId = sessionKey ? this.turnOfInput(sessionKey, cur) : undefined;
+        links.push({ inputId: cur, hop: 0, ...this.where(sessionKey), principal: ex?.principal ?? null, ...(turnId ? { turnId } : {}) });
+        end = 'root';
+        break;
+      }
+      const turnId = sessionKey ? this.turnOfInput(sessionKey, cur) : undefined;
+      const c = rec.cause;
+      links.push({
+        inputId: cur,
+        ...(c.hop !== undefined ? { hop: c.hop } : {}),
+        ...this.where(sessionKey),
+        principal: rec.principal,
+        ...(turnId ? { turnId } : {}),
+        basis: c.basis,
+        ...(rec.loopGuard ? { loopGuard: rec.loopGuard } : {}),
+      });
+      if (c.basis === 'none' || c.basis === 'declared' || !c.from) {
+        end = 'broken';
+        break;
+      }
+      const inputs = this.turnInputs(c.from.sessionKey, c.from.turnId);
+      if (!inputs.length) break; // the producing turn's log is gone
+      // The producing turn's chain is its highest-hop triggering input.
+      let next = inputs[0]!;
+      let best = -1;
+      for (const id of inputs) {
+        const h = this.records.causeOf(id)?.cause.hop ?? this.router.explain(id)?.cause?.hop ?? 0;
+        if (h > best) {
+          best = h;
+          next = id;
+        }
+      }
+      cur = next;
+      session = c.from.sessionKey;
+    }
+    const first = this.records.causeOf(inputId)?.cause ?? this.router.explain(inputId)?.cause;
+    return { inputId, ...(first?.chain !== undefined ? { chain: first.chain } : links.length === 1 && end === 'root' ? { chain: inputId } : {}), links, end };
+  }
+
+  /** A chain link's session and, when its agent is known, its address. */
+  private where(sessionKey: string | undefined): Pick<ChainLink, 'sessionKey' | 'address'> {
+    if (!sessionKey) return {};
+    const agent = this.agentOfSession(sessionKey);
+    return { sessionKey, ...(agent !== undefined ? { address: formatAddress({ agent, sessionKey }) } : {}) };
   }
 
   /** `deliver`: send a host's message through the outbox, idempotent per operationId (across restarts too). */
@@ -1181,12 +1411,12 @@ export class Gateway {
         code === 'agent_unavailable'
           ? 'This conversation\'s agent is not available any more, so the message was not delivered. Ask the operator to restore it.'
           : `This conversation could not be started (${code}), so the message was not delivered. Ask the operator.`;
-      await this.systemReply({ route, text, operationId: `${code}:${inputId}`, sessionKey });
+      await this.systemReply({ route, text, operationId: `${code}:${inputId}`, sessionKey, inputId });
     }
   }
 
   /** A topic command's answer: one plain message on the route, through the outbox (recorded in the topic's session). */
-  private async systemReply(a: { route: ReplyRoute; text: string; operationId: string; sessionKey: string }): Promise<void> {
+  private async systemReply(a: { route: ReplyRoute; text: string; operationId: string; sessionKey: string; inputId?: string }): Promise<void> {
     const ch = this.channelFor(a.route);
     if (!ch) {
       // Local ends read their stream; a channel route with no instance is never sent as another account (decision 8).
@@ -1195,6 +1425,9 @@ export class Gateway {
     }
     const { replyToMessageId: _r, ...route } = { ...a.route, account: ch.account };
     await this.outbox.send(ch.adapter, { operationId: a.operationId, sessionKey: a.sessionKey, route, msg: { text: a.text } });
+    // No turn wrote it: explain of its operationId names the input it answers (EX-2).
+    const ob = a.inputId !== undefined ? this.records.outboundByOperation(a.operationId) : undefined;
+    if (ob && !ob.inputIds) this.records.putOutbound({ ...ob, inputIds: [a.inputId!] });
   }
 
   /**
@@ -1973,7 +2206,8 @@ ${a.summary}` }],
           origin,
           content,
           replyRoute: localRoute(cmd.sessionKey),
-          channelContext: { channel: 'local', ...cmd.input.channelContext },
+          // Field by field: a client never sets origin, cause or channelRef; `loopGuard` is the lane's label.
+          channelContext: { channel: 'local', ...withoutKey(cmd.input.channelContext, 'loopGuard') },
         };
         const r =
           cmd.mode === 'observe'
@@ -2095,6 +2329,28 @@ ${a.summary}` }],
 const HANDED_HINT = 'this message was handed to this topic by a topic switch: answer it here; do not call session_rotate or session_switch for it';
 
 const turnRef = (t: TurnContext) => ({ sessionKey: t.sessionKey, turnId: t.turnId });
+
+function withoutKey<T extends Record<string, unknown>>(o: T | undefined, k: string): Partial<T> {
+  if (!o || !(k in o)) return o ?? {};
+  const { [k]: _drop, ...rest } = o;
+  return rest as Partial<T>;
+}
+
+/** What the cause index keeps of an admitted agent input. */
+function causeRecord(sessionKey: string, input: InputRecord): CauseRecord {
+  return { inputId: input.inputId, sessionKey, principal: input.origin.principal?.id ?? null, cause: input.cause!, at: Date.now() };
+}
+
+/** A chain id as other deployments see it (mail X-Agents-IO-Hop): stable, opaque, not an input id of ours. */
+function opaqueChain(chain: string): string {
+  return createHash('sha256').update(`agents-io:chain:${chain}`).digest('hex').slice(0, 16);
+}
+
+/** A context record handed again under `<id>@<seq>` (a revision of context an earlier turn saw). */
+function isHandedContext(id: string, context: Set<string>): boolean {
+  const at = id.lastIndexOf('@');
+  return at > 0 && context.has(id.slice(0, at));
+}
 
 function fail(code: string, message = code): Outcome {
   return { ok: false, code, message };

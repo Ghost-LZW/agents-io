@@ -132,7 +132,7 @@ describe('input writing', () => {
     expect(q.written.map((m) => m.priority)).toEqual(['later', 'later']);
     expect(q.written[0]!.origin).toEqual({ kind: 'human' });
     const content = q.written[0]!.message.content as { type: string; text: string }[];
-    expect(content[0]!.text).toBe('[agents-io input from=owner kind=human via=fake:a:c1 chat=Team]');
+    expect(content[0]!.text).toBe('[agents-io input from=owner kind=human evidence=platform_signed via=fake:a:c1 chat=Team]');
     expect(content[1]).toEqual({ type: 'text', text: 'hello' });
   });
 
@@ -161,12 +161,12 @@ describe('input writing', () => {
 
   it('preface marks unknown senders and agents #ID-2', () => {
     const p = preface({ ...input('x', ''), origin: { kind: 'agent', principal: null, evidence: 'none', via: 'lark:a:c', adapter: 'lark', declared: 'bot-7' } });
-    expect(p).toBe('[agents-io input from=unknown kind=agent via=lark:a:c declared=bot-7]');
+    expect(p).toBe('[agents-io input from=unknown kind=agent evidence=none via=lark:a:c declared=bot-7]');
   });
 
   it('preface carries ref=channel:<channel>/<message id> only for a channel message, verbatim (never truncated) #EX-4', () => {
     const ref = 'channel:lark-bot/om_1';
-    expect(preface({ ...input('x', ''), channelRef: ref, channelContext: { chat: 'Team' } })).toBe(`[agents-io input from=owner kind=human via=fake:a:c1 ref=${ref} chat=Team]`);
+    expect(preface({ ...input('x', ''), channelRef: ref, channelContext: { chat: 'Team' } })).toBe(`[agents-io input from=owner kind=human evidence=platform_signed via=fake:a:c1 ref=${ref} chat=Team]`);
     // local / host / system inputs have no channel message to point at
     expect(preface(input('x', ''))).not.toMatch(/ ref=/);
     // a long mail Message-ID stays whole; one with whitespace is quoted, still one token
@@ -184,11 +184,11 @@ describe('input writing', () => {
     const first = q.written[0]!.message.content as { type: string; text: string }[];
     expect(first[0]!.text).toBe(
       '[agents-io context, not addressed to you: recorded in the conversation; read it, do not reply to it unless the addressed input asks]\n' +
-        '[agents-io input from=unknown kind=human via=lark:a:g1 senderName=Eve context=true watch=wg]',
+        '[agents-io input from=unknown kind=human evidence=platform_signed via=lark:a:g1 senderName=Eve context=true watch=wg]',
     );
     expect(first[1]).toEqual({ type: 'text', text: 'the launch moved to Thursday' });
     const second = q.written[1]!.message.content as { type: string; text: string }[];
-    expect(second[0]!.text).toBe('[agents-io input from=owner kind=human via=fake:a:c1]');
+    expect(second[0]!.text).toBe('[agents-io input from=owner kind=human evidence=platform_signed via=fake:a:c1]');
   });
 
   it('a watched input reaches the model with the watch= marker in its sender preface #ID-2', async () => {
@@ -201,9 +201,21 @@ describe('input writing', () => {
     expect(first[0]!.text).toMatch(/^\[agents-io input .* watch=wg( |\])/);
   });
 
-  // INVARIANTS ID-2 不成立 1: the sender preface omits origin.evidence; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('the sender preface names the origin evidence #ID-2', () => {
-    expect(preface(input('x', ''))).toContain('evidence=platform_signed');
+  it('the sender preface names the origin evidence #ID-2', () => {
+    expect(preface(input('x', ''))).toContain(' evidence=platform_signed ');
+    expect(preface({ ...input('x', ''), origin: { kind: 'agent', principal: { id: 'agent:reviewer', labels: ['agent'] }, evidence: 'daemon', via: 'agent:reviewer:reviewer:main', adapter: 'agent' } })).toContain(' evidence=daemon ');
+  });
+
+  it('an agent message shows hop=N only (chain and turn ids stay out); a loop-guarded one shows loopGuard= #ID-2', () => {
+    const agent = { kind: 'agent' as const, principal: { id: 'agent:reviewer', labels: ['agent'] }, evidence: 'daemon' as const, via: 'agent:reviewer:reviewer:main', adapter: 'agent' };
+    const cause = { peer: 'reviewer/reviewer:main', basis: 'internal' as const, hop: 3, chain: 'in_root', from: { sessionKey: 'reviewer:main', turnId: 'turn_9' }, rootPrincipal: 'lark:ou_owner' };
+    const p = preface({ ...input('x', ''), origin: agent, cause, channelContext: {} });
+    expect(p).toBe('[agents-io input from=agent:reviewer kind=agent evidence=daemon via=agent:reviewer:reviewer:main hop=3]');
+    expect(p).not.toMatch(/in_root|turn_9|lark:ou_owner/);
+    // A broken chain (outside agent) has no hop; a human input none either.
+    expect(preface({ ...input('x', ''), origin: { ...agent, evidence: 'platform_signed' }, cause: { peer: 'lark:ou_x', basis: 'none' } })).not.toMatch(/ hop=/);
+    expect(preface(input('x', ''))).not.toMatch(/ hop=/);
+    expect(preface({ ...input('x', ''), origin: agent, cause, channelContext: { context: true, loopGuard: 'pair' } })).toMatch(/ hop=3 .*loopGuard=pair\]$/);
   });
 
   it('startTurn only when idle #HC-1', async () => {

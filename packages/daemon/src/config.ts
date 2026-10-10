@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { Type, type Static } from '@sinclair/typebox';
 import { Binding, Evidence, IdentityEntry, Tier, WatchDraft, errors, type BindingTable, type Principal, type RunSpec, type WatchSource } from '@agents-io/protocol';
-import { DEFAULT_BLOB_MAX_BYTES, Router, RouterError, checkIdentities, ownerIdentities, ownersTable, type AgentSpec } from '@agents-io/session';
+import { DEFAULT_BLOB_MAX_BYTES, Router, RouterError, checkIdentities, ownerIdentities, ownersTable, type AgentContactRule, type AgentSpec, type LoopGuardOptions } from '@agents-io/session';
 import { resolveChannelModule } from './channel-module.js';
 import { loadEnvFile } from '@agents-io/testkit';
 import type { CodexTransportOption } from '@agents-io/harness-codex';
@@ -364,6 +364,37 @@ export const ConfigFile = Type.Object(
               ),
             ),
           ),
+          /**
+           * Loop guard (docs/design/agent-messaging §4.4): an agent input with a hop above
+           * `maxHops` (default 8), or one more from a peer that started `pair.maxTurns`
+           * (default 10) turns in a session within `pair.windowMs` (default 15 min) since a
+           * person last wrote there, is recorded as context instead of starting a turn.
+           */
+          loopGuard: Type.Optional(
+            Type.Object(
+              {
+                maxHops: Type.Optional(Type.Integer({ minimum: 1 })),
+                pair: Type.Optional(Type.Object({ maxTurns: Type.Optional(Type.Integer({ minimum: 1 })), windowMs: Type.Optional(Type.Integer({ minimum: 1 })) }, Closed)),
+              },
+              Closed,
+            ),
+          ),
+          /**
+           * Which agent may contact which (`Policy.contact`; `from` / `to` an agent name or `*`,
+           * `ops` default all). Not set: every contact is denied (agent-messaging §4.6).
+           */
+          agentContacts: Type.Optional(
+            Type.Array(
+              Type.Object(
+                {
+                  from: Type.String(),
+                  to: Type.String(),
+                  ops: Type.Optional(Type.Array(Type.Union(['list', 'send', 'run', 'observe', 'control'].map((x) => Type.Literal(x))))),
+                },
+                Closed,
+              ),
+            ),
+          ),
         },
         Closed,
       ),
@@ -561,6 +592,10 @@ export interface Config {
     watchAllowlist: Partial<Pick<WatchSource, 'channel' | 'account' | 'conversation' | 'conversationKind'>>[];
     /** `policy.answerOnBehalf` (default false): `resolve { onBehalfOf }` is allowed. */
     answerOnBehalf: boolean;
+    /** `policy.loopGuard` (defaults in `LOOP_GUARD_DEFAULTS`). */
+    loopGuard: LoopGuardOptions;
+    /** `policy.agentContacts` (none: every contact denied). */
+    agentContacts: AgentContactRule[];
   };
   /** Owner watches from the config file. */
   watches: (WatchDraft & { id: string })[];
@@ -791,6 +826,8 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
       routes: c.policy?.routes ?? [],
       watchAllowlist: c.policy?.watchAllowlist ?? [],
       answerOnBehalf: c.policy?.answerOnBehalf ?? false,
+      loopGuard: c.policy?.loopGuard ?? {},
+      agentContacts: (c.policy?.agentContacts ?? []) as AgentContactRule[],
     },
     watches: c.watches ?? [],
     local: {

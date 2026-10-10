@@ -36,7 +36,8 @@ host commands (authenticate with the token file next to the socket; docs/HOSTS.m
   aio redispatch <cursor> [--agent <name>] [--session main|per-conversation|per-thread|topic|<key json>]
                 [--cwd <dir>] [--env K=V …]                           (a queued item to a session, original sender kept)
   aio bindings  put [--file table.json|-] | get
-  aio explain   <inputId>
+  aio explain   <inputId | operationId> [--chain]                    (routing record; a delivery's turn and inputs;
+                                                                       --chain: an agent input back to the root of its chain)
   aio verify    <channelRef>                                          (channel:<channel>/<message id>)
 
 console (HTTP + WebSocket API for web UIs, on 127.0.0.1:7464 by default; config \`console\`)
@@ -96,6 +97,7 @@ export function parseCli(argv: string[]): CliArgs {
         once: { type: 'boolean' },
         limit: { type: 'string' },
         'token-file': { type: 'string' },
+        chain: { type: 'boolean' },
       },
     });
   } catch (e) {
@@ -511,10 +513,10 @@ async function bindings(a: CliArgs): Promise<number> {
 
 async function explain(a: CliArgs): Promise<number> {
   const id = a.rest[0];
-  if (!id) throw new ConfigError('usage: aio explain <inputId>');
+  if (!id) throw new ConfigError('usage: aio explain <inputId | operationId> [--chain]');
   const client = await hostClient(a);
   try {
-    print(await client.explain(id));
+    print(await client.explain(id, a.values.chain === true ? { chain: true } : {}));
     return 0;
   } finally {
     client.close();

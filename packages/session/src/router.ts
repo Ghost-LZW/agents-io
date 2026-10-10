@@ -16,6 +16,7 @@ import {
   type InputRecord,
   type Origin,
   type Policy,
+  type Principal,
   type RouteExplanation,
   type Watch,
   type WatchSource,
@@ -384,6 +385,12 @@ export class Router {
   identify(a: IdentifyArgs): Identity {
     if (this.identitiesExpireAt !== undefined && this.identitiesExpireAt <= this.now()) this.rebuildIdentities();
     return this.identities.identify(a);
+  }
+
+  /** The principal of one of this deployment's agents (`IdentityMap.agentPrincipal`; the host map may name it). */
+  agentPrincipal(agent: string): Principal {
+    if (this.identitiesExpireAt !== undefined && this.identitiesExpireAt <= this.now()) this.rebuildIdentities();
+    return this.identities.agentPrincipal(agent);
   }
 
   // ---- routing ------------------------------------------------------------

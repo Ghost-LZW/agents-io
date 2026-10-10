@@ -177,6 +177,21 @@
                 },
                 "declared": {
                   "type": "string"
+                },
+                "cause": {
+                  "type": "object",
+                  "required": [
+                    "hop"
+                  ],
+                  "properties": {
+                    "hop": {
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "chain": {
+                      "type": "string"
+                    }
+                  }
                 }
               }
             },

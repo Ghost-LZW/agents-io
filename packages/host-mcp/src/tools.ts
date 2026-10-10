@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { realpath, readFile, stat } from 'node:fs/promises';
 import { basename, isAbsolute, relative, resolve, sep } from 'node:path';
 import {
+  agentRouteKey,
   routeKey,
   type BlobStore,
   type ChannelAdapter,
@@ -97,6 +98,8 @@ export interface HostToolsOptions {
   fileAccess?(args: { path: string; cwd: string; turn: TurnContext }): boolean | Promise<boolean>;
   /** Sender identity attached to sends (required by channels with `caps.declaresSender`). */
   as?(sessionKey: string): string | undefined;
+  /** The agent a session runs: its address `<agent>/<sessionKey>` is what the agent acts as (watches). */
+  agentOf?(sessionKey: string): string | undefined;
   /** Watch control (dev-gateway `addWatch`/`removeWatch`/`listWatches`); absent = no watch tools. */
   watches?: WatchControl;
   /** Provenance of a session's turn (`Lane.provenance`), attached to every write the turn makes. */
@@ -146,9 +149,14 @@ export interface WatchControl {
 /** Declared identity of a session's agent: what its watches are created by. */
 export const agentIdentity = (sessionKey: string) => `session:${sessionKey}`;
 
-/** The origin a session's agent acts with: kind `agent`, no principal, declared = its session identity. */
-export function agentOrigin(sessionKey: string): Origin {
-  return { kind: 'agent', principal: null, evidence: 'none', declared: agentIdentity(sessionKey), via: `agent:${sessionKey}`, adapter: 'host-mcp' };
+/**
+ * The origin a session's agent acts with (creating watches): kind `agent`, evidence `daemon`
+ * (this daemon runs it), `via` = its session address as a route key (`agent:<agent>:<sessionKey>`,
+ * agent-messaging §4.1), declared = its session identity. No principal: watches stay created by
+ * `session:<key>` (`Policy.watch` treats it as an agent, never an owner).
+ */
+export function agentOrigin(sessionKey: string, agent?: string): Origin {
+  return { kind: 'agent', principal: null, evidence: 'daemon', declared: agentIdentity(sessionKey), via: agent !== undefined ? agentRouteKey({ agent, sessionKey }) : `agent:${sessionKey}`, adapter: 'agent' };
 }
 
 const WATCH_KINDS = ['dm', 'group', 'thread', 'meeting', 'mail', 'other'];
@@ -562,7 +570,7 @@ export class HostTools {
   private async watchTool(b: ToolBinding, name: 'watch_add' | 'watch_remove' | 'watch_list', args: Record<string, unknown>) {
     const w = this.o.watches;
     if (!w) throw new ToolError('watches are not available on this host');
-    const by = agentOrigin(b.sessionKey);
+    const by = agentOrigin(b.sessionKey, this.o.agentOf?.(b.sessionKey));
     const me = agentIdentity(b.sessionKey);
     const view = (x: Watch) => ({ ...x, mine: x.createdBy === me });
     if (name === 'watch_list') return { ok: true, session: b.sessionKey, watches: w.list(b.sessionKey).map(view) };

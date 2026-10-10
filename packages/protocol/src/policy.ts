@@ -6,6 +6,7 @@ import type { Resolver } from './requests.js';
 import type { BodyOf } from './events.js';
 import type { Watch } from './watch.js';
 import type { TurnProvenance } from './host.js';
+import type { AgentAddress } from './address.js';
 
 export interface IdentifyArgs {
   channel: string;
@@ -24,6 +25,22 @@ export interface Identity {
   declared?: string;
   /** This deployment's own agent output echoed back. */
   self?: boolean;
+  /**
+   * The sending account is a trusted agent account (`agentAccounts`): its out-of-band
+   * claims (a declared identity, a declared hop: `sender.cause`) may be taken.
+   */
+  trustedAgent?: boolean;
+}
+
+/** What one agent may do to another (`Policy.contact`). */
+export type ContactOp = 'list' | 'send' | 'run' | 'observe' | 'control';
+
+export interface ContactArgs {
+  from: AgentAddress;
+  to: AgentAddress | { agent: string };
+  op: ContactOp;
+  /** The sender's running turn, when the contact comes from one. */
+  turn: TurnContext | null;
 }
 
 export interface Admission {
@@ -84,4 +101,10 @@ export interface Policy {
    * their origin stays the original sender, never the watch's creator.
    */
   triage?(args: { watch: Watch; input: InputRecord }): Promise<'drop' | 'context' | 'trigger'>;
+  /**
+   * May one agent contact another (list it, send to it, run it, observe or control it)?
+   * Default: deny unless `policy.agentContacts` allows it (docs/design/agent-messaging §4.6).
+   * Defined for the agent-messaging tools; nothing calls it yet.
+   */
+  contact?(args: ContactArgs): Promise<'allow' | 'deny'>;
 }

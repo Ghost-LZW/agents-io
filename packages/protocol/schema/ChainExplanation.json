@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/ChainExplanation",
+  "type": "object",
+  "required": [
+    "inputId",
+    "links",
+    "end"
+  ],
+  "properties": {
+    "inputId": {
+      "type": "string"
+    },
+    "chain": {
+      "type": "string"
+    },
+    "links": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "inputId",
+          "principal"
+        ],
+        "properties": {
+          "inputId": {
+            "type": "string"
+          },
+          "hop": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sessionKey": {
+            "type": "string"
+          },
+          "address": {
+            "type": "string"
+          },
+          "principal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "basis": {
+            "anyOf": [
+              {
+                "const": "internal",
+                "type": "string"
+              },
+              {
+                "const": "recovered",
+                "type": "string"
+              },
+              {
+                "const": "declared",
+                "type": "string"
+              },
+              {
+                "const": "none",
+                "type": "string"
+              }
+            ]
+          },
+          "loopGuard": {
+            "type": "object",
+            "required": [
+              "tripped",
+              "limit"
+            ],
+            "properties": {
+              "tripped": {
+                "anyOf": [
+                  {
+                    "const": "hops",
+                    "type": "string"
+                  },
+                  {
+                    "const": "pair",
+                    "type": "string"
+                  }
+                ]
+              },
+              "limit": {
+                "type": "integer"
+              },
+              "hop": {
+                "type": "integer"
+              },
+              "peer": {
+                "type": "string"
+              },
+              "count": {
+                "type": "integer"
+              },
+              "windowMs": {
+                "type": "integer"
+              },
+              "sessionKey": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "end": {
+      "anyOf": [
+        {
+          "const": "root",
+          "type": "string"
+        },
+        {
+          "const": "broken",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "type": "string"
+        }
+      ]
+    }
+  }
+}

@@ -123,6 +123,12 @@ export const SendOp = Type.Object({
   operationId: Type.String(),
   /** Sender identity to attach (e.g. `runner:x/run:y`). Required when caps.declaresSender. */
   as: Type.Optional(Type.String()),
+  /**
+   * With `as`: where this agent-authored message sits in a chain of agent messages — the
+   * hop it has at a recipient and an opaque chain id. An adapter that can carry it
+   * out-of-band (mail: `X-Agents-IO-Hop`) may; never in the text. Others ignore it.
+   */
+  cause: Type.Optional(Type.Object({ hop: Type.Integer({ minimum: 1 }), chain: Type.String() })),
 });
 export type SendOp = Static<typeof SendOp>;
 

@@ -76,6 +76,10 @@
         {
           "const": "none",
           "type": "string"
+        },
+        {
+          "const": "daemon",
+          "type": "string"
         }
       ]
     },
