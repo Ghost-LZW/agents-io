@@ -130,7 +130,7 @@ interface World {
  * (`outputTools`) or for its default agent (`agents.<default>.tools`). Off by default (decision 13).
  */
 export function e2eTools(base: Config): boolean {
-  return base.outputTools || (base.defaultAgent !== undefined && base.agents[base.defaultAgent]?.tools === true);
+  return base.outputTools || (base.defaultAgent !== undefined && base.agents[base.defaultAgent]?.tools === true && !base.agents[base.defaultAgent]?.toolNames);
 }
 const TOOLS_OFF = 'output tools are off (set "tools": true on the default agent, or "outputTools": true)';
 

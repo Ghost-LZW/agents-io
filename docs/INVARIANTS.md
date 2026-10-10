@@ -595,10 +595,10 @@
 
 ### CF-6 给模型的工具默认关闭，按 agent 开启
 
-- **承诺**：给模型的工具默认关闭、按 agent 配置开启（ROADMAP §1 原则 2）。
-- **实现**：`outputTools` 默认 `false`（`config.ts` `resolveConfig`，决定 13），是每个 agent `tools` 的缺省值（`resolveAgents`）；网关只在有 agent 开了 `tools` 时建 `HostTools` / MCP 服务（`gateway.ts` 构造函数），只给这些 agent 的 harness 挂（`mcp: … agent.tools`）。开启时 15 个工具全部注册（`packages/host-mcp/src/server.ts:20-131`），`live_*` 在没有任何通道能开 live 时也出现（`gateway.ts:382-399`）。
+- **承诺**：给模型的工具默认关闭、按 agent 配置开启，可以逐个开启（ROADMAP §1 原则 2）。
+- **实现**：`outputTools` 默认 `false`（`config.ts` `resolveConfig`，决定 13），是每个 agent `tools` 的缺省值（`resolveAgents`）；网关只在有 agent 开了 `tools` 时建 `HostTools` / MCP 服务（`gateway.ts` 构造函数），只给这些 agent 的 harness 挂（`mcp: … agent.tools`）；`tools` 是名字列表时解析成 `toolNames`（`config.ts` `resolveAgents`，未知名字报错），`HostMcpServer.mcpFor(a, toolNames)` 给这个 token 记下允许的工具，`build` 只注册它们（`packages/host-mcp/src/server.ts`）。`tools: true` 时 15 个工具全部注册（`packages/host-mcp/src/server.ts:20-131`），`live_*` 在没有任何通道能开 live 时也出现（`gateway.ts:382-399`）。
 - **测试**：`packages/daemon/test/output-tools.test.ts` "off by default (decision 13): neither outputTools nor an agent turns them on, nothing is mounted #CF-6"、"agents.<name>.tools: true turns them on for that agent alone, with outputTools unset #CF-6"、"outputTools: false mounts nothing #CF-6"；`packages/daemon/test/topics.test.ts` "agents without the session_* tools get no topic hint #CF-6"（agent 的 `tools: false` 优先于顶层 `outputTools: true`）；`host-mcp.test.ts` "are listed over MCP only when the host provides watches #CF-6"；`packages/host-mcp/test/topic-tools.test.ts` "are listed over MCP only when the host provides topics #CF-6"。
-- **状态**：有测试（按 agent 开关）。逐个工具的开关仍不存在：一个 agent 要么 15 个全有、要么全无，逐个工具的取舍留给 ROADMAP §4 第 11 项（工具负担复查）。测试：`it.fails` `packages/daemon/test/output-tools.test.ts` "enabling only send_message for an agent lists only that tool over MCP #CF-6"（按设想的 `agents.<name>.tools: ['send_message']` 写；今天配置只收布尔值）。
+- **状态**：有测试（按 agent、按工具）。逐个工具的开关：`agents.<name>.tools: ['send_message', …]`（2026-10-11）；测试 `packages/daemon/test/output-tools.test.ts` "enabling only send_message for an agent lists only that tool over MCP"（原 `it.fails`，已修）、"agents.<name>.tools as a list: unknown names are a config error; an empty list is off"。哪些工具该默认给哪类 agent，仍留给 ROADMAP §4 第 11 项（工具负担复查）。
 - **行为变化**：2026-10-11 之前缺省开启；没写 `outputTools` / `tools` 的部署升级后不再有输出工具（CHANNELS §输出工具）。
 
 ### CF-7 谁能建、改、删监听

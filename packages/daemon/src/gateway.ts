@@ -211,6 +211,9 @@ const DAEMON_VERSION: string = (() => {
 })();
 
 /** Local ends post to this route; no adapter renders it, they read the stream instead. */
+/** The agent has the session_* tools (all tools, or a list naming one). */
+const hasTopicTools = (a: AgentConfig | undefined): boolean => !!a?.tools && (!a.toolNames || a.toolNames.some((n) => n.startsWith('session_')));
+
 export const localRoute = (sessionKey: string): ReplyRoute => ({ channel: 'local', account: 'local', conversationId: sessionKey });
 
 /** Wait for `p`, at most `ms`; the timer holds the event loop and is cleared when `p` wins. */
@@ -481,7 +484,7 @@ export class Gateway {
       // `/new`, `/topics`, `/switch` answer with one short message on the route they came from.
       systemReply: (a) => this.systemReply(a),
       // Inputs of a current topic say how to move between topics, to agents that have the session_* tools.
-      ...(tools ? { topicHint: (agent: string | undefined) => (c.agents[agent ?? c.defaultAgent ?? '']?.tools ? TOPIC_TOOLS_HINT : undefined) } : {}),
+      ...(tools ? { topicHint: (agent: string | undefined) => (hasTopicTools(c.agents[agent ?? c.defaultAgent ?? '']) ? TOPIC_TOOLS_HINT : undefined) } : {}),
       onReplyError: (err) => this.log('warn', `topic command reply failed: ${(err as Error).message}`),
       // A session whose agent is gone refuses the input: its log says so, and the route
       // too when the message was addressed to it (observe-only messages stay silent).
@@ -789,7 +792,7 @@ export class Gateway {
       hub: this.hub,
       policy: this.agentPolicy(agent),
       cwd,
-      ...(this.mcp && agent.tools ? { mcp: (a: { sessionKey: string; generation: number; harnessId: string }) => this.mcp!.mcpFor(a) } : {}),
+      ...(this.mcp && agent.tools ? { mcp: (a: { sessionKey: string; generation: number; harnessId: string }) => this.mcp!.mcpFor(a, agent.toolNames) } : {}),
       onLiveEnded: (liveId, reason) => this.liveEnded(sessionKey, liveId, reason),
       onHarnessEvent: (e) => {
         // A topic remembers its harness session id (switching back resumes it; the lane resumes from the log).
@@ -1107,7 +1110,7 @@ export class Gateway {
         }
         return `${p}_${randomUUID()}`;
       },
-      ...(this.mcp && r.agent.tools ? { mcp: (a: { sessionKey: string; generation: number; harnessId: string }) => this.mcp!.mcpFor(a) } : {}),
+      ...(this.mcp && r.agent.tools ? { mcp: (a: { sessionKey: string; generation: number; harnessId: string }) => this.mcp!.mcpFor(a, r.agent.toolNames) } : {}),
       onHarnessEvent: (e) => this.o.onHarnessEvent?.(r.sessionKey, e),
     });
     this.lanes.set(r.sessionKey, lane);

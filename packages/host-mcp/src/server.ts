@@ -175,6 +175,8 @@ function callIdOf(meta: Record<string, unknown> | undefined): string | undefined
 export class HostMcpServer {
   private http: Server | undefined;
   private readonly tokens = new Map<string, ToolBinding>();
+  /** Tokens limited to some tools (the agent's `tools` list). */
+  private readonly allowed = new Map<string, ReadonlySet<string>>();
   private base: string | undefined;
 
   constructor(private readonly o: HostMcpServerOptions) {}
@@ -212,13 +214,25 @@ export class HostMcpServer {
 
   /** Forget every token of a session (or one token). */
   revoke(match: string | { sessionKey: string }): void {
-    if (typeof match === 'string') this.tokens.delete(match);
-    else for (const [t, b] of this.tokens) if (b.sessionKey === match.sessionKey) this.tokens.delete(t);
+    if (typeof match === 'string') {
+      this.tokens.delete(match);
+      this.allowed.delete(match);
+    } else
+      for (const [t, b] of this.tokens)
+        if (b.sessionKey === match.sessionKey) {
+          this.tokens.delete(t);
+          this.allowed.delete(t);
+        }
   }
 
-  /** `LaneOptions.mcp` for a session: mints one token per harness binding. */
-  mcpFor(a: { sessionKey: string; generation: number; harnessId: string }): { url: string; token: string; transport: 'http' } {
-    return { url: this.url, token: this.mint({ sessionKey: a.sessionKey, generation: a.generation, harnessId: a.harnessId }), transport: 'http' };
+  /**
+   * `LaneOptions.mcp` for a session: mints one token per harness binding. `tools` limits
+   * what that token lists and may call (the agent's `tools` list); every tool when absent.
+   */
+  mcpFor(a: { sessionKey: string; generation: number; harnessId: string }, tools?: readonly string[]): { url: string; token: string; transport: 'http' } {
+    const token = this.mint({ sessionKey: a.sessionKey, generation: a.generation, harnessId: a.harnessId });
+    if (tools) this.allowed.set(token, new Set(tools));
+    return { url: this.url, token, transport: 'http' };
   }
 
   async close(): Promise<void> {
@@ -230,14 +244,17 @@ export class HostMcpServer {
     await new Promise<void>((r) => h.close(() => r()));
   }
 
-  private binding(req: IncomingMessage): ToolBinding | undefined {
+  private binding(req: IncomingMessage): { b: ToolBinding; allow?: ReadonlySet<string> } | undefined {
     const h = req.headers.authorization;
     const m = typeof h === 'string' ? /^Bearer\s+(\S+)$/i.exec(h) : null;
     if (!m) return undefined;
     const given = Buffer.from(m[1]!);
     for (const [t, b] of this.tokens) {
       const want = Buffer.from(t);
-      if (want.length === given.length && timingSafeEqual(want, given)) return b;
+      if (want.length === given.length && timingSafeEqual(want, given)) {
+        const allow = this.allowed.get(t);
+        return allow ? { b, allow } : { b };
+      }
     }
     return undefined;
   }
@@ -248,8 +265,8 @@ export class HostMcpServer {
       res.writeHead(404).end();
       return;
     }
-    const b = this.binding(req);
-    if (!b) {
+    const found = this.binding(req);
+    if (!found) {
       res.writeHead(401, { 'content-type': 'application/json', 'www-authenticate': 'Bearer' }).end(JSON.stringify({ error: 'invalid or missing bearer token' }));
       return;
     }
@@ -258,7 +275,7 @@ export class HostMcpServer {
       res.writeHead(405, { allow: 'POST' }).end();
       return;
     }
-    const server = this.build(b);
+    const server = this.build(found.b, found.allow);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => {
       void transport.close();
@@ -272,9 +289,11 @@ export class HostMcpServer {
     }
   }
 
-  private build(b: ToolBinding): McpServer {
+  private build(b: ToolBinding, allow?: ReadonlySet<string>): McpServer {
     const server = new McpServer({ name: SERVER_NAME, version: '0.1.0' }, { capabilities: { tools: {} } });
     for (const name of TOOL_NAMES) {
+      // Per-agent tool list (CF-6): a tool not listed is neither offered nor callable.
+      if (allow && !allow.has(name)) continue;
       if (name.startsWith('watch_') && !this.o.tools.hasWatches) continue;
       if (name.startsWith('session_') && !this.o.tools.hasTopics) continue;
       if (name.startsWith('live_') && !this.o.tools.hasLive) continue;
