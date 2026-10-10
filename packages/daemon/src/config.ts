@@ -227,7 +227,10 @@ const AgentEntry = Type.Object(
     cwd: Type.Optional(Type.String()),
     /** `task`: only `run.start` / `aio run` runs it; no binding may target it. Default `interactive`. */
     mode: Type.Optional(Type.Union([Type.Literal('interactive'), Type.Literal('task')])),
-    /** Mount the host MCP output tools (default: top-level `outputTools`). */
+    /**
+     * Mount the host MCP output tools for this agent (default: top-level `outputTools`,
+     * itself off by default: principle 2, decision 13). This is the per-agent switch.
+     */
     tools: Type.Optional(Type.Boolean()),
     /** Extra system instructions read from this file (Claude: appended to the preset prompt; Codex: developer instructions). */
     instructionsFile: Type.Optional(Type.String()),
@@ -299,8 +302,10 @@ export const ConfigFile = Type.Object(
     identities: Type.Optional(Type.Array(IdentityEntry)),
     channels: Type.Optional(Type.Array(ChannelEntry)),
     /**
-     * Mount the host MCP output tools (send_file, ask_choice, mention, reply_to,
-     * send_message, get_channel_context) into every harness instance (default true).
+     * Default of every agent's `tools`: mount the host MCP output tools (send_file,
+     * ask_choice, mention, reply_to, send_message, watch_*, session_*, live_*…).
+     * Default false since decision 13 (it was true): turn tools on per agent with
+     * `agents.<name>.tools: true`, or set this to true for every agent.
      */
     outputTools: Type.Optional(Type.Boolean()),
     /**
@@ -333,6 +338,13 @@ export const ConfigFile = Type.Object(
           /** Put every owner DM (any channel) into this one session. */
           ownerSessionKey: Type.Optional(Type.String()),
           routes: Type.Optional(Type.Array(Type.String())),
+          /**
+           * Let a request be answered on someone's behalf (default false, decision 13): a host
+           * connection's `resolve { onBehalfOf }` is refused with `on_behalf_not_allowed` until
+           * this is true. The one switch for answering in another's name; agent-on-behalf
+           * approval (decision 12) will sit behind it too.
+           */
+          answerOnBehalf: Type.Optional(Type.Boolean()),
           /**
            * Sources an agent may watch without asking (defaultPolicy `watchAllowlist`):
            * each entry matches when every field it sets equals the watch source's.
@@ -543,10 +555,12 @@ export interface Config {
     ownerSessionKey?: string;
     routes: string[];
     watchAllowlist: Partial<Pick<WatchSource, 'channel' | 'account' | 'conversation' | 'conversationKind'>>[];
+    /** `policy.answerOnBehalf` (default false): `resolve { onBehalfOf }` is allowed. */
+    answerOnBehalf: boolean;
   };
   /** Owner watches from the config file. */
   watches: (WatchDraft & { id: string })[];
-  /** Host MCP output tools mounted into every harness instance. */
+  /** The config's `outputTools` (default false): the default of every agent's `tools`. */
   outputTools: boolean;
   /** How long a parked topic's lane stays open while idle (0: until the daemon stops). */
   topics: { parkedIdleMs: number };
@@ -741,7 +755,8 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
 
   const owners = [...(c.policy?.owners ?? []), ...(env.AGENTS_IO_OWNERS ?? '').split(',').map((s) => s.trim()).filter(Boolean)];
   const ownerSessionKey = c.policy?.ownerSessionKey;
-  const outputTools = c.outputTools ?? true;
+  // Off unless asked for (principle 2, decision 13: the default was true before 2026-10-11).
+  const outputTools = c.outputTools ?? false;
   const { agents, defaultAgent } = resolveAgents(c, harnesses, defaultHarness, outputTools, path);
   const identities = c.identities ?? [];
   const localSession = c.local?.session ?? ownerSessionKey ?? 'local:main';
@@ -771,6 +786,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
       ...(ownerSessionKey ? { ownerSessionKey } : {}),
       routes: c.policy?.routes ?? [],
       watchAllowlist: c.policy?.watchAllowlist ?? [],
+      answerOnBehalf: c.policy?.answerOnBehalf ?? false,
     },
     watches: c.watches ?? [],
     local: {

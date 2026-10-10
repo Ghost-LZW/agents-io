@@ -763,6 +763,14 @@ describe('helpers', () => {
     ]);
   });
 
+  it('sender preface carries ref=channel:<channel>/<message id> only for a channel message, bare like Claude Code', async () => {
+    const ref = 'channel:lark-bot/om_1';
+    expect(await renderInputs([{ ...input('i1', 'confirm'), channelRef: ref }])).toEqual([
+      { type: 'text', text: `[sender from=owner kind=human via=lark:a:c1 ref=${ref} chat="Team"]\nconfirm`, text_elements: [] },
+    ]);
+    expect(((await renderInputs([input('i2', 'local')]))[0] as { text: string }).text).not.toMatch(/ ref=/);
+  });
+
   it('labels context-only inputs as not addressed to the agent (also without the sender preface)', async () => {
     const stranger = { kind: 'human' as const, principal: null, evidence: 'platform_signed' as const, via: 'lark:a:g1', adapter: 'lark' };
     const ctx = { ...input('c1', 'the launch moved to Thursday'), origin: stranger, channelContext: { senderName: 'Eve', context: true } };

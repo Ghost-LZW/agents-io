@@ -31,7 +31,7 @@ harness 事件 ──▶ SessionLog（seq）──▶ Compositor（读全量，�
 每条输入在发给 harness 前，前面加一行发送者说明，后面是转换过的内容块：
 
 ```
-[agents-io input from=lark-bot:on_bc38… kind=human via=lark-bot:default:oc_7a1… channel=lark-bot conversationKind=dm conversationId=oc_7a1… senderName=张三 sentAt=1791… reply=card markdown=basic maxChars=4000 buttons=yes media=image,file,audio]
+[agents-io input from=lark-bot:on_bc38… kind=human via=lark-bot:default:oc_7a1… ref=channel:lark-bot/om_5f2… channel=lark-bot conversationKind=dm conversationId=oc_7a1… senderName=张三 sentAt=1791… reply=card markdown=basic maxChars=4000 buttons=yes media=image,file,audio]
 列出当前目录下的文件，然后用一句话总结
 ```
 
@@ -41,6 +41,7 @@ harness 事件 ──▶ SessionLog（seq）──▶ Compositor（读全量，�
 - `kind`：`human`、`agent`、`channel_event` 等。
 - `via`：来源路由，格式为 `通道:账号:会话[:线程]`。
 - `declared`：只有发送账号可信、且通过适配器控制的元数据表明身份时才出现，消息正文里的自称不算。
+- `ref`：这条输入对应的渠道消息引用 `channel:<通道>/<消息 id>`（决定 13），与宿主入站队列的幂等键、`input.verify` / `aio verify` 的参数同一格式。网关按核对过的信封盖章（`InputRecord.channelRef`），适配器和客户端都不能设置；不截断，含空白或引号时整体加 JSON 引号。只有来自渠道消息的输入才有：本地（`aio input` / `attach`）、宿主 `input` 帧、任务运行、系统输入（汇总、话题摘要、live 委托）都没有。agent 调宿主命令做敏感写操作（确认、作答）时把它原样带上，宿主用 `aio verify <ref>` 自己核验作者与证据（HOSTS §4.1）。
 - 后面的 `key=value` 来自适配器提供的上下文（如邮件主题、发送者名字），网关自己的字段同名时以网关为准。
 - `senderName`：适配器给出的发送者显示名（飞书经通讯录解析，邮件取 From 里的名字），拿不到就没有这一项。
 - `reply`：这一轮的回复会怎么显示，由网关按渲染该路由的通道能力和档位生成，适配器不能伪造。格式固定为
@@ -81,7 +82,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 - 每条输入的路由解释（命中了哪些规则、表版本、回调结果、主体、证据，没投递时还有原因）写进日志所在的 SQLite，重启后仍能用 `Router.explain(inputId)` 查到。
 - 宿主应用自己实现的 `Policy.admit` 只在没有任何表时生效（dev-gateway 传入 `policy.admit` 时不再生成默认表，监听照常生效）。这是兼容旧接口，新代码请写 Binding 规则。
 
-**来源标记**（决定 4、5：只标记，不拦截，不降档）：每一轮都算出 `TurnProvenance`：触发这一轮的输入的主体；上下文里有没有被监听、汇总或只记录的输入；有没有来自外部（没有主体）的输入；有没有群聊输入。用 `Lane.provenance(turnId)` 读取。harness 子进程的环境变量按 session 设置而不是按轮设置，所以交互 session 的来源标记不放进 `AGENTS_IO_TURN_PROVENANCE`，而是附在输出工具的每次写入上：`agents-io.output` 记录的 `provenance` 字段，以及宿主 MCP `onCall` 事件的 `provenance`。只有 `run.start` 的任务运行在子进程环境里带 `AGENTS_IO_TURN_PROVENANCE`（子进程只跑这一次运行，值在启动时定下：`triggeredBy` 为 `["host:<宿主名>"]`（无宿主名时为 `host:cli`），其余标记为 `false`）；任务运行里输出工具的写入同样带 `provenance`。标记按这一轮**实际交给 harness 的内容**算（见 §1b）：只记录的输入交给了哪一轮，那一轮和这个 session 之后的每一轮都标 `watched`（来自陌生人的再标 `external`，来自群聊的再标 `group`），因为它们留在 harness 的对话里了；被监听开的轮次（digest、trigger）的输入同样延续到之后的轮次。某一轮运行期间才记下的输入不在这一轮里，从下一轮起才算。
+**来源标记**（决定 4、5：只标记，不拦截，不降档）：每一轮都算出 `TurnProvenance`：触发这一轮的输入的主体；上下文里有没有被监听、汇总或只记录的输入；有没有来自外部（没有主体）的输入；有没有群聊输入。用 `Lane.provenance(turnId)` 读取。来源标记不进 harness 子进程的环境变量（子进程跨多轮复用；任务运行的 `AGENTS_IO_TURN_PROVENANCE` 值恒定、没有信息，已删除，决定 13；任务运行只保留 `AGENTS_IO_RUN_ID`），而是附在输出工具的每次写入上：`agents-io.output` 记录的 `provenance` 字段，以及进程内嵌入时宿主 MCP `onCall` 事件的 `provenance`；交互 session 与任务运行都是如此。标记按这一轮**实际交给 harness 的内容**算（见 §1b）：只记录的输入交给了哪一轮，那一轮和这个 session 之后的每一轮都标 `watched`（来自陌生人的再标 `external`，来自群聊的再标 `group`），因为它们留在 harness 的对话里了；被监听开的轮次（digest、trigger）的输入同样延续到之后的轮次。某一轮运行期间才记下的输入不在这一轮里，从下一轮起才算。
 
 ## 1b. 只记录的输入怎样交给 agent
 
@@ -350,7 +351,8 @@ aio-dev watch remove team-digest
 - 每个 harness 绑定（一个 session 的一次 open，即一个 generation）发一个随机 bearer token，token 对应 `(sessionKey, generation)`。每次调用时再取这个 session **当前正在跑的那一轮**，没有在跑的轮次就拒绝（监听工具除外）。没有 token 或 token 不对：HTTP 401。
 - **Claude Code**：通过 SDK `mcpServers` 挂成 `agents_io`（`type: 'http'`，`headers.Authorization`），设 `alwaysLoad: true`（工具总在提示里，不藏在 tool search 后面），并加一条 `allowedTools: mcp__agents_io` 允许规则：这些工具自己按 `Policy.outbound` 检查目的地，不再弹审批。
 - **Codex**：在 `thread/start`（或 `thread/resume`）的 `config` 里按线程覆盖 `mcp_servers.agents_io = { url, http_headers: { Authorization }, default_tools_approval_mode: "approve" }`。已实测（codex-cli 0.160.1）：按线程的配置会启动这个服务（`mcpServer/startupStatus/updated` 显示 `ready`）；不设 `default_tools_approval_mode` 时，非只读的 MCP 工具在 `approvalPolicy: never` 下会被直接拒掉（模型回答"需要审批但无法审批"）。
-- dev-gateway 默认打开（配置 `"outputTools": true`），关掉就不挂。
+- **默认关闭，按 agent 开启**（原则 2，决定 13）：在 agent 上写 `"tools": true` 才挂，例如 `"agents": { "assistant": { "harness": "claude", "tools": true } }`；顶层 `"outputTools": true` 把所有没写 `tools` 的 agent 一起打开（它只是各 agent `tools` 的缺省值），agent 自己的 `tools: false` 仍优先。没有任何 agent 开启时网关不起 MCP 服务。`packages/daemon/aio.config.example.json`（dev-gateway / e2e 用的示例配置）给 `assistant` 开了。
+- **行为变化（2026-10-11）**：此前 `outputTools` 缺省为 `true`，什么都不写的部署所有 agent 都有工具。升级后这样的部署**不再挂任何输出工具**：`ask_choice` 按钮、`send_file`、`mention`、`send_message`、`watch_*`、`session_*`（模型自己切话题；`/new`、`/switch` 聊天命令不受影响）、`live_*` 都没有，话题提示行也不再出现。要保持原样，在配置顶层加 `"outputTools": true`，或给需要的 agent 加 `"tools": true`。
 - **幂等**：每次调用的 operationId 是 `tool:<sessionKey>:<harness 的工具调用 id>`。Claude Code 在 `_meta["claudecode/toolUseId"]` 里给出调用 id，Codex 在 `_meta.callId` 里给出（同时还有 `x-codex-turn-metadata`、`threadId`、`itemId` 等）。都没有时退回 JSON-RPC 请求 id。同一个调用重试不会发出两条消息。
 - **记录**：每条工具发出的消息在 session 日志里记一条 `native` 事件 `agents-io.output`（内容是工具名、operationId、路由、`RenderedMessage`，ask_choice 还有问题和选项），随后 Outbox 写 `delivery.settled`。工具调用本身的 `item.*` 事件照常来自 harness。
 

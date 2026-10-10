@@ -36,7 +36,8 @@ see `docs/E2E.md` §0). New:
 
 - An **agent** is a named run configuration: harness instance, `model`, `effort`,
   `profile`, `cwd`, `tools` (mount the host MCP output tools; default top-level
-  `outputTools`), `instructionsFile` (Claude: appended to the preset system
+  `outputTools`, which defaults to **false** since 2026-10-11: turn tools on per
+  agent with `"tools": true`, or for all agents with `"outputTools": true`), `instructionsFile` (Claude: appended to the preset system
   prompt; Codex: developer instructions), `mode`.
 - `mode: "task"` agents only run through `run.start` / `aio run`. A binding (config
   or host-pushed, including a callout's `onFailure`) that targets one is rejected
@@ -120,13 +121,15 @@ before any host frame; after it, the connection's client frames carry the origin
   `policy { hook: "outbound", args: { from, to } }` is `Policy.outbound` (answer
   `{ verdict }`); timeout (`hostCallouts.outbound.timeoutMs`, default 2000), error or
   a bad answer deny. Without a host that answers the hook, the local policy decides.
-- `resolve { onBehalfOf }` (host connections only): answer a request as that
+- `resolve { onBehalfOf }` (host connections only, and only with
+  `policy.answerOnBehalf: true`, default false; otherwise `on_behalf_not_allowed`
+  and the `resolve.onBehalfOf` feature is not advertised): answer a request as that
   principal. A `human` request still requires it among its `principals`; the log
   records `by: { kind, id: <principal>, via: "host:<name>" }`.
 - `run.start`: only `mode: task` agents. A fresh session `run:<runId>`, its own
   harness adapter (Codex: its own app-server over stdio) with the request `env`
   over the instance's env, in the child process only (never logged, never on
-  argv; the daemon also sets `AGENTS_IO_RUN_ID` and `AGENTS_IO_TURN_PROVENANCE`).
+  argv; the daemon also sets `AGENTS_IO_RUN_ID`).
   The input is the turn's content; the turn ends → `run.ended { status, exitCode }`
   and the session closes. `runId` is an idempotency key: starting an ended run
   again answers `state: "ended"` with its outcome. `run.cancel` interrupts;

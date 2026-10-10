@@ -206,6 +206,26 @@
         }
       ]
     },
+    "claimedEvidence": {
+      "anyOf": [
+        {
+          "const": "platform_signed",
+          "type": "string"
+        },
+        {
+          "const": "dkim_pass",
+          "type": "string"
+        },
+        {
+          "const": "device_only",
+          "type": "string"
+        },
+        {
+          "const": "none",
+          "type": "string"
+        }
+      ]
+    },
     "at": {
       "type": "number"
     },

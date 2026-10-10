@@ -92,6 +92,13 @@ export const InputRecord = Type.Object({
   origin: Origin,
   content: Type.Array(ContentBlock),
   replyRoute: Type.Union([ReplyRoute, Type.Null()]),
+  /**
+   * `channel:<channel>/<message id>` of the channel message this input is, stamped by the
+   * gateway from the (verified) envelope; absent for local, host, system and agent-tool inputs.
+   * The same key `input.verify` / `aio verify` and the host queue use, so an agent can hand it
+   * to a host command and the host can check the author itself. Clients cannot set it.
+   */
+  channelRef: Type.Optional(Type.String()),
   /** Small scalar facts a harness may surface to the model (chat name, sender name…). */
   channelContext: Type.Record(Type.String(), Type.Union([Type.String(), Type.Number(), Type.Boolean()])),
 });

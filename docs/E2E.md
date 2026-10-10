@@ -79,6 +79,8 @@ e2e 跑的是默认实例（`--harness` 可换），保留它的 `env`、`config
 | p | topic-rotate | 话题（决定 6）：主人私聊先说 A（Rust GPX 工具、代号 BLUE-HERON-7），再问无关的 B（澳大利亚首都）→ agent 调 `session_rotate`，新话题 session（`<会话 key>#<topicId>`）以摘要为 context 接手这条消息并回答 Canberra；**重启守护进程**；再说"回到刚才 Rust GPX 命令行工具的话题：它的秘密代号是什么"→ B 里的 agent 调 `session_list` + `session_switch`，A 成为当前话题，A 的 session 用原生 id 续接并答出 BLUE-HERON-7；报告摘要里是否带了代号 |
 | q | topic-command | 聊天命令：`/new Groceries` → 系统回复、新话题当前；下一条消息进新话题，卡片 `channelData["agents-io/topic"].title` 为 Groceries；`/topics` 列出两个（▶ 标当前）；`/switch 2` 回到第一个话题，回答记得第一个话题里的词（kiwi）而不是第二个的（mango）；命令本身不进 harness（共 3 个 turn） |
 
+**m、n、o、p 需要输出工具**：输出工具默认关闭（决定 13），e2e 的场景 agent 跟随配置里默认 agent 的 `tools`（或顶层 `outputTools`）。示例配置 `aio.config.example.json` 的 `assistant` 已写 `"tools": true`；自己的配置没开时这四个场景显示 `SKIP output tools are off`。
+
 **p 依赖模型（不稳定）**：是否调 `session_rotate` / `session_switch` 是模型自己的决定，p 不是确定性测试。实测（2026-10，`--data-dir ~/.agents-io/e2e`）：codex 默认模型 3/3；claude-code haiku 4/5、sonnet 1/4。失败都是模型没调工具、无工具报错：多数是 B 里直接答出了代号（轮换摘要里带了 A 的代号，模型就不切回），一次是根本没轮换、在 A 里答了 Canberra。p 失败时先看原因里的 `tools …: none`；q 不依赖模型的选择，应当每次通过。
 
 e2e 会忽略配置里的通道（不需要通道密钥），claude-code 下不加载用户/项目 settings（否则用户的权限规则会替人回答审批），codex 下 `restricted` 未配置时用 `approvalPolicy: untrusted`、effort 默认 `low`。

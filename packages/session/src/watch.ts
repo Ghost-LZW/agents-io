@@ -12,6 +12,7 @@ import {
   type WatchFilter,
   type WatchSource,
 } from '@agents-io/protocol';
+import { channelRefOf } from './host-queue.js';
 import type { CommandResult, Lane } from './lane.js';
 import { withDefaults, type FullPolicy, type SessionPolicy } from './policy.js';
 
@@ -595,6 +596,7 @@ export class WatchDispatcher {
       origin,
       content: env.content,
       replyRoute: null,
+      channelRef: channelRefOf(env),
       channelContext: { ...base, watch: w.id, watchMode: w.mode, watchSource: origin.via },
     };
     let verdict = await this.policy.triage({ watch: w, input });

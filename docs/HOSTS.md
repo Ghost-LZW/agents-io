@@ -109,7 +109,7 @@
 
 ## 4. 宿主协议
 
-本地 unix socket（目录 0700、socket 0600），JSONL，请求带 `id`、同 `id` 的 `result` 应答。宿主连接先 `host.hello { token, name, consumer?, callouts? }`；token 由守护进程每次启动时重新生成，写入 socket 旁的 0600 文件 `<socket>.token`；运维可用 `aio serve --token-file <path>` 或配置 `host.tokenFile` 指定一个跨重启不变的令牌文件（存在则读、不存在则生成，见 `docs/design/host-token-file`）。带 token 的连接数量不限（`aio run`、`aio tail` 等命令都是这样的连接）；`hello` 里带 `consumer`（推送消费）或开启任一回调钩子（`callouts`）的连接才是**宿主**，同一时刻至多一个。宿主在线时，`onHostDown: "suspend"` 的宿主表生效，回调发给它，发起连接已断开的 run 的 `run.ended` 也发给它。只拉取的宿主没有这样的常驻连接：可以在 `hello` 里带 `lease: { ttlMs }` 声明在线（该名字的任一连接每发一帧就续期，到期视为宿主下线，`onHostDown` 据此生效），或者让宿主表使用 `onHostDown: "keep"`（可配 `expiresAt` 当租约）。已有宿主时再来一个带角色的 `hello` 默认得到 `host_connected`；带 `takeover: true`（且 token 正确）则顶替旧连接：守护进程关闭旧连接、记日志，旧连接未确认的推送改推给新连接，结果里带 `replaced: { name }`（宿主断线重连而旧连接半开时用）。控制台 `/ws` 有心跳（`console.heartbeat`，默认每 30 s ping，10 s 内无应答即断开），半开的远程宿主连接会被及时清掉（见 `docs/design/host-liveness`）。宿主连接也可以发送所有客户端帧（`subscribe`、`input`、`resolve` 等，见 `packages/protocol/src/client.ts`），`origin` 标记为 `kind: "system"`。
+本地 unix socket（目录 0700、socket 0600），JSONL，请求带 `id`、同 `id` 的 `result` 应答。宿主连接先 `host.hello { token, name, consumer?, callouts? }`；token 由守护进程每次启动时重新生成，写入 socket 旁的 0600 文件 `<socket>.token`；运维可用 `aio serve --token-file <path>` 或配置 `host.tokenFile` 指定一个跨重启不变的令牌文件（存在则读、不存在则生成，见 `docs/design/host-token-file`）。带 token 的连接数量不限（`aio run`、`aio tail` 等命令都是这样的连接）；`hello` 里带 `consumer`（推送消费）或开启任一回调钩子（`callouts`）的连接才是**宿主**，同一时刻至多一个。宿主在线时，`onHostDown: "suspend"` 的宿主表生效，回调发给它，发起连接已断开的 run 的 `run.ended` 也发给它。只拉取的宿主（`aio tail` / `inbound.read`）没有这样的常驻连接，守护进程始终视它为不在线：它的表要用 `onHostDown: "keep"`，并定期重推（`bindings.put`）、每次给一个新的 `expiresAt` 当租约（例如每隔 T 重推一次，`expiresAt = now + 2T`），宿主停止重推后表到点挂起；否则默认的 `suspend` 表一直不生效（§6）。协议里曾有的 `host.hello.lease` 守护进程从未实现，已删除（决定 13）；旧宿主仍带这个字段不会被拒，只是被忽略。已有宿主时再来一个带角色的 `hello` 默认得到 `host_connected`；带 `takeover: true`（且 token 正确）则顶替旧连接：守护进程关闭旧连接、记日志，旧连接未确认的推送改推给新连接，结果里带 `replaced: { name }`（宿主断线重连而旧连接半开时用）。控制台 `/ws` 有心跳（`console.heartbeat`，默认每 30 s ping，10 s 内无应答即断开），半开的远程宿主连接会被及时清掉（见 `docs/design/host-liveness`）。宿主连接也可以发送所有客户端帧（`subscribe`、`input`、`resolve` 等，见 `packages/protocol/src/client.ts`），`origin` 标记为 `kind: "system"`。
 
 | 帧 | 方向 | 用途 |
 |---|---|---|
@@ -129,15 +129,19 @@
 
 `host.hello.callouts` 是 `boolean | string[]`：`true` 等于 `["route"]`；列表可含 `route`、`resolve`、`outbound`，未知名字忽略，结果的 `callouts` 列出实际开启的钩子。方案见 `docs/design/host-callouts`。
 
+**`resolve` 与 `outbound` 两个钩子已冻结**（决定 13）：行为不变、照常可用，但不再增加钩子种类或参数，没有使用者之前也不为它们做新设计；新宿主不应依赖它们去表达本可以随表推送的静态规则。
+
 - **`resolve`**：`policy { hook: "resolve", args: { request, ctx } }`（`request.opened` 的事件体与 `TurnContext`，与 `Policy.resolve` 参数相同），答复一个 `Resolver`。超时（配置 `hostCallouts.resolve.timeoutMs`，默认 3000 ms）、出错、答复不合 schema 或宿主不在线时，按守护进程本地策略决定。
 - **`outbound`**：`policy { hook: "outbound", args: { from, to } }`，答复 `{ verdict: "allow" | "deny" }`。开启后超时（`hostCallouts.outbound.timeoutMs`，默认 2000 ms）、出错、答复不合 schema 一律 `deny`；没有开启的宿主时按本地策略。**注意两个方向不同**：宿主在线时失败即拒绝，宿主断开后则回到本地策略，本地允许的去向（如预注册的 `routes`）照常放行——宿主靠 `outbound` 施加的限制在它离线期间不生效。需要离线也受限的部署，应把限制同时写进本地策略（离线时一律拒绝的选项列为后续工作，见 `docs/design/host-callouts` §8）。
-- **代答**：宿主连接（`origin.kind = "system"` 且 `origin.adapter = "host"`；网关与会话 lane 各查一次）发 `resolve` 时可带 `onBehalfOf: "<成员 id>"`。`human` 请求要求该成员在 `principals` 里；日志记 `request.resolved.by = { kind, id: <成员>, via: "host:<名字>" }`。非宿主连接带 `onBehalfOf` 答 `not_eligible`。
+- **代答**：宿主连接（`origin.kind = "system"` 且 `origin.adapter = "host"`；网关与会话 lane 各查一次）发 `resolve` 时可带 `onBehalfOf: "<成员 id>"`。`human` 请求要求该成员在 `principals` 里；日志记 `request.resolved.by = { kind, id: <成员>, via: "host:<名字>" }`。非宿主连接带 `onBehalfOf` 答 `not_eligible`。**须部署方显式开启**（决定 13）：配置 `"policy": { "answerOnBehalf": true }`，缺省 `false`；未开启时宿主连接带 `onBehalfOf` 的 `resolve` 答 `on_behalf_not_allowed`（请求保持打开，宿主仍可不带 `onBehalfOf` 以自己的名义作答），`host.hello` 的 `features` 也不列 `"resolve.onBehalfOf"`。这是"以别人的名义作答"的唯一开关，决定 12 的 agent 代为审批以后也挂在它下面，不另设开关。**行为变化（2026-10-11）**：此前任何带 token 的宿主都能代答；依赖代答的部署升级后要加这一项。
 
-**能力协商**：`host.hello` 的结果带 `features: string[]`，按能力名协商而不是按版本号。目前有 `"session.launch"`：回调答复可带 `launch`、可用 `session.prepare`、规则可用 `callout.skipWhenPinned`；`"callouts.resolve"`、`"callouts.outbound"`、`"resolve.onBehalfOf"`（§4.1）；`"inbound.redispatch"`（§2.1）；`"host.takeover"`：`host.hello` 支持 `takeover: true`（§2）。旧守护进程的 `callouts` 只接受布尔。推荐做法：直接发钩子列表，收到 `invalid_frame` 再用 `callouts: true` 重发（旧守护进程只有 `route`）。不要先用 `callouts: true` 握手探测 features：那次握手已让这条连接成为**唯一的**宿主、只开了 `route`，想换成列表必须断开重连，期间占着宿主位置。结果里没有某个 feature 时，宿主不得依赖它。
+**能力协商**：`host.hello` 的结果带 `features: string[]`，按能力名协商而不是按版本号。目前有 `"session.launch"`：回调答复可带 `launch`、可用 `session.prepare`、规则可用 `callout.skipWhenPinned`；`"callouts.resolve"`、`"callouts.outbound"`、`"resolve.onBehalfOf"`（§4.1，只在 `policy.answerOnBehalf` 开启时列出）；`"inbound.redispatch"`（§2.1）；`"host.takeover"`：`host.hello` 支持 `takeover: true`（§2）。旧守护进程的 `callouts` 只接受布尔。推荐做法：直接发钩子列表，收到 `invalid_frame` 再用 `callouts: true` 重发（旧守护进程只有 `route`）。不要先用 `callouts: true` 握手探测 features：那次握手已让这条连接成为**唯一的**宿主、只开了 `route`，想换成列表必须断开重连，期间占着宿主位置。结果里没有某个 feature 时，宿主不得依赖它。
 
 **`session.prepare { sessionKey, agent, launch }`**：用于不经渠道路由打开的会话（宿主连接发的客户端 `input` 帧、本地 `aio input` / `aio attach`、指向该键的 watch），也可以让宿主在键可预知时（如成员入驻时建群）提前登记，规则就不必开回调。它只登记（agent 行与 launch 行在同一事务里写入），不拉起 harness；第一条输入到达时按登记建 lane。结果 `{ sessionKey, agent, launch: { cwd?, envKeys }, created }`：同一键用相同的值再 prepare 幂等（`created: false`）。错误码：`unknown_agent`、`not_interactive_agent`、`launch_not_allowed`（agent 没有 `sessionParams`）、`bad_cwd`、`bad_env`、`launch_unsupported`（Codex `unix` 实例带 env）、`launch_conflict`（键已有不同的 launch，或已是无 launch 的会话）、`agent_conflict`（键已属于另一个 agent）、`invalid_frame`（含 `run:` 前缀的键，task run 用 `run.start`）。遇到 `launch_conflict` 换键，不要重试。每个请求的 `result.value` 都有 schema（`packages/protocol/src/host.ts` 末尾的 `HOST_RESULT_VALUES`，JSON Schema 见 `packages/protocol/schema/*Result.json`）。
 
-**宿主写命令的来源标记**：守护进程为每一轮算出来源摘要（是否含 context/digest/外部/群聊输入），附在输出工具的每次调用上（`agents-io.output` 记录的 `provenance` 字段，宿主 MCP `onCall` 事件的 `provenance`），交互 session 与任务运行都是如此。harness 环境变量 `AGENTS_IO_TURN_PROVENANCE` 只有 `run.start` 的任务运行才有：子进程为这一次运行单独启动，值在启动时定下（`triggeredBy` 为 `["host:<宿主名>"]`（无宿主名时为 `host:cli`），其余标记为 `false`）；交互 session 的子进程跨多轮复用，环境变量不按轮设置，所以没有这个变量（见 CHANNELS.md §1a 的来源标记）。不拦截任何调用（决定 4）。
+**宿主写命令的来源标记**：守护进程为每一轮算出来源摘要（是否含 context/digest/外部/群聊输入），附在输出工具的每次调用上（`agents-io.output` 记录的 `provenance` 字段；宿主 MCP `onCall` 事件的 `provenance` 只在进程内嵌入时可用，远程宿主收不到），交互 session 与任务运行都是如此（见 CHANNELS.md §1a 的来源标记）。来源不进 harness 子进程的环境变量：任务运行只带 `AGENTS_IO_RUN_ID`（让工作区里的宿主命令能把调用对到这次运行）；原有的 `AGENTS_IO_TURN_PROVENANCE` 值恒定（`triggeredBy: ["host:<名>"]`，其余为 `false`），发起运行的宿主本来就知道，已删除（决定 13）。不拦截任何调用（决定 4）。
+
+**交互 session 里的宿主写命令：带 `ref`，宿主自己核验**（决定 4 的兑现方式，决定 13）。按原则 7，agent 是在工作区里直接调宿主命令（如 `x`）写入的，这次调用不经过 agents-io，守护进程没法往上附来源。所以来源换成一个宿主能独立验证的事实：给模型的发送者说明行里，来自渠道消息的输入带 `ref=channel:<通道>/<消息 id>`（CHANNELS §1）；agent 调宿主写命令时把触发它的那条消息的 `ref` 当参数带上；宿主用 `aio verify <ref>`（`input.verify { channelRef }`）查到这条消息的平台作者、主体、标签与封顶后的证据，按自己的规则决定收不收（例如"确认"必须来自 `owner` 且证据为 `platform_signed`）。没有 `ref` 的写请求（agent 自发、本地输入、宿主自己发的 `input`）由宿主决定怎么对待。`ref` 证明的是"这个人确实发过这条消息"，不证明这条消息就是触发本次命令的那条：agent 可能拿会话里更早的一条消息的 `ref`。核验结果带 `conversation`、`receivedAt` 与 `inputId`，宿主可以据此再加约束（同一会话、足够新、一条消息只认一次确认）。
 
 ## 5. 命令行（给不想写 socket 客户端的宿主）
 
@@ -158,9 +162,9 @@
 |---|---|
 | start-executor 适配器（0003） | Go 薄客户端或直接 `aio run`：`StartRequest` → `aio run --agent executor --run-id <run 引用> --cwd <workdir> --env XWO_CREDENTIAL_FILE=…`，退出码即 `exit_code` |
 | to-human 适配器（0003 / 0006） | `aio send`：按 0010 的绑定把成员映射成路由；提问、审批渲染为带按钮的卡片，按钮 id 以 `xwo:` 开头 |
-| 接收程序（0008）与经渠道回答（0010） | 长期运行的 `aio tail --consumer xwo`：每条记录变成 `x input add` 或 `x answer`（带渠道凭证和渠道引用），成功后 ack |
+| 接收程序（0008）与经渠道回答（0010） | 长期运行的 `aio tail --consumer xwo`：每条记录变成 `x input add` 或 `x answer`（带渠道凭证和渠道引用），成功后 ack。`aio tail` 只拉取，不让连接成为宿主，所以 x-work-os 推的表必须用 `onHostDown: "keep"`，并定期重推、每次带新的 `expiresAt`（如每 5 分钟重推，`expiresAt = now + 10 min`）；不这样做，表一直按 `host_down` 挂起，规则不生效（§4）。改用推送消费（`host.hello { consumer }`）则可用默认的 `suspend` |
 | 身份 | x-work-os 把 0010 的渠道身份绑定转成身份映射，随 `bindings.put` 推送 |
-| 讨论会话（0005 F） | 一条 `dispatch` 规则把主人的私聊交给交互 agent；确认时 agent 调 x-work-os 命令，附来源标记；x-work-os 可用 `input.verify` 核验确认者 |
+| 讨论会话（0005 F） | 一条 `dispatch` 规则把主人的私聊交给交互 agent；确认时 agent 在工作区里调 x-work-os 命令，带上触发它的那条消息的 `ref=channel:<通道>/<消息 id>`（发送者说明行里有）；x-work-os 用 `aio verify <ref>` 核验确认者与证据，不信 agent 的转述（§4.1） |
 
 x-work-os 核心不依赖 agents-io；换成别的 IO 实现，只需换掉这些适配器。
 

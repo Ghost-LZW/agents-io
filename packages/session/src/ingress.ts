@@ -344,6 +344,7 @@ export class Ingress {
       origin,
       content: env.content,
       replyRoute: env.replyRoute,
+      channelRef: channelRefOf(env),
       channelContext: channelContext(env, this.replyOf(env)),
     };
     const decision = await this.router.route(env, origin, input);

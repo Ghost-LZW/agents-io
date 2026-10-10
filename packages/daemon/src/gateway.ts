@@ -237,7 +237,7 @@ export class Gateway {
   readonly watches: WatchDispatcher;
   /** Inbound media (channels put, harnesses read). */
   readonly blobs: FsBlobStore;
-  /** Host output tools (`config.outputTools`), mounted into every harness binding over MCP. */
+  /** Host output tools, when some agent has `tools` on; mounted over MCP into those agents' harness bindings only. */
   readonly tools: HostTools | undefined;
   private readonly mcp: HostMcpServer | undefined;
   /** The durable host inbound queue (`on: "host"` rules), in the log's database. */
@@ -396,6 +396,7 @@ export class Gateway {
       prepareSession: (f) => this.prepareSession(f),
       redispatch: (name, f) => this.redispatch(name, f),
       calloutTimeouts: { resolve: c.hostCallouts.resolveTimeoutMs, outbound: c.hostCallouts.outboundTimeoutMs },
+      answerOnBehalf: c.policy.answerOnBehalf,
       log: (level, msg, data) => this.log(level, msg, data),
       ...(o.hostPush?.timeoutMs !== undefined ? { pushTimeoutMs: o.hostPush.timeoutMs } : {}),
       ...(o.hostPush?.retryMs !== undefined ? { pushRetryMs: o.hostPush.retryMs } : {}),
@@ -410,7 +411,8 @@ export class Gateway {
       replyRoute: (w) => this.homeRoute(w.target.sessionKey),
       onError: (err, id) => this.log('warn', `watch ${id}: ${(err as Error).message}`),
     });
-    if (c.outputTools) {
+    // Built when some agent has tools (agents.<name>.tools, default `outputTools`, off); only those agents' harnesses mount them.
+    if (Object.values(c.agents).some((a) => a.tools)) {
       this.tools = new HostTools({
         hub: this.hub,
         outbox: this.outbox,
@@ -1061,8 +1063,9 @@ export class Gateway {
     const c = this.o.config;
     const inst = c.harnesses[r.agent.harness];
     if (!inst) throw new Error(`agent ${r.agent.name}: unknown harness instance ${r.agent.harness}`);
-    const provenance: TurnProvenance = { sessionKey: r.sessionKey, turnId: r.turnId, triggeredBy: [`host:${this.host.hostName() ?? 'cli'}`], watched: false, external: false, group: false };
-    const env = { ...r.env, AGENTS_IO_RUN_ID: r.runId, AGENTS_IO_TURN_PROVENANCE: JSON.stringify(provenance) };
+    // AGENTS_IO_RUN_ID lets a host command run in the workspace tie itself to this run. There is no
+    // per-run provenance variable: it was a constant the host that started the run already knows (decision 13).
+    const env = { ...r.env, AGENTS_IO_RUN_ID: r.runId };
     let adapter: HarnessAdapter;
     let own: HarnessAdapter | undefined;
     if (this.o.harness) adapter = this.o.harness;
@@ -1907,6 +1910,8 @@ ${a.summary}` }],
       case 'resolve':
         // Answering on someone's behalf is the host's (its connection is authenticated with the token).
         if (cmd.onBehalfOf !== undefined && !isHostOrigin(origin)) return fail('not_eligible', 'onBehalfOf is for host connections');
+        // And only where the deployment turned it on (decision 13: one explicit switch, default off).
+        if (cmd.onBehalfOf !== undefined && !this.o.config.policy.answerOnBehalf) return fail('on_behalf_not_allowed', 'answering on behalf is off: set policy.answerOnBehalf: true');
       // falls through
       case 'interrupt':
       case 'control': {

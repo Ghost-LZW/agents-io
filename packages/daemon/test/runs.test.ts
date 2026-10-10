@@ -70,7 +70,7 @@ describe('run.start', () => {
     const runInst = w.built.find((i) => i.env.XWO_CREDENTIAL !== undefined)!;
     expect(runInst.env.XWO_CREDENTIAL).toBe(secret);
     expect(runInst.env.AGENTS_IO_RUN_ID).toBe('e');
-    expect(JSON.parse(runInst.env.AGENTS_IO_TURN_PROVENANCE!)).toMatchObject({ sessionKey: 'run:e', triggeredBy: ['host:cli'], external: false });
+    expect(runInst.env).not.toHaveProperty('AGENTS_IO_TURN_PROVENANCE'); // removed (decision 13): a constant the host already knows
     expect(w.built.filter((i) => i !== runInst).every((i) => i.env.XWO_CREDENTIAL === undefined)).toBe(true);
     // Nothing persisted carries it.
     await w.stop();

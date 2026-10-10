@@ -71,13 +71,11 @@ export type AdminLoginResult = Static<typeof AdminLoginResult>;
 
 /** Who the host is, as far as routing is concerned. */
 export const AdminHostState = Type.Object({
-  /** A host connection (consumer / callouts) is open, or a lease is live. */
+  /** A host connection (consumer / callouts) is open. */
   connected: Type.Boolean(),
   name: Type.Optional(Type.String()),
   consumer: Type.Optional(Type.String()),
   callouts: Type.Optional(Type.Boolean()),
-  /** Unix ms a pull-only host's presence lease runs out. */
-  leaseExpiresAt: Type.Optional(Type.Number()),
   /** The host-pushed binding table, if any. */
   table: Type.Optional(Type.Object({ version: Type.String(), active: Type.Boolean(), suspended: Type.Optional(Type.Union([Type.Literal('expired'), Type.Literal('host_down')])) })),
 });

@@ -225,15 +225,6 @@ export const HostHello = Type.Object({
    */
   callouts: Type.Optional(Type.Union([Type.Boolean(), Type.Array(Type.String())])),
   /**
-   * Presence lease for a pull-only host (one with neither `consumer` nor
-   * `callouts`, e.g. a long-running `aio tail`): the host named `name` counts as
-   * connected, so its `onHostDown: "suspend"` table stays active, until `ttlMs`
-   * after its last frame on any authenticated connection of that name; every
-   * frame renews it. A lease for another name while a host is connected is
-   * refused with `host_connected`.
-   */
-  lease: Type.Optional(Type.Object({ ttlMs: Type.Number() })),
-  /**
    * When another connection holds the host role (`consumer` / `callouts`),
    * replace it instead of failing with `host_connected`: the daemon closes the
    * old connection (its unacked pushes are pushed again here) and logs the
@@ -442,8 +433,6 @@ export const HostHelloResult = Type.Object({
   bindings: Type.Object({ version: Type.Union([Type.String(), Type.Null()]), active: Type.Boolean(), suspended: Type.Optional(Suspended) }),
   /** Push consumption: the consumer's acked cursor and the queue head. */
   inbound: Type.Optional(Type.Object({ consumer: Type.String(), acked: Type.Number(), head: Type.Number() })),
-  /** The granted presence lease, when the hello asked for one. */
-  lease: Type.Optional(Type.Object({ ttlMs: Type.Number(), expiresAt: Type.Number() })),
   /** The host connection this hello replaced (`takeover: true`). */
   replaced: Type.Optional(Type.Object({ name: Type.String() })),
   /**

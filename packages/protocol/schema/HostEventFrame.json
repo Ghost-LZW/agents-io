@@ -340,6 +340,9 @@
                     }
                   ]
                 },
+                "channelRef": {
+                  "type": "string"
+                },
                 "channelContext": {
                   "type": "object",
                   "patternProperties": {
@@ -1077,6 +1080,9 @@
                       "type": "null"
                     }
                   ]
+                },
+                "channelRef": {
+                  "type": "string"
                 },
                 "channelContext": {
                   "type": "object",
@@ -2145,6 +2151,9 @@
                           }
                         ]
                       },
+                      "channelRef": {
+                        "type": "string"
+                      },
                       "channelContext": {
                         "type": "object",
                         "patternProperties": {
@@ -2644,6 +2653,9 @@
                                 "type": "null"
                               }
                             ]
+                          },
+                          "channelRef": {
+                            "type": "string"
                           },
                           "channelContext": {
                             "type": "object",

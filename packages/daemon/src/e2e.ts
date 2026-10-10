@@ -125,6 +125,15 @@ interface World {
   watch(sessionKey: string, o?: { tier?: 'full' | 'card' | 'headline' | 'final'; fromSeq?: number; client?: LocalClient }): Promise<Watch>;
 }
 
+/**
+ * Output tools for the scenario agent: on when the base config turns them on for every agent
+ * (`outputTools`) or for its default agent (`agents.<default>.tools`). Off by default (decision 13).
+ */
+export function e2eTools(base: Config): boolean {
+  return base.outputTools || (base.defaultAgent !== undefined && base.agents[base.defaultAgent]?.tools === true);
+}
+const TOOLS_OFF = 'output tools are off (set "tools": true on the default agent, or "outputTools": true)';
+
 /** Per-scenario config: temp dirs, no configured channels, e2e owners, local principal. Runs the default instance. */
 export function e2eConfig(base: Config, dir: string): Config {
   const { cwd: _cwd, ...h } = defaultInstance(base);
@@ -142,7 +151,7 @@ export function e2eConfig(base: Config, dir: string): Config {
   return {
     ...rest,
     // The scenarios talk to one agent on the default instance through the owners default table.
-    agents: { [DEFAULT_AGENT]: { name: DEFAULT_AGENT, harness: inst.name, mode: 'interactive', tools: base.outputTools, configured: false } },
+    agents: { [DEFAULT_AGENT]: { name: DEFAULT_AGENT, harness: inst.name, mode: 'interactive', tools: e2eTools(base), configured: false } },
     defaultAgent: DEFAULT_AGENT,
     identities: [],
     dataDir: dir,
@@ -607,7 +616,7 @@ export const SCENARIOS: Scenario[] = [
   {
     id: 'm',
     name: 'output-ask-choice',
-    skip: (c) => (c.outputTools ? undefined : 'outputTools is off'),
+    skip: (c) => (e2eTools(c) ? undefined : TOOLS_OFF),
     async run(ctx) {
       const w = await world(ctx);
       const sk = 'e2e:default:c1';
@@ -638,7 +647,7 @@ export const SCENARIOS: Scenario[] = [
   {
     id: 'n',
     name: 'output-send-file',
-    skip: (c) => (c.outputTools ? undefined : 'outputTools is off'),
+    skip: (c) => (e2eTools(c) ? undefined : TOOLS_OFF),
     async run(ctx) {
       const w = await world(ctx);
       const sk = 'e2e:default:c1';
@@ -665,7 +674,7 @@ export const SCENARIOS: Scenario[] = [
   {
     id: 'o',
     name: 'output-terminal-choose',
-    skip: (c) => (c.outputTools ? undefined : 'outputTools is off'),
+    skip: (c) => (e2eTools(c) ? undefined : TOOLS_OFF),
     async run(ctx) {
       const w = await world(ctx);
       const sk = 'e2e:local';
@@ -692,7 +701,7 @@ export const SCENARIOS: Scenario[] = [
   {
     id: 'p',
     name: 'topic-rotate',
-    skip: (c) => (c.outputTools ? undefined : 'outputTools is off'),
+    skip: (c) => (e2eTools(c) ? undefined : TOOLS_OFF),
     async run(ctx) {
       // Topics (decision 6): the agent rotates on an unrelated question and switches back when asked,
       // across a daemon restart (so switching back resumes the parked harness session natively).

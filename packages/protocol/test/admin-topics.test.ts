@@ -7,6 +7,7 @@ import {
   AdminConfigValidation,
   AdminError,
   AdminExplain,
+  AdminHostState,
   AdminLarkBotJob,
   AdminLarkBotRequest,
   AdminQueue,
@@ -20,6 +21,7 @@ import {
   HOST_REQUEST_FRAME_TYPES,
   HOST_RESULT_VALUES,
   HostEventFrame,
+  HostHello,
   HostHelloResult,
   HostRequestFrame,
   InboundReadResult,
@@ -86,9 +88,15 @@ describe('topics', () => {
 });
 
 describe('host protocol additions', () => {
-  it('hello lease, run.start overrides, run.ended timeout/duration/usage', () => {
+  it('host.hello has no presence lease (decision 13): pull-only hosts use onHostDown keep + expiresAt', () => {
+    expect(HostHello.properties).not.toHaveProperty('lease');
+    expect(HostHelloResult.properties).not.toHaveProperty('lease');
+    expect(AdminHostState.properties).not.toHaveProperty('leaseExpiresAt');
+    // an old host still sending it is not refused: the field is just ignored
     expect(check(HostRequestFrame, { v: 1, type: 'host.hello', id: '1', token: 't', name: 'xwo', lease: { ttlMs: 60_000 } })).toBe(true);
-    expect(check(HostRequestFrame, { v: 1, type: 'host.hello', id: '1', token: 't', name: 'xwo', lease: {} })).toBe(false);
+  });
+
+  it('run.start overrides, run.ended timeout/duration/usage', () => {
     const start = { v: 1, type: 'run.start', id: '2', runId: 'r', agent: 'exec', input: [{ type: 'text', text: 'go' }] };
     expect(check(HostRequestFrame, { ...start, overrides: { model: 'opus', effort: 'high', profile: 'restricted' } })).toBe(true);
     expect(check(HostRequestFrame, { ...start, overrides: {} })).toBe(true);
@@ -100,7 +108,7 @@ describe('host protocol additions', () => {
 
   it('a result-value schema for every host request', () => {
     expect(Object.keys(HOST_RESULT_VALUES).sort()).toEqual([...HOST_REQUEST_FRAME_TYPES].sort());
-    expect(errors(HostHelloResult, { name: 'xwo', protocol: 1, host: false, bindings: { version: null, active: false }, lease: { ttlMs: 1, expiresAt: 2 } })).toEqual([]);
+    expect(errors(HostHelloResult, { name: 'xwo', protocol: 1, host: false, bindings: { version: null, active: false } })).toEqual([]);
     expect(errors(BindingsGetResult, { config: null, host: { table: { version: '1', bindings: [], identities: [] }, putAt: 1, active: false, suspended: 'host_down' }, hostConnected: false })).toEqual([]);
     expect(check(BindingsGetResult, { config: null, host: null, hostConnected: false, extra: 1 })).toBe(true);
     expect(errors(RunStartResult, { runId: 'r', sessionKey: 'run:r', state: 'ended', ended: { v: 1, type: 'run.ended', runId: 'r', sessionKey: 'run:r', status: 'completed', exitCode: 0 } })).toEqual([]);

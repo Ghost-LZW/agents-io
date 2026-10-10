@@ -1,6 +1,6 @@
 # 宿主接口复查：按原则 7 划分控制面与环境面
 
-> 状态：复查稿（2026-10-10），待 owner 拍板。
+> 状态：复查稿（2026-10-10）。决定 13 已按 §5 建议 1、2、3、4、6 执行（2026-10-11）：`lease` 与 `AGENTS_IO_TURN_PROVENANCE` 已删，`resolve` / `outbound` 已冻结，说明行已带 `ref=`，§6 待拍板 1 选 (a)；另外输出工具改为默认关闭、代答加了开关 `policy.answerOnBehalf`。执行细节见 DECISIONS 决定 13 补记。建议 5（HOSTS 的控制面 / 环境面用法一节）与待拍板 2–5 未动。
 
 依据：`docs/ROADMAP.md` §1 第 6、7 条，`docs/design/locus/DECISIONS.md` 决定 1–12（尤其决定 12 的"宿主的两个面"），`docs/HOSTS.md`，`docs/POSITIONING.md`。范围：宿主能碰到的全部接口，即 `packages/protocol/src/host.ts` 的帧和字段、宿主连接可用的客户端帧、`aio` 的宿主命令、来源标记，以及控制台 admin API（`packages/protocol/src/admin.ts`，粗看）。本文只给结论和理由，不改代码，也不改其他文档。
 
