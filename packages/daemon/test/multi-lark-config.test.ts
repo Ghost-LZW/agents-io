@@ -31,7 +31,7 @@ describe('console config: several lark-bot channels', () => {
     ['a missing variable', [bot('a', { appId: 'env:NOPE', appSecret: 'env:A_SECRET' })], /environment variable NOPE is not set/],
   ];
   for (const [what, channels, message] of cases) {
-    it(`${what}: validate and PUT answer 422, the file is unchanged`, () => {
+    it(`${what}: validate and PUT answer 422, the file is unchanged #CF-3 #SE-1`, () => {
       const { path, s, initial } = store();
       const next = { ...(JSON.parse(initial) as Record<string, unknown>), channels };
       const v = s.validate(next);
@@ -43,7 +43,7 @@ describe('console config: several lark-bot channels', () => {
     });
   }
 
-  it('two bots with their own references are accepted', () => {
+  it('two bots with their own references are accepted #CF-3', () => {
     const { s, initial } = store();
     const next = { ...(JSON.parse(initial) as Record<string, unknown>), channels: [bot(undefined), bot('proj-a', { appId: 'env:A_ID', appSecret: 'env:A_SECRET' })] };
     expect(s.put(next)).toMatchObject({ status: 200 });

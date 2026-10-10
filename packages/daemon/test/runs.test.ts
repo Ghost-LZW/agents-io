@@ -25,7 +25,7 @@ async function world(raw: Record<string, unknown> = {}) {
 }
 
 describe('run.start', () => {
-  it('runs one turn of a task agent in a fresh session run:<id> with its run config and the given cwd; run.ended exit 0; the session is closed', async () => {
+  it('runs one turn of a task agent in a fresh session run:<id> with its run config and the given cwd; run.ended exit 0; the session is closed #RN-1', async () => {
     const w = await world();
     const h = await w.host();
     const r = await h.runStart({ runId: 'r1', agent: 'exec', cwd: w.dir, input: [{ type: 'text', text: 'pong please' }] });
@@ -44,7 +44,7 @@ describe('run.start', () => {
     expect(w.harness.sessions.filter((x) => x.args.sessionKey === 'run:r1')).toHaveLength(1);
   });
 
-  it('exit codes: a failing turn is 1, a cancel is 130, a timeout 124', async () => {
+  it('exit codes: a failing turn is 1, a cancel is 130, a timeout 124 #RN-1', async () => {
     const w = await world();
     const h = await w.host();
     await h.runStart({ runId: 'f', agent: 'exec', input: [{ type: 'text', text: 'please fail' }] });
@@ -61,7 +61,7 @@ describe('run.start', () => {
     expect(await h.runEndedOf('t')).toMatchObject({ status: 'interrupted', exitCode: 124, error: { code: 'timeout' } });
   });
 
-  it('env goes into the run child only: the instance built for the run has it; the log, explain records and other instances do not', async () => {
+  it('env goes into the run child only: the instance built for the run has it; the log, explain records and other instances do not #SE-1 #EX-3', async () => {
     const w = await world();
     const h = await w.host();
     const secret = 'sekrit-value-123';
@@ -83,7 +83,7 @@ describe('run.start', () => {
     }
   });
 
-  it('refuses interactive and unknown agents, bad cwd and env names', async () => {
+  it('refuses interactive and unknown agents, bad cwd and env names #RN-1', async () => {
     const w = await world();
     const h = await w.host();
     const input = [{ type: 'text' as const, text: 'x' }];
@@ -98,7 +98,7 @@ describe('run.start', () => {
     await expect(plain.runStart({ runId: 'a', agent: 'exec', input })).rejects.toMatchObject({ code: 'unauthorized' });
   });
 
-  it('agent instructions reach the harness; observe routes render the run on a channel; run.ended goes to the host when the asking connection left', async () => {
+  it('agent instructions reach the harness; observe routes render the run on a channel; run.ended goes to the host when the asking connection left #RN-1', async () => {
     const instructions = join(tmp(), 'executor.md');
     writeFileSync(instructions, 'You are the executor.\n');
     const w = await world({ agents: { ...AGENTS, exec: { ...AGENTS.exec, instructionsFile: instructions } } });
@@ -119,7 +119,7 @@ describe('run.start', () => {
     await until(() => w.chat.sent.find((x) => x.route.conversationId === 'ops')?.finalized);
   });
 
-  it('a run an earlier daemon left mid-turn is ambiguous (exit 3) after the restart', async () => {
+  it('a run an earlier daemon left mid-turn is ambiguous (exit 3) after the restart #RS-5 #RN-1', async () => {
     const w = await world();
     // What a crashed daemon leaves: a run session whose turn never completed.
     const draft = { ts: Date.now(), level: 'primary' as const, audience: 'status' as const, durability: 'durable' as const, harness: 'claude-code', generation: 1 };
@@ -130,7 +130,7 @@ describe('run.start', () => {
     expect(await h.runStart({ runId: 'd', agent: 'exec', input: [{ type: 'text', text: 'again' }] })).toMatchObject({ state: 'ended', ended: { status: 'ambiguous', exitCode: 3, error: { code: 'host_restarted' } } });
   });
 
-  it('daemon stop interrupts running runs and tells their connections', async () => {
+  it('daemon stop interrupts running runs and tells their connections #RN-1', async () => {
     const w = await world();
     const h = await w.host();
     await h.runStart({ runId: 's', agent: 'exec', input: [{ type: 'text', text: 'wait' }] });
@@ -142,7 +142,7 @@ describe('run.start', () => {
 });
 
 describe('interactive agents', () => {
-  it('a binding to a named agent opens its session with that agent: prefix, model, cwd', async () => {
+  it('a binding to a named agent opens its session with that agent: prefix, model, cwd #RT-1', async () => {
     const w = await daemon({
       raw: {
         agents: { chat: { harness: 'claude-code' }, helper: { harness: 'claude-code', model: 'opus', cwd: 'helper-dir' } },
@@ -163,7 +163,7 @@ describe('interactive agents', () => {
     expect(s.args.cwd).toBe(join(w.dir, 'helper-dir'));
   });
 
-  it('a session whose recorded agent is gone refuses input with agent_unavailable, never falling back to the default agent', async () => {
+  it('a session whose recorded agent is gone refuses input with agent_unavailable, never falling back to the default agent #FC-1 #IN-1', async () => {
     const w1 = await daemon({ raw: { agents: { chat: { harness: 'claude-code' }, helper: { harness: 'claude-code', cwd: 'helper-dir' } } }, script });
     const c1 = await w1.client();
     await c1.input('helper:x', 'hi');
@@ -196,7 +196,7 @@ describe('interactive agents', () => {
     expect(w2.gw.records.agentOf('helper:new')).toBe('chat');
   });
 
-  it('a session whose recorded agent is a task agent now refuses input with agent_unavailable', async () => {
+  it('a session whose recorded agent is a task agent now refuses input with agent_unavailable #FC-1', async () => {
     const w1 = await daemon({ raw: { agents: { chat: { harness: 'claude-code' }, helper: { harness: 'claude-code' } } }, script });
     const c1 = await w1.client();
     await c1.input('helper:x', 'hi');
@@ -210,7 +210,7 @@ describe('interactive agents', () => {
     expect(w2.gw.records.agentOf('helper:x')).toBe('helper');
   });
 
-  it('a channel message to a session whose agent is gone: refused (no harness), a notice on the route, and explain says agent_unavailable', async () => {
+  it('a channel message to a session whose agent is gone: refused (no harness), a notice on the route, and explain says agent_unavailable #FC-1 #EX-1', async () => {
     const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };
     const owner = (agent: string) => [{ id: 'owner', match: { conversationKind: 'dm', labels: ['owner'] }, on: 'dispatch', agent, session: 'main' }];
     const w1 = await daemon({ raw: { agents: { chat: { harness: 'claude-code' } }, bindings: owner('chat') }, script });
@@ -236,7 +236,7 @@ describe('interactive agents', () => {
     expect(log.some((e) => e.body.t === 'input.rejected' && e.body.inputIds.includes(r2.inputId!) && e.body.reason === 'agent_unavailable')).toBe(true);
   });
 
-  it('an observe-only (context) message to a session whose agent is gone: refused and logged, but nothing is said on the route', async () => {
+  it('an observe-only (context) message to a session whose agent is gone: refused and logged, but nothing is said on the route #FC-1 #IN-1', async () => {
     const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };
     const rule = (agent: string, on: string) => [{ id: 'owner', match: { conversationKind: 'dm', labels: ['owner'] }, on, agent, session: 'main' }];
     const w1 = await daemon({ raw: { agents: { chat: { harness: 'claude-code' } }, bindings: rule('chat', 'dispatch') }, script });
@@ -257,5 +257,21 @@ describe('interactive agents', () => {
     await new Promise((r) => setTimeout(r, 50));
     expect(w2.chat.sent).toHaveLength(0);
     expect(w2.harness.sessions).toHaveLength(0);
+  });
+
+  // INVARIANTS FC-3 不成立: with no interactive agent `pickAgent` throws a plain Error, so the input gets no input.rejected and explain no rejection; turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails('no interactive agent at all (only task agents): a channel input is refused with agent_unavailable, recorded in the log and in explain; accept does not throw #FC-3 #IN-1', async () => {
+    // Config validation refuses bindings without an agent here, so the channel input reaches a session through a watch trigger.
+    const w = await daemon({
+      raw: { agents: { exec: AGENTS.exec }, watches: [{ id: 'w', source: { channel: 'fake', conversation: 'g1' }, target: { sessionKey: 'main' }, mode: 'trigger' }] },
+      script,
+    });
+    const r = await w.chat.inject({ sender: { channelUserId: 'eve', evidence: 'platform_signed' }, conversation: { id: 'g1', kind: 'group' }, text: 'hi' });
+    expect(r.accepted).toBe(true);
+    await new Promise((res) => setTimeout(res, 150));
+    expect(w.harness.sessions).toHaveLength(0);
+    // The route is the watched group, where a watch never answers (CF-5): no notice is asserted.
+    expect(w.gw.router.explain(r.inputId!)!.matched[0]).toMatchObject({ sessionKey: 'main', rejected: { code: 'agent_unavailable' } });
+    expect(w.gw.hub.log.read('main', 0).some((e) => e.body.t === 'input.rejected' && e.body.inputIds.includes(r.inputId!) && e.body.reason === 'agent_unavailable')).toBe(true);
   });
 });

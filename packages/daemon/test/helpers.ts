@@ -120,3 +120,11 @@ export async function closeAndWait(gw: Gateway, c: LocalClient, wasHost = true):
   c.close();
   if (wasHost) await until(() => gw.host.hostPeer() === undefined);
 }
+
+/** Node flags that let a fixture child run the workspace's TypeScript sources (no dist/ needed). */
+export const SOURCE_LOADER = [
+  '--experimental-transform-types',
+  '--disable-warning=ExperimentalWarning',
+  '--import',
+  join(import.meta.dirname, '..', '..', '..', 'scripts', 'source-loader.mjs'),
+];

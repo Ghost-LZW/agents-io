@@ -1,16 +1,17 @@
 import { readFileSync, statSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
 import type { Binding, BindingTable, InboundItem } from '@agents-io/protocol';
 import { CommandError } from '../src/client.js';
 import { tokenPath } from '../src/token.js';
-import { closeAndWait, daemon, until } from './helpers.js';
+import { closeAndWait, daemon, until, type World } from './helpers.js';
 
 const hostRule = (o: Partial<Binding> = {}): Binding => ({ id: 'to-host', match: { channel: 'fake', keywords: ['xwo'] }, on: 'host', ...o });
 const table = (version: string, bindings: Binding[], o: Partial<BindingTable> = {}): BindingTable => ({ version, bindings, identities: [], ...o });
 const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };
 
 describe('host.hello', () => {
-  it('writes a 0600 token file next to the socket; the token is required; frames before hello are refused', async () => {
+  it('writes a 0600 token file next to the socket; the token is required; frames before hello are refused #HQ-7 #SE-2', async () => {
     const w = await daemon();
     const tp = tokenPath(w.config.socketPath);
     expect(statSync(tp).mode & 0o777).toBe(0o600);
@@ -25,7 +26,7 @@ describe('host.hello', () => {
     expect(Array.isArray(await c.sessions())).toBe(true);
   });
 
-  it('at most one host (consumer / callouts); plain authenticated connections are not limited; the slot frees on disconnect', async () => {
+  it('at most one host (consumer / callouts); plain authenticated connections are not limited; the slot frees on disconnect #HQ-6', async () => {
     const w = await daemon();
     const h1 = await w.host({ consumer: 'xwo' });
     expect(w.gw.router.hostConnected).toBe(true);
@@ -42,7 +43,7 @@ describe('host.hello', () => {
     await closeAndWait(w.gw, h2);
   });
 
-  it('the token is fresh per start and the file goes away on stop', async () => {
+  it('the token is fresh per start and the file goes away on stop #HQ-7', async () => {
     const w = await daemon();
     const t1 = w.gw.token;
     await w.stop();
@@ -53,7 +54,7 @@ describe('host.hello', () => {
 });
 
 describe('bindings.put / get', () => {
-  it('installs the host table (routing follows it), persists it, and suspends it while the host is away', async () => {
+  it('installs the host table (routing follows it), persists it, and suspends it while the host is away #HQ-5', async () => {
     const w = await daemon();
     const h = await w.host({ consumer: 'xwo' });
     h.onRequest('inbound', () => ({ accepted: true }));
@@ -79,7 +80,7 @@ describe('bindings.put / get', () => {
     await closeAndWait(w2.gw, h2);
   });
 
-  it('onHostDown keep stays active without a host', async () => {
+  it('onHostDown keep stays active without a host #HQ-5', async () => {
     const w = await daemon();
     const h = await w.host();
     expect(await h.bindingsPut(table('k1', [hostRule()], { onHostDown: 'keep' }))).toMatchObject({ active: true });
@@ -87,7 +88,7 @@ describe('bindings.put / get', () => {
     expect(w.gw.router.explain(r.inputId!)?.matched.map((m) => m.bindingId)).toContain('to-host');
   });
 
-  it('a host table may not target a task agent', async () => {
+  it('a host table may not target a task agent #RT-1', async () => {
     const w = await daemon({ raw: { agents: { chat: { harness: 'claude-code' }, exec: { harness: 'claude-code', mode: 'task' } } } });
     const h = await w.host();
     await expect(h.bindingsPut(table('t', [{ id: 'bad', match: {}, on: 'dispatch', agent: 'exec' }]))).rejects.toMatchObject({ code: 'task_agent' });
@@ -102,7 +103,7 @@ describe('host inbound queue', () => {
     return w;
   }
 
-  it('push: delivered in order, the cursor moves on { accepted: true }; a refusal is redelivered; unacked items come again after a reconnect', async () => {
+  it('push: delivered in order, the cursor moves on { accepted: true }; a refusal is redelivered; unacked items come again after a reconnect #HQ-1', async () => {
     const w = await withHostTable();
     const got: InboundItem[] = [];
     let refuseOnce = true;
@@ -141,7 +142,7 @@ describe('host inbound queue', () => {
     await closeAndWait(w.gw, h2);
   });
 
-  it('pull: inbound.read never moves the cursor; inbound.ack does; channel redeliveries are one item', async () => {
+  it('pull: inbound.read never moves the cursor; inbound.ack does; channel redeliveries are one item #HQ-1 #HQ-2', async () => {
     const w = await withHostTable();
     await w.chat.inject({ id: 'p1', sender: alice, text: 'xwo a' });
     await w.chat.inject({ id: 'p1', sender: alice, text: 'xwo a' }); // the channel redelivers
@@ -159,12 +160,36 @@ describe('host inbound queue', () => {
     await w.chat.inject({ id: 'p3', sender: alice, text: 'xwo c' });
     expect((await waiting).items.map((i) => i.channelRef)).toEqual(['channel:fake/p3']);
   });
+
+  it('an unacked item is pushed again to the same consumer after a daemon restart #HQ-1', async () => {
+    const w = await withHostTable();
+    const seen: InboundItem[] = [];
+    const h = await w.host({ consumer: 'xwo' });
+    // The host never answers: the push stays unacked when the daemon stops.
+    h.onRequest('inbound', (f) => {
+      seen.push(f.item as InboundItem);
+      return new Promise(() => {});
+    });
+    await w.chat.inject({ id: 'r1', sender: alice, text: 'xwo across a restart' });
+    await until(() => seen.length === 1);
+    await w.stop();
+    const w2 = await daemon({ dir: w.dir });
+    const again: InboundItem[] = [];
+    const h2 = await w2.host({ consumer: 'xwo' });
+    h2.onRequest('inbound', (f) => {
+      again.push(f.item as InboundItem);
+      return { accepted: true };
+    });
+    await until(() => again.length === 1);
+    expect(again[0]).toMatchObject({ cursor: seen[0]!.cursor, channelRef: 'channel:fake/r1' });
+    await until(() => w2.gw.hostQueue.cursor('xwo') === seen[0]!.cursor);
+  });
 });
 
 describe('route callouts', () => {
   const calloutRule: Binding = { id: 'ask', match: { channel: 'fake', keywords: ['triage'] }, on: 'dispatch', callout: { timeoutMs: 80 } };
 
-  it('timeout → onFailure (default host: the durable queue); recorded in explain', async () => {
+  it('timeout → onFailure (default host: the durable queue); recorded in explain #HQ-3 #EX-1', async () => {
     const w = await daemon();
     const h = await w.host({ callouts: true });
     await h.bindingsPut(table('c1', [calloutRule]));
@@ -175,7 +200,7 @@ describe('route callouts', () => {
     expect((await h.inboundRead({ consumer: 'any' })).items.map((i) => i.channelRef)).toEqual(['channel:fake/c-1']);
   });
 
-  it('an answer replaces the rule; no host → no_host and onFailure', async () => {
+  it('an answer replaces the rule; no host → no_host and onFailure #HQ-3', async () => {
     const w = await daemon();
     const h = await w.host({ callouts: true });
     await h.bindingsPut(table('c2', [{ ...calloutRule, callout: { timeoutMs: 1000, onFailure: 'drop' } }], { onHostDown: 'keep' }));
@@ -194,7 +219,7 @@ describe('route callouts', () => {
 });
 
 describe('deliver, input.verify, explain', () => {
-  it('deliver is idempotent per operationId, across a restart too; an unknown channel is an error', async () => {
+  it('deliver is idempotent per operationId, across a restart too; an unknown channel is an error #DL-2 #RS-1', async () => {
     const w = await daemon();
     const h = await w.host();
     const route = { channel: 'fake', account: 'default', conversationId: 'dm-alice' };
@@ -210,7 +235,7 @@ describe('deliver, input.verify, explain', () => {
     expect(w2.chat.sent).toHaveLength(0);
   });
 
-  it('a send in flight when the daemon died is settled unknown on the next start (logged in its session) and not sent again', async () => {
+  it('a send in flight when the daemon died is settled unknown on the next start (logged in its session) and not sent again #DL-2 #RS-1', async () => {
     const w = await daemon();
     const route = { channel: 'fake', account: 'default', conversationId: 'dm-alice' };
     // What a crash between the in-flight mark and the settlement leaves behind.
@@ -224,7 +249,22 @@ describe('deliver, input.verify, explain', () => {
     expect(w2.chat.sent).toHaveLength(0);
   });
 
-  it('stop waits for a send in flight: it settles before the records close', async () => {
+  // INVARIANTS DL-2 不成立 1: settled outbox records are pruned after 30 days (records.ts outPrune), after which the same operationId is sent again; turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails('after the 30-day prune of settled outbox records, the same operationId is not sent again #DL-2', async () => {
+    const w = await daemon();
+    const route = { channel: 'fake', account: 'default', conversationId: 'dm-alice' };
+    await (await w.host()).deliver({ operationId: 'op-old', route, message: { text: 'once' } });
+    await w.stop();
+    // 31 days pass: age the settled record; the next start prunes at open.
+    const db = new DatabaseSync(w.config.logPath);
+    db.prepare('UPDATE daemon_outbox SET at = at - ?').run(31 * 86_400_000);
+    db.close();
+    const w2 = await daemon({ dir: w.dir });
+    expect(await (await w2.host()).deliver({ operationId: 'op-old', route, message: { text: 'once' } })).toMatchObject({ duplicate: true });
+    expect(w2.chat.sent).toHaveLength(0);
+  });
+
+  it('stop waits for a send in flight: it settles before the records close #DL-1 #RS-8', async () => {
     const w = await daemon();
     const route = { channel: 'fake', account: 'default', conversationId: 'dm-alice' };
     const send = w.chat.send.bind(w.chat);
@@ -244,7 +284,7 @@ describe('deliver, input.verify, explain', () => {
     expect(w2.gw.records.allInFlight()).toEqual([]);
   });
 
-  it('input.verify answers the platform author and evidence the channel reported, and the principal it was stamped with; unknown refs are not found', async () => {
+  it('input.verify answers the platform author and evidence the channel reported, and the principal it was stamped with; unknown refs are not found #EX-4 #ID-4', async () => {
     const w = await daemon();
     await w.chat.inject({ id: 'v1', sender: { ...alice, displayName: 'Alice' }, text: 'confirm' });
     await w.chat.inject({ id: 'v2', sender: { channelUserId: 'alice', evidence: 'none' }, text: 'forged?' });
@@ -260,7 +300,7 @@ describe('deliver, input.verify, explain', () => {
     expect((await (await w2.host()).verify('channel:fake/v1')).found).toBe(true);
   });
 
-  it('explain returns the routing record of an input; unknown ids are an error', async () => {
+  it('explain returns the routing record of an input; unknown ids are an error #EX-1', async () => {
     const w = await daemon();
     const r = await w.chat.inject({ sender: alice, text: 'hi' });
     const h = await w.host();
@@ -268,4 +308,35 @@ describe('deliver, input.verify, explain', () => {
     expect(ex).toMatchObject({ inputId: r.inputId, principal: 'fake:alice', matched: [{ bindingId: 'default:owner-dm', source: 'config', on: 'dispatch' }] });
     await expect(h.explain('in_nope')).rejects.toBeInstanceOf(CommandError);
   });
+
+  // INVARIANTS EX-2 不成立 1: explain only takes an inputId; no lookup by operationId (nor turnId, requestId), and system replies, host deliver and live_say record no turn at all; turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails('explain by the operationId of an output-tool send returns the turnId and that turn\'s inputIds #EX-2', async () => {
+    const holder: { w?: World } = {};
+    const w = await daemon({
+      raw: { outputTools: true },
+      script: async (t) => {
+        await mcpCall(holder.w!.harness.sessions.at(-1)!.args.mcp, 'send_message', { route: 'current', text: 'side effect' }, 'toolu_ex2');
+        t.emit({ t: 'text.snapshot', text: 'done', final: true }, { audience: 'answer' });
+      },
+    });
+    holder.w = w;
+    const r = await w.chat.inject({ sender: alice, text: 'do it' });
+    await until(() => w.chat.sent.some((s) => s.msg.text === 'side effect'));
+    const started = w.gw.hub.log.read('fake:default:c1', 0).find((e) => e.body.t === 'turn.started')!.body as { turnId: string; inputIds: string[] };
+    expect(started.inputIds).toEqual([r.inputId]);
+    const ex = await (await w.host()).explain('tool:fake:default:c1:toolu_ex2');
+    expect(ex).toMatchObject({ turnId: started.turnId, inputIds: [r.inputId] });
+  });
 });
+
+/** What a harness does with HarnessOpenArgs.mcp: a JSON-RPC tools/call over streamable HTTP. */
+async function mcpCall(mcp: { url: string; token: string } | undefined, name: string, args: Record<string, unknown>, callId: string) {
+  if (!mcp) throw new Error('no mcp mounted');
+  const res = await fetch(mcp.url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${mcp.token}` },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args, _meta: { 'claudecode/toolUseId': callId } } }),
+  });
+  const body = (await res.json()) as { result: { isError?: boolean; content: { text: string }[] } };
+  return { isError: !!body.result.isError, text: body.result.content[0]!.text };
+}

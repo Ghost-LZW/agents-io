@@ -21,7 +21,7 @@ const host = {} as LocalHost;
 const mode = (p: string) => statSync(p).mode & 0o7777;
 
 describe('LocalServer socket path', () => {
-  it('creates a missing socket directory 0700 and the socket 0600', async () => {
+  it('creates a missing socket directory 0700 and the socket 0600 #SE-2', async () => {
     const d = tmp();
     const s = new LocalServer(host, join(d, 'run', 'aio.sock'));
     await s.listen();
@@ -30,7 +30,7 @@ describe('LocalServer socket path', () => {
     expect(mode(join(d, 'run', 'aio.sock'))).toBe(0o600);
   });
 
-  it('does not chmod an existing directory it did not create; refuses one other users can reach', async () => {
+  it('does not chmod an existing directory it did not create; refuses one other users can reach #SE-2', async () => {
     const d = tmp();
     const proj = join(d, 'proj');
     mkdirSync(proj);
@@ -40,7 +40,7 @@ describe('LocalServer socket path', () => {
     expect(existsSync(join(proj, 'aio.sock'))).toBe(false);
   });
 
-  it('never unlinks a file that is not a socket', async () => {
+  it('never unlinks a file that is not a socket #SE-2', async () => {
     const d = tmp();
     const dir = join(d, 'state');
     mkdirSync(dir, { mode: 0o700 });
@@ -50,7 +50,7 @@ describe('LocalServer socket path', () => {
     expect(readFileSync(file, 'utf8')).toBe('precious');
   });
 
-  it('replaces a stale socket left by a killed process', async () => {
+  it('replaces a stale socket left by a killed process #SE-2', async () => {
     const d = tmp();
     const p = join(d, 'run', 'aio.sock');
     mkdirSync(join(d, 'run'), { mode: 0o700 });
@@ -67,7 +67,7 @@ describe('LocalServer socket path', () => {
 });
 
 describe('gateway data files', () => {
-  it('the SQLite session log (and its -wal/-shm) is 0600 even in an existing 0755 directory; existing files are tightened', async () => {
+  it('the SQLite session log (and its -wal/-shm) is 0600 even in an existing 0755 directory; existing files are tightened #SE-2', async () => {
     const d = tmp();
     const dir = join(d, 'repo');
     mkdirSync(dir);

@@ -8,7 +8,6 @@ import {
   ADMIN_WS_BEARER_PREFIX,
   ADMIN_WS_SUBPROTOCOL,
   AdminConfigDocument,
-  AdminLarkBotJob,
   AdminQueue,
   AdminSessions,
   AdminStatus,
@@ -22,50 +21,13 @@ import { main } from '../src/cli.js';
 import { ConfigError, resolveConfig } from '../src/config.js';
 import { ConsoleAuth } from '../src/console.js';
 import { consoleUrlPath } from '../src/token.js';
-import { daemon, tmp, until, type World } from './helpers.js';
+import { consoleDaemon, rawGet } from './console-helpers.js';
+import { tmp, until } from './helpers.js';
 
-const FAKE_BOT = fileURLToPath(new URL('./fixtures/fake-create-lark-bot.mjs', import.meta.url));
 const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };
 
-interface Res {
-  status: number;
-  body: any;
-  headers: Headers;
-}
-
-/** A console daemon plus a fetch helper. */
-async function consoleDaemon(o: Parameters<typeof daemon>[0] = {}): Promise<World & { url: string; api(path: string, init?: RequestInit & { token?: string | null; json?: unknown }): Promise<Res> }> {
-  const w = await daemon({ console: true, ...o });
-  const url = w.gw.console!.url;
-  const api = async (path: string, init: RequestInit & { token?: string | null; json?: unknown } = {}): Promise<Res> => {
-    const { token, json, ...rest } = init;
-    const headers = new Headers(rest.headers);
-    const t = token === undefined ? w.gw.token : token;
-    if (t !== null) headers.set('Authorization', `Bearer ${t}`);
-    if (json !== undefined) headers.set('Content-Type', 'application/json');
-    const r = await fetch(url + path, { ...rest, headers, ...(json !== undefined ? { body: JSON.stringify(json) } : {}) });
-    const text = await r.text();
-    return { status: r.status, body: text ? JSON.parse(text) : undefined, headers: r.headers };
-  };
-  return { ...w, url, api };
-}
-
-/** Raw HTTP/1.1 (fetch cannot set Host or Origin freely). */
-async function rawGet(url: string, path: string, headers: Record<string, string>): Promise<{ status: number; headers: Record<string, string | string[] | undefined> }> {
-  const { request } = await import('node:http');
-  const u = new URL(url);
-  return new Promise((resolve, reject) => {
-    const req = request({ host: u.hostname, port: u.port, path, method: headers.method ?? 'GET', headers }, (res) => {
-      res.resume();
-      res.on('end', () => resolve({ status: res.statusCode!, headers: res.headers }));
-    });
-    req.on('error', reject);
-    req.end();
-  });
-}
-
 describe('console auth', () => {
-  it('needs a token: missing / wrong → 401; the host token works', async () => {
+  it('needs a token: missing / wrong → 401; the host token works #SE-3', async () => {
     const w = await consoleDaemon();
     expect(await w.api('/api/status', { token: null })).toMatchObject({ status: 401, body: { error: { code: 'unauthorized' } } });
     expect(await w.api('/api/status', { token: 'nope' })).toMatchObject({ status: 401, body: { error: { code: 'unauthorized', message: 'wrong token' } } });
@@ -77,7 +39,7 @@ describe('console auth', () => {
     expect(r.headers.get('cache-control')).toBe('no-store');
   });
 
-  it('login link → one-time token → session (cookie HttpOnly SameSite=Strict, and a bearer token); single use; sessions cannot make links', async () => {
+  it('login link → one-time token → session (cookie HttpOnly SameSite=Strict, and a bearer token); single use; sessions cannot make links #SE-3', async () => {
     const w = await consoleDaemon();
     const link = await w.api('/api/login-link', { method: 'POST', json: {} });
     expect(link.status).toBe(200);
@@ -101,7 +63,7 @@ describe('console auth', () => {
     expect(await w.api('/api/login', { method: 'POST', json: { nope: 1 }, token: null })).toMatchObject({ status: 400, body: { error: { code: 'invalid_request' } } });
   });
 
-  it('expired one-time tokens and sessions are refused', () => {
+  it('expired one-time tokens and sessions are refused #SE-3', () => {
     let now = 1_000_000;
     const auth = new ConsoleAuth('host-token', 60_000, () => now);
     expect(auth.check('host-token')).toEqual({ ok: true, role: 'host' });
@@ -117,22 +79,7 @@ describe('console auth', () => {
     expect(auth.check(undefined)).toMatchObject({ ok: false, why: expect.stringContaining('missing') });
   });
 
-  it('aio console-link prints a one-time login URL that logs in once', async () => {
-    const w = await consoleDaemon();
-    const out: string[] = [];
-    const spy = vi.spyOn(console, 'log').mockImplementation((s: string) => void out.push(s));
-    try {
-      expect(await main(['console-link', '--socket', w.config.socketPath])).toBe(0);
-    } finally {
-      spy.mockRestore();
-    }
-    expect(out[0]).toMatch(new RegExp(`^${w.url}/#login=`));
-    const loginToken = out[0]!.split('#login=')[1];
-    expect((await w.api('/api/login', { method: 'POST', json: { loginToken }, token: null })).status).toBe(200);
-    expect((await w.api('/api/login', { method: 'POST', json: { loginToken }, token: null })).status).toBe(401);
-  });
-
-  it('aio serve writes the console URL next to the token file (0600) and removes it at stop', async () => {
+  it('aio serve writes the console URL next to the token file (0600) and removes it at stop #SE-2', async () => {
     const w = await consoleDaemon();
     const f = consoleUrlPath(w.config.socketPath);
     expect(readFileSync(f, 'utf8').trim()).toBe(w.url);
@@ -143,7 +90,7 @@ describe('console auth', () => {
 });
 
 describe('console listening and origins', () => {
-  it('listens on 127.0.0.1 by default; a non-loopback host needs allowRemote', async () => {
+  it('listens on 127.0.0.1 by default; a non-loopback host needs allowRemote #SE-3', async () => {
     const w = await consoleDaemon();
     expect(w.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
     const base = { env: {}, baseDir: w.dir, cwd: w.dir };
@@ -155,7 +102,7 @@ describe('console listening and origins', () => {
     expect(() => resolveConfig({ console: { origins: ['https://ui.example/path'] } }, base)).toThrow(/not an origin/);
   });
 
-  it('refuses foreign Host headers (DNS rebinding) and Origins; CORS only for configured origins', async () => {
+  it('refuses foreign Host headers (DNS rebinding) and Origins; CORS only for configured origins #SE-3', async () => {
     const w = await consoleDaemon({ raw: { console: { origins: ['https://ui.example'] } } });
     const auth = `Bearer ${w.gw.token}`;
     const port = new URL(w.url).port;
@@ -174,14 +121,6 @@ describe('console listening and origins', () => {
     expect(pre.status).toBe(204);
     expect(pre.headers['access-control-allow-headers']).toContain('Authorization');
     expect((await rawGet(w.url, '/api/config', { method: 'OPTIONS', Host: `127.0.0.1:${port}`, Origin: 'https://evil.example' })).status).toBe(403);
-  });
-
-  it('a taken port is logged, not fatal', async () => {
-    const a = await consoleDaemon();
-    const port = Number(new URL(a.url).port);
-    const b = await daemon({ console: true, raw: { console: { port } } });
-    expect(b.gw.console).toBeUndefined();
-    expect(Array.isArray(b.gw.sessions())).toBe(true);
   });
 });
 
@@ -202,7 +141,7 @@ describe('console config', () => {
     return { w, path };
   }
 
-  it('GET never shows secret values: literals are redacted, env: references listed as set / unset', async () => {
+  it('GET never shows secret values: literals are redacted, env: references listed as set / unset #SE-1', async () => {
     const { w, path } = await withSecrets();
     const r = await w.api('/api/config');
     expect(r.status).toBe(200);
@@ -219,7 +158,7 @@ describe('console config', () => {
     expect(doc.issues).toContainEqual(expect.objectContaining({ path: '/channels/0/config/password', code: 'inline_secret', severity: 'warning' }));
   });
 
-  it('PUT: redacted values keep the stored ones, new literal secrets are refused (422, nothing written), stale revisions 409; writes are atomic and 0600', async () => {
+  it('PUT: redacted values keep the stored ones, new literal secrets are refused (422, nothing written), stale revisions 409; writes are atomic and 0600 #SE-1 #SE-2', async () => {
     const { w, path } = await withSecrets();
     const doc = (await w.api('/api/config')).body as AdminConfigDocument;
     const before = readFileSync(path, 'utf8');
@@ -267,18 +206,10 @@ describe('console config', () => {
     ghost.channels[0].config.secret = ADMIN_REDACTED;
     expect((await w.api('/api/config', { method: 'PUT', json: { config: ghost } })).body.issues).toContainEqual(expect.objectContaining({ code: 'redacted_without_value' }));
   });
-
-  it('PUT of the document the daemon started with applies live (nothing to restart)', async () => {
-    const w = await consoleDaemon();
-    const doc = (await w.api('/api/config')).body as AdminConfigDocument;
-    expect(doc.issues).toEqual([]);
-    const r = await w.api('/api/config', { method: 'PUT', json: { config: doc.config } });
-    expect(r).toMatchObject({ status: 200, body: { applied: 'live', issues: [] } });
-  });
 });
 
 describe('console: explain, queue, sessions', () => {
-  it('match the protocol schemas and the daemon state', async () => {
+  it('match the protocol schemas and the daemon state #PR-1', async () => {
     const w = await consoleDaemon();
     const h = await w.host({ name: 'xwo', consumer: 'xwo' });
     h.onRequest('inbound', () => new Promise(() => {})); // never accepts: the item stays pending
@@ -331,7 +262,7 @@ describe('console /ws', () => {
       ws.once('error', reject);
     });
 
-  it('speaks the client frames: sessions, subscribe + input round-trip, as the console principal', async () => {
+  it('speaks the client frames: sessions, subscribe + input round-trip, as the console principal #ID-3 #SE-3', async () => {
     const origins: unknown[] = [];
     const w = await consoleDaemon({
       script: async (t) => {
@@ -361,7 +292,7 @@ describe('console /ws', () => {
     ws.close();
   });
 
-  it('host frames after host.hello with the host token; browsers authenticate with the bearer subprotocol', async () => {
+  it('host frames after host.hello with the host token; browsers authenticate with the bearer subprotocol #SE-3', async () => {
     const w = await consoleDaemon();
     // The global (browser-like) WebSocket cannot set headers: the token rides in the subprotocol list.
     const g = new globalThis.WebSocket(`${w.url.replace('http', 'ws')}/ws`, [ADMIN_WS_SUBPROTOCOL, ADMIN_WS_BEARER_PREFIX + w.gw.token]);
@@ -379,7 +310,7 @@ describe('console /ws', () => {
     g.close();
   });
 
-  it('refuses the upgrade without a valid token, from a foreign origin, or on another path', async () => {
+  it('refuses the upgrade without a valid token, from a foreign origin, or on another path #SE-3', async () => {
     const w = await consoleDaemon();
     const status = (url: string, protocols: string[], headers: Record<string, string> = {}) =>
       new Promise<number>((resolve) => {
@@ -397,199 +328,6 @@ describe('console /ws', () => {
     expect(await status(`${base}/ws`, [ADMIN_WS_SUBPROTOCOL], { Authorization: `Bearer ${w.gw.token}`, Origin: 'https://evil.example' })).toBe(403);
     expect(await status(`${base}/other`, [ADMIN_WS_SUBPROTOCOL], { Authorization: `Bearer ${w.gw.token}` })).toBe(404);
     expect(await status(`${base}/ws`, [ADMIN_WS_SUBPROTOCOL], { Authorization: `Bearer ${w.gw.token}` })).toBe(101);
-  });
-});
-
-describe('console Lark bot provisioning', () => {
-  async function provisioning(mode = 'ok', raw: Record<string, unknown> = {}, env: Record<string, string> = {}) {
-    const argsOut = join(process.env.TMPDIR ?? '/tmp', `aio-fake-args-${process.pid}-${Date.now()}-${Math.random()}.json`);
-    const w = await consoleDaemon({ raw: { console: { port: 0, larkBotCommand: [process.execPath, FAKE_BOT] }, ...raw }, consoleEnv: { FAKE_MODE: mode, FAKE_ARGS_OUT: argsOut, PATH: process.env.PATH!, ...env } });
-    const job = async (id: string) => (await w.api(`/api/bots/lark/${id}`)).body as AdminLarkBotJob;
-    /** Wait for one of `states`. */
-    const until = async (id: string, states: string[]) => {
-      let j: AdminLarkBotJob | undefined;
-      for (let i = 0; i < 300 && !states.includes(j?.state ?? ''); i++) {
-        j = await job(id);
-        if (!states.includes(j.state)) await new Promise((r) => setTimeout(r, 20));
-      }
-      return j!;
-    };
-    /** Start a job and wait for its QR; `scan()` lets the fake go on. */
-    const begin = async (body: Record<string, unknown>) => {
-      const r = await w.api('/api/bots/lark', { method: 'POST', json: { name: 'Bot', ...body } });
-      expect(r.status).toBe(202);
-      const id = r.body.job as string;
-      await until(id, ['waiting_scan']);
-      const argv = JSON.parse(readFileSync(argsOut, 'utf8')) as string[];
-      return { id, argv, scan: () => writeFileSync(`${argv[argv.indexOf('--qr-out') + 1]}.scanned`, '') };
-    };
-    const cfgPath = join(w.dir, 'aio.config.json');
-    const readCfg = () => JSON.parse(readFileSync(cfgPath, 'utf8'));
-    /** Channels in the file only (the daemon itself runs none: it would dial Feishu). */
-    const seed = (channels: unknown[]) => writeFileSync(cfgPath, JSON.stringify({ ...readCfg(), channels }, null, 2) + '\n', { mode: 0o600 });
-    return { w, job, argsOut, until, begin, cfgPath, readCfg, seed };
-  }
-
-  it('starting → waiting_scan (QR payload) → configuring → succeeded; credentials only in the env file; the config gets the channel and the owner', async () => {
-    const { w, job, argsOut } = await provisioning();
-    const start = await w.api('/api/bots/lark', { method: 'POST', json: { name: 'Ops Bot', avatar: 'data:image/png;base64,iVBORw0KGgo=' } });
-    expect(start.status).toBe(202);
-    const id = start.body.job as string;
-    let j: AdminLarkBotJob | undefined;
-    for (let i = 0; i < 200 && j?.state !== 'waiting_scan'; i++) {
-      j = await job(id);
-      await new Promise((r) => setTimeout(r, 20));
-    }
-    expect(check(AdminLarkBotJob, j)).toBe(true);
-    expect(j).toMatchObject({ job: id, state: 'waiting_scan', qr: { payload: '{"qrlogin":{"token":"fake-qr-token"}}' } });
-    // One job at a time.
-    expect(await w.api('/api/bots/lark', { method: 'POST', json: { name: 'Another' } })).toMatchObject({ status: 409, body: { error: { code: 'conflict' } } });
-    // The child got the pinned flags.
-    const argv = JSON.parse(readFileSync(argsOut, 'utf8')) as string[];
-    expect(argv).toEqual(expect.arrayContaining(['--json', '--qr-out', '--write-env', join(w.dir, '.env.live'), '--name', 'Ops Bot', '--brand', 'feishu', '--preset', 'messaging,contact', '--avatar']));
-    // Scan.
-    writeFileSync(`${argv[argv.indexOf('--qr-out') + 1]}.scanned`, '');
-    for (let i = 0; i < 200 && j?.state !== 'succeeded' && j?.state !== 'failed'; i++) {
-      j = await job(id);
-      await new Promise((r) => setTimeout(r, 20));
-    }
-    expect(check(AdminLarkBotJob, j)).toBe(true);
-    expect(j).toMatchObject({
-      state: 'succeeded',
-      result: { appId: 'cli_fake123', domain: 'feishu', botName: 'Ops Bot', account: 'default', env: { appId: 'env:LARK_APP_ID', appSecret: 'env:LARK_APP_SECRET', domain: 'env:LARK_DOMAIN' }, owner: 'lark-bot:on_owner1', channelAdded: true },
-    });
-    expect(j!.qr).toBeUndefined();
-    expect(JSON.stringify(j)).not.toContain('very-secret-value');
-    const env = readFileSync(join(w.dir, '.env.live'), 'utf8');
-    expect(env).toContain('LARK_APP_SECRET=very-secret-value');
-    const cfg = JSON.parse(readFileSync(join(w.dir, 'aio.config.json'), 'utf8'));
-    // Always explicit references (decision 8): the entry never depends on the LARK_APP_* fallback.
-    expect(cfg.channels).toEqual([{ type: 'lark-bot', config: { appId: 'env:LARK_APP_ID', appSecret: 'env:LARK_APP_SECRET', domain: 'env:LARK_DOMAIN' } }]);
-    expect(argv).not.toContain('--env-prefix');
-    expect(cfg.policy.owners).toEqual(['fake:alice', 'lark-bot:on_owner1']);
-    expect(statSync(join(w.dir, 'aio.config.json')).mode & 0o777).toBe(0o600);
-    // The config document now validates with the new env file, and shows the references only.
-    const doc = (await w.api('/api/config')).body as AdminConfigDocument;
-    expect(JSON.stringify(doc)).not.toContain('very-secret-value');
-    // A second bot under the same account would replace the first one's credentials.
-    expect(await w.api('/api/bots/lark', { method: 'POST', json: { name: 'Second' } })).toMatchObject({ status: 409, body: { error: { code: 'conflict' } } });
-    expect(await w.api('/api/bots/lark', { method: 'POST', json: { name: 'Second', account: 'default' } })).toMatchObject({ status: 409 });
-    expect(await w.api('/api/bots/lark/lark_nope')).toMatchObject({ status: 404, body: { error: { code: 'unknown_job' } } });
-  });
-
-  it('an expired QR code ends the job as expired; a crash as failed; bad requests are 400', async () => {
-    const { w, job } = await provisioning('expire');
-    const id = (await w.api('/api/bots/lark', { method: 'POST', json: { name: 'X', addChannel: false } })).body.job;
-    let st: AdminLarkBotJob | undefined;
-    for (let i = 0; i < 200 && !['expired', 'failed', 'succeeded'].includes(st?.state ?? ''); i++) {
-      st = await job(id);
-      await new Promise((r) => setTimeout(r, 20));
-    }
-    expect(st).toMatchObject({ state: 'expired', error: { code: 'qr_expired' } });
-    expect(await w.api('/api/bots/lark', { method: 'POST', json: { name: 'X', avatar: 'https://example.com/a.png' } })).toMatchObject({ status: 400, body: { error: { code: 'invalid_request' } } });
-    expect(await w.api('/api/bots/lark', { method: 'POST', json: { nameX: 'X' } })).toMatchObject({ status: 400 });
-
-    const c = await provisioning('crash');
-    const cid = (await c.w.api('/api/bots/lark', { method: 'POST', json: { name: 'Y', addChannel: false } })).body.job;
-    let cs: AdminLarkBotJob | undefined;
-    for (let i = 0; i < 200 && !['expired', 'failed', 'succeeded'].includes(cs?.state ?? ''); i++) {
-      cs = await c.job(cid);
-      await new Promise((r) => setTimeout(r, 20));
-    }
-    expect(cs).toMatchObject({ state: 'failed', error: { code: 'no_result', message: expect.stringContaining('exited with 7') } });
-  });
-
-  it('addChannel:false does not overwrite the credentials of an existing bot (env file or environment): refused, nothing spawned', async () => {
-    const { w, argsOut } = await provisioning();
-    const envFile = join(w.dir, '.env.live');
-    writeFileSync(envFile, 'LARK_APP_ID=cli_old\nLARK_APP_SECRET=old-secret\n', { mode: 0o600 });
-    const r = await w.api('/api/bots/lark', { method: 'POST', json: { name: 'Later', addChannel: false } });
-    expect(r).toMatchObject({ status: 409, body: { error: { code: 'conflict', message: expect.stringContaining('LARK_APP_ID') } } });
-    expect(JSON.stringify(r.body)).not.toContain('old-secret');
-    expect(readFileSync(envFile, 'utf8')).toBe('LARK_APP_ID=cli_old\nLARK_APP_SECRET=old-secret\n');
-    expect(existsSync(argsOut)).toBe(false);
-    // The same through the process environment.
-    const p = await provisioning('ok');
-    const e = await consoleDaemon({ raw: { console: { port: 0, larkBotCommand: [process.execPath, FAKE_BOT] } }, consoleEnv: { FAKE_ARGS_OUT: p.argsOut, LARK_APP_SECRET: 'x', PATH: process.env.PATH } });
-    expect((await e.api('/api/bots/lark', { method: 'POST', json: { name: 'Later', addChannel: false } })).status).toBe(409);
-  });
-
-  // Decision 8: several bots in one daemon, one account each.
-  const LARK_A = { type: 'lark-bot', config: { appId: 'env:LARK_APP_ID', appSecret: 'env:LARK_APP_SECRET', domain: 'env:LARK_DOMAIN' } };
-
-  it('a second bot under another account: --env-prefix LARK_PROJ_A_, an entry with explicit references, result env with those names', async () => {
-    const p = await provisioning('ok', {}, { LARK_APP_ID: 'cli_first', LARK_APP_SECRET: 's1', LARK_DOMAIN: 'feishu' });
-    p.seed([LARK_A]);
-    const { id, argv, scan } = await p.begin({ account: 'proj-a', owner: false });
-    expect(argv).toEqual(expect.arrayContaining(['--env-prefix', 'LARK_PROJ_A_']));
-    scan();
-    const j = await p.until(id, ['succeeded', 'failed']);
-    expect(j).toMatchObject({ state: 'succeeded', result: { account: 'proj-a', env: { appId: 'env:LARK_PROJ_A_APP_ID', appSecret: 'env:LARK_PROJ_A_APP_SECRET', domain: 'env:LARK_PROJ_A_DOMAIN' }, channelAdded: true } });
-    expect(p.readCfg().channels).toEqual([LARK_A, { type: 'lark-bot', account: 'proj-a', config: { appId: 'env:LARK_PROJ_A_APP_ID', appSecret: 'env:LARK_PROJ_A_APP_SECRET', domain: 'env:LARK_PROJ_A_DOMAIN' } }]);
-    expect(readFileSync(join(p.w.dir, '.env.live'), 'utf8')).toContain('LARK_PROJ_A_APP_SECRET=very-secret-value');
-    expect(JSON.stringify(j)).not.toContain('very-secret-value');
-  });
-
-  it('start checks: same account 409, target variables set 409 (named), a name reading the same variables 409, a bad account 400; nothing spawned', async () => {
-    const p = await provisioning('ok', {}, { LARK_APP_ID: 'cli_1', LARK_APP_SECRET: 's', LARK_PROJ_A_APP_ID: 'cli_2', LARK_PROJ_A_APP_SECRET: 's', LARK_OPS_DOMAIN: 'lark' });
-    p.seed([LARK_A, { type: 'lark-bot', account: 'proj-a', config: { appId: 'env:LARK_PROJ_A_APP_ID', appSecret: 'env:LARK_PROJ_A_APP_SECRET' } }]);
-    const post = (json: Record<string, unknown>) => p.w.api('/api/bots/lark', { method: 'POST', json: { name: 'N', ...json } });
-    expect(await post({ account: 'proj-a' })).toMatchObject({ status: 409, body: { error: { code: 'conflict', message: expect.stringContaining('account proj-a is already configured') } } });
-    // proj_a maps to the same LARK_PROJ_A_* names the proj-a entry reads.
-    expect(await post({ account: 'proj_a' })).toMatchObject({ status: 409, body: { error: { message: expect.stringContaining('LARK_PROJ_A_APP_ID') } } });
-    expect(await post({ account: 'ops' })).toMatchObject({ status: 409, body: { error: { message: expect.stringContaining('LARK_OPS_DOMAIN') } } });
-    for (const account of ['a:b', '-x', '', 'x'.repeat(65)]) expect(await post({ account })).toMatchObject({ status: 400, body: { error: { code: 'invalid_request' } } });
-    expect(existsSync(p.argsOut)).toBe(false);
-  });
-
-  it('a config change while the job waits for a scan: an entry for the same account added meanwhile → failed (conflict), only that entry stays; another account → both', async () => {
-    const p = await provisioning('ok', {}, { LARK_APP_ID: 'cli_first', LARK_APP_SECRET: 's1', LARK_DOMAIN: 'feishu', THEIR_SECRET: 't' });
-    p.seed([LARK_A]);
-    const { id, scan } = await p.begin({ account: 'proj-a' });
-    const theirs = { type: 'lark-bot', account: 'proj-a', config: { appId: 'cli_theirs', appSecret: 'env:THEIR_SECRET' } };
-    const cur = await p.w.api('/api/config');
-    const put = await p.w.api('/api/config', { method: 'PUT', json: { config: { ...cur.body.config, channels: [LARK_A, theirs] }, ifRevision: cur.body.revision } });
-    expect(put.status).toBe(200);
-    scan();
-    const j = await p.until(id, ['succeeded', 'failed']);
-    expect(j).toMatchObject({ state: 'failed', error: { code: 'conflict', message: expect.stringContaining('LARK_PROJ_A_APP_ID') } });
-    const cfg = p.readCfg();
-    expect(cfg.channels).toEqual([LARK_A, theirs]);
-    // Not added, so no owner either.
-    expect(cfg.policy.owners).toEqual(['fake:alice']);
-
-    const q = await provisioning('ok', {}, { LARK_APP_ID: 'cli_first', LARK_APP_SECRET: 's1', LARK_DOMAIN: 'feishu', INTL_SECRET: 'i' });
-    q.seed([LARK_A]);
-    const b = await q.begin({ account: 'proj-a', owner: false });
-    const other = { type: 'lark-bot', account: 'brand-intl', config: { appId: 'cli_intl', appSecret: 'env:INTL_SECRET', domain: 'lark' } };
-    const c2 = await q.w.api('/api/config');
-    expect((await q.w.api('/api/config', { method: 'PUT', json: { config: { ...c2.body.config, channels: [LARK_A, other] }, ifRevision: c2.body.revision } })).status).toBe(200);
-    b.scan();
-    expect(await q.until(b.id, ['succeeded', 'failed'])).toMatchObject({ state: 'succeeded' });
-    expect(q.readCfg().channels.map((c: { account?: string }) => c.account ?? 'default')).toEqual(['default', 'brand-intl', 'proj-a']);
-  });
-
-  it('the created app is one a configured channel already runs → failed (duplicate_app), config and owners unchanged', async () => {
-    const p = await provisioning('ok', {}, { LARK_APP_ID: 'cli_same', LARK_APP_SECRET: 's1', LARK_DOMAIN: 'feishu', FAKE_APP_ID: 'cli_same' });
-    p.seed([LARK_A]);
-    const before = readFileSync(p.cfgPath, 'utf8');
-    const { id, scan } = await p.begin({ account: 'proj-a' });
-    scan();
-    const j = await p.until(id, ['succeeded', 'failed']);
-    expect(j).toMatchObject({ state: 'failed', error: { code: 'duplicate_app', message: expect.stringMatching(/cli_same.*account default.*LARK_PROJ_A_APP_ID/) } });
-    expect(readFileSync(p.cfgPath, 'utf8')).toBe(before);
-  });
-
-  it('a config that would not load with the bot → failed (config_invalid), nothing written', async () => {
-    const p = await provisioning();
-    const { id, scan } = await p.begin({ account: 'proj-a' });
-    // Changed by hand meanwhile: another bot whose app id variable is not set.
-    p.seed([{ type: 'lark-bot', account: 'other', config: { appId: 'env:AIO_TEST_MISSING_VAR', appSecret: 'env:AIO_TEST_MISSING_VAR' } }]);
-    const before = readFileSync(p.cfgPath, 'utf8');
-    scan();
-    const j = await p.until(id, ['succeeded', 'failed']);
-    expect(j).toMatchObject({ state: 'failed', error: { code: 'config_invalid', message: expect.stringContaining('AIO_TEST_MISSING_VAR') } });
-    expect(readFileSync(p.cfgPath, 'utf8')).toBe(before);
   });
 });
 
@@ -631,7 +369,7 @@ describe('console config: credentials by schema', () => {
     return { w, path };
   }
 
-  it('GET of a real-world config (mail pass, env maps, headers, codex config, bridge args, lark config) shows no secret string anywhere', async () => {
+  it('GET of a real-world config (mail pass, env maps, headers, codex config, bridge args, lark config) shows no secret string anywhere #SE-1', async () => {
     const { w } = await realWorldDaemon();
     const r = await w.api('/api/config');
     expect(r.status).toBe(200);
@@ -650,7 +388,7 @@ describe('console config: credentials by schema', () => {
     expect(r.body.issues).toContainEqual(expect.objectContaining({ path: '/channels/2/config/imap/auth/pass', code: 'inline_secret', severity: 'warning' }));
   });
 
-  it('PUT refuses literals in credential fields whatever their name, keeps stored values for the marker, and honours the marker only on credential fields', async () => {
+  it('PUT refuses literals in credential fields whatever their name, keeps stored values for the marker, and honours the marker only on credential fields #SE-1', async () => {
     const { w, path } = await realWorldDaemon();
     const doc = (await w.api('/api/config')).body as AdminConfigDocument;
     const before = readFileSync(path, 'utf8');
@@ -686,21 +424,7 @@ describe('console config: credentials by schema', () => {
 });
 
 describe('console URL file and console-link', () => {
-  it('a stale console URL file is removed at start, also when the bind fails', async () => {
-    const a = await consoleDaemon();
-    const port = Number(new URL(a.url).port);
-    const dir = tmp();
-    const sock = join(dir, 'run', 'aio.sock');
-    const { mkdirSync } = await import('node:fs');
-    mkdirSync(join(dir, 'run'), { recursive: true, mode: 0o700 });
-    writeFileSync(consoleUrlPath(sock), 'http://127.0.0.1:1\n', { mode: 0o600 });
-    const b = await daemon({ dir, console: true, raw: { console: { port } } });
-    expect(b.config.socketPath).toBe(sock);
-    expect(b.gw.console).toBeUndefined();
-    expect(existsSync(consoleUrlPath(sock))).toBe(false);
-  });
-
-  it('aio console-link never sends the host token to a listener that is not this daemon', async () => {
+  it('aio console-link never sends the host token to a listener that is not this daemon #SE-3', async () => {
     const w = await consoleDaemon();
     const { createServer } = await import('node:http');
     const seen: (string | undefined)[] = [];
@@ -728,7 +452,7 @@ describe('console URL file and console-link', () => {
 });
 
 describe('console cookie scope', () => {
-  it('the cookie name is per daemon; a session works only through the Host it logged in with', async () => {
+  it('the cookie name is per daemon; a session works only through the Host it logged in with #SE-3', async () => {
     const a = await consoleDaemon();
     const b = await consoleDaemon();
     expect(a.gw.console!.cookieName).toMatch(/^aio_console_[0-9a-f]{12,}$/);
@@ -742,7 +466,7 @@ describe('console cookie scope', () => {
     expect((await rawGet(a.url, '/api/queue', { Host: `127.0.0.1:${port}`, Cookie: `aio_console=${login.body.token}` })).status).toBe(401);
   });
 
-  it('/ws: a valid bearer subprotocol wins over a stale cookie', async () => {
+  it('/ws: a valid bearer subprotocol wins over a stale cookie #SE-3', async () => {
     const w = await consoleDaemon();
     const code = await new Promise<number>((resolve) => {
       const ws = new WebSocket(`${w.url.replace('http', 'ws')}/ws`, [ADMIN_WS_SUBPROTOCOL, ADMIN_WS_BEARER_PREFIX + w.gw.token], { headers: { Cookie: `aio_console=stale; ${w.gw.console!.cookieName ?? "aio_console"}=stale` } });
@@ -758,7 +482,7 @@ describe('console cookie scope', () => {
 });
 
 describe('console allowed hosts', () => {
-  it('a wildcard bind with allowRemote needs console.allowedHosts, and accepts those Host values', async () => {
+  it('a wildcard bind with allowRemote needs console.allowedHosts, and accepts those Host values #SE-3', async () => {
     const base = { env: {}, baseDir: tmp(), cwd: tmp() };
     expect(() => resolveConfig({ console: { host: '0.0.0.0', allowRemote: true } }, base)).toThrow(/allowedHosts/);
     expect(resolveConfig({ console: { host: '0.0.0.0', allowRemote: true, allowedHosts: ['aio.lan', '192.168.1.5'] } }, base).console.allowedHosts).toEqual(['aio.lan', '192.168.1.5']);

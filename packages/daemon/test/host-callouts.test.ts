@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { FakeTurnScript } from '@agents-io/testkit';
 import type { ReplyRoute } from '@agents-io/protocol';
 import { calloutHooks } from '../src/host.js';
-import { daemon, until, type World } from './helpers.js';
+import { closeAndWait, daemon, until, type World } from './helpers.js';
 
 /*
  * Host `policy` hooks beyond `route` (docs/design/host-callouts): `resolve` and
@@ -22,7 +22,7 @@ const route: ReplyRoute = { channel: 'fake', account: 'default', conversationId:
 const onBehalf = { policy: { owners: ['fake:alice'], answerOnBehalf: true } };
 
 describe('host.hello callouts', () => {
-  it('true is route only; a list names hooks, unknown ones ignored; the result lists what was granted; features advertise it', async () => {
+  it('true is route only; a list names hooks, unknown ones ignored; the result lists what was granted; features advertise it #RQ-3', async () => {
     expect([...calloutHooks(true)]).toEqual(['route']);
     expect([...calloutHooks(false)]).toEqual([]);
     expect([...calloutHooks(['outbound', 'nope', 'resolve'])]).toEqual(['resolve', 'outbound']);
@@ -40,7 +40,7 @@ describe('host.hello callouts', () => {
 });
 
 describe('resolve callout', () => {
-  it('the host picks the resolver (human) and answers on the principal\'s behalf; the log records the principal and the host', async () => {
+  it('the host picks the resolver (human) and answers on the principal\'s behalf; the log records the principal and the host #RQ-3', async () => {
     const w = await daemon({ script: approval, raw: onBehalf });
     const h = await w.host({ callouts: ['resolve'] });
     const asked: Record<string, unknown>[] = [];
@@ -67,7 +67,7 @@ describe('resolve callout', () => {
     expect(events(w, 'S1', 'text.snapshot').at(-1)).toMatchObject({ text: 'got allow_once' });
   });
 
-  it('a host resolver answered on behalf of a principal records it with via', async () => {
+  it('a host resolver answered on behalf of a principal records it with via #RQ-3', async () => {
     const w = await daemon({ script: approval, raw: onBehalf });
     const h = await w.host({ callouts: ['resolve'] });
     h.onRequest('policy', () => ({ kind: 'host' }));
@@ -79,7 +79,7 @@ describe('resolve callout', () => {
     expect(events(w, 'S2', 'request.resolved')[0]).toMatchObject({ by: { kind: 'host', id: 'member-7', via: 'host:xwo' } });
   });
 
-  it('onBehalfOf is off by default (policy.answerOnBehalf): on_behalf_not_allowed, not advertised, the request stays open', async () => {
+  it('onBehalfOf is off by default (policy.answerOnBehalf): on_behalf_not_allowed, not advertised, the request stays open #RQ-3', async () => {
     const w = await daemon({ script: approval });
     expect(w.gw.config.policy.answerOnBehalf).toBe(false);
     const h = await w.host({ callouts: ['resolve'] });
@@ -100,7 +100,7 @@ describe('resolve callout', () => {
     expect((events(w, 'S3', 'request.resolved')[0]!.by as Record<string, unknown>).via).toBeUndefined();
   });
 
-  it('timeout, error and a bad answer fall back to the local policy; a host without the hook is never asked', async () => {
+  it('timeout, error and a bad answer fall back to the local policy; a host without the hook is never asked #RQ-4', async () => {
     for (const answer of ['timeout', 'error', 'bad', 'not-asked'] as const) {
       const w = await daemon({ script: approval, raw: { hostCallouts: { resolve: { timeoutMs: 50 } } }, policy: { resolve: async () => ({ kind: 'auto', decision: { kind: 'deny', message: 'local' } }) } });
       const h = await w.host({ callouts: answer === 'not-asked' ? ['route'] : ['resolve'] });
@@ -122,7 +122,7 @@ describe('resolve callout', () => {
 });
 
 describe('outbound callout', () => {
-  it('the host decides; timeout, error and bad answers deny; without the hook the local policy decides', async () => {
+  it('the host decides; timeout, error and bad answers deny; without the hook the local policy decides #DL-5', async () => {
     const w = await daemon({ raw: { hostCallouts: { outbound: { timeoutMs: 50 } } } });
     // No host: the local policy (an unregistered route outside a turn is denied, a registered one allowed).
     expect(await w.gw.policy.outbound({ from: null, to: route })).toBe('deny');
@@ -144,12 +144,23 @@ describe('outbound callout', () => {
     }
   });
 
-  it('a host that only answers route callouts leaves outbound to the local policy', async () => {
+  it('a host that only answers route callouts leaves outbound to the local policy #DL-5', async () => {
     const w = await daemon({ raw: { policy: { owners: ['fake:alice'], routes: ['fake:default:elsewhere'] } } });
     const h = await w.host({ callouts: true });
     h.onRequest('policy', () => {
       throw new Error('must not be asked');
     });
     expect(await w.gw.policy.outbound({ from: null, to: route })).toBe('allow');
+  });
+
+  // INVARIANTS DL-5 不成立 1: once the host that declared `outbound` disconnects, answers('outbound') is false and the local policy decides (fail open); turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails('a host that declared the outbound callout disconnects: a send to a route other than the turn\'s own is still refused #DL-5', async () => {
+    // The local policy alone would allow this registered route; the host tightened it.
+    const w = await daemon({ raw: { policy: { owners: ['fake:alice'], routes: ['fake:default:elsewhere'] } } });
+    const h = await w.host({ callouts: ['outbound'] });
+    h.onRequest('policy', () => ({ verdict: 'deny' }));
+    expect(await w.gw.policy.outbound({ from: null, to: route })).toBe('deny');
+    await closeAndWait(w.gw, h);
+    expect(await w.gw.policy.outbound({ from: null, to: route })).toBe('deny');
   });
 });
