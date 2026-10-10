@@ -362,3 +362,5 @@ e2e（`aio e2e`，`packages/daemon/src/e2e.ts` 加场景 `agent-loop-guard`）�
 - **客户端不能贴 `loopGuard` 标签**：适配器的 `context` 与本地 / 宿主客户端的 `channelContext` 里的 `loopGuard` 都被去掉，只有 lane 截停时会写。
 
 测试（§9 各条）：1、2、3、4、5、6（watch 转投、`inbound.redispatch`；话题换手只靠代码路径，同 `channelRef`）、7、8、9（通道规则、watch trigger、`inbound.redispatch`；宿主 `input` 帧与本地输入是 system / human，只清零成对计数）、10、11、12（cause 与 explain 跨重启；成对计数清零未单独测）、13（两跳）、14（`SendOp.cause`；`as` 见上表）、16 都有 core 测试，带 `#ID-7`、`#ID-8`、`#EX-5`、`#EX-6`、`#IN-8`、`#CF-9`。15（`announce`）没有做。
+
+**合并评审后的修订（2026-10-11）**：live 委托也过 lane 的截停检查点（按会议计成对次数，截停即打断 harness 已开的轮次）；只有有主体的人清零成对计数；上下文输入带过来的 `carried` 同样并进来源；出站索引在发送时取来源、索引一次发送的每一条平台消息；cause 记录按 `(input_id, session_key)` 存；`agent` 通道 id 保留；默认 `Policy.outbound` 按"本轮输入全部来自主人"放行任何目的地。依据与测试见 `docs/INVARIANTS.md` IN-8、EX-5、EX-6、ID-3、ID-8、DL-5 与 §15 第 17 条（未修的几项）。
