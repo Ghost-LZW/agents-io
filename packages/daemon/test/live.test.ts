@@ -77,6 +77,9 @@ class MeetingChannel extends FakeChannel {
   /** Offer frames endpoints instead of webrtc. */
   frames = false;
   readonly endpoints: (LiveEndpoint & { answers: string[]; closes: string[]; hangUp(reason: string): void })[] = [];
+  liveRoute(account: string, target: string) {
+    return { channel: this.id, account, conversationId: `meeting:${target}` };
+  }
   async openLive(account: string, target: string): Promise<LiveEndpoint> {
     if (target === 'busy') throw new Error('MEETING_PARTICIPANT_BUSY');
     if (target.startsWith('slow')) await new Promise((r) => setTimeout(r, 80));
@@ -108,7 +111,9 @@ async function setup(
   o: { dir?: string; log?: SessionLog; harness?: LiveFakeHarness; chat?: MeetingChannel; policy?: Partial<Policy> } = {},
 ) {
   const dir = o.dir ?? mkdtempSync(join(tmpdir(), 'aio-live-'));
-  const base = resolveConfig({ policy: { owners: ['fake:alice'] }, local: { principal: 'me' }, outputTools: true }, { env: {}, baseDir: dir, cwd: dir });
+  // The meetings these tests join are preregistered destinations (DL-5: live_join asks Policy.outbound).
+  const routes = ['42', '43', '5', '6', '7', '8', '9', 'busy', 'slow1', 'slow2'].map((t) => `fake:default:meeting:${t}`);
+  const base = resolveConfig({ policy: { owners: ['fake:alice'], routes }, local: { principal: 'me' }, outputTools: true }, { env: {}, baseDir: dir, cwd: dir });
   const config = { ...base, socketPath: join(dir, 'run', 'aio.sock'), blobs: { ...base.blobs, dir: join(dir, 'blobs') } };
   const chat = o.chat ?? new MeetingChannel('fake');
   const harness = o.harness ?? new LiveFakeHarness(script);
@@ -344,8 +349,29 @@ describe('live: ends, transports and destinations', () => {
     expect(chat.endpoints).toHaveLength(2);
   });
 
-  // INVARIANTS DL-5 不成立 2: live_join's target (gateway.ts joinLive) never goes through Policy.outbound; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('live_join goes through the outbound check: a policy that denies every destination refuses it, no endpoint is opened #DL-5', async () => {
+  it('live_join to a meeting that is not a preregistered destination is refused by the default policy; a channel that cannot name the route first has its endpoint closed #DL-5', async () => {
+    const t = toolTurns({ join: ['live_join', { target: '99' }] });
+    const w = await setup(t.script);
+    t.holder.h = w.harness;
+    await from(w.chat, 'join');
+    const r = await until(() => t.results['join']);
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/fake:default:meeting:99 is not an allowed destination/);
+    expect(w.chat.endpoints).toHaveLength(0);
+
+    const chat = new MeetingChannel('fake');
+    (chat as { liveRoute?: unknown }).liveRoute = undefined;
+    const t2 = toolTurns({ join: ['live_join', { target: '99' }] });
+    const w2 = await setup(t2.script, { chat });
+    t2.holder.h = w2.harness;
+    await from(w2.chat, 'join');
+    expect((await until(() => t2.results['join'])).isError).toBe(true);
+    expect(chat.endpoints).toHaveLength(1);
+    expect(chat.endpoints[0]!.closes).toEqual(['not an allowed destination']);
+    expect(w2.harness.starts).toHaveLength(0);
+  });
+
+  it('live_join goes through the outbound check: a policy that denies every destination refuses it, no endpoint is opened #DL-5', async () => {
     const t = toolTurns({ join: ['live_join', { target: '42' }] });
     const w = await setup(t.script, { policy: { outbound: async () => 'deny' } });
     t.holder.h = w.harness;

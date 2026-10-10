@@ -22,7 +22,7 @@ export type VerifyResult = InputVerifyResult;
 export class DaemonRecords implements OutboxStore {
   readonly db: DatabaseSync;
   private readonly ownsDb: boolean;
-  private q: Record<'inPut' | 'inGet' | 'inPrune' | 'outGet' | 'outPut' | 'outPrune' | 'flyPut' | 'flyGet' | 'flyAll' | 'flyDel' | 'agentGet' | 'agentPut' | 'launchGet' | 'launchPut' | 'launchKeys', StatementSync>;
+  private q: Record<'inPut' | 'inGet' | 'inPrune' | 'outGet' | 'outPut' | 'outPrune' | 'flyPut' | 'flyGet' | 'flyAll' | 'flyDel' | 'agentGet' | 'agentPut' | 'launchGet' | 'launchPut' | 'launchKeys' | 'flagGet' | 'flagPut' | 'flagDel', StatementSync>;
   /** Tests: called between the agent row and the launch row of `pin` (a throw rolls both back). */
   betweenPinWrites?: () => void;
 
@@ -36,6 +36,7 @@ export class DaemonRecords implements OutboxStore {
       CREATE TABLE IF NOT EXISTS daemon_outbox_inflight (operation_id TEXT PRIMARY KEY, at INTEGER NOT NULL, json TEXT NOT NULL) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS daemon_session_agents (session_key TEXT PRIMARY KEY, agent TEXT NOT NULL) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS daemon_session_launch (session_key TEXT PRIMARY KEY, cwd TEXT, env_json TEXT NOT NULL, at INTEGER NOT NULL) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS daemon_flags (name TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
     `);
     const p = (sql: string) => this.db.prepare(sql);
     this.q = {
@@ -59,6 +60,9 @@ export class DaemonRecords implements OutboxStore {
       launchGet: p('SELECT cwd, env_json FROM daemon_session_launch WHERE session_key = ?'),
       launchKeys: p('SELECT session_key FROM daemon_session_launch'),
       launchPut: p('INSERT INTO daemon_session_launch (session_key, cwd, env_json, at) VALUES (?, ?, ?, ?)'),
+      flagGet: p('SELECT value FROM daemon_flags WHERE name = ?'),
+      flagPut: p('INSERT INTO daemon_flags (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value'),
+      flagDel: p('DELETE FROM daemon_flags WHERE name = ?'),
     };
     const retain = o.retainMs ?? 30 * DAY;
     this.q.inPrune.run(Date.now() - retain);
@@ -138,6 +142,18 @@ export class DaemonRecords implements OutboxStore {
   /** The first agent recorded for a session stays its agent. */
   setAgent(sessionKey: string, agent: string): void {
     this.q.agentPut.run(sessionKey, agent);
+  }
+
+  // ---- flags ----------------------------------------------------------------
+
+  /** A small named fact that must survive a restart (e.g. the host that declared `outbound`). */
+  flag(name: string): string | undefined {
+    return (this.q.flagGet.get(name) as { value: string } | undefined)?.value;
+  }
+
+  setFlag(name: string, value: string | undefined): void {
+    if (value === undefined) this.q.flagDel.run(name);
+    else this.q.flagPut.run(name, value);
   }
 
   // ---- session launch (decision 7) ---------------------------------------

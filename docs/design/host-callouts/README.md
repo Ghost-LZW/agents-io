@@ -58,7 +58,7 @@ POSITIONING §2 的判据：某个请求交给谁答、某个目的地能不能�
 
 `policy { hook: "outbound", args: { from, to } }`（`from: TurnContext | null`，`to: ReplyRoute`），宿主答复 `{ verdict: "allow" | "deny" }`。
 
-- 宿主未连接或没开启 `outbound`：沿用本地 `policy.outbound`（行为不变）。注意：开启过 `outbound` 的宿主断开后同样回到本地策略，本地允许的去向（如预注册 `routes`）照常放行；宿主施加的限制离线期间不生效（见 §8）。
+- 宿主未连接或没开启 `outbound`：沿用本地 `policy.outbound`（行为不变）。开启过 `outbound` 的宿主断开后（含重启后）不回到本地策略：只放行本轮自己的回复路由，其余拒绝，直到它重连或一个不含 `outbound` 的宿主连上（2026-10-11 修，INVARIANTS DL-5；原来回到本地策略，是 fail open）。
 - **fail closed = 拒绝**：已开启时超时、出错、答复不合 schema，一律 `deny`。
 - 超时：`hostCallouts.outbound.timeoutMs`，默认 2000 ms。
 
@@ -100,5 +100,5 @@ POSITIONING §2 的判据：某个请求交给谁答、某个目的地能不能�
 
 ## 8. 后续
 
-- **离线时的 `outbound`**：可加配置（如 `hostCallouts.outbound.whenOffline: "deny"`），让开启过 `outbound` 的宿主断开期间一律拒绝外发，而不是回到本地策略。当前只在文档中说明。
+- ~~**离线时的 `outbound`**~~：已改为缺省行为，不加配置（2026-10-11，见 §4 与 INVARIANTS DL-5）：断开期间只放行本轮回复路由。
 - **Schema 去重**：`HostEventFrame.json` 内联了完整的 `request.opened` 事件体与 `TurnContextView`（约 1300 行），与 `TurnContextView.json`、`ResolveCalloutAnswer.json` 重复。可在 `emit-schema` 中用 `$id` / `$ref` 共享定义；不影响正确性。

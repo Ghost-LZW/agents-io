@@ -174,6 +174,12 @@ export interface ChannelAdapter {
    * media then flows between them, never through the gateway.
    */
   openLive?(account: string, target: string): Promise<LiveEndpoint>;
+  /**
+   * The route a live on `target` would have (`LiveEndpoint.route`), without opening it,
+   * so `live_join` can ask `Policy.outbound` before anything is joined. Without it the
+   * gateway checks the opened endpoint's route and closes the endpoint when it is denied.
+   */
+  liveRoute?(account: string, target: string): ReplyRoute;
   /** Release resources (called once, at daemon shutdown, after `start`'s signal aborted). */
   close?(): Promise<void>;
 }

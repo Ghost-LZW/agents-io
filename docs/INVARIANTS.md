@@ -144,13 +144,16 @@
 
 ### DL-5 外发目的地检查；宿主 outbound 回调失败即拒
 
-- **承诺**：输出工具发往的每个路由都过 `Policy.outbound`（默认只允许本轮回复路由与预登记路由）；宿主声明了 `outbound` 钩子时由宿主决定，超时、出错、答复不合 schema 一律拒绝（决定 9）。
-- **实现**：`gateway.ts:324-334`；`packages/daemon/src/host.ts:242-254`；`packages/host-mcp/src/tools.ts:380-397`（`allowed()`）。
-- **测试**：`packages/daemon/test/host-callouts.test.ts` "the host decides; timeout, error and bad answers deny; without the hook the local policy decides #DL-5"、"a host that only answers route callouts leaves outbound to the local policy #DL-5"；`host-mcp.test.ts` "denies destinations outside Policy.outbound with a clear error and a notice #DL-5"。
+- **承诺**：输出工具发往的每个路由都过 `Policy.outbound`（默认只允许本轮回复路由与预登记路由），`live_join` 的地点也一样；宿主声明了 `outbound` 钩子时由宿主决定，超时、出错、答复不合 schema 一律拒绝（决定 9）；这个宿主断开期间（含重启后）只放行本轮自己的回复路由，直到它重连或一个不声明 `outbound` 的宿主连上。
+- **实现**：`gateway.ts` 构造函数里的 `outbound`（`host.outboundHeldBy()`、宿主回调、本地策略）；`packages/daemon/src/host.ts` `outboundHeldBy` 与 `hello`（宿主名记在 `DaemonRecords` 的 `daemon_flags`，跨重启）；`gateway.ts` `joinLive` / `liveAllowed`（通道有 `liveRoute` 时打开之前检查，否则检查打开后的端点路由，被拒即关闭端点）；`packages/host-mcp/src/tools.ts:380-397`（`allowed()`）。
+- **测试**：`packages/daemon/test/host-callouts.test.ts` "the host decides; timeout, error and bad answers deny; without the hook the local policy decides #DL-5"、"a host that only answers route callouts leaves outbound to the local policy #DL-5"、"a host that declared the outbound callout disconnects: a send to a route other than the turn's own is still refused"（原 `it.fails`，已修；也覆盖重启后与交还本地策略）；`packages/daemon/test/live.test.ts` "live_join goes through the outbound check: a policy that denies every destination refuses it, no endpoint is opened"（原 `it.fails`，已修）、"live_join to a meeting that is not a preregistered destination is refused by the default policy; a channel that cannot name the route first has its endpoint closed"；`host-mcp.test.ts` "denies destinations outside Policy.outbound with a clear error and a notice #DL-5"。
 - **状态**：部分覆盖。
+- **决定（2026-10-11，依原则 4 与决定 9"`outbound` 任何失败都拒绝"自决；决定 13 冻结回调的扩展，这里是改正确性，不加新能力）**：
+  1. 宿主离线时只放行本轮自己的回复路由：回复发问的地方不需要宿主授权，本地策略额外放宽的（预登记路由）正是宿主可能收紧过的，按 fail closed 拒绝。没有加配置开关（`host-callouts` §8 原设想的 `whenOffline`）。
+  2. `live_join` 的地点按普通外发目的地处理：机器人在那里说话。缺省策略下要把会议路由预登记进 `policy.routes`，或由宿主 `outbound` 放行；`ChannelAdapter.liveRoute(account, target)`（可选）让网关在打开之前检查。
 - **不成立**：
-  1. 宿主断线时退回本地策略：`answers('outbound')` 在宿主断开后为假（`host.ts:97-100`），`gateway.ts:327` 改用 `local.outbound`。宿主收紧过的外发在它离线期间放宽，是 fail open，不是 fail closed。测试：`it.fails` `packages/daemon/test/host-callouts.test.ts` "a host that declared the outbound callout disconnects: a send to a route other than the turn's own is still refused #DL-5"。
-  2. `live_join` 的目标（`gateway.ts:1164-1171`）不过 outbound 检查：agent 可以让机器人加入任意会议号。测试：`it.fails` `packages/daemon/test/live.test.ts` "live_join goes through the outbound check: a policy that denies every destination refuses it, no endpoint is opened #DL-5"。
+  1. ~~宿主断线时退回本地策略~~：已修，见上。
+  2. ~~`live_join` 的目标不过 outbound 检查~~：已修，见上。
   3. outbox 自带的 outbound 检查只在 `Delivery.from` 存在时生效（`outbox.ts:108`），守护进程里没有调用方传 `from`，实际只靠输出工具的 `allowed()`。
 
 ---
@@ -749,7 +752,7 @@
 5. ~~outbox 结算前崩溃会重复发送；停止时投递可能既不结算也不记录（DL-1、DL-2）。~~ 已修（决定 13）：发送前写进行中记录，重启后结算为 `unknown` 不重发；`stop()` 有界等待 outbox；单次尝试有超时。
 6. **多机器人退回仍会发生（DL-4，不成立）。** 机器人 b 停掉或启动失败后，`channelFor` 只看到 a，发给 b 的 `deliver` / `systemReply` / `live_join` 改写成 a 发出。决定 8 的本意是"不以别的机器人发出"。
 7. ~~**宿主 `lease` 未实现（HQ-5，不成立）。**~~ 已删（决定 13）：只拉取的宿主用 `onHostDown: "keep"` + 定期重推刷新 `expiresAt`，HOSTS §4、§6 写明。
-8. **宿主 outbound 在宿主离线时退回本地策略（DL-5，不成立于"fail closed"）；`live_join` 目标不过 outbound 检查。**
+8. ~~**宿主 outbound 在宿主离线时退回本地策略（DL-5，不成立于"fail closed"）；`live_join` 目标不过 outbound 检查。**~~ 已修（2026-10-11）：离线期间只放行本轮回复路由；`live_join` 过 `Policy.outbound`。
 9. **并发 `live_join` 停掉已有 live 并泄漏端点（LN-3，不成立）。** 需要在 `gateway.ts:1168` 检查后同步占位。
 10. **入站去重只在内存，部分失败重试会重复进会话（IN-5，不成立）。**
 11. **没有可用交互 agent 时 `accept` 直接抛错（FC-3，不成立）**。（harness 起不来时只在日志里拒绝的 FC-2 已修。）

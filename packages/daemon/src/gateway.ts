@@ -367,7 +367,18 @@ export class Gateway {
         }
       },
       // A connected host whose hello lists `outbound` decides where agents may send; no answer denies.
+      // While that host is away (also after a restart, until it or a host without the hook
+      // connects) only the turn's own routes stay open: the local policy's wider allowances
+      // (preregistered routes) are what the host may have tightened, so they fail closed.
       outbound: async (a) => {
+        const held = this.host.outboundHeldBy();
+        if (held !== undefined) {
+          const k = routeKey(a.to);
+          const own = a.from ? [a.from.replyRoute, ...a.from.inputs.map((i) => i.replyRoute)] : [];
+          if (own.some((r) => r && routeKey(r) === k)) return 'allow';
+          this.log('warn', `host ${held} decides outbound and is not connected: ${k} denied`);
+          return 'deny';
+        }
         if (!this.host.answers('outbound')) return local.outbound(a);
         try {
           return await this.host.outboundCallout(a.from, a.to);
@@ -1235,7 +1246,19 @@ export class Gateway {
     const liveId = `live_${randomUUID().slice(0, 8)}`;
     try {
       ch = this.liveChannel(turn, a.channel);
+      // DL-5: where a live happens is an outbound destination like any other (the bot speaks
+      // there). Asked before opening when the channel can name the route; otherwise of the
+      // opened endpoint, which is closed again when denied.
+      const at = ch.adapter.liveRoute?.(ch.account, a.target);
+      if (at) await this.liveAllowed(turn, at);
       endpoint = await ch.adapter.openLive!(ch.account, a.target);
+      if (!at || routeKey(at) !== routeKey(endpoint.route)) {
+        const opened = endpoint;
+        await this.liveAllowed(turn, opened.route).catch(async (e: unknown) => {
+          await opened.close('not an allowed destination').catch(() => undefined);
+          throw e;
+        });
+      }
       // stop() already left the lives it knew of: a join that lands after that is closed here.
       if (this.stopped) {
         await endpoint.close('gateway stopping').catch(() => undefined);
@@ -1285,6 +1308,12 @@ export class Gateway {
       void lane.stopLive().catch(() => undefined);
     });
     return { liveId, title: endpoint.title, route: routeKey(endpoint.route) };
+  }
+
+  /** `Policy.outbound` for a live destination; a deny or a failing check refuses (fail closed). */
+  private async liveAllowed(turn: TurnContext, to: ReplyRoute): Promise<void> {
+    const v = await this.policy.outbound({ from: turn, to }).catch(() => 'deny' as const);
+    if (v !== 'allow') throw new ToolError(`live_join: ${routeKey(to)} is not an allowed destination (Policy.outbound; preregister it in policy.routes)`);
   }
 
   /** The channel a live opens on: `spec` (id or id:account), else the turn's reply channel. */
