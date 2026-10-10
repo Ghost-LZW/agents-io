@@ -515,6 +515,12 @@ class Bridge implements BridgedChannel {
     if (!this.ctx) await new Promise<void>((r) => this.ctxWaiters.push(r));
     try {
       const value = await this.ctx!.emit(envelope);
+      // "Not taken now" (the daemon is stopping) is a retryable failure for the peer, so a peer
+      // that reads accepted:false as final still does not confirm the message (IN-7).
+      if (!value.accepted && !value.permanent) {
+        conn.link.send({ v: PROTOCOL_VERSION, type: 'result', id, ok: false, error: { code: 'emit_failed', message: value.error ?? 'not accepted', retryable: true } });
+        return;
+      }
       conn.link.send({ v: PROTOCOL_VERSION, type: 'result', id, ok: true, value });
     } catch (err) {
       conn.link.send({ v: PROTOCOL_VERSION, type: 'result', id, ok: false, error: { code: 'emit_failed', message: errMsg(err), retryable: true } });

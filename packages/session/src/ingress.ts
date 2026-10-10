@@ -6,6 +6,7 @@ import {
   type Command,
   type ContentBlock,
   type DecisionKind,
+  type EmitResult,
   type InputRecord,
   type ChannelCaps,
   type Evidence,
@@ -245,10 +246,11 @@ export class Ingress {
   }
 
   /** A `ChannelContext.emit` implementation for one adapter, bound to `source` when given (see {@link EmitSource}). */
-  emitter(source?: EmitSource): (env: InboundEnvelope) => Promise<{ accepted: boolean; inputId?: string }> {
+  emitter(source?: EmitSource): (env: InboundEnvelope) => Promise<EmitResult> {
     return async (env) => {
       const r = await this.accept(env, source);
-      return { accepted: r.accepted, ...(r.inputId !== undefined ? { inputId: r.inputId } : {}) };
+      // accept refuses only invalid envelopes: never taken, so `permanent` (IN-7).
+      return r.accepted ? { accepted: true, ...(r.inputId !== undefined ? { inputId: r.inputId } : {}) } : { accepted: false, permanent: true, ...(r.error !== undefined ? { error: r.error } : {}) };
     };
   }
 

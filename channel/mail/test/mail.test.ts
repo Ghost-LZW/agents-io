@@ -99,8 +99,20 @@ describe('inbound', () => {
     await h.stop();
   });
 
-  // INVARIANTS IN-7 不成立 1: onMessage moves the checkpoint after any emit that returns, also { accepted: false } (gateway stopping); turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('does not move the checkpoint past a message the host answered accepted:false #IN-7', async () => {
+  it('moves the checkpoint past a message the host refused for good (permanent), so later mail is not blocked #IN-7', async () => {
+    const source = new FakeSource();
+    const store = new MemoryMailStore();
+    const adapter = new MailChannel(cfg, { source, transport: new FakeTransport(), store, verify: passVerifier, blobs: { put: async () => {} } });
+    const ctl = new AbortController();
+    const done = adapter.start({ account: 'bot', config: undefined, signal: ctl.signal, emit: async () => ({ accepted: false, permanent: true, error: 'invalid' }), log: () => {} });
+    source.push({ uid: 8, raw: raw({ 'Message-ID': '<bad@x>' }, 'x') });
+    for (let i = 0; i < 200 && (await store.getCheckpoint('INBOX'))?.uid !== 8; i++) await new Promise((r) => setTimeout(r, 5));
+    expect((await store.getCheckpoint('INBOX'))?.uid).toBe(8);
+    ctl.abort();
+    await done;
+  });
+
+  it('does not move the checkpoint past a message the host answered accepted:false #IN-7', async () => {
     const source = new FakeSource();
     const store = new MemoryMailStore();
     const adapter = new MailChannel(cfg, { source, transport: new FakeTransport(), store, verify: passVerifier, blobs: { put: async () => {} } });

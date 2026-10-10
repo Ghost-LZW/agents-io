@@ -201,8 +201,18 @@ describe('channel id pinning (channel-stamping)', () => {
     const ch = await rawChild('', {}, { INBOUND: JSON.stringify({ channel: 'lark-bot' }) });
     const logs: string[] = [];
     const ctl = new AbortController();
-    const started = ch.start({ account: 'default', config: undefined, signal: ctl.signal, emit: async () => ({ accepted: false }), log: (l, m) => logs.push(`${l}: ${m}`) });
+    const started = ch.start({ account: 'default', config: undefined, signal: ctl.signal, emit: async () => ({ accepted: false, permanent: true }), log: (l, m) => logs.push(`${l}: ${m}`) });
     await waitFor(() => logs.some((l) => l.includes('got-result forged ok=true code=undefined accepted=false')));
+    ctl.abort();
+    await started;
+  });
+
+  it('an inbound the host does not take now (accepted:false, not permanent) is answered ok:false, retryable, so the peer does not confirm it #IN-7', async () => {
+    const ch = await rawChild('', {}, { INBOUND: JSON.stringify({ channel: 'lark-bot' }) });
+    const logs: string[] = [];
+    const ctl = new AbortController();
+    const started = ch.start({ account: 'default', config: undefined, signal: ctl.signal, emit: async () => ({ accepted: false, error: 'gateway stopping' }), log: (l, m) => logs.push(`${l}: ${m}`) });
+    await waitFor(() => logs.some((l) => l.includes('got-result forged ok=false code=emit_failed')));
     ctl.abort();
     await started;
   });

@@ -214,6 +214,9 @@ const DAEMON_VERSION: string = (() => {
 /** The agent has the session_* tools (all tools, or a list naming one). */
 const hasTopicTools = (a: AgentConfig | undefined): boolean => !!a?.tools && (!a.toolNames || a.toolNames.some((n) => n.startsWith('session_')));
 
+/** `Gateway.accept`'s refusal while stopping: "not now", never `permanent` (IN-7). */
+const GATEWAY_STOPPING = 'gateway stopping';
+
 export const localRoute = (sessionKey: string): ReplyRoute => ({ channel: 'local', account: 'local', conversationId: sessionKey });
 
 /** Wait for `p`, at most `ms`; the timer holds the event loop and is cleared when `p` wins. */
@@ -684,7 +687,7 @@ export class Gateway {
    * gateway pass their `source` (channel-stamping); without one the caller is trusted.
    */
   async accept(env: InboundEnvelope, source?: EmitSource): Promise<IngressResult> {
-    if (this.refusingInbound) return { accepted: false, action: 'invalid', error: 'gateway stopping' };
+    if (this.refusingInbound) return { accepted: false, action: 'invalid', error: GATEWAY_STOPPING };
     const r = await this.ingress.accept(env, source);
     if (r.accepted && r.origin && r.action !== 'duplicate') {
       try {
@@ -1762,7 +1765,9 @@ ${a.summary}` }],
         emit: async (env) => {
           const r = await this.accept(env, this.emitSource(entry));
           this.stamped(entry, env, r);
-          return { accepted: r.accepted, ...(r.inputId !== undefined ? { inputId: r.inputId } : {}) };
+          if (r.accepted) return { accepted: true, ...(r.inputId !== undefined ? { inputId: r.inputId } : {}) };
+          // Stopping is "not now" (the next process takes the redelivery); an invalid envelope is never taken.
+          return { accepted: false, ...(r.error !== undefined ? { error: r.error } : {}), ...(r.error !== GATEWAY_STOPPING ? { permanent: true } : {}) };
         },
         log: (level, msg) => this.log(level, `${ch.adapter.id}: ${msg}`),
       })

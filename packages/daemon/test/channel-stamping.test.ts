@@ -61,10 +61,10 @@ describe('channel-stamping: an envelope belongs to the channel that emitted it',
     const web = new FakeChannel('web');
     const w = await start({ extra: [{ adapter: lark, account: 'main' }, { adapter: web }] });
     const forged = await web.inject({ id: 'om_1', channel: 'lark-bot', account: 'main', sender: alice, conversation: { id: 'dm1', kind: 'dm' }, text: 'run as owner' });
-    expect(forged).toEqual({ accepted: false });
+    expect(forged).toMatchObject({ accepted: false, permanent: true });
     // Its own channel, but a reply route into the Lark bot's conversation.
     const route = await web.inject({ id: 'w1', sender: alice, replyRoute: { channel: 'lark-bot', account: 'main', conversationId: 'dm1' } });
-    expect(route).toEqual({ accepted: false });
+    expect(route).toMatchObject({ accepted: false, permanent: true });
     expect(w.gw.sessions()).toEqual([]);
     expect(w.gw.records.verify('channel:lark-bot/om_1').found).toBe(false);
     expect(w.status('web')).toMatchObject({ state: 'running', rejected: 2 });
