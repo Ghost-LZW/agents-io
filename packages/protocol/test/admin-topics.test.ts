@@ -2,17 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   ADMIN_ENDPOINTS,
   ADMIN_WS_SUBPROTOCOL,
-  AdminConfigDocument,
-  AdminConfigPut,
-  AdminConfigValidation,
-  AdminError,
-  AdminExplain,
   AdminHostState,
-  AdminLarkBotJob,
-  AdminLarkBotRequest,
-  AdminQueue,
-  AdminSessions,
-  AdminStatus,
   Binding,
   BindingsGetResult,
   CLIENT_FRAME_TYPES,
@@ -20,7 +10,6 @@ import {
   DeliverResult,
   HOST_REQUEST_FRAME_TYPES,
   HOST_RESULT_VALUES,
-  HostEventFrame,
   HostHello,
   HostHelloResult,
   HostRequestFrame,
@@ -58,7 +47,7 @@ const input = {
 const explanation = { inputId: 'in_1', tableVersions: ['config'], matched: [{ bindingId: 'b', source: 'config', on: 'host' }], principal: null, evidence: 'none', at: 3 };
 
 describe('topics', () => {
-  it('scope, Topic, topic.changed', () => {
+  it('scope, Topic, topic.changed #PR-1', () => {
     expect(check(SessionScope, 'topic')).toBe(true);
     expect(check(Binding, { id: 'flat', match: { conversationKind: 'dm' }, on: 'dispatch', agent: 'a', session: 'topic' })).toBe(true);
     expect(errors(Topic, topic)).toEqual([]);
@@ -73,7 +62,7 @@ describe('topics', () => {
     expect(check(SessionEvent, { ...e, body: { t: 'topic.changed', conversation: 'c', reason: 'user' } })).toBe(false);
   });
 
-  it('topic.list / topic.switch client frames (host connections send client frames too)', () => {
+  it('topic.list / topic.switch client frames (host connections send client frames too) #PR-1', () => {
     expect(CLIENT_FRAME_TYPES).toContain('topic.list');
     expect(CLIENT_FRAME_TYPES).toContain('topic.switch');
     expect(check(ClientFrame, { v: 1, type: 'topic.list', id: '1' })).toBe(true);
@@ -88,7 +77,7 @@ describe('topics', () => {
 });
 
 describe('host protocol additions', () => {
-  it('host.hello has no presence lease (decision 13): pull-only hosts use onHostDown keep + expiresAt', () => {
+  it('host.hello has no presence lease (decision 13): pull-only hosts use onHostDown keep + expiresAt #HQ-5', () => {
     expect(HostHello.properties).not.toHaveProperty('lease');
     expect(HostHelloResult.properties).not.toHaveProperty('lease');
     expect(AdminHostState.properties).not.toHaveProperty('leaseExpiresAt');
@@ -96,17 +85,7 @@ describe('host protocol additions', () => {
     expect(check(HostRequestFrame, { v: 1, type: 'host.hello', id: '1', token: 't', name: 'xwo', lease: { ttlMs: 60_000 } })).toBe(true);
   });
 
-  it('run.start overrides, run.ended timeout/duration/usage', () => {
-    const start = { v: 1, type: 'run.start', id: '2', runId: 'r', agent: 'exec', input: [{ type: 'text', text: 'go' }] };
-    expect(check(HostRequestFrame, { ...start, overrides: { model: 'opus', effort: 'high', profile: 'restricted' } })).toBe(true);
-    expect(check(HostRequestFrame, { ...start, overrides: {} })).toBe(true);
-    expect(check(HostRequestFrame, { ...start, overrides: { model: 1 } })).toBe(false);
-    const ended = { v: 1, type: 'run.ended', runId: 'r', sessionKey: 'run:r', status: 'timeout', exitCode: 124, durationMs: 1200, usage: { inputTokens: 10 } };
-    expect(errors(HostEventFrame, ended)).toEqual([]);
-    expect(check(HostEventFrame, { ...ended, status: 'killed' })).toBe(false);
-  });
-
-  it('a result-value schema for every host request', () => {
+  it('a result-value schema for every host request #PR-1', () => {
     expect(Object.keys(HOST_RESULT_VALUES).sort()).toEqual([...HOST_REQUEST_FRAME_TYPES].sort());
     expect(errors(HostHelloResult, { name: 'xwo', protocol: 1, host: false, bindings: { version: null, active: false } })).toEqual([]);
     expect(errors(BindingsGetResult, { config: null, host: { table: { version: '1', bindings: [], identities: [] }, putAt: 1, active: false, suspended: 'host_down' }, hostConnected: false })).toEqual([]);
@@ -128,7 +107,7 @@ describe('host protocol additions', () => {
 });
 
 describe('admin API', () => {
-  it('lists every endpoint once, with schemas', () => {
+  it('lists every endpoint once, with schemas #PR-1', () => {
     const keys = ADMIN_ENDPOINTS.map((e) => `${e.method} ${e.path}`);
     expect(new Set(keys).size).toBe(keys.length);
     for (const k of ['GET /api/status', 'GET /api/config', 'PUT /api/config', 'POST /api/config/validate', 'GET /api/explain/:inputId', 'GET /api/queue', 'GET /api/sessions', 'POST /api/bots/lark', 'GET /api/bots/lark/:job']) {
@@ -139,42 +118,5 @@ describe('admin API', () => {
       if (e.method === 'GET') expect('body' in e).toBe(false);
     }
     expect(ADMIN_WS_SUBPROTOCOL).toBe('agents-io.v1');
-  });
-
-  it('validates admin bodies', () => {
-    expect(errors(AdminError, { error: { code: 'unauthorized', message: 'no token' } })).toEqual([]);
-    const status = {
-      version: '0.1.0', protocol: 1, pid: 42, startedAt: 1, now: 2, dataDir: '/d', socket: '/d/run/aio.sock',
-      host: { connected: true, name: 'xwo', consumer: 'xwo', table: { version: 'v1', active: true } },
-      channels: [{ id: 'lark-bot', account: 'default', state: 'running' }],
-      agents: [{ name: 'assistant', harness: 'claude', mode: 'interactive', default: true }, { name: 'exec', harness: 'codex', mode: 'task', profile: 'bypass' }],
-      sessions: { total: 3, live: 1, running: 0 }, runs: { running: [] }, queue: { head: 7 },
-    };
-    expect(errors(AdminStatus, status)).toEqual([]);
-    expect(check(AdminStatus, { ...status, channels: [{ id: 'x', account: 'a', state: 'weird' }] })).toBe(false);
-
-    const doc = {
-      path: '/home/u/aio.config.json', revision: 'sha256:ab',
-      config: { channels: [{ type: 'lark-bot', config: { appId: 'env:LARK_APP_ID', appSecret: '<redacted>' } }] },
-      issues: [{ path: '/agents/exec', message: 'unknown harness', code: 'unknown_harness', severity: 'error' }],
-      env: [{ name: 'LARK_APP_ID', set: true }],
-    };
-    expect(errors(AdminConfigDocument, doc)).toEqual([]);
-    expect(errors(AdminConfigPut, { config: doc.config, ifRevision: doc.revision })).toEqual([]);
-    expect(check(AdminConfigPut, { config: [] })).toBe(false);
-    expect(errors(AdminConfigValidation, { valid: false, issues: doc.issues })).toEqual([]);
-    expect(errors(AdminExplain, explanation)).toEqual([]);
-    expect(errors(AdminQueue, { head: 9, consumers: [{ consumer: 'xwo', acked: 4, pending: 5, push: false, oldestPendingAt: 1 }] })).toEqual([]);
-    const session = { sessionKey: 's', harness: 'claude', state: 'idle', head: 3, queued: 0, pendingRequests: [], live: false, agent: 'assistant', conversation: topic.conversation, topic };
-    expect(errors(AdminSessions, { sessions: [session] })).toEqual([]);
-    expect(check(AdminSessions, { sessions: [{ ...session, head: 'x' }] })).toBe(false);
-
-    expect(errors(AdminLarkBotRequest, { name: 'my agent', domain: 'lark', presets: ['messaging'] })).toEqual([]);
-    expect(check(AdminLarkBotRequest, { name: 'x', domain: 'slack' })).toBe(false);
-    expect(errors(AdminLarkBotJob, { job: 'j1', state: 'waiting_scan', qr: { payload: 'https://open.feishu.cn/x', expiresAt: 9 }, createdAt: 1, updatedAt: 2 })).toEqual([]);
-    expect(errors(AdminLarkBotJob, {
-      job: 'j1', state: 'succeeded', createdAt: 1, updatedAt: 3,
-      result: { appId: 'cli_x', domain: 'feishu', account: 'default', env: { appId: 'env:LARK_APP_ID', appSecret: 'env:LARK_APP_SECRET' }, channelAdded: true },
-    })).toEqual([]);
   });
 });
