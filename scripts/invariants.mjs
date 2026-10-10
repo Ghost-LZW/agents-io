@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Invariants <-> tests (decision 14, docs/TESTING.md). Reads text only; never runs a test.
 //
-//   node scripts/invariants.mjs check              drift report (warnings only for now; exit 0)
+//   node scripts/invariants.mjs check              drift report; any drift is an error (exit 1, decision 14)
 //   node scripts/invariants.mjs affected [files…]  changed files -> invariants -> tests per tier
 //   node scripts/invariants.mjs list [ID…|--json]  the tests tagged with each id (or every test as JSON)
 //
@@ -212,11 +212,11 @@ function check() {
   const { entries } = readInvariants();
   const tests = readTests();
   const tagged = byId(tests);
-  const warn = [];
+  const errors = [];
   const section = (title, rows) => {
     if (!rows.length) return;
-    warn.push(`\n${title} (${rows.length})`);
-    for (const r of rows) warn.push(`  ${r}`);
+    errors.push(`\n${title} (${rows.length})`);
+    for (const r of rows) errors.push(`  ${r}`);
   };
 
   section(
@@ -233,11 +233,9 @@ function check() {
   );
   const has = (e, kind) => (tagged.get(e.id) ?? []).some((t) => t.kind === kind);
   section(
-    'invariants marked 不成立 with no it.fails tagged with them',
-    [...entries.values()].filter((e) => e.false && !has(e, 'fails') && !has(e, 'todo')).map((e) => `${e.id}  ${e.title}`),
+    'invariants marked 不成立 with no it.fails tagged with them (an it.todo does not count: reproduce it)',
+    [...entries.values()].filter((e) => e.false && !has(e, 'fails')).map((e) => `${e.id}  ${e.title}${has(e, 'todo') ? '  [it.todo only]' : ''}`),
   );
-  const todoOnly = [...entries.values()].filter((e) => e.false && !has(e, 'fails') && has(e, 'todo'));
-  const notes = todoOnly.length ? [`note: 不成立 covered only by it.todo (not reproducible yet): ${todoOnly.map((e) => e.id).join(', ')}`] : [];
   // Quoted test names in INVARIANTS.md that match no test (renamed or deleted).
   const names = tests.map((t) => t.name);
   const describes = tests.map((t) => t.file).filter((f, i, a) => a.indexOf(f) === i)
@@ -257,11 +255,14 @@ function check() {
     `invariants: ${entries.size} ids; tests: ${tests.length} (core ${c.core}, local ${c.local}, e2e ${c.e2e}, live ${c.live}); ` +
       `it.fails ${c.fails}; tagged ${tests.filter((t) => t.tags.length).length}`,
   );
-  for (const n of notes) console.log(n);
-  if (warn.length) console.log(warn.join('\n'));
-  else console.log('no drift');
-  console.log(warn.length ? '\n(warnings only: decision 14 turns these into errors once the backlog is cleared)' : '');
-  process.exitCode = 0;
+  if (errors.length) {
+    console.log(errors.join('\n'));
+    console.log('\ninvariants:check failed: fix the drift above (docs/TESTING.md, decision 14)');
+    process.exitCode = 1;
+  } else {
+    console.log('no drift');
+    process.exitCode = 0;
+  }
 }
 
 function changedFiles() {

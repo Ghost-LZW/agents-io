@@ -20,13 +20,13 @@
 - 测试名末尾写它守着的编号，可以多个：`it('close rejects queued inputs … #IN-1 #RS-6', …)`。失败报告里直接看到打破了哪条承诺。
 - 按编号选：`npx vitest run --project core -t '#IN-1\b'`（`\b` 让 `#IN-1` 不命中 `#IN-10`）；不带 `--project` 时 core 与 e2e 一起选。
 - 已知不成立的路径写成 `it.fails('… #IN-1', …)`，上面一行注释写它对应 INVARIANTS 的哪一条"不成立"。现在它"按预期失败"所以是绿的；有人修好了，它变红：把它改成 `it`，并改 INVARIANTS 的状态。
-- 没法测的承诺先写 `it.todo('… #ID')`，让缺口在报告里可见。
+- 没法测的承诺先写 `it.todo('… #ID')`，让缺口在报告里可见。标了"不成立"的条目必须有 `it.fails`，只有 `it.todo` 时 `check` 报错：先设法复现（LN-4 曾以为假 harness 复现不了，其实可以）。
 
 ## 对照脚本
 
 `scripts/invariants.mjs` 只读文本，不跑测试：
 
-- `pnpm invariants:check`：标签指向不存在的编号；没有任何测试的编号；core 里没有标签的测试；标了"不成立"却没有 `it.fails` 的编号；INVARIANTS 里引用了、但已经不存在的测试名。现在只警告（退出码 0），积压清完后改为报错。
+- `pnpm invariants:check`：标签指向不存在的编号；没有任何测试的编号；core 里没有标签的测试；标了"不成立"却没有 `it.fails` 的编号；INVARIANTS 里引用了、但已经不存在的测试名。任何一项都是错误，退出码 1（决定 14；2026-10-11 积压清完后由警告改为报错）。
 - `pnpm invariants:affected [文件…]`：不给文件时取相对 `main` 的改动。按 INVARIANTS 各条"实现"里写的文件找出受影响的编号，列出每个编号在各层的测试数，打印要跑的 vitest 命令；没有任何编号提到的源文件也列出来（要么它不承担承诺，要么清单漏了一条）。
 - `node scripts/invariants.mjs list [编号…]`：每个编号下的测试。
 

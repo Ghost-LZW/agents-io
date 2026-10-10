@@ -163,3 +163,5 @@
 - **"不成立"都写成了 `it.fails`**（25 条，含读新编号时发现的 IN-7、SE-1）；LN-4 的 Codex 迟到 `live.ended` 用假 harness 复现不了，写成 `it.todo`。原以为不成立或未测、写测试后发现成立的：DL-3、HQ-1（网关层跨重启）、ID-6、LN-1、LN-5、RS-3（现状如实）、RS-7、RS-8、CF-4、RS-1 的 blob。
 
 - 补记（2026-10-11，决定 13 的 DL-5 修复）：默认 `Policy.outbound` 对 `bypass` 一轮（只有全部输入来自主人时才是这一档）放行任何目的地，包括 `live_join` 的会议。依据决定 4、5：这一轮的 harness 已能联网、执行命令，agents-io 再拦外发只减功能、不减风险。其他轮仍只放行本轮回复路由与预登记路由；宿主声明了 `outbound` 时由宿主决定。
+
+- 补记（2026-10-11，不成立积压清完）：剩下的 `it.fails`（IN-1 五条、IN-5 两条、EX-2 一条）都修好改成 `it`；LN-4 的 `it.todo` 其实能用假 harness 复现（`stop()` 先返回、`live.ended` 后到），修好后也是 `it`。依原则自决的细节记在 INVARIANTS 各条的"决定"：入站去重键放在守护进程的 session 日志里（input id 由 `(channel, account, 消息 id)` 派生，lane 打开时从日志重建已接纳的 id），不另建表（IN-5）；接纳途中策略钩子抛错是拒绝（`policy_error`），id 不占用（IN-1）；`live_say` 不经 outbox，但留下与投递相同的日志与 `daemon_outbound` 记录（EX-2）。积压清空，按上表 `pnpm invariants:check` 改为有漂移即退出码 1；没有 `it.todo` 留下，所以没有保留"只警告"的一档。
