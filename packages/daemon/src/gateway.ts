@@ -66,6 +66,7 @@ import {
   type TopicRecord,
   topicContext,
   topicView,
+  settleLeftoverInputs,
 } from '@agents-io/session';
 import { HostMcpServer, HostTools, ToolError, agentIdentity, type TopicHandover } from '@agents-io/host-mcp';
 import { ClaudeCodeHarness, findOnPath, type ClaudeCodeHarnessConfig } from '@agents-io/harness-claude-code';
@@ -471,6 +472,7 @@ export class Gateway {
       gw.runs.settleAllDangling();
       // Sends an earlier process left in flight: unknown, never resent (decision 13).
       for (const r of gw.outbox.recover()) gw.log('warn', `delivery ${r.operationId} was in flight when the previous daemon stopped; settled unknown, not resent`);
+      gw.settleLeftoverInputs();
       await gw.loadConfigWatches();
       await gw.startChannels();
       await gw.adoptRunningTurns();
@@ -1680,6 +1682,19 @@ ${a.summary}` }],
   }
 
   /**
+   * Inputs a previous process admitted but never settled (it crashed): rejected
+   * (`host_restarted`), so no id stays queued in a snapshot (`aio sessions`). Before
+   * any lane opens. Runs are settled by `Runs.settleAllDangling`.
+   */
+  private settleLeftoverInputs(): void {
+    for (const key of this.hub.log.sessions()) {
+      if (key.startsWith('run:')) continue;
+      const ids = settleLeftoverInputs(this.hub, key);
+      if (ids.length) this.log('warn', `${key}: ${ids.length} input(s) a previous process left unsettled rejected (host_restarted)`);
+    }
+  }
+
+  /**
    * Sessions the log shows mid-turn were left by a previous process. A Codex
    * app-server on a Unix socket may still be running that turn: open the session
    * now so the harness adopts it (turn.adopted) instead of waiting for input.
@@ -1851,7 +1866,7 @@ ${a.summary}` }],
     const codex = (l: Lane) => !own.has(l.sessionKey) && codexOf(this.o.harness ?? this.instances.get(l.harnessId));
     const detached = [...this.lanes.values()].filter(codex);
     const closed = [...this.lanes.values()].filter((l) => !codex(l));
-    for (const l of detached) l.detach();
+    for (const l of detached) l.detach('gateway stopping');
     const adapters = this.o.harness ? [this.o.harness] : [...this.instances.values()];
     // Bounded by a timer that holds the event loop: harness close() may wait on unref'd timers only.
     await within(

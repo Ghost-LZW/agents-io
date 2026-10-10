@@ -10,6 +10,7 @@ import {
   Outbox,
   defaultPolicy,
   newTurnView,
+  rejectionNotice,
   renderTurn,
   type SessionPolicy,
 } from '../src/index.js';
@@ -130,6 +131,54 @@ describe('end to end: channel → ingress → lane → harness → compositor �
     await until(() => w.channel.sent.length === 2);
     expect(w.channel.sent[1]!.msg).toEqual({ text: 'answer' });
     expect(w.channel.sent.every((s) => s.edits.length === 0)).toBe(true);
+  });
+});
+
+describe('end to end: rejected inputs reach the sender', () => {
+  it('stop with queued inputs: rejected (lane_closed) and the sender gets a notice on the route; the running turn ends on its own card', async () => {
+    const w = world((t) => new Promise((_, reject) => t.signal.addEventListener('abort', () => reject(new Error('aborted')))));
+    await w.channel.inject({ sender: alice, text: 'long job' });
+    await until(() => w.channel.sent.length === 1);
+    await w.channel.inject({ sender: alice, text: 'and then this' });
+    await w.channel.inject({ sender: alice, text: 'and this' });
+    const lane = w.lanes.get(SESSION)!;
+    expect(lane.queued()).toHaveLength(2);
+    await lane.close('gateway stopping');
+    await lane.whenIdle();
+    const rejected = bodies(w.events(), 'input.rejected');
+    expect(rejected[0]).toMatchObject({ reason: 'lane_closed: gateway stopping', replyRoute: { channel: 'fake', conversationId: 'c1' } });
+    expect((rejected[0] as { inputIds: string[] }).inputIds).toHaveLength(2);
+    expect(w.hub.snapshot(SESSION).queued).toEqual([]);
+    await until(() => w.channel.sent.length === 2 && w.channel.sent[0]!.finalized);
+    expect(w.channel.sent[1]!.msg.text).toBe(rejectionNotice('lane_closed: gateway stopping'));
+    expect(w.channel.sent[1]!.route).toMatchObject({ channel: 'fake', conversationId: 'c1' });
+    // The running turn is settled by its own card (the fake harness's close ends it as harness_closed), with no extra notice.
+    expect(lastRender(w.channel.sent[0]!).sections).toContainEqual({ kind: 'status', text: 'Outcome unknown' });
+    expect(bodies(w.events(), 'input.rejected')[1]).toEqual({ t: 'input.rejected', inputIds: [expect.any(String)], reason: 'ambiguous' });
+  });
+
+  it('start_failed is visible: the sender gets a notice instead of silence (no detail from the error)', async () => {
+    const w = world(async () => {}, {
+      policy: {
+        plan: async () => {
+          throw new Error('spawn /secret/path/claude ENOENT');
+        },
+      },
+    });
+    await w.channel.inject({ sender: alice, text: 'hello' });
+    await until(() => w.channel.sent.length === 1);
+    expect(bodies(w.events(), 'input.rejected')[0]).toMatchObject({ reason: 'start_failed: spawn /secret/path/claude ENOENT' });
+    expect(w.channel.sent[0]!.msg.text).toBe('This message was not processed: the agent could not start. Try again later, or ask the operator.');
+    expect(w.channel.sent[0]!.msg.text).not.toContain('/secret');
+    await until(() => bodies(w.events(), 'delivery.settled').length === 1);
+    expect(bodies(w.events(), 'delivery.settled')[0]).toMatchObject({ result: 'delivered' });
+  });
+
+  it('a rejection without a route (its turn\'s card tells the story, or the route is unknown) sends nothing', async () => {
+    const w = world(async () => {});
+    w.hub.append(SESSION, { ts: 1, level: 'primary', audience: 'status', durability: 'durable', body: { t: 'input.rejected', inputIds: ['gone'], reason: 'host_restarted' } });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(w.channel.sent).toEqual([]);
   });
 });
 

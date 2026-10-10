@@ -17,6 +17,15 @@ harness 事件 ──▶ SessionLog（seq）──▶ Compositor（读全量，�
 
 **回复只回到来源**：一轮的正式回复只投递到发起它的那个路由。在飞书里发起的轮次，回复只出现在飞书；在终端发起的轮次，飞书不会收到。其他端想看，可以订阅同一个 session 的事件流。
 
+**没被处理的消息会告诉发送者**：一条消息还没进任何一轮就被拒（日志里 `input.rejected` 带 `replyRoute`），compositor 在它的路由上回一句短消息（经 outbox，每条拒绝一次）。目前两种情况：
+
+| 原因（`reason`） | 什么时候 | 发送者看到 |
+|---|---|---|
+| `lane_closed: <原因>` | 守护进程停止 / 重启（或 session 的 lane 关闭）时，这条还在排队 | This message was not processed: the agent stopped or restarted before it got to it. Please send it again. |
+| `start_failed: <错误>` | 这一轮起不来（harness 启动失败、策略出错） | This message was not processed: the agent could not start. Try again later, or ask the operator. |
+
+冒号后的细节只在日志里（可能含路径、主机名），不发到通道。已经开了卡片的轮次（被打断、结果不明）由卡片自己的状态行说明，不再另发。停机时通道已停收，这句提示是尽力而为。进程崩溃（没有正常停止）留下的排队输入在下次启动时记为 `input.rejected host_restarted`，日志里没有它们的路由，不发提示。停机前排队的消息**不会**在重启后重放，需要重发。
+
 ## 1. agent 实际收到的输入长什么样
 
 每条输入在发给 harness 前，前面加一行发送者说明，后面是转换过的内容块：
