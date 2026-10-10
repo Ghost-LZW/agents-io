@@ -13,7 +13,7 @@
 - **状态**：`有测试`（主路径与已知边界都有测试）/ `部分覆盖`（主路径有测试，某些路径没有，或某些路径不成立）/ `没有测试`。
 - **不成立**：代码里找到的、与承诺相反的路径。只写读代码确认过的；"可能"表示读代码得出、没有用测试复现。
 
-术语：投递结算的取值是 `delivered` / `rejected` / `unknown`（`packages/protocol/src/events.ts:189-193`），ROADMAP §3 写的 `ambiguous` 在代码里叫 `unknown`；`ambiguous` 是 turn 与 run 的状态。
+术语：投递结算的取值是 `delivered` / `rejected` / `unknown`（`packages/protocol/src/events.ts:189-193`）；`ambiguous` 是 turn 与 run 的状态，不用于投递。
 
 除特别说明，"跨重启"都以守护进程默认的 SQLite 日志为前提（见 RS-9）。
 
@@ -80,25 +80,29 @@
 
 ### DL-1 每次投递以一条 delivery.settled 结束
 
-- **承诺**：经 outbox 的每次投递恰好写一条 `delivery.settled`（`delivered` / `rejected` / `unknown`）；不可重试的错误是 `rejected`，重试用尽是 `unknown`，`unknown` 不再重放。
-- **实现**：`packages/session/src/outbox.ts:101-128`（重试循环）、`:131-147`（先写 store 再写日志）、`:87-88`。
-- **测试**：`packages/session/test/outbox.test.ts` "delivers each operationId once, even when called again or concurrently"、"retries with backoff, then settles"、"settles as rejected on a non-retryable error and unknown when retries run out"；`packages/host-mcp/test/host-mcp.test.ts` "send_file on the local route is event-only (no adapter), still settled"。
-- **状态**：部分覆盖。
-- **不成立**：
-  1. `policy.outbound` 在 try 之外 await（`outbox.ts:108-111`），抛错时既不结算也不记录。守护进程自己的包装会接住宿主回调的错误（`gateway.ts:326-334`），但自定义 `policy.outbound` 抛错时成立。
-  2. 单次尝试没有超时：适配器的 `send` 永不返回时永不结算，`inflight` 一直占着（`outbox.ts:89-92`）。
-  3. 守护进程停止不等 outbox：`Gateway.stop()`（`gateway.ts:1790-1834`）先停通道再关 `records` 与日志，正在退避重试的投递随后 `settle` 到已关闭的库上抛错（`outbox.ts:132`），没有结算事件也没有记录。
-  4. 不在承诺范围内（按设计）：卡片流式编辑不经 outbox（`packages/session/src/compositor.ts:562-569`，RECOMMENDATION §3.1"progress 可以丢中间帧"）；宿主 `deliver` 找不到通道直接答 `unknown_channel`（`gateway.ts:1076`）。
+- **承诺**：经 outbox 的每次投递恰好写一条 `delivery.settled`（`delivered` / `rejected` / `unknown`）；不可重试的错误是 `rejected`，重试用尽是 `unknown`，`unknown` 不再重放。单次尝试有上限（`attemptTimeoutMs`，默认 60 s），超时即 `unknown`、不重试（平台可能已收到）。外发检查抛错即 `rejected`（fail closed）。守护进程停止时最多等 5 s 让正在发的投递结算（通道与库都还开着），等待重试的立刻结算为 `unknown`；5 s 后仍在发的保留进行中记录，由下次启动结算（DL-2）。
+- **实现**：`packages/session/src/outbox.ts` `Outbox.run`（政策检查、重试循环、`withTimeout`）、`settle`（先写 store 再写日志）、`drain` / `close`；`Gateway.stop()`（`gateway.ts:1827` 在 compositor 停止之后、通道关闭之前 `outbox.drain(5000)`，`:1835` 在关库之前 `outbox.close()`）。
+- **测试**：`packages/session/test/outbox.test.ts` "delivers each operationId once, even when called again or concurrently"、"retries with backoff, then settles"、"settles as rejected on a non-retryable error and unknown when retries run out"、"an attempt that times out settles unknown and is not retried (the platform may have it)"、"an outbound check that throws rejects (fail closed) and is settled"、"drain waits for running attempts, stops retries; close leaves what still runs in flight for the next recover"；`packages/daemon/test/host.test.ts` "stop waits for a send in flight: it settles before the records close"；`packages/host-mcp/test/host-mcp.test.ts` "send_file on the local route is event-only (no adapter), still settled"。
+- **状态**：有测试。
+- **细节（按原则自决，决定 13）**：
+  1. 超时默认 60 s（飞书上传大文件也够），嵌入方可经 `OutboxOptions.attemptTimeoutMs` 改；超时后的迟到结果被忽略。
+  2. 停止时不再重试：重试前的错误多半表示没发出，但停止后无从确认，记 `unknown` 比留到下次启动更早进日志（原则 1）。
+  3. `close()` 之后新投递答 `rejected`（`outbox closed`，确实没发，不写库），之后的结算不写库也不写日志，进行中记录留给下次启动。
+- **不在承诺范围内（按设计）**：卡片流式编辑不经 outbox（`packages/session/src/compositor.ts:562-569`，RECOMMENDATION §3.1"progress 可以丢中间帧"）；宿主 `deliver` 找不到通道直接答 `unknown_channel`（`gateway.ts:1076`）。
 
 ### DL-2 operationId 幂等，跨重启
 
-- **承诺**：同一 operationId 至多一次平台发送，重复调用返回第一次的结果；结算记录持久，重启后仍幂等。通道再各自做一层（飞书请求 uuid、邮件 Message-ID）。
-- **实现**：`outbox.ts:86-94`；SQLite 表 `daemon_outbox`（`packages/daemon/src/records.ts:34`、`:90-97`，接线 `gateway.ts:336`）；宿主 `deliver` 用 `host:` 命名空间（`gateway.ts:1072-1074`）；飞书 `adapter.ts:503-521`；邮件 `channel/mail/src/outbound.ts:17-21`、`channel/mail/src/adapter.ts:106-138`。输出工具的 operationId 是 `tool:<sessionKey>:<调用 id>`（CHANNELS.md §输出工具）。
-- **测试**：`outbox.test.ts` "delivers each operationId once, even when called again or concurrently"；`packages/daemon/test/host.test.ts` "deliver is idempotent per operationId, across a restart too; an unknown channel is an error"；`channel/lark-bot/test/outbound.test.ts` "is idempotent: same operationId gives one platform message and a stable uuid"、"retries a failed operation under the same uuid"；`channel/mail/test/mail.test.ts` "is idempotent: same operationId, same Message-ID, one transport call"、"retries a pending send with the same Message-ID"；`host-mcp.test.ts` "is idempotent per tool call id"。
-- **状态**：部分覆盖（已结算的有测试；结算前崩溃没有测试）。
+- **承诺**：同一 operationId 至多一次平台发送，重复调用返回第一次的结果；每次尝试在调用适配器**之前**写进行中记录，结算时在同一 savepoint 里写结果并删掉进行中记录。进程在两者之间死掉，下次启动把留下的进行中记录结算为 `unknown`（会话日志写 `delivery.settled`，守护进程日志一条 warn），**不自动重发**；同一 operationId 再来（还没恢复时也一样）直接得到这个 `unknown`。通道再各自做一层（飞书请求 uuid、邮件 Message-ID）。
+- **实现**：`outbox.ts` `Outbox.deliver`（已结算 / 本进程在发 / 上个进程留下的进行中记录，三种都不再发）、`run` 里的 `store.begin`、`recover`；`OutboxStore` 接口加 `begin` / `inFlight` / `allInFlight`，内存实现 `MemoryOutboxStore`；SQLite 表 `daemon_outbox` 与 `daemon_outbox_inflight`（`packages/daemon/src/records.ts:35-36`、`DaemonRecords.put` / `begin`，接线 `gateway.ts:336`），启动时 `gw.outbox.recover()`（`gateway.ts:468`，在通道启动之前）；宿主 `deliver` 用 `host:` 命名空间（`gateway.ts:1072-1074`）；飞书 `adapter.ts:503-521`；邮件 `channel/mail/src/outbound.ts:17-21`、`channel/mail/src/adapter.ts:106-138`。输出工具的 operationId 是 `tool:<sessionKey>:<调用 id>`（CHANNELS.md §输出工具）。
+- **测试**：`outbox.test.ts` "delivers each operationId once, even when called again or concurrently"、"a crash between the in-flight mark and the settlement: the next process settles it unknown and never resends"、"the same operationId is not sent again while an earlier process has it in flight, even before recover"、"marks each attempt in flight before calling the adapter, and settling clears the mark"；`packages/daemon/test/host.test.ts` "deliver is idempotent per operationId, across a restart too; an unknown channel is an error"、"a send in flight when the daemon died is settled unknown on the next start (logged in its session) and not sent again"；`channel/lark-bot/test/outbound.test.ts` "is idempotent: same operationId gives one platform message and a stable uuid"、"retries a failed operation under the same uuid"；`channel/mail/test/mail.test.ts` "is idempotent: same operationId, same Message-ID, one transport call"、"retries a pending send with the same Message-ID"；`host-mcp.test.ts` "is idempotent per tool call id"。
+- **状态**：部分覆盖。
+- **细节（按原则自决，决定 13）**：
+  1. 进行中记录按尝试更新（记 `attempts`、`startedAt`、`turnId`），退避等待期间也在；死在退避里同样记 `unknown`（上一次尝试的结果本来就不明）。
+  2. 进行中记录不随 30 天清理删除：下次启动总会结算它。
+  3. 不自动重发：`unknown` 交给宿主或人决定（原则 6），代价是可能少发一次；重复发送（飞书上传、邮件 SMTP）不可撤回，少发可补。
 - **不成立**：
-  1. 记录只在 `settle` 时写（`outbox.ts:132`），尝试开始前不记。进程在发送与结算之间死掉（或 DL-1 第 3 条的停止），重启后同一 operationId 会再调适配器：飞书只靠请求 uuid 在平台去重窗口内挡住，上传（`image.create` / `file.create`，`adapter.ts:377`、`:384`）没有 uuid 会重复；邮件对 `pending` 记录重跑 SMTP（同一 Message-ID，但 SMTP 不去重）。
-  2. 结算记录 30 天后清理（`records.ts:52-55`），之后同一 operationId 会再发。
+  1. 结算记录 30 天后清理（`records.ts` `outPrune`），之后同一 operationId 会再发。
+  2. 嵌入方不传持久 store 时（`MemoryOutboxStore`）跨进程不成立，见 RS-9。
 
 ### DL-3 回复只回到来源
 
@@ -427,7 +431,7 @@
 | 话题表 | `packages/session/src/topics.ts:135` | `packages/session/test/topics.test.ts` "switches back, persists across reopen (same database as the log), and keeps native ids"；`daemon/test/topics.test.ts` "chat commands answer with a system reply; switching back after a restart resumes the native session" |
 | 宿主入站队列与游标 | `host-queue.ts:76-87` | `host-queue.test.ts` "push: unacked items are redelivered after a reconnect (at least once), also across a restart" |
 | launch 记录 | `records.ts:36` | `session-launch.test.ts` "a restart reopens the session with its launch and resumes it" |
-| outbox 结算记录 | `records.ts:34` | `host.test.ts` "deliver is idempotent per operationId, across a restart too; an unknown channel is an error" |
+| outbox 结算与进行中记录 | `records.ts:35-36` | `host.test.ts` "deliver is idempotent per operationId, across a restart too; an unknown channel is an error"、"a send in flight when the daemon died is settled unknown on the next start (logged in its session) and not sent again" |
 | 监听与 digest 缓冲 | `watch.ts:124-134` | `watch.test.ts` "buffered items and the watch survive a restart, and flush afterwards"、"is idempotent per (watch, envelope), also across a restart"；`daemon/test/watch.test.ts` "a digest buffered before a gateway restart is delivered after it; it replies to the target home route" |
 | 宿主表与路由解释 | `router.ts:223-247` | `router.test.ts` "persists: a restart keeps the last table, suspended until the host reconnects (unless keep)"、"are persisted: explain(inputId) works across a restart" |
 | 待交出的 context | `lane.ts:245`、`:725` | `context.test.ts` "context recorded but not handed before the restart goes to the next turn; handed context does not" |
@@ -487,7 +491,7 @@
 - **承诺**：`stop()` 每一步都有上限（通道 3 s、lane 关闭 8 s、`whenIdle` 3 s、compositor 5 s 等），不会因为某个 harness 或通道卡住而挂住。
 - **实现**：`gateway.ts:1785-1834`（`within(...)`）。
 - **测试**：`gateway.test.ts` "socket is private, rejects bad frames, and tells subscribers when the gateway stops"；`daemon/test/live.test.ts` "live_leave ends the live; the gateway stopping ends a running one"。
-- **状态**：部分覆盖（有界本身没有测试；有界的代价是 DL-1 第 3 条、LN-4、IN-1 第 1 条）。
+- **状态**：部分覆盖（有界本身没有测试；有界的代价是 LN-4、IN-1 第 1 条；outbox 在关库前最多等 5 s，超出的留进行中记录，见 DL-1）。
 
 ### RS-9 持久化以 SQLite 日志为前提
 
@@ -552,7 +556,7 @@
 2. **排队中的输入在停止或重启时静默丢失（IN-1 / RS-6，不成立）。** `lane.ts:445-446` 关闭后队列不拒不重放，`input.admitted queued` 不带记录无法重建，`snapshot.queued` 留下幽灵 id。这是 ROADMAP §3 第一条不变量，也是原则 5 的直接反例，且和 RS-5 的"遗留 turn 结算时不拒输入"、FC-2 的"拒绝了但发送者看不到"叠在一起：从发送者看，消息就是没了。最小修法：`close` / `stop` 时对队列写 `input.rejected`（或带记录写 `queued` 并在构造时重放），`settleDangling` 同时拒掉未消费的输入。
 3. **`aio explain` 不能从副作用反查（EX-2，不成立）。** 只接受 inputId，返回路由记录；系统回复、宿主 `deliver`、`live_say` 连手工串的线索都没有。原则 4 与决定 4 都以它为"不拦截"的配套。
 4. **重启丢 turn（RS-3 / RS-4，不成立于原则 5）。** Claude Code 的 turn 被打断；Codex stdio 的 turn 既不接管也不结束，挂到下一条输入才记 ambiguous（RS-5），没有新输入就一直显示运行中。三者都没有测试。
-5. **outbox 结算前崩溃会重复发送；停止时投递可能既不结算也不记录（DL-1、DL-2，不成立）。** `outbox.ts:132` 只在结算时写记录；`stop()` 不等 outbox 就关库；单次尝试无超时。飞书上传与邮件在重放时会真的重复。
+5. ~~outbox 结算前崩溃会重复发送；停止时投递可能既不结算也不记录（DL-1、DL-2）。~~ 已修（决定 13）：发送前写进行中记录，重启后结算为 `unknown` 不重发；`stop()` 有界等待 outbox；单次尝试有超时。
 6. **多机器人退回仍会发生（DL-4，不成立）。** 机器人 b 停掉或启动失败后，`channelFor` 只看到 a，发给 b 的 `deliver` / `systemReply` / `live_join` 改写成 a 发出。决定 8 的本意是"不以别的机器人发出"。
 7. **宿主 `lease` 未实现（HQ-5，不成立）。** HOSTS.md:111 与协议都有，守护进程不读。只拉取的宿主推的默认 `suspend` 表永远不生效。
 8. **宿主 outbound 在宿主离线时退回本地策略（DL-5，不成立于"fail closed"）；`live_join` 目标不过 outbound 检查。**
@@ -561,4 +565,4 @@
 11. **没有可用交互 agent 时 `accept` 直接抛错（FC-3，不成立）**；harness 起不来时只在日志里拒绝（FC-2）。
 12. **`closeLane` 窗口可能出现同一键两个 lane（LN-2，可能）**；**监听回复可能回到被监听的群（CF-5，可能）**：都需要先写测试复现。
 13. **未测的承诺**：live 传输拒绝与视频过滤（LN-5）、模块 harness 启动失败（CF-4）、Claude Code 停止时的行为（RS-3）、非 SQLite 持久化（RS-9）、模型输入里的 watch 标记（ID-2）。
-14. **文档本身的出入**：ROADMAP §3 的 `ambiguous` 在投递里叫 `unknown`；决定 12 说 `onBehalfOf` "须显式开启"而它没有开关（RQ-3）；工具默认开启与原则 2 相反（CF-6，ROADMAP 已列复查）；`docs/E2E.md` 的"已知缺口"仍写 outbox 在内存、compositor 不接管旧卡片、没有宿主 MCP 工具，三条都已过时。
+14. **文档本身的出入**：决定 12 说 `onBehalfOf` "须显式开启"而它没有开关（RQ-3）；工具默认开启与原则 2 相反（CF-6，ROADMAP 已列复查）；`docs/E2E.md` 的"已知缺口"仍写 outbox 在内存、compositor 不接管旧卡片、没有宿主 MCP 工具，三条都已过时。

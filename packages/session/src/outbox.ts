@@ -21,19 +21,56 @@ export interface DeliveryRecord {
   error?: string;
 }
 
-/** Where settled deliveries are remembered. Must be durable for idempotency across restarts. */
+/**
+ * An attempt that has started and not settled yet. Written before the adapter is
+ * called, so a process that dies mid-send leaves it behind: the next process
+ * settles it as `unknown` and never sends it again (decision 13).
+ */
+export interface InFlightDelivery {
+  operationId: string;
+  sessionKey: string;
+  route: ReplyRoute;
+  turnId?: string;
+  /** The attempt that was started (1-based). */
+  attempts: number;
+  startedAt: number;
+}
+
+/**
+ * Where deliveries are remembered: settled outcomes and in-flight marks. Must be
+ * durable for idempotency across restarts (the daemon keeps it in its SQLite records).
+ */
 export interface OutboxStore {
+  /** The settled outcome of an operation. */
   get(operationId: string): DeliveryRecord | undefined;
+  /** Settle: write the outcome and drop the operation's in-flight mark. */
   put(rec: DeliveryRecord): void;
+  /** Mark an attempt as started, before the adapter is called (replaces an earlier mark). */
+  begin(rec: InFlightDelivery): void;
+  /** The in-flight mark of an operation that has no settled outcome. */
+  inFlight(operationId: string): InFlightDelivery | undefined;
+  /** Every in-flight mark that has no settled outcome. */
+  allInFlight(): InFlightDelivery[];
 }
 
 export class MemoryOutboxStore implements OutboxStore {
   private m = new Map<string, DeliveryRecord>();
+  private f = new Map<string, InFlightDelivery>();
   get(id: string) {
     return this.m.get(id);
   }
   put(rec: DeliveryRecord) {
     this.m.set(rec.operationId, rec);
+    this.f.delete(rec.operationId);
+  }
+  begin(rec: InFlightDelivery) {
+    this.f.set(rec.operationId, rec);
+  }
+  inFlight(id: string) {
+    return this.m.has(id) ? undefined : this.f.get(id);
+  }
+  allInFlight() {
+    return [...this.f.values()].filter((r) => !this.m.has(r.operationId));
   }
 }
 
@@ -51,6 +88,11 @@ export interface OutboxOptions {
   maxAttempts?: number;
   baseDelayMs?: number;
   maxDelayMs?: number;
+  /**
+   * Upper bound of one attempt (default 60 s). An attempt that runs out settles as
+   * `unknown` without a retry: the platform may have received it.
+   */
+  attemptTimeoutMs?: number;
   sleep?: (ms: number) => Promise<void>;
 }
 
@@ -68,17 +110,26 @@ export interface Delivery {
 
 /**
  * Delivery obligations: one operationId produces at most one settled outcome, and
- * the attempt runs again only while the outcome is still open. Retries use
- * exponential backoff; an outcome that stays unclear is `unknown` and never replayed.
+ * the attempt runs again only while the outcome is still open. Each attempt is
+ * marked in flight in the store before the adapter is called; a mark left by a
+ * process that died is settled as `unknown` (by `recover`, or by the next
+ * `deliver` of that id) and never replayed. Retries use exponential backoff; an
+ * outcome that stays unclear (retries run out, an attempt times out) is `unknown`.
  */
 export class Outbox {
   private readonly store: OutboxStore;
   private inflight = new Map<string, Promise<DeliveryRecord>>();
+  private draining = false;
+  private closed = false;
+  private wake!: () => void;
+  /** Resolves when stopping begins: retries waiting in backoff stop waiting. */
+  private readonly stopping = new Promise<void>((r) => (this.wake = r));
 
   constructor(private readonly o: OutboxOptions = {}) {
     this.store = o.store ?? new MemoryOutboxStore();
   }
 
+  /** The settled outcome of an operation (one in flight has none yet). */
   get(operationId: string): DeliveryRecord | undefined {
     return this.store.get(operationId);
   }
@@ -88,6 +139,11 @@ export class Outbox {
     if (done) return Promise.resolve(done);
     const running = this.inflight.get(d.operationId);
     if (running) return running;
+    // Nothing is sent and nothing recorded: the store may be closed already.
+    if (this.closed) return Promise.resolve({ operationId: d.operationId, sessionKey: d.sessionKey, route: d.route, status: 'rejected', attempts: 0, error: 'outbox closed' });
+    // Marked in flight by an earlier process (not recovered yet): unknown, never resent.
+    const stale = this.store.inFlight(d.operationId);
+    if (stale) return Promise.resolve(this.settleStale(stale));
     const p = this.run(d, attempt).finally(() => this.inflight.delete(d.operationId));
     this.inflight.set(d.operationId, p);
     return p;
@@ -98,22 +154,81 @@ export class Outbox {
     return this.deliver(d, () => adapter.send(d.route, d.msg, { operationId: d.operationId, ...(d.as !== undefined ? { as: d.as } : {}) }));
   }
 
+  /**
+   * Settle every in-flight mark an earlier process left (the platform may or may
+   * not have received it) as `unknown`, with `delivery.settled` in its session.
+   * Nothing is resent. Call once at start.
+   */
+  recover(): DeliveryRecord[] {
+    return this.store
+      .allInFlight()
+      .filter((r) => !this.inflight.has(r.operationId))
+      .map((r) => this.settleStale(r));
+  }
+
+  /**
+   * Stopping: no more retries (a delivery waiting for one settles `unknown` now),
+   * and wait at most `ms` for the attempts that are running. One still running
+   * after that keeps its in-flight mark and the next `recover` settles it.
+   */
+  async drain(ms: number): Promise<void> {
+    this.draining = true;
+    this.wake();
+    const all = Promise.all([...this.inflight.values()].map((p) => p.catch(() => undefined)));
+    let t: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([all, new Promise((r) => (t = setTimeout(r, ms)))]);
+    clearTimeout(t);
+  }
+
+  /** The store and the log are about to close: nothing is written any more, new deliveries are refused. */
+  close(): void {
+    this.draining = true;
+    this.closed = true;
+    this.wake();
+  }
+
+  private settleStale(r: InFlightDelivery): DeliveryRecord {
+    return this.settle(
+      { sessionKey: r.sessionKey, ...(r.turnId !== undefined ? { turnId: r.turnId } : {}) },
+      { operationId: r.operationId, sessionKey: r.sessionKey, route: r.route, status: 'unknown', attempts: r.attempts, error: 'in flight when the previous process stopped; not resent' },
+    );
+  }
+
   private async run(d: Delivery, attempt: (n: number) => Promise<SendResult | void>): Promise<DeliveryRecord> {
     const max = this.o.maxAttempts ?? 5;
     const base = this.o.baseDelayMs ?? 200;
     const cap = this.o.maxDelayMs ?? 10_000;
+    const timeout = this.o.attemptTimeoutMs ?? 60_000;
     const sleep = this.o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
     const rec: DeliveryRecord = { operationId: d.operationId, sessionKey: d.sessionKey, route: d.route, status: 'unknown', attempts: 0 };
 
     if (d.from !== undefined && this.o.policy?.outbound) {
-      const verdict = await this.o.policy.outbound({ from: d.from, to: d.route });
+      let verdict: string;
+      try {
+        verdict = await this.o.policy.outbound({ from: d.from, to: d.route });
+      } catch (err) {
+        // Fail closed: a check that cannot answer denies.
+        return this.settle(d, { ...rec, status: 'rejected', error: `outbound check failed: ${err instanceof Error ? err.message : String(err)}` });
+      }
       if (verdict !== 'allow') return this.settle(d, { ...rec, status: 'rejected', error: `outbound denied: ${routeKey(d.route)}` });
     }
 
     for (let n = 1; n <= max; n++) {
+      // Closed while waiting (policy check): never sent, and there is no store to mark in.
+      if (this.closed) return { ...rec, status: 'rejected', error: 'outbox closed' };
       rec.attempts = n;
+      this.store.begin({
+        operationId: d.operationId,
+        sessionKey: d.sessionKey,
+        route: d.route,
+        ...(d.turnId !== undefined ? { turnId: d.turnId } : {}),
+        attempts: n,
+        startedAt: Date.now(),
+      });
       try {
-        const r = await attempt(n);
+        const r = await withTimeout(Promise.resolve().then(() => attempt(n)), timeout);
+        // The platform may have it: unknown, not retried.
+        if (r === TIMED_OUT) return this.settle(d, { ...rec, error: `attempt ${n} timed out after ${timeout} ms` });
         return this.settle(d, {
           ...rec,
           status: 'delivered',
@@ -122,13 +237,18 @@ export class Outbox {
       } catch (err) {
         rec.error = err instanceof Error ? err.message : String(err);
         if ((err as { retryable?: unknown })?.retryable === false) return this.settle(d, { ...rec, status: 'rejected' });
-        if (n < max) await sleep(Math.min(cap, base * 2 ** (n - 1)));
+        if (n < max) {
+          if (!this.draining) await Promise.race([sleep(Math.min(cap, base * 2 ** (n - 1))), this.stopping]);
+          if (this.draining) return this.settle(d, { ...rec, error: `${rec.error}; not retried: stopping` });
+        }
       }
     }
     return this.settle(d, rec);
   }
 
-  private settle(d: Delivery, rec: DeliveryRecord): DeliveryRecord {
+  private settle(d: Pick<Delivery, 'sessionKey' | 'turnId'>, rec: DeliveryRecord): DeliveryRecord {
+    // Closed: the in-flight mark stays, and the next process settles it as unknown.
+    if (this.closed) return rec;
     this.store.put(rec);
     this.o.hub?.append(d.sessionKey, {
       ts: Date.now(),
@@ -146,5 +266,18 @@ export class Outbox {
       },
     });
     return rec;
+  }
+}
+
+const TIMED_OUT = Symbol('timed out');
+
+/** `p`, or `TIMED_OUT` after `ms`. A late outcome of `p` is ignored (a late rejection too). */
+async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+  p.catch(() => undefined);
+  let t: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([p, new Promise<typeof TIMED_OUT>((r) => (t = setTimeout(() => r(TIMED_OUT), ms)))]);
+  } finally {
+    clearTimeout(t);
   }
 }

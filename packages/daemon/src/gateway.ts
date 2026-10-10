@@ -469,6 +469,8 @@ export class Gateway {
       }
       gw.watches.start();
       gw.runs.settleAllDangling();
+      // Sends an earlier process left in flight: unknown, never resent (decision 13).
+      for (const r of gw.outbox.recover()) gw.log('warn', `delivery ${r.operationId} was in flight when the previous daemon stopped; settled unknown, not resent`);
       await gw.loadConfigWatches();
       await gw.startChannels();
       await gw.adoptRunningTurns();
@@ -1863,12 +1865,16 @@ ${a.summary}` }],
     await within(Promise.all(closed.map((l) => l.whenIdle())), 3000);
     await within(Promise.all([...this.launched.values()].map((x) => x.dispose())), 3000);
     await within(Promise.all(this.compositors.map((c) => c.stop())), 5000);
+    // Sends still running settle while their channel and the records are open; no more retries.
+    await this.outbox.drain(5000);
     for (const ch of this.channels) await within(ch.close?.().catch(() => undefined), 3000);
     await within(this.watches.idle(), 3000);
     await within(this.mcp?.close(), 2000);
     await within(new Promise(() => {}), 50);
     this.watches.registry.close();
     this.hostQueue.close();
+    // Anything still sending keeps its in-flight mark; the next start settles it as unknown.
+    this.outbox.close();
     this.records.close();
     this.router.close();
     this.topics.close();
