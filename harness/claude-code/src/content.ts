@@ -33,9 +33,16 @@ export function preface(input: InputRecord): string {
   const parts = [`from=${o.principal?.id ?? 'unknown'}`, `kind=${o.kind}`, `via=${o.via}`];
   if (o.declared) parts.push(`declared=${o.declared}`);
   if (o.self) parts.push('self=true');
+  // Stamped, never truncated: the agent passes it verbatim to a host command, which checks it with `aio verify`.
+  if (input.channelRef) parts.push(`ref=${refToken(input.channelRef)}`);
   for (const [k, v] of Object.entries(input.channelContext)) parts.push(`${k}=${oneLine(String(v))}`);
   const head = input.channelContext.context === true ? `[agents-io ${CONTEXT_LABEL}]\n` : '';
   return `${head}[agents-io input ${parts.join(' ')}]`;
+}
+
+/** The channel ref as one copyable token: bare when it has no whitespace or quotes, else JSON-quoted. */
+export function refToken(ref: string): string {
+  return /^[^\s"]+$/.test(ref) ? ref : JSON.stringify(ref);
 }
 
 function oneLine(s: string, max = 120): string {

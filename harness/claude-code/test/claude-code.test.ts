@@ -315,6 +315,17 @@ describe('input writing', () => {
     expect(p).toBe('[agents-io input from=unknown kind=agent via=lark:a:c declared=bot-7]');
   });
 
+  it('preface carries ref=channel:<channel>/<message id> only for a channel message, verbatim (never truncated)', () => {
+    const ref = 'channel:lark-bot/om_1';
+    expect(preface({ ...input('x', ''), channelRef: ref, channelContext: { chat: 'Team' } })).toBe(`[agents-io input from=owner kind=human via=fake:a:c1 ref=${ref} chat=Team]`);
+    // local / host / system inputs have no channel message to point at
+    expect(preface(input('x', ''))).not.toMatch(/ ref=/);
+    // a long mail Message-ID stays whole; one with whitespace is quoted, still one token
+    const long = `channel:mail/<${'a'.repeat(200)}@mail.example.com>`;
+    expect(preface({ ...input('x', ''), channelRef: long })).toContain(` ref=${long}`);
+    expect(preface({ ...input('x', ''), channelRef: 'channel:x/a b' })).toContain(' ref="channel:x/a b"');
+  });
+
   it('labels context-only inputs as not addressed to the agent, keeping their own sender preface', async () => {
     const { s, q } = await setup();
     const stranger = { kind: 'human' as const, principal: null, evidence: 'platform_signed' as const, via: 'lark:a:g1', adapter: 'lark' };

@@ -31,7 +31,7 @@ harness 事件 ──▶ SessionLog（seq）──▶ Compositor（读全量，�
 每条输入在发给 harness 前，前面加一行发送者说明，后面是转换过的内容块：
 
 ```
-[agents-io input from=lark-bot:on_bc38… kind=human via=lark-bot:default:oc_7a1… channel=lark-bot conversationKind=dm conversationId=oc_7a1… senderName=张三 sentAt=1791… reply=card markdown=basic maxChars=4000 buttons=yes media=image,file,audio]
+[agents-io input from=lark-bot:on_bc38… kind=human via=lark-bot:default:oc_7a1… ref=channel:lark-bot/om_5f2… channel=lark-bot conversationKind=dm conversationId=oc_7a1… senderName=张三 sentAt=1791… reply=card markdown=basic maxChars=4000 buttons=yes media=image,file,audio]
 列出当前目录下的文件，然后用一句话总结
 ```
 
@@ -41,6 +41,7 @@ harness 事件 ──▶ SessionLog（seq）──▶ Compositor（读全量，�
 - `kind`：`human`、`agent`、`channel_event` 等。
 - `via`：来源路由，格式为 `通道:账号:会话[:线程]`。
 - `declared`：只有发送账号可信、且通过适配器控制的元数据表明身份时才出现，消息正文里的自称不算。
+- `ref`：这条输入对应的渠道消息引用 `channel:<通道>/<消息 id>`（决定 13），与宿主入站队列的幂等键、`input.verify` / `aio verify` 的参数同一格式。网关按核对过的信封盖章（`InputRecord.channelRef`），适配器和客户端都不能设置；不截断，含空白或引号时整体加 JSON 引号。只有来自渠道消息的输入才有：本地（`aio input` / `attach`）、宿主 `input` 帧、任务运行、系统输入（汇总、话题摘要、live 委托）都没有。agent 调宿主命令做敏感写操作（确认、作答）时把它原样带上，宿主用 `aio verify <ref>` 自己核验作者与证据（HOSTS §4.1）。
 - 后面的 `key=value` 来自适配器提供的上下文（如邮件主题、发送者名字），网关自己的字段同名时以网关为准。
 - `senderName`：适配器给出的发送者显示名（飞书经通讯录解析，邮件取 From 里的名字），拿不到就没有这一项。
 - `reply`：这一轮的回复会怎么显示，由网关按渲染该路由的通道能力和档位生成，适配器不能伪造。格式固定为

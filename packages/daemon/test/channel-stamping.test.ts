@@ -2,6 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import type { InputRecord } from '@agents-io/protocol';
 import { FakeChannel, FakeHarness } from '@agents-io/testkit';
 import { ConfigError, resolveConfig, type HarnessInstance } from '../src/config.js';
 import { Gateway, InstanceHarness, type ExtraChannel } from '../src/gateway.js';
@@ -16,7 +17,7 @@ import { cleanups, tmp, until } from './helpers.js';
 const RAW_CHILD = fileURLToPath(new URL('../../../channel/jsonl-bridge/test/fixtures/raw_child.mjs', import.meta.url));
 const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };
 
-async function start(o: { channels?: unknown[]; extra?: ExtraChannel[]; owners?: string[] } = {}) {
+async function start(o: { channels?: unknown[]; extra?: ExtraChannel[]; owners?: string[]; harness?: FakeHarness } = {}) {
   const dir = tmp('aio-stamp-');
   mkdirSync(join(dir, 'work'), { recursive: true });
   const raw = { dataDir: dir, policy: { owners: o.owners ?? ['lark-bot:alice'] }, local: { principal: 'me' }, cwd: join(dir, 'work'), channels: o.channels ?? [] };
@@ -24,7 +25,7 @@ async function start(o: { channels?: unknown[]; extra?: ExtraChannel[]; owners?:
   const logs: string[] = [];
   const gw = await Gateway.start({
     config: { ...base, socketPath: join(dir, 'run', 'aio.sock') },
-    buildHarness: (i: HarnessInstance) => new InstanceHarness(i, new FakeHarness()),
+    buildHarness: (i: HarnessInstance) => new InstanceHarness(i, o.harness ?? new FakeHarness()),
     ...(o.extra ? { channels: o.extra } : {}),
     logger: (level, msg) => logs.push(`${level}: ${msg}`),
     listen: false,
@@ -36,6 +37,23 @@ async function start(o: { channels?: unknown[]; extra?: ExtraChannel[]; owners?:
 
 const bridge = (account: string, env: Record<string, string> = {}, extra: Record<string, unknown> = {}) => ({ type: 'bridge', account, command: process.execPath, args: [RAW_CHILD], env, ...extra });
 const inbound = (env: Record<string, unknown>) => JSON.stringify(env);
+
+describe('channel ref: the input a channel message becomes points back at it (decision 13)', () => {
+  it('the harness gets channelRef = channel:<channel>/<message id>, the key aio verify answers with the stamped author', async () => {
+    const seen: InputRecord[] = [];
+    const harness = new FakeHarness(async (t) => {
+      seen.push(...t.inputs);
+      t.emit({ t: 'text.snapshot', text: 'ok', final: true }, { audience: 'answer' });
+    });
+    const lark = new FakeChannel('lark-bot');
+    const w = await start({ extra: [{ adapter: lark, account: 'main' }], harness });
+    const r = await lark.inject({ id: 'om_9', sender: alice, conversation: { id: 'dm1', kind: 'dm' }, text: 'confirm T-1' });
+    expect(r.accepted).toBe(true);
+    await until(() => seen.length > 0);
+    expect(seen[0]!.channelRef).toBe('channel:lark-bot/om_9');
+    expect(w.gw.records.verify(seen[0]!.channelRef!)).toMatchObject({ found: true, records: [expect.objectContaining({ principal: 'lark-bot:alice', evidence: 'platform_signed', inputId: seen[0]!.inputId })] });
+  });
+});
 
 describe('channel-stamping: an envelope belongs to the channel that emitted it', () => {
   it('a channel claiming another channel as the owner is refused: no lane, no input.verify record, counted', async () => {

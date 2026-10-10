@@ -288,7 +288,15 @@
 - **承诺**：输出工具的每次调用附带本轮来源摘要（是否含 context / digest / 外部 / 群聊），不拦截（决定 4，HOSTS.md §宿主写命令的来源标记）。
 - **实现**：`tools.ts:404-405`（`provenance` 写进 `agents-io.output` 记录）；`lane.ts:338-353`。来源不进 harness 子进程环境：任务运行只带 `AGENTS_IO_RUN_ID`（`gateway.ts` `openRunLane`），`AGENTS_IO_TURN_PROVENANCE` 已删除（决定 13）。
 - **测试**：`host-mcp.test.ts` "tags every write with the turn provenance (never blocks it)"；`packages/daemon/test/runs.test.ts` "env goes into the run child only: the instance built for the run has it; the log, explain records and other instances do not"（带 `AGENTS_IO_RUN_ID`、不带 `AGENTS_IO_TURN_PROVENANCE`）；`context.test.ts` "provenance: flags come from the context actually handed, and stay for later turns"；`routing.test.ts` "an owner DM: triggered by the owner, nothing watched, external or group"、"a watch trigger from a stranger: triggered by null, watched, external"。
-- **状态**：部分覆盖（agent 在工作区里直接调 `x` 这类宿主命令时，交互 session 拿不到本轮来源，宿主无从核查）。
+- **状态**：有测试（输出工具的写入）。agent 在工作区里直接调 `x` 这类宿主命令时不经 agents-io，按决定 4 的修订（决定 13）由 EX-4 兑现。
+
+### EX-4 来自渠道消息的输入在模型面前带可核验的 ref
+
+- **承诺**：来自渠道消息的输入（直接派发、只记录、watch、补投、话题转交）带 `InputRecord.channelRef = channel:<通道>/<消息 id>`，由网关按核对过的信封盖章，客户端不能设置；两个 harness 的发送者说明行都把它原样（不截断）写成 `ref=…`；同一个键传给 `input.verify` / `aio verify` 能查到这条消息的盖章作者与证据。本地、宿主、任务运行与系统输入没有 `ref`（决定 4 修订，决定 13；HOSTS §4.1）。
+- **实现**：`packages/session/src/ingress.ts` `process`（`channelRef: channelRefOf(env)`，`env` 是盖章后的信封）、`packages/session/src/watch.ts` `deliver`；补投与话题转交展开原 `InputRecord`，引用不变；客户端 `input` 帧逐字段构造 `InputRecord`（`gateway.ts` `case 'input'`），不带 `channelRef`。`harness/claude-code/src/content.ts` `preface`、`harness/codex/src/map.ts` `senderPreface`；`packages/daemon/src/records.ts` `recordInput` / `verify` 用同一个 `channelRefOf`。
+- **测试**：`packages/daemon/test/channel-stamping.test.ts` "the harness gets channelRef = channel:<channel>/<message id>, the key aio verify answers with the stamped author"；`harness/claude-code/test/claude-code.test.ts` "preface carries ref=channel:<channel>/<message id> only for a channel message, verbatim (never truncated)"；`harness/codex/test/codex.test.ts` "sender preface carries ref=channel:<channel>/<message id> only for a channel message, bare like Claude Code"。
+- **状态**：部分覆盖（watch、补投路径的 `channelRef` 没有单独的测试）。
+- **注意**：`ref` 只证明"这个人发过这条消息"，不证明它就是触发这次宿主命令的那条；agent 可以带会话里更早一条消息的 `ref`。宿主要靠 `verify` 结果里的 `conversation` / `receivedAt` / `inputId` 自己加约束。
 
 ---
 

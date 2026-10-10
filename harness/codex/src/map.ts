@@ -26,6 +26,8 @@ export function senderPreface(input: InputRecord): string {
   const o = input.origin;
   const parts = [`from=${o.principal?.id ?? 'unknown'}`, `kind=${o.kind}`, `via=${o.via}`];
   if (o.declared) parts.push(`declared=${o.declared}`);
+  // Bare like the Claude Code preface, so the agent can pass it verbatim to a host command (`aio verify`).
+  if (input.channelRef) parts.push(`ref=${/^[^\s"]+$/.test(input.channelRef) ? input.channelRef : JSON.stringify(input.channelRef)}`);
   for (const [k, v] of Object.entries(input.channelContext)) parts.push(`${k}=${JSON.stringify(v)}`);
   return `[sender ${parts.join(' ')}]`;
 }
