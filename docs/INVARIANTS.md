@@ -113,14 +113,13 @@
 - **承诺**：同一 operationId 至多一次平台发送，重复调用返回第一次的结果；每次尝试在调用适配器**之前**写进行中记录，结算时在同一 savepoint 里写结果并删掉进行中记录。进程在两者之间死掉，下次启动把留下的进行中记录结算为 `unknown`（会话日志写 `delivery.settled`，守护进程日志一条 warn），**不自动重发**；同一 operationId 再来（还没恢复时也一样）直接得到这个 `unknown`。通道再各自做一层（飞书请求 uuid、邮件 Message-ID）。
 - **实现**：`outbox.ts` `Outbox.deliver`（已结算 / 本进程在发 / 上个进程留下的进行中记录，三种都不再发）、`run` 里的 `store.begin`、`recover`；`OutboxStore` 接口加 `begin` / `inFlight` / `allInFlight`，内存实现 `MemoryOutboxStore`；SQLite 表 `daemon_outbox` 与 `daemon_outbox_inflight`（`packages/daemon/src/records.ts:35-36`、`DaemonRecords.put` / `begin`，接线 `gateway.ts:336`），启动时 `gw.outbox.recover()`（`gateway.ts:468`，在通道启动之前）；宿主 `deliver` 用 `host:` 命名空间（`gateway.ts:1072-1074`）；飞书 `adapter.ts:503-521`；邮件 `channel/mail/src/outbound.ts:17-21`、`channel/mail/src/adapter.ts:106-138`。输出工具的 operationId 是 `tool:<sessionKey>:<调用 id>`（CHANNELS.md §输出工具）。
 - **测试**：`outbox.test.ts` "delivers each operationId once, even when called again or concurrently #DL-1 #DL-2"、"a crash between the in-flight mark and the settlement: the next process settles it unknown and never resends #DL-2"、"the same operationId is not sent again while an earlier process has it in flight, even before recover #DL-2"、"marks each attempt in flight before calling the adapter, and settling clears the mark #DL-2"；`packages/daemon/test/host.test.ts` "deliver is idempotent per operationId, across a restart too; an unknown channel is an error #DL-2 #RS-1"、"a send in flight when the daemon died is settled unknown on the next start (logged in its session) and not sent again #DL-2 #RS-1"；`channel/lark-bot/test/outbound.test.ts` "is idempotent: same operationId gives one platform message and a stable uuid #DL-2"、"retries a failed operation under the same uuid #DL-2 #DL-1"；`channel/mail/test/mail.test.ts` "is idempotent: same operationId, same Message-ID, one transport call #DL-2"、"retries a pending send with the same Message-ID #DL-2"；`host-mcp.test.ts` "is idempotent per tool call id #DL-2"。
-- **状态**：部分覆盖。
+- **状态**：有测试。
 - **细节（按原则自决，决定 13）**：
   1. 进行中记录按尝试更新（记 `attempts`、`startedAt`、`turnId`），退避等待期间也在；死在退避里同样记 `unknown`（上一次尝试的结果本来就不明）。
   2. 进行中记录不随 30 天清理删除：下次启动总会结算它。
   3. 不自动重发：`unknown` 交给宿主或人决定（原则 6），代价是可能少发一次；重复发送（飞书上传、邮件 SMTP）不可撤回，少发可补。
   4. **结算记录不删，30 天后压成墓碑**（2026-10-11，依原则 1、4 自决）：`records.ts` `outPrune`（`:48-51`）把超过保留期的行改成 `at = 0`、去掉 `error` 与 `providerMessageId`，结果（`status`、`attempts`、路由）留下；同一 operationId 任何时候再来都得到它（`duplicate: true`），不再发。没有选"拒收早于保留期的 operationId"：operationId 由调用方取名，不带时间，看不出新旧。代价是每个 operationId 永久一小行（不含消息内容）。测试：`packages/daemon/test/host.test.ts` "after the 30-day prune of settled outbox records, the same operationId is not sent again"（原 `it.fails`，已修）。
-- **不成立**：
-  1. 嵌入方不传持久 store 时（`MemoryOutboxStore`）跨进程不成立，见 RS-9。
+- **注意**：嵌入方不传持久 store 时（`MemoryOutboxStore`）跨进程不成立；守护进程这时启动告警，见 RS-9。
 
 ### DL-3 回复只回到来源
 
@@ -148,14 +147,12 @@
 - **承诺**：输出工具发往的每个路由都过 `Policy.outbound`（默认只允许本轮回复路由与预登记路由），`live_join` 的地点也一样；宿主声明了 `outbound` 钩子时由宿主决定，超时、出错、答复不合 schema 一律拒绝（决定 9）；这个宿主断开期间（含重启后）只放行本轮自己的回复路由，直到它重连或一个不声明 `outbound` 的宿主连上。
 - **实现**：`gateway.ts` 构造函数里的 `outbound`（`host.outboundHeldBy()`、宿主回调、本地策略）；`packages/daemon/src/host.ts` `outboundHeldBy` 与 `hello`（宿主名记在 `DaemonRecords` 的 `daemon_flags`，跨重启）；`gateway.ts` `joinLive` / `liveAllowed`（通道有 `liveRoute` 时打开之前检查，否则检查打开后的端点路由，被拒即关闭端点）；`packages/host-mcp/src/tools.ts:380-397`（`allowed()`）。
 - **测试**：`packages/daemon/test/host-callouts.test.ts` "the host decides; timeout, error and bad answers deny; without the hook the local policy decides #DL-5"、"a host that only answers route callouts leaves outbound to the local policy #DL-5"、"a host that declared the outbound callout disconnects: a send to a route other than the turn's own is still refused"（原 `it.fails`，已修；也覆盖重启后与交还本地策略）；`packages/daemon/test/live.test.ts` "live_join goes through the outbound check: a policy that denies every destination refuses it, no endpoint is opened"（原 `it.fails`，已修）、"live_join to a meeting that is not a preregistered destination is refused by the default policy; a channel that cannot name the route first has its endpoint closed"；`host-mcp.test.ts` "denies destinations outside Policy.outbound with a clear error and a notice #DL-5"。
-- **状态**：部分覆盖。
+- **状态**：有测试。
 - **决定（2026-10-11，依原则 4 与决定 9"`outbound` 任何失败都拒绝"自决；决定 13 冻结回调的扩展，这里是改正确性，不加新能力）**：
   1. 宿主离线时只放行本轮自己的回复路由：回复发问的地方不需要宿主授权，本地策略额外放宽的（预登记路由）正是宿主可能收紧过的，按 fail closed 拒绝。没有加配置开关（`host-callouts` §8 原设想的 `whenOffline`）。
   2. `live_join` 的地点按普通外发目的地处理：机器人在那里说话。缺省策略下要把会议路由预登记进 `policy.routes`，或由宿主 `outbound` 放行；`ChannelAdapter.liveRoute(account, target)`（可选）让网关在打开之前检查。
-- **不成立**：
-  1. ~~宿主断线时退回本地策略~~：已修，见上。
-  2. ~~`live_join` 的目标不过 outbound 检查~~：已修，见上。
-  3. outbox 自带的 outbound 检查只在 `Delivery.from` 存在时生效（`outbox.ts:108`），守护进程里没有调用方传 `from`，实际只靠输出工具的 `allowed()`。
+- **已修**：~~宿主断线时退回本地策略~~、~~`live_join` 的目标不过 outbound 检查~~（2026-10-11，见上）。
+- **注意**：outbox 自带的 outbound 检查只在 `Delivery.from` 存在时生效（`outbox.ts:108`），守护进程里没有调用方传 `from`，实际只靠输出工具的 `allowed()`。
 
 ---
 
@@ -761,8 +758,8 @@
 9. **并发 `live_join` 停掉已有 live 并泄漏端点（LN-3，不成立）。** 需要在 `gateway.ts:1168` 检查后同步占位。
 10. **入站去重只在内存，部分失败重试会重复进会话（IN-5，不成立）。**
 11. ~~**没有可用交互 agent 时 `accept` 直接抛错（FC-3，不成立）**~~ 已修（2026-10-11）。（harness 起不来时只在日志里拒绝的 FC-2 已修。）
-12. **`closeLane` 窗口出现同一键两个 lane（LN-2）**；**监听回复会回到被监听的群（CF-5）**：决定 14 已用 `it.fails` 复现，未修。
-13. ~~**未测的承诺**：live 传输拒绝与视频过滤（LN-5）、模块 harness 启动失败（CF-4）、Claude Code 停止时的行为（RS-3）、非 SQLite 持久化（RS-9）、模型输入里的 watch 标记（ID-2）。~~ 决定 14 都补了测试：LN-5、CF-4、RS-3、ID-2 的 watch 标记成立；RS-9 不成立（`it.fails`）。
+12. ~~**`closeLane` 窗口出现同一键两个 lane（LN-2）**；**监听回复会回到被监听的群（CF-5）**~~：已修（2026-10-11）。另：~~路由表迟到的旧版本覆盖新表（HQ-5）~~、~~逐个工具的开关（CF-6）~~、~~结算记录 30 天后清理即可重发（DL-2）~~ 同日已修。
+13. ~~**未测的承诺**：live 传输拒绝与视频过滤（LN-5）、模块 harness 启动失败（CF-4）、Claude Code 停止时的行为（RS-3）、非 SQLite 持久化（RS-9）、模型输入里的 watch 标记（ID-2）。~~ 决定 14 都补了测试：LN-5、CF-4、RS-3、ID-2 的 watch 标记成立；RS-9 当时不成立，2026-10-11 已加告警。
 14. **文档本身的出入**：~~决定 12 说 `onBehalfOf` "须显式开启"而它没有开关（RQ-3）~~ 已加 `policy.answerOnBehalf`（决定 13）；~~工具默认开启与原则 2 相反（CF-6）~~ 已改为默认关闭（决定 13）；`docs/E2E.md` 的"已知缺口"仍写 outbox 在内存、compositor 不接管旧卡片、没有宿主 MCP 工具，三条都已过时。
 15. **A 组合并评审（2026-10-11）遗留**，按原则 4 记下，未修：
     - **启动时为每个会话折叠全量日志**（`settleLeftoverInputs` 调 `hub.snapshot`）：没有压缩时随日志线性增长；等日志压缩一起做。
@@ -773,4 +770,4 @@
 16. **决定 14 新编号读代码时发现的（2026-10-11）**，未修：
     - ~~**停止期间的入站被确认后丢失（IN-7，不成立）**~~（已修，`EmitResult.permanent`）：停止时 `Gateway.accept` 答 `accepted: false`（`gateway stopping`）而不抛错，飞书照常 ack 并保留去重键、邮件照常前移 checkpoint，消息不再交给下一个进程。
     - ~~**路径型 launch 变量被拒时错误带原值（SE-1，不成立，轻微）**~~：已修，`bad_env` 只写键名。
-    - **未测**：`runChannelConformance` 抓违规（CN-1）、`emit` 返回 `accepted: false` 时的确认（IN-7）。
+    - **未测**：`runChannelConformance` 抓违规（CN-1）。~~`emit` 返回 `accepted: false` 时的确认（IN-7）~~ 已有测试。
