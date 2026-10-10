@@ -4,7 +4,7 @@ import { until } from './helpers.js';
 import { completed, mcpCall, setup } from './output-tools-helpers.js';
 
 describe('dev-gateway host output tools', () => {
-  it('mounts a per-binding token; ask_choice buttons → click → choice event in the asking session; outbound denial #CF-6 #DL-5 #SE-3', async () => {
+  it('mounts a per-binding token; ask_choice buttons → click → choice event in the asking session; an owner turn sends anywhere #CF-6 #DL-5 #SE-3', async () => {
     const holder: { h?: FakeHarness } = {};
     const results: { isError: boolean; text: string }[] = [];
     const w = await setup(async (t) => {
@@ -12,7 +12,7 @@ describe('dev-gateway host output tools', () => {
       const first = t.inputs[0]!.content[0]!;
       if (first.type === 'text') {
         results.push(await mcpCall(mcp, 'ask_choice', { question: 'Red or blue?', options: ['red', 'blue'] }, 'toolu_1'));
-        results.push(await mcpCall(mcp, 'send_message', { route: 'fake:default:elsewhere', text: 'leak' }, 'toolu_2'));
+        results.push(await mcpCall(mcp, 'send_message', { route: 'fake:default:elsewhere', text: 'fyi' }, 'toolu_2'));
         t.emit({ t: 'text.snapshot', text: 'waiting', final: true }, { audience: 'answer' });
       } else {
         t.emit({ t: 'text.snapshot', text: `got ${JSON.stringify(first)}`, final: true }, { audience: 'answer' });
@@ -26,7 +26,8 @@ describe('dev-gateway host output tools', () => {
     expect(mcp.token.length).toBeGreaterThan(20);
     await until(() => results.length === 2);
     expect(results[0]!.isError).toBe(false);
-    expect(results[1]).toMatchObject({ isError: true, text: expect.stringMatching(/outbound policy/) });
+    // An owner (bypass) turn may send anywhere under the default policy; a restricted turn's denial is in core (#DL-5).
+    expect(results[1]).toMatchObject({ isError: false, text: expect.stringContaining('"delivered":"fake:default:elsewhere"') });
     await until(() => completed(w.events) === 1);
     const blue = choiceMsg.msg.actions!.find((a) => a.label === 'blue')!;
     // A card click comes from a conversation kind the policy does not tie to the DM session; it still reaches the asker.
