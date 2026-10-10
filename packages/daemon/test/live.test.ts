@@ -349,20 +349,19 @@ describe('live: ends, transports and destinations', () => {
     expect(chat.endpoints).toHaveLength(2);
   });
 
-  it('live_join to a meeting that is not a preregistered destination is refused by the default policy; a channel that cannot name the route first has its endpoint closed #DL-5', async () => {
+  it('live_join from an owner turn (bypass) reaches a meeting that is not preregistered; a channel that cannot name the route first has its endpoint closed when the check denies #DL-5', async () => {
     const t = toolTurns({ join: ['live_join', { target: '99' }] });
     const w = await setup(t.script);
     t.holder.h = w.harness;
     await from(w.chat, 'join');
     const r = await until(() => t.results['join']);
-    expect(r.isError).toBe(true);
-    expect(r.text).toMatch(/fake:default:meeting:99 is not an allowed destination/);
-    expect(w.chat.endpoints).toHaveLength(0);
+    expect(r.isError).toBe(false);
+    expect(w.chat.endpoints).toHaveLength(1);
 
     const chat = new MeetingChannel('fake');
     (chat as { liveRoute?: unknown }).liveRoute = undefined;
     const t2 = toolTurns({ join: ['live_join', { target: '99' }] });
-    const w2 = await setup(t2.script, { chat });
+    const w2 = await setup(t2.script, { chat, policy: { outbound: async () => 'deny' } });
     t2.holder.h = w2.harness;
     await from(w2.chat, 'join');
     expect((await until(() => t2.results['join'])).isError).toBe(true);

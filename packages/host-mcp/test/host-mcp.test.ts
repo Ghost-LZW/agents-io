@@ -64,7 +64,8 @@ describe('HostTools', () => {
   });
 
   it('denies destinations outside Policy.outbound with a clear error and a notice #DL-5', async () => {
-    const w = world();
+    // A restricted turn: a bypass (owner) turn may send anywhere under the default policy.
+    const w = world({ turn: turnOf(route(), 'restricted') });
     const err = await call(w, 'send_message', { route: 'fake:default:other', text: 'leak' }).catch((e) => e);
     expect(err).toBeInstanceOf(ToolError);
     expect(err.message).toMatch(/not allowed by the host's outbound policy/);
@@ -168,7 +169,7 @@ describe('HostMcpServer (streamable HTTP)', () => {
   });
 
   it('lists the tools and maps the harness tool-call id from _meta to the operationId #DL-2 #DL-5', async () => {
-    const w = world();
+    const w = world({ turn: turnOf(route(), 'restricted') });
     const calls: { tool: string; meta: unknown }[] = [];
     const s = new HostMcpServer({ tools: w.tools, onCall: (e) => calls.push({ tool: e.tool, meta: e.meta }) });
     servers.push(s);

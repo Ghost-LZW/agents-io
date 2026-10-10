@@ -369,7 +369,7 @@ aio-dev watch remove team-digest
 | `watch_add / watch_remove / watch_list` | 见下面"agent 自己建监听" | 永远是自己的 session |
 | `live_join / live_say / live_leave` | 以语音进出会议或通话，见 §7a | 通道的媒体对端 |
 
-目的地一律过 `Policy.outbound`。默认策略只允许本轮的回复路由（以及本轮输入带来的路由）和主人在 `policy.routes` 里预登记的路由。被拒时工具返回错误，错误里写明被拒的路由、允许的是哪些，并让模型不要换个目的地重试；日志里记一条 `notice`。
+目的地一律过 `Policy.outbound`。默认策略：主人触发的一轮（`bypass`）可以发往任何地方（它的 harness 本来就能访问一切，拦住只减功能、不减风险，决定 4、5）；其他轮只允许本轮的回复路由（以及本轮输入带来的路由）和主人在 `policy.routes` 里预登记的路由。被拒时工具返回错误，错误里写明被拒的路由、允许的是哪些，并让模型不要换个目的地重试；日志里记一条 `notice`。
 
 ### 各通道怎么呈现
 
@@ -425,7 +425,7 @@ aio-dev watch remove team-digest
 agent 自己以语音进一个会议或通话：听得到所有人，用自己的声音说话。语音由 harness 出（目前只有 Codex realtime v3，WebRTC），媒体对端由通道出（`ChannelAdapter.openLive`，例如某个通道的"加入会议"），网关只在两者之间转交 SDP，**音频不经过 agents-io**。
 
 - **开启**：Codex 实例配 `"live": true`（连接改用 Codex 的实验接口）；agent 挂了输出工具（`tools`）。
-- **工具**：`live_join { target, channel?, instructions?, voice? }`：在当前对话的通道（或 `channel` 指定的通道）上打开对端，`target` 由通道解释（如会议号、`new`），挂到本 session 的 Codex thread 上；`live_say { text }`：让语音说一段话；`live_leave`：离开。一个 session 同时至多一个 live。live 的地点（端点的 `route`）和其他外发目的地一样过 `Policy.outbound`（INVARIANTS DL-5）：缺省策略只放行本轮的回复路由和 `policy.routes` 里预登记的路由，宿主声明了 `outbound` 回调时由宿主决定。通道实现 `liveRoute(account, target)` 时网关在打开之前检查；没有实现的，打开后检查端点的路由，被拒就立即关闭端点。
+- **工具**：`live_join { target, channel?, instructions?, voice? }`：在当前对话的通道（或 `channel` 指定的通道）上打开对端，`target` 由通道解释（如会议号、`new`），挂到本 session 的 Codex thread 上；`live_say { text }`：让语音说一段话；`live_leave`：离开。一个 session 同时至多一个 live。live 的地点（端点的 `route`）和其他外发目的地一样过 `Policy.outbound`（INVARIANTS DL-5）：缺省策略放行主人触发的一轮（`bypass`）去任何会议，其他轮只放行本轮的回复路由和 `policy.routes` 里预登记的路由，宿主声明了 `outbound` 回调时由宿主决定。通道实现 `liveRoute(account, target)` 时网关在打开之前检查；没有实现的，打开后检查端点的路由，被拒就立即关闭端点。
 - **带着上下文进会**：语音挂在这个 session 的 thread 上，知道之前文字里聊过什么；会后在同一个对话里用文字接着问，它也知道会上说了什么。
 - **会里说的话怎么到 agent**：语音端自己能答的直接答；需要查资料、跑工具的，委托给 Codex：每次委托是一条输入（`transcript` 块，`from=unknown`，`channelContext` 带 `live=true`、`liveId`、`liveTitle`，回复路由是发起 live 的那个对话），Codex 随即在 thread 上开一轮，lane 把它当作本 session 的当前轮（排队、工具、来源标记照常）。这一轮**没有回复路由**：答案由语音说出，不自动发到 IM；要落成文字用 `send_message` 发到 `current`。委托时已有一轮在跑，就并进那一轮。
 - **权限**：委托出来的轮次用 thread 当时的设置，与文字轮次相同；来源标记 `external`（决定 4、5：只标记，不降档）。会里任何人都能让它干活，按需给这个 agent 合适的 profile。

@@ -64,11 +64,12 @@ describe('defaultPolicy.plan / resolve / outbound', () => {
     expect((await p.plan({ sessionKey: 's', inputs: mixed })).profile).toBe('restricted');
   });
 
-  it('allows outbound only to the turn’s routes and preregistered ones #DL-5', async () => {
+  it('allows outbound to the turn’s routes and preregistered ones; a bypass (owner) turn anywhere #DL-5', async () => {
     const steered = input('w', { route: route('web', 'web') });
-    expect(await p.outbound({ from: ctx('bypass', { inputs: [steered] }), to: route() })).toBe('allow');
-    expect(await p.outbound({ from: ctx('bypass', { inputs: [steered] }), to: route('web', 'web') })).toBe('allow');
-    expect(await p.outbound({ from: ctx('bypass'), to: route('elsewhere') })).toBe('deny');
+    expect(await p.outbound({ from: ctx('restricted', { inputs: [steered] }), to: route() })).toBe('allow');
+    expect(await p.outbound({ from: ctx('restricted', { inputs: [steered] }), to: route('web', 'web') })).toBe('allow');
+    expect(await p.outbound({ from: ctx('restricted'), to: route('elsewhere') })).toBe('deny');
+    expect(await p.outbound({ from: ctx('bypass'), to: route('elsewhere') })).toBe('allow');
     expect(await p.outbound({ from: null, to: { channel: 'mail', account: 'default', conversationId: 'me@example.com' } })).toBe('allow');
     expect(await p.outbound({ from: null, to: route() })).toBe('deny');
   });
