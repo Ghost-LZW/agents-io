@@ -67,6 +67,7 @@ class MeetingChannel extends FakeChannel {
   readonly endpoints: (LiveEndpoint & { answers: string[]; closes: string[]; hangUp(reason: string): void })[] = [];
   async openLive(account: string, target: string): Promise<LiveEndpoint> {
     if (target === 'busy') throw new Error('MEETING_PARTICIPANT_BUSY');
+    if (target.startsWith('slow')) await new Promise((r) => setTimeout(r, 80));
     let hangUp!: (r: string) => void;
     const ended = new Promise<string>((r) => (hangUp = r));
     const ep = {
@@ -155,6 +156,27 @@ describe('live tools (decision 11)', () => {
     const l = await until(() => results['leave']?.[0]);
     expect(JSON.parse(l.text)).toEqual({ ok: true, left: false });
     expect(w.harness.starts).toHaveLength(1);
+  });
+
+  it('two concurrent live_join: one wins, the other is refused without touching the running live or opening an endpoint', async () => {
+    const holder: { h?: LiveFakeHarness } = {};
+    const results: { isError: boolean; text: string }[] = [];
+    const w = await setup(async (t) => {
+      const mcp = holder.h!.sessions.at(-1)!.args.mcp;
+      const text = t.inputs.flatMap((i) => i.content).map((c) => (c.type === 'text' ? c.text : '')).join(' ');
+      if (text === 'race') results.push(...(await Promise.all([mcpCall(mcp, 'live_join', { target: 'slow1' }, 'r1'), mcpCall(mcp, 'live_join', { target: 'slow2' }, 'r2')])));
+    });
+    holder.h = w.harness;
+    await w.chat.inject({ sender: { channelUserId: 'alice', evidence: 'platform_signed' }, text: 'race' });
+    await until(() => results.length === 2);
+    expect(results.filter((r) => !r.isError)).toHaveLength(1);
+    const refused = results.find((r) => r.isError)!;
+    expect(refused.text).toMatch(/another live_join is in progress|already in a live/);
+    // The winner's endpoint is the only one ever opened and it is still up; its voice was never stopped.
+    expect(w.chat.endpoints).toHaveLength(1);
+    expect(w.chat.endpoints[0]!.closes).toEqual([]);
+    expect(w.harness.starts).toHaveLength(1);
+    expect(w.events.some((e) => e.body.t === 'live.ended')).toBe(false);
   });
 
   it('live_leave ends the live; the gateway stopping ends a running one', async () => {

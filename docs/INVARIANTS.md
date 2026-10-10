@@ -109,11 +109,17 @@
 
 ### DL-4 多个飞书机器人时不以别的机器人发出
 
-- **承诺**：多账号时 `deliver` / `systemReply` / `replyCaps` / 输出工具按 `(channel, account)` 选实例，只有该通道 id 恰好一个条目时才退回；飞书适配器拒绝发往别的账号的路由（决定 8）。
-- **实现**：`gateway.ts:1625-1628`（`channelFor`）；`compositor.ts:445-448`；`channel/lark-bot/src/adapter.ts:492-495`（`ownRoute`，用于 send / edit / finalize / retract）。
-- **测试**：`multi-lark.test.ts` "a DM to bot b is answered by b only, and its output-tool messages go out through b"、"host deliver: to its own account; an account that is not running is unknown_channel (no fallback with several bots)"、"one bot only: a delivery naming another account still goes out, as that bot's account"、"a binding with match.account only takes that bot's inputs"；`compositor-accounts.test.ts` "a route of account b is rendered by b only"、"restore: only the route's account picks up the open turn and finalizes its card"；`outbound.test.ts` "send / edit / finalize / retract refuse a route of another account, not retryable, without calling the API"。
-- **状态**：部分覆盖。
-- **不成立**：`channelFor` 数的是**当前在跑的条目**，不是配置的条目。机器人 b 被热生效停掉（`gateway.ts:1579-1580`）或启动失败被移除（`gateway.ts:1548-1551`）后只剩 a，`deliver` 与 `systemReply` 把路由改写成 `account: ch.account`（`gateway.ts:1078`、`:1107`），改写后能通过 `ownRoute`，发给 b 的消息以 a 的身份发出。`live_join` 不指定通道时同样（`gateway.ts:1224`、`:1171`）。没有测试。
+- **承诺**：多账号时 `deliver` / `systemReply` / `replyCaps` / 输出工具按 `(channel, account)` 选实例，只有该通道 id 恰好一个**配置条目**时才退回（数配置，不数在跑的：b 停掉或启动失败后 a 不会变成唯一的机器人）；找不到实例时 `deliver` 答 `unknown_channel`，区分“已配置但未运行”与“未配置”，并列出可用的 `(通道, 账号)`；`systemReply` 记 warn 不发；飞书适配器拒绝发往别的账号的路由（决定 8）。
+- **实现**：`gateway.ts` `channelFor` / `configured` / `noChannelMessage`；`compositor.ts:445-448`；`channel/lark-bot/src/adapter.ts:492-495`（`ownRoute`，用于 send / edit / finalize / retract）。
+- **测试**：`multi-lark.test.ts` "a bot that failed to start is configured but not running: its messages are never sent as the other bot"、"a DM to bot b is answered by b only, and its output-tool messages go out through b"、"host deliver: to its own account; an account that is not running is unknown_channel (no fallback with several bots)"、"one bot only: a delivery naming another account still goes out, as that bot's account"、"a binding with match.account only takes that bot's inputs"；`compositor-accounts.test.ts` "a route of account b is rendered by b only"、"restore: only the route's account picks up the open turn and finalizes its card"；`outbound.test.ts` "send / edit / finalize / retract refuse a route of another account, not retryable, without calling the API"。
+- **状态**：已覆盖（停掉或启动失败的账号不退回，已修）。
+
+### DL-4b agent 写出的每条消息带 agent 身份（`SendOp.as`）
+
+- **承诺**：会话的卡片（compositor）和输出工具发出的每条消息都带 `as = session:<sessionKey>`（`agentIdentity`，与来源 `declared`、watch 的 `createdBy` 同一格式），适配器记下它，回流时作为 `declared` 读回（POSITIONING §2 身份表明）。宿主 `deliver` 与系统回复不是 agent 写的，不带 `as`。
+- **实现**：`gateway.ts` `compose`（`as`）与 `HostTools.as`。
+- **测试**：`multi-lark.test.ts` "every agent-authored message carries the agent identity (SendOp.as); host deliveries and system replies carry none"。
+- **状态**：已覆盖。回流时把 `session:<key>` 认作 self 需要 `isSelfDeclared`，守护进程尚未接线（属 ingress/identity）。
 
 ### DL-5 外发目的地检查；宿主 outbound 回调失败即拒
 
@@ -288,11 +294,10 @@
 
 ### LN-3 一个 session 至多一个 live
 
-- **承诺**：同一 session 同时至多一个 live；已有 live 时 `live_join` 报错（决定 11）。
-- **实现**：`gateway.ts:1168-1169`；`lane.ts:386`。
-- **测试**：`live.test.ts`（session）"starts the harness live, records live.started, refuses a second one, and needs a harness that has it"；`packages/daemon/test/live.test.ts` "live_join pairs the channel peer with the harness voice; the far side hanging up ends both; live_say / live_leave"。
-- **状态**：部分覆盖（只测了先后两次）。
-- **不成立**：并发的两个 `live_join`（harness 并行调工具时可能发生）都通过 `gateway.ts:1168` 的检查，然后各自 await `openLive`、各自 `lives.set`（`:1173`），B 覆盖 A；lane 拒绝 B（`lane.ts:386`）；B 的 catch 删掉自己的登记并调 `lane.stopLive()`（`gateway.ts:1196-1199`），停掉的是 **A 的**语音；A 的 `live.ended` 到达时表里已没有它（`gateway.ts:1242-1243`），A 的通道端点不会关闭。结果是零个 live 加一个泄漏的会议端点。
+- **承诺**：同一 session 同时至多一个 live；已有 live 时 `live_join` 报错；并发的第二个 `live_join` 在 `await openLive` 之前就被 `joining` 占位拒绝，不碰正在跑的 live，也不为它开端点（决定 11）。
+- **实现**：`gateway.ts` `joinLive`（`joining` 占位）；`lane.ts:386`。
+- **测试**：`live.test.ts`（session）"starts the harness live, records live.started, refuses a second one, and needs a harness that has it"；`packages/daemon/test/live.test.ts` "two concurrent live_join: one wins, the other is refused without touching the running live or opening an endpoint"、"live_join pairs the channel peer with the harness voice; the far side hanging up ends both; live_say / live_leave"。
+- **状态**：已覆盖（先后两次与并发两次）。
 
 ### LN-4 live 任一端结束，两端都结束并记 live.ended
 

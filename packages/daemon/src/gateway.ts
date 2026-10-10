@@ -67,7 +67,7 @@ import {
   topicContext,
   topicView,
 } from '@agents-io/session';
-import { HostMcpServer, HostTools, ToolError, type TopicHandover } from '@agents-io/host-mcp';
+import { HostMcpServer, HostTools, ToolError, agentIdentity, type TopicHandover } from '@agents-io/host-mcp';
 import { ClaudeCodeHarness, findOnPath, type ClaudeCodeHarnessConfig } from '@agents-io/harness-claude-code';
 import { CodexHarness, type CodexProfile } from '@agents-io/harness-codex';
 import { loadChannelModule } from './channel-module.js';
@@ -222,6 +222,8 @@ export class Gateway {
   private readonly agentAdapters = new Map<string, HarnessAdapter>();
   private readonly lanes = new Map<string, Lane>();
   /** Running lives (decision 11), by session: the channel's media peer of each. */
+  /** Sessions with a live_join still opening its endpoint (the claim that keeps it to one live). */
+  private readonly joining = new Set<string>();
   private readonly lives = new Map<string, { liveId: string; endpoint: LiveEndpoint }>();
   /** Agent and working directory of each live lane. */
   private readonly laneInfo = new Map<string, { agent: AgentConfig; cwd?: string }>();
@@ -234,6 +236,8 @@ export class Gateway {
   /** Live channel applies run one at a time. */
   private applying: Promise<unknown> = Promise.resolve();
   private readonly channels: RunningChannel[] = [];
+  /** Every (channel id, account) configured or injected and not removed from the config: stays when its instance failed or stopped. */
+  private readonly configured = new Map<string, { id: string; account: string }>();
   private server: LocalServer | undefined;
   private tokenFile: string | undefined;
   /** The console API server (`GatewayOptions.console`). */
@@ -374,6 +378,7 @@ export class Gateway {
         // Only lanes that exist: a tool call always comes from a running harness session.
         turn: (key) => this.lanes.get(key)?.currentTurn(),
         adapter: (r) => this.channelFor(r)?.adapter,
+        as: (key) => agentIdentity(key),
         blobs: this.blobs,
         cwd: (key) => this.laneInfo.get(key)?.cwd ?? this.instanceOf(this.lanes.get(key)?.harnessId)?.cwd ?? c.cwd,
         tier: (r) => this.channelFor(r)?.tier,
@@ -1073,8 +1078,9 @@ export class Gateway {
     const settled = this.outbox.get(operationId);
     if (settled) return { ok: true, value: { ...settled, operationId: f.operationId, duplicate: true } };
     const ch = this.channelFor(f.route);
-    if (!ch) return fail('unknown_channel', `no running channel ${f.route.channel} with account ${f.route.account} (running: ${this.channels.map((x) => `${x.adapter.id} (${x.account})`).join(', ') || 'none'})`);
-    // A single-account fallback sends as that account (the adapter refuses routes of other accounts).
+    if (!ch) return fail('unknown_channel', this.noChannelMessage(f.route));
+    // A single-entry fallback sends as that entry's account (the adapter refuses routes of other accounts).
+    // Not agent-authored (the host speaks): no `as`.
     const rec = await this.outbox.send(ch.adapter, { operationId, sessionKey: `host:${hostName}`, route: { ...f.route, account: ch.account }, msg: f.message });
     return { ok: true, value: { ...rec, operationId: f.operationId, duplicate: false } };
   }
@@ -1103,7 +1109,11 @@ export class Gateway {
   /** A topic command's answer: one plain message on the route, through the outbox (recorded in the topic's session). */
   private async systemReply(a: { route: ReplyRoute; text: string; operationId: string; sessionKey: string }): Promise<void> {
     const ch = this.channelFor(a.route);
-    if (!ch) return; // local ends read their stream; there is no adapter to send with
+    if (!ch) {
+      // Local ends read their stream; a channel route with no instance is never sent as another account (decision 8).
+      if (a.route.channel !== 'local') this.log('warn', `system reply not sent: ${this.noChannelMessage(a.route)}`);
+      return;
+    }
     const { replyToMessageId: _r, ...route } = { ...a.route, account: ch.account };
     await this.outbox.send(ch.adapter, { operationId: a.operationId, sessionKey: a.sessionKey, route, msg: { text: a.text } });
   }
@@ -1167,10 +1177,20 @@ export class Gateway {
     if (!lane) throw new ToolError(`no session ${sessionKey}`);
     const cur = this.lives.get(sessionKey);
     if (cur) throw new ToolError(`already in a live (${cur.endpoint.title}); live_leave first`);
-    const ch = this.liveChannel(turn, a.channel);
-    const endpoint = await ch.adapter.openLive!(ch.account, a.target);
+    // Decision 11: one live per session. Claimed before the first await, so a concurrent join is refused
+    // without touching the running one and without opening an endpoint of its own.
+    if (this.joining.has(sessionKey)) throw new ToolError('another live_join is in progress for this session; at most one live per session');
+    this.joining.add(sessionKey);
+    let endpoint: LiveEndpoint;
+    let ch: RunningChannel;
     const liveId = `live_${randomUUID().slice(0, 8)}`;
-    this.lives.set(sessionKey, { liveId, endpoint });
+    try {
+      ch = this.liveChannel(turn, a.channel);
+      endpoint = await ch.adapter.openLive!(ch.account, a.target);
+      this.lives.set(sessionKey, { liveId, endpoint });
+    } finally {
+      this.joining.delete(sessionKey);
+    }
     try {
       const offer = endpoint.offer;
       let transport: LiveStartArgs['transport'];
@@ -1374,6 +1394,8 @@ ${a.summary}` }],
       // Each bot renders its own routes only: two Lark bots must not race for one reply.
       account,
       outbox: this.outbox,
+      // Every message the session's agent produces says who wrote it (POSITIONING §2 identity declaration).
+      as: agentIdentity(sessionKey),
       ...(tier ? { tier } : {}),
       // A stop button on streaming cards; Ingress turns its click into an `interrupt` command.
       interruptButton: true,
@@ -1537,6 +1559,7 @@ ${a.summary}` }],
         launched.push(e);
       } catch (err) {
         failed.push({ ...ref(w.c), error: (err as Error).message });
+        this.configured.set(`${w.c.type}\0${w.c.account}`, { id: w.c.type, account: w.c.account });
         this.log('error', `channel ${w.c.type} (${w.c.account}) not started: ${(err as Error).message}`);
       }
     }
@@ -1548,7 +1571,7 @@ ${a.summary}` }],
       if (e.ended) {
         // Its start rejected: forget it, so the next apply starts it again.
         failed.push({ ...ref(e.source!), error: e.error ?? 'the channel stopped' });
-        if (!this.stopped) await this.stopChannel(e);
+        if (!this.stopped) await this.stopChannel(e, false);
       } else if (e.state === 'failed') failed.push({ ...ref(e.source!), error: e.error ?? 'not connected' });
       else out.started.push(ref(e.source!));
     }
@@ -1565,8 +1588,10 @@ ${a.summary}` }],
   }
 
   /** Stop one running channel and the compositors rendering to it, and forget it. */
-  private async stopChannel(e: RunningChannel): Promise<void> {
+  private async stopChannel(e: RunningChannel, forget = true): Promise<void> {
     e.ac.abort();
+    // Removed from the config: no longer configured. A start that failed stays configured (it is just not running).
+    if (forget) this.configured.delete(`${e.adapter.id}\0${e.account}`);
     await within(e.running, 3000);
     const comps = this.compositors.filter((c) => this.compositorAdapter.get(c) === e.adapter);
     await within(Promise.all(comps.map((c) => c.stop())), 5000);
@@ -1612,6 +1637,7 @@ ${a.summary}` }],
       );
     const entry: RunningChannel = { adapter: ch.adapter, account: ch.account, ...(ch.tier ? { tier: ch.tier } : {}), ac, running, state: 'running', ...(ch.close ? { close: ch.close } : {}) };
     this.channels.push(entry);
+    this.configured.set(`${ch.adapter.id}\0${ch.account}`, { id: ch.adapter.id, account: ch.account });
     this.log('info', `channel ${ch.adapter.id} (${ch.account}) started`);
     return entry;
   }
@@ -1623,8 +1649,24 @@ ${a.summary}` }],
    * a message never goes out as another bot (decision 8).
    */
   private channelFor(r: { channel: string; account: string }): RunningChannel | undefined {
-    const same = this.channels.filter((x) => x.adapter.id === r.channel);
-    return same.find((x) => x.account === r.account) ?? (same.length === 1 ? same[0] : undefined);
+    const same = this.channels.filter((x) => x.adapter.id === r.channel && !x.ended);
+    const own = same.find((x) => x.account === r.account);
+    if (own) return own;
+    // The fallback counts configured entries, not running ones: a stopped or failed bot b must not turn a into the one bot.
+    return same.length === 1 && this.configuredAccounts(r.channel).length <= 1 ? same[0] : undefined;
+  }
+
+  /** Accounts of the entries configured (or injected) for a channel id, running or not. */
+  private configuredAccounts(channel: string): string[] {
+    return [...this.configured.values()].filter((x) => x.id === channel).map((x) => x.account);
+  }
+
+  /** Why no instance sends to this route: configured but not running, or not configured; and what is available. */
+  private noChannelMessage(r: { channel: string; account: string }): string {
+    const avail = this.channels.filter((x) => !x.ended).map((x) => `${x.adapter.id} (${x.account})`).join(', ') || 'none';
+    const configured = this.configured.has(`${r.channel}\0${r.account}`);
+    const why = configured ? `channel ${r.channel} with account ${r.account} is configured but not running` : `no channel ${r.channel} with account ${r.account} is configured`;
+    return `${why}; never sent as another account (available: ${avail})`;
   }
 
   /** Caps and tier of the running channel that renders replies to (channel, account), for the input's `reply` summary. */

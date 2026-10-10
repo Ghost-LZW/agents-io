@@ -25,14 +25,21 @@ async function mcpCall(mcp: { url: string; token: string } | undefined, name: st
   return { isError: !!body.result.isError, text: body.result.content[0]!.text };
 }
 
-async function bots(o: { raw?: Record<string, unknown>; script?: FakeTurnScript; accounts?: string[] } = {}) {
+/** A bot whose connection never comes up: `start` rejects, so the instance ends at once (configured, not running). */
+class DeadBot extends FakeChannel {
+  override async start(): Promise<void> {
+    throw new Error('connect refused');
+  }
+}
+
+async function bots(o: { raw?: Record<string, unknown>; script?: FakeTurnScript; accounts?: string[]; dead?: string[] } = {}) {
   const dir = tmp('aio-ml-');
   mkdirSync(join(dir, 'work'), { recursive: true });
   const raw = { dataDir: dir, policy: { owners: ['lark-bot:alice'] }, local: { principal: 'me' }, cwd: join(dir, 'work'), ...o.raw };
   const base = resolveConfig(raw, { env: {}, baseDir: dir, cwd: dir });
   const config = { ...base, socketPath: join(dir, 'run', 'aio.sock') };
   const harness = new FakeHarness(o.script);
-  const chans = Object.fromEntries((o.accounts ?? ['a', 'b']).map((acc) => [acc, new FakeChannel('lark-bot')]));
+  const chans = Object.fromEntries((o.accounts ?? ['a', 'b']).map((acc) => [acc, (o.dead?.includes(acc) ? new DeadBot('lark-bot') : new FakeChannel('lark-bot'))]));
   const gw = await Gateway.start({
     config,
     buildHarness: (i: HarnessInstance) => new InstanceHarness(i, harness),
@@ -92,6 +99,47 @@ describe('several lark-bot accounts (decision 8)', () => {
     expect((r as { message: string }).message).toContain('lark-bot (a), lark-bot (b)');
     expect(a.sent).toEqual([]);
     expect(b.sent).toHaveLength(1);
+  });
+
+  it('a bot that failed to start is configured but not running: its messages are never sent as the other bot', async () => {
+    const w = await bots({ dead: ['b'] });
+    const { a } = w.chans as { a: FakeChannel };
+    await until(() => ((w.gw as unknown as { channels: { ended?: boolean }[] }).channels.some((c) => c.ended) ? true : undefined));
+    const r = (await w.gw.deliver('xwo', deliver({ channel: 'lark-bot', account: 'b', conversationId: 'c9' }, 'op1'))) as { ok: boolean; code: string; message: string };
+    expect(r).toMatchObject({ ok: false, code: 'unknown_channel' });
+    expect(r.message).toContain('configured but not running');
+    expect(r.message).toContain('lark-bot (a)');
+    // An account nobody configured is told apart from a configured one that is down.
+    const n = (await w.gw.deliver('xwo', deliver({ channel: 'lark-bot', account: 'zz', conversationId: 'c9' }, 'op2'))) as { message: string };
+    expect(n.message).toContain('no channel lark-bot with account zz is configured');
+    // System replies take the same path: nothing goes out as a.
+    await (w.gw as unknown as { systemReply(x: unknown): Promise<void> }).systemReply({ route: { channel: 'lark-bot', account: 'b', conversationId: 'c9' }, text: 'x', operationId: 'sys1', sessionKey: 's' });
+    expect(a.sent).toEqual([]);
+    // Bot a itself still works.
+    expect(await w.gw.deliver('xwo', deliver({ channel: 'lark-bot', account: 'a', conversationId: 'c9' }, 'op3'))).toMatchObject({ ok: true });
+    expect(a.sent).toHaveLength(1);
+  });
+
+  it('every agent-authored message carries the agent identity (SendOp.as); host deliveries and system replies carry none', async () => {
+    const holder: { h?: FakeHarness } = {};
+    const w = await bots({
+      script: async (t) => {
+        await mcpCall(holder.h!.sessions.at(-1)!.args.mcp, 'ask_choice', { question: 'Red or blue?', options: ['red', 'blue'] }, 'toolu_1');
+        t.emit({ t: 'text.snapshot', text: 'answer from b', final: true }, { audience: 'answer' });
+      },
+    });
+    holder.h = w.harness;
+    const { b } = w.chans as { b: FakeChannel };
+    await b.inject({ ...alice, text: 'hi' });
+    await until(() => b.sent.some((m) => m.finalized) && b.sent.length >= 2);
+    const key = w.harness.sessions.at(-1)!.args.sessionKey;
+    expect(b.sent.length).toBeGreaterThanOrEqual(2);
+    for (const m of b.sent) expect(m.op.as).toBe(`session:${key}`);
+    await w.gw.deliver('xwo', deliver({ channel: 'lark-bot', account: 'b', conversationId: 'c9' }, 'opx'));
+    expect(b.sent.at(-1)!.op.as).toBeUndefined();
+    await (w.gw as unknown as { systemReply(x: unknown): Promise<void> }).systemReply({ route: { channel: 'lark-bot', account: 'b', conversationId: 'c9' }, text: 'x', operationId: 'sys1', sessionKey: 's' });
+    expect(b.sent.at(-1)!.msg).toMatchObject({ text: 'x' });
+    expect(b.sent.at(-1)!.op.as).toBeUndefined();
   });
 
   it('one bot only: a delivery naming another account still goes out, as that bot\'s account', async () => {
