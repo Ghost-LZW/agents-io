@@ -263,7 +263,8 @@ export class Lane {
       maxItems: Math.max(0, o.context?.maxItems ?? CONTEXT_DEFAULTS.maxItems),
       maxChars: Math.max(1, o.context?.maxChars ?? CONTEXT_DEFAULTS.maxChars),
     };
-    // Context recorded but not handed over before the previous host stopped is still handed to the next turn.
+    // Context recorded but not handed over before the previous host stopped is still handed to the next turn;
+    // the ids it admitted stay known.
     if (snap.seq > 0) this.rebuildContext(o.hub.log.read(o.sessionKey, 0));
   }
 
@@ -282,6 +283,9 @@ export class Lane {
    */
   observe(input: InputRecord): Promise<CommandResult> {
     return this.serial(async () => {
+      // The same message again (a redelivery, also after a restart): not a revision.
+      const prior = this.observedInputs.get(input.inputId);
+      if (prior && sameContent(prior, input)) return { ok: true, disposition: 'duplicate' } as const;
       this.recordContext(input);
       this.indexCause(input);
       return { ok: true, disposition: 'observe_only' } as const;
@@ -903,6 +907,8 @@ export class Lane {
     const records = new Map<string, InputRecord>();
     for (const e of events) {
       const b = e.body;
+      // Admitted by an earlier host: the same input id again is a duplicate (IN-5 across restarts).
+      if (b.t === 'input.admitted' && b.disposition !== 'observe_only') this.known.add(b.inputId);
       if (b.t === 'input.admitted' && b.input) {
         records.set(b.inputId, b.input);
         if (b.disposition === 'observe_only') {

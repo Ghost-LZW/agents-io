@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import {
   InboundEnvelope,
   errors,
@@ -104,6 +104,12 @@ export interface IngressOptions {
    * conversation (card callbacks often carry another conversation kind, no thread).
    */
   hub?: Pick<Hub, 'locate'>;
+  /**
+   * Input ids. Default: derived from `(channel, account, envelope id)` ({@link envelopeInputId}),
+   * so a redelivery of the same message (also after a restart, or after a partial fan-out)
+   * is the same input and the lanes, which keep the ids their session log admitted, answer
+   * it as a duplicate (IN-5). An embedder giving its own ids takes that over.
+   */
   newId?: (prefix: string) => string;
   /**
    * Rewrite a routed envelope before it becomes an input, e.g. turn a click on
@@ -238,7 +244,7 @@ export interface IngressResult {
 export class Ingress {
   private readonly policy: FullPolicy;
   private readonly router: Router;
-  private readonly newId: (prefix: string) => string;
+  private readonly inputIdOf: (env: InboundEnvelope) => string;
   private seen = new Map<string, IngressResult>();
   /** Envelopes being processed, so a concurrent duplicate waits for (and reuses) the first. */
   private inflight = new Map<string, Promise<IngressResult>>();
@@ -247,7 +253,8 @@ export class Ingress {
 
   constructor(private readonly o: IngressOptions) {
     this.policy = withDefaults(o.policy);
-    this.newId = o.newId ?? ((p) => `${p}_${randomUUID()}`);
+    const newId = o.newId;
+    this.inputIdOf = newId ? () => newId('in') : (env) => envelopeInputId(env.channel, env.account, env.id);
     this.router =
       o.router ??
       new Router({
@@ -366,9 +373,13 @@ export class Ingress {
       return { accepted: true, action, sessionKey: owner, origin, result };
     }
 
-    const revisionOf = env.revisionOf !== undefined ? this.inputIds.get(envKey(env.channel, env.account, env.revisionOf)) : undefined;
+    // The original's id: remembered, else (default ids) derived from it, so a revision still finds it after the window or a restart.
+    const revisionOf =
+      env.revisionOf !== undefined
+        ? (this.inputIds.get(envKey(env.channel, env.account, env.revisionOf)) ?? (this.o.newId ? undefined : envelopeInputId(env.channel, env.account, env.revisionOf)))
+        : undefined;
     let input: InputRecord = {
-      inputId: revisionOf ?? this.newId('in'),
+      inputId: revisionOf ?? this.inputIdOf(env),
       origin,
       content: env.content,
       replyRoute: env.replyRoute,
@@ -380,7 +391,7 @@ export class Ingress {
     const own = decision.deliveries.filter((d) => d.source !== 'watch');
     // Latest-wins revisions keep the original input id, but only for context-only inputs:
     // a dispatched input may already be running, so its revision is a new input.
-    if (revisionOf && own.some((d) => d.on === 'dispatch')) input = { ...input, inputId: this.newId('in') };
+    if (revisionOf && own.some((d) => d.on === 'dispatch')) input = { ...input, inputId: this.inputIdOf(env) };
     this.inputIds.set(envKey(env.channel, env.account, env.id), input.inputId);
     const explanation: Explanation = { ...decision.explanation, inputId: input.inputId, ...(claimedEvidence !== undefined ? { claimedEvidence } : {}), ...(cause ? { cause } : {}) };
     this.router.record(explanation);
@@ -676,6 +687,11 @@ function ago(ms: number): string {
 }
 
 const envKey = (channel: string, account: string, id: string) => `${channel}:${account}:${id}`;
+
+/** The input id of a channel message: the same `(channel, account, envelope id)` is always the same input. */
+export function envelopeInputId(channel: string, account: string, id: string): string {
+  return `in_${createHash('sha256').update(`${channel}\u0000${account}\u0000${id}`).digest('hex').slice(0, 24)}`;
+}
 
 /** Why an envelope does not belong to the source that emitted it, if it does not. */
 function sourceMismatch(env: InboundEnvelope, s: EmitSource): string | undefined {

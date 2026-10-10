@@ -279,8 +279,7 @@ describe('Ingress dedup beyond one process and one delivery (IN-5)', () => {
     return { ingress, admitted, idle, stop };
   }
 
-  // INVARIANTS IN-5 不成立 1: the dedup table is in memory, so after a restart a platform redelivery enters the session again under a new input id; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('after a restart (a new Ingress) the same (channel, account, id) does not enter the session a second time #IN-5', async () => {
+  it('after a restart (a new Ingress) the same (channel, account, id) does not enter the session a second time #IN-5', async () => {
     const path = tempPath();
     const env = fakeEnvelope({ id: 'om_redelivered', sender: alice, text: 'once' });
     const one = processAt(path);
@@ -295,8 +294,7 @@ describe('Ingress dedup beyond one process and one delivery (IN-5)', () => {
     await two.stop();
   });
 
-  // INVARIANTS IN-5 不成立 2: a non-LaneUnavailableError from the second delivery makes accept throw without remembering the envelope, so the redelivery enters the first session again; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('an envelope fanned out to two sessions whose second delivery throws: the redelivery does not give the first session the input twice #IN-5', async () => {
+  it('an envelope fanned out to two sessions whose second delivery throws: the redelivery does not give the first session the input twice #IN-5', async () => {
     const router = new Router({
       agents: [{ name: 'default', sessionPrefix: '' }],
       defaultAgent: 'default',
@@ -320,5 +318,50 @@ describe('Ingress dedup beyond one process and one delivery (IN-5)', () => {
     expect(w.admitted('B')).toHaveLength(1);
     expect(w.admitted('A')).toHaveLength(1);
     await w.stop();
+  });
+
+  it('after a restart a context-only message delivered again is not recorded a second time #IN-5', async () => {
+    const path = tempPath();
+    const router = () =>
+      new Router({
+        agents: [{ name: 'default', sessionPrefix: '' }],
+        defaultAgent: 'default',
+        config: { version: 'v', identities: [], bindings: [{ id: 'c', match: {}, on: 'context', session: { key: 'C' } }] },
+      });
+    const env = fakeEnvelope({ id: 'om_ctx', sender: alice, text: 'fyi' });
+    const one = processAt(path, { router: router() });
+    expect((await one.ingress.accept(env)).action).toBe('observe');
+    await one.stop();
+    const two = processAt(path, { router: router() });
+    expect((await two.ingress.accept({ ...env })).result).toEqual({ ok: true, disposition: 'duplicate' });
+    expect(two.admitted('C')).toHaveLength(1);
+    await two.stop();
+  });
+
+  it('past the dedup window: a redelivery still does not enter the session twice, and a revision still replaces its original #IN-5', async () => {
+    const hub = new Hub(new MemorySessionLog());
+    const policy = defaultPolicy({ owners: ['fake:alice'], run: RUN });
+    const lanes = new Map<string, Lane>();
+    const harness = new FakeHarness(async () => {});
+    const ingress = new Ingress({
+      policy,
+      dedupWindow: 1,
+      lanes: (k) => {
+        let l = lanes.get(k);
+        if (!l) lanes.set(k, (l = new Lane({ sessionKey: k, harness, hub, policy, thinkingHeadline: null })));
+        return l;
+      },
+    });
+    const seg = (text: string) => [{ type: 'transcript' as const, speaker: 'eve', text, startMs: 0, endMs: 900, stable: true }];
+    const m1 = fakeEnvelope({ id: 'w1', sender: alice, text: 'first' });
+    const first = await ingress.accept(m1);
+    const c1 = await ingress.accept(fakeEnvelope({ id: 'c1', sender: stranger, conversation: group, content: seg('helo') }));
+    await ingress.accept(fakeEnvelope({ id: 'w2', sender: alice, text: 'second' })); // pushes w1 and c1 out of the window
+    expect((await ingress.accept({ ...m1 })).result).toEqual({ ok: true, disposition: 'duplicate' });
+    const rev = await ingress.accept(fakeEnvelope({ id: 'c1-r1', revisionOf: 'c1', sender: stranger, conversation: group, content: seg('hello') }));
+    expect(rev.inputId).toBe(c1.inputId);
+    for (const l of lanes.values()) await l.whenIdle();
+    expect(bodies(hub.log.read('fake:default:c1', 0), 'input.admitted').filter((b) => (b as { inputId: string }).inputId === first.inputId)).toHaveLength(1);
+    expect(lanes.get('fake:default:g1')!.observed().map((i) => i.content)).toEqual([seg('hello')]);
   });
 });
