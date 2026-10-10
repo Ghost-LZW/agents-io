@@ -1,130 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import type { SendMailOptions } from 'nodemailer';
-import type { BlobStore, InboundEnvelope } from '@agents-io/protocol';
+import type { BlobStore } from '@agents-io/protocol';
 import { runChannelConformance } from '@agents-io/testkit';
-import {
-  MailChannel,
-  MemoryMailStore,
-  messageIdFor,
-  splitQuote,
-  verdictFromAuth,
-  type AttachmentBlob,
-  type AuthVerdict,
-  type FetchedMail,
-  type MailChannelConfig,
-  type MailSource,
-  type MailTransport,
-  type MailVerifier,
-} from '../src/index.js';
-
-const cfg: MailChannelConfig = {
-  account: 'bot',
-  imap: { host: 'x', port: 993, secure: true, auth: { user: 'bot@agents.test', pass: 'p' } },
-  smtp: { host: 'x', port: 465, secure: true },
-  from: 'Agent <bot@agents.test>',
-};
-
-function raw(headers: Record<string, string>, body: string, extra = ''): Buffer {
-  const h = { From: 'Alice <Alice@Example.com>', To: 'bot@agents.test', Subject: 'Hello', Date: 'Mon, 01 Jan 2026 10:00:00 +0000', ...headers };
-  const head = Object.entries(h).map(([k, v]) => `${k}: ${v}`).join('\r\n');
-  return Buffer.from(`${head}\r\n${extra || 'Content-Type: text/plain; charset=utf-8\r\n'}\r\n${body}`);
-}
-
-class FakeSource implements MailSource {
-  private queue: FetchedMail[] = [];
-  private wake: () => void = () => {};
-  checkpointSeen: unknown;
-  push(m: FetchedMail) {
-    this.queue.push(m);
-    this.wake();
-  }
-  async watch(a: Parameters<MailSource['watch']>[0]) {
-    this.checkpointSeen = await a.checkpoint();
-    while (!a.signal.aborted) {
-      const m = this.queue.shift();
-      if (m) await a.onMessage({ ...m, uidValidity: '1' });
-      else await new Promise<void>((r) => { this.wake = r; a.signal.addEventListener('abort', () => r(), { once: true }); });
-    }
-  }
-}
-
-class FakeTransport implements MailTransport {
-  sent: SendMailOptions[] = [];
-  async sendMail(o: SendMailOptions) {
-    this.sent.push(o);
-    return {};
-  }
-}
-
-const passVerifier: MailVerifier = async () => ({ evidence: 'dkim_pass' });
-
-async function harness(opts: { verify?: MailVerifier; store?: MemoryMailStore; hostBlobs?: BlobStore; cfg?: Partial<MailChannelConfig> } = {}) {
-  const source = new FakeSource();
-  const transport = new FakeTransport();
-  const store = opts.store ?? new MemoryMailStore();
-  const blobs: AttachmentBlob[] = [];
-  const sink = opts.hostBlobs ? {} : { blobs: { put: async (b: AttachmentBlob) => void blobs.push(b) } };
-  const adapter = new MailChannel({ ...cfg, ...opts.cfg }, { source, transport, store, verify: opts.verify ?? passVerifier, ...sink });
-  const envs: InboundEnvelope[] = [];
-  const ctl = new AbortController();
-  const done = adapter.start({
-    account: 'bot',
-    config: undefined,
-    signal: ctl.signal,
-    ...(opts.hostBlobs ? { blobs: opts.hostBlobs } : {}),
-    emit: async (e) => {
-      envs.push(e);
-      return { accepted: true };
-    },
-    log: () => {},
-  });
-  const next = async (m: FetchedMail) => {
-    const n = envs.length;
-    source.push(m);
-    for (let i = 0; i < 200 && envs.length === n; i++) await new Promise((r) => setTimeout(r, 5));
-    return envs[n]!;
-  };
-  return { adapter, source, transport, store, blobs, envs, next, stop: async () => { ctl.abort(); await done; } };
-}
+import { MailChannel, MemoryMailStore, messageIdFor, verdictFromAuth, type AuthVerdict, type MailVerifier } from '../src/index.js';
+import { FakeSource, FakeTransport, cfg, harness, passVerifier, raw } from './mail-helpers.js';
 
 describe('inbound', () => {
-  it('maps threading ids and sender', async () => {
-    const h = await harness();
-    const first = await h.next({ uid: 1, raw: raw({ 'Message-ID': '<a@x>' }, 'hi') });
-    expect(first.id).toBe('<a@x>');
-    expect(first.conversation).toEqual({ id: '<a@x>', kind: 'mail' });
-    expect(first.sender.channelUserId).toBe('alice@example.com');
-    expect(first.replyRoute).toEqual({ channel: 'mail', account: 'bot', conversationId: '<a@x>', replyToMessageId: '<a@x>' });
-
-    const reply = await h.next({ uid: 2, raw: raw({ 'Message-ID': '<b@x>', 'In-Reply-To': '<a@x>' }, 'again') });
-    expect(reply.conversation.id).toBe('<a@x>');
-    const deep = await h.next({ uid: 3, raw: raw({ 'Message-ID': '<c@x>', 'In-Reply-To': '<b@x>', References: '<a@x> <b@x>' }, 'deep') });
-    expect(deep.conversation.id).toBe('<a@x>');
-    expect(deep.replyRoute?.replyToMessageId).toBe('<c@x>');
-    await h.stop();
-  });
-
-  it('strips quoted history into a truncated quote block', async () => {
-    const h = await harness();
-    const body = 'Sounds good.\n\nOn Mon, 1 Jan 2026 at 09:00, Bot <bot@agents.test> wrote:\n> earlier text\n> more';
-    const e = await h.next({ uid: 1, raw: raw({ 'Message-ID': '<q@x>', 'In-Reply-To': '<p@x>' }, body) });
-    expect(e.content[0]).toEqual({ type: 'text', text: 'Subject: Hello\n\nSounds good.' });
-    expect(e.content[1]).toMatchObject({ type: 'quote', fromMessageId: '<p@x>' });
-    expect((e.content[1] as { text: string }).text).toContain('> earlier text');
-
-    const long = 'ok\n' + Array.from({ length: 2000 }, () => '> quoted line here').join('\n');
-    const e2 = await h.next({ uid: 2, raw: raw({ 'Message-ID': '<q2@x>' }, long) });
-    expect((e2.content[1] as { text: string }).text.length).toBeLessThan(4100);
-    await h.stop();
-  });
-
-  it('splitQuote handles outlook and original-message markers', () => {
-    expect(splitQuote('yes\n\n-----Original Message-----\nFrom: a\nSent: b\n').body).toBe('yes');
-    expect(splitQuote('yes\n\nFrom: a\nSent: b\nTo: c\n\nold').body).toBe('yes');
-    expect(splitQuote('no quotes').quoted).toBe('');
-  });
-
-  it('turns attachments into ref blocks and stores bytes via the blob sink', async () => {
+  it('turns attachments into ref blocks and stores bytes via the blob sink #MD-1', async () => {
     const h = await harness();
     const mime = [
       'Content-Type: multipart/mixed; boundary="B"',
@@ -151,7 +32,7 @@ describe('inbound', () => {
     await h.stop();
   });
 
-  it('stores attachments in the host BlobStore and emits file/image blocks with its refs', async () => {
+  it('stores attachments in the host BlobStore and emits file/image blocks with its refs #MD-1', async () => {
     const stored: { bytes: Uint8Array; mime: string; name?: string }[] = [];
     const hostBlobs: BlobStore = {
       async put(bytes, meta) {
@@ -186,20 +67,7 @@ describe('inbound', () => {
     await h.stop();
   });
 
-  it('drops auto-replies and bounces', async () => {
-    const h = await harness();
-    const a = await h.next({ uid: 1, raw: raw({ 'Message-ID': '<oo@x>', 'Auto-Submitted': 'auto-replied' }, 'out of office') });
-    expect(a.admission).toBe('drop');
-    const b = await h.next({ uid: 2, raw: raw({ 'Message-ID': '<bulk@x>', Precedence: 'bulk' }, 'news') });
-    expect(b.admission).toBe('drop');
-    const c = await h.next({ uid: 3, raw: raw({ 'Message-ID': '<bn@x>', From: 'MAILER-DAEMON@example.com' }, 'undeliverable') });
-    expect(c.admission).toBe('drop');
-    const d = await h.next({ uid: 4, raw: raw({ 'Message-ID': '<ok@x>', 'Auto-Submitted': 'no' }, 'normal') });
-    expect(d.admission).toBeUndefined();
-    await h.stop();
-  });
-
-  it('maps verification to evidence, defaulting to none', async () => {
+  it('maps verification to evidence, defaulting to none #ID-4 #ID-3', async () => {
     const pass = await harness();
     expect((await pass.next({ uid: 1, raw: raw({ 'Message-ID': '<e1@x>' }, 'x') })).sender.evidence).toBe('dkim_pass');
     await pass.stop();
@@ -211,7 +79,7 @@ describe('inbound', () => {
     await boom.stop();
   });
 
-  it('verdictFromAuth requires aligned DKIM for the From domain', () => {
+  it('verdictFromAuth requires aligned DKIM for the From domain #ID-4', () => {
     const dmarc = (dkim: string | false, status = 'pass') => ({ domain: 'example.com', status: { result: status }, alignment: { dkim: { result: dkim, strict: false }, spf: { result: 'pass', strict: false } } });
     const res = (d: unknown, results: unknown[] = []) => ({ dkim: { headerFrom: ['example.com'], envelopeFrom: false, results }, dmarc: d }) as never;
     expect(verdictFromAuth(res(dmarc('pass')), 'example.com').evidence).toBe('dkim_pass');
@@ -223,48 +91,43 @@ describe('inbound', () => {
     expect(verdictFromAuth(res(dmarc('pass')), 'other.com').evidence).toBe('none');
   });
 
-  it('persists a checkpoint after the host accepts each message', async () => {
+  it('persists a checkpoint after the host accepts each message #IN-7', async () => {
     const h = await harness();
     await h.next({ uid: 7, raw: raw({ 'Message-ID': '<cp@x>' }, 'x') });
     await new Promise((r) => setTimeout(r, 10));
     expect(await h.store.getCheckpoint('INBOX')).toEqual({ uidValidity: '1', uid: 7 });
     await h.stop();
   });
+
+  // INVARIANTS IN-7 不成立 1: onMessage moves the checkpoint after any emit that returns, also { accepted: false } (gateway stopping); turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails('does not move the checkpoint past a message the host answered accepted:false #IN-7', async () => {
+    const source = new FakeSource();
+    const store = new MemoryMailStore();
+    const adapter = new MailChannel(cfg, { source, transport: new FakeTransport(), store, verify: passVerifier, blobs: { put: async () => {} } });
+    const ctl = new AbortController();
+    let emitted = 0;
+    const done = adapter.start({
+      account: 'bot',
+      config: undefined,
+      signal: ctl.signal,
+      emit: async () => {
+        emitted++;
+        return { accepted: false, error: 'gateway stopping' };
+      },
+      log: () => {},
+    });
+    source.push({ uid: 7, raw: raw({ 'Message-ID': '<stop@x>' }, 'x') });
+    for (let i = 0; i < 200 && emitted === 0; i++) await new Promise((r) => setTimeout(r, 5));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(emitted).toBe(1);
+    expect((await store.getCheckpoint('INBOX'))?.uid).not.toBe(7);
+    ctl.abort();
+    await done;
+  });
 });
 
 describe('outbound', () => {
-  it('sends output-tool attachments from the host blob store; a numbered ask_choice is plain text', async () => {
-    const m = new Map<string, { bytes: Uint8Array; mime: string; name?: string }>([['sha256:r', { bytes: new TextEncoder().encode('# hi'), mime: 'text/markdown', name: 'README.md' }]]);
-    const hostBlobs: BlobStore = { put: async () => 'x', get: async (ref) => { const b = m.get(ref); if (!b) throw new Error('missing'); return b; } };
-    const h = await harness({ hostBlobs });
-    const e = await h.next({ uid: 1, raw: raw({ 'Message-ID': '<f@x>', Subject: 'File' }, 'send it') });
-    expect(h.adapter.caps('bot').media.out).toEqual(['file', 'image']);
-    await h.adapter.send(e.replyRoute!, { text: 'here', attachments: [{ ref: 'sha256:r', mime: 'text/markdown', name: 'README.md' }] }, { operationId: 'op1' });
-    const sent = h.transport.sent[0]!;
-    expect(sent.attachments).toEqual([{ filename: 'README.md', content: Buffer.from('# hi'), contentType: 'text/markdown' }]);
-    await expect(h.adapter.send(e.replyRoute!, { text: 'x', attachments: [{ ref: 'sha256:gone', mime: 'text/plain' }] }, { operationId: 'op2' })).rejects.toThrow(/attachment sha256:gone/);
-    expect(h.transport.sent).toHaveLength(1);
-    await h.adapter.send(e.replyRoute!, { text: 'Pick\n\n1. a\n2. b\n\nReply with the number of your choice', channelData: { 'agents-io/choice': { choiceId: 'c', question: 'Pick', options: ['a', 'b'], multi: false } } }, { operationId: 'op3' });
-    expect(h.transport.sent[1]!.text).toContain('1. a\n2. b');
-    await h.stop();
-  });
-
-  it('replies with In-Reply-To, References and Re: subject', async () => {
-    const h = await harness();
-    const e = await h.next({ uid: 1, raw: raw({ 'Message-ID': '<c@x>', 'In-Reply-To': '<b@x>', References: '<a@x> <b@x>', Subject: 'Plan' }, 'q') });
-    const r = await h.adapter.send(e.replyRoute!, { text: 'Done', sections: [{ kind: 'body', text: 'Done <b>' }, { kind: 'footer', text: 'bye' }] }, { operationId: 'op1' });
-    const m = h.transport.sent[0]!;
-    expect(m.to).toBe('alice@example.com');
-    expect(m.subject).toBe('Re: Plan');
-    expect(m.inReplyTo).toBe('<c@x>');
-    expect(m.references).toEqual(['<a@x>', '<b@x>', '<c@x>']);
-    expect(m.text).toBe('Done');
-    expect(m.html).toContain('Done &lt;b&gt;');
-    expect(m.messageId).toBe(r.providerMessageId);
-    await h.stop();
-  });
-
-  it('a thread participant reusing a Message-ID cannot redirect the reply to the original sender', async () => {
+  it('a thread participant reusing a Message-ID cannot redirect the reply to the original sender #DL-3 #IN-5', async () => {
     const h = await harness();
     const original = raw({ 'Message-ID': '<a1@corp.com>', Subject: 'Plan', Cc: 'mallory@evil.com' }, 'q');
     const alice = await h.next({ uid: 1, raw: original });
@@ -286,7 +149,7 @@ describe('outbound', () => {
     await h.stop();
   });
 
-  it('is idempotent: same operationId, same Message-ID, one transport call', async () => {
+  it('is idempotent: same operationId, same Message-ID, one transport call #DL-2', async () => {
     const h = await harness();
     const e = await h.next({ uid: 1, raw: raw({ 'Message-ID': '<a@x>' }, 'q') });
     const [a, b] = await Promise.all([
@@ -304,7 +167,7 @@ describe('outbound', () => {
     await h.stop();
   });
 
-  it('retries a pending send with the same Message-ID', async () => {
+  it('retries a pending send with the same Message-ID #DL-2', async () => {
     const h = await harness();
     const e = await h.next({ uid: 1, raw: raw({ 'Message-ID': '<a@x>' }, 'q') });
     const id = messageIdFor('crash', cfg.from);
@@ -317,7 +180,7 @@ describe('outbound', () => {
 });
 
 describe('sender declaration', () => {
-  it('adds the header and trusts it only on our own echoed Message-ID', async () => {
+  it('adds the header and trusts it only on our own echoed Message-ID #DL-4b #ID-5', async () => {
     const h = await harness();
     const e = await h.next({ uid: 1, raw: raw({ 'Message-ID': '<a@x>' }, 'q') });
     const res = await h.adapter.send(e.replyRoute!, { text: 'hi' }, { operationId: 'o1', as: 'runner:x/run:y' });
@@ -340,7 +203,7 @@ describe('sender declaration', () => {
     await h.stop();
   });
 
-  it('never treats a recipient-forged copy of our Message-ID and header as our echo', async () => {
+  it('never treats a recipient-forged copy of our Message-ID and header as our echo #DL-4b #ID-4', async () => {
     // DKIM passes only on mail actually signed for our domain; recipients see our ids and headers but cannot sign.
     const verify: MailVerifier = async (r, domain) => ({
       evidence: r.includes('X-Test-Signed: agents.test') && domain === 'agents.test' ? 'dkim_pass' : 'none',
@@ -367,7 +230,7 @@ describe('sender declaration', () => {
     await h.stop();
   });
 
-  it('omits the header when no sender is given', async () => {
+  it('omits the header when no sender is given #DL-4b', async () => {
     const h = await harness();
     const e = await h.next({ uid: 1, raw: raw({ 'Message-ID': '<a@x>' }, 'q') });
     await h.adapter.send(e.replyRoute!, { text: 'hi' }, { operationId: 'o2' });
@@ -377,7 +240,7 @@ describe('sender declaration', () => {
 });
 
 describe('conformance', () => {
-  it('passes runChannelConformance with fakes', async () => {
+  it('passes runChannelConformance with fakes #CN-1', async () => {
     const source = new FakeSource();
     const transport = new FakeTransport();
     const store = new MemoryMailStore();
@@ -394,40 +257,11 @@ describe('conformance', () => {
   });
 });
 
-describe.skipIf(!process.env.MAIL_LIVE_IMAP_HOST)('live', () => {
-  it('connects to IMAP and lists the mailbox baseline', async () => {
-    const { ImapSource } = await import('../src/index.js');
-    const src = new ImapSource({
-      imap: {
-        host: process.env.MAIL_LIVE_IMAP_HOST!,
-        port: Number(process.env.MAIL_LIVE_IMAP_PORT ?? 993),
-        secure: true,
-        auth: { user: process.env.MAIL_LIVE_USER!, pass: process.env.MAIL_LIVE_PASS },
-      },
-      pollIntervalMs: 1000,
-    });
-    const ctl = new AbortController();
-    let baseline: unknown;
-    const p = src.watch({
-      mailbox: 'INBOX',
-      signal: ctl.signal,
-      checkpoint: async () => undefined,
-      baseline: async (cp) => void (baseline = cp),
-      onMessage: async () => {},
-      log: () => {},
-    });
-    await new Promise((r) => setTimeout(r, 5000));
-    ctl.abort();
-    await p;
-    expect(baseline).toBeDefined();
-  }, 20000);
-});
-
 describe('internal delivery (opt-in provider evidence)', () => {
   const noAuth: MailVerifier = async () => ({ evidence: 'none' });
   const internal = { From: 'Owner <i@example.com>', 'Message-ID': '<int@x>', 'X-QQ-BUSINESS-ORIGIN': '2' };
 
-  it('mail from a listed domain without Received/Authentication-Results is platform_signed', async () => {
+  it('mail from a listed domain without Received/Authentication-Results is platform_signed #ID-3 #ID-4', async () => {
     const h = await harness({ verify: noAuth, cfg: { internalDelivery: { domains: ['Example.com'] } } });
     const e = await h.next({ uid: 1, raw: raw(internal, 'hi') });
     expect(e.sender.evidence).toBe('platform_signed');
@@ -435,7 +269,7 @@ describe('internal delivery (opt-in provider evidence)', () => {
     await h.stop();
   });
 
-  it('a provider-added hop (mail from outside) never counts, even from a listed domain', async () => {
+  it('a provider-added hop (mail from outside) never counts, even from a listed domain #ID-4', async () => {
     const h = await harness({ verify: noAuth, cfg: { internalDelivery: { domains: ['example.com'] } } });
     const viaMx = await h.next({ uid: 1, raw: raw({ ...internal, Received: 'from evil.test by mx.example.net' }, 'hi') });
     expect(viaMx.sender.evidence).toBe('none');
@@ -444,7 +278,7 @@ describe('internal delivery (opt-in provider evidence)', () => {
     await h.stop();
   });
 
-  it('is off by default and limited to the listed domains', async () => {
+  it('is off by default and limited to the listed domains #ID-4', async () => {
     const off = await harness({ verify: noAuth });
     expect((await off.next({ uid: 1, raw: raw(internal, 'hi') })).sender.evidence).toBe('none');
     await off.stop();

@@ -4,7 +4,7 @@ import { LarkBotAdapter } from '../src/index.js';
 import { FakeLark, messageEvent } from './fake-lark.js';
 
 describe('channel conformance', () => {
-  it('passes runChannelConformance against a fake platform', async () => {
+  it('passes runChannelConformance against a fake platform #CN-1', async () => {
     const lark = new FakeLark();
     const adapter = new LarkBotAdapter(
       { appId: 'cli_x', appSecret: 's', domain: 'feishu', editMinIntervalMs: 0 },
