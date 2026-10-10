@@ -241,6 +241,8 @@ export class Lane {
   private live: LiveInfo | undefined;
   /** Delegations (live.handoff) waiting for the turn the harness starts for them. */
   private handoffs = new Map<string, InputRecord>();
+  /** Lives the lane itself recorded as ended (closing with one open). */
+  private endedLives = new Set<string>();
   private readonly guard: LoopGuard | undefined;
   /** The chain of the last turn: an adopted turn (no inputs in memory) keeps it. */
   private lastCause: TurnCause | undefined;
@@ -547,6 +549,37 @@ export class Lane {
       p.abort?.abort();
     }
     this.rejectQueue();
+    this.rejectHandoffs([...this.handoffs.keys()], `${LANE_CLOSED}: ${reason}`);
+    this.endLive(reason);
+  }
+
+  /**
+   * The lane stops listening with a live still open (the harness has not reported its
+   * `live.ended` yet, e.g. Codex waits for thread/realtime/closed): the lane records it now,
+   * since a late one from the harness would not reach the log (LN-4). Lives do not survive
+   * the lane (RS-7). A later `live.ended` from the harness for it is not recorded again.
+   */
+  private endLive(reason: string): void {
+    const live = this.live;
+    if (!live) return;
+    this.live = undefined;
+    this.endedLives.add(live.liveId);
+    this.emit({ body: { t: 'live.ended', liveId: live.liveId, reason } });
+    try {
+      this.o.onLiveEnded?.(live.liveId, reason);
+    } catch {
+      // the log has it
+    }
+  }
+
+  /**
+   * Live delegations (`live.handoff`) the harness never started a turn for, dropped: pushed
+   * out by the bound, their live ended, or the lane closed. No route: the voice side asked.
+   */
+  private rejectHandoffs(ids: string[], reason: string): void {
+    if (!ids.length) return;
+    for (const id of ids) this.handoffs.delete(id);
+    this.emit({ body: { t: 'input.rejected', inputIds: ids, reason } });
   }
 
   /**
@@ -1093,16 +1126,22 @@ export class Lane {
         if (t) t.inputs.push(record);
         else {
           this.handoffs.set(b.inputId, record);
+          const evicted: string[] = [];
           for (const k of this.handoffs.keys()) {
-            if (this.handoffs.size <= 32) break;
+            if (this.handoffs.size <= MAX_HANDOFFS) break;
             this.handoffs.delete(k);
+            evicted.push(k);
           }
+          this.rejectHandoffs(evicted, 'handoff_overflow');
         }
         return;
       }
       case 'live.ended':
+        if (this.endedLives.has(b.liveId)) return; // the lane already recorded it as it closed
         if (this.live?.liveId === b.liveId) this.live = undefined;
         this.emitHarness(e, gen);
+        // Delegations of that live no turn took will never get one now.
+        this.rejectHandoffs([...this.handoffs].filter(([, r]) => r.channelContext.liveId === b.liveId).map(([id]) => id), 'live_ended');
         this.o.onLiveEnded?.(b.liveId, b.reason);
         return;
       case 'turn.started': {
@@ -1422,6 +1461,14 @@ function byRoute(inputs: InputRecord[]): { route: ReplyRoute | null; ids: string
   }
   return [...groups.values()];
 }
+
+/** Same content, reply route and context: a context input delivered again, not revised. */
+function sameContent(a: InputRecord, b: InputRecord): boolean {
+  return JSON.stringify([a.content, a.replyRoute, a.channelContext]) === JSON.stringify([b.content, b.replyRoute, b.channelContext]);
+}
+
+/** Live delegations kept waiting for the turn the harness starts for them. */
+const MAX_HANDOFFS = 32;
 
 /** Inputs of `turnId` (started with `inputIds`, plus any steered into it) with no consumed / rejected / cancelled record. */
 function unsettledInputsOf(events: SessionEvent[], turnId: string, inputIds: string[]): string[] {
