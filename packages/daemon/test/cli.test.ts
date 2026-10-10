@@ -13,7 +13,7 @@ const ctx = (dir: string) => ({ env: {}, baseDir: dir, cwd: dir });
 describe('config: agents and bindings', () => {
   it('without agents: one `default` agent on the default instance, and the owners default table', () => {
     const c = resolveConfig({ policy: { owners: ['lark-bot:ou_1'] } }, ctx('/tmp'));
-    expect(c.agents).toEqual({ default: { name: 'default', harness: 'claude-code', mode: 'interactive', tools: true, configured: false } });
+    expect(c.agents).toEqual({ default: { name: 'default', harness: 'claude-code', mode: 'interactive', tools: false, configured: false } }); // tools off by default (decision 13)
     expect(c.defaultAgent).toBe('default');
     const t = configTable(c)!;
     expect(t.bindings.map((b) => b.id)).toContain('default:owner-dm');
@@ -28,7 +28,7 @@ describe('config: agents and bindings', () => {
       ctx(dir),
     );
     expect(c.defaultAgent).toBe('chat');
-    expect(c.agents.exec).toMatchObject({ mode: 'task', instructions: 'be terse', cwd: join(dir, 'w'), configured: true, tools: true });
+    expect(c.agents.exec).toMatchObject({ mode: 'task', instructions: 'be terse', cwd: join(dir, 'w'), configured: true, tools: false }); // the outputTools default (off)
     expect(c.agents.chat).toMatchObject({ mode: 'interactive', model: 'opus', tools: false });
     // Without bindings the owners table targets the default agent.
     expect(configTable(c)!.bindings.every((b) => b.agent === 'chat')).toBe(true);
