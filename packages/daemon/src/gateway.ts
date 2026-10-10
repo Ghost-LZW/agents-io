@@ -322,6 +322,8 @@ export class Gateway {
       watches: { list: () => this.watches.list() },
       selfAccounts: c.policy.selfAccounts,
       agentAccounts: c.policy.agentAccounts,
+      // An agent account's message declaring one of our sessions (SendOp.as) is our own echo.
+      isSelfDeclared: (declared) => declared.startsWith('session:') && this.isOurSession(declared.slice('session:'.length)),
       routeCallout: (bindingId, input, envelope) => this.host.routeCallout(bindingId, input, envelope),
       topics: this.topics,
       // Decision 7: callout answers may launch the session they land in; pinned sessions may skip the callout.
@@ -1902,6 +1904,11 @@ ${a.summary}` }],
       case 'unsubscribe':
         return fail('use_subscribe', 'subscriptions belong to a connection');
     }
+  }
+
+  /** A session this daemon has run or registered: its log, a lane, or a pinned agent or launch. */
+  private isOurSession(key: string): boolean {
+    return this.lanes.has(key) || this.hub.log.head(key) > 0 || this.records.agentOf(key) !== undefined || this.records.launchOf(key) !== undefined;
   }
 
   sessions(): SessionInfo[] {

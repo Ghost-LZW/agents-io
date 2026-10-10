@@ -59,6 +59,22 @@ const deliver = (route: { channel: string; account: string; conversationId: stri
   ({ v: 1, type: 'deliver', id: 'x', operationId, route, message: { text: 'hi' } }) as unknown as Deliver;
 
 describe('several lark-bot accounts (decision 8)', () => {
+
+  it("an agent account's message declaring one of our sessions is our own echo: never a turn", async () => {
+    // Bot b is another agent account; a rule dispatches everything, so only the self check keeps an echo from looping.
+    const w = await bots({ raw: { policy: { owners: ['lark-bot:alice'], agentAccounts: ['lark-bot:botb'] }, bindings: [{ id: 'all', match: {}, on: 'dispatch' }] } });
+    const { a } = w.chans as { a: FakeChannel };
+    await a.inject({ ...alice, conversation: { id: 'dm1', kind: 'dm' }, text: 'hello' });
+    await until(() => w.harness.sessions.length === 1);
+    const ours = w.harness.sessions[0]!.args.sessionKey;
+    const bot = (declared: string, id: string) =>
+      a.inject({ sender: { channelUserId: 'botb', evidence: 'platform_signed', isBot: true, declared }, conversation: { id, kind: 'group' }, text: 'relayed' });
+    const echo = await bot(`session:${ours}`, 'g1');
+    const other = await bot('session:somewhere-else', 'g2');
+    // An echo matches no rule unless the rule says includeSelf; the other agent's message is dispatched.
+    expect(w.gw.router.explain(echo.inputId!)?.matched).toEqual([]);
+    expect(w.gw.router.explain(other.inputId!)?.matched.map((m) => m.on)).toEqual(['dispatch']);
+  });
   it('a DM to bot b is answered by b only, and its output-tool messages go out through b', async () => {
     const holder: { h?: FakeHarness } = {};
     const tool: { isError: boolean; text: string }[] = [];

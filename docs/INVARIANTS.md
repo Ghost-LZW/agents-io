@@ -127,7 +127,7 @@
 - **承诺**：会话的卡片（compositor）和输出工具发出的每条消息都带 `as = session:<sessionKey>`（`agentIdentity`，与来源 `declared`、watch 的 `createdBy` 同一格式），适配器记下它，回流时作为 `declared` 读回（POSITIONING §2 身份表明）。宿主 `deliver` 与系统回复不是 agent 写的，不带 `as`。
 - **实现**：`gateway.ts` `compose`（`as`）与 `HostTools.as`。
 - **测试**：`multi-lark.test.ts` "every agent-authored message carries the agent identity (SendOp.as); host deliveries and system replies carry none"。
-- **状态**：已覆盖。回流时把 `session:<key>` 认作 self 需要 `isSelfDeclared`，守护进程尚未接线（属 ingress/identity）。
+- **状态**：已覆盖。回流时 `agentAccounts` 里的账号声明本部署的 `session:<key>` 即认作 self（守护进程接 `isSelfDeclared`，按会话日志、lane、登记判断），不触发任何规则；测试 "an agent account's message declaring one of our sessions is our own echo: never a turn"。
 
 ### DL-5 外发目的地检查；宿主 outbound 回调失败即拒
 
