@@ -4,7 +4,7 @@ import { createServer, type Server } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import type { ChannelAdapter, InboundEnvelope } from '@agents-io/protocol';
 import { FakeChannel, runChannelConformance } from '@agents-io/testkit';
 import { ChannelBridgeError, connectChannel, serveChannel, spawnChannel, type BridgedChannel } from '../src/index.js';
@@ -14,9 +14,8 @@ const fixture = (n: string) => join(here, 'fixtures', n);
 const route = { channel: 'fake-child', account: 'default', conversationId: 'c1' };
 const hasPython = spawnSync('python3', ['--version']).status === 0;
 
-beforeAll(() => {
-  if (!existsSync(join(here, '..', 'dist', 'index.js'))) throw new Error('run `npx tsc -b channel/jsonl-bridge` first: fixtures import dist/');
-});
+// Fixtures run under plain node on the TypeScript sources (no dist/ needed).
+const loader = ['--experimental-transform-types', '--disable-warning=ExperimentalWarning', '--import', join(here, '..', '..', '..', 'scripts', 'source-loader.mjs')];
 
 /** Starts the adapter and collects what it emits; `stop` aborts and waits for start to return. */
 function run(adapter: ChannelAdapter, account = 'default') {
@@ -59,9 +58,9 @@ const track = async (p: Promise<BridgedChannel>) => {
   return c;
 };
 const fakeChild = (env: Record<string, string> = {}, extra = {}) =>
-  track(spawnChannel({ command: process.execPath, args: [fixture('fake_child.mjs')], env, account: 'default', ...extra }));
+  track(spawnChannel({ command: process.execPath, args: [...loader, fixture('fake_child.mjs')], env, account: 'default', ...extra }));
 const rawChild = (mode: string, extra = {}, env: Record<string, string> = {}) =>
-  track(spawnChannel({ command: process.execPath, args: [fixture('raw_child.mjs')], env: { MODE: mode, ...env }, account: 'default', ...extra }));
+  track(spawnChannel({ command: process.execPath, args: [...loader, fixture('raw_child.mjs')], env: { MODE: mode, ...env }, account: 'default', ...extra }));
 
 /** A file the raw child appends its pid to on every launch. */
 function pidLog() {

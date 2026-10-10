@@ -4,7 +4,7 @@
 //                   later launches inject "after-restart" and keep running
 import { existsSync, writeFileSync } from 'node:fs';
 import { FakeChannel } from '@agents-io/testkit';
-import { serveChannel } from '../../dist/index.js';
+import { serveChannel } from '../../src/index.js';
 
 const ch = new FakeChannel('fake-child');
 const started = ch.start.bind(ch);
