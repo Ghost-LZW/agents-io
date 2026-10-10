@@ -184,8 +184,7 @@ describe('session launch: checks (§8.2–8.4)', () => {
     expect(w.gw.records.launchOf('p1')).toEqual({ env: { CLAUDE_CONFIG_DIR: fx.h1 } });
   });
 
-  // INVARIANTS SE-1 不成立 1: launch.ts underRoots puts the refused path value into the bad_env message; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('a refused path-valued env names the key, never the value #SE-1', async () => {
+  it('a refused path-valued env names the key, never the value #SE-1', async () => {
     const w = await world();
     for (const v of [w.fx.out, 'homes/h1', join(w.fx.homes, 'nope')]) {
       const r = prepare(w, { env: { CLAUDE_CONFIG_DIR: v } }) as { ok: false; code: string; message: string };
