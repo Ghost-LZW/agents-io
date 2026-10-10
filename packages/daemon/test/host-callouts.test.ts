@@ -18,13 +18,15 @@ const approval: FakeTurnScript = async (t) => {
 
 const events = (w: World, key: string, t: string) => w.gw.hub.log.read(key, 0).filter((e) => e.body.t === t).map((e) => e.body as Record<string, unknown>);
 const route: ReplyRoute = { channel: 'fake', account: 'default', conversationId: 'elsewhere' };
+/** `policy.answerOnBehalf` on (decision 13: off by default). */
+const onBehalf = { policy: { owners: ['fake:alice'], answerOnBehalf: true } };
 
 describe('host.hello callouts', () => {
   it('true is route only; a list names hooks, unknown ones ignored; the result lists what was granted; features advertise it', async () => {
     expect([...calloutHooks(true)]).toEqual(['route']);
     expect([...calloutHooks(false)]).toEqual([]);
     expect([...calloutHooks(['outbound', 'nope', 'resolve'])]).toEqual(['resolve', 'outbound']);
-    const w = await daemon();
+    const w = await daemon({ raw: onBehalf });
     const c = await w.client();
     const r = await c.hello({ token: w.gw.token, name: 'h', callouts: ['resolve', 'nope'] });
     expect(r).toMatchObject({ host: true, callouts: ['resolve'] });
@@ -39,7 +41,7 @@ describe('host.hello callouts', () => {
 
 describe('resolve callout', () => {
   it('the host picks the resolver (human) and answers on the principal\'s behalf; the log records the principal and the host', async () => {
-    const w = await daemon({ script: approval });
+    const w = await daemon({ script: approval, raw: onBehalf });
     const h = await w.host({ callouts: ['resolve'] });
     const asked: Record<string, unknown>[] = [];
     h.onRequest('policy', (f) => {
@@ -66,7 +68,7 @@ describe('resolve callout', () => {
   });
 
   it('a host resolver answered on behalf of a principal records it with via', async () => {
-    const w = await daemon({ script: approval });
+    const w = await daemon({ script: approval, raw: onBehalf });
     const h = await w.host({ callouts: ['resolve'] });
     h.onRequest('policy', () => ({ kind: 'host' }));
     const c = await w.client();
@@ -75,6 +77,27 @@ describe('resolve callout', () => {
     await h.command({ type: 'resolve', sessionKey: 'S2', requestId: 'r1', decision: { kind: 'deny' }, onBehalfOf: 'member-7' });
     await until(() => events(w, 'S2', 'turn.completed').length === 1);
     expect(events(w, 'S2', 'request.resolved')[0]).toMatchObject({ by: { kind: 'host', id: 'member-7', via: 'host:xwo' } });
+  });
+
+  it('onBehalfOf is off by default (policy.answerOnBehalf): on_behalf_not_allowed, not advertised, the request stays open', async () => {
+    const w = await daemon({ script: approval });
+    expect(w.gw.config.policy.answerOnBehalf).toBe(false);
+    const h = await w.host({ callouts: ['resolve'] });
+    h.onRequest('policy', () => ({ kind: 'host' }));
+    const probe = await w.client();
+    expect((await probe.hello({ token: w.gw.token, name: 'probe' })).features).not.toContain('resolve.onBehalfOf');
+    const c = await w.client();
+    await c.input('S3', 'go');
+    await until(() => events(w, 'S3', 'request.opened')[0]);
+    await expect(h.command({ type: 'resolve', sessionKey: 'S3', requestId: 'r1', decision: { kind: 'allow_once' }, onBehalfOf: 'member-7' })).rejects.toMatchObject({ code: 'on_behalf_not_allowed' });
+    // A connection that is not the host still gets not_eligible first.
+    await expect(c.command({ type: 'resolve', sessionKey: 'S3', requestId: 'r1', decision: { kind: 'allow_once' }, onBehalfOf: 'member-7' })).rejects.toMatchObject({ code: 'not_eligible' });
+    expect(events(w, 'S3', 'request.resolved')).toEqual([]);
+    // The host can still answer in its own name.
+    await h.command({ type: 'resolve', sessionKey: 'S3', requestId: 'r1', decision: { kind: 'deny' } });
+    await until(() => events(w, 'S3', 'turn.completed').length === 1);
+    expect(events(w, 'S3', 'request.resolved')[0]).toMatchObject({ by: { kind: 'host' } });
+    expect((events(w, 'S3', 'request.resolved')[0]!.by as Record<string, unknown>).via).toBeUndefined();
   });
 
   it('timeout, error and a bad answer fall back to the local policy; a host without the hook is never asked', async () => {

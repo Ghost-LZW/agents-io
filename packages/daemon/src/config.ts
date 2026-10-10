@@ -339,6 +339,13 @@ export const ConfigFile = Type.Object(
           ownerSessionKey: Type.Optional(Type.String()),
           routes: Type.Optional(Type.Array(Type.String())),
           /**
+           * Let a request be answered on someone's behalf (default false, decision 13): a host
+           * connection's `resolve { onBehalfOf }` is refused with `on_behalf_not_allowed` until
+           * this is true. The one switch for answering in another's name; agent-on-behalf
+           * approval (decision 12) will sit behind it too.
+           */
+          answerOnBehalf: Type.Optional(Type.Boolean()),
+          /**
            * Sources an agent may watch without asking (defaultPolicy `watchAllowlist`):
            * each entry matches when every field it sets equals the watch source's.
            */
@@ -548,6 +555,8 @@ export interface Config {
     ownerSessionKey?: string;
     routes: string[];
     watchAllowlist: Partial<Pick<WatchSource, 'channel' | 'account' | 'conversation' | 'conversationKind'>>[];
+    /** `policy.answerOnBehalf` (default false): `resolve { onBehalfOf }` is allowed. */
+    answerOnBehalf: boolean;
   };
   /** Owner watches from the config file. */
   watches: (WatchDraft & { id: string })[];
@@ -777,6 +786,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
       ...(ownerSessionKey ? { ownerSessionKey } : {}),
       routes: c.policy?.routes ?? [],
       watchAllowlist: c.policy?.watchAllowlist ?? [],
+      answerOnBehalf: c.policy?.answerOnBehalf ?? false,
     },
     watches: c.watches ?? [],
     local: {

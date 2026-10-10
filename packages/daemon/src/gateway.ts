@@ -396,6 +396,7 @@ export class Gateway {
       prepareSession: (f) => this.prepareSession(f),
       redispatch: (name, f) => this.redispatch(name, f),
       calloutTimeouts: { resolve: c.hostCallouts.resolveTimeoutMs, outbound: c.hostCallouts.outboundTimeoutMs },
+      answerOnBehalf: c.policy.answerOnBehalf,
       log: (level, msg, data) => this.log(level, msg, data),
       ...(o.hostPush?.timeoutMs !== undefined ? { pushTimeoutMs: o.hostPush.timeoutMs } : {}),
       ...(o.hostPush?.retryMs !== undefined ? { pushRetryMs: o.hostPush.retryMs } : {}),
@@ -1909,6 +1910,8 @@ ${a.summary}` }],
       case 'resolve':
         // Answering on someone's behalf is the host's (its connection is authenticated with the token).
         if (cmd.onBehalfOf !== undefined && !isHostOrigin(origin)) return fail('not_eligible', 'onBehalfOf is for host connections');
+        // And only where the deployment turned it on (decision 13: one explicit switch, default off).
+        if (cmd.onBehalfOf !== undefined && !this.o.config.policy.answerOnBehalf) return fail('on_behalf_not_allowed', 'answering on behalf is off: set policy.answerOnBehalf: true');
       // falls through
       case 'interrupt':
       case 'control': {

@@ -364,13 +364,13 @@
 - **测试**：`lane.test.ts` "cancels open requests when the turn ends without answering them"、"a request opened while idle is not cancelled by the next turn ending"、"human: times out to deny"、"a throwing policy.escalate after a model escalation denies the request with a notice"、"a throwing policy.escalate without a reviewer denies the request and keeps the harness session"；`codex.test.ts` "passes native decisions through and cancels open requests when the turn ends"。
 - **状态**：有测试。
 
-### RQ-3 代人作答只给宿主连接，并记 by.via
+### RQ-3 代人作答须显式开启，只给宿主连接，并记 by.via
 
-- **承诺**：`resolve { onBehalfOf }` 只有宿主连接能用，日志记 `by.via: "host:<name>"`（决定 9）。
-- **实现**：`gateway.ts:1746`；`lane.ts:1209-1215`。
-- **测试**：`lane.test.ts` "onBehalfOf: only a host connection (system origin through the host adapter) may relay"；`host-callouts.test.ts` "the host picks the resolver (human) and answers on the principal's behalf; the log records the principal and the host"、"a host resolver answered on behalf of a principal records it with via"。
+- **承诺**：`resolve { onBehalfOf }` 只有宿主连接能用，且只在部署方开启 `policy.answerOnBehalf`（缺省 `false`）时可用，否则答 `on_behalf_not_allowed`、请求不变、`features` 不列 `resolve.onBehalfOf`；日志记 `by.via: "host:<name>"`（决定 9、决定 13）。决定 12 的 agent 代为审批共用这个开关。
+- **实现**：`gateway.ts` `case 'resolve'`（先 `not_eligible`，再查 `config.policy.answerOnBehalf`）；`host.ts` `hello`（按开关过滤 `FEATURES`）；`config.ts` `policy.answerOnBehalf`；`lane.ts` `resolveCommand`（再查一次宿主 origin 与 principals）。
+- **测试**：`lane.test.ts` "onBehalfOf: only a host connection (system origin through the host adapter) may relay"；`host-callouts.test.ts` "onBehalfOf is off by default (policy.answerOnBehalf): on_behalf_not_allowed, not advertised, the request stays open"、"the host picks the resolver (human) and answers on the principal's behalf; the log records the principal and the host"、"a host resolver answered on behalf of a principal records it with via"、"true is route only; a list names hooks, unknown ones ignored; the result lists what was granted; features advertise it"。
 - **状态**：有测试。
-- **注意**：决定 12 说代为审批"与 `onBehalfOf` 一样须显式开启"，但 `onBehalfOf` 没有开关，任何通过 token 认证的宿主都能用（`host.ts:263` 直接列在 `FEATURES` 里）。要么改决定 12 的措辞，要么给它加开关。
+- **注意**：开关只在网关一层（会话 lane 不知道配置）；lane 的 `resolveCommand` 只经网关调用。
 
 ### RQ-4 resolve 回调失败退回本地策略
 
@@ -587,7 +587,7 @@
 11. **没有可用交互 agent 时 `accept` 直接抛错（FC-3，不成立）**。（harness 起不来时只在日志里拒绝的 FC-2 已修。）
 12. **`closeLane` 窗口可能出现同一键两个 lane（LN-2，可能）**；**监听回复可能回到被监听的群（CF-5，可能）**：都需要先写测试复现。
 13. **未测的承诺**：live 传输拒绝与视频过滤（LN-5）、模块 harness 启动失败（CF-4）、Claude Code 停止时的行为（RS-3）、非 SQLite 持久化（RS-9）、模型输入里的 watch 标记（ID-2）。
-14. **文档本身的出入**：决定 12 说 `onBehalfOf` "须显式开启"而它没有开关（RQ-3）；~~工具默认开启与原则 2 相反（CF-6）~~ 已改为默认关闭（决定 13）；`docs/E2E.md` 的"已知缺口"仍写 outbox 在内存、compositor 不接管旧卡片、没有宿主 MCP 工具，三条都已过时。
+14. **文档本身的出入**：~~决定 12 说 `onBehalfOf` "须显式开启"而它没有开关（RQ-3）~~ 已加 `policy.answerOnBehalf`（决定 13）；~~工具默认开启与原则 2 相反（CF-6）~~ 已改为默认关闭（决定 13）；`docs/E2E.md` 的"已知缺口"仍写 outbox 在内存、compositor 不接管旧卡片、没有宿主 MCP 工具，三条都已过时。
 15. **A 组合并评审（2026-10-11）遗留**，按原则 4 记下，未修：
     - **启动时为每个会话折叠全量日志**（`settleLeftoverInputs` 调 `hub.snapshot`）：没有压缩时随日志线性增长；等日志压缩一起做。
     - **崩溃后同一输入两种结局（IN-1，可能）**：digest flush 的 `input.admitted` 落盘后、`endFlush` 前崩溃，重启时 `settleLeftoverInputs` 拒掉该 id，watch 的 redo 又以同一 id 收下并消费（`watch.ts:450`、`:671`）。需先写测试复现。

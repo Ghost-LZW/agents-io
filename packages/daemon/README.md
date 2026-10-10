@@ -121,7 +121,9 @@ before any host frame; after it, the connection's client frames carry the origin
   `policy { hook: "outbound", args: { from, to } }` is `Policy.outbound` (answer
   `{ verdict }`); timeout (`hostCallouts.outbound.timeoutMs`, default 2000), error or
   a bad answer deny. Without a host that answers the hook, the local policy decides.
-- `resolve { onBehalfOf }` (host connections only): answer a request as that
+- `resolve { onBehalfOf }` (host connections only, and only with
+  `policy.answerOnBehalf: true`, default false; otherwise `on_behalf_not_allowed`
+  and the `resolve.onBehalfOf` feature is not advertised): answer a request as that
   principal. A `human` request still requires it among its `principals`; the log
   records `by: { kind, id: <principal>, via: "host:<name>" }`.
 - `run.start`: only `mode: task` agents. A fresh session `run:<runId>`, its own

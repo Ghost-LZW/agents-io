@@ -49,6 +49,8 @@ export interface HostServiceDeps {
   prepareSession(f: Extract<HostRequestFrame, { type: 'session.prepare' }>): Outcome;
   /** `inbound.redispatch`: deliver a queued host-inbound item to a session with its original origin. */
   redispatch(hostName: string, f: Extract<HostRequestFrame, { type: 'inbound.redispatch' }>): Promise<Outcome>;
+  /** `policy.answerOnBehalf`: the `resolve.onBehalfOf` feature is advertised only when it is on. */
+  answerOnBehalf?: boolean;
   /** Per-hook timeouts of the `resolve` / `outbound` callouts (config `hostCallouts`). */
   calloutTimeouts?: { resolve?: number; outbound?: number };
   log: LogFn;
@@ -190,7 +192,7 @@ export class HostService implements HostFrames {
       bindings: { version: st?.table.version ?? null, active: st?.active ?? false, ...(st?.suspended ? { suspended: st.suspended } : {}) },
       ...(f.consumer !== undefined ? { inbound: { consumer: f.consumer, acked: this.d.queue.cursor(f.consumer), head: this.d.queue.head() } } : {}),
       ...(replaced !== undefined ? { replaced: { name: replaced } } : {}),
-      features: FEATURES,
+      features: this.d.answerOnBehalf ? FEATURES : FEATURES.filter((x) => x !== 'resolve.onBehalfOf'),
       ...(f.callouts !== undefined ? { callouts: role ? [...hooks] : [] } : {}),
     });
   }
@@ -259,7 +261,7 @@ export class HostService implements HostFrames {
   }
 }
 
-/** Capabilities `host.hello` advertises (a host must not rely on one this list lacks). */
+/** Capabilities `host.hello` advertises (a host must not rely on one this list lacks); `resolve.onBehalfOf` only with `policy.answerOnBehalf`. */
 export const FEATURES = ['session.launch', 'callouts.resolve', 'callouts.outbound', 'resolve.onBehalfOf', 'inbound.redispatch', 'host.takeover'];
 
 /** The `policy` hooks a host may answer. */

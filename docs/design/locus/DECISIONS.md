@@ -130,5 +130,5 @@
 | `resolve` / `outbound` 回调 | 冻结，不再扩展 | 原则 6、7（无使用者） |
 | 来源行加 `ref=channel:<通道>/<消息 id>` | 加；决定 4 的"写命令来源标记"改为宿主经 `aio verify` 核验引用 | 原则 2、7 |
 | 输出工具默认开启（`config.ts:727`） | 改为默认关闭，按 agent 配置开启；dev-gateway 配置同步 | 原则 2 |
-| `onBehalfOf` 与 agent 代批 | 共用一个显式开关，默认关 | 决定 12 |
+| `onBehalfOf` 与 agent 代批 | 共用一个显式开关，默认关（已实现为 `policy.answerOnBehalf`，未开启答 `on_behalf_not_allowed`） | 决定 12 |
 | agent 通信地基（agent-messaging 提案 §待拍板 1–8） | 全部按提案推荐；默认跳数 8、同一对 15 分钟 10 轮，属可调参数 | 原则 1、4、6；决定 4/5/12 |
