@@ -40,7 +40,7 @@
   4. **detach 发生在开轮途中（可能）。** 输入已 `startTurn` 交给 Codex unix、`turn.started` 还没记下时停机：日志里它仍在 `queued`、没有开着的 turn，下次启动记为 `host_restarted`，而 Codex 可能已经在跑它（应为 ambiguous）。没有测试复现。
   5. lane 关闭后到达的输入答 `{ ok: false, reason: 'closed' }`，没进 lane、没有 `input.admitted`；调用方（ingress）是否在原路由上说明不在本条范围内。
   6. **digest flush 崩溃后同一输入两种结局**（第 15 节第 15 项，已复现）：flush 的 `input.admitted` 落盘后、`endFlush` 前崩溃，重启时 `settleLeftoverInputs` 先把该 id 记 `input.rejected host_restarted`，watch 的 redo 又以同一 id 收下并消费（`watch.ts` `flush` / redo）。测试：`it.fails` `packages/session/test/watch.test.ts` "a flush that crashed after input.admitted and before endFlush: after the restart its input has exactly one outcome #IN-1"。
-  7. **没有任何交互 agent 时**（只有任务 agent，watch trigger 能走到这里）`accept` 抛错，输入没有终态，见 FC-3。
+  7. ~~**没有任何交互 agent 时** `accept` 抛错~~：已修，记 `input.rejected agent_unavailable`，见 FC-3。
 
 ### IN-2 未消费的输入重排一次，再拒绝
 
@@ -83,13 +83,14 @@
 
 ### IN-7 通道只在网关接受之后才向平台确认
 
-- **承诺**：仓库内的通道适配器只在 `emit` 返回（网关已接受）之后才向平台确认（飞书事件 ack、邮件 checkpoint 前移）；`emit` 失败时不确认、不留去重键，平台重投能再进来；超过平台确认期限仍未接受的，适配器保留去重键并自己重试 `emit`。
-- **实现**：`channel/lark-bot/src/adapter.ts` `deliver`（`ackTimeoutMs` 期限之前失败：删去重键并抛出，SDK 答 500 让飞书重投；期限之后：保留去重键，最多 `EMIT_RETRIES` 次退避重试）、`onMessage`（declared 查询失败、映射为空时也删去重键）、`onCardAction`；`channel/mail/src/adapter.ts` `start` 里的 `onMessage`（`await ctx.emit(env)` 之后才 `setCheckpoint`，抛错即下次重取）；网关一侧 `packages/daemon/src/gateway.ts` `startChannel` 的 `emit` → `Gateway.accept` → `packages/session/src/ingress.ts` `accept`（`accepted` 时才 `remember`）。
-- **测试**：标签 `#IN-7`；例：`channel/lark-bot/test/inbound.test.ts` "forgets the dedup key when emit fails so the platform redelivery is processed #IN-7 #IN-5"、"a card click whose emit fails is not acked either #IN-7"、"an emit that fails after the ack deadline is retried by the adapter, keeping the dedup key #IN-7 #IN-5"、"a failing declared-sender lookup is not acked and leaves no dedup key behind #IN-7"；`channel/mail/test/mail.test.ts` "persists a checkpoint after the host accepts each message #IN-7"；`channel/lark-bot/test/enrich.test.ts` "acks within ackTimeoutMs while a download hangs, then emits in chat order once it ends #IN-7"。
-- **状态**：部分覆盖（`emit` 抛错的路径有测试；`emit` 正常返回 `accepted: false` 的路径不成立，有 `it.fails`）。
-- **不成立**：
-  1. **停止期间收到的消息被确认后丢失。** `Gateway.stop` 先置 `refusingInbound`，通道还要再连着一段时间（等拒绝提示与收尾卡片发出）；这期间 `Gateway.accept` 答 `{ accepted: false, error: 'gateway stopping' }`，不抛错。飞书 `deliver` 只把抛错当失败，于是 ack 并保留去重键，飞书不再重投；邮件 `onMessage` 照常前移 checkpoint。两者都不会交给下一个进程。测试：`it.fails` `channel/lark-bot/test/inbound.test.ts` "an emit answering accepted:false is not acked and leaves no dedup key, so the redelivery gets in #IN-7"；`it.fails` `channel/mail/test/mail.test.ts` "does not move the checkpoint past a message the host answered accepted:false #IN-7"。
-  2. 期限之后重试用尽（`EMIT_RETRIES`）或通道被中止时，飞书已经 ack，这条消息丢失（CHANNELS.md §8 已记）。
+- **承诺**：仓库内的通道适配器只在 `emit` 答 `accepted: true`（网关已接受）之后才向平台确认（飞书事件 ack、邮件 checkpoint 前移）；`emit` 抛错或答不带 `permanent` 的 `accepted: false`（守护进程停止期间的 `gateway stopping`）时不确认、不留去重键，平台重投能再进来；`permanent: true` 的拒收（无效信封、冒充）是终态，照常确认；超过平台确认期限仍未接受的，适配器保留去重键并自己重试 `emit`。
+- **实现**：`channel/lark-bot/src/adapter.ts` `deliver`（`ackTimeoutMs` 期限之前失败：删去重键并抛出，SDK 答 500 让飞书重投；期限之后：保留去重键，最多 `EMIT_RETRIES` 次退避重试）、`onMessage`（declared 查询失败、映射为空时也删去重键）、`onCardAction`；`channel/mail/src/adapter.ts` `start` 里的 `onMessage`（`await ctx.emit(env)` 之后才 `setCheckpoint`，抛错即下次重取）；`notTaken`（`channel/lark-bot/src/adapter.ts`，`deliver` 里把非终态的 `accepted: false` 当失败）；`channel/jsonl-bridge/src/host.ts` `onInbound`（非终态的 `accepted: false` 答对端 `ok:false retryable`）；网关一侧 `packages/daemon/src/gateway.ts` `startChannel` 的 `emit`（拒收标 `permanent`，`GATEWAY_STOPPING` 除外）→ `Gateway.accept` → `packages/session/src/ingress.ts` `accept`（`accepted` 时才 `remember`；`emitter` 同样标 `permanent`）；结果类型 `packages/protocol/src/channel.ts` `EmitResult`。
+- **测试**：标签 `#IN-7`；例：`channel/lark-bot/test/inbound.test.ts` "forgets the dedup key when emit fails so the platform redelivery is processed #IN-7 #IN-5"、"a card click whose emit fails is not acked either #IN-7"、"an emit that fails after the ack deadline is retried by the adapter, keeping the dedup key #IN-7 #IN-5"、"a failing declared-sender lookup is not acked and leaves no dedup key behind #IN-7"；`channel/mail/test/mail.test.ts` "persists a checkpoint after the host accepts each message #IN-7"；`channel/lark-bot/test/enrich.test.ts` "acks within ackTimeoutMs while a download hangs, then emits in chat order once it ends #IN-7"；`channel/lark-bot/test/inbound.test.ts` "an emit answering accepted:false is not acked and leaves no dedup key, so the redelivery gets in"（原 `it.fails`，已修）、"a permanent refusal (an envelope the host will never take) is acked: redelivery cannot help #IN-7"；`channel/mail/test/mail.test.ts` "does not move the checkpoint past a message the host answered accepted:false"（原 `it.fails`，已修）、"moves the checkpoint past a message the host refused for good (permanent), so later mail is not blocked #IN-7"；`channel/jsonl-bridge/test/bridge.test.ts` "an inbound the host does not take now (accepted:false, not permanent) is answered ok:false, retryable, so the peer does not confirm it #IN-7"；`packages/daemon/test/stop-inputs.test.ts` "a channel message arriving while the daemon stops is answered accepted:false, not permanent, so the channel does not confirm it #IN-7"。
+- **状态**：有测试（期限之后重试用尽仍会丢，见下）。
+- **决定（2026-10-11，依原则 1 自决）**：`emit` 的结果加 `permanent`，区分"现在不收"与"永远不收"。只把 `accepted: false` 一律当失败会让邮件卡在一封无效信封上、之后的信都进不来；只让网关停止时改为抛错则不满足"`accepted: false` 不确认"。原来 CHANNELS.md 写的"`accepted:false` 是终态"收窄为 `permanent: true` 才是终态。
+- **已修**：
+  1. ~~**停止期间收到的消息被确认后丢失。**~~ 原来 `Gateway.accept` 停止期间答 `{ accepted: false, error: 'gateway stopping' }`，飞书只把抛错当失败（ack 并保留去重键），邮件照常前移 checkpoint。现在这个答复不带 `permanent`，两个适配器都当失败处理，测试见上（原两条 `it.fails`）。
+- **边界**：期限之后重试用尽（`EMIT_RETRIES`）或通道被中止时，飞书已经 ack，这条消息丢失（CHANNELS.md §8 已记）。
 
 ---
 
@@ -112,14 +113,13 @@
 - **承诺**：同一 operationId 至多一次平台发送，重复调用返回第一次的结果；每次尝试在调用适配器**之前**写进行中记录，结算时在同一 savepoint 里写结果并删掉进行中记录。进程在两者之间死掉，下次启动把留下的进行中记录结算为 `unknown`（会话日志写 `delivery.settled`，守护进程日志一条 warn），**不自动重发**；同一 operationId 再来（还没恢复时也一样）直接得到这个 `unknown`。通道再各自做一层（飞书请求 uuid、邮件 Message-ID）。
 - **实现**：`outbox.ts` `Outbox.deliver`（已结算 / 本进程在发 / 上个进程留下的进行中记录，三种都不再发）、`run` 里的 `store.begin`、`recover`；`OutboxStore` 接口加 `begin` / `inFlight` / `allInFlight`，内存实现 `MemoryOutboxStore`；SQLite 表 `daemon_outbox` 与 `daemon_outbox_inflight`（`packages/daemon/src/records.ts:35-36`、`DaemonRecords.put` / `begin`，接线 `gateway.ts:336`），启动时 `gw.outbox.recover()`（`gateway.ts:468`，在通道启动之前）；宿主 `deliver` 用 `host:` 命名空间（`gateway.ts:1072-1074`）；飞书 `adapter.ts:503-521`；邮件 `channel/mail/src/outbound.ts:17-21`、`channel/mail/src/adapter.ts:106-138`。输出工具的 operationId 是 `tool:<sessionKey>:<调用 id>`（CHANNELS.md §输出工具）。
 - **测试**：`outbox.test.ts` "delivers each operationId once, even when called again or concurrently #DL-1 #DL-2"、"a crash between the in-flight mark and the settlement: the next process settles it unknown and never resends #DL-2"、"the same operationId is not sent again while an earlier process has it in flight, even before recover #DL-2"、"marks each attempt in flight before calling the adapter, and settling clears the mark #DL-2"；`packages/daemon/test/host.test.ts` "deliver is idempotent per operationId, across a restart too; an unknown channel is an error #DL-2 #RS-1"、"a send in flight when the daemon died is settled unknown on the next start (logged in its session) and not sent again #DL-2 #RS-1"；`channel/lark-bot/test/outbound.test.ts` "is idempotent: same operationId gives one platform message and a stable uuid #DL-2"、"retries a failed operation under the same uuid #DL-2 #DL-1"；`channel/mail/test/mail.test.ts` "is idempotent: same operationId, same Message-ID, one transport call #DL-2"、"retries a pending send with the same Message-ID #DL-2"；`host-mcp.test.ts` "is idempotent per tool call id #DL-2"。
-- **状态**：部分覆盖。
+- **状态**：有测试。
 - **细节（按原则自决，决定 13）**：
   1. 进行中记录按尝试更新（记 `attempts`、`startedAt`、`turnId`），退避等待期间也在；死在退避里同样记 `unknown`（上一次尝试的结果本来就不明）。
   2. 进行中记录不随 30 天清理删除：下次启动总会结算它。
   3. 不自动重发：`unknown` 交给宿主或人决定（原则 6），代价是可能少发一次；重复发送（飞书上传、邮件 SMTP）不可撤回，少发可补。
-- **不成立**：
-  1. 结算记录 30 天后清理（`records.ts` `outPrune`），之后同一 operationId 会再发。测试：`it.fails` `packages/daemon/test/host.test.ts` "after the 30-day prune of settled outbox records, the same operationId is not sent again #DL-2"。
-  2. 嵌入方不传持久 store 时（`MemoryOutboxStore`）跨进程不成立，见 RS-9。
+  4. **结算记录不删，30 天后压成墓碑**（2026-10-11，依原则 1、4 自决）：`records.ts` `outPrune`（`:48-51`）把超过保留期的行改成 `at = 0`、去掉 `error` 与 `providerMessageId`，结果（`status`、`attempts`、路由）留下；同一 operationId 任何时候再来都得到它（`duplicate: true`），不再发。没有选"拒收早于保留期的 operationId"：operationId 由调用方取名，不带时间，看不出新旧。代价是每个 operationId 永久一小行（不含消息内容）。测试：`packages/daemon/test/host.test.ts` "after the 30-day prune of settled outbox records, the same operationId is not sent again"（原 `it.fails`，已修）。
+- **注意**：嵌入方不传持久 store 时（`MemoryOutboxStore`）跨进程不成立；守护进程这时启动告警，见 RS-9。
 
 ### DL-3 回复只回到来源
 
@@ -144,14 +144,15 @@
 
 ### DL-5 外发目的地检查；宿主 outbound 回调失败即拒
 
-- **承诺**：输出工具发往的每个路由都过 `Policy.outbound`（默认只允许本轮回复路由与预登记路由）；宿主声明了 `outbound` 钩子时由宿主决定，超时、出错、答复不合 schema 一律拒绝（决定 9）。
-- **实现**：`gateway.ts:324-334`；`packages/daemon/src/host.ts:242-254`；`packages/host-mcp/src/tools.ts:380-397`（`allowed()`）。
-- **测试**：`packages/daemon/test/host-callouts.test.ts` "the host decides; timeout, error and bad answers deny; without the hook the local policy decides #DL-5"、"a host that only answers route callouts leaves outbound to the local policy #DL-5"；`host-mcp.test.ts` "denies destinations outside Policy.outbound with a clear error and a notice #DL-5"。
-- **状态**：部分覆盖。
-- **不成立**：
-  1. 宿主断线时退回本地策略：`answers('outbound')` 在宿主断开后为假（`host.ts:97-100`），`gateway.ts:327` 改用 `local.outbound`。宿主收紧过的外发在它离线期间放宽，是 fail open，不是 fail closed。测试：`it.fails` `packages/daemon/test/host-callouts.test.ts` "a host that declared the outbound callout disconnects: a send to a route other than the turn's own is still refused #DL-5"。
-  2. `live_join` 的目标（`gateway.ts:1164-1171`）不过 outbound 检查：agent 可以让机器人加入任意会议号。测试：`it.fails` `packages/daemon/test/live.test.ts` "live_join goes through the outbound check: a policy that denies every destination refuses it, no endpoint is opened #DL-5"。
-  3. outbox 自带的 outbound 检查只在 `Delivery.from` 存在时生效（`outbox.ts:108`），守护进程里没有调用方传 `from`，实际只靠输出工具的 `allowed()`。
+- **承诺**：输出工具发往的每个路由都过 `Policy.outbound`（默认：`bypass`（主人触发）的一轮不限；其他轮只允许本轮回复路由与预登记路由），`live_join` 的地点也一样；宿主声明了 `outbound` 钩子时由宿主决定，超时、出错、答复不合 schema 一律拒绝（决定 9）；这个宿主断开期间（含重启后）只放行本轮自己的回复路由，直到它重连或一个不声明 `outbound` 的宿主连上。
+- **实现**：`gateway.ts` 构造函数里的 `outbound`（`host.outboundHeldBy()`、宿主回调、本地策略）；`packages/daemon/src/host.ts` `outboundHeldBy` 与 `hello`（宿主名记在 `DaemonRecords` 的 `daemon_flags`，跨重启）；`gateway.ts` `joinLive` / `liveAllowed`（通道有 `liveRoute` 时打开之前检查，否则检查打开后的端点路由，被拒即关闭端点）；`packages/host-mcp/src/tools.ts:380-397`（`allowed()`）。
+- **测试**：`packages/daemon/test/host-callouts.test.ts` "the host decides; timeout, error and bad answers deny; without the hook the local policy decides #DL-5"、"a host that only answers route callouts leaves outbound to the local policy #DL-5"、"a host that declared the outbound callout disconnects: a send to a route other than the turn's own is still refused"（原 `it.fails`，已修；也覆盖重启后与交还本地策略）；`packages/daemon/test/live.test.ts` "live_join goes through the outbound check: a policy that denies every destination refuses it, no endpoint is opened"（原 `it.fails`，已修）、"live_join to a meeting that is not a preregistered destination is refused by the default policy; a channel that cannot name the route first has its endpoint closed"；`host-mcp.test.ts` "denies destinations outside Policy.outbound with a clear error and a notice #DL-5"。
+- **状态**：有测试。
+- **决定（2026-10-11，依原则 4 与决定 9"`outbound` 任何失败都拒绝"自决；决定 13 冻结回调的扩展，这里是改正确性，不加新能力）**：
+  1. 宿主离线时只放行本轮自己的回复路由：回复发问的地方不需要宿主授权，本地策略额外放宽的（预登记路由）正是宿主可能收紧过的，按 fail closed 拒绝。没有加配置开关（`host-callouts` §8 原设想的 `whenOffline`）。
+  2. `live_join` 的地点按普通外发目的地处理：机器人在那里说话。缺省策略下要把会议路由预登记进 `policy.routes`，或由宿主 `outbound` 放行；`ChannelAdapter.liveRoute(account, target)`（可选）让网关在打开之前检查。
+- **已修**：~~宿主断线时退回本地策略~~、~~`live_join` 的目标不过 outbound 检查~~（2026-10-11，见上）。
+- **注意**：outbox 自带的 outbound 检查只在 `Delivery.from` 存在时生效（`outbox.ts:108`），守护进程里没有调用方传 `from`，实际只靠输出工具的 `allowed()`。
 
 ---
 
@@ -191,13 +192,14 @@
 
 ### HQ-5 宿主推送的表带版本，宿主下线时按 onHostDown 生效
 
-- **承诺**：`bindings.put` 整表原子替换，同版本同内容是空操作；宿主推送的表默认 `suspend`，宿主下线期间不生效；重启后保留最后一张表，挂起到宿主重连（`keep` 除外）；只拉取的宿主（`aio tail`）始终视为不在线，它的表用 `onHostDown: "keep"` 加定期重推、每次刷新 `expiresAt` 当租约（HOSTS.md §4、§6；`host.hello.lease` 已删除，决定 13）。
-- **实现**：`router.ts:269-279`、`:312-318`、`:237-247`。
-- **测试**：`router.test.ts` "atomic replace with version; the same version again is a no-op #HQ-5"、"suspends while the host is down (default) or keeps routing with onHostDown: keep #HQ-5"、"persists: a restart keeps the last table, suspended until the host reconnects (unless keep) #HQ-5 #RS-1"、"expires at expiresAt #HQ-5"、"pull-only host lease: onHostDown keep + a periodic re-push with a fresh expiresAt routes without a host connection, and lapses when the re-push stops #HQ-5"；`packages/protocol/test/admin-topics.test.ts` "host.hello has no presence lease (decision 13): pull-only hosts use onHostDown keep + expiresAt #HQ-5"；`host.test.ts` "installs the host table (routing follows it), persists it, and suspends it while the host is away #HQ-5"、"onHostDown keep stays active without a host #HQ-5"。
-- **状态**：部分覆盖。
+- **承诺**：`bindings.put` 整表原子替换，同版本同内容是空操作；新旧版本都是十进制整数时，比当前小的推送被拒（`stale_version`），不替换；宿主推送的表默认 `suspend`，宿主下线期间不生效；重启后保留最后一张表，挂起到宿主重连（`keep` 除外）；只拉取的宿主（`aio tail`）始终视为不在线，它的表用 `onHostDown: "keep"` 加定期重推、每次刷新 `expiresAt` 当租约（HOSTS.md §4、§6；`host.hello.lease` 已删除，决定 13）。
+- **实现**：`router.ts` `putHostTable`（`olderVersion`）、`:312-318`、`:237-247`。
+- **测试**：`router.test.ts` "atomic replace with version; the same version again is a no-op #HQ-5"、"suspends while the host is down (default) or keeps routing with onHostDown: keep #HQ-5"、"persists: a restart keeps the last table, suspended until the host reconnects (unless keep) #HQ-5 #RS-1"、"expires at expiresAt #HQ-5"、"pull-only host lease: onHostDown keep + a periodic re-push with a fresh expiresAt routes without a host connection, and lapses when the re-push stops #HQ-5"；`packages/protocol/test/admin-topics.test.ts` "host.hello has no presence lease (decision 13): pull-only hosts use onHostDown keep + expiresAt #HQ-5"；`host.test.ts` "installs the host table (routing follows it), persists it, and suspends it while the host is away #HQ-5"、"onHostDown keep stays active without a host #HQ-5"；`router.test.ts` "a late older version does not replace a newer table"（原 `it.fails`，已修）。
+- **状态**：有测试。
+- **决定（2026-10-11，依原则 4 自决）**：版本只在两边都是十进制整数时比较（数值比较，不按字符串），覆盖计数器与时间戳两种常见做法；其他形式（哈希、标签）没有可推断的先后，照旧替换，否则用哈希做版本的宿主会被随机拒绝。被拒时错误里写当前版本，宿主重置计数器后推一个更大的版本即可恢复（宿主没有删表的帧）。
 - **不成立**：
   1. ~~**`lease` 没有实现。**~~ 已删（决定 13）：`host.hello.lease`、`HostHelloResult.lease`、`AdminHostState.leaseExpiresAt` 从协议与 schema 删除；租约的正式做法是 `onHostDown: "keep"` + 重推刷新 `expiresAt`。旧宿主仍带 `lease` 不会被拒（对象 schema 允许多余字段），只是被忽略。
-  2. 版本不比较先后：任何版本都替换当前表（`router.ts:270-275`），迟到的旧推送会覆盖新表。文档只说"带版本号"，没说单调；若宿主依赖单调，这里不成立。测试：`it.fails` `packages/session/test/router.test.ts` "a late older version does not replace a newer table #HQ-5"（以"单调"为准写的；若决定版本不保证单调，删掉它并在承诺里写明）。
+  2. ~~版本不比较先后~~：已修，见上面的决定。
 
 ### HQ-6 同一时刻至多一个宿主；接管要 token；/ws 有心跳
 
@@ -325,10 +327,10 @@
 ### LN-2 一个 session 只有一个写者 lane，同一时刻至多一个 turn
 
 - **承诺**：每个会话键至多一个 `Lane`；命令与 harness 事件在 lane 里逐个处理；同一时刻至多一个 turn。
-- **实现**：`gateway.ts:223`、`:703-736`（同步的取或建）；`lane.ts:455-459`（`serial`）；`lane.ts:833`、`:853`（先置 `this.turn` 再 await）。
-- **测试**：`lane.test.ts` "never merges inputs from two principals or two routes into one turn #IN-3 #LN-2"；`live.test.ts` "a delegation becomes an input from the far side and the harness-started turn runs as the lane turn #LN-6 #LN-2 #ID-1 #LN-4"。"一个键一个 lane"本身没有测试。
-- **状态**：部分覆盖。
-- **不成立**（决定 14 已复现）：`closeLane`（停放话题空闲时关闭）先把 lane 从表里删掉，再最多等 8 s 关闭它（`gateway.ts:1316-1324`）。这期间到达的输入会为同一个键建第二个 `Lane`（`gateway.ts:715`），旧 lane 的事件循环只检查 generation 与 detached、不检查 closed（`lane.ts:885`），两个 harness 会话可能同时续接同一个原生会话。日志 seq 仍单调（共用同步日志），但有两个写者。测试：`it.fails` `packages/daemon/test/topics.test.ts` "an input that arrives while a parked topic's lane is closing does not open a second lane for the same key #LN-2"（让旧会话的 `close()` 卡住，确定地复现）。
+- **实现**：`gateway.ts` `lane`（同步的取或建）与 `laneAfterClose`（键的旧 lane 正在关闭时先等关完再建：ingress、watch、话题转交、本地命令都经它）、`closeLane`（关闭期间登记在 `closingLanes`）；`lane.ts:455-459`（`serial`）；`lane.ts:833`、`:853`（先置 `this.turn` 再 await）。
+- **测试**：`lane.test.ts` "never merges inputs from two principals or two routes into one turn #IN-3 #LN-2"；`live.test.ts` "a delegation becomes an input from the far side and the harness-started turn runs as the lane turn #LN-6 #LN-2 #ID-1 #LN-4"；`packages/daemon/test/topics.test.ts` "an input that arrives while a parked topic's lane is closing does not open a second lane for the same key"（原 `it.fails`，已修）。
+- **状态**：有测试。
+- **已修（2026-10-11）**：~~`closeLane`（停放话题空闲时关闭）先把 lane 从表里删掉、再最多等 8 s 关闭它，期间到达的输入为同一个键建第二个 `Lane`，两个 harness 会话可能同时续接同一个原生会话~~。现在这期间的输入等旧 lane 关完（`closeLane` 各步有上限，合计约 16 s）再建新 lane。代价是这条输入晚到；按原则 1（一条日志一个写者）取正确性。旧 lane 的事件循环仍不检查 closed（`lane.ts:885`），但它的 harness 会话在新 lane 建起之前已经关闭或超时。
 
 ### LN-3 一个 session 至多一个 live
 
@@ -419,11 +421,11 @@
 
 ### FC-3 没有可用的交互 agent 时明确拒绝
 
-- **承诺**：（隐含于 IN-1）找不到任何交互 agent 时，输入应被明确拒绝。
-- **实现**：`gateway.ts:774` 抛普通 `Error`（不是 `LaneUnavailableError`），`ingress.ts:452-460` 原样抛出，`accept` 整个失败，不写 `input.rejected`、不回说明、explain 没有记录。
-- **测试**：`it.fails` `packages/daemon/test/runs.test.ts` "no interactive agent at all (only task agents): a channel input is refused with agent_unavailable, recorded in the log and in explain; accept does not throw #FC-3 #IN-1"。
-- **状态**：不成立（只有 `it.fails`）。
-- **不成立**：如上。配置校验已拒绝"没有 agent 又没有默认 agent"的绑定，所以渠道输入只能经 watch trigger 走到这里（测试用的就是这条路）；agent 不能热改。本地输入在同样情况下答 `no_agent`。
+- **承诺**：（隐含于 IN-1）找不到任何交互 agent 时，输入被明确拒绝：`input.rejected agent_unavailable` 进会话日志，explain 的对应规则带 `rejected`，`accept` 不抛错；本地输入答 `agent_unavailable`（同样记日志）。
+- **实现**：`gateway.ts` `pickAgent`（抛 `LaneUnavailableError('agent_unavailable', …)`，与"会话的 agent 已不在"同一路径）→ `refuseUnavailable`；watch 投递：`packages/session/src/watch.ts` `deliver`（`lanes` 抛 `LaneUnavailableError` 时返回 `unavailable`，带它本来要交给会话的输入，claim 保留）→ `ingress.ts` watch 循环调 `onUnavailable` 并在 explain 里标 `rejected`。
+- **测试**：`packages/daemon/test/runs.test.ts` "no interactive agent at all (only task agents): a channel input is refused with agent_unavailable, recorded in the log and in explain; accept does not throw"（原 `it.fails`，已修；被拒的是 watch 交给会话的输入 `inw_<watch>_…`）。
+- **状态**：有测试。
+- **注意**：配置校验已拒绝"没有 agent 又没有默认 agent"的绑定，所以渠道输入只能经 watch trigger 走到这里；agent 不能热改。以前本地输入在这种情况下答 `no_agent`、不记日志，现在答 `agent_unavailable` 并记 `input.rejected`。
 
 ### FC-4 launch 不在允许范围就拒绝
 
@@ -501,21 +503,22 @@
 - **状态**：有测试（现状如实；与原则 5 不符的部分见下）。
 - **与原则不符**：原则 5。已列入 ROADMAP §4 第 6 项（`docs/design/claude-persistence.md`）。
 
-### RS-4 Codex（stdio）正在跑的 turn 在重启时丢失，且日志里不结束
+### RS-4 Codex（stdio）正在跑的 turn 在重启时丢失，下次启动时结算
 
-- **现状**：停止时网关按 harness 类型挑出 Codex lane 一律 detach（`gateway.ts:1808-1816`），但 stdio 的 app-server 随守护进程退出（`harness/codex/src/harness.ts:415-427` 注释"over stdio it dies with us"）。turn 既没被接管也没被结束，留在日志里，直到 RS-5。
-- **测试**：`it.fails` `packages/daemon/test/stop-inputs.test.ts` "Codex over stdio mid-turn at stop: after the next start, with no new input, the turn is settled (ambiguous host_restarted) and the snapshot no longer shows it running #RS-4 #RS-5"。
-- **状态**：不成立（只有 `it.fails`）。
-- **不成立**（决定 14 已复现：停止时所有 Codex lane 都 detach，`adoptRunningTurns` 只重开 unix 的）：与"确定地续上"相反，且比 Claude Code 更差：后者至少记了 `interrupted`。
+- **现状**：停止时网关按 harness 类型挑出 Codex lane 一律 detach（`gateway.ts` `stop`），但 stdio 的 app-server 随守护进程退出（`harness/codex/src/harness.ts` 注释"over stdio it dies with us"），turn 不能续上。
+- **承诺**：下次启动时不等新输入就结算：`turn.completed ambiguous host_restarted`，快照不再显示它在跑，旧卡片按 RS-1 收尾。
+- **实现**：`gateway.ts` `adoptRunningTurns`（不是 Codex unix 的遗留 turn：建 lane、`Lane.settleLeftover()`，不打开 harness）；`lane.ts` `settleLeftover` → `settleDangling`。
+- **测试**：`packages/daemon/test/stop-inputs.test.ts` "Codex over stdio mid-turn at stop: after the next start, with no new input, the turn is settled (ambiguous host_restarted) and the snapshot no longer shows it running"（原 `it.fails`，已修）。
+- **状态**：有测试。
+- **与原则不符（仍然）**：原则 5"确定地续上"：stdio 的 turn 仍然丢失，只是结局确定、可见。续上要 app-server 比守护进程活得久（unix 传输，RS-2）。
 
-### RS-5 遗留 turn 在下一条输入时记 ambiguous
+### RS-5 遗留 turn 不等新输入就结算
 
-- **承诺**：上一个进程留下的、没被接管的 turn，在下一轮开始前记 `turn.completed ambiguous host_restarted`。任务 run 在启动时就结算（exit 3）。
-- **实现**：`lane.ts:801-833`；`packages/daemon/src/runs.ts:175-192`。
-- **测试**：`runs.test.ts` "a run an earlier daemon left mid-turn is ambiguous (exit 3) after the restart #RS-5 #RN-1"。
-- **测试（续）**：`lane.test.ts` "settles a turn nobody adopted as ambiguous before the next turn starts, rejecting its unconsumed inputs #IN-1 #RS-5"（结算时它没被消费的输入记 `input.rejected host_restarted`，不带路由：卡片收尾为 Outcome unknown）。
-- **状态**：部分覆盖。
-- **不成立**：交互 session 只在有新输入时才结算（`pump` 要求 `queue.length`），没有新输入的会话的 turn 一直开着（快照、`aio sessions` 显示运行中）。启动时不提前结算，是为了让 compositor 在 lane 打开时接管旧卡片再收尾（RS-1"遗留卡片收尾"）。测试：`it.fails` `packages/session/test/lane.test.ts` "a leftover turn nobody adopts is settled ambiguous once the lane opens, without waiting for a new input #RS-5"（修的时候要在 compositor 接管旧卡片之后再结算）。
+- **承诺**：上一个进程留下的、没被接管的 turn，记 `turn.completed ambiguous host_restarted`：harness 可能接管的（Codex unix），在 lane 打开、harness 有机会接管之后；不能接管的，在启动时（RS-4）；都不等新输入。有新输入时仍在开轮之前结算。任务 run 在启动时就结算（exit 3）。
+- **实现**：`lane.ts` `open`（打开后、harness 开时排的事件处理完再 `settleLeftover`）、`settleLeftover`、`pump`（`awaitAdoption` / `settleDangling`）；`gateway.ts` `adoptRunningTurns`；`packages/daemon/src/runs.ts` `settleAllDangling`。
+- **测试**：`runs.test.ts` "a run an earlier daemon left mid-turn is ambiguous (exit 3) after the restart #RS-5 #RN-1"；`lane.test.ts` "settles a turn nobody adopted as ambiguous before the next turn starts, rejecting its unconsumed inputs #IN-1 #RS-5"（结算时它没被消费的输入记 `input.rejected host_restarted`，不带路由：卡片收尾为 Outcome unknown）、"a leftover turn nobody adopts is settled ambiguous once the lane opens, without waiting for a new input"（原 `it.fails`，已修）；`stop-inputs.test.ts` RS-4 那条。
+- **状态**：有测试。
+- **决定（2026-10-11，依原则 1、5 自决）**：结算经 lane 发出（不在启动时直接写日志），这样 compositor 先在 lane 建起时接管旧卡片、再按 ambiguous 收尾（RS-1"遗留卡片收尾"）。启动时只为 Codex unix 打开 harness；其余不打开（Claude Code、Codex stdio 的进程已随上个守护进程退出，打开只会白起一个进程）。会话的 agent 已不在（FC-1）时建不了 lane，turn 留着，守护进程记 warn。
 
 ### RS-6 排队未开始的输入在停止或重启时明确拒绝，不重放
 
@@ -544,10 +547,12 @@
 
 ### RS-9 持久化以 SQLite 日志为前提
 
-- **现状**：宿主队列、`DaemonRecords`（outbox、launch、input.verify）、路由表都和日志共用一个 SQLite 库（`gateway.ts:266-270`）。嵌入方传入非 SQLite 的日志或 `logPath: ':memory:'` 时，它们全部在内存里，没有告警。`aio serve` 默认 `dataDir/log.sqlite`（`config.ts:736`），不受影响。
-- **测试**：`it.fails` `packages/daemon/test/gateway.test.ts` "Gateway.start with a MemorySessionLog logs a "not persistent" warning #RS-9"。
-- **状态**：不成立（只有 `it.fails`）。
-- **不成立**：嵌入方用非 SQLite 日志时没有任何告警，宿主队列、outbox、launch 记录、路由表悄悄只在内存里。
+- **现状**：宿主队列、`DaemonRecords`（outbox、launch、input.verify）、路由表都和日志共用一个 SQLite 库（`gateway.ts` 构造函数）。嵌入方传入非 SQLite 的日志或 `logPath: ':memory:'` 时，它们全部在内存里。`aio serve` 默认 `dataDir/log.sqlite`（`config.ts:736`），不受影响。
+- **承诺**：这种情况下 `Gateway.start` 记一条 warn（"session log is not persistent …"），说明哪些东西只在内存里。
+- **实现**：`gateway.ts` 构造函数（`log instanceof SqliteSessionLog`，或没传日志而 `logPath` 是 `:memory:`）。
+- **测试**：`packages/daemon/test/gateway.test.ts` "Gateway.start with a MemorySessionLog logs a "not persistent" warning"（原 `it.fails`，已修）。
+- **状态**：有测试。
+- **注意**：嵌入方自己传入的 `SqliteSessionLog` 若开在 `:memory:` 上，网关认不出，不告警。
 
 ---
 
@@ -583,18 +588,18 @@
 
 ### CF-5 监听开的轮次永远不回到被监听的会话
 
-- **承诺**：trigger 与 digest 开的轮次回复到目标 session 的主路由，永远不回到被监听的那个会话（CHANNELS.md:275，`watch.ts:405-409` 注释）。
-- **实现**：`gateway.ts:368`（`replyRoute: homeRoute(target)`）、`:1672-1675`。没有任何地方比较主路由与 `w.source`。
-- **测试**：`watch.test.ts` "never delivers into the session the input already went to #CF-5"（只覆盖"输入本身已进目标 session"的情况）。
-- **状态**：部分覆盖。
-- **不成立**（决定 14 已复现）：群 G 的 @ 会话自己建一个监听 G 中非 @ 消息的 watch 时，目标的主路由就是 G，trigger 开的轮次会回到 G。`Policy.watch`（`policy.ts:135`）与 `add`（`watch.ts:485-486`）都不拒绝 source 与目标主路由相同。测试：`it.fails` `packages/session/test/watch.test.ts` "a watch whose source is the target session's home route is refused #CF-5"。
+- **承诺**：trigger 与 digest 开的轮次回复到目标 session 的主路由，永远不回到被监听的那个会话（CHANNELS.md 监听一节，`watch.ts` 注释）。
+- **实现**：`gateway.ts`（`replyRoute: homeRoute(target)`）；`packages/session/src/watch.ts` `add`（不是 `context` 的监听，source 按 id 点名目标主路由所在的会话即拒，`invalid`）、`deliver`（`fromHome`：来自主路由会话的消息 trigger 降为 context、不进 digest 缓冲，覆盖按类型匹配的宽 source）。
+- **测试**：`watch.test.ts` "never delivers into the session the input already went to #CF-5"、"a watch whose source is the target session's home route is refused"（原 `it.fails`，已修）、"a broader trigger watch covering the target's home conversation records that conversation's messages as context, never a turn there #CF-5"。
+- **状态**：有测试。
+- **决定（2026-10-11，依原则 4 与本条承诺自决）**：建监听时能判断的（source 点名这个会话）直接拒，错误说明原因并提示改用 `context`；宽 source 不拒（主人从私聊监听"所有群"是正常用法），按消息降级。`context` 监听不开轮，不受限制。主路由随最近一轮变化，建监听时的判断只是当时的主路由；之后变成被监听会话的情况由按消息的检查兜住。
 
 ### CF-6 给模型的工具默认关闭，按 agent 开启
 
-- **承诺**：给模型的工具默认关闭、按 agent 配置开启（ROADMAP §1 原则 2）。
-- **实现**：`outputTools` 默认 `false`（`config.ts` `resolveConfig`，决定 13），是每个 agent `tools` 的缺省值（`resolveAgents`）；网关只在有 agent 开了 `tools` 时建 `HostTools` / MCP 服务（`gateway.ts` 构造函数），只给这些 agent 的 harness 挂（`mcp: … agent.tools`）。开启时 15 个工具全部注册（`packages/host-mcp/src/server.ts:20-131`），`live_*` 在没有任何通道能开 live 时也出现（`gateway.ts:382-399`）。
+- **承诺**：给模型的工具默认关闭、按 agent 配置开启，可以逐个开启（ROADMAP §1 原则 2）。
+- **实现**：`outputTools` 默认 `false`（`config.ts` `resolveConfig`，决定 13），是每个 agent `tools` 的缺省值（`resolveAgents`）；网关只在有 agent 开了 `tools` 时建 `HostTools` / MCP 服务（`gateway.ts` 构造函数），只给这些 agent 的 harness 挂（`mcp: … agent.tools`）；`tools` 是名字列表时解析成 `toolNames`（`config.ts` `resolveAgents`，未知名字报错），`HostMcpServer.mcpFor(a, toolNames)` 给这个 token 记下允许的工具，`build` 只注册它们（`packages/host-mcp/src/server.ts`）。`tools: true` 时 15 个工具全部注册（`packages/host-mcp/src/server.ts:20-131`），`live_*` 在没有任何通道能开 live 时也出现（`gateway.ts:382-399`）。
 - **测试**：`packages/daemon/test/output-tools.test.ts` "off by default (decision 13): neither outputTools nor an agent turns them on, nothing is mounted #CF-6"、"agents.<name>.tools: true turns them on for that agent alone, with outputTools unset #CF-6"、"outputTools: false mounts nothing #CF-6"；`packages/daemon/test/topics.test.ts` "agents without the session_* tools get no topic hint #CF-6"（agent 的 `tools: false` 优先于顶层 `outputTools: true`）；`host-mcp.test.ts` "are listed over MCP only when the host provides watches #CF-6"；`packages/host-mcp/test/topic-tools.test.ts` "are listed over MCP only when the host provides topics #CF-6"。
-- **状态**：有测试（按 agent 开关）。逐个工具的开关仍不存在：一个 agent 要么 15 个全有、要么全无，逐个工具的取舍留给 ROADMAP §4 第 11 项（工具负担复查）。测试：`it.fails` `packages/daemon/test/output-tools.test.ts` "enabling only send_message for an agent lists only that tool over MCP #CF-6"（按设想的 `agents.<name>.tools: ['send_message']` 写；今天配置只收布尔值）。
+- **状态**：有测试（按 agent、按工具）。逐个工具的开关：`agents.<name>.tools: ['send_message', …]`（2026-10-11）；测试 `packages/daemon/test/output-tools.test.ts` "enabling only send_message for an agent lists only that tool over MCP"（原 `it.fails`，已修）、"agents.<name>.tools as a list: unknown names are a config error; an empty list is off"。哪些工具该默认给哪类 agent，仍留给 ROADMAP §4 第 11 项（工具负担复查）。
 - **行为变化**：2026-10-11 之前缺省开启；没写 `outputTools` / `tools` 的部署升级后不再有输出工具（CHANNELS §输出工具）。
 
 ### CF-7 谁能建、改、删监听
@@ -663,8 +668,8 @@
 - **承诺**：机密（配置里 `env:` 引用的值、通道凭据、launch env 的值、宿主 MCP token、任务运行的 env）不出现在错误信息、守护进程日志、explain、会话事件、`aio sessions`、控制台 `GET` 和任何子进程命令行里；只出现变量名或键名。
 - **实现**：`packages/daemon/src/config.ts` `substituteEnv`、`ChildSecrets` 与 `claudeMcpViaEnv` / `claudeSettingsViaEnv` / `codexConfigViaEnv`（值进子进程 env，配置里只留 `${NAME}` 或 env-var 间接设置）、`noEnvRefs`；`packages/daemon/src/console-config.ts` `isCredential` / `redact` / `unredact`（`GET` 换成 `ADMIN_REDACTED`，`PUT` 拒绝凭据字段的字面值）；`packages/daemon/src/launch.ts` `launchView`（只给键）及其在 explain、日志里的使用；`harness/claude-code/src/adapter.ts` `open`（宿主 MCP token 走 `AGENTS_IO_MCP_TOKEN` 环境变量，`mcpServers` 里只写 `Bearer ${AGENTS_IO_MCP_TOKEN}`）；`harness/codex/src/harness.ts` `launchFlags` / `secretAt`（像机密的 `-c` 设置直接拒绝）。
 - **测试**：标签 `#SE-1`；例：`packages/daemon/test/config.test.ts` "env:NAME secrets never reach a child command line" 组（"claude mcpServers: the value goes to the child env, the server config says ${NAME}" 等 5 条）、"named instances: clear errors that never echo values #SE-1"、"rejects unknown keys and bad values without echoing values #SE-1"、"errors name entries and variables, never values #CF-3 #SE-1"；`packages/daemon/test/console.test.ts` "GET never shows secret values: literals are redacted, env: references listed as set / unset #SE-1"、"GET of a real-world config (mail pass, env maps, headers, codex config, bridge args, lark config) shows no secret string anywhere #SE-1"、"PUT refuses literals in credential fields whatever their name, keeps stored values for the marker, and honours the marker only on credential fields #SE-1"；`packages/daemon/test/session-launch.test.ts` "env values never show in the event log, explain, sessions, the daemon log or the harness argv; keys do #SE-1"；`packages/daemon/test/runs.test.ts` "env goes into the run child only: the instance built for the run has it; the log, explain records and other instances do not #SE-1 #EX-3"；`harness/claude-code/test/claude-code.test.ts` "host MCP token is passed through the env, never in mcpServers (the SDK puts those on the CLI argv) #SE-1"；`harness/codex/test/unix.test.ts` "refuses secrets in -c values (argv is readable by other local users); env-var indirection is fine #SE-1"。
-- **状态**：部分覆盖。
-- **不成立**：路径型 launch 变量（`envPathRoots` 管的，如 `CLAUDE_CONFIG_DIR`、`CODEX_HOME`）被拒时，`launch.ts` `underRoots` 的原因带原值（"must be absolute: …"、"is outside the allowed roots: …"），经 `checkLaunch` 的 `bad_env` 进 `session.prepare` 的错误答复，回调 launch 被拒时还进守护进程 warn（`router.ts` `route`）。这些值是路径，不是凭据，但仍是"launch env 的值"。测试：`it.fails` `packages/daemon/test/session-launch.test.ts` "a refused path-valued env names the key, never the value #SE-1"。
+- **状态**：有测试。
+- **路径型 launch 变量**（`envPathRoots` 管的，如 `CLAUDE_CONFIG_DIR`、`CODEX_HOME`）被拒时，`launch.ts` `underRoots` 的原因只说为什么（"must be absolute"、"does not exist"、"is outside the allowed roots"），不带值；`checkLaunch` 的 `bad_env` 只写键名（`launch.ts:56-58`）。`cwd` 不是 env，`bad_cwd` 仍带路径。测试：`packages/daemon/test/session-launch.test.ts` "a refused path-valued env names the key, never the value"（原 `it.fails`，已修）。
 - **注意**：launch env 的值要跨重启续接，所以明文存在本地 SQLite（`records.ts`，0600，见 SE-2）。
 
 ### SE-2 本地文件与 socket 只有本人可读
@@ -745,16 +750,16 @@
 1. ~~**通道可以冒充别的通道与主人（ID-3）。**~~ 已修（channel-stamping，决定 13）：信封的 `channel/account`/回复路由按发出它的通道实例核对，不符拒收；一个通道 id 只属于一种适配器；证据按条目授予 ∩ caps 封顶。见 ID-3。
 2. ~~**排队中的输入在停止或重启时静默丢失（IN-1 / RS-6）。**~~ 已修（决定 13）：停止时拒掉并在原路由通知，崩溃遗留在启动时拒掉，遗留 turn 结算时拒掉它的输入，开轮失败在通道上可见。剩下 IN-1 不成立第 1–5 条（策略钩子抛错、live 委托溢出、被接管输入、开轮途中 detach、关闭后到达）。
 3. **`aio explain` 不能从副作用反查（EX-2，不成立）。** 只接受 inputId，返回路由记录；系统回复、宿主 `deliver`、`live_say` 连手工串的线索都没有。原则 4 与决定 4 都以它为"不拦截"的配套。
-4. **重启丢 turn（RS-3 / RS-4，不成立于原则 5）。** Claude Code 的 turn 被打断；Codex stdio 的 turn 既不接管也不结束，挂到下一条输入才记 ambiguous（RS-5），没有新输入就一直显示运行中。三者都没有测试。
+4. **重启丢 turn（RS-3 / RS-4，不成立于原则 5）。** Claude Code 的 turn 被打断；Codex stdio 的 turn 不能接管，~~挂到下一条输入才记 ambiguous~~ 现在下次启动时就记 ambiguous（RS-4、RS-5 已修，2026-10-11）。turn 本身仍然丢失。
 5. ~~outbox 结算前崩溃会重复发送；停止时投递可能既不结算也不记录（DL-1、DL-2）。~~ 已修（决定 13）：发送前写进行中记录，重启后结算为 `unknown` 不重发；`stop()` 有界等待 outbox；单次尝试有超时。
 6. **多机器人退回仍会发生（DL-4，不成立）。** 机器人 b 停掉或启动失败后，`channelFor` 只看到 a，发给 b 的 `deliver` / `systemReply` / `live_join` 改写成 a 发出。决定 8 的本意是"不以别的机器人发出"。
 7. ~~**宿主 `lease` 未实现（HQ-5，不成立）。**~~ 已删（决定 13）：只拉取的宿主用 `onHostDown: "keep"` + 定期重推刷新 `expiresAt`，HOSTS §4、§6 写明。
-8. **宿主 outbound 在宿主离线时退回本地策略（DL-5，不成立于"fail closed"）；`live_join` 目标不过 outbound 检查。**
+8. ~~**宿主 outbound 在宿主离线时退回本地策略（DL-5，不成立于"fail closed"）；`live_join` 目标不过 outbound 检查。**~~ 已修（2026-10-11）：离线期间只放行本轮回复路由；`live_join` 过 `Policy.outbound`。
 9. **并发 `live_join` 停掉已有 live 并泄漏端点（LN-3，不成立）。** 需要在 `gateway.ts:1168` 检查后同步占位。
 10. **入站去重只在内存，部分失败重试会重复进会话（IN-5，不成立）。**
-11. **没有可用交互 agent 时 `accept` 直接抛错（FC-3，不成立）**。（harness 起不来时只在日志里拒绝的 FC-2 已修。）
-12. **`closeLane` 窗口出现同一键两个 lane（LN-2）**；**监听回复会回到被监听的群（CF-5）**：决定 14 已用 `it.fails` 复现，未修。
-13. ~~**未测的承诺**：live 传输拒绝与视频过滤（LN-5）、模块 harness 启动失败（CF-4）、Claude Code 停止时的行为（RS-3）、非 SQLite 持久化（RS-9）、模型输入里的 watch 标记（ID-2）。~~ 决定 14 都补了测试：LN-5、CF-4、RS-3、ID-2 的 watch 标记成立；RS-9 不成立（`it.fails`）。
+11. ~~**没有可用交互 agent 时 `accept` 直接抛错（FC-3，不成立）**~~ 已修（2026-10-11）。（harness 起不来时只在日志里拒绝的 FC-2 已修。）
+12. ~~**`closeLane` 窗口出现同一键两个 lane（LN-2）**；**监听回复会回到被监听的群（CF-5）**~~：已修（2026-10-11）。另：~~路由表迟到的旧版本覆盖新表（HQ-5）~~、~~逐个工具的开关（CF-6）~~、~~结算记录 30 天后清理即可重发（DL-2）~~ 同日已修。
+13. ~~**未测的承诺**：live 传输拒绝与视频过滤（LN-5）、模块 harness 启动失败（CF-4）、Claude Code 停止时的行为（RS-3）、非 SQLite 持久化（RS-9）、模型输入里的 watch 标记（ID-2）。~~ 决定 14 都补了测试：LN-5、CF-4、RS-3、ID-2 的 watch 标记成立；RS-9 当时不成立，2026-10-11 已加告警。
 14. **文档本身的出入**：~~决定 12 说 `onBehalfOf` "须显式开启"而它没有开关（RQ-3）~~ 已加 `policy.answerOnBehalf`（决定 13）；~~工具默认开启与原则 2 相反（CF-6）~~ 已改为默认关闭（决定 13）；`docs/E2E.md` 的"已知缺口"仍写 outbox 在内存、compositor 不接管旧卡片、没有宿主 MCP 工具，三条都已过时。
 15. **A 组合并评审（2026-10-11）遗留**，按原则 4 记下，未修：
     - **启动时为每个会话折叠全量日志**（`settleLeftoverInputs` 调 `hub.snapshot`）：没有压缩时随日志线性增长；等日志压缩一起做。
@@ -763,6 +768,6 @@
     - **热更新时启动失败的模块通道**按 `type` 记为已配置（模块 id 加载后才知道），同 id 的另一账号仍可能被退回使用（DL-4）。bridge 写了 `id` 时已按 id 记。
     - 已修：bridge 类通道收不到停止提示（停止时先拒入站、最后才中止通道）；拒绝提示不再带 `as`；`startChannel` 同步 emit 读到未赋值的 `entry`；邮件 `config.account` 覆盖条目账号；停止期间完成的 `live_join` 未关闭。
 16. **决定 14 新编号读代码时发现的（2026-10-11）**，未修：
-    - **停止期间的入站被确认后丢失（IN-7，不成立）**：停止时 `Gateway.accept` 答 `accepted: false`（`gateway stopping`）而不抛错，飞书照常 ack 并保留去重键、邮件照常前移 checkpoint，消息不再交给下一个进程。
-    - **路径型 launch 变量被拒时错误带原值（SE-1，不成立，轻微）**：`CLAUDE_CONFIG_DIR` / `CODEX_HOME` 的路径出现在 `bad_env` 错误与守护进程 warn 里。
-    - **未测**：`runChannelConformance` 抓违规（CN-1）、`emit` 返回 `accepted: false` 时的确认（IN-7）。
+    - ~~**停止期间的入站被确认后丢失（IN-7，不成立）**~~（已修，`EmitResult.permanent`）：停止时 `Gateway.accept` 答 `accepted: false`（`gateway stopping`）而不抛错，飞书照常 ack 并保留去重键、邮件照常前移 checkpoint，消息不再交给下一个进程。
+    - ~~**路径型 launch 变量被拒时错误带原值（SE-1，不成立，轻微）**~~：已修，`bad_env` 只写键名。
+    - **未测**：`runChannelConformance` 抓违规（CN-1）。~~`emit` 返回 `accepted: false` 时的确认（IN-7）~~ 已有测试。

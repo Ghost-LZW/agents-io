@@ -153,8 +153,7 @@ describe('outbound callout', () => {
     expect(await w.gw.policy.outbound({ from: null, to: route })).toBe('allow');
   });
 
-  // INVARIANTS DL-5 不成立 1: once the host that declared `outbound` disconnects, answers('outbound') is false and the local policy decides (fail open); turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('a host that declared the outbound callout disconnects: a send to a route other than the turn\'s own is still refused #DL-5', async () => {
+  it('a host that declared the outbound callout disconnects: a send to a route other than the turn\'s own is still refused #DL-5', async () => {
     // The local policy alone would allow this registered route; the host tightened it.
     const w = await daemon({ raw: { policy: { owners: ['fake:alice'], routes: ['fake:default:elsewhere'] } } });
     const h = await w.host({ callouts: ['outbound'] });
@@ -162,5 +161,17 @@ describe('outbound callout', () => {
     expect(await w.gw.policy.outbound({ from: null, to: route })).toBe('deny');
     await closeAndWait(w.gw, h);
     expect(await w.gw.policy.outbound({ from: null, to: route })).toBe('deny');
+    // The turn's own route stays open: replying where the turn was asked needs no host.
+    const own = { channel: 'fake', account: 'default', conversationId: 'dm-alice' };
+    const turn = { replyRoute: own, inputs: [] } as unknown as Parameters<typeof w.gw.policy.outbound>[0]['from'];
+    expect(await w.gw.policy.outbound({ from: turn, to: own })).toBe('allow');
+    expect(await w.gw.policy.outbound({ from: turn, to: route })).toBe('deny');
+    // Also after a restart, until a host connects again.
+    await w.stop();
+    const w2 = await daemon({ dir: w.dir, raw: { policy: { owners: ['fake:alice'], routes: ['fake:default:elsewhere'] } } });
+    expect(await w2.gw.policy.outbound({ from: null, to: route })).toBe('deny');
+    // A host that connects without the hook hands outbound back to the local policy.
+    await w2.host({ callouts: ['route'] });
+    expect(await w2.gw.policy.outbound({ from: null, to: route })).toBe('allow');
   });
 });

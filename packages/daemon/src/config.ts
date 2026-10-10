@@ -7,6 +7,7 @@ import { DEFAULT_BLOB_MAX_BYTES, Router, RouterError, checkIdentities, ownerIden
 import { resolveChannelModule } from './channel-module.js';
 import { loadEnvFile } from '@agents-io/testkit';
 import type { CodexTransportOption } from '@agents-io/harness-codex';
+import { TOOL_NAMES } from '@agents-io/host-mcp';
 
 /*
  * aio.config.json: what runs. Secrets never go in it: they come from the
@@ -229,9 +230,10 @@ const AgentEntry = Type.Object(
     mode: Type.Optional(Type.Union([Type.Literal('interactive'), Type.Literal('task')])),
     /**
      * Mount the host MCP output tools for this agent (default: top-level `outputTools`,
-     * itself off by default: principle 2, decision 13). This is the per-agent switch.
+     * itself off by default: principle 2, decision 13). This is the per-agent switch:
+     * `true` mounts every tool, a list of tool names only those (`[]` is `false`).
      */
-    tools: Type.Optional(Type.Boolean()),
+    tools: Type.Optional(Type.Union([Type.Boolean(), Type.Array(Type.String())])),
     /** Extra system instructions read from this file (Claude: appended to the preset prompt; Codex: developer instructions). */
     instructionsFile: Type.Optional(Type.String()),
     /**
@@ -508,6 +510,8 @@ export interface AgentConfig {
   mode: 'interactive' | 'task';
   /** Host MCP output tools mounted. */
   tools: boolean;
+  /** Only these tools are listed (`agents.<name>.tools` as a list); every tool when absent. */
+  toolNames?: string[];
   /** Contents of `instructionsFile`. */
   instructions?: string;
   /** Session launch bounds (decision 7); roots are absolute. */
@@ -828,6 +832,12 @@ function resolveAgents(
       }
     }
     const sessionParams = a.sessionParams && resolveSessionParams(a.sessionParams, `${where}.sessionParams`, a.mode ?? 'interactive', path);
+    let toolNames: string[] | undefined;
+    if (Array.isArray(a.tools)) {
+      const unknown = a.tools.filter((t) => !(TOOL_NAMES as readonly string[]).includes(t));
+      if (unknown.length) fail(`${where}.tools: unknown tool ${unknown.map((t) => JSON.stringify(t)).join(', ')} (tools: ${TOOL_NAMES.join(', ')})`);
+      toolNames = [...new Set(a.tools)];
+    }
     agents[name] = {
       name,
       harness: a.harness,
@@ -836,7 +846,8 @@ function resolveAgents(
       ...(a.profile !== undefined ? { profile: a.profile } : {}),
       ...(a.cwd !== undefined ? { cwd: path(a.cwd) } : {}),
       mode: a.mode ?? 'interactive',
-      tools: a.tools ?? outputTools,
+      tools: toolNames ? toolNames.length > 0 : (a.tools as boolean | undefined) ?? outputTools,
+      ...(toolNames?.length ? { toolNames } : {}),
       ...(instructions !== undefined ? { instructions } : {}),
       ...(sessionParams ? { sessionParams } : {}),
       configured: true,

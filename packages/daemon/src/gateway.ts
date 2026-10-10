@@ -211,6 +211,12 @@ const DAEMON_VERSION: string = (() => {
 })();
 
 /** Local ends post to this route; no adapter renders it, they read the stream instead. */
+/** The agent has the session_* tools (all tools, or a list naming one). */
+const hasTopicTools = (a: AgentConfig | undefined): boolean => !!a?.tools && (!a.toolNames || a.toolNames.some((n) => n.startsWith('session_')));
+
+/** `Gateway.accept`'s refusal while stopping: "not now", never `permanent` (IN-7). */
+const GATEWAY_STOPPING = 'gateway stopping';
+
 export const localRoute = (sessionKey: string): ReplyRoute => ({ channel: 'local', account: 'local', conversationId: sessionKey });
 
 /** Wait for `p`, at most `ms`; the timer holds the event loop and is cleared when `p` wins. */
@@ -259,6 +265,8 @@ export class Gateway {
   /** Adapters of configured agents (their cwd and instructions over the instance's). */
   private readonly agentAdapters = new Map<string, HarnessAdapter>();
   private readonly lanes = new Map<string, Lane>();
+  /** Lanes being closed (parked topics idling out): a new lane for the key waits for the close (LN-2). */
+  private readonly closingLanes = new Map<string, Promise<void>>();
   /** Running lives (decision 11), by session: the channel's media peer of each. */
   /** Sessions with a live_join still opening its endpoint (the claim that keeps it to one live). */
   private readonly joining = new Set<string>();
@@ -307,6 +315,10 @@ export class Gateway {
     }
     const log = o.log ?? new SqliteSessionLog({ path: c.logPath });
     const db = log instanceof SqliteSessionLog ? { db: log.db } : {};
+    // RS-9: the host queue, outbox, launch records and host table share the log's database.
+    if (!(log instanceof SqliteSessionLog) || (!o.log && c.logPath === ':memory:')) {
+      this.log('warn', 'session log is not persistent (not a SQLite file): the session log, host inbound queue, outbox, launch records and host binding table are kept in memory and lost at stop; a restart may resend or lose deliveries');
+    }
     this.hub = new Hub(log);
     this.records = new DaemonRecords(db);
     this.hostQueue = new HostQueue(db);
@@ -367,7 +379,18 @@ export class Gateway {
         }
       },
       // A connected host whose hello lists `outbound` decides where agents may send; no answer denies.
+      // While that host is away (also after a restart, until it or a host without the hook
+      // connects) only the turn's own routes stay open: the local policy's wider allowances
+      // (preregistered routes) are what the host may have tightened, so they fail closed.
       outbound: async (a) => {
+        const held = this.host.outboundHeldBy();
+        if (held !== undefined) {
+          const k = routeKey(a.to);
+          const own = a.from ? [a.from.replyRoute, ...a.from.inputs.map((i) => i.replyRoute)] : [];
+          if (own.some((r) => r && routeKey(r) === k)) return 'allow';
+          this.log('warn', `host ${held} decides outbound and is not connected: ${k} denied`);
+          return 'deny';
+        }
         if (!this.host.answers('outbound')) return local.outbound(a);
         try {
           return await this.host.outboundCallout(a.from, a.to);
@@ -407,7 +430,7 @@ export class Gateway {
     this.watches = new WatchDispatcher({
       registry,
       policy: this.policy,
-      lanes: (key) => this.lane(key),
+      lanes: (key) => this.laneAfterClose(key),
       replyRoute: (w) => this.homeRoute(w.target.sessionKey),
       onError: (err, id) => this.log('warn', `watch ${id}: ${(err as Error).message}`),
     });
@@ -458,7 +481,7 @@ export class Gateway {
     this.ingress = new Ingress({
       policy: this.policy,
       router: this.router,
-      lanes: (key, agent, launch) => this.lane(key, agent, launch),
+      lanes: (key, agent, launch) => this.laneAfterClose(key, agent, launch),
       hub: this.hub,
       watches: this.watches,
       onWatchError: (err) => this.log('warn', `watch fan-out failed: ${(err as Error).message}`),
@@ -470,7 +493,7 @@ export class Gateway {
       // `/new`, `/topics`, `/switch` answer with one short message on the route they came from.
       systemReply: (a) => this.systemReply(a),
       // Inputs of a current topic say how to move between topics, to agents that have the session_* tools.
-      ...(tools ? { topicHint: (agent: string | undefined) => (c.agents[agent ?? c.defaultAgent ?? '']?.tools ? TOPIC_TOOLS_HINT : undefined) } : {}),
+      ...(tools ? { topicHint: (agent: string | undefined) => (hasTopicTools(c.agents[agent ?? c.defaultAgent ?? '']) ? TOPIC_TOOLS_HINT : undefined) } : {}),
       onReplyError: (err) => this.log('warn', `topic command reply failed: ${(err as Error).message}`),
       // A session whose agent is gone refuses the input: its log says so, and the route
       // too when the message was addressed to it (observe-only messages stay silent).
@@ -670,7 +693,7 @@ export class Gateway {
    * gateway pass their `source` (channel-stamping); without one the caller is trusted.
    */
   async accept(env: InboundEnvelope, source?: EmitSource): Promise<IngressResult> {
-    if (this.refusingInbound) return { accepted: false, action: 'invalid', error: 'gateway stopping' };
+    if (this.refusingInbound) return { accepted: false, action: 'invalid', error: GATEWAY_STOPPING };
     const r = await this.ingress.accept(env, source);
     if (r.accepted && r.origin && r.action !== 'duplicate') {
       try {
@@ -745,6 +768,12 @@ export class Gateway {
    * `launch` (decision 7) is pinned with a new session and must match an existing
    * one's; a session pinned to a launch always opens with it.
    */
+  /** `lane`, after a close of the key's previous lane finishes: one writer lane per key (LN-2). */
+  async laneAfterClose(sessionKey: string, agentName?: string, launch?: SessionLaunch): Promise<Lane> {
+    for (let c = this.closingLanes.get(sessionKey); c; c = this.closingLanes.get(sessionKey)) await c;
+    return this.lane(sessionKey, agentName, launch);
+  }
+
   lane(sessionKey: string, agentName?: string, launch?: SessionLaunch): Lane {
     // Before the live-lane shortcut: a conflicting launch must not pass silently.
     let fresh: SessionLaunch | undefined;
@@ -778,7 +807,7 @@ export class Gateway {
       hub: this.hub,
       policy: this.agentPolicy(agent),
       cwd,
-      ...(this.mcp && agent.tools ? { mcp: (a: { sessionKey: string; generation: number; harnessId: string }) => this.mcp!.mcpFor(a) } : {}),
+      ...(this.mcp && agent.tools ? { mcp: (a: { sessionKey: string; generation: number; harnessId: string }) => this.mcp!.mcpFor(a, agent.toolNames) } : {}),
       onLiveEnded: (liveId, reason) => this.liveEnded(sessionKey, liveId, reason),
       onHarnessEvent: (e) => {
         // A topic remembers its harness session id (switching back resumes it; the lane resumes from the log).
@@ -824,7 +853,8 @@ export class Gateway {
     }
     const byPrefix = Object.values(c.agents).find((a) => a.name !== c.defaultAgent && a.mode === 'interactive' && sessionKey.startsWith(`${a.name}:`));
     const agent = usable(wanted) ?? byPrefix ?? usable(c.defaultAgent);
-    if (!agent) throw new Error(`no interactive agent for session ${sessionKey} (configure one, or a defaultAgent)`);
+    // FC-3: refused like a session whose agent is gone (recorded, explained), never a plain throw out of accept.
+    if (!agent) throw new LaneUnavailableError('agent_unavailable', `no interactive agent for session ${sessionKey} (configure one, or a defaultAgent)`);
     return agent;
   }
 
@@ -1096,7 +1126,7 @@ export class Gateway {
         }
         return `${p}_${randomUUID()}`;
       },
-      ...(this.mcp && r.agent.tools ? { mcp: (a: { sessionKey: string; generation: number; harnessId: string }) => this.mcp!.mcpFor(a) } : {}),
+      ...(this.mcp && r.agent.tools ? { mcp: (a: { sessionKey: string; generation: number; harnessId: string }) => this.mcp!.mcpFor(a, r.agent.toolNames) } : {}),
       onHarnessEvent: (e) => this.o.onHarnessEvent?.(r.sessionKey, e),
     });
     this.lanes.set(r.sessionKey, lane);
@@ -1188,7 +1218,7 @@ export class Gateway {
     const handed: string[] = [];
     try {
       // Inside the try: a target topic whose agent is gone (`agent_unavailable`) also sends the conversation back.
-      lane = this.lane(to.sessionKey, to.agent);
+      lane = await this.laneAfterClose(to.sessionKey, to.agent);
       if (context) {
         const r = await lane.observe(context);
         if (!r.ok) throw new Error(r.reason);
@@ -1235,7 +1265,19 @@ export class Gateway {
     const liveId = `live_${randomUUID().slice(0, 8)}`;
     try {
       ch = this.liveChannel(turn, a.channel);
+      // DL-5: where a live happens is an outbound destination like any other (the bot speaks
+      // there). Asked before opening when the channel can name the route; otherwise of the
+      // opened endpoint, which is closed again when denied.
+      const at = ch.adapter.liveRoute?.(ch.account, a.target);
+      if (at) await this.liveAllowed(turn, at);
       endpoint = await ch.adapter.openLive!(ch.account, a.target);
+      if (!at || routeKey(at) !== routeKey(endpoint.route)) {
+        const opened = endpoint;
+        await this.liveAllowed(turn, opened.route).catch(async (e: unknown) => {
+          await opened.close('not an allowed destination').catch(() => undefined);
+          throw e;
+        });
+      }
       // stop() already left the lives it knew of: a join that lands after that is closed here.
       if (this.stopped) {
         await endpoint.close('gateway stopping').catch(() => undefined);
@@ -1285,6 +1327,12 @@ export class Gateway {
       void lane.stopLive().catch(() => undefined);
     });
     return { liveId, title: endpoint.title, route: routeKey(endpoint.route) };
+  }
+
+  /** `Policy.outbound` for a live destination; a deny or a failing check refuses (fail closed). */
+  private async liveAllowed(turn: TurnContext, to: ReplyRoute): Promise<void> {
+    const v = await this.policy.outbound({ from: turn, to }).catch(() => 'deny' as const);
+    if (v !== 'allow') throw new ToolError(`live_join: ${routeKey(to)} is not an allowed destination (Policy.outbound; preregister it in policy.routes)`);
   }
 
   /** The channel a live opens on: `spec` (id or id:account), else the turn's reply channel. */
@@ -1392,6 +1440,20 @@ ${a.summary}` }],
 
   /** Drop a lane and its renderers, then close its harness session (its log stays: the next lane resumes from it). */
   private async closeLane(sessionKey: string, lane: Lane, reason: string): Promise<void> {
+    // Inputs arriving meanwhile wait for the close (`laneAfterClose`): no second lane on the same native session.
+    const done = this.doCloseLane(sessionKey, lane, reason);
+    const settled: Promise<void> = done.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.closingLanes.set(sessionKey, settled);
+    void settled.then(() => {
+      if (this.closingLanes.get(sessionKey) === settled) this.closingLanes.delete(sessionKey);
+    });
+    return done;
+  }
+
+  private async doCloseLane(sessionKey: string, lane: Lane, reason: string): Promise<void> {
     this.lanes.delete(sessionKey);
     this.laneInfo.delete(sessionKey);
     const launched = this.launched.get(sessionKey);
@@ -1730,7 +1792,9 @@ ${a.summary}` }],
         emit: async (env) => {
           const r = await this.accept(env, this.emitSource(entry));
           this.stamped(entry, env, r);
-          return { accepted: r.accepted, ...(r.inputId !== undefined ? { inputId: r.inputId } : {}) };
+          if (r.accepted) return { accepted: true, ...(r.inputId !== undefined ? { inputId: r.inputId } : {}) };
+          // Stopping is "not now" (the next process takes the redelivery); an invalid envelope is never taken.
+          return { accepted: false, ...(r.error !== undefined ? { error: r.error } : {}), ...(r.error !== GATEWAY_STOPPING ? { permanent: true } : {}) };
         },
         log: (level, msg) => this.log(level, `${ch.adapter.id}: ${msg}`),
       })
@@ -1804,19 +1868,29 @@ ${a.summary}` }],
   /**
    * Sessions the log shows mid-turn were left by a previous process. A Codex
    * app-server on a Unix socket may still be running that turn: open the session
-   * now so the harness adopts it (turn.adopted) instead of waiting for input.
+   * now so the harness adopts it (turn.adopted; if it does not, the lane settles it).
+   * Any other harness died with the previous process (Codex over stdio, Claude Code
+   * killed mid-turn): the turn is settled now (ambiguous, host_restarted; RS-4, RS-5)
+   * through its lane, so the compositor takes over the old card and finalizes it,
+   * without opening a harness session and without waiting for a new input.
    */
   private async adoptRunningTurns(): Promise<void> {
     for (const key of this.hub.log.sessions()) {
       if (key.startsWith('run:')) continue; // runs are settled at start (Runs.settleAllDangling)
       const snap = this.hub.snapshot(key);
+      if (!snap.turn) continue;
       const inst = this.instanceOf(snap.harness);
-      if (!snap.turn || inst?.kind !== 'codex' || inst.codex.transport.kind !== 'unix') continue;
+      const adoptable = inst?.kind === 'codex' && inst.codex.transport.kind === 'unix';
       try {
-        await this.lane(key).open();
-        this.log('info', `${key}: reopened to adopt turn ${snap.turn.turnId}`);
+        if (adoptable) {
+          await this.lane(key).open();
+          this.log('info', `${key}: reopened to adopt turn ${snap.turn.turnId}`);
+        } else {
+          await this.lane(key).settleLeftover();
+          this.log('warn', `${key}: turn ${snap.turn.turnId} was running when the previous daemon stopped and its harness cannot resume it; settled ambiguous (host_restarted)`);
+        }
       } catch (e) {
-        this.log('warn', `${key}: could not reopen: ${(e as Error).message}`);
+        this.log('warn', `${key}: could not ${adoptable ? 'reopen' : 'settle the turn it left'}: ${(e as Error).message}`);
       }
     }
   }
@@ -1874,7 +1948,7 @@ ${a.summary}` }],
     try {
       const live = this.lanes.get(cmd.sessionKey);
       if (!live && cmd.sessionKey.startsWith('run:')) return fail('no_run', `${cmd.sessionKey} is not running (task run sessions only take commands while their run runs)`);
-      lane = live ?? this.lane(cmd.sessionKey);
+      lane = live ?? (await this.laneAfterClose(cmd.sessionKey));
     } catch (e) {
       if (e instanceof LaneUnavailableError) {
         // Only a refused input is written to the session log; other commands just fail.

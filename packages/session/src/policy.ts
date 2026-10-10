@@ -112,6 +112,9 @@ export function defaultPolicy(o: DefaultPolicyOptions): FullPolicy {
       const k = routeKey(to);
       if (routes.has(k)) return 'allow';
       if (!from) return 'deny';
+      // A bypass turn (owner-triggered) can already reach anything through its harness; holding back its
+      // sends and lives would cost function without containing risk (decisions 4, 5).
+      if (from.run.profile === 'bypass') return 'allow';
       const own = [from.replyRoute, ...from.inputs.map((i) => i.replyRoute)];
       return own.some((r) => r && routeKey(r) === k) ? 'allow' : 'deny';
     },

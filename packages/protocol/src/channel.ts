@@ -140,14 +140,30 @@ export interface BlobStore {
   get(ref: string): Promise<{ bytes: Uint8Array; mime: string; name?: string }>;
 }
 
+/** What `ChannelContext.emit` answers. */
+export interface EmitResult {
+  accepted: boolean;
+  inputId?: string;
+  /** With `accepted: false`: why. */
+  error?: string;
+  /** With `accepted: false`: this envelope will never be accepted (confirming it loses nothing the host would take). */
+  permanent?: boolean;
+}
+
 export interface ChannelContext {
   account: string;
   config: unknown;
   signal: AbortSignal;
   /** Absent when the host has no blob store; adapters then emit platform refs only. */
   blobs?: BlobStore;
-  /** Hand one inbound message to the host. Resolves once the host has durably accepted it. */
-  emit(env: InboundEnvelope): Promise<{ accepted: boolean; inputId?: string }>;
+  /**
+   * Hand one inbound message to the host. Resolves once the host has durably accepted it
+   * (`accepted: true`); only then may the adapter confirm it to the platform (ack, checkpoint).
+   * `accepted: false` without `permanent` means "not taken now" (e.g. the daemon is stopping):
+   * treat it like a throw, do not confirm, let the platform or a retry bring it again (IN-7).
+   * `permanent: true` means it will never be taken (an invalid envelope): retrying is pointless.
+   */
+  emit(env: InboundEnvelope): Promise<EmitResult>;
   log(level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown): void;
 }
 
@@ -174,6 +190,12 @@ export interface ChannelAdapter {
    * media then flows between them, never through the gateway.
    */
   openLive?(account: string, target: string): Promise<LiveEndpoint>;
+  /**
+   * The route a live on `target` would have (`LiveEndpoint.route`), without opening it,
+   * so `live_join` can ask `Policy.outbound` before anything is joined. Without it the
+   * gateway checks the opened endpoint's route and closes the endpoint when it is denied.
+   */
+  liveRoute?(account: string, target: string): ReplyRoute;
   /** Release resources (called once, at daemon shutdown, after `start`'s signal aborted). */
   close?(): Promise<void>;
 }

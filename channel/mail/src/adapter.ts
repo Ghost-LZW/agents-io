@@ -87,8 +87,14 @@ export class MailChannel implements ChannelAdapter {
           self: addressOf(this.cfg.from),
           ...(this.cfg.internalDelivery ? { internalDomains: this.cfg.internalDelivery.domains.map((d) => d.toLowerCase()) } : {}),
         });
-        // Checkpoint only after the host has durably taken the envelope; a throw retries it.
-        await ctx.emit(env);
+        // Checkpoint only after the host has durably taken the envelope; a throw retries it, and so
+        // does `accepted: false` (IN-7: e.g. the daemon is stopping). A permanent refusal is logged
+        // and passed: it would block every later message and can never be taken.
+        const r = await ctx.emit(env);
+        if (!r.accepted) {
+          if (!r.permanent) throw new Error(`host did not accept uid ${mail.uid}: ${r.error ?? 'no reason given'}`);
+          ctx.log('error', `host refused uid ${mail.uid} for good: ${r.error ?? 'no reason given'}`);
+        }
         await this.store.setCheckpoint(mailbox, { uidValidity: mail.uidValidity, uid: mail.uid });
       },
     });

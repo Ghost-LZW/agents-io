@@ -161,3 +161,5 @@
 - **c1 少删了几条**：`session-launch` "host.hello advertises session.launch"（`host-callouts` 那条并不断言 `session.launch`）和 `daemon/test/topics` "agents without the session_* tools get no topic hint"（唯一断言 agent 的 `tools: false` 压过顶层 `outputTools: true` 的测试）保留；`watch.test.ts` 的授权测试删掉后，删除与覆盖权限那一半另留一条；`admin-topics` 的 run 部分并进 `protocol.test.ts` 的 PR-1 schema 测试。删掉 21 条（复查列 23 条，保留上面两条）。
 - **分类按 §3.1 的判据逐条重读**，各文件 a/b/c2/d 的个数与 §2 表有出入（例如飞书的群提及门控、邮件的自动回复过滤没有承诺，进 local）；没有承诺的留在 core 的一条也没有。
 - **"不成立"都写成了 `it.fails`**（25 条，含读新编号时发现的 IN-7、SE-1）；LN-4 的 Codex 迟到 `live.ended` 用假 harness 复现不了，写成 `it.todo`。原以为不成立或未测、写测试后发现成立的：DL-3、HQ-1（网关层跨重启）、ID-6、LN-1、LN-5、RS-3（现状如实）、RS-7、RS-8、CF-4、RS-1 的 blob。
+
+- 补记（2026-10-11，决定 13 的 DL-5 修复）：默认 `Policy.outbound` 对 `bypass` 一轮（只有全部输入来自主人时才是这一档）放行任何目的地，包括 `live_join` 的会议。依据决定 4、5：这一轮的 harness 已能联网、执行命令，agents-io 再拦外发只减功能、不减风险。其他轮仍只放行本轮回复路由与预登记路由；宿主声明了 `outbound` 时由宿主决定。

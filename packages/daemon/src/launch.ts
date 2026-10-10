@@ -38,7 +38,7 @@ export function checkLaunch(agent: AgentConfig, launch: SessionLaunch, inst: Har
   const out: SessionLaunch = {};
   if (launch.cwd !== undefined) {
     const r = underRoots(launch.cwd, p.cwdRoots);
-    if (typeof r !== 'string') return no('bad_cwd', `cwd ${r.why}`);
+    if (typeof r !== 'string') return no('bad_cwd', `cwd ${r.why}: ${launch.cwd}`);
     out.cwd = r;
   }
   const env = launch.env ?? {};
@@ -54,6 +54,7 @@ export function checkLaunch(agent: AgentConfig, launch: SessionLaunch, inst: Har
       const roots = p.envPathRoots[k];
       if (roots) {
         const r = underRoots(v, roots);
+        // The key only, never the value (SE-1): launch env values stay out of errors and logs.
         if (typeof r !== 'string') return no('bad_env', `${k} ${r.why}`);
         checked[k] = r;
       } else checked[k] = v;
@@ -65,15 +66,15 @@ export function checkLaunch(agent: AgentConfig, launch: SessionLaunch, inst: Har
   return { ok: true, launch: out };
 }
 
-/** The realpath of `p` when it is an absolute, existing directory under one of `roots` (also by realpath). */
+/** The realpath of `p` when it is an absolute, existing directory under one of `roots` (also by realpath). `why` never contains `p`. */
 function underRoots(p: string, roots: string[]): string | { why: string } {
-  if (!isAbsolute(p)) return { why: `must be absolute: ${p}` };
+  if (!isAbsolute(p)) return { why: 'must be absolute' };
   let real: string;
   try {
     real = realpathSync(p);
-    if (!statSync(real).isDirectory()) return { why: `is not a directory: ${p}` };
+    if (!statSync(real).isDirectory()) return { why: 'is not a directory' };
   } catch {
-    return { why: `does not exist: ${p}` };
+    return { why: 'does not exist' };
   }
   for (const root of roots) {
     let r: string;
@@ -85,7 +86,7 @@ function underRoots(p: string, roots: string[]): string | { why: string } {
     const rel = relative(r, real);
     if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))) return real;
   }
-  return { why: `is outside the allowed roots: ${p}` };
+  return { why: 'is outside the allowed roots' };
 }
 
 function no(code: string, message: string): LaunchCheck {

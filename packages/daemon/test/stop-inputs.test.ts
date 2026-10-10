@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { SessionEvent } from '@agents-io/protocol';
 import { SqliteSessionLog, rejectionNotice } from '@agents-io/session';
 import { CodexHarness } from '@agents-io/harness-codex';
-import { FakeChannel } from '@agents-io/testkit';
+import { FakeChannel, fakeEnvelope } from '@agents-io/testkit';
 import { FakeAppServer } from '../../../harness/codex/test/fake-app-server.js';
 import { resolveConfig } from '../src/config.js';
 import { Gateway, InstanceHarness } from '../src/gateway.js';
@@ -55,6 +55,18 @@ describe('inputs left when the daemon stops or crashes (INVARIANTS IN-1, RS-6)',
     ctrl.signal.addEventListener('abort', () => (aborted = true));
     await w.stop();
     expect(w.chat.sent.some((s) => s.msg.text === rejectionNotice('lane_closed: gateway stopping'))).toBe(true);
+  });
+
+  it('a channel message arriving while the daemon stops is answered accepted:false, not permanent, so the channel does not confirm it #IN-7', async () => {
+    const w = await daemon({ script: (t) => new Promise((_, reject) => t.signal.addEventListener('abort', () => reject(new Error('aborted')))) });
+    await w.chat.inject({ sender: alice, text: 'long job' });
+    await until(() => w.chat.sent.length === 1);
+    // The channel's emit as the gateway gave it (the fake forgets it once closed).
+    const ctx = (w.chat as unknown as { ctx: { emit: (e: unknown) => Promise<unknown> } }).ctx;
+    const stopping = w.stop();
+    await until(() => (w.gw as unknown as { refusingInbound: boolean }).refusingInbound);
+    expect(await ctx.emit(fakeEnvelope({ channel: 'fake', id: 'late', sender: alice, text: 'late' }))).toEqual({ accepted: false, error: 'gateway stopping' });
+    await stopping;
   });
 
   it('crash leftovers: inputs admitted but never settled by the previous process are rejected (host_restarted) at startup, and the snapshot lists none queued #IN-1 #RS-6', async () => {
@@ -114,8 +126,7 @@ describe('inputs left when the daemon stops or crashes (INVARIANTS IN-1, RS-6)',
     expect(w2.harness.sessions[0]!.args.resume).toBe('native-1');
   });
 
-  // INVARIANTS RS-4 不成立 1: a Codex stdio lane is detached at stop like a unix one, and nothing settles its turn at start without new input; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('Codex over stdio mid-turn at stop: after the next start, with no new input, the turn is settled (ambiguous host_restarted) and the snapshot no longer shows it running #RS-4 #RS-5', async () => {
+  it('Codex over stdio mid-turn at stop: after the next start, with no new input, the turn is settled (ambiguous host_restarted) and the snapshot no longer shows it running #RS-4 #RS-5', async () => {
     const dir = tmp();
     const raw = {
       dataDir: dir,

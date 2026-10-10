@@ -249,8 +249,7 @@ describe('deliver, input.verify, explain', () => {
     expect(w2.chat.sent).toHaveLength(0);
   });
 
-  // INVARIANTS DL-2 不成立 1: settled outbox records are pruned after 30 days (records.ts outPrune), after which the same operationId is sent again; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('after the 30-day prune of settled outbox records, the same operationId is not sent again #DL-2', async () => {
+  it('after the 30-day prune of settled outbox records, the same operationId is not sent again #DL-2', async () => {
     const w = await daemon();
     const route = { channel: 'fake', account: 'default', conversationId: 'dm-alice' };
     await (await w.host()).deliver({ operationId: 'op-old', route, message: { text: 'once' } });
@@ -260,7 +259,7 @@ describe('deliver, input.verify, explain', () => {
     db.prepare('UPDATE daemon_outbox SET at = at - ?').run(31 * 86_400_000);
     db.close();
     const w2 = await daemon({ dir: w.dir });
-    expect(await (await w2.host()).deliver({ operationId: 'op-old', route, message: { text: 'once' } })).toMatchObject({ duplicate: true });
+    expect(await (await w2.host()).deliver({ operationId: 'op-old', route, message: { text: 'once' } })).toMatchObject({ status: 'delivered', duplicate: true });
     expect(w2.chat.sent).toHaveLength(0);
   });
 

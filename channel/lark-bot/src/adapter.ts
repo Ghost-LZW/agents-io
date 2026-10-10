@@ -3,6 +3,7 @@ import type {
   ChannelAdapter,
   ChannelCaps,
   ChannelContext,
+  EmitResult,
   InboundEnvelope,
   ProgressView,
   RenderedMessage,
@@ -258,12 +259,15 @@ export class LarkBotAdapter implements ChannelAdapter {
    * Wait for the host to take the message, but never past Lark's ack deadline. A failure
    * before the deadline rejects (the SDK answers 500, Lark redelivers, the dedup key is
    * dropped for it); once the deadline acked the event Lark will not redeliver, so the
-   * adapter keeps the dedup key and retries the emit itself.
+   * adapter keeps the dedup key and retries the emit itself. An answer of `accepted: false`
+   * (not `permanent`) counts as a failure too (IN-7: e.g. the daemon is stopping).
    */
   private async deliver(ctx: ChannelContext, key: string, emit: () => Promise<unknown>): Promise<void> {
     let acked = false;
     const attempt = (n: number): Promise<unknown> =>
-      emit().catch(async (err) => {
+      emit()
+        .then((r) => notTaken(ctx, key, r))
+        .catch(async (err) => {
         if (!acked) throw err;
         if (n >= EMIT_RETRIES || ctx.signal.aborted) {
           this.dedup.delete(key);
@@ -918,4 +922,18 @@ export class LarkBotAdapter implements ChannelAdapter {
     await this.api('message.patch', () => this.client.im.v1.message.patch({ data: { content: json }, path: { message_id: id } }));
     st.lastCard = json;
   }
+}
+
+/**
+ * `ChannelContext.emit` answered: `accepted: false` without `permanent` is "not taken now",
+ * a failure like a throw (IN-7). A permanent refusal is logged and confirmed (redelivery cannot help).
+ */
+function notTaken(ctx: ChannelContext, key: string, r: unknown): unknown {
+  const res = r as EmitResult | undefined;
+  if (!res || res.accepted !== false) return r;
+  if (res.permanent) {
+    ctx.log('error', `host refused ${key} for good: ${res.error ?? 'no reason given'}`);
+    return r;
+  }
+  throw new Error(`host did not accept ${key}: ${res.error ?? 'no reason given'}`);
 }

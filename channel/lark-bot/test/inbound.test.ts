@@ -118,8 +118,7 @@ describe('inbound mapping', () => {
     await done;
   });
 
-  // INVARIANTS IN-7 不成立 1: deliver treats only a throw as failure, so an emit answering { accepted: false } (gateway stopping) is acked and keeps its dedup key; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('an emit answering accepted:false is not acked and leaves no dedup key, so the redelivery gets in #IN-7', async () => {
+  it('an emit answering accepted:false is not acked and leaves no dedup key, so the redelivery gets in #IN-7', async () => {
     let refuse = true;
     const { lark, envs, ctl, done } = await setup({
       emit: async (env) => {
@@ -132,6 +131,21 @@ describe('inbound mapping', () => {
     refuse = false;
     await lark.fire('im.message.receive_v1', messageEvent());
     expect(envs).toHaveLength(1);
+    ctl.abort();
+    await done;
+  });
+
+  it('a permanent refusal (an envelope the host will never take) is acked: redelivery cannot help #IN-7', async () => {
+    let emitted = 0;
+    const { lark, ctl, done } = await setup({
+      emit: async () => {
+        emitted++;
+        return { accepted: false, permanent: true, error: 'invalid envelope' };
+      },
+    });
+    await lark.fire('im.message.receive_v1', messageEvent());
+    await lark.fire('im.message.receive_v1', messageEvent());
+    expect(emitted).toBe(1);
     ctl.abort();
     await done;
   });

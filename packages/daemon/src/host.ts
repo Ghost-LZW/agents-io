@@ -95,6 +95,15 @@ export class HostService implements HostFrames {
     return h ? { name: h.name, callouts: h.hooks.size > 0, hooks: [...h.hooks], ...(h.consumer !== undefined ? { consumer: h.consumer } : {}) } : undefined;
   }
 
+  /**
+   * The host that last connected with the `outbound` hook, while it is not answering
+   * (disconnected, also across a daemon restart): sends only it could allow fail closed
+   * (DL-5). Cleared when a host connects without the hook.
+   */
+  outboundHeldBy(): string | undefined {
+    return this.answers('outbound') ? undefined : this.d.records.flag(OUTBOUND_FLAG);
+  }
+
   /** The connected host answers this `policy` hook. */
   answers(hook: CalloutHook): boolean {
     const h = this.host;
@@ -180,6 +189,7 @@ export class HostService implements HostFrames {
     peer.auth = { name, origin: () => hostOrigin(name) };
     if (role) {
       this.host = { peer, name, hooks, ...(f.consumer !== undefined ? { consumer: f.consumer } : {}) };
+      this.d.records.setFlag(OUTBOUND_FLAG, hooks.has('outbound') ? name : undefined);
       this.d.router.setHostConnected(true);
       if (f.consumer !== undefined) this.host.push = this.startPush(peer, f.consumer);
       this.d.log('info', `host ${name} connected${f.consumer !== undefined ? `, consuming as ${f.consumer}` : ''}${hooks.size ? `, answering callouts (${[...hooks].join(', ')})` : ''}`);
@@ -263,6 +273,9 @@ export class HostService implements HostFrames {
 
 /** Capabilities `host.hello` advertises (a host must not rely on one this list lacks); `resolve.onBehalfOf` only with `policy.answerOnBehalf`. */
 export const FEATURES = ['session.launch', 'callouts.resolve', 'callouts.outbound', 'resolve.onBehalfOf', 'inbound.redispatch', 'host.takeover'];
+
+/** `DaemonRecords` flag: the name of the host that declared the `outbound` hook. */
+const OUTBOUND_FLAG = 'host.outbound';
 
 /** The `policy` hooks a host may answer. */
 export type CalloutHook = 'route' | 'resolve' | 'outbound';

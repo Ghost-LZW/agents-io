@@ -39,7 +39,7 @@ import { contentText } from './watch.js';
 export class RouterError extends Error {
   override name = 'RouterError';
   constructor(
-    readonly code: 'invalid' | 'conflict' | 'task_agent' | 'unknown_agent',
+    readonly code: 'invalid' | 'conflict' | 'task_agent' | 'unknown_agent' | 'stale_version',
     message: string,
   ) {
     super(message);
@@ -270,6 +270,11 @@ export class Router {
     this.validate(table, 'host');
     const previous = this.host?.table.version;
     if (this.host && previous === table.version && JSON.stringify(this.host.table) === JSON.stringify(table)) return { version: table.version, previous, changed: false };
+    // HQ-5: decimal-integer versions (a counter, a ms timestamp) are ordered, so a late older
+    // push never replaces a newer table. Other versions are opaque labels: any one replaces.
+    if (previous !== undefined && olderVersion(table.version, previous)) {
+      throw new RouterError('stale_version', `host table ${table.version} is older than the installed ${previous}; push a version above ${previous}`);
+    }
     const putAt = this.now();
     this.q.tablePut.run('host', JSON.stringify(table), putAt);
     this.host = { table: structuredClone(table), putAt };
@@ -691,6 +696,12 @@ export function topicConversation(env: InboundEnvelope): string {
 export const REDISPATCH_RULE = 'host:redispatch';
 
 const targets = (on: BindingAction): on is Effective => on === 'dispatch' || on === 'context' || on === 'digest';
+
+/** `v` is older than `than`: both are decimal integers and `v` is smaller. */
+function olderVersion(v: string, than: string): boolean {
+  const dec = /^\d{1,30}$/;
+  return dec.test(v) && dec.test(than) && BigInt(v) < BigInt(than);
+}
 
 class CalloutTimeout extends Error {}
 

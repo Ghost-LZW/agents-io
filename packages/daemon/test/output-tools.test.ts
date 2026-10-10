@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { FakeHarness } from '@agents-io/testkit';
+import { resolveConfig } from '../src/config.js';
 import { until } from './helpers.js';
 import { completed, mcpCall, mcpTools, setup } from './output-tools-helpers.js';
 
@@ -38,8 +39,7 @@ describe('dev-gateway host output tools', () => {
     expect(w.gw.tools).toBeDefined();
   });
 
-  // INVARIANTS CF-6 状态: there is no per-tool switch (`tools` is a boolean; this list form is refused by the config schema), so an agent gets all 15 tools or none; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('enabling only send_message for an agent lists only that tool over MCP #CF-6', async () => {
+  it('enabling only send_message for an agent lists only that tool over MCP #CF-6', async () => {
     const holder: { h?: FakeHarness } = {};
     let listed: string[] | undefined;
     // The expected shape: `agents.<name>.tools` as a list of tool names (ROADMAP §1 principle 2; §4 item 11).
@@ -52,5 +52,13 @@ describe('dev-gateway host output tools', () => {
     await w.chat.inject({ sender: { channelUserId: 'alice', evidence: 'platform_signed' }, text: 'hi' });
     await until(() => listed);
     expect(listed).toEqual(['send_message']);
+  });
+
+  it('agents.<name>.tools as a list: unknown names are a config error; an empty list is off #CF-6', () => {
+    const resolve = (tools: unknown) => resolveConfig({ agents: { chat: { harness: 'claude-code', tools } }, defaultAgent: 'chat' }, { env: {}, baseDir: '/base', cwd: '/work' });
+    expect(() => resolve(['send_message', 'nope'])).toThrow(/agents\.chat\.tools: unknown tool "nope"/);
+    expect(resolve([]).agents.chat).toMatchObject({ tools: false });
+    expect(resolve([]).agents.chat!.toolNames).toBeUndefined();
+    expect(resolve(['send_message', 'send_message']).agents.chat).toMatchObject({ tools: true, toolNames: ['send_message'] });
   });
 });

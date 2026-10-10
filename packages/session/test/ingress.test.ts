@@ -225,7 +225,7 @@ describe('Ingress source stamping (channel-stamping, decision 13)', () => {
   it('emitter(source) answers like accept(env, source); without a source nothing is checked or capped #ID-3', async () => {
     const { ingress, lanes } = world();
     const emit = ingress.emitter(src({ evidence: ['none'] }));
-    expect(await emit(fakeEnvelope({ id: 'e1', channel: 'other', sender: alice }))).toEqual({ accepted: false });
+    expect(await emit(fakeEnvelope({ id: 'e1', channel: 'other', sender: alice }))).toMatchObject({ accepted: false, permanent: true });
     const ok = await emit(fakeEnvelope({ id: 'e2', conversation: group, sender: alice }));
     expect(ok.accepted).toBe(true);
     const again = await ingress.accept(fakeEnvelope({ id: 'e2', conversation: group, sender: alice }), src({ evidence: ['none'] }));

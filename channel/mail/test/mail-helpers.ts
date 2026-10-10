@@ -38,8 +38,18 @@ export class FakeSource implements MailSource {
     this.checkpointSeen = await a.checkpoint();
     while (!a.signal.aborted) {
       const m = this.queue.shift();
-      if (m) await a.onMessage({ ...m, uidValidity: '1' });
-      else await new Promise<void>((r) => { this.wake = r; a.signal.addEventListener('abort', () => r(), { once: true }); });
+      let wait = !m;
+      if (m) {
+        try {
+          await a.onMessage({ ...m, uidValidity: '1' });
+        } catch (e) {
+          // Like ImapSource: the message is fetched again later (here: at the next push).
+          a.log('warn', `onMessage failed: ${String(e)}`);
+          this.queue.unshift(m);
+          wait = true;
+        }
+      }
+      if (wait) await new Promise<void>((r) => { this.wake = r; a.signal.addEventListener('abort', () => r(), { once: true }); });
     }
   }
 }
