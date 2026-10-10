@@ -173,6 +173,11 @@ export const RouteExplanation = Type.Object({
   ),
   principal: Type.Union([Type.String(), Type.Null()]),
   evidence: Evidence,
+  /**
+   * The evidence the envelope claimed, when the emitting channel may not give it and
+   * it was capped to `none` (channel-stamping): `evidence` is what identity saw.
+   */
+  claimedEvidence: Type.Optional(Evidence),
   /** Unix ms of the routing decision. */
   at: Type.Optional(Type.Number()),
   /** This input is a host-inbound item redispatched by the host (`inbound.redispatch`): the original input and queue cursor. */

@@ -12,6 +12,7 @@ import {
   type AdminStatus,
   type ChannelAdapter,
   type ContentBlock,
+  type Evidence,
   type HarnessAdapter,
   type HarnessCaps,
   type HarnessEvent,
@@ -51,6 +52,7 @@ import {
   Outbox,
   Router,
   SqliteSessionLog,
+  SOURCE_MISMATCH,
   TOPIC_TOOLS_HINT,
   TopicError,
   TopicRegistry,
@@ -58,6 +60,7 @@ import {
   WatchRegistry,
   defaultPolicy,
   type AddWatchResult,
+  type EmitSource,
   type FullPolicy,
   type IngressResult,
   type RemoveWatchResult,
@@ -73,8 +76,8 @@ import { CodexHarness, type CodexProfile } from '@agents-io/harness-codex';
 import { loadChannelModule } from './channel-module.js';
 import { LarkBotAdapter } from '@agents-io/channel-lark-bot';
 import { MailChannel, type MailChannelConfig } from '@agents-io/channel-mail';
-import { spawnChannel, type BridgeState } from '@agents-io/channel-jsonl-bridge';
-import { ConfigError, agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type ResolvedChannel } from './config.js';
+import { spawnChannel, type BridgedChannel, type BridgeState } from '@agents-io/channel-jsonl-bridge';
+import { ConfigError, RESERVED_CHANNEL_IDS, UNGRANTED_EVIDENCE, agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type ResolvedChannel } from './config.js';
 import { ConsoleServer } from './console.js';
 import { ConfigStore, canonical } from './console-config.js';
 import { LarkBotJobs } from './provision.js';
@@ -162,7 +165,41 @@ interface RunningChannel {
   ended?: boolean;
   /** A bridge reported its connection state (it has connected or failed a first connect). */
   reported?: boolean;
+  /** Which adapter its channel id belongs to (channel-stamping F4, {@link channelOwner}). */
+  owner: ChannelOwner;
+  /** Envelopes refused for claiming another (channel, account) or reply route. */
+  rejected: number;
+  /** Envelopes whose evidence was capped to `none`. */
+  evidenceCapped: number;
+  /** Last warn per reason (rate limit: one a minute). */
+  warnedAt?: Map<string, number>;
 }
+
+/**
+ * Who a channel id belongs to: the built-in type (`lark-bot`, `mail`), one bridge
+ * program (`bridge:` command and args), one module (`module:` file and export), or, for
+ * an adapter the embedder passes (`GatewayOptions.channels`), its class (several bots
+ * of one adapter class are several objects). Channels sharing an id must share an
+ * owner; only their accounts differ.
+ */
+type ChannelOwner = string | Function;
+
+function channelOwner(cfg: ResolvedChannel): string {
+  switch (cfg.type) {
+    case 'lark-bot':
+    case 'mail':
+      return cfg.type;
+    case 'bridge':
+      return `bridge:${JSON.stringify([cfg.command, cfg.args ?? []])}`;
+    case 'module':
+      return `module:${JSON.stringify([cfg.module, cfg.export ?? null])}`;
+  }
+}
+
+const ownerName = (o: ChannelOwner) => (typeof o === 'string' ? o : `embedded adapter ${o.name || '(anonymous class)'}`);
+
+/** Bridge and module channels give strong evidence only when the entry grants it. */
+const grantedByDefault = (o: ChannelOwner) => typeof o !== 'string' || o === 'lark-bot' || o === 'mail';
 
 const DAEMON_VERSION: string = (() => {
   try {
@@ -552,7 +589,7 @@ export class Gateway {
         ...(h ? { name: h.name, callouts: h.callouts, ...(h.consumer !== undefined ? { consumer: h.consumer } : {}) } : {}),
         ...(st ? { table: { version: st.table.version, active: st.active, ...(st.suspended ? { suspended: st.suspended } : {}) } } : {}),
       },
-      channels: this.channels.map((ch) => ({ id: ch.adapter.id, account: ch.account, state: ch.state, ...(ch.error ? { error: ch.error } : {}) })),
+      channels: this.channels.map((ch) => ({ id: ch.adapter.id, account: ch.account, state: ch.state, ...(ch.error ? { error: ch.error } : {}), ...(ch.rejected ? { rejected: ch.rejected } : {}), ...(ch.evidenceCapped ? { evidenceCapped: ch.evidenceCapped } : {}) })),
       agents: Object.values(c.agents).map((a) => ({
         name: a.name,
         harness: a.harness,
@@ -616,13 +653,15 @@ export class Gateway {
 
   /**
    * Accept one envelope from a channel: route it (Ingress) and remember who sent
-   * it as the channel reported it, so `input.verify` can answer later.
+   * it as stamped, so `input.verify` can answer later. Channels started by the
+   * gateway pass their `source` (channel-stamping); without one the caller is trusted.
    */
-  async accept(env: InboundEnvelope): Promise<IngressResult> {
-    const r = await this.ingress.accept(env);
+  async accept(env: InboundEnvelope, source?: EmitSource): Promise<IngressResult> {
+    const r = await this.ingress.accept(env, source);
     if (r.accepted && r.origin && r.action !== 'duplicate') {
       try {
-        this.records.recordInput(env, r.origin, r.inputId);
+        // As stamped (evidence capped), not as claimed: hosts verify authors with it.
+        this.records.recordInput(r.envelope ?? env, r.origin, r.inputId);
       } catch (e) {
         this.log('warn', `recording input ${r.inputId ?? env.id} failed: ${(e as Error).message}`);
       }
@@ -1395,13 +1434,15 @@ ${a.summary}` }],
     try {
       let i = 0;
       for (const ch of this.o.config.channels) all.push(await this.buildConfigChannel(ch, i++));
-      for (const x of this.o.channels ?? []) all.push({ adapter: x.adapter, account: x.account ?? 'default', ...(x.tier ? { tier: x.tier } : {}) });
-      // Only now is a module channel's id known: one (channel, account) is one route target.
-      const seen = new Set<string>();
+      for (const x of this.o.channels ?? []) all.push({ adapter: x.adapter, account: x.account ?? 'default', owner: x.adapter.constructor, ...(x.tier ? { tier: x.tier } : {}) });
+      // Only now is a module channel's id known: one channel id belongs to one adapter, one (channel, account)
+      // is one route target. A bridge without `id` that has not connected yet is checked at its hello.
+      const known: BuiltChannel[] = [];
       for (const c of all) {
-        const k = `${c.adapter.id}\0${c.account}`;
-        if (seen.has(k)) throw new ConfigError(`two channels have the same (channel, account) = (${c.adapter.id}, ${c.account}); give one another account`);
-        seen.add(k);
+        if (!idKnown(c)) continue;
+        const why = idConflict(c.adapter.id, c.owner, c.account, known);
+        if (why) throw new ConfigError(why);
+        known.push(c);
       }
     } catch (e) {
       await closeAll();
@@ -1423,10 +1464,14 @@ ${a.summary}` }],
       if (!entry) return void (early = st);
       this.bridgeState(entry, st);
     };
+    const owner = channelOwner(cfg);
+    // Each hello's id is checked against the running channels (a bridge without `id` learns its id there).
+    const acceptId = (id: string) => idConflict(id, owner, cfg.account, this.channels.filter((e) => e !== entry));
     const own = this.o.channelAdapter?.(cfg);
-    const built = own ? { adapter: own, account: cfg.account, ...(cfg.tier ? { tier: cfg.tier } : {}) } : await buildChannel(cfg, index, (l, m, d) => this.log(l, m, d), onState);
+    const built = own ? { adapter: own, account: cfg.account, ...(cfg.tier ? { tier: cfg.tier } : {}) } : await buildChannel(cfg, index, (l, m, d) => this.log(l, m, d), onState, acceptId);
     return {
       ...built,
+      owner,
       source: cfg,
       bind: (e) => {
         entry = e;
@@ -1439,7 +1484,47 @@ ${a.summary}` }],
     const e = this.startChannel(b);
     if (b.source) e.source = b.source;
     b.bind?.(e);
+    // A bridge's caps are its peer's: checked once it connects (bridgeState).
+    if (idKnown(b) && !isBridge(b.adapter)) this.checkGrant(e);
     return e;
+  }
+
+  /**
+   * The source a channel's envelopes are stamped against: its id and account, and
+   * the evidence it may give — the entry's `evidence` grant (default: caps for
+   * built-in and embedded adapters, `device_only` for bridges and modules) ∩ the
+   * adapter's current `caps.evidence` (a bridge's change with each hello), plus `none`.
+   */
+  private emitSource(e: RunningChannel): EmitSource {
+    const caps = e.adapter.caps(e.account);
+    const grant = e.source?.evidence ?? (grantedByDefault(e.owner) ? caps.evidence : UNGRANTED_EVIDENCE);
+    const evidence: Evidence[] = [...caps.evidence.filter((x) => grant.includes(x)), 'none'];
+    return { channel: e.adapter.id, account: e.account, evidence, declaresSender: caps.declaresSender };
+  }
+
+  /** Warn about an `evidence` grant the adapter cannot give (it is only intersected with caps). */
+  private checkGrant(e: RunningChannel): void {
+    const caps = e.adapter.caps(e.account).evidence;
+    const extra = (e.source?.evidence ?? []).filter((x) => x !== 'none' && !caps.includes(x));
+    if (extra.length) this.log('warn', `channel ${e.adapter.id} (${e.account}): evidence ${extra.join(', ')} granted in the config, but the adapter cannot give it (caps.evidence: ${caps.join(', ') || 'none'}); ignored`);
+  }
+
+  /** Count and log (one per reason a minute) what stamping did to an envelope from `e`. */
+  private stamped(e: RunningChannel, env: InboundEnvelope, r: IngressResult): void {
+    const warn = (reason: string, msg: string) => {
+      const now = Date.now();
+      const at = (e.warnedAt ??= new Map()).get(reason);
+      if (at !== undefined && now - at < 60_000) return;
+      e.warnedAt.set(reason, now);
+      this.log('warn', `channel ${e.adapter.id} (${e.account}): ${msg} (status counts every one)`);
+    };
+    if (!r.accepted && r.error?.startsWith(SOURCE_MISMATCH)) {
+      e.rejected++;
+      warn('source', `refused envelope ${env.id}: ${r.error.slice(SOURCE_MISMATCH.length).trim()}`);
+    } else if (r.claimedEvidence !== undefined && r.action !== 'duplicate') {
+      e.evidenceCapped++;
+      warn('evidence', `envelope ${env.id} claims evidence ${r.claimedEvidence}, beyond this channel's cap (grant it with "evidence" on the channel entry); taken as none`);
+    }
   }
 
   /** Build and start one configured channel next to the running ones (live apply). */
@@ -1450,9 +1535,10 @@ ${a.summary}` }],
       await b.close?.().catch(() => undefined);
       throw new Error('gateway stopping');
     }
-    if (this.channels.some((e) => e.adapter.id === b.adapter.id && e.account === b.account)) {
+    const why = idKnown(b) ? idConflict(b.adapter.id, b.owner, b.account, this.channels) : undefined;
+    if (why) {
       await b.close?.().catch(() => undefined);
-      throw new ConfigError(`two channels have the same (channel, account) = (${b.adapter.id}, ${b.account}); give one another account`);
+      throw new ConfigError(why);
     }
     return this.launchChannel(b);
   }
@@ -1465,6 +1551,7 @@ ${a.summary}` }],
       entry.state = 'running';
       delete entry.error;
       if (was === 'failed') this.log('info', `channel ${entry.adapter.id} (${entry.account}) connected`);
+      this.checkGrant(entry);
     } else {
       entry.state = 'failed';
       entry.error = `${st.error ?? 'not connected'}; retrying`;
@@ -1583,7 +1670,7 @@ ${a.summary}` }],
     this.log('info', `channel ${e.adapter.id} (${e.account}) stopped`);
   }
 
-  private startChannel(ch: { adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }): RunningChannel {
+  private startChannel(ch: { adapter: ChannelAdapter; account: string; owner: ChannelOwner; tier?: Tier; config?: unknown; close?: () => Promise<void> }): RunningChannel {
     const ac = new AbortController();
     const running = ch.adapter
       .start({
@@ -1591,8 +1678,10 @@ ${a.summary}` }],
         config: ch.config,
         signal: ac.signal,
         blobs: this.blobs,
+        // Stamped against this instance: an envelope claiming another (channel, account) is refused.
         emit: async (env) => {
-          const r = await this.accept(env);
+          const r = await this.accept(env, this.emitSource(entry));
+          this.stamped(entry, env, r);
           return { accepted: r.accepted, ...(r.inputId !== undefined ? { inputId: r.inputId } : {}) };
         },
         log: (level, msg) => this.log(level, `${ch.adapter.id}: ${msg}`),
@@ -1610,7 +1699,7 @@ ${a.summary}` }],
           this.log('error', `channel ${ch.adapter.id} stopped: ${err.message}`);
         },
       );
-    const entry: RunningChannel = { adapter: ch.adapter, account: ch.account, ...(ch.tier ? { tier: ch.tier } : {}), ac, running, state: 'running', ...(ch.close ? { close: ch.close } : {}) };
+    const entry: RunningChannel = { adapter: ch.adapter, account: ch.account, ...(ch.tier ? { tier: ch.tier } : {}), ac, running, state: 'running', owner: ch.owner, rejected: 0, evidenceCapped: 0, ...(ch.close ? { close: ch.close } : {}) };
     this.channels.push(entry);
     this.log('info', `channel ${ch.adapter.id} (${ch.account}) started`);
     return entry;
@@ -2020,9 +2109,37 @@ const DEFAULT_LIVE_INSTRUCTIONS =
   'You take part by voice in a live session (a meeting or a call) as this deployment\'s assistant. Speak briefly and naturally, in the language people use. Stay quiet unless someone addresses you. For anything that needs facts, files, tools or actions, delegate it, then report the result accurately, without adding details.';
 
 /** A channel built but not started yet. */
-type BuiltChannel = { adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void>; source?: ResolvedChannel; bind?: (e: RunningChannel) => void };
+type BuiltChannel = { adapter: ChannelAdapter; account: string; owner: ChannelOwner; tier?: Tier; config?: unknown; close?: () => Promise<void>; source?: ResolvedChannel; bind?: (e: RunningChannel) => void };
 
-async function buildChannel(ch: ResolvedChannel, index: number, log: (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void, onState?: (s: BridgeState) => void): Promise<{ adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }> {
+const isBridge = (a: ChannelAdapter): a is BridgedChannel => typeof (a as Partial<BridgedChannel>).state === 'function' && typeof (a as Partial<BridgedChannel>).close === 'function';
+
+/** Its channel id is settled: anything but a bridge without `id` whose peer has not said hello yet. */
+function idKnown(b: { adapter: ChannelAdapter; source?: ResolvedChannel }): boolean {
+  return !(b.source?.type === 'bridge' && b.source.id === undefined && isBridge(b.adapter) && !b.adapter.state().connected);
+}
+
+/**
+ * Why a channel (`id`, `owner`, `account`) cannot run next to `others`, if it cannot:
+ * one channel id belongs to one adapter, only accounts differ (channel-stamping F4), and
+ * bridges and modules never take a built-in id.
+ */
+function idConflict(id: string, owner: ChannelOwner, account: string, others: Iterable<{ adapter: ChannelAdapter; owner: ChannelOwner; account: string }>): string | undefined {
+  if (typeof owner === 'string' && owner !== 'lark-bot' && owner !== 'mail' && RESERVED_CHANNEL_IDS.includes(id)) return `channel id ${JSON.stringify(id)} is a built-in channel id; ${ownerName(owner)} cannot use it`;
+  for (const o of others) {
+    if (o.adapter.id !== id) continue;
+    if (o.owner !== owner) return `channel id ${JSON.stringify(id)} belongs to ${ownerName(o.owner)}; ${ownerName(owner)} cannot use it too (one channel id is one adapter, only accounts differ)`;
+    if (o.account === account) return `two channels have the same (channel, account) = (${id}, ${account}); give one another account`;
+  }
+  return undefined;
+}
+
+async function buildChannel(
+  ch: ResolvedChannel,
+  index: number,
+  log: (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void,
+  onState?: (s: BridgeState) => void,
+  acceptId?: (id: string) => string | undefined,
+): Promise<{ adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }> {
   const tier = ch.tier ? { tier: ch.tier } : {};
   switch (ch.type) {
     case 'lark-bot':
@@ -2039,8 +2156,9 @@ async function buildChannel(ch: ResolvedChannel, index: number, log: (level: 'de
         ...(ch.config !== undefined ? { config: ch.config } : {}),
         // A peer that fails its first hello is retried with the restart backoff instead of failing the daemon.
         retryFirstConnect: true,
-        ...(ch.id !== undefined ? { id: ch.id } : {}),
+        ...(ch.id !== undefined ? { id: ch.id, expectId: ch.id } : {}),
         ...(onState ? { onState } : {}),
+        ...(acceptId ? { acceptId } : {}),
       });
       return { adapter: b, account: ch.account, config: ch.config, close: () => b.close(), ...tier };
     }

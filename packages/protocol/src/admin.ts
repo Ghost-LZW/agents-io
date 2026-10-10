@@ -89,6 +89,10 @@ export const AdminChannel = Type.Object({
   account: Type.String(),
   state: Type.Union([Type.Literal('starting'), Type.Literal('running'), Type.Literal('failed'), Type.Literal('stopped')]),
   error: Type.Optional(Type.String()),
+  /** Envelopes refused because they claimed another channel, account or reply route than this channel instance (since start). */
+  rejected: Type.Optional(Type.Number()),
+  /** Envelopes whose sender evidence was beyond this channel's evidence cap and became `none` (since start). */
+  evidenceCapped: Type.Optional(Type.Number()),
 });
 export type AdminChannel = Static<typeof AdminChannel>;
 

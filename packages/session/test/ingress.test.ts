@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { FakeHarness, fakeEnvelope } from '@agents-io/testkit';
-import { Hub, Ingress, Lane, MemorySessionLog, Router, actionId, defaultPolicy, interruptActionId, ownersTable, parseActionId, replySummary, type SessionPolicy } from '../src/index.js';
+import { Hub, Ingress, Lane, MemorySessionLog, Router, SOURCE_MISMATCH, actionId, defaultPolicy, interruptActionId, ownersTable, parseActionId, replySummary, type EmitSource, type SessionPolicy } from '../src/index.js';
 import type { ChannelCaps, InputRecord } from '@agents-io/protocol';
 import { RUN, bodies, until } from './helpers.js';
 
@@ -187,5 +187,92 @@ describe('Ingress', () => {
     expect(await click(alice, actionId('nope', 'allow_once'))).toMatchObject({ action: 'resolve', result: { ok: false, reason: 'unknown_request' } });
     expect(parseActionId('req:a:b:deny')).toEqual({ requestId: 'a:b', kind: 'deny' });
     expect(parseActionId('req:a:answer')).toBeUndefined();
+  });
+});
+
+describe('Ingress source stamping (channel-stamping, decision 13)', () => {
+  const src = (o: Partial<EmitSource> = {}): EmitSource => ({ channel: 'fake', account: 'default', evidence: ['platform_signed', 'none'], declaresSender: true, ...o });
+
+  it('refuses an envelope claiming another channel, account or reply route, without remembering it', async () => {
+    const { ingress, lanes } = world();
+    const s = src();
+    const cases = [
+      fakeEnvelope({ id: 'x1', channel: 'lark-bot', sender: alice }),
+      fakeEnvelope({ id: 'x2', account: 'other', sender: alice }),
+      fakeEnvelope({ id: 'x3', sender: alice, replyRoute: { channel: 'lark-bot', account: 'default', conversationId: 'c1' } }),
+      fakeEnvelope({ id: 'x4', sender: alice, replyRoute: { channel: 'fake', account: 'other', conversationId: 'c1' } }),
+    ];
+    for (const env of cases) {
+      const r = await ingress.accept(env, s);
+      expect(r).toMatchObject({ accepted: false, action: 'invalid' });
+      expect(r.error!.startsWith(SOURCE_MISMATCH)).toBe(true);
+      expect(r.inputId).toBeUndefined();
+    }
+    expect(lanes.size).toBe(0);
+    // Not in the dedup table: a conforming envelope with x3's id is accepted afterwards.
+    expect(await ingress.accept(fakeEnvelope({ id: 'x3', sender: alice }), s)).toMatchObject({ accepted: true, action: 'dispatch' });
+    await lanes.get('fake:default:c1')!.whenIdle();
+  });
+
+  it('checks the source before dedup: a forged copy of a seen (channel, account, id) is invalid, not a duplicate', async () => {
+    const { ingress, lanes } = world();
+    const ok = await ingress.accept(fakeEnvelope({ id: 'seen', sender: alice }), src());
+    expect(ok.accepted).toBe(true);
+    // Emitted by another instance (account "b") but claiming the first one's (channel, account, id).
+    const forged = await ingress.accept(fakeEnvelope({ id: 'seen', sender: alice }), src({ account: 'b' }));
+    expect(forged).toMatchObject({ accepted: false, action: 'invalid' });
+    expect(forged.inputId).toBeUndefined();
+    await lanes.get('fake:default:c1')!.whenIdle();
+  });
+
+  it('caps evidence beyond the source to none: the owner is a stranger, the explanation keeps the claim, the caller object is untouched', async () => {
+    const { ingress, lanes } = world();
+    const env = fakeEnvelope({ id: 'cap', conversation: group, sender: { ...alice } });
+    const r = await ingress.accept(env, src({ evidence: ['device_only', 'none'] }));
+    expect(r.accepted).toBe(true);
+    expect(r.origin).toMatchObject({ principal: null, evidence: 'none', adapter: 'fake' });
+    expect(r.claimedEvidence).toBe('platform_signed');
+    expect(r.explanation).toMatchObject({ evidence: 'none', claimedEvidence: 'platform_signed', principal: null });
+    expect(r.envelope!.sender.evidence).toBe('none');
+    expect(r.envelope).not.toBe(env);
+    expect(env.sender.evidence).toBe('platform_signed');
+    // Within the cap nothing is copied and nothing is claimed.
+    const within = fakeEnvelope({ id: 'ok', sender: alice });
+    const w = await ingress.accept(within, src());
+    expect(w.envelope).toBe(within);
+    expect(w.claimedEvidence).toBeUndefined();
+    expect(w.explanation!.claimedEvidence).toBeUndefined();
+    expect(w.origin!.principal?.id).toBe('fake:alice');
+    for (const l of lanes.values()) await l.whenIdle();
+  });
+
+  it('drops sender.declared when the source may not declare senders, also from a trusted agent account', async () => {
+    const { ingress } = world();
+    const env = fakeEnvelope({ id: 'decl', conversation: group, sender: { channelUserId: 'peer', evidence: 'platform_signed', isBot: true, declared: 'runner:x/run:1' } });
+    const trusted = await ingress.accept({ ...env, id: 'decl-0' }, src());
+    expect(trusted.origin?.declared).toBe('runner:x/run:1');
+    const r = await ingress.accept(env, src({ declaresSender: false }));
+    expect(r.accepted).toBe(true);
+    expect(r.origin?.declared).toBeUndefined();
+    expect(r.envelope!.sender.declared).toBeUndefined();
+    expect(r.envelope!.sender.evidence).toBe('platform_signed');
+    expect(env.sender.declared).toBe('runner:x/run:1');
+  });
+
+  it('emitter(source) answers like accept(env, source); without a source nothing is checked or capped', async () => {
+    const { ingress, lanes } = world();
+    const emit = ingress.emitter(src({ evidence: ['none'] }));
+    expect(await emit(fakeEnvelope({ id: 'e1', channel: 'other', sender: alice }))).toEqual({ accepted: false });
+    const ok = await emit(fakeEnvelope({ id: 'e2', conversation: group, sender: alice }));
+    expect(ok.accepted).toBe(true);
+    const again = await ingress.accept(fakeEnvelope({ id: 'e2', conversation: group, sender: alice }), src({ evidence: ['none'] }));
+    expect(again).toMatchObject({ action: 'duplicate', inputId: ok.inputId, claimedEvidence: 'platform_signed', explanation: { evidence: 'none' } });
+    // Regression: the trusted path (no source) stamps as claimed.
+    const env = fakeEnvelope({ id: 'e3', channel: 'other', sender: { channelUserId: 'alice', evidence: 'dkim_pass' } });
+    const t = await ingress.accept(env);
+    expect(t).toMatchObject({ accepted: true, origin: { evidence: 'dkim_pass', adapter: 'other' } });
+    expect(t.envelope).toBe(env);
+    expect(t.claimedEvidence).toBeUndefined();
+    for (const l of lanes.values()) await l.whenIdle();
   });
 });
