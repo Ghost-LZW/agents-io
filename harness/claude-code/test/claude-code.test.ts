@@ -1,76 +1,32 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { assertConformingStream, runHarnessEnvConformance } from '@agents-io/testkit';
-import type { HarnessEvent, HarnessOpenArgs, HarnessSession, RunSpec } from '@agents-io/protocol';
-import { ClaudeCodeHarness, type ClaudeCodeHarnessConfig, convertBlock, inputUuid, mapAnswers, preface, riskOf } from '../src/index.js';
-import type { ClaudeCodeOptions, PermissionResult } from '../src/types.js';
+import { runHarnessEnvConformance } from '@agents-io/testkit';
+import type { HarnessSession } from '@agents-io/protocol';
+import { ClaudeCodeHarness, convertBlock, inputUuid, preface } from '../src/index.js';
+import type { PermissionResult } from '../src/types.js';
 import { bodies, collectUntil, fakeQueryFn, input, isTurnCompleted, sdk, type FakeQuery } from './fake-query.js';
-
-const run: RunSpec = { harness: 'claude-code', model: 'haiku', profile: 'bypass' };
-
-async function setup(over: Partial<HarnessOpenArgs> = {}, options: ClaudeCodeOptions = {}, config: ClaudeCodeHarnessConfig = {}) {
-  const fq = fakeQueryFn();
-  const h = new ClaudeCodeHarness({
-    ...config,
-    query: fq.fn,
-    claudePath: '/usr/local/bin/claude',
-    sdkVersion: '0.3.291',
-    cliVersion: async () => '2.1.291',
-  });
-  const s = await h.open({ sessionKey: 's', generation: 1, cwd: '/tmp/x', run, options: options as Record<string, unknown>, ...over });
-  const q = fq.last();
-  const raw = s.events[Symbol.asyncIterator]();
-  const seen: HarnessEvent[] = [];
-  const it: AsyncIterator<HarnessEvent> = {
-    next: async () => {
-      const r = await raw.next();
-      if (!r.done) seen.push(r.value);
-      return r;
-    },
-  };
-  const turnInputs = new Map<string, string[]>();
-  return {
-    h,
-    s,
-    q,
-    it,
-    turnInputs,
-    /** Tracks which inputs each turn was given, for conformance checks. */
-    give(turnId: string, ...ids: string[]) {
-      turnInputs.set(turnId, [...(turnInputs.get(turnId) ?? []), ...ids]);
-    },
-    /** Checks everything read so far (the argument only documents what the test looked at). */
-    conform(_evs?: HarnessEvent[]) {
-      assertConformingStream(seen, { turnInputs: (t) => turnInputs.get(t) });
-    },
-  };
-}
-
-const uuidOf = (q: FakeQuery, i: number) => q.written[i]!.uuid!;
+import { run, setup, uuidOf } from './claude-code-helpers.js';
 
 describe('probe', () => {
-  it('reports versions and caps', async () => {
+  it('reports versions and caps #HC-1', async () => {
     const h = new ClaudeCodeHarness({ sdkVersion: '0.3.291', cliVersion: async () => '2.1.291' });
     const p = await h.probe();
     expect(p.version).toBe('claude-code 2.1.291 (agent-sdk 0.3.291)');
     expect(p.caps).toMatchObject({ steer: 'tool_boundary', interrupt: true, approvals: true, questions: true, tokenDeltas: true, resume: true, switchModelMidSession: true, cancelQueued: true });
   });
 
-  it('refuses unknown major versions', async () => {
+  it('refuses unknown major versions #HC-1', async () => {
     await expect(new ClaudeCodeHarness({ sdkVersion: '0.4.0', cliVersion: async () => '2.1.291' }).probe()).rejects.toThrow(/unsupported Claude Agent SDK 0\.4\.0/);
     await expect(new ClaudeCodeHarness({ sdkVersion: '0.3.291', cliVersion: async () => '3.0.0' }).probe()).rejects.toThrow(/unsupported Claude Code CLI 3\.0\.0/);
   });
 
-  it('open() refuses too', async () => {
+  it('open() refuses too #HC-1', async () => {
     const h = new ClaudeCodeHarness({ query: fakeQueryFn().fn, sdkVersion: '1.0.0', cliVersion: async () => '2.1.291' });
     await expect(h.open({ sessionKey: 's', generation: 1, cwd: '.', run })).rejects.toThrow(/unsupported/);
   });
 });
 
 describe('open → SDK options', () => {
-  it('bypass profile, model verbatim, effort, mcp, env scrub, local CLI', async () => {
+  it('bypass profile, model verbatim, effort, mcp, env scrub, local CLI #RS-3 #SE-1', async () => {
     process.env.CLAUDE_CODE_RESUME_INTERRUPTED_TURN = '1';
     try {
       const { q, s } = await setup({ run: { ...run, model: 'claude-haiku-4-5', effort: 'low' }, mcp: { url: 'http://127.0.0.1:9/mcp', token: 'tok' } });
@@ -94,7 +50,7 @@ describe('open → SDK options', () => {
     }
   });
 
-  it('host MCP token is passed through the env, never in mcpServers (the SDK puts those on the CLI argv)', async () => {
+  it('host MCP token is passed through the env, never in mcpServers (the SDK puts those on the CLI argv) #SE-1', async () => {
     const { q } = await setup({ run, mcp: { url: 'http://h/mcp', token: 'sekrit-token-123' } });
     const o = q.options;
     // The SDK serialises mcpServers as `--mcp-config <json>`; the CLI expands ${VAR} from its env.
@@ -104,7 +60,7 @@ describe('open → SDK options', () => {
   });
 
   describe('per-session env (args.env)', () => {
-    it('is the top layer of the child env: over config.configDir and options.env', async () => {
+    it('is the top layer of the child env: over config.configDir and options.env #LA-3', async () => {
       const { q } = await setup(
         { env: { CLAUDE_CONFIG_DIR: '/session/cfg', FOO: 'session' } },
         { env: { FOO: 'open', BAR: 'open' } },
@@ -113,12 +69,7 @@ describe('open → SDK options', () => {
       expect(q.options.env).toMatchObject({ CLAUDE_CONFIG_DIR: '/session/cfg', FOO: 'session', BAR: 'open' });
     });
 
-    it('without args.env the instance configDir still applies', async () => {
-      const { q } = await setup({}, {}, { configDir: '/instance/cfg' });
-      expect(q.options.env?.CLAUDE_CONFIG_DIR).toBe('/instance/cfg');
-    });
-
-    it('never reaches argv-bound options or events (conformance)', async () => {
+    it('never reaches argv-bound options or events (conformance) #HC-2 #SE-1', async () => {
       const fq = fakeQueryFn();
       const h = new ClaudeCodeHarness({ query: fq.fn, claudePath: '/usr/local/bin/claude', sdkVersion: '0.3.291', cliVersion: async () => '2.1.291' });
       const report = await runHarnessEnvConformance({
@@ -141,7 +92,7 @@ describe('open → SDK options', () => {
     });
   });
 
-  it('non-bypass default is permissionMode default (never omitted), profiles map from options', async () => {
+  it('non-bypass default is permissionMode default (never omitted), profiles map from options #ID-6', async () => {
     const a = await setup({ run: { ...run, profile: 'reviewer' } });
     expect(a.q.options.permissionMode).toBe('default');
     expect(a.q.options.allowDangerouslySkipPermissions).toBeUndefined();
@@ -155,67 +106,7 @@ describe('open → SDK options', () => {
     expect(b.s.nativeId()).toBe('abc-session');
   });
 
-  it('instance launch config: env over process.env, configDir, settings, sources, plugins, skills, flags, dirs, MCP', async () => {
-    process.env.AGENTS_IO_TEST_INHERITED = 'from-process';
-    process.env.AGENTS_IO_TEST_REMOVED = 'from-process';
-    try {
-      const { q } = await setup(
-        { run: { ...run, profile: 'ro' }, mcp: { url: 'http://h/mcp', token: 't' } },
-        { env: { PER_OPEN: '1' }, profiles: { ro: { permissionMode: 'default', additionalDirectories: ['/p', '/shared'] } } },
-        {
-          env: { ANTHROPIC_BASE_URL: 'http://gw', AGENTS_IO_TEST_REMOVED: undefined, CLAUDE_CONFIG_DIR: '/loses' },
-          configDir: '/cfg/claude-a',
-          settings: { model: 'x', permissions: { allow: ['Read'] } },
-          settingSources: ['user'],
-          mcpServers: { docs: { type: 'http', url: 'http://docs' } },
-          plugins: ['/plugins/one'],
-          skills: ['pdf'],
-          extraArgs: { 'debug-to-stderr': null },
-          additionalDirectories: ['/shared', '/i'],
-          profiles: { ro: { permissionMode: 'dontAsk' }, other: { permissionMode: 'plan' } },
-        },
-      );
-      const o = q.options;
-      expect(o.env).toMatchObject({ AGENTS_IO_TEST_INHERITED: 'from-process', ANTHROPIC_BASE_URL: 'http://gw', CLAUDE_CONFIG_DIR: '/cfg/claude-a', PER_OPEN: '1' });
-      expect(o.env).not.toHaveProperty('AGENTS_IO_TEST_REMOVED');
-      expect(o.settings).toEqual({ model: 'x', permissions: { allow: ['Read'] } });
-      expect(o.settingSources).toEqual(['user']);
-      expect(o.plugins).toEqual([{ type: 'local', path: '/plugins/one' }]);
-      expect(o.skills).toEqual(['pdf']);
-      expect(o.extraArgs).toEqual({ 'debug-to-stderr': null });
-      // Per-open profiles win over the instance's; directories are the union.
-      expect(o.permissionMode).toBe('default');
-      expect(o.additionalDirectories).toEqual(['/shared', '/i', '/p']);
-      expect(o.mcpServers).toEqual({ docs: { type: 'http', url: 'http://docs' }, agents_io: { type: 'http', url: 'http://h/mcp', headers: { Authorization: 'Bearer ${AGENTS_IO_MCP_TOKEN}' }, alwaysLoad: true } });
-      expect(o.env).toMatchObject({ AGENTS_IO_MCP_TOKEN: 't' });
-      // Instance profiles apply when the open passes none.
-      const b = await setup({ run: { ...run, profile: 'other' } }, {}, { profiles: { other: { permissionMode: 'plan' } }, settings: '/etc/s.json' });
-      expect(b.q.options).toMatchObject({ permissionMode: 'plan', settings: '/etc/s.json' });
-      expect(b.q.options.settingSources).toBeUndefined();
-      expect(b.q.options.env).not.toHaveProperty('CLAUDE_CONFIG_DIR', '/cfg/claude-a');
-      // Per-open sdk options (e.g. e2e's settingSources: []) still win.
-      const c = await setup({}, { sdk: { settingSources: [] } }, { settingSources: ['user', 'project'] });
-      expect(c.q.options.settingSources).toEqual([]);
-    } finally {
-      delete process.env.AGENTS_IO_TEST_INHERITED;
-      delete process.env.AGENTS_IO_TEST_REMOVED;
-    }
-  });
-
-  it('probe runs the configured `claude` with the instance environment', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'aio-cc-'));
-    try {
-      const bin = join(dir, 'claude');
-      writeFileSync(bin, `#!/bin/sh\nprintf '%s|%s' "$CLAUDE_CONFIG_DIR" "$X_INST" > "${join(dir, 'seen')}"\necho "2.1.291 (Claude Code)"\n`, { mode: 0o755 });
-      const h = new ClaudeCodeHarness({ sdkVersion: '0.3.291', claudePath: bin, configDir: join(dir, 'cfg'), env: { X_INST: 'on' } });
-      expect((await h.probe()).version).toBe('claude-code 2.1.291 (agent-sdk 0.3.291)');
-      expect(readFileSync(join(dir, 'seen'), 'utf8')).toBe(`${join(dir, 'cfg')}|on`);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('emits nativeId at open and again when system/init reports another id', async () => {
+  it('emits nativeId at open and again when system/init reports another id #RS-1 #HC-1', async () => {
     const { s, q, it, give, conform } = await setup({ resume: 'old' });
     const first = await collectUntil(it, (e) => e.body.t === 'session.bound');
     expect(first[0]!.body).toMatchObject({ nativeId: 'old' });
@@ -229,50 +120,8 @@ describe('open → SDK options', () => {
   });
 });
 
-describe('gateway / non-Claude models', () => {
-  it('options.env is merged over process.env; model ids are never validated', async () => {
-    process.env.AGENTS_IO_TEST_INHERITED = 'from-process';
-    process.env.ANTHROPIC_MODEL = 'overridden-below';
-    try {
-      const { q, s, it } = await setup(
-        { run: { ...run, model: 'gemini-3.8-flash-high' } },
-        {
-          env: {
-            ANTHROPIC_BASE_URL: 'http://gateway.local',
-            ANTHROPIC_AUTH_TOKEN: 'secret',
-            ANTHROPIC_MODEL: 'gemini-3.8-flash-high',
-            ANTHROPIC_SMALL_FAST_MODEL: 'gemini-3.8-flash-low',
-            CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1000000',
-            CLAUDE_CODE_RESUME_INTERRUPTED_TURN: '1',
-          },
-        },
-      );
-      expect(q.options.model).toBe('gemini-3.8-flash-high');
-      expect(q.options.env).toMatchObject({
-        AGENTS_IO_TEST_INHERITED: 'from-process',
-        ANTHROPIC_BASE_URL: 'http://gateway.local',
-        ANTHROPIC_AUTH_TOKEN: 'secret',
-        ANTHROPIC_MODEL: 'gemini-3.8-flash-high',
-        ANTHROPIC_SMALL_FAST_MODEL: 'gemini-3.8-flash-low',
-        CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1000000',
-      });
-      // even an explicit request from deployment config cannot re-enable auto re-run
-      expect(q.options.env).not.toHaveProperty('CLAUDE_CODE_RESUME_INTERRUPTED_TURN');
-      await s.startTurn('t1', [input('a', 'x')], { ...run, model: 'gpt-7-mini' });
-      expect(q.calls).toEqual([{ method: 'setModel', arg: 'gpt-7-mini' }]);
-      await q.waitWritten(1);
-      q.push(sdk.init(), sdk.result({ uuids: [uuidOf(q, 0)] }));
-      const evs = await collectUntil(it, isTurnCompleted);
-      expect(bodies(evs, 'turn.started')[0]!.run.model).toBe('gpt-7-mini');
-    } finally {
-      delete process.env.AGENTS_IO_TEST_INHERITED;
-      delete process.env.ANTHROPIC_MODEL;
-    }
-  });
-});
-
 describe('input writing', () => {
-  it('one SDKUserMessage per input, uuid bound to inputId, explicit priority, preface', async () => {
+  it('one SDKUserMessage per input, uuid bound to inputId, explicit priority, preface #ID-2', async () => {
     const { s, q } = await setup();
     const id = '1b4e28ba-2fa1-41d2-883f-0016d3cca427';
     await s.startTurn('t1', [input(id, 'hello', { channelContext: { chat: 'Team' } }), input('plain-id', 'second')]);
@@ -287,7 +136,7 @@ describe('input writing', () => {
     expect(content[1]).toEqual({ type: 'text', text: 'hello' });
   });
 
-  it('converts every content block kind', async () => {
+  it('converts every content block kind #MD-1', async () => {
     const t = async (b: Parameters<typeof convertBlock>[0], r?: Parameters<typeof convertBlock>[1]) => convertBlock(b, r);
     expect((await t({ type: 'quote', text: 'a\nb' })).blocks).toEqual([{ type: 'text', text: '> a\n> b' }]);
     expect((await t({ type: 'transcript', speaker: 'Ann', text: 'hi', startMs: 61000, endMs: 63500, stable: true })).blocks[0]).toEqual({ type: 'text', text: '[Ann 01:01-01:03] hi' });
@@ -303,19 +152,19 @@ describe('input writing', () => {
     expect(local.blocks[0]).toEqual({ type: 'text', text: '[file a.pdf application/pdf at /blobs/bb.pdf]' });
   });
 
-  it('skipped images surface as a notice event', async () => {
+  it('skipped images surface as a notice event #MD-1', async () => {
     const { s, it } = await setup();
     await s.startTurn('t1', [input('i1', 'look', { content: [{ type: 'image', ref: 'sha256:aa', mime: 'image/png' }] })]);
     const evs = await collectUntil(it, (e) => e.body.t === 'turn.started');
     expect(bodies(evs, 'notice')[0]!.message).toMatch(/skipped/);
   });
 
-  it('preface marks unknown senders and agents', () => {
+  it('preface marks unknown senders and agents #ID-2', () => {
     const p = preface({ ...input('x', ''), origin: { kind: 'agent', principal: null, evidence: 'none', via: 'lark:a:c', adapter: 'lark', declared: 'bot-7' } });
     expect(p).toBe('[agents-io input from=unknown kind=agent via=lark:a:c declared=bot-7]');
   });
 
-  it('preface carries ref=channel:<channel>/<message id> only for a channel message, verbatim (never truncated)', () => {
+  it('preface carries ref=channel:<channel>/<message id> only for a channel message, verbatim (never truncated) #EX-4', () => {
     const ref = 'channel:lark-bot/om_1';
     expect(preface({ ...input('x', ''), channelRef: ref, channelContext: { chat: 'Team' } })).toBe(`[agents-io input from=owner kind=human via=fake:a:c1 ref=${ref} chat=Team]`);
     // local / host / system inputs have no channel message to point at
@@ -326,7 +175,7 @@ describe('input writing', () => {
     expect(preface({ ...input('x', ''), channelRef: 'channel:x/a b' })).toContain(' ref="channel:x/a b"');
   });
 
-  it('labels context-only inputs as not addressed to the agent, keeping their own sender preface', async () => {
+  it('labels context-only inputs as not addressed to the agent, keeping their own sender preface #ID-2', async () => {
     const { s, q } = await setup();
     const stranger = { kind: 'human' as const, principal: null, evidence: 'platform_signed' as const, via: 'lark:a:g1', adapter: 'lark' };
     const ctx = { ...input('c1', 'the launch moved to Thursday'), origin: stranger, channelContext: { senderName: 'Eve', context: true, watch: 'wg' } };
@@ -342,7 +191,22 @@ describe('input writing', () => {
     expect(second[0]!.text).toBe('[agents-io input from=owner kind=human via=fake:a:c1]');
   });
 
-  it('startTurn only when idle', async () => {
+  it('a watched input reaches the model with the watch= marker in its sender preface #ID-2', async () => {
+    const { s, q } = await setup();
+    // What Watches.deliverWatch hands the lane for a trigger watch (packages/session/src/watch.ts).
+    const watched = input('w1', 'ship it?', { channelContext: { watch: 'wg', watchMode: 'trigger', watchSource: 'lark:a:g1' } });
+    await s.startTurn('t1', [watched]);
+    await q.waitWritten(1);
+    const first = q.written[0]!.message.content as { type: string; text: string }[];
+    expect(first[0]!.text).toMatch(/^\[agents-io input .* watch=wg( |\])/);
+  });
+
+  // INVARIANTS ID-2 不成立 1: the sender preface omits origin.evidence; turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails('the sender preface names the origin evidence #ID-2', () => {
+    expect(preface(input('x', ''))).toContain('evidence=platform_signed');
+  });
+
+  it('startTurn only when idle #HC-1', async () => {
     const { s } = await setup();
     await s.startTurn('t1', [input('i1', 'a')]);
     await expect(s.startTurn('t2', [input('i2', 'b')])).rejects.toThrow(/session layer owns the queue/);
@@ -350,7 +214,7 @@ describe('input writing', () => {
 });
 
 describe('event mapping', () => {
-  it('maps a full turn and conforms', async () => {
+  it('maps a full turn and conforms #HC-1', async () => {
     const { s, q, it, give, conform } = await setup();
     give('t1', 'i1');
     await s.startTurn('t1', [input('i1', 'do it')]);
@@ -420,7 +284,7 @@ describe('event mapping', () => {
     expect(evs.filter((e) => e.turnId === 't1').length).toBeGreaterThan(20);
   });
 
-  it('error results fail the turn; is_error success too', async () => {
+  it('error results fail the turn; is_error success too #HC-1', async () => {
     const { s, q, it, give, conform } = await setup();
     give('t1', 'i1');
     await s.startTurn('t1', [input('i1', 'x')]);
@@ -436,7 +300,7 @@ describe('event mapping', () => {
     conform(evs);
   });
 
-  it('the CLI dying mid-turn ends it ambiguous', async () => {
+  it('the CLI dying mid-turn ends it ambiguous #IN-1 #HC-1', async () => {
     const { s, q, it, give, conform } = await setup();
     give('t1', 'i1');
     await s.startTurn('t1', [input('i1', 'x')]);
@@ -450,7 +314,7 @@ describe('event mapping', () => {
 });
 
 describe('consumed reconciliation', () => {
-  it('a CLI batch of several inputs → one turn, one input.consumed', async () => {
+  it('a CLI batch of several inputs → one turn, one input.consumed #IN-1 #HC-1', async () => {
     const { s, q, it, give, conform } = await setup();
     give('t1', 'a', 'b');
     await s.startTurn('t1', [input('a', '1'), input('b', '2')]);
@@ -461,7 +325,7 @@ describe('consumed reconciliation', () => {
     conform(evs);
   });
 
-  it('CLI splits our inputs over two native turns → still one canonical turn', async () => {
+  it('CLI splits our inputs over two native turns → still one canonical turn #IN-1 #HC-1', async () => {
     const { s, q, it, give, conform } = await setup();
     give('t1', 'a', 'b');
     await s.startTurn('t1', [input('a', '1'), input('b', '2')]);
@@ -475,7 +339,7 @@ describe('consumed reconciliation', () => {
     conform(evs);
   });
 
-  it('ignores uuids the CLI enqueued itself', async () => {
+  it('ignores uuids the CLI enqueued itself #IN-4 #HC-1', async () => {
     const { s, q, it, give, conform } = await setup();
     give('t1', 'a');
     await s.startTurn('t1', [input('a', '1')]);
@@ -488,7 +352,7 @@ describe('consumed reconciliation', () => {
 });
 
 describe('steer', () => {
-  it('writes priority next and reconciles the fold-in', async () => {
+  it('writes priority next and reconciles the fold-in #IN-1 #HC-1', async () => {
     const { s, q, it, give, conform } = await setup();
     give('t1', 'a');
     await s.startTurn('t1', [input('a', 'start')]);
@@ -504,7 +368,7 @@ describe('steer', () => {
     conform(evs);
   });
 
-  it('a steer that missed the fold runs as the CLI next turn but is reported in the same turn', async () => {
+  it('a steer that missed the fold runs as the CLI next turn but is reported in the same turn #IN-1 #HC-1', async () => {
     const { s, q, it, give, conform } = await setup();
     give('t1', 'a', 'b');
     await s.startTurn('t1', [input('a', 'start')]);
@@ -521,7 +385,7 @@ describe('steer', () => {
     conform(evs);
   });
 
-  it('reports no_active_turn / stale / not_steerable', async () => {
+  it('reports no_active_turn / stale / not_steerable #HC-1', async () => {
     const { s } = await setup();
     expect(await s.steer([input('x', 'x')], 't1')).toBe('no_active_turn');
     await s.startTurn('t1', [input('a', 'a')]);
@@ -546,7 +410,7 @@ describe('approvals', () => {
     return ctx;
   }
 
-  it('tool approval: allow_session returns the suggestions as updatedPermissions', async () => {
+  it('tool approval: allow_session returns the suggestions as updatedPermissions #RQ-1', async () => {
     const { s, q, it } = await inTurn();
     const suggestions = [{ type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'git push:*' }], behavior: 'allow', destination: 'session' }];
     const { p } = ask(q, 'Bash', { command: 'git push origin main' }, { requestId: 'r1', suggestions: suggestions as never, decisionReason: '\u001b[1mask rule\u001b[0m' });
@@ -569,7 +433,7 @@ describe('approvals', () => {
     expect(resolved!.body).toMatchObject({ requestId: 'r1', decision: { kind: 'allow_session' } });
   });
 
-  it('suppressAlwaysAllowRule / defaultToNo are carried; allow_session degrades to once', async () => {
+  it('suppressAlwaysAllowRule / defaultToNo are carried; allow_session degrades to once #RQ-1', async () => {
     const { s, q, it } = await inTurn();
     const { p } = ask(q, 'Write', { file_path: '/etc/x' }, { requestId: 'r2', suggestions: [{ type: 'setMode', mode: 'acceptEdits', destination: 'session' }], suppressAlwaysAllowRule: true, defaultToNo: true, blockedPath: '/etc/x' });
     const opened = (await collectUntil(it, (e) => e.body.t === 'request.opened')).at(-1)!.body;
@@ -578,7 +442,7 @@ describe('approvals', () => {
     expect(await p).toEqual({ behavior: 'allow', updatedInput: { file_path: '/etc/x' } });
   });
 
-  it('deny carries message and interrupt; second respond is a no-op', async () => {
+  it('deny carries message and interrupt; second respond is a no-op #RQ-1', async () => {
     const { s, q } = await inTurn();
     const { p } = ask(q, 'Bash', { command: 'rm -rf /' }, { requestId: 'r3' });
     await s.respond('r3', { kind: 'deny', message: 'nope', interruptTurn: true });
@@ -586,7 +450,7 @@ describe('approvals', () => {
     expect(await p).toEqual({ behavior: 'deny', message: 'nope', interrupt: true });
   });
 
-  it('a denied tool completes as declined', async () => {
+  it('a denied tool completes as declined #RQ-1', async () => {
     const { s, q, it, conform } = await inTurn();
     q.push(sdk.toolUse('tu-r4', 'Bash', { command: 'rm x' }));
     const { p } = ask(q, 'Bash', { command: 'rm x' }, { requestId: 'r4' });
@@ -598,21 +462,7 @@ describe('approvals', () => {
     expect(bodies(evs, 'item.completed')[0]!.item.status).toBe('declined');
   });
 
-  it('AskUserQuestion is a question; answers map to question text', async () => {
-    const { s, q, it } = await inTurn();
-    const questions = [
-      { question: 'Which DB?', header: 'DB', options: [{ label: 'pg', description: '' }, { label: 'sqlite', description: '' }], multiSelect: false },
-      { question: 'Which features?', header: 'Feat', options: [{ label: 'a', description: '' }, { label: 'b', description: '' }], multiSelect: true },
-    ];
-    const { p } = ask(q, 'AskUserQuestion', { questions }, { requestId: 'r5' });
-    const opened = (await collectUntil(it, (e) => e.body.t === 'request.opened')).at(-1)!.body;
-    expect(opened).toMatchObject({ kind: 'question', title: 'Question: Which DB?', allowedDecisions: ['answer', 'deny'], allowAlways: false });
-    await s.respond('r5', { kind: 'answer', answers: { DB: 'pg', '1': ['a', 'b'] } });
-    expect(await p).toEqual({ behavior: 'allow', updatedInput: { questions, answers: { 'Which DB?': 'pg', 'Which features?': 'a, b' } } });
-    expect(mapAnswers({ questions }, { 'Which DB?': 'sqlite' })).toEqual({ 'Which DB?': 'sqlite' });
-  });
-
-  it('redelivered request ids open one prompt; abort → runtime_cancelled', async () => {
+  it('redelivered request ids open one prompt; abort → runtime_cancelled #RQ-1 #RQ-2', async () => {
     const { q, it, conform, s } = await inTurn();
     const a = ask(q, 'Bash', { command: 'ls' }, { requestId: 'r6' });
     const b = ask(q, 'Bash', { command: 'ls' }, { requestId: 'r6' });
@@ -627,7 +477,7 @@ describe('approvals', () => {
     await s.respond('r6', { kind: 'allow_once' }); // late answer is ignored
   });
 
-  it('native decisions pass through verbatim', async () => {
+  it('native decisions pass through verbatim #RQ-1', async () => {
     const { s, q } = await inTurn();
     const { p } = ask(q, 'Bash', { command: 'ls' }, { requestId: 'r7' });
     await s.respond('r7', { kind: 'native', payload: { behavior: 'allow', updatedInput: { command: 'ls -1' } } });
@@ -636,7 +486,7 @@ describe('approvals', () => {
 });
 
 describe('interrupt', () => {
-  it('calls query.interrupt, withdraws still-queued inputs, ends interrupted', async () => {
+  it('calls query.interrupt, withdraws still-queued inputs, ends interrupted #IN-1 #HC-1', async () => {
     const { s, q, it, give, conform } = await setup();
     give('t1', 'a', 'b');
     await s.startTurn('t1', [input('a', 'long job')]);
@@ -654,7 +504,7 @@ describe('interrupt', () => {
     conform(evs);
   });
 
-  it('interrupt before the CLI picked up the input ends the turn without a result', async () => {
+  it('interrupt before the CLI picked up the input ends the turn without a result #IN-1 #HC-1', async () => {
     const { s, q, it, give, conform } = await setup();
     give('t1', 'a');
     await s.startTurn('t1', [input('a', 'x')]);
@@ -666,7 +516,7 @@ describe('interrupt', () => {
     conform(evs);
   });
 
-  it('interrupt for another turn id is ignored; cancelQueued withdraws a pending steer', async () => {
+  it('interrupt for another turn id is ignored; cancelQueued withdraws a pending steer #IN-1 #HC-1', async () => {
     const { s, q, it, give, conform } = await setup();
     give('t1', 'a', 'b');
     await s.startTurn('t1', [input('a', 'x')]);
@@ -686,7 +536,7 @@ describe('interrupt', () => {
 });
 
 describe('run changes and close', () => {
-  it('switches model and effort mid-session, refuses tool-permission changes', async () => {
+  it('switches model and effort mid-session, refuses tool-permission changes #ID-6', async () => {
     const { s, q, it } = await setup({}, { profiles: { bypass: { permissionMode: 'bypassPermissions' }, narrow: { permissionMode: 'bypassPermissions', allowedTools: ['Read'] } } });
     await s.startTurn('t1', [input('a', 'x')], { ...run, model: 'sonnet', effort: 'high' });
     expect(q.calls).toEqual([{ method: 'setModel', arg: 'sonnet' }, { method: 'applyFlagSettings', arg: { effortLevel: 'high' } }]);
@@ -698,7 +548,7 @@ describe('run changes and close', () => {
     await s.startTurn('t3', [input('c', 'z')], { ...run, model: 'sonnet', effort: 'high' });
   });
 
-  it('close ends the prompt stream, closes the query and the event stream', async () => {
+  it('close ends the prompt stream, closes the query and the event stream #HC-1', async () => {
     const { s, q, it } = await setup();
     await s.close('bye');
     expect(q.promptEnded).toBe(true);
@@ -707,7 +557,7 @@ describe('run changes and close', () => {
     expect(rest.some((e) => e.body.t === 'notice')).toBe(false);
   });
 
-  it('close mid-turn interrupts and ends the turn', async () => {
+  it('close mid-turn interrupts and ends the turn #RS-3 #IN-1', async () => {
     const { s, q, it, give, conform } = await setup();
     give('t1', 'a');
     await s.startTurn('t1', [input('a', 'x')]);
@@ -720,15 +570,6 @@ describe('run changes and close', () => {
     const evs = await collectUntil(it, () => false);
     expect(bodies(evs, 'turn.completed')[0]).toMatchObject({ status: 'interrupted' });
     conform(evs);
-  });
-});
-
-describe('helpers', () => {
-  it('derives risk from tool names', () => {
-    expect(riskOf('Read', { file_path: 'a' })).toEqual({});
-    expect(riskOf('WebFetch', { url: 'x' })).toEqual({ network: true });
-    expect(riskOf('Bash', { command: 'sudo rm x' })).toEqual({ writes: true, elevated: true });
-    expect(riskOf('mcp__lark__send', {})).toEqual({ network: true });
   });
 });
 

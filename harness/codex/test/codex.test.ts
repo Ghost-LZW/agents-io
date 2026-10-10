@@ -1,66 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import type { HarnessEvent, HarnessOpenArgs, HarnessSession, InputRecord } from '@agents-io/protocol';
-import { FakeChannel, assertConformingStream, checkEventStream, defaultChannelCaps } from '@agents-io/testkit';
-import { Compositor, Hub, Ingress, Lane, MemorySessionLog, Outbox, defaultPolicy } from '@agents-io/session';
-import { CodexHarness, UnsupportedCodexVersionError, diffStats, renderInputs, summarizeItem, type CodexHarnessOptions } from '../src/index.js';
-import { displayCommand } from '../src/map.js';
+import type { HarnessSession } from '@agents-io/protocol';
+import { assertConformingStream } from '@agents-io/testkit';
+import { Hub, Lane, MemorySessionLog, defaultPolicy } from '@agents-io/session';
+import { UnsupportedCodexVersionError, renderInputs } from '../src/index.js';
 import { FakeAppServer, FakeRpcError } from './fake-app-server.js';
-
-const input = (id: string, text: string, extra: Partial<InputRecord> = {}): InputRecord => ({
-  inputId: id,
-  origin: { kind: 'human', principal: { id: 'owner', labels: ['owner'] }, evidence: 'platform_signed', via: 'lark:a:c1', adapter: 'lark' },
-  content: [{ type: 'text', text }],
-  replyRoute: { channel: 'lark', account: 'a', conversationId: 'c1' },
-  channelContext: { chat: 'Team' },
-  ...extra,
-});
-
-const run = { harness: 'codex', model: 'gpt-5.5', effort: 'high', profile: 'bypass' };
-
-function setup(opts: Partial<CodexHarnessOptions> = {}) {
-  const fake = new FakeAppServer();
-  const harness = new CodexHarness({ transport: fake.transport, ...opts });
-  return { fake, harness };
-}
-
-async function open(harness: CodexHarness, over: Partial<HarnessOpenArgs> = {}) {
-  return harness.open({ sessionKey: 's1', generation: 1, cwd: '/work', run, ...over });
-}
-
-/** Collects events until `until` matches (inclusive). */
-function collector(s: HarnessSession) {
-  const events: HarnessEvent[] = [];
-  const waiters: { pred: (e: HarnessEvent) => boolean; resolve: (e: HarnessEvent) => void }[] = [];
-  let ended = false;
-  const done = (async () => {
-    for await (const e of s.events) {
-      events.push(e);
-      for (const w of [...waiters]) if (w.pred(e)) (waiters.splice(waiters.indexOf(w), 1), w.resolve(e));
-    }
-    ended = true;
-  })();
-  return {
-    events,
-    done,
-    get ended() {
-      return ended;
-    },
-    until(pred: (e: HarnessEvent) => boolean): Promise<HarnessEvent> {
-      const hit = events.find(pred);
-      if (hit) return Promise.resolve(hit);
-      return new Promise((resolve) => waiters.push({ pred, resolve }));
-    },
-    of<T extends HarnessEvent['body']['t']>(t: T) {
-      return events.filter((e) => e.body.t === t).map((e) => e.body as Extract<HarnessEvent['body'], { t: T }>);
-    },
-  };
-}
-
-const isCompleted = (e: HarnessEvent) => e.body.t === 'turn.completed';
-const tick = () => new Promise((r) => setTimeout(r, 5));
+import { collector, input, isCompleted, open, run, setup, tick } from './codex-helpers.js';
 
 describe('handshake and probe', () => {
-  it('initializes with clientInfo, sends initialized, reports version and caps', async () => {
+  it('initializes with clientInfo, sends initialized, reports version and caps #HC-1', async () => {
     const { fake, harness } = setup();
     const p = await harness.probe();
     expect(p.version).toBe('0.160.1');
@@ -73,7 +20,7 @@ describe('handshake and probe', () => {
     expect(idx).toBeGreaterThan(fake.received.indexOf(init));
   });
 
-  it('refuses unknown versions clearly, unless allowed', async () => {
+  it('refuses unknown versions clearly, unless allowed #HC-1', async () => {
     const { fake, harness } = setup();
     fake.userAgent = 'agents_io/0.170.0 (x)';
     await expect(harness.probe()).rejects.toBeInstanceOf(UnsupportedCodexVersionError);
@@ -91,16 +38,7 @@ describe('handshake and probe', () => {
 });
 
 describe('open', () => {
-  it('maps RunSpec and the bypass profile to thread/start; nativeId is the thread id', async () => {
-    const { fake, harness } = setup();
-    const s = await open(harness, { mcp: { url: 'http://127.0.0.1:9/mcp', token: 'tok' } });
-    expect(s.nativeId()).toBe('thr-1');
-    const p = fake.sent('thread/start')[0]!.params;
-    expect(p).toMatchObject({ model: 'gpt-5.5', cwd: '/work', approvalPolicy: 'never', sandbox: 'workspace-write' });
-    expect(p.config.mcp_servers.agents_io).toEqual({ url: 'http://127.0.0.1:9/mcp', http_headers: { Authorization: 'Bearer tok' }, default_tools_approval_mode: 'approve' });
-  });
-
-  it('uses on-request for unconfigured profiles and honours configured ones', async () => {
+  it('uses on-request for unconfigured profiles and honours configured ones #ID-6', async () => {
     const { fake, harness } = setup();
     await open(harness, { run: { ...run, profile: 'restricted' } });
     expect(fake.sent('thread/start')[0]!.params).toMatchObject({ approvalPolicy: 'on-request', sandbox: 'workspace-write' });
@@ -109,7 +47,7 @@ describe('open', () => {
     expect(fake.spawned).toBe(1); // one process, many threads
   });
 
-  it('rejects a per-session env (one shared app-server), accepts an empty one', async () => {
+  it('rejects a per-session env (one shared app-server), accepts an empty one #HC-2', async () => {
     const { fake, harness } = setup();
     await expect(open(harness, { env: { K: 'v' } })).rejects.toThrow(/per-session env.*own app-server/);
     expect(fake.sent('thread/start')).toHaveLength(0);
@@ -117,7 +55,7 @@ describe('open', () => {
     expect(fake.sent('thread/start')).toHaveLength(1);
   });
 
-  it('resumes an existing thread', async () => {
+  it('resumes an existing thread #RS-1', async () => {
     const { fake, harness } = setup();
     const s = await open(harness, { resume: 'thr-old' });
     expect(s.nativeId()).toBe('thr-old');
@@ -126,7 +64,7 @@ describe('open', () => {
 });
 
 describe('turn mapping', () => {
-  it('maps a full turn to a conforming stream', async () => {
+  it('maps a full turn to a conforming stream #HC-1 #ID-2', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
     const c = collector(s);
@@ -207,67 +145,7 @@ describe('turn mapping', () => {
     expect(done).toMatchObject({ status: 'completed', usage: { total: { totalTokens: 10 } } });
   });
 
-  it('shows reasoning in the ProgressView like Claude thinking (one stream per item, parts as paragraphs)', async () => {
-    const { fake, harness } = setup();
-    fake.onTurnStart = (p, tid) => {
-      const th = p.threadId;
-      const n = (method: string, params: object) => fake.notify(method, { threadId: th, turnId: tid, ...params });
-      fake.echoUser(th, tid, p.clientUserMessageId);
-      n('item/started', { item: { type: 'reasoning', id: 'r1', summary: [], content: [] }, startedAtMs: 1 });
-      n('item/reasoning/summaryTextDelta', { itemId: 'r1', delta: 'Plan A', summaryIndex: 0 });
-      n('item/reasoning/textDelta', { itemId: 'r1', delta: 'raw duplicate', contentIndex: 0 });
-      n('item/reasoning/summaryTextDelta', { itemId: 'r1', delta: 'Plan B', summaryIndex: 1 });
-      n('item/completed', { item: { type: 'reasoning', id: 'r1', summary: ['Plan A', 'Plan B'], content: [] }, completedAtMs: 1 });
-      const msg = { type: 'agentMessage', id: 'm1', phase: 'final_answer', memoryCitation: null, delivery: null, questions: null };
-      n('item/started', { item: { ...msg, text: '' }, startedAtMs: 1 });
-      n('item/completed', { item: { ...msg, text: 'Done' }, completedAtMs: 1 });
-      fake.completeTurn(th, tid, 'completed');
-    };
-    const hub = new Hub(new MemorySessionLog());
-    const policy = defaultPolicy({ owners: ['fake:alice'], run });
-    const lane = new Lane({ sessionKey: 'fake:default:c1', harness, hub, policy, cwd: '/work' });
-    const ingress = new Ingress({ policy, lanes: () => lane });
-    const channel = new FakeChannel('fake', defaultChannelCaps);
-    const compositor = new Compositor({ hub, sessionKey: 'fake:default:c1', adapter: channel, outbox: new Outbox({ hub, sleep: async () => {} }), throttleMs: 1 });
-    compositor.start();
-    const ac = new AbortController();
-    void channel.start({ account: 'default', config: {}, signal: ac.signal, emit: ingress.emitter(), log: () => {} });
-    try {
-      await channel.inject({ sender: { channelUserId: 'alice', evidence: 'platform_signed' }, text: 'think' });
-      for (let i = 0; i < 200 && channel.sent[0]?.finalized !== true; i++) await tick();
-      const card = channel.sent[0]!;
-      const fin = card.edits.at(-1) ?? card.msg;
-      expect(fin.progress!.steps).toEqual([{ kind: 'reasoning', id: 'r1', text: 'Plan A\n\nPlan B', done: true }]);
-      expect(fin.progress!.answer).toBe('Done');
-      const delta = hub.log.read('fake:default:c1', 0).filter((e) => e.body.t === 'item.completed' && e.body.item.type === 'reasoning');
-      expect(delta[0]).toMatchObject({ audience: 'commentary', visibility: 'participants' });
-    } finally {
-      ac.abort();
-      await compositor.stop();
-      await lane.close();
-    }
-  });
-
-  it('sends per-turn overrides only when the RunSpec changes', async () => {
-    const { fake, harness } = setup();
-    const s = await open(harness, { run: { ...run, effort: undefined } });
-    const c = collector(s);
-    fake.onTurnStart = (p, tid) => {
-      fake.echoUser(p.threadId, tid, p.clientUserMessageId);
-      fake.completeTurn(p.threadId, tid, 'completed');
-    };
-    await s.startTurn('T1', [input('i1', 'a')]);
-    await c.until(isCompleted);
-    await s.startTurn('T2', [input('i2', 'b')], { harness: 'codex', model: 'gpt-6', effort: 'low', profile: 'restricted' });
-    await c.until((e) => isCompleted(e) && e.turnId === 'T2');
-    const [a, b] = fake.sent('turn/start').map((m) => m.params);
-    expect(a).not.toHaveProperty('model');
-    expect(a).not.toHaveProperty('approvalPolicy');
-    expect(b).toMatchObject({ model: 'gpt-6', effort: 'low', approvalPolicy: 'on-request', sandboxPolicy: { type: 'workspaceWrite' } });
-    expect(checkEventStream(c.events)).toEqual([]);
-  });
-
-  it('a profile switch resets reviewer, approval policy and sandbox the new profile leaves unset', async () => {
+  it('a profile switch resets reviewer, approval policy and sandbox the new profile leaves unset #ID-6', async () => {
     const { fake, harness } = setup();
     const profiles = {
       auto: { approvalPolicy: 'on-request' as const, approvalsReviewer: 'auto_review' as const, sandbox: 'danger-full-access' as const },
@@ -291,7 +169,7 @@ describe('turn mapping', () => {
     });
   });
 
-  it('maps failed turns with code and retryable', async () => {
+  it('maps failed turns with code and retryable #HC-1 #IN-2', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
     const c = collector(s);
@@ -307,7 +185,7 @@ describe('turn mapping', () => {
     assertConformingStream(c.events);
   });
 
-  it('reports a rejected turn/start as a failed turn', async () => {
+  it('reports a rejected turn/start as a failed turn #IN-1 #HC-1', async () => {
     const { fake, harness } = setup();
     fake.handlers['turn/start'] = () => {
       throw new FakeRpcError(-32600, 'model not found');
@@ -320,7 +198,7 @@ describe('turn mapping', () => {
     assertConformingStream(c.events);
   });
 
-  it('a resumed thread reporting its last turn usage before turn/start answers does not steal the new turn', async () => {
+  it('a resumed thread reporting its last turn usage before turn/start answers does not steal the new turn #HC-1', async () => {
     const { fake, harness } = setup();
     const start = fake.handlers['turn/start']!;
     fake.handlers['turn/start'] = (p) => {
@@ -341,7 +219,7 @@ describe('turn mapping', () => {
     expect(c.events.filter((e) => e.body.t === 'native' && e.body.name === 'turn/started')).toHaveLength(0);
   });
 
-  it('maps turns started by another client as foreign turns', async () => {
+  it('maps turns started by another client as foreign turns #HC-1', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
     const c = collector(s);
@@ -367,7 +245,7 @@ describe('turn mapping', () => {
     assertConformingStream(c.events, { turnInputs: { 'codex:tui-1': [], T1: ['i1'] } });
   });
 
-  it('injects context with thread/inject_items', async () => {
+  it('injects context with thread/inject_items #IN-6 #ID-2', async () => {
     const { fake, harness } = setup();
     fake.handlers['thread/inject_items'] = () => ({});
     const s = await open(harness);
@@ -380,7 +258,7 @@ describe('turn mapping', () => {
 });
 
 describe('steer', () => {
-  it('steers with the Codex turn id and reconciles consumption of steered input', async () => {
+  it('steers with the Codex turn id and reconciles consumption of steered input #IN-1 #HC-1', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
     const c = collector(s);
@@ -403,7 +281,7 @@ describe('steer', () => {
     expect(await s.steer([input('i4', 'late')], 'T1')).toBe('no_active_turn');
   });
 
-  it('maps stale, not steerable and no-active-turn', async () => {
+  it('maps stale, not steerable and no-active-turn #HC-1', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
     collector(s);
@@ -432,7 +310,7 @@ describe('steer', () => {
     await expect(s.steer([input('i6', 'x')], 'T1')).rejects.toThrow('boom');
   });
 
-  it('a steer whose response is lost keeps its inputs: a later echo still counts them as consumed', async () => {
+  it('a steer whose response is lost keeps its inputs: a later echo still counts them as consumed #IN-1 #HC-1', async () => {
     const { fake, harness } = setup({ requestTimeoutMs: 100 });
     const s = await open(harness);
     const c = collector(s);
@@ -459,7 +337,7 @@ describe('approvals', () => {
     command: "/bin/zsh -lc 'rm -rf build'", cwd: '/work', commandActions: [], ...extra,
   });
 
-  it('opens a request and maps decisions to Codex responses', async () => {
+  it('opens a request and maps decisions to Codex responses #RQ-1', async () => {
     const { fake, harness } = setup();
     const s = await open(harness, { run: { ...run, profile: 'restricted' } });
     const c = collector(s);
@@ -508,7 +386,7 @@ describe('approvals', () => {
     assertConformingStream(c.events);
   });
 
-  it('honours availableDecisions and reports requests resolved elsewhere', async () => {
+  it('honours availableDecisions and reports requests resolved elsewhere #RQ-1', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
     const c = collector(s);
@@ -535,7 +413,7 @@ describe('approvals', () => {
     assertConformingStream(c.events);
   });
 
-  it('passes native decisions through and cancels open requests when the turn ends', async () => {
+  it('passes native decisions through and cancels open requests when the turn ends #RQ-2', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
     const c = collector(s);
@@ -557,42 +435,13 @@ describe('approvals', () => {
     assertConformingStream(c.events);
   });
 
-  it('offers Codex amendments as suggestions and maps them back from allow_session', async () => {
-    const { fake, harness } = setup();
-    const s = await open(harness);
-    const c = collector(s);
-    const answers: unknown[] = [];
-    const avail = ['accept', { acceptWithExecpolicyAmendment: { execpolicy_amendment: ['touch', 'x'] } }, 'cancel'];
-    fake.onTurnStart = async (p, tid) => {
-      fake.echoUser(p.threadId, tid, p.clientUserMessageId);
-      const params = cmdParams(p.threadId, tid, { command: "/bin/zsh -lc 'touch x'", proposedExecpolicyAmendment: ['touch', 'x'], availableDecisions: avail });
-      answers.push((await fake.request('item/commandExecution/requestApproval', params)).result);
-      answers.push((await fake.request('item/commandExecution/requestApproval', params)).result);
-      fake.completeTurn(p.threadId, tid, 'completed');
-    };
-    await s.startTurn('T1', [input('i1', 'x')]);
-    await c.until((e) => e.body.t === 'request.opened');
-    const o = c.of('request.opened')[0]!;
-    expect(o.allowedDecisions).toEqual(['allow_once', 'allow_session', 'deny', 'native']);
-    expect(o.allowAlways).toBe(true);
-    expect(o.suggestions).toEqual([{ execpolicyAmendment: ['touch', 'x'] }]);
-    await s.respond(o.requestId, { kind: 'allow_session' });
-    await c.until((e) => e.body.t === 'request.opened' && c.of('request.opened').length === 2);
-    await s.respond(c.of('request.opened')[1]!.requestId, { kind: 'allow_session', updatedPermissions: { execpolicyAmendment: ['touch'] } });
-    await c.until(isCompleted);
-    expect(answers).toEqual([
-      { decision: { acceptWithExecpolicyAmendment: { execpolicy_amendment: ['touch', 'x'] } } },
-      { decision: { acceptWithExecpolicyAmendment: { execpolicy_amendment: ['touch'] } } },
-    ]);
-  });
-
   const autoReview = (fake: FakeAppServer, th: string, tid: string, status: 'approved' | 'denied', rationale: string | null = null) => {
     const base = { threadId: th, turnId: tid, reviewId: 'rv1', targetItemId: 'c1', action: { type: 'command', source: 'shell', command: 'curl example.com', cwd: '/work' } };
     fake.notify('item/autoApprovalReview/started', { ...base, startedAtMs: 1, review: { status: 'inProgress', riskLevel: null, userAuthorization: null, rationale: null } });
     fake.notify('item/autoApprovalReview/completed', { ...base, startedAtMs: 1, completedAtMs: 2, decisionSource: 'agent', review: { status, riskLevel: 'high', userAuthorization: null, rationale } });
   };
 
-  it('reports Codex auto reviews as notices, never as requests a resolver could answer', async () => {
+  it('reports Codex auto reviews as notices, never as requests a resolver could answer #RQ-1', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
     const c = collector(s);
@@ -614,7 +463,7 @@ describe('approvals', () => {
     assertConformingStream(c.events);
   });
 
-  it('a restricted lane records no deny for an action Codex auto review approved', async () => {
+  it('a restricted lane records no deny for an action Codex auto review approved #RQ-1 #ID-6', async () => {
     const { fake, harness } = setup();
     fake.onTurnStart = (p, tid) => {
       fake.echoUser(p.threadId, tid, p.clientUserMessageId);
@@ -636,7 +485,7 @@ describe('approvals', () => {
     }
   });
 
-  it('refuses server requests it does not implement', async () => {
+  it('refuses server requests it does not implement #HC-1', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
     collector(s);
@@ -648,7 +497,7 @@ describe('approvals', () => {
 });
 
 describe('consumed reconciliation', () => {
-  it('marks a turn ambiguous when Codex never echoes an input', async () => {
+  it('marks a turn ambiguous when Codex never echoes an input #IN-1 #HC-1', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
     const c = collector(s);
@@ -665,7 +514,7 @@ describe('consumed reconciliation', () => {
     assertConformingStream(c.events, { turnInputs: { T1: ['i1', 'i2'] } });
   });
 
-  it('decodes batch client ids and ignores user messages from other clients', async () => {
+  it('decodes batch client ids and ignores user messages from other clients #IN-4 #HC-1', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
     const c = collector(s);
@@ -684,7 +533,7 @@ describe('consumed reconciliation', () => {
 });
 
 describe('interrupt and lifecycle', () => {
-  it('interrupts with the Codex turn id', async () => {
+  it('interrupts with the Codex turn id #IN-1 #HC-1', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
     const c = collector(s);
@@ -698,7 +547,7 @@ describe('interrupt and lifecycle', () => {
     assertConformingStream(c.events);
   });
 
-  it('ends the turn as ambiguous and the stream when app-server dies', async () => {
+  it('ends the turn as ambiguous and the stream when app-server dies #IN-1 #HC-1', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
     const c = collector(s);
@@ -713,7 +562,7 @@ describe('interrupt and lifecycle', () => {
     expect(fake.spawned).toBe(2);
   });
 
-  it('unsubscribes on close and stops the process with the last session', async () => {
+  it('unsubscribes on close and stops the process with the last session #HC-1', async () => {
     const { fake, harness } = setup();
     const a = await open(harness);
     const b = await open(harness, { sessionKey: 's2' });
@@ -729,7 +578,7 @@ describe('interrupt and lifecycle', () => {
     await expect(a.startTurn('T9', [input('i9', 'x')])).rejects.toThrow(/closed/);
   });
 
-  it('close interrupts an active turn first', async () => {
+  it('close interrupts an active turn first #IN-1 #HC-1', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
     const c = collector(s);
@@ -744,7 +593,7 @@ describe('interrupt and lifecycle', () => {
 });
 
 describe('helpers', () => {
-  it('renders quote, transcript, ref, event and resolved images', async () => {
+  it('renders quote, transcript, ref, event and resolved images #MD-1', async () => {
     const rec = input('i1', 'look', {
       content: [
         { type: 'quote', text: 'a\nb' },
@@ -763,7 +612,7 @@ describe('helpers', () => {
     ]);
   });
 
-  it('sender preface carries ref=channel:<channel>/<message id> only for a channel message, bare like Claude Code', async () => {
+  it('sender preface carries ref=channel:<channel>/<message id> only for a channel message, bare like Claude Code #EX-4', async () => {
     const ref = 'channel:lark-bot/om_1';
     expect(await renderInputs([{ ...input('i1', 'confirm'), channelRef: ref }])).toEqual([
       { type: 'text', text: `[sender from=owner kind=human via=lark:a:c1 ref=${ref} chat="Team"]\nconfirm`, text_elements: [] },
@@ -771,7 +620,7 @@ describe('helpers', () => {
     expect(((await renderInputs([input('i2', 'local')]))[0] as { text: string }).text).not.toMatch(/ ref=/);
   });
 
-  it('labels context-only inputs as not addressed to the agent (also without the sender preface)', async () => {
+  it('labels context-only inputs as not addressed to the agent (also without the sender preface) #ID-2', async () => {
     const stranger = { kind: 'human' as const, principal: null, evidence: 'platform_signed' as const, via: 'lark:a:g1', adapter: 'lark' };
     const ctx = { ...input('c1', 'the launch moved to Thursday'), origin: stranger, channelContext: { senderName: 'Eve', context: true } };
     const label = '[context, not addressed to you: recorded in the conversation; read it, do not reply to it unless the addressed input asks]';
@@ -782,21 +631,27 @@ describe('helpers', () => {
     expect(await renderInputs([ctx], { preface: false })).toEqual([{ type: 'text', text: `${label}\nthe launch moved to Thursday`, text_elements: [] }]);
   });
 
-  it('unwraps login-shell commands and shortens paths under cwd', () => {
-    expect(displayCommand("/bin/zsh -lc 'echo '\\''hi'\\'''")).toBe("echo 'hi'");
-    expect(displayCommand('/bin/zsh -lc ls')).toBe('ls');
-    expect(displayCommand('git status')).toBe('git status');
-    const m = summarizeItem({ type: 'fileChange', id: 'f', status: 'completed', changes: [{ path: '/work/src/a.ts', kind: { type: 'add' }, diff: '' }] }, '/work');
-    expect(m?.summary).toMatchObject({ title: 'Edit src/a.ts', result: { preview: 'add src/a.ts' } });
+  // What Watches.deliverWatch hands the lane for a trigger watch (packages/session/src/watch.ts).
+  const watched = () => input('w1', 'ship it?', { channelContext: { watch: 'wg', watchMode: 'trigger', watchSource: 'lark:a:g1' } });
+
+  it('a watched input reaches the model with the watch= marker in its sender preface #ID-2', async () => {
+    const { fake, harness } = setup();
+    const s = await open(harness);
+    collector(s);
+    await s.startTurn('T1', [watched()]);
+    expect(fake.sent('turn/start')[0]!.params.input[0].text).toMatch(/^\[sender .* watch="wg"( |\])/);
   });
 
-  it('counts diff stats per file', () => {
-    expect(
-      diffStats('diff --git a/x b/x\nnew file mode 100644\n--- /dev/null\n+++ b/x\n@@ -0,0 +1 @@\n+hi\ndiff --git a/y b/y\n--- a/y\n+++ b/y\n@@ -1 +0,0 @@\n-bye\n'),
-    ).toEqual([
-      { path: 'x', added: 1, removed: 0 },
-      { path: 'y', added: 0, removed: 1 },
-    ]);
+  // INVARIANTS ID-2 不成立 1: the sender preface omits origin.evidence; turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails('the sender preface names the origin evidence #ID-2', async () => {
+    const [first] = (await renderInputs([input('i1', 'x')])) as { text: string }[];
+    expect(first!.text).toMatch(/ evidence=("?)platform_signed\1/);
+  });
+
+  // INVARIANTS ID-2 不成立 2: `preface: false` drops the whole sender preface, watch marker included; turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails('preface: false still marks a watched input as watched #ID-2', async () => {
+    const [first] = (await renderInputs([watched()], { preface: false })) as { text: string }[];
+    expect(first!.text).toMatch(/watch=("?)wg\1/);
   });
 });
 
@@ -818,21 +673,7 @@ describe('live (realtime voice, decision 11)', () => {
     fake.handlers['thread/realtime/appendSpeech'] = () => ({});
   }
 
-  it('is only offered when enabled, and opts the connection into the experimental API', async () => {
-    const off = setup();
-    expect((await open(off.harness)).live).toBeUndefined();
-    expect(off.fake.sent('initialize')[0]!.params.capabilities.experimentalApi).toBe(false);
-    const on = setup({ live: true });
-    const s = await open(on.harness);
-    expect(s.live).toBeDefined();
-    const caps = on.fake.sent('initialize')[0]!.params.capabilities;
-    expect(caps.experimentalApi).toBe(true);
-    expect(caps.optOutNotificationMethods).not.toContain('thread/realtime/itemAdded');
-    expect(caps.optOutNotificationMethods).toContain('thread/realtime/outputAudio/delta');
-    expect((await open(on.harness, { options: { live: false } })).live).toBeUndefined();
-  });
-
-  it('starts v3 over WebRTC on the thread and returns the answer; transcripts, speech and stop map', async () => {
+  it('starts v3 over WebRTC on the thread and returns the answer; transcripts, speech and stop map #LN-4', async () => {
     const { fake, harness } = setup({ live: true });
     liveServer(fake);
     const s = await open(harness);
@@ -862,7 +703,7 @@ describe('live (realtime voice, decision 11)', () => {
     await expect(s.live!.say('x')).rejects.toThrow(/no live/);
   });
 
-  it('a delegation becomes the input of the turn Codex starts for it (initiator harness, consumed)', async () => {
+  it('a delegation becomes the input of the turn Codex starts for it (initiator harness, consumed) #LN-6', async () => {
     const { fake, harness } = setup({ live: true });
     liveServer(fake);
     const s = await open(harness);
@@ -888,7 +729,7 @@ describe('live (realtime voice, decision 11)', () => {
     expect(c.of('turn.started')[1]).toMatchObject({ initiator: 'foreign', inputIds: [] });
   });
 
-  it('a start whose answer never comes or fails cleans up; the session closing ends the live', async () => {
+  it('a start whose answer never comes or fails cleans up; the session closing ends the live #LN-4', async () => {
     const { fake, harness } = setup({ live: true });
     fake.handlers['thread/realtime/start'] = () => {
       throw new FakeRpcError(-32600, 'realtime unavailable');

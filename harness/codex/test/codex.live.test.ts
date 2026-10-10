@@ -10,7 +10,7 @@ import { CodexHarness } from '../src/index.js';
 const live = process.env.AGENTS_IO_LIVE_CODEX === '1';
 
 describe.skipIf(!live)('live codex app-server', () => {
-  it('runs one turn with a no-approval profile and emits a conforming stream', async () => {
+  it('runs one turn with a no-approval profile and emits a conforming stream #HC-1', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'agents-io-codex-'));
     const harness = new CodexHarness({ bin: process.env.CODEX_BIN ?? 'codex' });
     try {
@@ -57,7 +57,7 @@ describe.skipIf(!live)('live codex app-server', () => {
   }, 180_000);
 
   /** Host restart over unix: the turn keeps running in the detached app-server and the new host sees it finish. */
-  it('survives a host restart mid-turn over a unix socket (spawn: own)', async () => {
+  it('survives a host restart mid-turn over a unix socket (spawn: own) #RS-2', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'aio-cwd-'));
     const stateDir = mkdtempSync(join(tmpdir(), 'aio-st-'));
     const opts = { bin: process.env.CODEX_BIN ?? 'codex', transport: { kind: 'unix' as const, spawn: 'own' as const, stateDir } };
