@@ -352,8 +352,9 @@
 ### EX-6 `aio explain --chain` 从一条 agent 输入走回链的根
 
 - **承诺**：`aio explain --chain <inputId>`（宿主帧 `explain { chain: true }`）沿 `cause.from` 往回走：这条输入 → 产生它的 turn → 那一轮跳数最大的触发输入 → …，直到跳数为 0 的根；每一级列 inputId、hop、session 与地址 `<agent>/<sessionKey>`、主体、它触发的 turnId、`basis`、是否被截停（`loopGuard`）；`end` 为 `root`、`broken`（`basis: none`，或另一部署声明的 `declared`）或 `unknown`（记录过了保留期）。重启后可用。不认识的 id 答 `unknown_input`。
-- **实现**：`packages/daemon/src/gateway.ts` `explainChain`、`turnOfInput`、`turnInputs`；`packages/daemon/src/records.ts` `daemon_causes`（`putCause`、`causeOf`，保留 7 天，同 explain）；路由记录里的 `cause`（`packages/session/src/ingress.ts`，回流输入不进 lane 时由它找到）；`packages/daemon/src/cli.ts` `explain`（`--chain`）。
-- **测试**：标签 `#EX-6`；`packages/daemon/test/agent-messaging.test.ts` "explain by the operationId of a reply card: its turn and that turn's inputs; explain --chain walks a recovered input back to the root"、"a trip leaves a loop_guard notice in the receiving and the sending session, explain shows it (also after a restart), nothing goes to a channel"。
+- **实现**：`packages/daemon/src/gateway.ts` `explainChain`、`turnOfInput`、`turnInputs`；`packages/daemon/src/records.ts` `daemon_causes`（按 `(input_id, session_key)` 存：同一信封进了几个 session（派发与 watch）各留一条，截停记在被截停的那个 session 上；`putCause`、`causeOf(inputId, sessionKey?)`、`causesOf`，保留 7 天，同 explain；旧的只按 `input_id` 的表启动时迁移）；`gateway.ts` `causeIn`（往回走时取产生它的那一轮所在 session 的记录，起点取开了轮的那个 session）；路由记录里的 `cause`（`packages/session/src/ingress.ts`，回流输入不进 lane 时由它找到）；`packages/daemon/src/cli.ts` `explain`（`--chain`）。
+- **测试**：标签 `#EX-6`；`packages/daemon/test/agent-messaging.test.ts` "explain by the operationId of a reply card: its turn and that turn's inputs; explain --chain walks a recovered input back to the root"、"a trip leaves a loop_guard notice in the receiving and the sending session, explain shows it (also after a restart), nothing goes to a channel"、"one envelope in two sessions keeps a cause record in each; explain --chain follows the session the producing turn ran in"、"a cause table from before (keyed by input alone) is moved over on start, its records kept"。
+- **已修**：~~一个信封进了几个 session 时 cause 记录按 `input_id` 互相覆盖，`explain --chain` 可能走到错的 session（没有 turnId、截停标记张冠李戴）~~（2026-10-11 合并评审）。
 - **状态**：部分覆盖（只测了两跳；按 chain id 列出整条链——提案 §4.8 的"往前走"——没有做，`daemon_causes` 已按 chain 存）。
 
 ---

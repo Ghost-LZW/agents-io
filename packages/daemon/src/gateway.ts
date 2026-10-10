@@ -1283,7 +1283,7 @@ export class Gateway {
     }
     const e = this.router.explain(id);
     // A loop-guard trip is recorded by the lane, possibly before the routing record is (re)written: the cause index keeps it.
-    const trip = e && !e.loopGuard ? this.records.causeOf(id)?.loopGuard : undefined;
+    const trip = e && !e.loopGuard ? this.records.causesOf(id).find((r) => r.loopGuard)?.loopGuard : undefined;
     if (e) return { ok: true, value: trip ? { ...e, loopGuard: trip } : e };
     const fx = this.explainEffect(id);
     return fx ? { ok: true, value: fx } : fail('unknown_input', `no routing record or delivery for ${id} (unknown, or older than the retention)`);
@@ -1342,7 +1342,7 @@ export class Gateway {
     for (let n = 0; n < 64; n++) {
       const ex = this.router.explain(cur);
       const rec: Omit<CauseRecord, 'at'> | undefined =
-        this.records.causeOf(cur) ??
+        this.causeIn(cur, session) ??
         (ex?.cause ? { inputId: cur, sessionKey: session ?? ex.matched[0]?.sessionKey ?? '', principal: ex.principal, cause: ex.cause, ...(ex.loopGuard ? { loopGuard: ex.loopGuard } : {}) } : undefined);
       const sessionKey = rec?.sessionKey || session || ex?.matched.find((m) => m.sessionKey)?.sessionKey;
       if (!rec) {
@@ -1374,7 +1374,7 @@ export class Gateway {
       let next = inputs[0]!;
       let best = -1;
       for (const id of inputs) {
-        const h = this.records.causeOf(id)?.cause.hop ?? this.router.explain(id)?.cause?.hop ?? 0;
+        const h = this.records.causeOf(id, c.from.sessionKey)?.cause.hop ?? this.router.explain(id)?.cause?.hop ?? 0;
         if (h > best) {
           best = h;
           next = id;
@@ -1385,6 +1385,17 @@ export class Gateway {
     }
     const first = this.records.causeOf(inputId)?.cause ?? this.router.explain(inputId)?.cause;
     return { inputId, ...(first?.chain !== undefined ? { chain: first.chain } : links.length === 1 && end === 'root' ? { chain: inputId } : {}), links, end };
+  }
+
+  /**
+   * The cause record of `inputId` on a chain walk: in `session` (the producing turn's session)
+   * when known; at the start, of the session where it started a turn, else the first recorded
+   * (one envelope may reach several sessions: a dispatch and a watch).
+   */
+  private causeIn(inputId: string, session: string | undefined): CauseRecord | undefined {
+    if (session !== undefined) return this.records.causeOf(inputId, session);
+    const all = this.records.causesOf(inputId);
+    return all.find((r) => this.turnOfInput(r.sessionKey, inputId) !== undefined) ?? all[0];
   }
 
   /** A chain link's session and, when its agent is known, its address. */

@@ -1,4 +1,5 @@
 import { mkdirSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { BodyOf, ChainExplanation, EffectExplanation, RouteExplanation, SessionEvent } from '@agents-io/protocol';
@@ -6,6 +7,7 @@ import { agentInput } from '@agents-io/session';
 import { FakeChannel, FakeHarness, type FakeTurnScript } from '@agents-io/testkit';
 import { ConfigError, resolveConfig, type HarnessInstance } from '../src/config.js';
 import { Gateway, InstanceHarness } from '../src/gateway.js';
+import { DaemonRecords } from '../src/records.js';
 import { cleanups, daemon, tmp, until } from './helpers.js';
 import { CONV, alice, turnsIn, world as topicsWorld } from './topics-helpers.js';
 
@@ -120,6 +122,42 @@ describe('the outbound index', () => {
     // Unknown ids are an error, not an empty answer.
     expect(gw.explain('nope', true)).toMatchObject({ ok: false, code: 'unknown_input' });
     expect(gw.explain('nope')).toMatchObject({ ok: false, code: 'unknown_input' });
+  });
+
+  it('one envelope in two sessions keeps a cause record in each; explain --chain follows the session the producing turn ran in #EX-6', async () => {
+    const { gw } = await bots();
+    const ev = (sessionKey: string, body: SessionEvent['body']) => gw.hub.append(sessionKey, { ts: Date.now(), level: 'primary', audience: 'status', durability: 'durable', body });
+    const cause = { peer: 'lark-bot:peerbot', basis: 'declared' as const, hop: 2, chain: 'theirs' };
+    // x reached s1 (where it started turn t1) and, through a watch, s2 as context (where it was stopped).
+    ev('s1', { t: 'input.admitted', inputId: 'x', disposition: 'new_turn' });
+    ev('s1', { t: 'turn.started', turnId: 't1', inputIds: ['x'], replyRoute: null });
+    gw.records.putCause({ inputId: 'x', sessionKey: 's1', principal: null, cause, at: Date.now() });
+    gw.records.putCause({ inputId: 'x', sessionKey: 's2', principal: null, cause, loopGuard: { tripped: 'hops', hop: 2, limit: 1 }, at: Date.now() });
+    expect(gw.records.causeOf('x', 's1')!.loopGuard).toBeUndefined();
+    expect(gw.records.causeOf('x', 's2')!.loopGuard).toMatchObject({ tripped: 'hops' });
+    // What turn t1 sent came back as y.
+    gw.records.putCause({ inputId: 'y', sessionKey: 's3', principal: 'agent:default', cause: { peer: 'default/s1', basis: 'recovered', hop: 3, chain: 'theirs', from: { sessionKey: 's1', turnId: 't1' } }, at: Date.now() });
+    const chain = ok<ChainExplanation>(gw.explain('y', true));
+    expect(chain.links).toMatchObject([
+      { inputId: 'y', hop: 3, sessionKey: 's3', basis: 'recovered' },
+      { inputId: 'x', hop: 2, sessionKey: 's1', turnId: 't1', basis: 'declared' },
+    ]);
+    expect(chain.links[1]!.loopGuard).toBeUndefined();
+    expect(chain.end).toBe('broken');
+    // Starting at x: the session where it started a turn.
+    expect(ok<ChainExplanation>(gw.explain('x', true)).links[0]).toMatchObject({ sessionKey: 's1', turnId: 't1' });
+  });
+
+  it('a cause table from before (keyed by input alone) is moved over on start, its records kept #EX-6 #RS-1', () => {
+    const db = new DatabaseSync(':memory:');
+    db.exec('CREATE TABLE daemon_causes (input_id TEXT PRIMARY KEY, chain TEXT, hop INTEGER, session_key TEXT NOT NULL, at INTEGER NOT NULL, json TEXT NOT NULL) WITHOUT ROWID');
+    const rec = { inputId: 'x', sessionKey: 's1', principal: null, cause: { peer: 'p', basis: 'none' as const }, at: Date.now() };
+    db.prepare('INSERT INTO daemon_causes VALUES (?, ?, ?, ?, ?, ?)').run('x', null, null, 's1', rec.at, JSON.stringify(rec));
+    const r = new DaemonRecords({ db });
+    expect(r.causeOf('x', 's1')).toEqual(rec);
+    r.putCause({ ...rec, sessionKey: 's2' });
+    expect(r.causesOf('x').map((c) => c.sessionKey)).toEqual(['s1', 's2']);
+    db.close();
   });
 
   it('an agent-authored send carries its chain position out-of-band (SendOp.cause); host deliveries carry none #EX-5 #DL-4b', async () => {
