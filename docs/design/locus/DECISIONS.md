@@ -153,3 +153,11 @@
 | c2（无承诺的功能测试） | 移入 `local` 层；坏了就删或重写，不机械改断言；本次不批量删 | 原则 2（呈现是投影）、原则 4 |
 | c1（重复、钉实现细节、测已删除的东西） | 删除 | 原则 4 |
 | "不成立"条目 | 每条都要有 `it.fails`；`check` 先警告，补齐后改为报错 | 原则 4：修好时测试变红，承诺状态自动可见 |
+
+**实施（2026-10-11）**，按上表做完，`docs/TESTING.md` 写明怎么跑。与复查稿不同的地方，依原则自决：
+
+- **测试不再依赖 `dist/`**：vitest 把 `@agents-io/*` 指向各包 `src/`，起子进程的 fixture 用 `scripts/source-loader.mjs`（node `--experimental-transform-types`）。复查只点了 jsonl-bridge，实际整个套件都要先构建（原则 4：core 必须随时能跑）。
+- **多加两个编号**：CF-7（监听的授权：主人任意、agent 只按白名单、只能删改自己建的）、CF-8（飞书平台需求清单与注册的处理器一致）。复查把这两组算成 b 却没给编号；有人依赖、就要有承诺（原则 4）。
+- **c1 少删了几条**：`session-launch` "host.hello advertises session.launch"（`host-callouts` 那条并不断言 `session.launch`）和 `daemon/test/topics` "agents without the session_* tools get no topic hint"（唯一断言 agent 的 `tools: false` 压过顶层 `outputTools: true` 的测试）保留；`watch.test.ts` 的授权测试删掉后，删除与覆盖权限那一半另留一条；`admin-topics` 的 run 部分并进 `protocol.test.ts` 的 PR-1 schema 测试。删掉 21 条（复查列 23 条，保留上面两条）。
+- **分类按 §3.1 的判据逐条重读**，各文件 a/b/c2/d 的个数与 §2 表有出入（例如飞书的群提及门控、邮件的自动回复过滤没有承诺，进 local）；没有承诺的留在 core 的一条也没有。
+- **"不成立"都写成了 `it.fails`**（25 条，含读新编号时发现的 IN-7、SE-1）；LN-4 的 Codex 迟到 `live.ended` 用假 harness 复现不了，写成 `it.todo`。原以为不成立或未测、写测试后发现成立的：DL-3、HQ-1（网关层跨重启）、ID-6、LN-1、LN-5、RS-3（现状如实）、RS-7、RS-8、CF-4、RS-1 的 blob。

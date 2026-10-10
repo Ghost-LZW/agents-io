@@ -1,6 +1,8 @@
 # 端到端测试：aio 守护进程
 
 > `packages/daemon`（`aio`）把所有包接进一个常驻进程：通道、Binding 表、lane、Hub、宿主入站队列、宿主协议（`docs/HOSTS.md`）。`examples/dev-gateway` 只剩一个同名 CLI 的包装（`aio-dev`，`aio-dev send` 对应 `aio input`）。出站 outbox 的结算记录在 SQLite 里（`deliver` 跨重启幂等）。
+>
+> 单元与集成测试（`pnpm test`、四层、`#编号` 标签、`pnpm invariants:affected`）见 [TESTING.md](TESTING.md)；本文是守护进程与真实平台的端到端与手工清单，属于 `live` 层。
 
 ```
 channels(lark-bot / mail / bridge…) ─▶ Ingress ─▶ Lane(每 session 一条, harness 懒打开) ─▶ Hub(SQLite log)
