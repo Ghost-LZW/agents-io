@@ -132,3 +132,12 @@
 | 输出工具默认开启（`config.ts:727`） | 改为默认关闭，按 agent 配置开启；dev-gateway 配置同步 | 原则 2 |
 | `onBehalfOf` 与 agent 代批 | 共用一个显式开关，默认关（已实现为 `policy.answerOnBehalf`，未开启答 `on_behalf_not_allowed`） | 决定 12 |
 | agent 通信地基（agent-messaging 提案 §待拍板 1–8） | 全部按提案推荐；默认跳数 8、同一对 15 分钟 10 轮，属可调参数 | 原则 1、4、6；决定 4/5/12 |
+
+### 决定 13 补记：B 组（宿主接口收窄）的执行细节
+
+日期：2026-10-11。以下细节由维护者按原则自定：
+
+- **`lease` 删除后旧宿主不被拒**：协议对象允许多余字段，带 `lease` 的 `host.hello` 照常通过、字段被忽略。只拉取的宿主的租约做法是 `onHostDown: "keep"` + 定期重推、刷新 `expiresAt`（同版本只改 `expiresAt` 的重推算一次变更，不是空操作）。
+- **`ref` 是 `InputRecord` 的独立字段 `channelRef`，不放进 `channelContext`**：`channelContext` 有适配器与本地客户端可写的部分，`ref` 是供宿主核验的事实，只能由网关按核对过的信封盖章（原则 4）。来源路径：直接派发、只记录、watch；补投与话题转交沿用原输入的引用。说明行里原样输出、不截断（邮件 Message-ID 可能很长），含空白或引号时整体加 JSON 引号；Codex 头里也不加引号，与 Claude Code 一致，方便 agent 原样复制。
+- **输出工具开关的层次**：顶层 `outputTools` 保留，含义收窄为各 agent `tools` 的缺省值，缺省 `false`；有任一 agent 开启时网关才起 MCP 服务。e2e 的场景 agent 跟随配置里默认 agent 的 `tools`（或顶层 `outputTools`），示例配置给 `assistant` 开启。
+- **代答开关名 `policy.answerOnBehalf`，错误码 `on_behalf_not_allowed`**：与 `launch_not_allowed`（部署方没有授权该能力）同一形式；非宿主连接仍先得到 `not_eligible`；未开启时 `features` 不列 `resolve.onBehalfOf`，宿主可按能力名判断。
