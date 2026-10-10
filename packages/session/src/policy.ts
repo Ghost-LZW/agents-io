@@ -16,6 +16,7 @@ import {
   type InputRecord,
   type Watch,
   type WatchSource,
+  type ContactArgs,
 } from '@agents-io/protocol';
 import { IdentityMap, OWNER_LABEL, ownerIdentities } from './identity.js';
 
@@ -59,6 +60,24 @@ export interface DefaultPolicyOptions {
    * field it sets equals the watch's source (channel, account, conversation, conversationKind).
    */
   watchAllowlist?: Partial<Pick<WatchSource, 'channel' | 'account' | 'conversation' | 'conversationKind'>>[];
+  /**
+   * Which agent may contact which (`Policy.contact`): `from` / `to` are agent names or `*`,
+   * `ops` limits the operations (default all). Nothing listed: every contact is denied.
+   */
+  agentContacts?: AgentContactRule[];
+}
+
+/** One `policy.agentContacts` entry. */
+export interface AgentContactRule {
+  from: string;
+  to: string;
+  ops?: ContactArgs['op'][];
+}
+
+/** `Policy.contact` from `policy.agentContacts`: allowed only by a matching rule (none: deny). */
+export function contactAllowed(rules: readonly AgentContactRule[], a: ContactArgs): boolean {
+  const name = (x: string, want: string) => want === '*' || want === x;
+  return rules.some((r) => name(a.from.agent, r.from) && name(a.to.agent, r.to) && (r.ops === undefined || r.ops.includes(a.op)));
 }
 
 const OWNER = OWNER_LABEL;
@@ -145,6 +164,10 @@ export function defaultPolicy(o: DefaultPolicyOptions): FullPolicy {
     async triage({ watch }: { watch: Watch; input: InputRecord }): Promise<'drop' | 'context' | 'trigger'> {
       return watch.mode === 'trigger' ? 'trigger' : 'context';
     },
+
+    async contact(a: ContactArgs): Promise<'allow' | 'deny'> {
+      return contactAllowed(o.agentContacts ?? [], a) ? 'allow' : 'deny';
+    },
   };
 }
 
@@ -161,5 +184,6 @@ export function withDefaults(p: SessionPolicy = {}): FullPolicy {
     escalate: p.escalate?.bind(p) ?? d.escalate,
     watch: p.watch?.bind(p) ?? d.watch,
     triage: p.triage?.bind(p) ?? d.triage,
+    contact: p.contact?.bind(p) ?? d.contact,
   };
 }

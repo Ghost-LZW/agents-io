@@ -4,6 +4,7 @@ import {
   type Policy,
   type RenderedMessage,
   type ReplyRoute,
+  type SendOp,
   type SendResult,
   type TurnContext,
 } from '@agents-io/protocol';
@@ -94,6 +95,14 @@ export interface OutboxOptions {
    */
   attemptTimeoutMs?: number;
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Every settled outcome of a delivery (not a duplicate answered from the store), e.g. to
+   * index which turn sent which platform message (agent-messaging §4.3.3) and to explain a
+   * side effect by its operationId. Errors are ignored.
+   */
+  onSettled?: (d: Pick<Delivery, 'sessionKey' | 'turnId'>, rec: DeliveryRecord) => void;
+  /** The chain position an agent-authored send (`as` set) carries out-of-band (`SendOp.cause`). */
+  causeOf?: (d: Delivery) => SendOp['cause'] | undefined;
 }
 
 export interface Delivery {
@@ -151,7 +160,10 @@ export class Outbox {
 
   /** `deliver` around `adapter.send`. The adapter also gets the operationId for its own dedup. */
   send(adapter: ChannelAdapter, d: Delivery & { msg: RenderedMessage; as?: string }): Promise<DeliveryRecord> {
-    return this.deliver(d, () => adapter.send(d.route, d.msg, { operationId: d.operationId, ...(d.as !== undefined ? { as: d.as } : {}) }));
+    return this.deliver(d, () => {
+      const cause = d.as !== undefined ? this.o.causeOf?.(d) : undefined;
+      return adapter.send(d.route, d.msg, { operationId: d.operationId, ...(d.as !== undefined ? { as: d.as } : {}), ...(cause ? { cause } : {}) });
+    });
   }
 
   /**
@@ -250,6 +262,11 @@ export class Outbox {
     // Closed: the in-flight mark stays, and the next process settles it as unknown.
     if (this.closed) return rec;
     this.store.put(rec);
+    try {
+      this.o.onSettled?.(d, rec);
+    } catch {
+      // an index is best effort; the outcome is recorded
+    }
     this.o.hub?.append(d.sessionKey, {
       ts: Date.now(),
       ...(d.turnId !== undefined ? { turnId: d.turnId } : {}),

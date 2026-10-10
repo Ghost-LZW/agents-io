@@ -5,6 +5,7 @@ import {
   errors,
   type ContentBlock,
   type InboundEnvelope,
+  type InputCause,
   type InputRecord,
   type Origin,
   type ReplyRoute,
@@ -545,10 +546,10 @@ export class WatchDispatcher {
    * also across restarts), ask `Policy.triage`, then record context, buffer for
    * the digest, or start a turn. Failures come back as `action: "error"`.
    */
-  async deliverWatch(watchId: string, env: InboundEnvelope, origin: Origin, channelContext: InputRecord['channelContext']): Promise<WatchDelivery> {
+  async deliverWatch(watchId: string, env: InboundEnvelope, origin: Origin, channelContext: InputRecord['channelContext'], cause?: InputCause): Promise<WatchDelivery> {
     const w = this.registry.get(watchId);
     if (!w) return { watchId, sessionKey: '', action: 'error', error: `watch ${watchId} not found` };
-    return this.claimAndDeliver(w, env, origin, channelContext);
+    return this.claimAndDeliver(w, env, origin, channelContext, cause);
   }
 
   /**
@@ -556,7 +557,7 @@ export class WatchDispatcher {
    * target session and batch it into one system turn per period, with the same
    * buffers, timers and crash recovery as digest watches.
    */
-  async deliverDigest(spec: DigestSpec, env: InboundEnvelope, origin: Origin, channelContext: InputRecord['channelContext']): Promise<WatchDelivery> {
+  async deliverDigest(spec: DigestSpec, env: InboundEnvelope, origin: Origin, channelContext: InputRecord['channelContext'], cause?: InputCause): Promise<WatchDelivery> {
     const id = bindingDigestId(spec.rule, spec.sessionKey);
     const prior = this.registry.bindingDigest(id);
     const w: Watch = {
@@ -570,17 +571,17 @@ export class WatchDispatcher {
       ...(spec.note !== undefined ? { note: spec.note } : {}),
     };
     this.registry.putBindingDigest(w);
-    return this.claimAndDeliver(w, env, origin, channelContext);
+    return this.claimAndDeliver(w, env, origin, channelContext, cause);
   }
 
-  private async claimAndDeliver(w: Watch, env: InboundEnvelope, origin: Origin, channelContext: InputRecord['channelContext']): Promise<WatchDelivery> {
+  private async claimAndDeliver(w: Watch, env: InboundEnvelope, origin: Origin, channelContext: InputRecord['channelContext'], cause?: InputCause): Promise<WatchDelivery> {
     const envKey = `${env.channel}:${env.id}`;
     const root = env.revisionOf !== undefined ? (this.revisionRoot.get(`${env.channel}:${env.revisionOf}`) ?? `${env.channel}:${env.revisionOf}`) : envKey;
     if (env.revisionOf !== undefined) this.revisionRoot.set(envKey, root);
     const sessionKey = w.target.sessionKey;
     if (!this.registry.claim(w.id, envKey)) return { watchId: w.id, sessionKey, action: 'duplicate' };
     try {
-      return await this.deliver(w, env, origin, envKey, root, channelContext);
+      return await this.deliver(w, env, origin, envKey, root, channelContext, cause);
     } catch (e) {
       this.registry.unclaim(w.id, envKey);
       this.o.onError?.(e, w.id);
@@ -588,7 +589,7 @@ export class WatchDispatcher {
     }
   }
 
-  private async deliver(w: Watch, env: InboundEnvelope, origin: Origin, envKey: string, root: string, base: InputRecord['channelContext']): Promise<WatchDelivery> {
+  private async deliver(w: Watch, env: InboundEnvelope, origin: Origin, envKey: string, root: string, base: InputRecord['channelContext'], cause?: InputCause): Promise<WatchDelivery> {
     const sessionKey = w.target.sessionKey;
     const input: InputRecord = {
       inputId: watchInputId(w.id, root),
@@ -597,6 +598,8 @@ export class WatchDispatcher {
       content: env.content,
       replyRoute: null,
       channelRef: channelRefOf(env),
+      // The same input in another place: its chain unchanged, no extra hop.
+      ...(cause ? { cause } : {}),
       channelContext: { ...base, watch: w.id, watchMode: w.mode, watchSource: origin.via },
     };
     let verdict = await this.policy.triage({ watch: w, input });

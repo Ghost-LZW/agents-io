@@ -123,7 +123,7 @@ describe('turn provenance', () => {
   it('an owner DM: triggered by the owner, nothing watched, external or group #EX-3', async () => {
     const w = world();
     await w.ingress.accept(fakeEnvelope({ sender: alice, text: 'hi' }));
-    expect(await prov(w, 'fake:default:c1')).toEqual([{ sessionKey: 'fake:default:c1', turnId: expect.any(String), triggeredBy: ['fake:alice'], watched: false, external: false, group: false }]);
+    expect(await prov(w, 'fake:default:c1')).toEqual([{ sessionKey: 'fake:default:c1', turnId: expect.any(String), triggeredBy: ['fake:alice'], watched: false, external: false, group: false, cause: { hop: 0, chain: expect.any(String), rootPrincipal: 'fake:alice' } }]);
     await w.close();
   });
 

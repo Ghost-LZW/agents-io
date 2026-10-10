@@ -12,6 +12,7 @@ import {
   type InputRecord,
   type LiveFrame,
   type LiveStartArgs,
+  type LoopGuardTrip,
   type Origin,
   type ReplyRoute,
   type ResolvedBy,
@@ -25,6 +26,7 @@ import type { Hub } from './hub.js';
 import type { EventDraft, SessionSnapshot, SessionState, Visibility } from './log.js';
 import { withDefaults, type FullPolicy, type SessionPolicy } from './policy.js';
 import { GROUPISH } from './watch.js';
+import { LoopGuard, loopGuardMessage, turnCause, type LoopGuardOptions, type TurnCause } from './loop-guard.js';
 
 export interface ModelReviewArgs {
   sessionKey: string;
@@ -80,6 +82,19 @@ export interface LaneOptions {
   onHarnessEvent?: (e: HarnessEvent) => void;
   /** A live (realtime voice) on this session ended, whichever side ended it (decision 11). */
   onLiveEnded?: (liveId: string, reason: string) => void;
+  /**
+   * Hop and same-pair limits checked on every input that would start or join a turn
+   * (docs/design/agent-messaging §4.4); defaults `LOOP_GUARD_DEFAULTS`. `false` turns it off.
+   */
+  loopGuard?: LoopGuardOptions | false;
+  /**
+   * The loop guard stopped an input (it was recorded as context with
+   * `channelContext.loopGuard`, and a `loop_guard` notice is in this session's log),
+   * e.g. to tell the sending session and record it for `explain`. Errors are ignored.
+   */
+  onLoopGuard?: (a: { sessionKey: string; input: InputRecord; trip: LoopGuardTrip }) => void;
+  /** An input with a cause was admitted (as an input or as context), e.g. to index it for `explain --chain`. Errors are ignored. */
+  onCause?: (a: { sessionKey: string; input: InputRecord }) => void;
 }
 
 /** A live running on the session (decision 11): what delegated inputs are attributed to. */
@@ -226,12 +241,16 @@ export class Lane {
   private live: LiveInfo | undefined;
   /** Delegations (live.handoff) waiting for the turn the harness starts for them. */
   private handoffs = new Map<string, InputRecord>();
+  private readonly guard: LoopGuard | undefined;
+  /** The chain of the last turn: an adopted turn (no inputs in memory) keeps it. */
+  private lastCause: TurnCause | undefined;
 
   constructor(private readonly o: LaneOptions) {
     this.sessionKey = o.sessionKey;
     this.adapter = o.harness;
     this.policy = withDefaults(o.policy);
     this.newId = o.newId ?? ((p) => `${p}_${randomUUID()}`);
+    this.guard = o.loopGuard === false ? undefined : new LoopGuard(o.loopGuard ?? {});
     // A log written by an earlier host: continue its generations, and remember a turn it left open
     // so the harness can adopt it (turn.adopted) or the next turn settles it as ambiguous.
     const snap = o.hub.snapshot(o.sessionKey);
@@ -261,11 +280,44 @@ export class Lane {
    */
   observe(input: InputRecord): Promise<CommandResult> {
     return this.serial(async () => {
-      this.observedInputs.set(input.inputId, input);
-      const e = this.emit({ body: { t: 'input.admitted', inputId: input.inputId, disposition: 'observe_only', ...pid(input), input } });
-      this.addContext(input, e.seq);
+      this.recordContext(input);
+      this.indexCause(input);
       return { ok: true, disposition: 'observe_only' } as const;
     });
+  }
+
+  private recordContext(input: InputRecord): void {
+    this.observedInputs.set(input.inputId, input);
+    const e = this.emit({ body: { t: 'input.admitted', inputId: input.inputId, disposition: 'observe_only', ...pid(input), input } });
+    this.addContext(input, e.seq);
+  }
+
+  private indexCause(input: InputRecord): void {
+    if (!input.cause || !this.o.onCause) return;
+    try {
+      this.o.onCause({ sessionKey: this.sessionKey, input });
+    } catch {
+      // indexing is best effort: the log has the record
+    }
+  }
+
+  /**
+   * The loop guard stopped `input`: it is recorded as context (labelled `loopGuard`,
+   * handed to the next turn like any context), with a `loop_guard` notice for operators.
+   * Never a turn, never anything on a channel.
+   */
+  private guarded(input: InputRecord, trip: LoopGuardTrip): CommandResult {
+    const t = { ...trip, sessionKey: this.sessionKey };
+    const record: InputRecord = { ...input, replyRoute: input.replyRoute, channelContext: { ...input.channelContext, loopGuard: trip.tripped } };
+    this.recordContext(record);
+    this.emit({ level: 'primary', visibility: 'operators', body: { t: 'notice', code: 'loop_guard', message: loopGuardMessage(trip, input.inputId) } });
+    this.indexCause(record);
+    try {
+      this.o.onLoopGuard?.({ sessionKey: this.sessionKey, input: record, trip: t });
+    } catch {
+      // reporting elsewhere is best effort: this session's log has it
+    }
+    return { ok: true, disposition: 'observe_only' };
   }
 
   /** Context-only inputs the next turn will be handed (latest revisions, arrival order, before the bounds). */
@@ -339,13 +391,18 @@ export class Lane {
   /** `inputs` triggered the turn; `context` was handed ahead of them. */
   private track(turnId: string, inputs: InputRecord[], context: InputRecord[] = []): void {
     const ctx = context.filter((c) => c.channelContext.contextOmitted === undefined);
+    // Relayed inputs bring the producing turn's flags along: an agent passing on a stranger's words is not a clean source.
+    const carried = (k: 'external' | 'watched' | 'group') => inputs.some((i) => i.cause?.carried?.[k] === true);
+    const cause = inputs.length ? turnCause(inputs) : this.lastCause;
+    if (cause) this.lastCause = cause;
     const p: TurnProvenance = {
       sessionKey: this.sessionKey,
       turnId,
       triggeredBy: inputs.map((i) => i.origin.principal?.id ?? null),
-      watched: this.ctxSeen.any || context.length > 0 || inputs.some(isWatched),
-      external: this.ctxSeen.external || ctx.some(isExternal) || inputs.some(isExternal),
-      group: this.ctxSeen.group || ctx.some(isGroup) || inputs.some(isGroup),
+      watched: this.ctxSeen.any || context.length > 0 || inputs.some(isWatched) || carried('watched'),
+      external: this.ctxSeen.external || ctx.some(isExternal) || inputs.some(isExternal) || carried('external'),
+      group: this.ctxSeen.group || ctx.some(isGroup) || inputs.some(isGroup) || carried('group'),
+      ...(cause ? { cause } : {}),
     };
     this.provenances.set(turnId, p);
     for (const k of this.provenances.keys()) {
@@ -564,6 +621,10 @@ export class Lane {
   private async input(input: InputRecord, mode: InputMode, expectedTurnId?: string): Promise<CommandResult> {
     if (this.known.has(input.inputId)) return { ok: true, disposition: 'duplicate' };
     this.known.add(input.inputId);
+    // The single loop checkpoint: every path that starts or joins a turn (queue, steer, interrupt) comes here.
+    const trip = this.guard?.check(input);
+    if (trip) return this.guarded(input, trip);
+    this.indexCause(input);
 
     if (mode === 'steer') {
       const r = await this.trySteer(input, expectedTurnId);
@@ -1339,7 +1400,8 @@ export function settleLeftoverInputs(hub: Hub, sessionKey: string): string[] {
 
 function pid(i: InputRecord): { principalId?: string; input?: InputRecord } {
   const id = principalId(i);
-  return { ...(id === undefined ? {} : { principalId: id }), ...(i.channelContext.watch !== undefined ? { input: i } : {}) };
+  // Watched inputs and agent inputs (with a cause) keep their record in the log: where they came from, and their chain.
+  return { ...(id === undefined ? {} : { principalId: id }), ...(i.channelContext.watch !== undefined || i.cause ? { input: i } : {}) };
 }
 
 /** Arrived through a watch (context, trigger) or is a digest of watched items. */

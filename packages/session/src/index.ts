@@ -13,3 +13,4 @@ export * from './identity.js';
 export * from './router.js';
 export * from './host-queue.js';
 export * from './topics.js';
+export * from './loop-guard.js';

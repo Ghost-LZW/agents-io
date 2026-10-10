@@ -237,11 +237,11 @@ describe('identity map', () => {
   it('keeps the safety rules: self echoes, declarations only from agent accounts, never naming a member #ID-4 #ID-5', () => {
     const m = new IdentityMap([entries], { selfAccounts: ['mail:me@x.com'], agentAccounts: ['mail:bot@x.com'], isSelfDeclared: (d) => d.startsWith('runner:me/') });
     expect(m.identify(args('me@x.com', 'dkim_pass', { declared: 'runner:me/1' }))).toEqual({ kind: 'agent', principal: null, self: true, declared: 'runner:me/1' });
-    expect(m.identify(args('bot@x.com', 'dkim_pass', { declared: 'runner:other/1' }))).toEqual({ kind: 'agent', principal: { id: 'runner:other/1', labels: ['agent'] }, declared: 'runner:other/1' });
+    expect(m.identify(args('bot@x.com', 'dkim_pass', { declared: 'runner:other/1' }))).toEqual({ kind: 'agent', principal: { id: 'runner:other/1', labels: ['agent'] }, declared: 'runner:other/1', trustedAgent: true });
     expect(m.identify(args('bot@x.com', 'dkim_pass', { declared: 'runner:me/2' }))).toMatchObject({ self: true });
     // A host principal id or a mapped channel identity is never borrowed through a declaration.
-    expect(m.identify(args('bot@x.com', 'dkim_pass', { declared: 'u-1' }))).toEqual({ kind: 'agent', principal: null });
-    expect(m.identify(args('bot@x.com', 'dkim_pass', { declared: 'mail:boss@x.com' }))).toEqual({ kind: 'agent', principal: null });
+    expect(m.identify(args('bot@x.com', 'dkim_pass', { declared: 'u-1' }))).toEqual({ kind: 'agent', principal: null, trustedAgent: true });
+    expect(m.identify(args('bot@x.com', 'dkim_pass', { declared: 'mail:boss@x.com' }))).toEqual({ kind: 'agent', principal: null, trustedAgent: true });
     // Anyone else's declaration is ignored, even naming a member.
     expect(m.identify(args('stranger@y.com', 'dkim_pass', { declared: 'u-1' }))).toEqual({ kind: 'human', principal: null });
   });
