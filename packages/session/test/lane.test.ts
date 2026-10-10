@@ -2,10 +2,14 @@ import { describe, expect, it } from 'vitest';
 import { FakeHarness, assertConformingStream, fakeHarnessCaps } from '@agents-io/testkit';
 import type { BodyOf, Decision } from '@agents-io/protocol';
 import { Lane, settleLeftoverInputs, type ModelReviewer } from '../src/index.js';
-import { ManualHarness, SteerableHarness, bodies, gate, input, origin, policy, route, setup, until } from './helpers.js';
+import { ManualHarness, RUN, SteerableHarness, bodies, gate, input, origin, policy, route, setup, until } from './helpers.js';
 
 const turnsOf = (evs: ReturnType<ReturnType<typeof setup>['events']>) =>
   bodies(evs, 'turn.started').map((b) => (b as BodyOf<'turn.started'>).inputIds);
+
+/** The terminal events (consumed / rejected / cancelled) that name an input. */
+const terminalOf = (evs: ReturnType<ReturnType<typeof setup>['events']>, inputId: string) =>
+  bodies(evs).filter((b) => (b.t === 'input.consumed' || b.t === 'input.rejected' || b.t === 'input.cancelled') && (b as { inputIds: string[] }).inputIds.includes(inputId));
 
 const req = (id: string, extra: Partial<BodyOf<'request.opened'>> = {}): BodyOf<'request.opened'> => ({
   t: 'request.opened',
@@ -20,7 +24,7 @@ const req = (id: string, extra: Partial<BodyOf<'request.opened'>> = {}): BodyOf<
 });
 
 describe('Lane: turns and queue', () => {
-  it('runs a turn and wraps harness events into a gapless, conforming session stream', async () => {
+  it('runs a turn and wraps harness events into a gapless, conforming session stream #LN-1', async () => {
     const { lane, raw, events } = setup();
     const i = input('hello');
     expect(await lane.command({ type: 'input', sessionKey: 's1', input: i, mode: 'queue' })).toEqual({ ok: true, disposition: 'new_turn' });
@@ -47,7 +51,7 @@ describe('Lane: turns and queue', () => {
     expect(started).toMatchObject({ owner: 'fake:alice', run: { harness: 'fake', profile: 'bypass' } });
   });
 
-  it('never merges inputs from two principals or two routes into one turn', async () => {
+  it('never merges inputs from two principals or two routes into one turn #IN-3 #LN-2', async () => {
     const g = gate();
     let first = true;
     const { lane, events } = setup({
@@ -75,7 +79,7 @@ describe('Lane: turns and queue', () => {
     assertConformingStream(events());
   });
 
-  it('re-queues admitted-but-unconsumed inputs once, then rejects them', async () => {
+  it('re-queues admitted-but-unconsumed inputs once, then rejects them #IN-1 #IN-2', async () => {
     const h = new ManualHarness();
     const { lane, events } = setup({ harness: h });
     await lane.command({ type: 'input', sessionKey: 's1', input: input('x', { id: 'x' }), mode: 'queue' });
@@ -90,7 +94,7 @@ describe('Lane: turns and queue', () => {
     await lane.whenIdle();
   });
 
-  it('marks a turn ambiguous when the harness consumed inputs it was not given', async () => {
+  it('marks a turn ambiguous when the harness consumed inputs it was not given #IN-4', async () => {
     const h = new ManualHarness();
     const { lane, events } = setup({ harness: h });
     await lane.command({ type: 'input', sessionKey: 's1', input: input('x', { id: 'x' }), mode: 'queue' });
@@ -100,7 +104,7 @@ describe('Lane: turns and queue', () => {
     expect(bodies(events(), 'turn.completed')[0]).toMatchObject({ status: 'ambiguous' });
   });
 
-  it('closes the turn as ambiguous when the harness stream ends mid-turn', async () => {
+  it('closes the turn as ambiguous when the harness stream ends mid-turn #IN-1', async () => {
     const h = new ManualHarness();
     const { lane, events } = setup({ harness: h });
     await lane.command({ type: 'input', sessionKey: 's1', input: input('x', { id: 'x' }), mode: 'queue' });
@@ -111,7 +115,7 @@ describe('Lane: turns and queue', () => {
     expect(bodies(events(), 'input.rejected')[0]).toMatchObject({ inputIds: ['x'], reason: 'ambiguous' });
   });
 
-  it('ignores a duplicate inputId', async () => {
+  it('ignores a duplicate inputId #IN-5', async () => {
     const { lane } = setup();
     const i = input('x');
     await lane.command({ type: 'input', sessionKey: 's1', input: i, mode: 'queue' });
@@ -120,7 +124,7 @@ describe('Lane: turns and queue', () => {
 });
 
 describe('Lane: steer', () => {
-  it('degrades to queue when the harness cannot steer', async () => {
+  it('degrades to queue when the harness cannot steer #IN-1', async () => {
     const g = gate();
     const { lane, events } = setup({ harness: new FakeHarness(() => g.promise) });
     await lane.command({ type: 'input', sessionKey: 's1', input: input('a', { id: 'a' }), mode: 'queue' });
@@ -132,7 +136,7 @@ describe('Lane: steer', () => {
     expect(turnsOf(events())).toEqual([['a'], ['b']]);
   });
 
-  it('steers only the turn owner; others are queued; another route becomes an extra delivery', async () => {
+  it('steers only the turn owner; others are queued; another route becomes an extra delivery #DL-3 #IN-3', async () => {
     const g = gate();
     const h = new SteerableHarness(async (t) => {
       await g.promise;
@@ -156,7 +160,7 @@ describe('Lane: steer', () => {
     assertConformingStream(raw);
   });
 
-  it('degrades a steer the harness refuses (stale / not_steerable / no_active_turn)', async () => {
+  it('degrades a steer the harness refuses (stale / not_steerable / no_active_turn) #IN-1', async () => {
     const g = gate();
     const h = new SteerableHarness(() => g.promise);
     const { lane, events } = setup({ harness: h });
@@ -167,6 +171,19 @@ describe('Lane: steer', () => {
     expect(bodies(events(), 'notice').at(-1)).toMatchObject({ message: expect.stringContaining('not_steerable') });
     g.open();
     await lane.whenIdle();
+  });
+  it('a steer that would change the turn\'s profile is queued instead (the profile comes from the turn\'s own inputs) #ID-6', async () => {
+    const g = gate();
+    const { lane, events } = setup({ harness: new SteerableHarness(() => g.promise) });
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('a', { id: 'a' }), mode: 'queue' });
+    await until(() => bodies(events(), 'turn.started').length === 1);
+    // Same principal as the turn owner, but not identified as an owner this time: restricted on its own.
+    expect(await lane.command({ type: 'input', sessionKey: 's1', input: input('n', { id: 'n', labels: [] }), mode: 'steer' })).toEqual({ ok: true, disposition: 'queued' });
+    expect(bodies(events(), 'notice').at(-1)).toMatchObject({ message: expect.stringContaining('profile_change') });
+    g.open();
+    await until(() => bodies(events(), 'turn.completed').length === 2);
+    expect(turnsOf(events())).toEqual([['a'], ['n']]);
+    expect(bodies(events(), 'turn.started').map((b) => (b as BodyOf<'turn.started'>).run.profile)).toEqual(['bypass', 'restricted']);
   });
 });
 
@@ -179,7 +196,7 @@ describe('Lane: interrupt', () => {
         }),
     );
 
-  it('interrupts the active turn and optionally clears the queue', async () => {
+  it('interrupts the active turn and optionally clears the queue #IN-1 #CT-1', async () => {
     const { lane, events, raw } = setup({ harness: blocking() });
     await lane.command({ type: 'input', sessionKey: 's1', input: input('a', { id: 'a' }), mode: 'queue' });
     await lane.command({ type: 'input', sessionKey: 's1', input: input('b', { id: 'b' }), mode: 'queue' });
@@ -193,7 +210,7 @@ describe('Lane: interrupt', () => {
     assertConformingStream(raw);
   });
 
-  it('refuses interrupts from someone who is neither turn owner nor owner', async () => {
+  it('refuses interrupts from someone who is neither turn owner nor owner #CT-1', async () => {
     const { lane, events } = setup({ harness: blocking() });
     await lane.command({ type: 'input', sessionKey: 's1', input: input('a'), mode: 'queue' });
     await until(() => bodies(events(), 'turn.started').length === 1);
@@ -203,7 +220,7 @@ describe('Lane: interrupt', () => {
     await lane.close();
   });
 
-  it('interrupt-mode input stops the turn and runs next', async () => {
+  it('interrupt-mode input stops the turn and runs next #IN-1', async () => {
     const { lane, events } = setup({ harness: blocking() });
     await lane.command({ type: 'input', sessionKey: 's1', input: input('a', { id: 'a' }), mode: 'queue' });
     await lane.command({ type: 'input', sessionKey: 's1', input: input('q', { id: 'q' }), mode: 'queue' });
@@ -223,7 +240,7 @@ describe('Lane: requests', () => {
       t.emit({ t: 'request.resolved', requestId: 'r1', decision: decisions[0]!, by: { kind: 'harness' } });
     });
 
-  it('auto: answers immediately per policy (bypass → allow)', async () => {
+  it('auto: answers immediately per policy (bypass → allow) #ID-6 #RQ-1', async () => {
     const got: Decision[] = [];
     const { lane, events, raw } = setup({ harness: asking(got) });
     await lane.command({ type: 'input', sessionKey: 's1', input: input('go'), mode: 'queue' });
@@ -237,7 +254,7 @@ describe('Lane: requests', () => {
     assertConformingStream(events());
   });
 
-  it('auto deny for a restricted turn', async () => {
+  it('auto deny for a restricted turn #ID-6', async () => {
     const got: Decision[] = [];
     const { lane, events } = setup({ harness: asking(got) });
     await lane.command({ type: 'input', sessionKey: 's1', input: input('go', { principal: null }), mode: 'queue' });
@@ -245,7 +262,7 @@ describe('Lane: requests', () => {
     expect(got[0]).toMatchObject({ kind: 'deny' });
   });
 
-  it('human: re-checks eligibility server side; first resolve wins', async () => {
+  it('human: re-checks eligibility server side; first resolve wins #RQ-1', async () => {
     const got: Decision[] = [];
     const { lane, events } = setup({
       harness: asking(got),
@@ -269,7 +286,7 @@ describe('Lane: requests', () => {
     expect(events().find((e) => e.body.t === 'request.resolved')!.audience).toBe('approval');
   });
 
-  it('human: times out to deny', async () => {
+  it('human: times out to deny #RQ-2', async () => {
     const got: Decision[] = [];
     const { lane, events } = setup({
       harness: asking(got),
@@ -282,7 +299,7 @@ describe('Lane: requests', () => {
     expect(bodies(events(), 'request.resolved')[0]).toMatchObject({ by: 'timeout' });
   });
 
-  it('host: only a system origin may resolve', async () => {
+  it('host: only a system origin may resolve #RQ-1', async () => {
     const got: Decision[] = [];
     const { lane, events } = setup({ harness: asking(got), policy: policy({ resolve: async () => ({ kind: 'host' }) }) });
     await lane.command({ type: 'input', sessionKey: 's1', input: input('go'), mode: 'queue' });
@@ -293,7 +310,7 @@ describe('Lane: requests', () => {
     await until(() => got.length === 1);
   });
 
-  it('onBehalfOf: only a host connection (system origin through the host adapter) may relay', async () => {
+  it('onBehalfOf: only a host connection (system origin through the host adapter) may relay #RQ-3', async () => {
     const got: Decision[] = [];
     const { lane, events } = setup({ harness: asking(got), policy: policy({ resolve: async () => ({ kind: 'human', principals: ['fake:alice'], routes: [] }) }) });
     await lane.command({ type: 'input', sessionKey: 's1', input: input('go'), mode: 'queue' });
@@ -306,7 +323,7 @@ describe('Lane: requests', () => {
     expect(bodies(events(), 'request.resolved')[0]).toMatchObject({ by: { kind: 'human', id: 'fake:alice', via: 'host:xwo' } });
   });
 
-  it('model: uses the reviewer; escalation re-opens for a human; no reviewer falls back to human', async () => {
+  it('model: uses the reviewer; escalation re-opens for a human; no reviewer falls back to human #RQ-1', async () => {
     const run = async (reviewer: ModelReviewer | undefined) => {
       const got: Decision[] = [];
       const ctx = setup({
@@ -339,7 +356,7 @@ describe('Lane: requests', () => {
     await c.lane.close();
   });
 
-  it('cancels open requests when the turn ends without answering them', async () => {
+  it('cancels open requests when the turn ends without answering them #RQ-2', async () => {
     const h = new ManualHarness({ ...fakeHarnessCaps });
     const { lane, events } = setup({ harness: h, policy: policy({ resolve: async () => ({ kind: 'human', principals: ['fake:alice'], routes: [] }) }) });
     await lane.command({ type: 'input', sessionKey: 's1', input: input('x', { id: 'x' }), mode: 'queue' });
@@ -374,13 +391,13 @@ describe('Lane: host restart', () => {
   const nextLane = (hub: ReturnType<typeof setup>['hub'], harness: ManualHarness) =>
     new Lane({ sessionKey: 's1', harness, hub, policy: policy(), thinkingHeadline: null });
 
-  it('detach leaves the running turn open in the log', async () => {
+  it('detach leaves the running turn open in the log #RS-2', async () => {
     const a = await firstHost();
     expect(bodies(a.events(), 'turn.completed')).toEqual([]);
     expect(a.hub.snapshot('s1').turn?.turnId).toBe(a.turnId);
   });
 
-  it('a new lane adopts the turn (turn.adopted), keeps it as the active turn and queues behind it', async () => {
+  it('a new lane adopts the turn (turn.adopted), keeps it as the active turn and queues behind it #RS-2', async () => {
     const a = await firstHost();
     const h2 = new ManualHarness();
     const lane2 = nextLane(a.hub, h2);
@@ -399,7 +416,7 @@ describe('Lane: host restart', () => {
     assertConformingStream(a.events(), { allowTrailing: true });
   });
 
-  it('settles a turn nobody adopted as ambiguous before the next turn starts, rejecting its unconsumed inputs', async () => {
+  it('settles a turn nobody adopted as ambiguous before the next turn starts, rejecting its unconsumed inputs #IN-1 #RS-5', async () => {
     const a = await firstHost();
     const h2 = new ManualHarness();
     const lane2 = nextLane(a.hub, h2);
@@ -411,7 +428,7 @@ describe('Lane: host restart', () => {
     expect(a.hub.snapshot('s1').turn?.turnId).toBe(h2.session!.starts[0]!.turnId);
   });
 
-  it('detach rejects the inputs queued behind the running turn (lane_closed, with their route), never the turn\'s own; the next lane still adopts it', async () => {
+  it('detach rejects the inputs queued behind the running turn (lane_closed, with their route), never the turn\'s own; the next lane still adopts it #IN-1 #RS-6', async () => {
     const h1 = new ManualHarness();
     const a = setup({ harness: h1 });
     const send = (i: ReturnType<typeof input>) => a.lane.command({ type: 'input', sessionKey: 's1', input: i, mode: 'queue' });
@@ -441,7 +458,7 @@ describe('Lane: host restart', () => {
     expect(bodies(a.events(), 'input.rejected').flatMap((b) => (b as BodyOf<'input.rejected'>).inputIds)).toEqual(['y', 'z']);
   });
 
-  it('crash leftovers: inputs a previous process admitted and never settled are rejected (host_restarted) at startup; the open turn is left to adoption', async () => {
+  it('crash leftovers: inputs a previous process admitted and never settled are rejected (host_restarted) at startup; the open turn is left to adoption #IN-1 #RS-6', async () => {
     const h1 = new ManualHarness();
     const a = setup({ harness: h1 });
     await a.lane.command({ type: 'input', sessionKey: 's1', input: input('long job', { id: 'x' }), mode: 'queue' });
@@ -456,10 +473,34 @@ describe('Lane: host restart', () => {
     expect(a.hub.snapshot('s1').turn?.inputIds).toEqual(['x']);
     expect(settleLeftoverInputs(a.hub, 's1')).toEqual([]); // idempotent
   });
+  // INVARIANTS IN-1 不成立 3: an adopted turn starts with `inputs: []`, so its inputs the harness never reports consumed get no terminal state when it ends; turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails('an adopted turn that ends without reporting its inputs consumed settles them #IN-1 #RS-2', async () => {
+    const a = await firstHost();
+    const h2 = new ManualHarness();
+    const lane2 = nextLane(a.hub, h2);
+    await lane2.open();
+    h2.session!.push({ t: 'turn.adopted', turnId: a.turnId, nativeTurnId: 'n1', inputIds: ['x'] }, { turnId: a.turnId });
+    await until(() => lane2.activeTurn()?.turnId === a.turnId);
+    h2.session!.complete(a.turnId, []);
+    await until(() => bodies(a.events(), 'turn.completed').length === 1);
+    await lane2.whenIdle();
+    expect(terminalOf(a.events(), 'x')).not.toEqual([]);
+  });
+
+  // INVARIANTS RS-5 不成立: an interactive session settles a leftover turn only when a new input arrives (`pump` needs `queue.length`); without one the turn stays open; turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails('a leftover turn nobody adopts is settled ambiguous once the lane opens, without waiting for a new input #RS-5', async () => {
+    const a = await firstHost();
+    const lane2 = nextLane(a.hub, new ManualHarness());
+    await lane2.open();
+    await new Promise((r) => setTimeout(r, 50));
+    await lane2.whenIdle();
+    expect(bodies(a.events(), 'turn.completed')).toMatchObject([{ turnId: a.turnId, status: 'ambiguous', error: { code: 'host_restarted' } }]);
+    expect(a.hub.snapshot('s1').turn).toBeNull();
+  });
 });
 
 describe('Lane: close', () => {
-  it('close rejects queued inputs (lane_closed) and the interrupted turn\'s; nothing stays queued', async () => {
+  it('close rejects queued inputs (lane_closed) and the interrupted turn\'s; nothing stays queued #IN-1 #RS-6', async () => {
     const h = new ManualHarness();
     const { lane, events, hub } = setup({ harness: h });
     const send = (i: ReturnType<typeof input>) => lane.command({ type: 'input', sessionKey: 's1', input: i, mode: 'queue' });
@@ -479,7 +520,7 @@ describe('Lane: close', () => {
     expect(await send(input('late', { id: 'late' }))).toEqual({ ok: false, reason: 'closed' });
   });
 
-  it('an input requeued as the turn ends during close is rejected, not stranded', async () => {
+  it('an input requeued as the turn ends during close is rejected, not stranded #IN-1', async () => {
     const h = new ManualHarness();
     const { lane, events, hub } = setup({ harness: h });
     await lane.command({ type: 'input', sessionKey: 's1', input: input('x', { id: 'x' }), mode: 'queue' });
@@ -493,7 +534,7 @@ describe('Lane: close', () => {
     expect(h.session!.starts).toHaveLength(1);
   });
 
-  it('an input whose admission was awaiting a policy hook when the lane closed is rejected', async () => {
+  it('an input whose admission was awaiting a policy hook when the lane closed is rejected #IN-1', async () => {
     const h = new ManualHarness();
     const g = gate();
     const { lane, events, hub } = setup({
@@ -518,7 +559,7 @@ describe('Lane: close', () => {
 });
 
 describe('Lane: named harness instances', () => {
-  it('opens the adapter the turn names, attributes events to it, and switches generations when the plan changes it', async () => {
+  it('opens the adapter the turn names, attributes events to it, and switches generations when the plan changes it #FC-2', async () => {
     const a = new FakeHarness(undefined, 'inst-a');
     const b = new FakeHarness(undefined, 'inst-b');
     let use = 'inst-a';
@@ -575,7 +616,7 @@ describe('Lane: robustness', () => {
     );
   const guest = (text: string, id: string, who: string) => input(text, { id, principal: who, labels: ['guest'] });
 
-  it('an input that arrives before the harness reports its adoption waits for it instead of settling the turn as ambiguous', async () => {
+  it('an input that arrives before the harness reports its adoption waits for it instead of settling the turn as ambiguous #RS-2', async () => {
     const h1 = new ManualHarness();
     const a = setup({ harness: h1 });
     await a.lane.command({ type: 'input', sessionKey: 's1', input: input('long job', { id: 'x' }), mode: 'queue' });
@@ -606,7 +647,7 @@ describe('Lane: robustness', () => {
     expect(bodies(a.events(), 'input.rejected')).toEqual([]);
   });
 
-  it('a throwing policy.escalate after a model escalation denies the request with a notice', async () => {
+  it('a throwing policy.escalate after a model escalation denies the request with a notice #RQ-2', async () => {
     const got: Decision[] = [];
     const { lane, events } = setup({
       harness: new FakeHarness(async (t) => {
@@ -628,7 +669,7 @@ describe('Lane: robustness', () => {
     expect(bodies(events(), 'notice')).toContainEqual(expect.objectContaining({ message: expect.stringContaining('escalate boom') }));
   });
 
-  it('a throwing policy.escalate without a reviewer denies the request and keeps the harness session', async () => {
+  it('a throwing policy.escalate without a reviewer denies the request and keeps the harness session #RQ-2', async () => {
     const got: Decision[] = [];
     const h = new FakeHarness(async (t) => {
       t.emit(req('r1'));
@@ -652,7 +693,7 @@ describe('Lane: robustness', () => {
     expect(h.sessions).toHaveLength(1);
   });
 
-  it('an exception while handling one harness event is logged and consumption continues', async () => {
+  it('an exception while handling one harness event is logged and consumption continues #IN-1', async () => {
     const h = new FakeHarness(async (t) => {
       t.emit({ t: 'plan.updated', steps: [{ text: 'a', status: 'pending' }] });
       t.emit({ t: 'text.snapshot', text: 'done', final: true }, { audience: 'answer' });
@@ -677,7 +718,7 @@ describe('Lane: robustness', () => {
     expect(h.sessions).toHaveLength(1);
   });
 
-  it('a request opened while idle is not cancelled by the next turn ending', async () => {
+  it('a request opened while idle is not cancelled by the next turn ending #RQ-2', async () => {
     const h = new ManualHarness();
     const { lane, events } = setup({ harness: h, policy: policy({ resolve: async () => ({ kind: 'human', principals: ['fake:alice'], routes: [] }) }) });
     await lane.command({ type: 'input', sessionKey: 's1', input: input('one', { id: 'a' }), mode: 'queue' });
@@ -695,7 +736,7 @@ describe('Lane: robustness', () => {
     expect(h.session!.responses).toEqual([{ requestId: 'idle1', decision: { kind: 'allow_once' } }]);
   });
 
-  it('interrupt with cancelQueue is authorised as cancel_queue: a turn owner who is not an owner cancels only their own queued inputs', async () => {
+  it('interrupt with cancelQueue is authorised as cancel_queue: a turn owner who is not an owner cancels only their own queued inputs #CT-1', async () => {
     const ops: string[] = [];
     const base = policy();
     const { lane, events } = setup({
@@ -712,5 +753,50 @@ describe('Lane: robustness', () => {
     await until(() => bodies(events(), 'turn.started').length === 2);
     expect(turnsOf(events()).at(-1)).toEqual(['d1']);
     await lane.close();
+  });
+  // INVARIANTS IN-1 不成立 1: `known.add` runs before an unguarded `await policy.control` (interrupt mode); a throw records nothing and burns the id (a retry answers duplicate); turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails('a throwing policy.control on an interrupt-mode input still settles it (input.rejected); a retry with the same id is not a duplicate #IN-1', async () => {
+    const { lane, events } = setup({
+      harness: blocking(),
+      policy: policy({
+        control: async () => {
+          throw new Error('control boom');
+        },
+      }),
+    });
+    try {
+      await lane.command({ type: 'input', sessionKey: 's1', input: input('a', { id: 'a' }), mode: 'queue' });
+      await until(() => bodies(events(), 'turn.started').length === 1);
+      const stop = input('stop', { id: 'i' });
+      await lane.command({ type: 'input', sessionKey: 's1', input: stop, mode: 'interrupt' }).catch(() => undefined);
+      expect(terminalOf(events(), 'i').map((b) => b.t)).toEqual(['input.rejected']);
+      expect(await lane.command({ type: 'input', sessionKey: 's1', input: stop, mode: 'queue' }).catch(() => undefined)).not.toEqual({ ok: true, disposition: 'duplicate' });
+    } finally {
+      await lane.close();
+    }
+  });
+
+  // INVARIANTS IN-1 不成立 1: `known.add` runs before an unguarded `await policy.plan` (the steer's re-plan); a throw records nothing and burns the id (a retry answers duplicate); turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails('a throwing policy.plan on a steer still settles the input (input.rejected); a retry with the same id is not a duplicate #IN-1', async () => {
+    const g = gate();
+    let plans = 0;
+    const { lane, events } = setup({
+      harness: new SteerableHarness(() => g.promise),
+      policy: policy({
+        plan: async () => {
+          if (++plans > 1) throw new Error('plan boom');
+          return { ...RUN, profile: 'bypass' };
+        },
+      }),
+    });
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('a', { id: 'a' }), mode: 'queue' });
+    await until(() => bodies(events(), 'turn.started').length === 1);
+    const more = input('more', { id: 's' });
+    await lane.command({ type: 'input', sessionKey: 's1', input: more, mode: 'steer' }).catch(() => undefined);
+    g.open();
+    await until(() => bodies(events(), 'turn.completed').length === 1);
+    await lane.whenIdle();
+    expect(terminalOf(events(), 's').map((b) => b.t)).toEqual(['input.rejected']);
+    expect(await lane.command({ type: 'input', sessionKey: 's1', input: more, mode: 'queue' }).catch(() => undefined)).not.toEqual({ ok: true, disposition: 'duplicate' });
   });
 });

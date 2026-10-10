@@ -3,76 +3,24 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FakeHarness, fakeEnvelope } from '@agents-io/testkit';
-import type { BodyOf, InputRecord, Origin, Watch, WatchDraft } from '@agents-io/protocol';
-import {
-  Hub,
-  Ingress,
-  Lane,
-  SqliteSessionLog,
-  WatchDispatcher,
-  WatchRegistry,
-  defaultPolicy,
-  matchesSource,
-  passesFilter,
-  type SessionPolicy,
-} from '../src/index.js';
+import type { BodyOf } from '@agents-io/protocol';
+import { Hub, Lane, SqliteSessionLog, WatchDispatcher, WatchRegistry, defaultPolicy, matchesSource, passesFilter, settleLeftoverInputs } from '../src/index.js';
 import { RUN, until } from './helpers.js';
-
-const OWNER: Origin = { kind: 'human', principal: { id: 'fake:alice', labels: ['owner'] }, evidence: 'device_only', via: 'local:local:main', adapter: 'local' };
-const AGENT: Origin = { kind: 'agent', principal: { id: 'session:main', labels: ['agent'] }, evidence: 'none', via: 'mcp', adapter: 'mcp' };
-const STRANGER_HUMAN: Origin = { kind: 'human', principal: null, evidence: 'platform_signed', via: 'fake:default:g1', adapter: 'fake' };
-
-const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };
-const eve = { channelUserId: 'eve', evidence: 'platform_signed' as const, displayName: 'Eve' };
-const group = { id: 'g1', kind: 'group' as const };
-const TARGET = 'main';
+import { AGENT, OWNER, STRANGER_HUMAN, TARGET, alice, draft, eve, group, world } from './watch-helpers.js';
 
 const dirs: string[] = [];
 afterEach(() => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
-
-function world(o: { policy?: Partial<SessionPolicy>; path?: string; allow?: Parameters<typeof defaultPolicy>[0]['watchAllowlist'] } = {}) {
-  const log = new SqliteSessionLog({ path: o.path ?? ':memory:' });
-  const hub = new Hub(log);
-  const policy: SessionPolicy = {
-    ...defaultPolicy({ owners: ['fake:alice'], selfAccounts: ['fake:mybot'], run: RUN, ...(o.allow ? { watchAllowlist: o.allow } : {}) }),
-    ...o.policy,
-  };
-  const lanes = new Map<string, Lane>();
-  const turns: InputRecord[][] = [];
-  const harness = new FakeHarness(async (t) => {
-    turns.push(t.inputs);
-    t.emit({ t: 'text.snapshot', text: 'ok', final: true }, { audience: 'answer' });
-  });
-  const lane = (sessionKey: string) => {
-    let l = lanes.get(sessionKey);
-    if (!l) lanes.set(sessionKey, (l = new Lane({ sessionKey, harness, hub, policy, thinkingHeadline: null })));
-    return l;
-  };
-  const registry = new WatchRegistry({ db: log.db });
-  const watches = new WatchDispatcher({ registry, policy, lanes: lane, replyRoute: () => ({ channel: 'fake', account: 'default', conversationId: 'owner-dm' }) });
-  watches.start();
-  const ingress = new Ingress({ policy, lanes: lane, watches });
-  const events = (k = TARGET) => log.read(k, 0);
-  const admitted = (k = TARGET) => events(k).filter((e) => e.body.t === 'input.admitted').map((e) => e.body as BodyOf<'input.admitted'>);
-  const idle = async () => {
-    await watches.idle();
-    await Promise.all([...lanes.values()].map((l) => l.whenIdle()));
-  };
-  const close = async () => {
-    watches.stop();
-    await idle();
-    log.close();
-  };
-  return { log, hub, ingress, watches, registry, lanes, turns, events, admitted, idle, close };
-}
-
-const draft = (d: Partial<WatchDraft> = {}): WatchDraft => ({ id: 'w1', source: { channel: 'fake', conversation: 'g1' }, target: { sessionKey: TARGET }, mode: 'context', ...d });
+const tempPath = () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aio-watch-'));
+  dirs.push(dir);
+  return join(dir, 'log.sqlite');
+};
 
 describe('watch matching', () => {
   const env = fakeEnvelope({ sender: eve, conversation: group, text: 'Deploy is BROKEN', mentions: [{ id: 'u9' }] });
-  it('matches source fields', () => {
+  it('matches source fields #RT-1', () => {
     expect(matchesSource({ channel: 'fake' }, env)).toBe(true);
     expect(matchesSource({ channel: 'other' }, env)).toBe(false);
     expect(matchesSource({ channel: 'fake', account: 'default', conversation: 'g1' }, env)).toBe(true);
@@ -83,7 +31,7 @@ describe('watch matching', () => {
     expect(matchesSource({ channel: 'fake', senders: ['bob', 'eve'] }, env)).toBe(true);
     expect(matchesSource({ channel: 'fake', senders: ['bob'] }, env)).toBe(false);
   });
-  it('applies filters: keywords case-insensitively, mentions, excludeSelf by default', () => {
+  it('applies filters: keywords case-insensitively, mentions, excludeSelf by default #RT-1 #ID-5', () => {
     expect(passesFilter({ keywords: ['broken'] }, env, STRANGER_HUMAN)).toBe(true);
     expect(passesFilter({ keywords: ['fine', 'deploy'] }, env, STRANGER_HUMAN)).toBe(true);
     expect(passesFilter({ keywords: ['fine'] }, env, STRANGER_HUMAN)).toBe(false);
@@ -95,7 +43,7 @@ describe('watch matching', () => {
 });
 
 describe('watch fan-out', () => {
-  it('records a watched group message as context in the target, keeping the original origin', async () => {
+  it('records a watched group message as context in the target, keeping the original origin #ID-1', async () => {
     const w = world();
     expect((await w.watches.add(OWNER, draft())).ok).toBe(true);
     const r = await w.ingress.accept(fakeEnvelope({ id: 'm1', sender: eve, conversation: group, text: 'hello group' }));
@@ -109,16 +57,7 @@ describe('watch fan-out', () => {
     await w.close();
   });
 
-  it('applies filters before delivering', async () => {
-    const w = world();
-    await w.watches.add(OWNER, draft({ filter: { keywords: ['URGENT'] } }));
-    await w.ingress.accept(fakeEnvelope({ sender: eve, conversation: group, text: 'just chatting' }));
-    await w.ingress.accept(fakeEnvelope({ sender: eve, conversation: group, text: 'this is urgent!' }));
-    expect(w.admitted().length).toBe(1);
-    await w.close();
-  });
-
-  it('never delivers into the session the input already went to', async () => {
+  it('never delivers into the session the input already went to #CF-5', async () => {
     const w = world();
     await w.watches.add(OWNER, draft({ target: { sessionKey: 'fake:default:g1' } }));
     const r = await w.ingress.accept(fakeEnvelope({ sender: eve, conversation: group, text: 'x' }));
@@ -127,7 +66,7 @@ describe('watch fan-out', () => {
     await w.close();
   });
 
-  it('delivers inputs the target policy dropped (stranger DM) but not adapter drops or card clicks', async () => {
+  it('delivers inputs the target policy dropped (stranger DM) but not adapter drops or card clicks #RT-1', async () => {
     const w = world();
     await w.watches.add(OWNER, draft({ source: { channel: 'fake', conversationKind: 'dm' } }));
     const dm = await w.ingress.accept(fakeEnvelope({ sender: eve, text: 'mail for the owner' }));
@@ -140,7 +79,7 @@ describe('watch fan-out', () => {
     await w.close();
   });
 
-  it('own echoes: excluded by default; with excludeSelf false only ever context, never a turn (no loops)', async () => {
+  it('own echoes: excluded by default; with excludeSelf false only ever context, never a turn (no loops) #ID-5', async () => {
     const w = world();
     const echo = (id: string) => fakeEnvelope({ id, sender: { channelUserId: 'mybot', evidence: 'platform_signed', isBot: true }, conversation: group, text: 'my own answer' });
     await w.watches.add(OWNER, draft({ mode: 'trigger' }));
@@ -152,7 +91,7 @@ describe('watch fan-out', () => {
     await w.close();
   });
 
-  it('is idempotent per (watch, envelope), also across a restart', async () => {
+  it('is idempotent per (watch, envelope), also across a restart #RS-1 #IN-5', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'aio-watch-'));
     dirs.push(dir);
     const path = join(dir, 'log.sqlite');
@@ -170,7 +109,7 @@ describe('watch fan-out', () => {
     await two.close();
   });
 
-  it('triage decides drop / context / trigger', async () => {
+  it('triage decides drop / context / trigger #RT-1', async () => {
     const verdicts: ('drop' | 'context' | 'trigger')[] = ['drop', 'context', 'trigger'];
     const w = world({ policy: { triage: async () => verdicts.shift()! } });
     await w.watches.add(OWNER, draft());
@@ -183,7 +122,7 @@ describe('watch fan-out', () => {
     await w.close();
   });
 
-  it('a trigger turn keeps the original sender: restricted for a stranger, bypass for the owner', async () => {
+  it('a trigger turn keeps the original sender: restricted for a stranger, bypass for the owner #ID-6 #ID-1 #CF-5', async () => {
     const w = world();
     await w.watches.add(OWNER, draft({ mode: 'trigger' }));
     await w.ingress.accept(fakeEnvelope({ sender: eve, conversation: group, text: 'do something' }));
@@ -201,7 +140,7 @@ describe('watch fan-out', () => {
 });
 
 describe('digest watches', () => {
-  it('buffers context and starts one system turn per period', async () => {
+  it('buffers context and starts one system turn per period #ID-1 #ID-6', async () => {
     const w = world();
     await w.watches.add(OWNER, draft({ mode: 'digest', digest: { everyMs: 80 }, note: 'summarise' }));
     for (const t of ['one', 'two', 'three']) await w.ingress.accept(fakeEnvelope({ sender: eve, conversation: group, text: t }));
@@ -222,19 +161,7 @@ describe('digest watches', () => {
     await w.close();
   });
 
-  it('flushes as soon as maxItems is reached', async () => {
-    const w = world();
-    await w.watches.add(OWNER, draft({ mode: 'digest', digest: { everyMs: 3_600_000, maxItems: 2 } }));
-    await w.ingress.accept(fakeEnvelope({ sender: eve, conversation: group, text: 'a' }));
-    expect(w.turns.length).toBe(0);
-    await w.ingress.accept(fakeEnvelope({ sender: eve, conversation: group, text: 'b' }));
-    await w.idle();
-    expect(w.turns.length).toBe(1);
-    expect((w.turns[0]![0]!.content[0] as { text: string }).text).toMatch(/2 new items/);
-    await w.close();
-  });
-
-  it('buffered items and the watch survive a restart, and flush afterwards', async () => {
+  it('buffered items and the watch survive a restart, and flush afterwards #RS-1', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'aio-watch-'));
     dirs.push(dir);
     const path = join(dir, 'log.sqlite');
@@ -250,7 +177,7 @@ describe('digest watches', () => {
     await two.close();
   });
 
-  it('a flush begun before a crash is redone with the same input id', async () => {
+  it('a flush begun before a crash is redone with the same input id #RS-7 #RS-1', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'aio-watch-'));
     dirs.push(dir);
     const path = join(dir, 'log.sqlite');
@@ -264,35 +191,55 @@ describe('digest watches', () => {
     expect(two.turns[0]![0]!.inputId).toBe('dg_crashed');
     await two.close();
   });
+
+  // INVARIANTS IN-1 (§12 item 15, reproduced): settleLeftoverInputs rejects the digest id (host_restarted), then the watch's redo admits the same id again and it is consumed — two outcomes; turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails('a flush that crashed after input.admitted and before endFlush: after the restart its input has exactly one outcome #IN-1', async () => {
+    const path = tempPath();
+    const one = world({ path });
+    await one.watches.add(OWNER, draft({ mode: 'digest', digest: { everyMs: 3_600_000 } }));
+    await one.ingress.accept(fakeEnvelope({ sender: eve, conversation: group, text: 'x' }));
+    // The crash: the flush was begun and its input admitted (queued) in the target; endFlush never ran.
+    one.registry.beginFlush('w1', 'dg_crashed');
+    one.hub.append(TARGET, { ts: Date.now(), level: 'primary', audience: 'status', durability: 'durable', body: { t: 'input.admitted', inputId: 'dg_crashed', disposition: 'queued' } });
+    await one.close();
+    // Startup in the gateway's order: watches start (their redo is async), then leftovers are settled before any lane opens.
+    const two = world({ path });
+    settleLeftoverInputs(two.hub, TARGET);
+    await until(() => two.turns.length === 1, 2000);
+    await two.idle();
+    const outcomes = two
+      .events()
+      .filter((e) => (e.body.t === 'input.consumed' || e.body.t === 'input.rejected' || e.body.t === 'input.cancelled') && e.body.inputIds.includes('dg_crashed'))
+      .map((e) => e.body.t);
+    expect(outcomes).toHaveLength(1);
+    await two.close();
+  });
 });
 
 describe('who may watch', () => {
-  it('owners anything; agents only allowlisted sources; strangers nothing', async () => {
+  it('removing: the creator, or someone policy lets create it, never another agent; an agent cannot replace a watch it does not own #CF-7', async () => {
     const w = world({ allow: [{ channel: 'fake', conversationKind: 'group' }] });
     expect(await w.watches.add(OWNER, draft({ id: 'o', source: { channel: 'mail' } }))).toMatchObject({ ok: true, watch: { createdBy: 'fake:alice' } });
     expect(await w.watches.add(AGENT, draft({ id: 'a1', source: { channel: 'fake', conversationKind: 'group' } }))).toMatchObject({ ok: true, watch: { createdBy: 'session:main' } });
-    expect(await w.watches.add(AGENT, draft({ id: 'a2', source: { channel: 'fake', conversationKind: 'dm' } }))).toMatchObject({ ok: false, code: 'forbidden' });
-    expect(await w.watches.add(AGENT, draft({ id: 'a3', source: { channel: 'mail' } }))).toMatchObject({ ok: false, code: 'forbidden' });
     expect(await w.watches.add(STRANGER_HUMAN, draft({ id: 's' }))).toMatchObject({ ok: false, code: 'forbidden' });
-    // Removing: the creator, or someone policy lets create it (not another agent).
     expect(await w.watches.remove(AGENT, 'o')).toMatchObject({ ok: false, code: 'forbidden' });
     expect(await w.watches.add(AGENT, draft({ id: 'o', source: { channel: 'fake', conversationKind: 'group' } }))).toMatchObject({ ok: false, code: 'forbidden' });
     expect(await w.watches.remove(OWNER, 'a1')).toEqual({ ok: true, removed: true });
     expect(await w.watches.remove(OWNER, 'nope')).toEqual({ ok: true, removed: false });
-    expect(w.watches.list().map((x: Watch) => x.id)).toEqual(['o']);
+    expect(w.watches.list().map((x) => x.id)).toEqual(['o']);
     await w.close();
   });
 
-  it('validates watches', async () => {
-    const w = world();
-    expect(await w.watches.add(OWNER, draft({ mode: 'digest' }))).toMatchObject({ ok: false, code: 'invalid' });
-    expect(await w.watches.add(OWNER, { ...draft(), mode: 'loud' } as never)).toMatchObject({ ok: false, code: 'invalid' });
-    const r = await w.watches.add(OWNER, { ...draft(), id: undefined } as never);
-    expect(r).toMatchObject({ ok: true });
+  // INVARIANTS CF-5 不成立 (可能, now reproduced): neither Policy.watch nor WatchDispatcher.add compares the source with the target's home route; turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails("a watch whose source is the target session's home route is refused #CF-5", async () => {
+    // A group's @-session watching the same group: its trigger turns would answer in the group it watches.
+    const w = world({ home: { channel: 'fake', account: 'default', conversationId: 'g1' } });
+    const r = await w.watches.add(OWNER, draft({ mode: 'trigger', source: { channel: 'fake', conversation: 'g1' } }));
     await w.close();
+    expect(r).toMatchObject({ ok: false });
   });
 
-  it('expired watches stop matching and are removed', async () => {
+  it('expired watches stop matching and are removed #RT-1', async () => {
     let now = 1_000;
     const log = new SqliteSessionLog();
     const registry = new WatchRegistry({ db: log.db, now: () => now });

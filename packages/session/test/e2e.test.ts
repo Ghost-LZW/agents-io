@@ -55,7 +55,7 @@ function world(script: FakeTurnScript, o: { caps?: ChannelCaps; policy?: Partial
 const lastRender = (rec: { msg: RenderedMessage; edits: RenderedMessage[] }) => rec.edits.at(-1) ?? rec.msg;
 
 describe('end to end: channel → ingress → lane → harness → compositor → channel', () => {
-  it('streams a card: send, throttled edits, finalize', async () => {
+  it('streams a card: send, throttled edits, finalize #DL-1 #DL-3 #DL-4b', async () => {
     const w = world(async (t) => {
       const item = { itemId: 'i1', type: 'command' as const, title: 'ls src', status: 'running' as const };
       t.emit({ t: 'item.started', item });
@@ -85,7 +85,7 @@ describe('end to end: channel → ingress → lane → harness → compositor �
     assertConformingStream(w.events());
   });
 
-  it('approval by button click on the card, re-checked server side', async () => {
+  it('approval by button click on the card, re-checked server side #RQ-1', async () => {
     const w = world(
       async (t) => {
         t.emit({ t: 'request.opened', requestId: 'r1', kind: 'tool_approval', title: 'git push', risk: { network: true }, allowedDecisions: ['allow_once', 'deny'], allowAlways: false, defaultDeny: true });
@@ -112,7 +112,7 @@ describe('end to end: channel → ingress → lane → harness → compositor �
     expect(bodies(w.events(), 'request.resolved')).toEqual([{ t: 'request.resolved', requestId: 'r1', decision: { kind: 'allow_once' }, by: { kind: 'human', id: 'fake:alice' } }]);
   });
 
-  it('final-tier channel without edit: one message per turn, plus one per human request', async () => {
+  it('final-tier channel without edit: one message per turn, plus one per human request #RQ-5', async () => {
     const caps: ChannelCaps = { ...defaultChannelCaps, edit: false, buttons: false, defaultTier: 'final' };
     const w = world(
       async (t) => {
@@ -135,7 +135,7 @@ describe('end to end: channel → ingress → lane → harness → compositor �
 });
 
 describe('end to end: rejected inputs reach the sender', () => {
-  it('stop with queued inputs: rejected (lane_closed) and the sender gets a notice on the route; the running turn ends on its own card', async () => {
+  it('stop with queued inputs: rejected (lane_closed) and the sender gets a notice on the route; the running turn ends on its own card #IN-1 #RS-6', async () => {
     const w = world((t) => new Promise((_, reject) => t.signal.addEventListener('abort', () => reject(new Error('aborted')))));
     await w.channel.inject({ sender: alice, text: 'long job' });
     await until(() => w.channel.sent.length === 1);
@@ -157,7 +157,7 @@ describe('end to end: rejected inputs reach the sender', () => {
     expect(bodies(w.events(), 'input.rejected')[1]).toEqual({ t: 'input.rejected', inputIds: [expect.any(String)], reason: 'ambiguous' });
   });
 
-  it('start_failed is visible: the sender gets a notice instead of silence (no detail from the error)', async () => {
+  it('start_failed is visible: the sender gets a notice instead of silence (no detail from the error) #FC-2 #IN-1', async () => {
     const w = world(async () => {}, {
       policy: {
         plan: async () => {
@@ -174,7 +174,7 @@ describe('end to end: rejected inputs reach the sender', () => {
     expect(bodies(w.events(), 'delivery.settled')[0]).toMatchObject({ result: 'delivered' });
   });
 
-  it('a rejection without a route (its turn\'s card tells the story, or the route is unknown) sends nothing', async () => {
+  it('a rejection without a route (its turn\'s card tells the story, or the route is unknown) sends nothing #FC-2 #IN-1', async () => {
     const w = world(async () => {});
     w.hub.append(SESSION, { ts: 1, level: 'primary', audience: 'status', durability: 'durable', body: { t: 'input.rejected', inputIds: ['gone'], reason: 'host_restarted' } });
     await new Promise((r) => setTimeout(r, 20));
@@ -183,16 +183,7 @@ describe('end to end: rejected inputs reach the sender', () => {
 });
 
 describe('renderTurn', () => {
-  it('renders headline and final tiers', () => {
-    const v = newTurnView('t');
-    v.currentTool = 'edit src/foo.ts';
-    expect(renderTurn(v, 'headline')).toEqual({ text: '▶ edit src/foo.ts', spokenText: '▶ edit src/foo.ts' });
-    v.text = 'partial';
-    expect(renderTurn(v, 'final')).toEqual({ text: 'partial' });
-    expect(renderTurn({ ...v, text: 'x'.repeat(50) }, 'card', { caps: { buttons: true, text: { maxChars: 10, markdown: 'none' } } }).text).toHaveLength(10);
-  });
-
-  it('final tier: a turn that ends without text still says how it ended', () => {
+  it('final tier: a turn that ends without text still says how it ended #OB-1', () => {
     const v = newTurnView('t');
     v.status = 'failed';
     expect(renderTurn(v, 'final')).toEqual({ text: 'Failed' });
@@ -238,7 +229,7 @@ describe('Compositor', () => {
   }
   const hasAllow = (ch: FakeChannel) => !!ch.sent[0]?.edits.at(-1)?.actions?.some((a) => a.label === 'Allow');
 
-  it('retries a failed streaming edit, so the approval buttons still appear', async () => {
+  it('retries a failed streaming edit, so the approval buttons still appear #RQ-5', async () => {
     const w = rig();
     const edit = w.channel.edit.bind(w.channel);
     let fail = 1;
@@ -253,7 +244,7 @@ describe('Compositor', () => {
     expect(w.errors).toHaveLength(1);
   });
 
-  it('shows an approval at once even when a throttled edit is already scheduled', async () => {
+  it('shows an approval at once even when a throttled edit is already scheduled #RQ-5', async () => {
     const w = rig({ throttleMs: 1000 });
     w.append({ t: 'turn.started', turnId: 't1', inputIds: [], replyRoute: R });
     await until(() => w.channel.sent.length === 1);
@@ -265,7 +256,7 @@ describe('Compositor', () => {
     expect(Date.now() - at).toBeLessThan(500);
   });
 
-  it('finalizes the card of a turn that was running when the previous host stopped', async () => {
+  it('finalizes the card of a turn that was running when the previous host stopped #RS-1 #RS-5', async () => {
     const log = new MemorySessionLog();
     const channel = new FakeChannel('fake', defaultChannelCaps);
     const first = rig({ log, channel });

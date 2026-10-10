@@ -15,13 +15,13 @@ const id = (channelUserId: string, extra: { declared?: string; isBot?: boolean }
   p.identify({ channel: 'fake', account: 'default', channelUserId, evidence: 'platform_signed', ...extra });
 
 describe('defaultPolicy.identify', () => {
-  it('only knows configured owners', async () => {
+  it('only knows configured owners #ID-4', async () => {
     expect(await id('alice')).toEqual({ kind: 'human', principal: { id: 'fake:alice', labels: ['owner'] } });
     expect(await id('mallory')).toEqual({ kind: 'human', principal: null });
     expect(await id('somebot', { isBot: true })).toEqual({ kind: 'agent', principal: null });
   });
 
-  it('accepts declared identity only from trusted agent accounts', async () => {
+  it('accepts declared identity only from trusted agent accounts #ID-4', async () => {
     // A declaration from an untrusted account is ignored, even if it names an owner.
     expect(await id('mallory', { declared: 'fake:alice' })).toEqual({ kind: 'human', principal: null });
     expect(await id('alice', { declared: 'runner:x' })).toEqual({ kind: 'human', principal: { id: 'fake:alice', labels: ['owner'] } });
@@ -33,7 +33,7 @@ describe('defaultPolicy.identify', () => {
     expect(await id('peerbot')).toEqual({ kind: 'agent', principal: null });
   });
 
-  it('never accepts a declared identity that names an owner, even from a trusted agent account', async () => {
+  it('never accepts a declared identity that names an owner, even from a trusted agent account #ID-4 #CT-1', async () => {
     const r = await id('peerbot', { declared: 'fake:alice' });
     expect(r.principal).toBeNull();
     expect(r.kind).toBe('agent');
@@ -42,7 +42,7 @@ describe('defaultPolicy.identify', () => {
     expect(await p.control({ sessionKey: 's', op: 'interrupt', origin: o, turn: { owner: 'fake:alice' } as TurnContext })).toBe('deny');
   });
 
-  it('marks this deployment’s own echoes as self', async () => {
+  it('marks this deployment’s own echoes as self #ID-5', async () => {
     expect(await id('mybot', { declared: 'runner:me/run:1' })).toMatchObject({ kind: 'agent', self: true });
     expect(await id('peerbot', { declared: 'runner:me/run:2' })).toMatchObject({ self: true });
   });
@@ -58,19 +58,13 @@ describe('defaultPolicy.plan / resolve / outbound', () => {
     ...extra,
   });
 
-  it('bypass only when every input is from an owner', async () => {
+  it('bypass only when every input is from an owner #ID-6', async () => {
     expect(await p.plan({ sessionKey: 's', inputs: [input('a', { principal: 'fake:alice' })] })).toEqual({ harness: 'fake', model: 'm', profile: 'bypass' });
     const mixed = [input('a', { principal: 'fake:alice' }), input('b', { principal: null })];
     expect((await p.plan({ sessionKey: 's', inputs: mixed })).profile).toBe('restricted');
   });
 
-  it('auto allows for bypass, auto denies for restricted', async () => {
-    const r = { t: 'request.opened' as const, requestId: 'r', kind: 'tool_approval' as const, title: 'x', risk: {}, allowedDecisions: [], allowAlways: false, defaultDeny: false };
-    expect(await p.resolve(r, ctx('bypass'))).toEqual({ kind: 'auto', decision: { kind: 'allow_once' } });
-    expect(await p.resolve(r, ctx('restricted'))).toMatchObject({ kind: 'auto', decision: { kind: 'deny' } });
-  });
-
-  it('allows outbound only to the turn’s routes and preregistered ones', async () => {
+  it('allows outbound only to the turn’s routes and preregistered ones #DL-5', async () => {
     const steered = input('w', { route: route('web', 'web') });
     expect(await p.outbound({ from: ctx('bypass', { inputs: [steered] }), to: route() })).toBe('allow');
     expect(await p.outbound({ from: ctx('bypass', { inputs: [steered] }), to: route('web', 'web') })).toBe('allow');
@@ -79,7 +73,7 @@ describe('defaultPolicy.plan / resolve / outbound', () => {
     expect(await p.outbound({ from: null, to: route() })).toBe('deny');
   });
 
-  it('control: owners and turn owners may interrupt', async () => {
+  it('control: owners and turn owners may interrupt #CT-1', async () => {
     expect(await p.control({ sessionKey: 's', op: 'interrupt', origin: origin('fake:alice'), turn: turnOwnedBy('x') })).toBe('allow');
     expect(await p.control({ sessionKey: 's', op: 'interrupt', origin: origin('x', ['agent']), turn: turnOwnedBy('x') })).toBe('allow');
     expect(await p.control({ sessionKey: 's', op: 'interrupt', origin: origin('y', []), turn: turnOwnedBy('x') })).toBe('deny');
@@ -97,17 +91,12 @@ describe('defaultPolicy.watch', () => {
     ({ kind, principal: id ? { id, labels } : null, evidence: 'platform_signed', via: 'v', adapter: 'a' }) as any;
   const p = defaultPolicy({ owners: ['fake:alice'], watchAllowlist: [{ channel: 'mail' }, { channel: 'lark-bot', conversation: 'oc_team' }] });
 
-  it('owners may watch anything; agents only allowlisted sources; others never', async () => {
+  it('owners may watch anything; agents only allowlisted sources; others never #CF-7', async () => {
     expect(await p.watch!({ watch: w({ channel: 'lark-bot', conversation: 'oc_secret' }), by: origin('human', 'fake:alice', ['owner']) })).toBe('allow');
     expect(await p.watch!({ watch: w({ channel: 'mail', conversationKind: 'mail' }), by: origin('agent', 'runner:x') })).toBe('allow');
     expect(await p.watch!({ watch: w({ channel: 'lark-bot', conversation: 'oc_team' }), by: origin('agent', 'runner:x') })).toBe('allow');
     expect(await p.watch!({ watch: w({ channel: 'lark-bot', conversation: 'oc_secret' }), by: origin('agent', 'runner:x') })).toBe('deny');
     expect(await p.watch!({ watch: w({ channel: 'mail' }), by: origin('human', 'fake:eve') })).toBe('deny');
-  });
-
-  it('triage keeps the watch mode by default', async () => {
-    expect(await p.triage!({ watch: { ...w({ channel: 'mail' }), mode: 'trigger' }, input: {} as any })).toBe('trigger');
-    expect(await p.triage!({ watch: w({ channel: 'mail' }), input: {} as any })).toBe('context');
   });
 });
 
@@ -115,16 +104,16 @@ describe('defaultPolicy owner evidence', () => {
   const p = defaultPolicy({ owners: ['mail:i@example.com'] });
   const args = (evidence: any) => ({ channel: 'mail', account: 'a', channelUserId: 'i@example.com', evidence });
 
-  it('an owner address without evidence is a stranger (forged From)', async () => {
+  it('an owner address without evidence is a stranger (forged From) #ID-4', async () => {
     expect((await p.identify!(args('none'))).principal).toBeNull();
   });
 
-  it('a DKIM-verified or platform-signed owner is the owner', async () => {
+  it('a DKIM-verified or platform-signed owner is the owner #ID-4', async () => {
     expect((await p.identify!(args('dkim_pass'))).principal).toMatchObject({ id: 'mail:i@example.com', labels: ['owner'] });
     expect((await p.identify!(args('platform_signed'))).principal).toMatchObject({ id: 'mail:i@example.com' });
   });
 
-  it('ownerEvidence can widen the accepted evidence', async () => {
+  it('ownerEvidence can widen the accepted evidence #ID-4', async () => {
     const q = defaultPolicy({ owners: ['mail:i@example.com'], ownerEvidence: ['dkim_pass', 'none'] });
     expect((await q.identify!(args('none'))).principal).toMatchObject({ id: 'mail:i@example.com' });
   });

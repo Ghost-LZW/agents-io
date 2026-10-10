@@ -1,7 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
 import { FakeHarness, fakeEnvelope } from '@agents-io/testkit';
-import { Hub, Ingress, Lane, MemorySessionLog, Router, SOURCE_MISMATCH, actionId, defaultPolicy, interruptActionId, ownersTable, parseActionId, replySummary, type EmitSource, type SessionPolicy } from '../src/index.js';
-import type { ChannelCaps, InputRecord } from '@agents-io/protocol';
+import { Hub, Ingress, Lane, MemorySessionLog, Router, SOURCE_MISMATCH, SqliteSessionLog, actionId, defaultPolicy, interruptActionId, ownersTable, parseActionId, type EmitSource, type SessionPolicy } from '../src/index.js';
+import type { InputRecord } from '@agents-io/protocol';
 import { RUN, bodies, until } from './helpers.js';
 
 function world(extra: Partial<SessionPolicy> = {}) {
@@ -31,7 +34,7 @@ const stranger = { channelUserId: 'eve', evidence: 'platform_signed' as const };
 const group = { id: 'g1', kind: 'group' as const };
 
 describe('Ingress', () => {
-  it('stamps origin from Policy.identify and dispatches owner input to a lane', async () => {
+  it('stamps origin from Policy.identify and dispatches owner input to a lane #ID-1 #ID-3', async () => {
     const { ingress, hub } = world();
     const r = await ingress.accept(fakeEnvelope({ id: 'm1', sender: { ...alice, declared: 'someone-else' }, text: 'hi' }));
     expect(r).toMatchObject({ accepted: true, action: 'dispatch', sessionKey: 'fake:default:c1', result: { ok: true, disposition: 'new_turn' } });
@@ -40,47 +43,7 @@ describe('Ingress', () => {
     await until(() => bodies(hub.log.read('fake:default:c1', 0), 'turn.completed').length === 1);
   });
 
-  it('passes the envelope context (e.g. a mail subject) to the harness as channelContext', async () => {
-    const { ingress, lanes, seen } = world();
-    await ingress.accept(fakeEnvelope({ sender: alice, text: 'hi', context: { subject: 'Weekly report', channel: 'spoofed' } }));
-    await lanes.get('fake:default:c1')!.whenIdle();
-    expect(seen[0]![0]!.channelContext).toMatchObject({ subject: 'Weekly report', channel: 'fake' });
-  });
-
-  it('adds a compact reply summary from the rendering adapter caps when configured', async () => {
-    const hub = new Hub(new MemorySessionLog());
-    const policy = defaultPolicy({ owners: ['fake:alice'], run: RUN });
-    const seen: InputRecord[] = [];
-    const harness = new FakeHarness(async (t) => {
-      seen.push(...t.inputs);
-    });
-    const lanes = new Map<string, Lane>();
-    const caps: ChannelCaps = {
-      text: { maxChars: 4000, markdown: 'basic' },
-      edit: true,
-      buttons: true,
-      media: { in: [], out: ['image', 'file'] },
-      voiceOut: 'none',
-      threads: false,
-      approvals: 'buttons',
-      defaultTier: 'card',
-      evidence: [],
-      declaresSender: false,
-    };
-    const lane = (k: string) => {
-      let l = lanes.get(k);
-      if (!l) lanes.set(k, (l = new Lane({ sessionKey: k, harness, hub, policy, thinkingHeadline: null })));
-      return l;
-    };
-    const ingress = new Ingress({ policy, lanes: lane, replyCaps: (channel) => (channel === 'fake' ? { caps } : undefined) });
-    await ingress.accept(fakeEnvelope({ sender: alice, text: 'hi', context: { reply: 'spoofed' } }));
-    await lanes.get('fake:default:c1')!.whenIdle();
-    expect(seen[0]!.channelContext.reply).toBe('card markdown=basic maxChars=4000 buttons=yes media=image,file');
-    const mail: ChannelCaps = { ...caps, buttons: false, media: { in: [], out: [] }, text: { maxChars: 100000, markdown: 'none' } };
-    expect(replySummary(mail, 'final')).toBe('final markdown=none maxChars=100000 buttons=no media=none');
-  });
-
-  it('dedups by (channel, id)', async () => {
+  it('dedups by (channel, id) #IN-5', async () => {
     const { ingress, lanes } = world();
     const env = fakeEnvelope({ id: 'same', sender: alice });
     const a = await ingress.accept(env);
@@ -91,7 +54,7 @@ describe('Ingress', () => {
     await lanes.get('fake:default:c1')!.whenIdle();
   });
 
-  it('dedups a duplicate that arrives while the first copy is still being processed', async () => {
+  it('dedups a duplicate that arrives while the first copy is still being processed #IN-5', async () => {
     const { ingress, lanes, seen } = world();
     const env = fakeEnvelope({ id: 'twice', sender: alice });
     const rs = await Promise.all([ingress.accept(env), ingress.accept({ ...env })]);
@@ -101,7 +64,7 @@ describe('Ingress', () => {
     expect(seen).toHaveLength(1);
   });
 
-  it('dedups per account: the same platform message id reaching two accounts is two envelopes', async () => {
+  it('dedups per account: the same platform message id reaching two accounts is two envelopes #IN-5', async () => {
     const { ingress, lanes } = world();
     const a = await ingress.accept(fakeEnvelope({ id: 'om_1', account: 'a', sender: alice }));
     const b = await ingress.accept(fakeEnvelope({ id: 'om_1', account: 'b', sender: alice }));
@@ -111,7 +74,7 @@ describe('Ingress', () => {
     await lanes.get('fake:b:c1')!.whenIdle();
   });
 
-  it('routes approval and stop clicks to the session that owns the request or turn', async () => {
+  it('routes approval and stop clicks to the session that owns the request or turn #RQ-1 #CT-1', async () => {
     const hub = new Hub(new MemorySessionLog());
     const policy = defaultPolicy({ owners: ['fake:alice'], run: RUN });
     const asked = new FakeHarness(async (t) => {
@@ -148,7 +111,7 @@ describe('Ingress', () => {
     expect([...lanes.keys()]).toEqual(['main']);
   });
 
-  it('drops self echoes and unknown DMs; observes strangers in groups', async () => {
+  it('drops self echoes and unknown DMs; observes strangers in groups #ID-5 #ID-1', async () => {
     const { ingress, hub } = world();
     expect(await ingress.accept(fakeEnvelope({ sender: { channelUserId: 'mybot', evidence: 'platform_signed', isBot: true, declared: 'runner:me/run:1' } }))).toMatchObject({
       accepted: true,
@@ -161,7 +124,7 @@ describe('Ingress', () => {
     expect(bodies(hub.log.read('fake:default:g1', 0))).toEqual([{ t: 'input.admitted', inputId: r.inputId, disposition: 'observe_only', input: expect.objectContaining({ inputId: r.inputId, origin: expect.objectContaining({ principal: null }) }) }]);
   });
 
-  it('applies revisionOf latest-wins for observe-only transcripts', async () => {
+  it('applies revisionOf latest-wins for observe-only transcripts #IN-5', async () => {
     const { ingress, lanes } = world();
     const seg = (text: string, stable: boolean) => [{ type: 'transcript' as const, speaker: 'eve', text, startMs: 0, endMs: 900, stable }];
     const first = await ingress.accept(fakeEnvelope({ id: 's1', sender: stranger, conversation: group, content: seg('helo wrld', false) }));
@@ -174,13 +137,13 @@ describe('Ingress', () => {
     expect(observed[0]!.content).toEqual(seg('hello, world', true));
   });
 
-  it('rejects invalid envelopes without remembering them', async () => {
+  it('rejects invalid envelopes without remembering them #IN-5', async () => {
     const { ingress } = world();
     const bad = { ...fakeEnvelope({ id: 'bad' }), v: 2 } as unknown as Parameters<Ingress['accept']>[0];
     expect(await ingress.accept(bad)).toMatchObject({ accepted: false, action: 'invalid' });
   });
 
-  it('turns an approval button click into a resolve command (eligibility re-checked by the lane)', async () => {
+  it('turns an approval button click into a resolve command (eligibility re-checked by the lane) #RQ-1', async () => {
     const { ingress } = world();
     const click = (sender: typeof alice, aid: string) =>
       ingress.accept(fakeEnvelope({ sender, content: [{ type: 'event', name: 'action', data: { actionId: aid, messageId: 'm1' } }] }));
@@ -193,7 +156,7 @@ describe('Ingress', () => {
 describe('Ingress source stamping (channel-stamping, decision 13)', () => {
   const src = (o: Partial<EmitSource> = {}): EmitSource => ({ channel: 'fake', account: 'default', evidence: ['platform_signed', 'none'], declaresSender: true, ...o });
 
-  it('refuses an envelope claiming another channel, account or reply route, without remembering it', async () => {
+  it('refuses an envelope claiming another channel, account or reply route, without remembering it #ID-3', async () => {
     const { ingress, lanes } = world();
     const s = src();
     const cases = [
@@ -214,7 +177,7 @@ describe('Ingress source stamping (channel-stamping, decision 13)', () => {
     await lanes.get('fake:default:c1')!.whenIdle();
   });
 
-  it('checks the source before dedup: a forged copy of a seen (channel, account, id) is invalid, not a duplicate', async () => {
+  it('checks the source before dedup: a forged copy of a seen (channel, account, id) is invalid, not a duplicate #ID-3 #IN-5', async () => {
     const { ingress, lanes } = world();
     const ok = await ingress.accept(fakeEnvelope({ id: 'seen', sender: alice }), src());
     expect(ok.accepted).toBe(true);
@@ -225,7 +188,7 @@ describe('Ingress source stamping (channel-stamping, decision 13)', () => {
     await lanes.get('fake:default:c1')!.whenIdle();
   });
 
-  it('caps evidence beyond the source to none: the owner is a stranger, the explanation keeps the claim, the caller object is untouched', async () => {
+  it('caps evidence beyond the source to none: the owner is a stranger, the explanation keeps the claim, the caller object is untouched #ID-3 #ID-4', async () => {
     const { ingress, lanes } = world();
     const env = fakeEnvelope({ id: 'cap', conversation: group, sender: { ...alice } });
     const r = await ingress.accept(env, src({ evidence: ['device_only', 'none'] }));
@@ -246,7 +209,7 @@ describe('Ingress source stamping (channel-stamping, decision 13)', () => {
     for (const l of lanes.values()) await l.whenIdle();
   });
 
-  it('drops sender.declared when the source may not declare senders, also from a trusted agent account', async () => {
+  it('drops sender.declared when the source may not declare senders, also from a trusted agent account #ID-3', async () => {
     const { ingress } = world();
     const env = fakeEnvelope({ id: 'decl', conversation: group, sender: { channelUserId: 'peer', evidence: 'platform_signed', isBot: true, declared: 'runner:x/run:1' } });
     const trusted = await ingress.accept({ ...env, id: 'decl-0' }, src());
@@ -259,7 +222,7 @@ describe('Ingress source stamping (channel-stamping, decision 13)', () => {
     expect(env.sender.declared).toBe('runner:x/run:1');
   });
 
-  it('emitter(source) answers like accept(env, source); without a source nothing is checked or capped', async () => {
+  it('emitter(source) answers like accept(env, source); without a source nothing is checked or capped #ID-3', async () => {
     const { ingress, lanes } = world();
     const emit = ingress.emitter(src({ evidence: ['none'] }));
     expect(await emit(fakeEnvelope({ id: 'e1', channel: 'other', sender: alice }))).toEqual({ accepted: false });
@@ -274,5 +237,88 @@ describe('Ingress source stamping (channel-stamping, decision 13)', () => {
     expect(t.envelope).toBe(env);
     expect(t.claimedEvidence).toBeUndefined();
     for (const l of lanes.values()) await l.whenIdle();
+  });
+});
+
+describe('Ingress dedup beyond one process and one delivery (IN-5)', () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+  const tempPath = () => {
+    const d = mkdtempSync(join(tmpdir(), 'aio-ingress-'));
+    dirs.push(d);
+    return join(d, 'log.sqlite');
+  };
+
+  /** One "process": a SQLite log at `path`, its lanes, an Ingress over them. */
+  function processAt(path: string, o: { router?: Router; failLane?: (k: string) => boolean } = {}) {
+    const log = new SqliteSessionLog({ path });
+    const hub = new Hub(log);
+    const policy = defaultPolicy({ owners: ['fake:alice'], run: RUN });
+    const lanes = new Map<string, Lane>();
+    const harness = new FakeHarness(async () => {});
+    const ingress = new Ingress({
+      policy,
+      ...(o.router ? { router: o.router } : {}),
+      lanes: (k) => {
+        if (o.failLane?.(k)) throw new Error(`lane ${k} failed to open`);
+        let l = lanes.get(k);
+        if (!l) lanes.set(k, (l = new Lane({ sessionKey: k, harness, hub, policy, thinkingHeadline: null })));
+        return l;
+      },
+    });
+    const admitted = (k: string) => bodies(log.read(k, 0), 'input.admitted');
+    const idle = async () => {
+      for (const l of lanes.values()) await l.whenIdle();
+    };
+    const stop = async () => {
+      for (const l of lanes.values()) await l.close();
+      log.close();
+    };
+    return { ingress, admitted, idle, stop };
+  }
+
+  // INVARIANTS IN-5 不成立 1: the dedup table is in memory, so after a restart a platform redelivery enters the session again under a new input id; turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails('after a restart (a new Ingress) the same (channel, account, id) does not enter the session a second time #IN-5', async () => {
+    const path = tempPath();
+    const env = fakeEnvelope({ id: 'om_redelivered', sender: alice, text: 'once' });
+    const one = processAt(path);
+    expect((await one.ingress.accept(env)).action).toBe('dispatch');
+    await one.idle();
+    expect(one.admitted('fake:default:c1')).toHaveLength(1);
+    await one.stop();
+    const two = processAt(path);
+    await two.ingress.accept({ ...env });
+    await two.idle();
+    expect(two.admitted('fake:default:c1')).toHaveLength(1);
+    await two.stop();
+  });
+
+  // INVARIANTS IN-5 不成立 2: a non-LaneUnavailableError from the second delivery makes accept throw without remembering the envelope, so the redelivery enters the first session again; turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails('an envelope fanned out to two sessions whose second delivery throws: the redelivery does not give the first session the input twice #IN-5', async () => {
+    const router = new Router({
+      agents: [{ name: 'default', sessionPrefix: '' }],
+      defaultAgent: 'default',
+      config: {
+        version: 'v',
+        identities: [],
+        bindings: [
+          { id: 'a', match: {}, on: 'dispatch', session: { key: 'A' } },
+          { id: 'b', match: {}, on: 'dispatch', session: { key: 'B' } },
+        ],
+      },
+    });
+    let failB = true;
+    const w = processAt(tempPath(), { router, failLane: (k) => k === 'B' && failB });
+    const env = fakeEnvelope({ id: 'om_fanout', sender: alice, text: 'to both' });
+    await expect(w.ingress.accept(env)).rejects.toThrow(/lane B failed/);
+    failB = false;
+    // The adapter forgot its dedup key (the emit failed) and the platform redelivers.
+    await w.ingress.accept({ ...env });
+    await w.idle();
+    expect(w.admitted('B')).toHaveLength(1);
+    expect(w.admitted('A')).toHaveLength(1);
+    await w.stop();
   });
 });

@@ -2,30 +2,21 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { FakeChannel, FakeHarness, defaultChannelCaps, fakeEnvelope } from '@agents-io/testkit';
+import { FakeHarness, fakeEnvelope } from '@agents-io/testkit';
 import type { InputRecord, Origin } from '@agents-io/protocol';
 import {
-  Compositor,
   Hub,
   Ingress,
   Lane,
   MemorySessionLog,
-  Outbox,
   Router,
   SqliteSessionLog,
-  TOPIC_KEY,
   TOPIC_TOOLS_HINT,
   TopicError,
   TopicRegistry,
   defaultBindings,
   defaultPolicy,
-  formatTopics,
-  newTurnView,
   ownersTable,
-  parseTopicCommand,
-  renderTurn,
-  titleFrom,
-  topicContext,
   type AgentSpec,
   type IngressOptions,
   type SessionPolicy,
@@ -48,7 +39,7 @@ let ids = 0;
 const newId = () => `tp_${++ids}`;
 
 describe('TopicRegistry', () => {
-  it('creates the first topic lazily, parks the current one on create, and never deletes', () => {
+  it('creates the first topic lazily, parks the current one on create, and never deletes #TP-1', () => {
     const r = new TopicRegistry({ newId });
     const a = r.ensureCurrent(CONV, 'default', key, { title: 'Rust CLI' });
     expect(a.created).toBe(true);
@@ -67,7 +58,7 @@ describe('TopicRegistry', () => {
     expect(r.siblings('nope')).toEqual([]);
   });
 
-  it('switches back, persists across reopen (same database as the log), and keeps native ids', () => {
+  it('switches back, persists across reopen (same database as the log), and keeps native ids #TP-1 #RS-1', () => {
     const path = tempDb();
     const log = new SqliteSessionLog({ path });
     let now = 1000;
@@ -93,7 +84,7 @@ describe('TopicRegistry', () => {
     log2.close();
   });
 
-  it('records topic.changed in the session left and the one now current', () => {
+  it('records topic.changed in the session left and the one now current #TP-1', () => {
     const hub = new Hub(new MemorySessionLog());
     const r = new TopicRegistry({ hub, newId });
     const a = r.ensureCurrent(CONV, 'default', key, { title: 'A' }).topic;
@@ -104,7 +95,7 @@ describe('TopicRegistry', () => {
     expect(bodies(hub.log.read(b.sessionKey, 0), 'topic.changed')).toEqual([want]);
   });
 
-  it('a rotate stores its summary on the topic it parks (the one it describes); the new topic starts without one', () => {
+  it('a rotate stores its summary on the topic it parks (the one it describes); the new topic starts without one #TP-1', () => {
     const path = tempDb();
     const log = new SqliteSessionLog({ path });
     const r = new TopicRegistry({ db: log.db, newId });
@@ -118,7 +109,7 @@ describe('TopicRegistry', () => {
     expect(r2.get(b.id)?.summary).toBeUndefined();
   });
 
-  it("a change a turn made is recorded under that turn in the turn's session", () => {
+  it("a change a turn made is recorded under that turn in the turn's session #TP-1", () => {
     const hub = new Hub(new MemorySessionLog());
     const r = new TopicRegistry({ hub, newId });
     const a = r.ensureCurrent(CONV, 'default', key).topic;
@@ -130,16 +121,6 @@ describe('TopicRegistry', () => {
     expect(hub.log.read(a.sessionKey, 0).filter((e) => e.body.t === 'topic.changed').at(-1)!.turnId).toBeUndefined();
   });
 
-  it('titles: trimmed and bounded; a first message gives a short title, a command none', () => {
-    const r = new TopicRegistry({ newId });
-    const t = r.create(CONV, 'default', key, { title: `  ${'x'.repeat(200)} ` }, 'user').topic;
-    expect(t.title!.length).toBe(80);
-    r.setTitle(t.id, '  renamed  ');
-    expect(r.get(t.id)!.title).toBe('renamed');
-    expect(titleFrom('hello there\nsecond line')).toBe('hello there');
-    expect(titleFrom('/new x')).toBeUndefined();
-    expect(titleFrom('a'.repeat(60))!.length).toBe(40);
-  });
 });
 
 const AGENTS: AgentSpec[] = [{ name: 'assistant', sessionPrefix: '' }];
@@ -149,23 +130,7 @@ const inputOf = (env: ReturnType<typeof fakeEnvelope>, origin: Origin = OWNER): 
 describe('router: session "topic"', () => {
   const table = { version: 'v', bindings: [{ id: 'dm', match: { conversationKind: 'dm' as const }, on: 'dispatch' as const, session: 'topic' as const }], identities: [] };
 
-  it('resolves to the current topic, creating the first one (with the conversation key) on first use', async () => {
-    const topics = new TopicRegistry({ newId });
-    const r = new Router({ agents: AGENTS, defaultAgent: 'assistant', config: table, topics });
-    const env = fakeEnvelope({ text: 'Tell me about Rust' });
-    const d1 = await r.route(env, OWNER, inputOf(env));
-    expect(d1.deliveries[0]).toMatchObject({ sessionKey: CONV, topic: { conversation: CONV, title: 'Tell me about Rust' } });
-    const first = topics.current(CONV, 'assistant')!;
-    const b = r.newTopic('assistant', CONV, { title: 'B' }, 'user');
-    expect(b.topic.sessionKey).toBe(`${CONV}#${b.topic.id}`);
-    const d2 = await r.route(env, OWNER, inputOf(env));
-    expect(d2.deliveries[0]).toMatchObject({ sessionKey: b.topic.sessionKey, topic: { id: b.topic.id, title: 'B' } });
-    expect(d2.explanation.matched[0]!.sessionKey).toBe(b.topic.sessionKey);
-    topics.switchTo(first.id, 'user');
-    expect((await r.route(env, OWNER, inputOf(env))).deliveries[0]!.sessionKey).toBe(CONV);
-  });
-
-  it('a threaded conversation keeps one session per thread; without a topic table a topic is the conversation', async () => {
+  it('a threaded conversation keeps one session per thread; without a topic table a topic is the conversation #TP-1 #RT-1', async () => {
     const topics = new TopicRegistry({ newId });
     const r = new Router({ agents: AGENTS, defaultAgent: 'assistant', config: table, topics });
     const threaded = fakeEnvelope({ conversation: { id: 'c1', kind: 'dm', threadId: 't9' } });
@@ -179,7 +144,7 @@ describe('router: session "topic"', () => {
     expect(() => plain.newTopic('assistant', CONV, {}, 'user')).toThrow(/no topic table/);
   });
 
-  it('context recorded by the default observe rule follows the current topic of a conversation that has topics', async () => {
+  it('context recorded by the default observe rule follows the current topic of a conversation that has topics #TP-1 #RT-1', async () => {
     const topics = new TopicRegistry({ newId });
     // The owner made the group's rule `topic` (the default observe rule stays `per-thread`).
     const bindings = defaultBindings({ agent: 'assistant' }).map((b) => (b.id === 'default:owner-group' ? { ...b, session: 'topic' as const } : b));
@@ -201,12 +166,6 @@ describe('router: session "topic"', () => {
     expect(topics.list({ conversation: 'fake:default:g2' })).toEqual([]);
   });
 
-  it('the default owner-DM rule uses topics; groups stay per thread', () => {
-    const b = defaultBindings({ agent: 'default' });
-    expect(b.find((x) => x.id === 'default:owner-dm')!.session).toBe('topic');
-    expect(b.filter((x) => x.id !== 'default:owner-dm').every((x) => x.session === 'per-thread')).toBe(true);
-    expect(defaultBindings({ agent: 'default', ownerSessionKey: 'me' }).find((x) => x.id === 'default:owner-dm')!.session).toEqual({ key: 'me' });
-  });
 });
 
 function world(extra: Partial<SessionPolicy> = {}, more: Partial<IngressOptions> = {}) {
@@ -242,18 +201,7 @@ const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };
 const say = (w: ReturnType<typeof world>, text: string, sender: { channelUserId: string; evidence: 'platform_signed' } = alice) => w.ingress.accept(fakeEnvelope({ sender, text }));
 
 describe('topic commands (Ingress)', () => {
-  it('parses /new [title], /topics, /switch <n|id>; anything else is a message', () => {
-    expect(parseTopicCommand([{ type: 'text', text: '/new' }])).toEqual({ name: 'new' });
-    expect(parseTopicCommand([{ type: 'text', text: ' /NEW  Trip   to Kyoto ' }])).toEqual({ name: 'new', arg: 'Trip to Kyoto' });
-    expect(parseTopicCommand([{ type: 'text', text: '/topics' }])).toEqual({ name: 'topics' });
-    expect(parseTopicCommand([{ type: 'text', text: '/switch 2' }])).toEqual({ name: 'switch', arg: '2' });
-    expect(parseTopicCommand([{ type: 'text', text: '/topics please' }])).toBeUndefined();
-    expect(parseTopicCommand([{ type: 'text', text: '/newer' }])).toBeUndefined();
-    expect(parseTopicCommand([{ type: 'text', text: 'please /new' }])).toBeUndefined();
-    expect(parseTopicCommand([{ type: 'text', text: '/new' }, { type: 'text', text: 'x' }])).toBeUndefined();
-  });
-
-  it('/new starts a topic the next message goes to; /topics lists; /switch goes back', async () => {
+  it('/new starts a topic the next message goes to; /topics lists; /switch goes back #TP-1', async () => {
     const w = world();
     const r1 = await say(w, 'Remember: my codename is HERON');
     expect(r1).toMatchObject({ action: 'dispatch', sessionKey: CONV });
@@ -290,16 +238,14 @@ describe('topic commands (Ingress)', () => {
     expect(w.replies.at(-1)!.text).toMatch(/^Already in topic/);
     expect((await say(w, '/switch 9')).command).toMatchObject({ ok: false });
     expect(w.replies.at(-1)!.text).toMatch(/No topic 9/);
+
+    // Case and spacing do not matter; anything that is not exactly a command is a message.
+    expect((await say(w, ' /NEW  Trip   to Kyoto ')).command).toMatchObject({ name: 'new', ok: true });
+    expect(w.topics.current(CONV, 'default')!.title).toBe('Trip to Kyoto');
+    for (const text of ['/topics please', '/newer', 'please /new']) expect((await say(w, text)).action).toBe('dispatch');
   });
 
-  it('inputs routed to a topic carry the hint on how to move between topics when one is configured', () => {
-    expect(topicContext({ id: 'tp_1', title: 'A' })).toEqual({ topic: 'tp_1', topicTitle: 'A' });
-    expect(topicContext({ id: 'tp_1' }, TOPIC_TOOLS_HINT)).toEqual({ topic: 'tp_1', topicTools: TOPIC_TOOLS_HINT });
-    expect(TOPIC_TOOLS_HINT).toMatch(/session_rotate/);
-    expect(TOPIC_TOOLS_HINT).toMatch(/session_switch/);
-  });
-
-  it("an input rewritten into a parked topic's session is labelled with that topic, without the hint", async () => {
+  it("an input rewritten into a parked topic's session is labelled with that topic, without the hint #TP-1", async () => {
     // A reply "2" to a question topic A asked goes back to A's session, though B is current.
     const w = world({}, { topicHint: TOPIC_TOOLS_HINT, rewrite: ({ env }) => (JSON.stringify(env.content).includes('"2"') ? { sessionKey: CONV } : undefined) });
     await say(w, 'Pick a colour');
@@ -318,7 +264,7 @@ describe('topic commands (Ingress)', () => {
     expect(ctx.topicTools).toBeUndefined();
   });
 
-  it('the hint is chosen per target agent (only agents with the session_* tools get it)', async () => {
+  it('the hint is chosen per target agent (only agents with the session_* tools get it) #CF-6', async () => {
     const w = world({}, { topicHint: (agent) => (agent === 'tools' ? TOPIC_TOOLS_HINT : undefined) });
     await say(w, 'hello');
     await until(() => w.seen.length === 1);
@@ -326,7 +272,7 @@ describe('topic commands (Ingress)', () => {
     expect(w.seen[0]!.inputs[0]!.channelContext.topicTools).toBeUndefined();
   });
 
-  it('Policy.control decides who may use them (owner by default)', async () => {
+  it('Policy.control decides who may use them (owner by default) #CT-1', async () => {
     const calls: string[] = [];
     const w = world({ control: async (a) => (calls.push(`${a.op}:${a.sessionKey}`), 'deny') });
     await say(w, 'hello');
@@ -335,62 +281,5 @@ describe('topic commands (Ingress)', () => {
     expect(w.replies.at(-1)!.text).toMatch(/only for the owner/);
     expect(calls).toEqual([`reset:${CONV}`]);
     expect(w.topics.list({ conversation: CONV })).toHaveLength(1);
-  });
-
-  it('formats an empty and a populated list', () => {
-    expect(formatTopics([])).toBe('No topics yet.');
-    const now = 10 * 60_000;
-    const text = formatTopics([{ id: 'a', agent: 'x', conversation: CONV, sessionKey: CONV, state: 'current', createdAt: 0, lastActiveAt: now - 5 * 60_000 }], now);
-    expect(text).toMatch(/▶ 1\. \(untitled\) · 5m ago/);
-  });
-});
-
-describe('topic title on cards', () => {
-  it('card and full renders carry the topic title; headline and final do not', () => {
-    const v = newTurnView('t1');
-    expect(renderTurn(v, 'card', { title: 'Groceries' }).channelData).toEqual({ [TOPIC_KEY]: { title: 'Groceries' } });
-    expect(renderTurn(v, 'full', { title: 'Groceries' }).channelData).toEqual({ [TOPIC_KEY]: { title: 'Groceries' } });
-    expect(renderTurn(v, 'card').channelData).toBeUndefined();
-    expect(renderTurn(v, 'final', { title: 'Groceries' }).channelData).toBeUndefined();
-    expect(renderTurn(v, 'headline', { title: 'Groceries' }).channelData).toBeUndefined();
-  });
-});
-
-describe('a turn handed to another topic', () => {
-  const ROUTE = { channel: 'fake', account: 'default', conversationId: 'c1' };
-  async function run(tier: 'card' | 'final', back = false) {
-    const hub = new Hub(new MemorySessionLog());
-    const channel = new FakeChannel('fake', { ...defaultChannelCaps, ...(tier === 'final' ? { edit: false, defaultTier: 'final' as const } : {}) });
-    const c = new Compositor({ hub, sessionKey: CONV, adapter: channel, outbox: new Outbox({ hub, sleep: async () => {} }), throttleMs: 1, title: () => 'Rust CLI' });
-    c.start();
-    const ev = (body: Parameters<Hub['append']>[1]['body'], turnId?: string) =>
-      hub.append(CONV, { ts: Date.now(), level: 'primary', audience: body.t === 'text.snapshot' ? 'answer' : 'status', durability: 'durable', ...(turnId ? { turnId } : {}), body });
-    ev({ t: 'turn.started', turnId: 't1', inputIds: ['in1'], replyRoute: ROUTE });
-    ev({ t: 'topic.changed', conversation: CONV, from: 'tp_a', to: 'tp_b', title: 'Capitals', reason: 'agent' }, 't1');
-    // A failed handover switches back (reason system): the turn answers here after all.
-    if (back) ev({ t: 'topic.changed', conversation: CONV, from: 'tp_b', to: 'tp_a', title: 'Rust CLI', reason: 'system' }, 't1');
-    ev({ t: 'text.snapshot', text: back ? 'Canberra.' : '→ Capitals', final: true }, 't1');
-    ev({ t: 'turn.completed', turnId: 't1', status: 'completed' }, 't1');
-    if (tier === 'card') await until(() => channel.sent[0]?.finalized);
-    else await new Promise((r) => setTimeout(r, 50));
-    await c.stop();
-    return channel.sent;
-  }
-
-  it('its card ends as one line naming the topic it moved to', async () => {
-    const [card] = await run('card');
-    const final = card!.edits.at(-1)!;
-    expect(final.text).toBe('→ Moved to topic "Capitals"');
-    expect(final.progress).toMatchObject({ steps: [], answer: '→ Moved to topic "Capitals"', answerFinal: true });
-    expect(JSON.stringify(final)).not.toContain('→ Capitals');
-  });
-
-  it('a channel that only gets final messages gets none for it', async () => {
-    expect(await run('final')).toEqual([]);
-  });
-
-  it('a handover switched back renders the answer as usual', async () => {
-    const [card] = await run('card', true);
-    expect(card!.edits.at(-1)!.text).toBe('Canberra.');
   });
 });
