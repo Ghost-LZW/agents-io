@@ -106,7 +106,7 @@ describe('turn mapping', () => {
 
     const start = fake.sent('turn/start')[0]!.params;
     expect(start.clientUserMessageId).toBe('i1');
-    expect(start.input[0].text).toBe('[sender from=owner kind=human via=lark:a:c1 chat="Team"]\nfix it');
+    expect(start.input[0].text).toBe('[sender from=owner kind=human evidence=platform_signed via=lark:a:c1 chat="Team"]\nfix it');
     expect(start.effort).toBe('high'); // thread default was medium
     expect(start.model).toBeUndefined(); // unchanged from thread/start
 
@@ -252,7 +252,7 @@ describe('turn mapping', () => {
     await s.inject!([input('i1', 'fyi: the build is green', { channelContext: {} })]);
     expect(fake.sent('thread/inject_items')[0]!.params).toEqual({
       threadId: 'thr-1',
-      items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: '[sender from=owner kind=human via=lark:a:c1]\nfyi: the build is green' }] }],
+      items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: '[sender from=owner kind=human evidence=platform_signed via=lark:a:c1]\nfyi: the build is green' }] }],
     });
   });
 });
@@ -606,7 +606,7 @@ describe('helpers', () => {
     });
     const out = await renderInputs([rec], { resolveMedia: (b) => (b.ref === 'sha256:1' ? { path: '/blobs/1.png' } : null) });
     expect(out).toEqual([
-      { type: 'text', text: '[sender from=owner kind=human via=lark:a:c1 chat="Team"]\n> a\n> b\n[transcript 1s-3s] Ann: hello', text_elements: [] },
+      { type: 'text', text: '[sender from=owner kind=human evidence=platform_signed via=lark:a:c1 chat="Team"]\n> a\n> b\n[transcript 1s-3s] Ann: hello', text_elements: [] },
       { type: 'localImage', path: '/blobs/1.png' },
       { type: 'text', text: '[ref Doc](https://e.x/doc)\n[event card.click] {"v":1}\n[image sha256:2 (image/png) not available]', text_elements: [] },
     ]);
@@ -615,7 +615,7 @@ describe('helpers', () => {
   it('sender preface carries ref=channel:<channel>/<message id> only for a channel message, bare like Claude Code #EX-4', async () => {
     const ref = 'channel:lark-bot/om_1';
     expect(await renderInputs([{ ...input('i1', 'confirm'), channelRef: ref }])).toEqual([
-      { type: 'text', text: `[sender from=owner kind=human via=lark:a:c1 ref=${ref} chat="Team"]\nconfirm`, text_elements: [] },
+      { type: 'text', text: `[sender from=owner kind=human evidence=platform_signed via=lark:a:c1 ref=${ref} chat="Team"]\nconfirm`, text_elements: [] },
     ]);
     expect(((await renderInputs([input('i2', 'local')]))[0] as { text: string }).text).not.toMatch(/ ref=/);
   });
@@ -625,8 +625,8 @@ describe('helpers', () => {
     const ctx = { ...input('c1', 'the launch moved to Thursday'), origin: stranger, channelContext: { senderName: 'Eve', context: true } };
     const label = '[context, not addressed to you: recorded in the conversation; read it, do not reply to it unless the addressed input asks]';
     expect(await renderInputs([ctx, input('i1', 'what did they say?')])).toEqual([
-      { type: 'text', text: `${label}\n[sender from=unknown kind=human via=lark:a:g1 senderName="Eve" context=true]\nthe launch moved to Thursday`, text_elements: [] },
-      { type: 'text', text: '[sender from=owner kind=human via=lark:a:c1 chat="Team"]\nwhat did they say?', text_elements: [] },
+      { type: 'text', text: `${label}\n[sender from=unknown kind=human evidence=platform_signed via=lark:a:g1 senderName="Eve" context=true]\nthe launch moved to Thursday`, text_elements: [] },
+      { type: 'text', text: '[sender from=owner kind=human evidence=platform_signed via=lark:a:c1 chat="Team"]\nwhat did they say?', text_elements: [] },
     ]);
     expect(await renderInputs([ctx], { preface: false })).toEqual([{ type: 'text', text: `${label}\nthe launch moved to Thursday`, text_elements: [] }]);
   });
@@ -642,16 +642,27 @@ describe('helpers', () => {
     expect(fake.sent('turn/start')[0]!.params.input[0].text).toMatch(/^\[sender .* watch="wg"( |\])/);
   });
 
-  // INVARIANTS ID-2 不成立 1: the sender preface omits origin.evidence; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('the sender preface names the origin evidence #ID-2', async () => {
+  it('the sender preface names the origin evidence (and self, like Claude Code) #ID-2', async () => {
     const [first] = (await renderInputs([input('i1', 'x')])) as { text: string }[];
     expect(first!.text).toMatch(/ evidence=("?)platform_signed\1/);
+    const echo = { ...input('i2', 'x'), origin: { kind: 'agent' as const, principal: null, evidence: 'platform_signed' as const, self: true, via: 'lark:a:c1', adapter: 'lark' } };
+    expect(((await renderInputs([echo]))[0] as { text: string }).text).toMatch(/ self=true/);
   });
 
-  // INVARIANTS ID-2 不成立 2: `preface: false` drops the whole sender preface, watch marker included; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('preface: false still marks a watched input as watched #ID-2', async () => {
+  it('preface: false still marks a watched input as watched #ID-2', async () => {
     const [first] = (await renderInputs([watched()], { preface: false })) as { text: string }[];
     expect(first!.text).toMatch(/watch=("?)wg\1/);
+    // Nothing to mark: no line at all.
+    expect(((await renderInputs([input('i1', 'plain')], { preface: false }))[0] as { text: string }).text).toBe('plain');
+  });
+
+  it('an agent message shows hop=N only (chain and turn ids stay out), like Claude Code #ID-2', async () => {
+    const agent = { kind: 'agent' as const, principal: { id: 'agent:reviewer', labels: ['agent'] }, evidence: 'daemon' as const, via: 'agent:reviewer:reviewer:main', adapter: 'agent' };
+    const cause = { peer: 'reviewer/reviewer:main', basis: 'internal' as const, hop: 3, chain: 'in_root', from: { sessionKey: 'reviewer:main', turnId: 'turn_9' }, rootPrincipal: 'lark:ou_owner' };
+    const [first] = (await renderInputs([{ ...input('i1', 'x'), origin: agent, cause, channelContext: { loopGuard: 'hops' } }])) as { text: string }[];
+    expect(first!.text).toBe('[sender from=agent:reviewer kind=agent evidence=daemon via=agent:reviewer:reviewer:main hop=3 loopGuard="hops"]\nx');
+    const [bare] = (await renderInputs([{ ...input('i1', 'x'), origin: agent, cause, channelContext: { loopGuard: 'hops' } }], { preface: false })) as { text: string }[];
+    expect(bare!.text).toBe('[sender loopGuard="hops"]\nx');
   });
 });
 
