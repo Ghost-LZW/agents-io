@@ -394,20 +394,25 @@ export class Lane {
     return id === undefined ? undefined : this.provenances.get(id);
   }
 
+  /** The provenance of the most recent turns (up to 8, newest last), e.g. to keep it past the lane's close. */
+  recentProvenance(): TurnProvenance[] {
+    return [...this.provenances.values()].slice(-8);
+  }
+
   /** `inputs` triggered the turn; `context` was handed ahead of them. */
   private track(turnId: string, inputs: InputRecord[], context: InputRecord[] = []): void {
     const ctx = context.filter((c) => c.channelContext.contextOmitted === undefined);
-    // Relayed inputs bring the producing turn's flags along: an agent passing on a stranger's words is not a clean source.
-    const carried = (k: 'external' | 'watched' | 'group') => inputs.some((i) => i.cause?.carried?.[k] === true);
+    // Relayed inputs (triggering or context) bring the producing turn's flags along (`isExternal` and the
+    // others read `cause.carried`): an agent passing on a stranger's words is not a clean source.
     const cause = inputs.length ? turnCause(inputs) : this.lastCause;
     if (cause) this.lastCause = cause;
     const p: TurnProvenance = {
       sessionKey: this.sessionKey,
       turnId,
       triggeredBy: inputs.map((i) => i.origin.principal?.id ?? null),
-      watched: this.ctxSeen.any || context.length > 0 || inputs.some(isWatched) || carried('watched'),
-      external: this.ctxSeen.external || ctx.some(isExternal) || inputs.some(isExternal) || carried('external'),
-      group: this.ctxSeen.group || ctx.some(isGroup) || inputs.some(isGroup) || carried('group'),
+      watched: this.ctxSeen.any || context.length > 0 || inputs.some(isWatched),
+      external: this.ctxSeen.external || ctx.some(isExternal) || inputs.some(isExternal),
+      group: this.ctxSeen.group || ctx.some(isGroup) || inputs.some(isGroup),
       ...(cause ? { cause } : {}),
     };
     this.provenances.set(turnId, p);
@@ -1461,15 +1466,23 @@ function pid(i: InputRecord): { principalId?: string; input?: InputRecord } {
   return { ...(id === undefined ? {} : { principalId: id }), ...(i.channelContext.watch !== undefined || i.cause ? { input: i } : {}) };
 }
 
-/** Arrived through a watch (context, trigger) or is a digest of watched items. */
-const isWatched = (i: InputRecord) => i.channelContext.watch !== undefined;
+/**
+ * A flag the turn that produced `i` had (agent-messaging §4.7): an input relayed by an agent
+ * carries it whether it triggers a turn or is handed as context. An agent principal (stamped
+ * by the daemon, or recovered from the outbound index) is not external by itself; what it
+ * carries still counts, so relaying never launders a source.
+ */
+const carried = (i: InputRecord, k: 'external' | 'watched' | 'group') => i.cause?.carried?.[k] === true;
 
-/** From a sender without a principal; a digest carries its senders' content. Host/system inputs are not external. */
-const isExternal = (i: InputRecord) => i.origin.principal === null && (i.origin.kind !== 'system' || i.origin.adapter === 'watch');
+/** Arrived through a watch (context, trigger), is a digest of watched items, or relays a watched turn. */
+const isWatched = (i: InputRecord) => i.channelContext.watch !== undefined || carried(i, 'watched');
+
+/** From a sender without a principal (a digest carries its senders' content), or relays an external turn. Host/system inputs are not external. */
+const isExternal = (i: InputRecord) => (i.origin.principal === null && (i.origin.kind !== 'system' || i.origin.adapter === 'watch')) || carried(i, 'external');
 
 const isGroup = (i: InputRecord) => {
   const k = i.channelContext.conversationKind;
-  return (typeof k === 'string' && GROUPISH.has(k)) || i.channelContext.watchGroup === true;
+  return (typeof k === 'string' && GROUPISH.has(k)) || i.channelContext.watchGroup === true || carried(i, 'group');
 };
 
 /** Characters of content counted against `context.maxChars` (a media block counts as a short label). */

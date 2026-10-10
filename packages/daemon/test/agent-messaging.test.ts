@@ -61,6 +61,29 @@ describe('the outbound index', () => {
     expect(chans.b.sent).toEqual([]);
   });
 
+  it('the turn\'s chain and flags are taken at send time: a delivery settling after its lane closed still indexes them #ID-8 #EX-5', async () => {
+    const { gw, chans } = await bots();
+    // Bot a's sends wait until released: the lane closes (a parked topic, an eviction) before the card settles.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const send = chans.a.send.bind(chans.a);
+    chans.a.send = async (...args: Parameters<typeof send>) => {
+      await gate;
+      return send(...args);
+    };
+    const group = { id: 'g1', kind: 'group' as const };
+    const r = await chans.a.inject({ id: 'om_h', sender: { channelUserId: 'alice', evidence: 'platform_signed' }, conversation: group, text: 'hi', admission: 'dispatch' });
+    await until(() => of(gw.hub.log.read('lark-bot:a:g1', 0), 'turn.completed')[0]);
+    const g = gw as unknown as { lanes: Map<string, unknown>; closeLane(k: string, l: unknown, why: string): Promise<void> };
+    const closing = g.closeLane('lark-bot:a:g1', g.lanes.get('lark-bot:a:g1'), 'test');
+    expect(g.lanes.has('lark-bot:a:g1')).toBe(false);
+    release();
+    await closing;
+    const card = await until(() => chans.a.sent[0]);
+    const echo = await chans.b.inject({ id: card.providerMessageId, sender: { channelUserId: 'ou_bot_a', isBot: true, evidence: 'platform_signed' }, conversation: group, text: 'on it' });
+    expect(gw.router.explain(echo.inputId!)!.cause).toMatchObject({ basis: 'recovered', hop: 1, chain: r.inputId, rootPrincipal: 'lark-bot:alice', carried: { external: false, group: true } });
+  });
+
   it('explain by the operationId of a reply card: its turn and that turn\'s inputs; explain --chain walks a recovered input back to the root #EX-2 #EX-6', async () => {
     const { gw, chans } = await bots();
     const group = { id: 'g1', kind: 'group' as const };

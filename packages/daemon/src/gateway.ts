@@ -96,7 +96,7 @@ import { HostService, isHostOrigin } from './host.js';
 import { LocalServer } from './local-server.js';
 import { privateDb, privateDir } from './private.js';
 import { blobResolvers, type MediaResolvers } from './media.js';
-import { DaemonRecords, type CauseRecord } from './records.js';
+import { DaemonRecords, type CauseRecord, type OutboundRecord } from './records.js';
 import { checkLaunch, launchView, sameLaunch, type LaunchCheck } from './launch.js';
 import { Runs } from './runs.js';
 import { consoleUrlPath, loadOrCreateTokenFile, removeTokenFile, TokenError, tokenPath, writeTokenFile } from './token.js';
@@ -274,6 +274,8 @@ export class Gateway {
   /** Adapters of configured agents (their cwd and instructions over the instance's). */
   private readonly agentAdapters = new Map<string, HarnessAdapter>();
   private readonly lanes = new Map<string, Lane>();
+  /** The last turns' provenance of lanes closed recently (bounded): deliveries that start or settle after the close still index it. */
+  private readonly closedProvenance = new Map<string, TurnProvenance>();
   /** Lanes being closed (parked topics idling out): a new lane for the key waits for the close (LN-2). */
   private readonly closingLanes = new Map<string, Promise<void>>();
   /** Running lives (decision 11), by session: the channel's media peer of each. */
@@ -426,7 +428,8 @@ export class Gateway {
       policy: this.policy,
       store: this.records,
       // Which turn sent which platform message (the outbound index), and explain of a side effect by operationId.
-      onSettled: (d, rec) => this.indexOutbound(d, rec),
+      atSend: (d) => this.provenanceAtSend(d),
+      onSettled: (d, rec, atSend) => this.indexOutbound(d, rec, atSend as OutboundRecord['provenance']),
       // Agent-authored sends carry their hop out-of-band where the channel can (mail X-Agents-IO-Hop).
       causeOf: (d) => this.sendCause(d.sessionKey, d.turnId),
     });
@@ -1223,9 +1226,21 @@ export class Gateway {
     return this.laneInfo.get(sessionKey)?.agent.name ?? this.records.agentOf(sessionKey);
   }
 
-  /** Outbox `onSettled`: every settled delivery, with the turn and the turn's chain when a turn made it. */
-  private indexOutbound(d: { sessionKey: string; turnId?: string }, rec: DeliveryRecord): void {
-    const p = d.turnId !== undefined ? this.lanes.get(d.sessionKey)?.provenance(d.turnId) : undefined;
+  /**
+   * Outbox `atSend`: the sending turn's provenance (chain and flags) when the delivery starts.
+   * Taken at send time, not at settle: the lane may be closed by then (a parked topic, a stop)
+   * and a recovered echo must still carry the turn's flags (EX-5, never laundered).
+   */
+  private provenanceAtSend(d: { sessionKey: string; turnId?: string }): OutboundRecord['provenance'] {
+    if (d.turnId === undefined) return undefined;
+    // A closed lane's turns: what its renderers flush while it closes is still that turn's.
+    const p = this.lanes.get(d.sessionKey)?.provenance(d.turnId) ?? this.closedProvenance.get(`${d.sessionKey}\u0000${d.turnId}`);
+    return p ? { external: p.external, watched: p.watched, group: p.group, ...(p.cause ? { cause: p.cause } : {}) } : undefined;
+  }
+
+  /** Outbox `onSettled`: every settled delivery, with the turn and the turn's chain (as at send time) when a turn made it. */
+  private indexOutbound(d: { sessionKey: string; turnId?: string }, rec: DeliveryRecord, atSend?: OutboundRecord['provenance']): void {
+    const p = atSend ?? this.provenanceAtSend(d);
     const agent = this.agentOfSession(d.sessionKey);
     this.records.putOutbound({
       operationId: rec.operationId,
@@ -1236,7 +1251,7 @@ export class Gateway {
       ...(agent !== undefined ? { agent } : {}),
       route: rec.route,
       result: rec.status,
-      ...(p ? { provenance: { external: p.external, watched: p.watched, group: p.group, ...(p.cause ? { cause: p.cause } : {}) } } : {}),
+      ...(p ? { provenance: p } : {}),
       at: Date.now(),
     });
   }
@@ -1687,6 +1702,13 @@ ${a.summary}` }],
   }
 
   private async doCloseLane(sessionKey: string, lane: Lane, reason: string): Promise<void> {
+    for (const p of lane.recentProvenance()) {
+      this.closedProvenance.set(`${sessionKey}\u0000${p.turnId}`, p);
+      for (const k of this.closedProvenance.keys()) {
+        if (this.closedProvenance.size <= 256) break;
+        this.closedProvenance.delete(k);
+      }
+    }
     this.lanes.delete(sessionKey);
     this.laneInfo.delete(sessionKey);
     const launched = this.launched.get(sessionKey);
