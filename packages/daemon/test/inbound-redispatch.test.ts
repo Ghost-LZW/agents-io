@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import type { Binding, BindingTable, InputRecord } from '@agents-io/protocol';
-import { parseCli, redispatchRequest } from '../src/cli.js';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { daemon, tmp, until } from './helpers.js';
@@ -31,7 +30,7 @@ async function world(raw?: Record<string, unknown>) {
 }
 
 describe('inbound.redispatch', () => {
-  it('delivers a queued item with its original origin, records both sides in explain, and is idempotent per cursor', async () => {
+  it('delivers a queued item with its original origin, records both sides in explain, and is idempotent per cursor #HQ-4 #ID-1 #EX-1', async () => {
     const { w, h, inputs } = await world();
     const r = await w.chat.inject({ id: 'm1', sender: bob, conversation: { id: 'g1', kind: 'group' }, text: 'xwo please' });
     const [item] = (await h.inboundRead({ consumer: 'any', after: 0 })).items;
@@ -62,7 +61,7 @@ describe('inbound.redispatch', () => {
     expect(w.gw.hostQueue.cursor('any')).toBe(0);
   });
 
-  it('concurrent first requests deliver once', async () => {
+  it('concurrent first requests deliver once #HQ-4', async () => {
     const { w, h, inputs } = await world();
     await w.chat.inject({ id: 'm2', sender: bob, text: 'xwo twice' });
     const [item] = (await h.inboundRead({ consumer: 'any', after: 0 })).items;
@@ -73,7 +72,7 @@ describe('inbound.redispatch', () => {
     expect(inputs).toHaveLength(1);
   });
 
-  it('default session is the per-conversation one; errors before delivery: unknown cursor, unknown agent, bad scope, task run key', async () => {
+  it('default session is the per-conversation one; errors before delivery: unknown cursor, unknown agent, bad scope, task run key #HQ-4', async () => {
     const { w, h } = await world();
     await w.chat.inject({ id: 'm3', sender: bob, conversation: { id: 'g9', kind: 'group' }, text: 'xwo hello' });
     const [item] = (await h.inboundRead({ consumer: 'any', after: 0 })).items;
@@ -88,7 +87,7 @@ describe('inbound.redispatch', () => {
     expect(ok.sessionKey).toContain('g9');
   });
 
-  it('a delivery refused by the session is not recorded: a retry elsewhere (with a launch) goes through; agent_conflict; the result names the session\'s own agent', async () => {
+  it('a delivery refused by the session is not recorded: a retry elsewhere (with a launch) goes through; agent_conflict; the result names the session\'s own agent #HQ-4 #LA-1', async () => {
     const dir = tmp();
     for (const d of ['a', 'b']) mkdirSync(join(dir, d), { recursive: true });
     const { w, h, inputs } = await world({
@@ -114,7 +113,7 @@ describe('inbound.redispatch', () => {
     await until(() => inputs.length === 2);
   });
 
-  it('concurrent requests: when the first fails, a waiter tries again with its own arguments', async () => {
+  it('concurrent requests: when the first fails, a waiter tries again with its own arguments #HQ-4', async () => {
     const { w, h, inputs } = await world();
     await w.chat.inject({ id: 'm7', sender: bob, text: 'xwo race' });
     const [item] = (await h.inboundRead({ consumer: 'any', after: 0 })).items;
@@ -125,7 +124,7 @@ describe('inbound.redispatch', () => {
     await until(() => inputs.length === 1);
   });
 
-  it('at most once: a redispatch cut off before its outcome was recorded is reported, never sent again', async () => {
+  it('at most once: a redispatch cut off before its outcome was recorded is reported, never sent again #HQ-4', async () => {
     const { w, h, inputs } = await world();
     const r = await w.chat.inject({ id: 'm8', sender: bob, text: 'xwo crash' });
     const [item] = (await h.inboundRead({ consumer: 'any', after: 0 })).items;
@@ -139,20 +138,11 @@ describe('inbound.redispatch', () => {
     expect(inputs).toHaveLength(0);
   });
 
-  it('a plain (non-host) connection cannot redispatch', async () => {
+  it('a plain (non-host) connection cannot redispatch #HQ-4', async () => {
     const { w, h } = await world();
     await w.chat.inject({ id: 'm4', sender: bob, text: 'xwo x' });
     const [item] = (await h.inboundRead({ consumer: 'any', after: 0 })).items;
     const c = await w.client();
     await expect(c.call('inbound.redispatch', { cursor: item!.cursor })).rejects.toMatchObject({ code: 'unauthorized' });
-  });
-
-  it('aio redispatch parses its arguments', () => {
-    const r = (argv: string[]) => redispatchRequest(parseCli(['redispatch', ...argv]));
-    expect(r(['7'])).toEqual({ cursor: 7 });
-    expect(r(['7', '--agent', 'chat', '--session', 'main', '--cwd', '/w', '--env', 'A=1'])).toEqual({ cursor: 7, agent: 'chat', session: 'main', launch: { cwd: '/w', env: { A: '1' } } });
-    expect(r(['7', '--session', 'K9'])).toEqual({ cursor: 7, session: { key: 'K9' } });
-    expect(r(['7', '--session', '{"key":"K9","agent":"x"}']).session).toEqual({ key: 'K9', agent: 'x' });
-    expect(() => r(['x'])).toThrow(/usage/);
   });
 });

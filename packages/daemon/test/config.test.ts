@@ -1,10 +1,9 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { homedir } from 'node:os';
 import { launchFlags } from '@agents-io/harness-codex';
-import { ConfigError, codexStateDir, defaultInstance, findEnvFile, loadConfig, resolveConfig, substituteEnv } from '../src/config.js';
+import { ConfigError, defaultInstance, findEnvFile, loadConfig, resolveConfig } from '../src/config.js';
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -18,130 +17,7 @@ const tmp = () => {
 const resolve = (raw: unknown, env: Record<string, string> = {}, extra = {}) => resolveConfig(raw, { env, baseDir: '/base', cwd: '/work', ...extra });
 
 describe('config', () => {
-  it('fills defaults from an empty file', () => {
-    const c = resolve({});
-    expect(c.defaultHarness).toBe('claude-code');
-    expect(Object.keys(c.harnesses)).toEqual(['claude-code']);
-    expect(defaultInstance(c)).toMatchObject({ name: 'claude-code', kind: 'claude-code', run: { harness: 'claude-code', model: 'haiku' }, claude: {} });
-    expect(c.logPath).toBe(join(c.dataDir, 'log.sqlite'));
-    expect(c.socketPath).toBe(join(c.dataDir, 'run', 'aio.sock'));
-    expect(c.cwd).toBe('/work');
-    expect(c.channels).toEqual([]);
-    expect(c.local).toEqual({ principal: { id: 'local:owner', labels: ['owner'] }, session: 'local:main' });
-  });
-
-  it('resolves paths against the config dir, ~ against home; env overrides the model; owners merge env', () => {
-    const c = resolve(
-      {
-        dataDir: 'state',
-        harness: { use: 'codex', codex: { run: { model: 'cfg-model', effort: 'low' }, transport: { kind: 'unix', spawn: 'own', stateDir: '~/cx' } } },
-        policy: { owners: ['lark-bot:u1'], ownerSessionKey: 'main' },
-      },
-      { AGENTS_IO_LIVE_CODEX_MODEL: 'env-model', AGENTS_IO_OWNERS: 'mail:a@b.c, lark-bot:u2' },
-    );
-    expect(c.dataDir).toBe('/base/state');
-    const cx = defaultInstance(c);
-    expect(cx.run).toEqual({ harness: 'codex', model: 'env-model', effort: 'low' });
-    if (cx.kind !== 'codex') throw new Error('codex');
-    expect(cx.codex.transport).toMatchObject({ kind: 'unix', spawn: 'own', stateDir: join(homedir(), 'cx') });
-    expect(c.policy.owners).toEqual(['lark-bot:u1', 'mail:a@b.c', 'lark-bot:u2']);
-    // The local end is the owner by default, in the owner's session.
-    expect(c.local).toEqual({ principal: { id: 'lark-bot:u1', labels: ['owner'] }, session: 'main' });
-  });
-
-  it('--harness overrides harness.use; codex defaults to the codex default model', () => {
-    const c = resolve({ harness: { use: 'claude-code' } }, {}, { harness: 'codex' });
-    expect(c.defaultHarness).toBe('codex');
-    expect(defaultInstance(c).run).toEqual({ harness: 'codex', model: '' });
-    // The older form keeps the adapter's default stateDir so a running deployment still adopts its turns.
-    const u = defaultInstance(resolve({ harness: { use: 'codex', codex: { transport: { kind: 'unix', spawn: 'own' } } } }));
-    expect(u.kind === 'codex' && u.codex.transport).toEqual({ kind: 'unix', spawn: 'own' });
-  });
-
-  it('named instances: per-kind launch settings, env refs, paths, default and --harness by name', () => {
-    const c = resolve(
-      {
-        harnesses: {
-          claude: { use: 'claude-code' },
-          'claude-gateway': {
-            use: 'claude-code',
-            env: { ANTHROPIC_BASE_URL: 'env:GW_URL', ANTHROPIC_AUTH_TOKEN: 'env:GW_TOKEN', ANTHROPIC_API_KEY: null, FIXED: 'v' },
-            run: { model: 'gemini-3.8-flash-high' },
-            configDir: '~/.claude-gw',
-            executable: 'bin/claude',
-            settings: { permissions: { allow: ['Read'] }, env: { X: 'env:GW_TOKEN' } },
-            settingSources: ['user'],
-            mcpServers: { docs: { type: 'http', url: 'https://docs', headers: { Authorization: 'env:GW_TOKEN' } } },
-            plugins: ['plugins/one'],
-            skills: 'all',
-            extraArgs: { 'debug-to-stderr': null },
-            additionalDirectories: ['shared'],
-            cwd: 'work',
-            profiles: { bypass: { permissionMode: 'bypassPermissions' } },
-          },
-          codex: {
-            use: 'codex',
-            home: '~/.codex-aio',
-            executable: 'codex',
-            config: { model_reasoning_summary: 'concise', 'mcp_servers.x.url': 'https://x', 'mcp_servers.x.bearer_token': 'env:GW_TOKEN' },
-            enable: ['web_search'],
-            disable: ['undo'],
-            transport: { kind: 'unix', spawn: 'own' },
-          },
-        },
-        defaultHarness: 'claude-gateway',
-      },
-      { GW_URL: 'https://gw.example', GW_TOKEN: 'tok-secret', AGENTS_IO_LIVE_CLAUDE_MODEL: 'env-model' },
-    );
-    expect(c.defaultHarness).toBe('claude-gateway');
-    const gw = c.harnesses['claude-gateway']!;
-    expect(gw).toMatchObject({
-      name: 'claude-gateway',
-      kind: 'claude-code',
-      // The env model override only touches the default instance.
-      run: { harness: 'claude-gateway', model: 'env-model' },
-      // Secrets for argv-bound settings (inline settings, mcpServers) ride in the child env.
-      env: { ANTHROPIC_BASE_URL: 'https://gw.example', ANTHROPIC_AUTH_TOKEN: 'tok-secret', ANTHROPIC_API_KEY: undefined, FIXED: 'v', X: 'tok-secret', GW_TOKEN: 'tok-secret' },
-      cwd: '/base/work',
-      claude: {
-        claudePath: '/base/bin/claude',
-        configDir: join(homedir(), '.claude-gw'),
-        settings: { permissions: { allow: ['Read'] }, env: {} },
-        settingSources: ['user'],
-        mcpServers: { docs: { headers: { Authorization: '${GW_TOKEN}' } } },
-        plugins: ['/base/plugins/one'],
-        skills: 'all',
-        extraArgs: { 'debug-to-stderr': null },
-        additionalDirectories: ['/base/shared'],
-      },
-    });
-    expect('ANTHROPIC_API_KEY' in gw.env).toBe(true); // null → removed from the child's environment
-    expect(c.harnesses.claude).toMatchObject({ run: { harness: 'claude', model: 'haiku' }, env: {}, claude: {} });
-    const cx = c.harnesses.codex!;
-    expect(cx).toMatchObject({
-      kind: 'codex',
-      run: { harness: 'codex', model: '' },
-      codex: {
-        bin: 'codex',
-        codexHome: join(homedir(), '.codex-aio'),
-        config: { model_reasoning_summary: 'concise', 'mcp_servers.x.url': 'https://x', 'mcp_servers.x.bearer_token_env_var': 'GW_TOKEN' },
-        enable: ['web_search'],
-        disable: ['undo'],
-        // Namespaced per instance: restart adoption never crosses instances.
-        transport: { kind: 'unix', spawn: 'own', stateDir: codexStateDir('codex') },
-      },
-    });
-    expect(codexStateDir('codex')).toBe(join(homedir(), '.agents-io', 'codex.codex'));
-
-    // --harness picks an instance by name, or a kind's first instance.
-    const raw = { harnesses: { a: { use: 'claude-code' }, b: { use: 'codex' } } };
-    expect(resolve(raw).defaultHarness).toBe('a');
-    expect(resolve(raw, {}, { harness: 'b' }).defaultHarness).toBe('b');
-    expect(resolve(raw, {}, { harness: 'codex' }).defaultHarness).toBe('b');
-    expect(() => resolve(raw, {}, { harness: 'nope' })).toThrow('unknown harness instance "nope" (configured: a, b)');
-  });
-
-  it('named instances: clear errors that never echo values', () => {
+  it('named instances: clear errors that never echo values #SE-1', () => {
     const bad = (raw: unknown, env: Record<string, string> = {}) => {
       try {
         resolve(raw, env);
@@ -178,36 +54,17 @@ describe('config', () => {
     ).toBe('harnesses a and b use the same codex stateDir /s; give each its own');
   });
 
-  it('rejects unknown keys and bad values without echoing values', () => {
+  it('rejects unknown keys and bad values without echoing values #SE-1', () => {
     expect(() => resolve({ harnes: {} })).toThrow(ConfigError);
     expect(() => resolve({ harness: { use: 'gpt' } })).toThrow(/invalid config/);
     expect(() => resolve({ channels: [{ type: 'bridge' }] })).toThrow(/invalid config/);
-  });
-
-  it('lark-bot takes credentials from the environment and names a missing one', () => {
-    expect(() => resolve({ channels: [{ type: 'lark-bot' }] }, { LARK_APP_ID: 'id' })).toThrow('channel lark-bot needs LARK_APP_SECRET');
-    const c = resolve({ channels: [{ type: 'lark-bot', tier: 'card' }] }, { LARK_APP_ID: 'id', LARK_APP_SECRET: 'secret', LARK_DOMAIN: 'lark' });
-    expect(c.channels[0]).toMatchObject({ type: 'lark-bot', account: 'default', tier: 'card', config: { appId: 'id', appSecret: 'secret', domain: 'lark' } });
-    // Clients skip channels, so they need no channel secrets.
-    expect(resolve({ channels: [{ type: 'lark-bot' }] }, {}, { channels: false }).channels).toEqual([]);
   });
 
   describe('several lark-bot channels (decision 8)', () => {
     const bot = (account: string | undefined, config?: Record<string, unknown>) => ({ type: 'lark-bot', ...(account !== undefined ? { account } : {}), ...(config ? { config } : {}) });
     const ENV = { LARK_APP_ID: 'cli_d', LARK_APP_SECRET: 's0', A_ID: 'cli_a', A_SECRET: 'sa-secret', B_ID: 'cli_b', B_SECRET: 'sb-secret', ENC: 'enc-value' };
 
-    it('explicit env: references per entry, the fallback for one, domain default feishu; encryptKey env: is substituted', () => {
-      const c = resolve({ channels: [bot(undefined), bot('proj-a', { appId: 'env:A_ID', appSecret: 'env:A_SECRET', encryptKey: 'env:ENC' }), bot('intl', { appId: 'cli_lit', appSecret: 'env:B_SECRET', domain: 'lark' })] }, ENV);
-      expect(c.channels.map((ch) => [ch.account, ch.config])).toEqual([
-        ['default', { appId: 'cli_d', appSecret: 's0', domain: 'feishu' }],
-        ['proj-a', { appId: 'cli_a', appSecret: 'sa-secret', encryptKey: 'enc-value', domain: 'feishu' }],
-        ['intl', { appId: 'cli_lit', appSecret: 'sb-secret', domain: 'lark' }],
-      ]);
-      // A single entry with env: in its config (the console's credential rule) gets values too.
-      expect(resolve({ channels: [bot(undefined, { encryptKey: 'env:ENC' })] }, ENV).channels[0]!.config).toMatchObject({ appId: 'cli_d', encryptKey: 'enc-value' });
-    });
-
-    it('errors name entries and variables, never values', () => {
+    it('errors name entries and variables, never values #CF-3 #SE-1', () => {
       const msg = (raw: unknown, env: Record<string, string> = ENV) => {
         try {
           resolve(raw, env);
@@ -230,7 +87,7 @@ describe('config', () => {
       expect(msg({ channels: [bot('a:b', { appId: 'cli_a', appSecret: 'x' }), bot('c', { appId: 'cli_b', appSecret: 'y' })] })).toMatch(/channels\[0\] \(account "a:b"\): with several lark-bot channels, accounts are/);
     });
 
-    it('the same appId on feishu and lark are two apps; one entry with ":" in its account only warns', () => {
+    it('the same appId on feishu and lark are two apps; one entry with ":" in its account only warns #CF-3', () => {
       const c = resolve({ channels: [bot('f', { appId: 'cli_x', appSecret: 'x' }), bot('l', { appId: 'cli_x', appSecret: 'y', domain: 'lark' })] }, ENV);
       expect(c.channels).toHaveLength(2);
       expect(c.warnings).toBeUndefined();
@@ -239,17 +96,7 @@ describe('config', () => {
     });
   });
 
-  it('substitutes env:NAME in mail and bridge config', () => {
-    const c = resolve(
-      { channels: [{ type: 'mail', config: { imap: { auth: { user: 'me', pass: 'env:MAIL_PASS' } } } }, { type: 'bridge', command: 'python3', args: ['x.py'], env: { TOKEN: 'env:TOK' }, cwd: 'ch' }] },
-      { MAIL_PASS: 'p', TOK: 't' },
-    );
-    expect(c.channels[0]).toMatchObject({ config: { imap: { auth: { user: 'me', pass: 'p' } } } });
-    expect(c.channels[1]).toMatchObject({ env: { TOKEN: 't' }, cwd: '/base/ch' });
-    expect(() => substituteEnv({ a: ['env:NOPE'] }, {}, 'x')).toThrow('x.a[0]: environment variable NOPE is not set');
-  });
-
-  it('loads the file and .env.live next to it; only harness-ish keys reach the harness', () => {
+  it('loads the file and .env.live next to it; only harness-ish keys reach the harness #SE-1', () => {
     const d = tmp();
     writeFileSync(join(d, 'aio.config.json'), JSON.stringify({ channels: [{ type: 'lark-bot' }] }));
     writeFileSync(join(d, '.env.live'), 'LARK_APP_ID=a\nLARK_APP_SECRET=b\nANTHROPIC_BASE_URL=http://x\n');
@@ -264,32 +111,8 @@ describe('config', () => {
     expect(n.harnesses.a!.env).toEqual({});
     expect(n.harnesses.g!.env).toEqual({ ANTHROPIC_BASE_URL: 'http://x' });
   });
-
-  it('an explicit missing config is an error; a missing default is all defaults', () => {
-    const d = tmp();
-    expect(() => loadConfig({ cwd: d, path: 'nope.json', env: {} })).toThrow(/not found/);
-    expect(defaultInstance(loadConfig({ cwd: d, env: {} })).kind).toBe('claude-code');
-  });
-
-  it('finds .env.live up the tree', () => {
-    const d = tmp();
-    mkdirSync(join(d, 'a', 'b'), { recursive: true });
-    writeFileSync(join(d, '.env.live'), 'X=1\n');
-    expect(findEnvFile({ cwd: join(d, 'a', 'b') })).toBe(join(d, '.env.live'));
-  });
-
-  it('the committed example config is valid', () => {
-    const raw = JSON.parse(readFileSync(new URL('../aio.config.example.json', import.meta.url), 'utf8'));
-    const c = resolve(raw, { LARK_APP_ID: 'a', LARK_APP_SECRET: 'b', GATEWAY_BASE_URL: 'u', GATEWAY_AUTH_TOKEN: 't' });
-    expect(Object.values(c.harnesses).filter((i) => i.unavailable)).toEqual([]);
-    // Without the gateway's variables only that instance is unavailable.
-    expect(Object.values(resolve(raw, { LARK_APP_ID: 'a', LARK_APP_SECRET: 'b' }).harnesses).filter((i) => i.unavailable).map((i) => i.name)).toEqual(['claude-gateway']);
-    expect(defaultInstance(c).kind).toBe('claude-code');
-    expect(Object.values(c.harnesses).map((i) => `${i.name}:${i.kind}`)).toEqual(['claude:claude-code', 'claude-gateway:claude-code', 'codex:codex']);
-    expect(c.channels.map((ch) => ch.type)).toContain('lark-bot');
-  });
   describe('.env.live discovery', () => {
-    it('skips a .env.live in a world-writable ancestor (e.g. /tmp): another user could have planted it', () => {
+    it('skips a .env.live in a world-writable ancestor (e.g. /tmp): another user could have planted it #SE-2', () => {
       const d = tmp();
       const up = join(d, 'up');
       mkdirSync(join(up, 'a', 'b'), { recursive: true });
@@ -301,7 +124,7 @@ describe('config', () => {
       expect(c.local.principal.id).toBe('local:owner');
     });
 
-    it('skips a .env.live owned by another user', () => {
+    it('skips a .env.live owned by another user #SE-2', () => {
       const d = tmp();
       mkdirSync(join(d, 'a'));
       writeFileSync(join(d, '.env.live'), 'X=1\n', { mode: 0o600 });
@@ -309,7 +132,7 @@ describe('config', () => {
       expect(findEnvFile({ configDir: d, uid: (process.getuid?.() ?? 0) + 1 })).toBeUndefined();
     });
 
-    it('refuses our own .env.live when others can write it, naming the fix', () => {
+    it('refuses our own .env.live when others can write it, naming the fix #SE-2', () => {
       const d = tmp();
       writeFileSync(join(d, '.env.live'), 'X=1\n');
       chmodSync(join(d, '.env.live'), 0o620);
@@ -317,7 +140,7 @@ describe('config', () => {
       expect(() => findEnvFile({ cwd: d })).toThrow(/writable by other users.*chmod 600/);
     });
 
-    it('an explicit --env-file is used as given', () => {
+    it('an explicit --env-file is used as given #SE-2', () => {
       const d = tmp();
       chmodSync(d, 0o1777);
       writeFileSync(join(d, 'x.env'), 'X=1\n');
@@ -326,7 +149,7 @@ describe('config', () => {
   });
 
   describe('env:NAME secrets never reach a child command line', () => {
-    it('claude mcpServers: the value goes to the child env, the server config says ${NAME}', () => {
+    it('claude mcpServers: the value goes to the child env, the server config says ${NAME} #SE-1', () => {
       const c = resolve(
         {
           harnesses: {
@@ -350,7 +173,7 @@ describe('config', () => {
       expect(JSON.stringify(a.kind === 'claude-code' && a.claude)).not.toMatch(/secret/);
     });
 
-    it('claude inline settings: settings.env refs move to the child env; others are refused', () => {
+    it('claude inline settings: settings.env refs move to the child env; others are refused #SE-1', () => {
       const c = resolve({ harnesses: { a: { use: 'claude-code', settings: { model: 'x', env: { X: 'env:T' } } } } }, { T: 'tok-secret' });
       const a = c.harnesses.a!;
       expect(a.kind === 'claude-code' && a.claude.settings).toEqual({ model: 'x', env: {} });
@@ -360,7 +183,7 @@ describe('config', () => {
       );
     });
 
-    it('a routed variable that disagrees with the instance env is an error', () => {
+    it('a routed variable that disagrees with the instance env is an error #SE-1', () => {
       expect(() =>
         resolve({ harnesses: { a: { use: 'claude-code', env: { GH: 'other' }, mcpServers: { gh: { env: { T: 'env:GH' } } } } } }, { GH: 'gh-secret' }),
       ).toThrow(/harnesses\.a: env\.GH .*mcpServers/);
@@ -368,7 +191,7 @@ describe('config', () => {
       expect(resolve({ harnesses: { a: { use: 'claude-code', env: { GH: 'env:GH' }, mcpServers: { gh: { env: { T: 'env:GH' } } } } } }, { GH: 'g' }).harnesses.a!.env).toEqual({ GH: 'g' });
     });
 
-    it('codex config: env refs become env-var indirection settings with the value in the child env', () => {
+    it('codex config: env refs become env-var indirection settings with the value in the child env #SE-1', () => {
       const c = resolve(
         {
           harnesses: {
@@ -404,7 +227,7 @@ describe('config', () => {
       expect(flags).not.toMatch(/secret/);
     });
 
-    it('codex config: an env ref with no env-var setting is a clear error that names the key, not the value', () => {
+    it('codex config: an env ref with no env-var setting is a clear error that names the key, not the value #SE-1', () => {
       expect(() => resolve({ harnesses: { cx: { use: 'codex', config: { 'mcp_servers.x.url': 'env:GW_URL' } } } }, { GW_URL: 'SECRET-VALUE' })).toThrow(
         /harnesses\.cx\.config\.mcp_servers\.x\.url: "env:" values would be on the codex app-server command line/,
       );
@@ -424,20 +247,20 @@ describe('config', () => {
       return 'no error';
     };
 
-    it('resolves roots against the config file; envPathRoots defaults to none', () => {
+    it('resolves roots against the config file; envPathRoots defaults to none #FC-4', () => {
       const c = resolve({ agents: { dev: { harness: 'claude-code', sessionParams: { cwdRoots: ['ws', '/abs'], envKeys: ['GIT_AUTHOR_NAME', 'CLAUDE_CONFIG_DIR'], envPathRoots: { CLAUDE_CONFIG_DIR: ['homes'] } } }, other: { harness: 'claude-code' } } });
       expect(c.agents.dev!.sessionParams).toEqual({ cwdRoots: ['/base/ws', '/abs'], envKeys: ['GIT_AUTHOR_NAME', 'CLAUDE_CONFIG_DIR'], envPathRoots: { CLAUDE_CONFIG_DIR: ['/base/homes'] } });
       expect(c.agents.other!.sessionParams).toBeUndefined();
       expect(resolve({ agents: { dev: { harness: 'claude-code', sessionParams: { cwdRoots: [], envKeys: [] } } } }).agents.dev!.sessionParams).toEqual({ cwdRoots: [], envKeys: [], envPathRoots: {} });
     });
 
-    it('CLAUDE_CONFIG_DIR / CODEX_HOME in envKeys need envPathRoots', () => {
+    it('CLAUDE_CONFIG_DIR / CODEX_HOME in envKeys need envPathRoots #FC-4', () => {
       expect(bad({ cwdRoots: [], envKeys: ['CLAUDE_CONFIG_DIR'] })).toMatch(/CLAUDE_CONFIG_DIR is in envKeys.*envPathRoots\.CLAUDE_CONFIG_DIR/);
       expect(bad({ cwdRoots: [], envKeys: ['CODEX_HOME'] })).toMatch(/CODEX_HOME is in envKeys/);
       expect(bad({ cwdRoots: [], envKeys: ['CODEX_HOME'], envPathRoots: { CODEX_HOME: [] } })).toMatch(/envPathRoots\.CODEX_HOME: needs at least one root/);
     });
 
-    it('refuses AGENTS_IO_* and malformed keys, envPathRoots keys not in envKeys, task agents, unknown fields', () => {
+    it('refuses AGENTS_IO_* and malformed keys, envPathRoots keys not in envKeys, task agents, unknown fields #FC-4', () => {
       expect(bad({ cwdRoots: [], envKeys: ['AGENTS_IO_MCP_TOKEN'] })).toMatch(/AGENTS_IO_\* variables are the daemon's own/);
       expect(bad({ cwdRoots: [], envKeys: ['1BAD'] })).toMatch(/not a variable name/);
       expect(bad({ cwdRoots: [], envKeys: ['A'], envPathRoots: { HOME: ['/h'] } })).toMatch(/envPathRoots\.HOME: not in envKeys/);

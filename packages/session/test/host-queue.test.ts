@@ -26,7 +26,7 @@ function item(id = `m${++n}`): Omit<InboundItem, 'cursor'> {
 }
 
 describe('HostQueue', () => {
-  it('dedups per account: the same message id on another bot account is a different message', () => {
+  it('dedups per account: the same message id on another bot account is a different message #HQ-2', () => {
     const q = new HostQueue();
     const a = item('same-id');
     expect(q.append(a)).toEqual({ cursor: 1, duplicate: false });
@@ -34,7 +34,7 @@ describe('HostQueue', () => {
     expect(q.append({ ...a })).toEqual({ cursor: 1, duplicate: true });
   });
 
-  it('appends idempotently on the channel reference: a redelivery returns the first cursor', async () => {
+  it('appends idempotently on the channel reference: a redelivery returns the first cursor #HQ-2', async () => {
     const q = new HostQueue();
     const a = item('same');
     expect(q.append(a)).toEqual({ cursor: 1, duplicate: false });
@@ -50,7 +50,7 @@ describe('HostQueue', () => {
     q.close();
   });
 
-  it('keeps one cursor per consumer; ack only moves forward; read after an explicit cursor', async () => {
+  it('keeps one cursor per consumer; ack only moves forward; read after an explicit cursor #HQ-1', async () => {
     const q = new HostQueue();
     for (let i = 0; i < 4; i++) q.append(item());
     expect((await q.read('a', { limit: 2 })).map((i) => i.cursor)).toEqual([1, 2]);
@@ -63,7 +63,7 @@ describe('HostQueue', () => {
     q.close();
   });
 
-  it('long-polls: read waits for the next append, or returns empty after waitMs', async () => {
+  it('long-polls: read waits for the next append, or returns empty after waitMs #HQ-1', async () => {
     const q = new HostQueue();
     const t0 = Date.now();
     expect(await q.read('a', { waitMs: 40 })).toEqual([]);
@@ -75,7 +75,7 @@ describe('HostQueue', () => {
     q.close();
   });
 
-  it('push: delivers in order and acks what the consumer accepts; retries a refusal', async () => {
+  it('push: delivers in order and acks what the consumer accepts; retries a refusal #HQ-1', async () => {
     const q = new HostQueue();
     q.append(item('p1'));
     const got: string[] = [];
@@ -101,7 +101,7 @@ describe('HostQueue', () => {
     q.close();
   });
 
-  it('push: unacked items are redelivered after a reconnect (at least once), also across a restart', async () => {
+  it('push: unacked items are redelivered after a reconnect (at least once), also across a restart #HQ-1 #RS-1', async () => {
     const path = join(mkdtempSync(join(tmpdir(), 'aio-hq-')), 'q.sqlite');
     dirs.push(join(path, '..'));
     const one = new HostQueue({ path });
@@ -142,7 +142,7 @@ describe('HostQueue', () => {
     two.close();
   });
 
-  it('a new subscription for the same consumer replaces the old one', async () => {
+  it('a new subscription for the same consumer replaces the old one #HQ-1', async () => {
     const q = new HostQueue();
     const a = q.subscribe('xwo', () => new Promise(() => {}));
     const b = q.subscribe('xwo', () => true);
@@ -154,7 +154,7 @@ describe('HostQueue', () => {
     q.close();
   });
 
-  it('retention: deletes only what every known consumer acked, after retainAckedMs', async () => {
+  it('retention: deletes only what every known consumer acked, after retainAckedMs #HQ-1', async () => {
     let now = 1_000;
     const q = new HostQueue({ now: () => now, retainAckedMs: 100 });
     for (let i = 0; i < 3; i++) q.append(item(`k${i}`));

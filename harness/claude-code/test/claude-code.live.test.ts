@@ -21,7 +21,7 @@ const options = (extra: Record<string, unknown> = {}) => ({ env: fileEnv, ...ext
 /** Runs the real local `claude` CLI. Costs a few cents; opt in with AGENTS_IO_LIVE_CLAUDE=1. */
 describe.skipIf(!live)('live Claude Code', () => {
   it(
-    'one cheap turn produces a conforming stream',
+    'one cheap turn produces a conforming stream #HC-1',
     async () => {
       const dir = mkdtempSync(join(tmpdir(), 'agents-io-cc-'));
       const h = new ClaudeCodeHarness();
@@ -57,7 +57,7 @@ describe.skipIf(!live)('live Claude Code', () => {
   );
 
   it(
-    'a default-mode turn routes Bash through request.opened and respond()',
+    'a default-mode turn routes Bash through request.opened and respond() #RQ-1',
     async () => {
       const dir = mkdtempSync(join(tmpdir(), 'agents-io-cc-'));
       const h = new ClaudeCodeHarness();

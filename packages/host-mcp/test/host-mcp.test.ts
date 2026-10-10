@@ -4,78 +4,19 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { PROTOCOL_VERSION, type ChannelCaps, type InboundEnvelope, type InputRecord, type ReplyRoute, type TurnContext } from '@agents-io/protocol';
-import { Hub, MemorySessionLog, Outbox, WatchDispatcher, WatchRegistry, defaultPolicy } from '@agents-io/session';
+import type { ReplyRoute } from '@agents-io/protocol';
+import { Hub, MemorySessionLog, Outbox, defaultPolicy } from '@agents-io/session';
 import { FakeChannel, defaultChannelCaps } from '@agents-io/testkit';
-import {
-  CHOICE_KEY,
-  HostMcpServer,
-  HostTools,
-  MENTIONS_KEY,
-  MemoryBlobStore,
-  OUTPUT_EVENT,
-  TOOL_NAMES,
-  ToolError,
-  choiceActionId,
-  parseChoiceActionId,
-  agentOrigin,
-  type OutputRecord,
-} from '../src/index.js';
-
-const SK = 's1';
-const route = (conversationId = 'c1', channel = 'fake'): ReplyRoute => ({ channel, account: 'default', conversationId, replyToMessageId: 'm0' });
-
-function input(r: ReplyRoute | null, principal = 'fake:alice'): InputRecord {
-  return {
-    inputId: 'in1',
-    origin: { kind: 'human', principal: { id: principal, labels: ['owner'] }, evidence: 'platform_signed', via: 'fake:default:c1', adapter: r?.channel ?? 'fake' },
-    content: [{ type: 'text', text: 'hi' }],
-    replyRoute: r,
-    channelContext: { channel: r?.channel ?? 'fake', conversationKind: 'dm', senderName: 'Alice' },
-  };
-}
-
-function turnOf(r: ReplyRoute | null, profile = 'bypass'): TurnContext {
-  return { sessionKey: SK, turnId: 't1', run: { harness: 'fake', model: 'm', profile }, inputs: [input(r)], replyRoute: r, deliveries: [] };
-}
-
-const NO_MEDIA: ChannelCaps = { ...defaultChannelCaps, buttons: false, media: { in: [], out: [] } };
-
-function world(o: { turn?: TurnContext | undefined; routes?: string[]; cwd?: string } = {}) {
-  const hub = new Hub(new MemorySessionLog());
-  const policy = defaultPolicy({ owners: ['fake:alice'], routes: o.routes ?? [] });
-  const outbox = new Outbox({ hub, policy, sleep: async () => {} });
-  const fake = new FakeChannel('fake', defaultChannelCaps);
-  const mail = new FakeChannel('mail', NO_MEDIA);
-  const blobs = new MemoryBlobStore();
-  const cwd = o.cwd ?? mkdtempSync(join(tmpdir(), 'aio-mcp-'));
-  let turn: TurnContext | undefined = 'turn' in o ? o.turn : turnOf(route());
-  const tools = new HostTools({
-    hub,
-    outbox,
-    policy,
-    turn: () => turn,
-    adapter: (r) => (r.channel === 'fake' ? fake : r.channel === 'mail' ? mail : undefined),
-    blobs,
-    cwd: () => cwd,
-    routes: () => o.routes ?? [],
-  });
-  const events = () => hub.log.read(SK, 0);
-  const outputs = () => events().filter((e) => e.body.t === 'native' && e.body.name === OUTPUT_EVENT).map((e) => e.native as OutputRecord);
-  return { hub, outbox, fake, mail, blobs, cwd, tools, events, outputs, setTurn: (t: TurnContext | undefined) => (turn = t) };
-}
-
-const B = { sessionKey: SK, generation: 1 };
-const call = (w: ReturnType<typeof world>, name: string, args: Record<string, unknown>, id?: string) =>
-  w.tools.call(B, name, args, id ? { toolCallId: id } : { requestId: Math.random() }).then((t) => JSON.parse(t));
+import { HostMcpServer, HostTools, MemoryBlobStore, OUTPUT_EVENT, TOOL_NAMES, ToolError, agentOrigin, type OutputRecord } from '../src/index.js';
+import { B, SK, call, route, turnOf, watchWorld, world } from './host-mcp-helpers.js';
 
 describe('HostTools', () => {
-  it('refuses when no turn is running', async () => {
+  it('refuses when no turn is running #EX-3', async () => {
     const w = world({ turn: undefined });
     await expect(call(w, 'send_message', { route: 'current', text: 'x' })).rejects.toThrow(/no turn is running/);
   });
 
-  it('send_message to the current route delivers through the outbox and records the output', async () => {
+  it('send_message to the current route delivers through the outbox and records the output #DL-1 #DL-2', async () => {
     const w = world();
     const r = await call(w, 'send_message', { route: 'current', text: 'hello' }, 'toolu_1');
     expect(r.ok).toBe(true);
@@ -89,7 +30,7 @@ describe('HostTools', () => {
     expect(settled[0]!.body).toMatchObject({ result: 'delivered', operationId: 'tool:s1:toolu_1' });
   });
 
-  it('tags every write with the turn provenance (never blocks it)', async () => {
+  it('tags every write with the turn provenance (never blocks it) #EX-3', async () => {
     const hub = new Hub(new MemorySessionLog());
     const policy = defaultPolicy({ owners: ['fake:alice'] });
     const fake = new FakeChannel('fake', defaultChannelCaps);
@@ -113,14 +54,7 @@ describe('HostTools', () => {
     expect(asked).toContain('s1/t1');
   });
 
-  it('reply_to keeps the reply target; message_id overrides it', async () => {
-    const w = world();
-    await call(w, 'reply_to', { route: 'current', text: 'a' }, 'c1');
-    await call(w, 'reply_to', { route: 'current', text: 'b', message_id: 'm9' }, 'c2');
-    expect(w.fake.sent.map((s) => s.route.replyToMessageId)).toEqual(['m0', 'm9']);
-  });
-
-  it('is idempotent per tool call id', async () => {
+  it('is idempotent per tool call id #DL-2', async () => {
     const w = world();
     await call(w, 'send_message', { route: 'current', text: 'once' }, 'toolu_same');
     await call(w, 'send_message', { route: 'current', text: 'once' }, 'toolu_same');
@@ -129,7 +63,7 @@ describe('HostTools', () => {
     expect(w.events().filter((e) => e.body.t === 'delivery.settled')).toHaveLength(1);
   });
 
-  it('denies destinations outside Policy.outbound with a clear error and a notice', async () => {
+  it('denies destinations outside Policy.outbound with a clear error and a notice #DL-5', async () => {
     const w = world();
     const err = await call(w, 'send_message', { route: 'fake:default:other', text: 'leak' }).catch((e) => e);
     expect(err).toBeInstanceOf(ToolError);
@@ -139,24 +73,13 @@ describe('HostTools', () => {
     expect(w.events().some((e) => e.body.t === 'notice' && e.body.message.includes('denied'))).toBe(true);
   });
 
-  it('allows preregistered routes', async () => {
+  it('allows preregistered routes #DL-5', async () => {
     const w = world({ routes: ['fake:default:ops'] });
     await call(w, 'send_message', { route: 'fake:default:ops', text: 'fyi' });
     expect(w.fake.sent[0]!.route.conversationId).toBe('ops');
   });
 
-  it('send_file uploads to the blob store and sends an attachment', async () => {
-    const w = world();
-    writeFileSync(join(w.cwd, 'README.md'), '# hi\n');
-    const r = await call(w, 'send_file', { path: 'README.md', caption: 'here' });
-    expect(r).toMatchObject({ ok: true, name: 'README.md', mime: 'text/markdown', bytes: 5 });
-    const att = w.fake.sent[0]!.msg.attachments![0]!;
-    expect(w.fake.sent[0]!.msg.text).toBe('here');
-    expect(att.name).toBe('README.md');
-    expect(new TextDecoder().decode((await w.blobs.get(att.ref)).bytes)).toBe('# hi\n');
-  });
-
-  it('send_file refuses missing files, both/neither args, outside cwd in a restricted turn, and channels without media', async () => {
+  it('send_file refuses missing files, both/neither args, outside cwd in a restricted turn, and channels without media #SE-4', async () => {
     const w = world({ turn: turnOf(route(), 'restricted') });
     await expect(call(w, 'send_file', { path: 'nope.txt' })).rejects.toThrow(/file not found/);
     await expect(call(w, 'send_file', {})).rejects.toThrow(/exactly one/);
@@ -168,7 +91,7 @@ describe('HostTools', () => {
     await expect(call(w, 'send_file', { path: 'a.txt' })).rejects.toThrow(/cannot send files/);
   });
 
-  it('send_file in a restricted turn: symlinks and .. cannot escape the working directory', async () => {
+  it('send_file in a restricted turn: symlinks and .. cannot escape the working directory #SE-4', async () => {
     const w = world({ turn: turnOf(route(), 'restricted') });
     const other = mkdtempSync(join(tmpdir(), 'aio-out-'));
     writeFileSync(join(other, 'secret.txt'), 'x');
@@ -190,7 +113,7 @@ describe('HostTools', () => {
     expect((await call(w, 'send_file', { path: join(w.cwd, 'sub', 'ok.txt') })).ok).toBe(true);
   });
 
-  it('send_file on the local route is event-only (no adapter), still settled', async () => {
+  it('send_file on the local route is event-only (no adapter), still settled #DL-1', async () => {
     const local: ReplyRoute = { channel: 'local', account: 'local', conversationId: SK };
     const w = world({ turn: turnOf(local) });
     writeFileSync(join(w.cwd, 'f.txt'), 'abc');
@@ -200,92 +123,11 @@ describe('HostTools', () => {
     expect(w.events().find((e) => e.body.t === 'delivery.settled')!.body).toMatchObject({ result: 'delivered', route: local });
   });
 
-  it('ask_choice renders buttons where the channel has them, a numbered list elsewhere', async () => {
-    const w = world();
-    const r = await call(w, 'ask_choice', { question: 'Red or blue?', options: ['red', 'blue'] }, 'q1');
-    expect(r.choiceId).toMatch(/^ch_/);
-    expect(r.note).toMatch(/next input/);
-    const msg = w.fake.sent[0]!.msg;
-    expect(msg.actions!.map((a) => a.id)).toEqual([choiceActionId(r.choiceId, 1), choiceActionId(r.choiceId, 2)]);
-    expect((msg.channelData as Record<string, unknown>)[CHOICE_KEY]).toMatchObject({ choiceId: r.choiceId, options: ['red', 'blue'], multi: false });
-
-    w.setTurn(turnOf(route('c1', 'mail')));
-    await call(w, 'ask_choice', { question: 'Pick', options: ['a', 'b', 'c'], multi: true }, 'q2');
-    const text = w.mail.sent[0]!.msg.text;
-    expect(text).toContain('1. a\n2. b\n3. c');
-    expect(text).toMatch(/numbers of your choices/);
-    expect(w.mail.sent[0]!.msg.actions).toBeUndefined();
-  });
-
-  it('a button click and a numbered reply come back as a choice event for the asking session', async () => {
-    const w = world();
-    const r = await call(w, 'ask_choice', { question: 'Red or blue?', options: ['red', 'blue'] }, 'q1');
-    const env = (content: InboundEnvelope['content'], r2 = route()): InboundEnvelope => ({
-      v: PROTOCOL_VERSION,
-      id: 'e1',
-      channel: 'fake',
-      account: 'default',
-      conversation: { id: 'c1', kind: 'other' },
-      sender: { channelUserId: 'alice', evidence: 'platform_signed' },
-      content,
-      replyRoute: r2,
-    });
-    const origin = input(route()).origin;
-    const click = w.tools.rewriteInbound({ env: env([{ type: 'event', name: 'action', data: { actionId: choiceActionId(r.choiceId, 2) } }]), origin, sessionKey: 'elsewhere' });
-    expect(click!.sessionKey).toBe(SK);
-    expect(click!.content![0]).toMatchObject({ type: 'event', name: 'choice', data: { choiceId: r.choiceId, selected: [{ n: 2, label: 'blue' }], via: 'button' } });
-    // answered: a later number is just text again
-    expect(w.tools.rewriteInbound({ env: env([{ type: 'text', text: '1' }]), origin, sessionKey: SK })).toBeUndefined();
-
-    const r2 = await call(w, 'ask_choice', { question: 'Again?', options: ['yes', 'no'] }, 'q2');
-    const reply = w.tools.rewriteInbound({ env: env([{ type: 'text', text: 'Subject: Re: x\n 1 ' }]), origin, sessionKey: SK });
-    expect(reply!.content![0]).toMatchObject({ data: { choiceId: r2.choiceId, selected: [{ n: 1, label: 'yes' }], via: 'reply' } });
-    // unrelated text or other routes are left alone
-    expect(w.tools.rewriteInbound({ env: env([{ type: 'text', text: 'red please' }]), origin, sessionKey: SK })).toBeUndefined();
-  });
-
-  it('local /choose input is normalized; bad answers are refused', async () => {
-    const w = world();
-    const r = await call(w, 'ask_choice', { question: 'Q', options: ['x', 'y'] }, 'q1');
-    const out = w.tools.normalizeLocal([{ type: 'event', name: 'choice', data: { choiceId: r.choiceId, selected: [2] } }]);
-    expect(out[0]).toMatchObject({ data: { selected: [{ n: 2, label: 'y' }], via: 'command' } });
-    expect(() => w.tools.normalizeLocal([{ type: 'event', name: 'choice', data: { choiceId: r.choiceId, selected: [3] } }])).toThrow(/between 1 and 2/);
-    expect(() => w.tools.normalizeLocal([{ type: 'event', name: 'choice', data: { choiceId: 'ch_nope', selected: [1] } }])).toThrow(/unknown choice/);
-  });
-
-  it('choices survive a restart through the session log', async () => {
+  it('choices survive a restart through the session log #RS-1', async () => {
     const w = world();
     const r = await call(w, 'ask_choice', { question: 'Q', options: ['x', 'y'] }, 'q1');
     const fresh = new HostTools({ hub: w.hub, outbox: w.outbox, policy: defaultPolicy({ owners: [] }), turn: () => undefined, adapter: () => undefined, blobs: w.blobs, cwd: () => w.cwd });
     expect(fresh.choiceAnswer(r.choiceId, [1], 'button').sessionKey).toBe(SK);
-  });
-
-  it('mention carries targets in channelData and names in the text fallback', async () => {
-    const w = world();
-    await call(w, 'mention', { user_ids: ['fake:alice', 'bob'], text: 'please look' });
-    const msg = w.fake.sent[0]!.msg;
-    expect(msg.text).toBe('@Alice @bob please look');
-    expect((msg.channelData as Record<string, unknown>)[MENTIONS_KEY]).toEqual({ targets: [{ id: 'alice', name: 'Alice' }, { id: 'bob' }], text: 'please look' });
-  });
-
-  it('get_channel_context summarises the route, caps, tier and participants', async () => {
-    const w = world({ routes: ['fake:default:ops'] });
-    const c = await call(w, 'get_channel_context', {});
-    expect(c).toMatchObject({
-      route: 'fake:default:c1',
-      channel: 'fake',
-      conversationKind: 'dm',
-      tier: 'card',
-      caps: { buttons: true, mediaOut: ['image', 'file'], markdown: 'basic' },
-      participants: [{ principal: 'fake:alice', userId: 'alice', name: 'Alice' }],
-      allowedDestinations: { current: 'fake:default:c1', preregistered: ['fake:default:ops'] },
-    });
-  });
-
-  it('parses choice action ids', () => {
-    expect(parseChoiceActionId(choiceActionId('ch_1', 3))).toEqual({ choiceId: 'ch_1', n: 3 });
-    expect(parseChoiceActionId(choiceActionId('ch_1', 'form'))).toEqual({ choiceId: 'ch_1', n: 'form' });
-    expect(parseChoiceActionId('req:x:allow_once')).toBeUndefined();
   });
 });
 
@@ -302,7 +144,7 @@ describe('HostMcpServer (streamable HTTP)', () => {
     return client;
   }
 
-  it('listens on loopback only', async () => {
+  it('listens on loopback only #SE-3', async () => {
     const w = world();
     const s = new HostMcpServer({ tools: w.tools });
     servers.push(s);
@@ -312,7 +154,7 @@ describe('HostMcpServer (streamable HTTP)', () => {
     }
   });
 
-  it('rejects requests without a valid token', async () => {
+  it('rejects requests without a valid token #SE-3', async () => {
     const w = world();
     const s = new HostMcpServer({ tools: w.tools });
     servers.push(s);
@@ -325,7 +167,7 @@ describe('HostMcpServer (streamable HTTP)', () => {
     await expect(connect(url, t)).rejects.toThrow();
   });
 
-  it('lists the tools and maps the harness tool-call id from _meta to the operationId', async () => {
+  it('lists the tools and maps the harness tool-call id from _meta to the operationId #DL-2 #DL-5', async () => {
     const w = world();
     const calls: { tool: string; meta: unknown }[] = [];
     const s = new HostMcpServer({ tools: w.tools, onCall: (e) => calls.push({ tool: e.tool, meta: e.meta }) });
@@ -350,25 +192,7 @@ describe('HostMcpServer (streamable HTTP)', () => {
 });
 
 describe('watch tools', () => {
-  function watchWorld() {
-    const hub = new Hub(new MemorySessionLog());
-    const policy = defaultPolicy({ owners: ['fake:alice'], watchAllowlist: [{ channel: 'lark-bot', conversation: 'oc_team' }] });
-    const d = new WatchDispatcher({ registry: new WatchRegistry(), policy, lanes: () => { throw new Error('no lanes'); } });
-    const tools = new HostTools({
-      hub,
-      outbox: new Outbox({ hub }),
-      policy,
-      turn: () => undefined,
-      adapter: () => undefined,
-      blobs: new MemoryBlobStore(),
-      cwd: () => '/',
-      watches: { add: (by, w) => d.add(by, w), remove: (by, id) => d.remove(by, id), list: (sk) => d.list({ target: sk }) },
-    });
-    const run = (sk: string, name: string, args: Record<string, unknown>) => tools.call({ sessionKey: sk, generation: 1 }, name, args).then((t) => JSON.parse(t));
-    return { d, tools, run };
-  }
-
-  it('adds a watch pinned to the caller session, created by its agent identity', async () => {
+  it('adds a watch pinned to the caller session, created by its agent identity #CF-7 #DL-4b', async () => {
     const w = watchWorld();
     const r = await w.run(SK, 'watch_add', { source: { channel: 'lark-bot', conversation: 'oc_team' }, mode: 'digest', digest_every_minutes: 30, keywords: ['deploy'], note: 'follow deploys' });
     expect(r.watch).toMatchObject({ target: { sessionKey: SK }, mode: 'digest', digest: { everyMs: 1_800_000 }, filter: { keywords: ['deploy'] }, createdBy: `session:${SK}`, mine: true });
@@ -377,24 +201,12 @@ describe('watch tools', () => {
     expect(await w.run('other', 'watch_list', {})).toMatchObject({ watches: [] });
   });
 
-  it('forbids a target argument', async () => {
+  it('forbids a target argument #CF-7', async () => {
     const w = watchWorld();
     await expect(w.run(SK, 'watch_add', { source: { channel: 'lark-bot', conversation: 'oc_team' }, mode: 'context', target: { sessionKey: 'main' } })).rejects.toThrow(/always delivers to your own session/);
   });
 
-  it('denies sources off the owner allowlist with a clear error', async () => {
-    const w = watchWorld();
-    await expect(w.run(SK, 'watch_add', { source: { channel: 'lark-bot', conversation: 'oc_secret' }, mode: 'trigger' })).rejects.toThrow(/not on the owner's watch allowlist/);
-    expect(w.d.list()).toHaveLength(0);
-  });
-
-  it('validates mode and digest period', async () => {
-    const w = watchWorld();
-    await expect(w.run(SK, 'watch_add', { source: { channel: 'lark-bot', conversation: 'oc_team' }, mode: 'digest' })).rejects.toThrow(/digest_every_minutes/);
-    await expect(w.run(SK, 'watch_add', { source: { channel: 'lark-bot' }, mode: 'loud' })).rejects.toThrow(/mode must be/);
-  });
-
-  it('removes only watches the agent created', async () => {
+  it('removes only watches the agent created #CF-7', async () => {
     const w = watchWorld();
     const owner = { kind: 'human' as const, principal: { id: 'fake:alice', labels: ['owner'] }, evidence: 'platform_signed' as const, via: 'fake:default:c1', adapter: 'fake' };
     const theirs = await w.d.add(owner, { id: 'w_owner', source: { channel: 'lark-bot', conversation: 'oc_any' }, target: { sessionKey: SK }, mode: 'context' });
@@ -407,7 +219,7 @@ describe('watch tools', () => {
     expect(w.d.list().map((x) => x.id)).toEqual(['w_owner']);
   });
 
-  it('are listed over MCP only when the host provides watches', async () => {
+  it('are listed over MCP only when the host provides watches #CF-6', async () => {
     const w = watchWorld();
     const s = new HostMcpServer({ tools: w.tools });
     await s.listen();

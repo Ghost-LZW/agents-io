@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { SessionEvent } from '@agents-io/protocol';
-import { Hub, MemorySessionLog, isSnapshotEvent, passes } from '../src/index.js';
+import { Hub, MemorySessionLog, isSnapshotEvent } from '../src/index.js';
 import { draft, take } from './helpers.js';
 
 const seqs = (evs: SessionEvent[]) => evs.filter((e) => e.durability === 'durable').map((e) => e.seq);
@@ -12,7 +12,7 @@ function seeded(n: number, opts: { retain?: number } = {}) {
 }
 
 describe('Hub', () => {
-  it('resumes from a seq: replay then live, no gaps', async () => {
+  it('resumes from a seq: replay then live, no gaps #LN-1', async () => {
     const hub = seeded(5);
     const sub = hub.subscribe({ sessionKey: 's', fromSeq: 3, tier: 'full' });
     hub.append('s', draft({ t: 'headline', text: 'live' }));
@@ -21,7 +21,7 @@ describe('Hub', () => {
     sub.close();
   });
 
-  it('sends a snapshot first to a late joiner', async () => {
+  it('sends a snapshot first to a late joiner #LN-1', async () => {
     const hub = seeded(2);
     hub.append('s', draft({ t: 'text.delta', delta: 'partial', stream: 'answer' }));
     const sub = hub.subscribe({ sessionKey: 's', tier: 'card' });
@@ -33,7 +33,7 @@ describe('Hub', () => {
     sub.close();
   });
 
-  it('sends a snapshot when fromSeq is behind what the log retains', async () => {
+  it('sends a snapshot when fromSeq is behind what the log retains #LN-1', async () => {
     const hub = seeded(10, { retain: 3 });
     const sub = hub.subscribe({ sessionKey: 's', fromSeq: 2, tier: 'full' });
     const [snap] = await take(sub, 1);
@@ -45,7 +45,7 @@ describe('Hub', () => {
     sub.close();
   });
 
-  it('gives two subscribers the same durable sequence', async () => {
+  it('gives two subscribers the same durable sequence #LN-1', async () => {
     const hub = seeded(3);
     const a = hub.subscribe({ sessionKey: 's', fromSeq: 0, tier: 'full' });
     const b = hub.subscribe({ sessionKey: 's', fromSeq: 1, tier: 'full' });
@@ -60,7 +60,7 @@ describe('Hub', () => {
     expect(eb).toEqual(ea.slice(1));
   });
 
-  it('drops only ephemeral events for a slow subscriber, then catches up from the log', async () => {
+  it('drops only ephemeral events for a slow subscriber, then catches up from the log #LN-1', async () => {
     const hub = new Hub(new MemorySessionLog());
     const slow = hub.subscribe({ sessionKey: 's', fromSeq: 0, tier: 'full', bufferSize: 4 });
     const fast = hub.subscribe({ sessionKey: 's', fromSeq: 0, tier: 'full' });
@@ -82,7 +82,7 @@ describe('Hub', () => {
     expect((await take(slow, 1))[0]).toMatchObject({ durability: 'ephemeral', body: { delta: 'again' } });
   });
 
-  it('filters by tier and never filters out human approvals', async () => {
+  it('filters by tier and never filters out human approvals #RQ-5', async () => {
     const hub = new Hub(new MemorySessionLog());
     const subs = {
       full: hub.subscribe({ sessionKey: 's', fromSeq: 0, tier: 'full' }),
@@ -113,7 +113,7 @@ describe('Hub', () => {
     expect(await kinds('final', 3)).toEqual(['request.opened', 'request.resolved', 'text.snapshot']);
   });
 
-  it('a lagging subscription yields nothing more once closed', async () => {
+  it('a lagging subscription yields nothing more once closed #LN-1', async () => {
     const hub = new Hub(new MemorySessionLog());
     const ac = new AbortController();
     const sub = hub.subscribe({ sessionKey: 's', fromSeq: 0, tier: 'full', bufferSize: 2, signal: ac.signal });
@@ -125,7 +125,7 @@ describe('Hub', () => {
     expect(got).toEqual([]);
   });
 
-  it("a late joiner's snapshot holds only what its visibility and tier would show live", async () => {
+  it("a late joiner's snapshot holds only what its visibility and tier would show live #LN-1", async () => {
     const hub = new Hub(new MemorySessionLog());
     const item = (itemId: string) => ({ itemId, type: 'command' as const, title: 't', status: 'running' as const, inputSummary: `SECRET ${itemId}` });
     hub.append('s', draft({ t: 'item.started', item: item('dbg') }, { level: 'debug', visibility: 'operators' }));
@@ -136,22 +136,5 @@ describe('Hub', () => {
     expect(await first('card')).toEqual([{ itemId: 'ok', type: 'command', title: 't', status: 'running' }]);
     expect((await first('full')).map((i) => i.itemId)).toEqual(['ok']);
     expect((await first('full'))[0]!.inputSummary).toBe('SECRET ok');
-  });
-
-  it('knows which session a turn or request belongs to', () => {
-    const hub = new Hub(new MemorySessionLog());
-    hub.append('a', draft({ t: 'turn.started', turnId: 't1', inputIds: [], replyRoute: null }));
-    hub.append('b', draft({ t: 'request.opened', requestId: 'r1', kind: 'tool_approval', title: 'x', risk: {}, allowedDecisions: [], allowAlways: false, defaultDeny: true }));
-    hub.append('c', draft({ t: 'turn.adopted', turnId: 't2', nativeTurnId: 'n', inputIds: [] }));
-    expect(hub.locate({ turnId: 't1' })).toBe('a');
-    expect(hub.locate({ requestId: 'r1' })).toBe('b');
-    expect(hub.locate({ turnId: 't2' })).toBe('c');
-    expect(hub.locate({ turnId: 'nope' })).toBeUndefined();
-  });
-
-  it('keeps internal events out unless asked for', () => {
-    const e = { ...draft({ t: 'headline', text: 'x' }), v: 1, sessionKey: 's', seq: 1, harness: 'h', generation: 1, visibility: 'internal' } as SessionEvent;
-    expect(passes(e, 'full')).toBe(false);
-    expect(passes(e, 'full', {}, ['internal'])).toBe(true);
   });
 });

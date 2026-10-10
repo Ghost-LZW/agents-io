@@ -2,8 +2,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { HarnessOpenArgs, HarnessSession, LiveEndpoint, LiveStartArgs, SessionEvent } from '@agents-io/protocol';
-import { MemorySessionLog } from '@agents-io/session';
+import type { HarnessOpenArgs, HarnessSession, LiveEndpoint, LiveFrame, LiveStartArgs, LiveTransport, Policy, SessionEvent } from '@agents-io/protocol';
+import { MemorySessionLog, SqliteSessionLog, type SessionLog } from '@agents-io/session';
 import { FakeChannel, FakeHarness, type FakeHarnessSession, type FakeTurnScript } from '@agents-io/testkit';
 import { LocalClient } from '../src/client.js';
 import { resolveConfig } from '../src/config.js';
@@ -39,6 +39,13 @@ async function mcpCall(mcp: { url: string; token: string } | undefined, name: st
 class LiveFakeHarness extends FakeHarness {
   readonly starts: LiveStartArgs[] = [];
   readonly said: string[] = [];
+  /** Transports the fake's live takes (undefined: the default, webrtc only). */
+  transports?: LiveTransport[];
+  private readonly enders: ((reason: string) => void)[] = [];
+  /** The harness side ends every running live on its own (voice closed, harness gone). */
+  endFromHarness(reason: string): void {
+    for (const e of this.enders) e(reason);
+  }
   override async open(args: HarnessOpenArgs): Promise<HarnessSession> {
     const s = (await super.open(args)) as FakeHarnessSession;
     let current: string | undefined;
@@ -47,8 +54,11 @@ class LiveFakeHarness extends FakeHarness {
       s.queue.push({ ts: Date.now(), level: 'primary', audience: 'status', durability: 'durable', body: { t: 'live.ended', liveId: current, reason } });
       current = undefined;
     };
+    this.enders.push(end);
+    const transports = this.transports;
     Object.assign(s, {
       live: {
+        ...(transports ? { transports } : {}),
         start: async (a: LiveStartArgs) => {
           this.starts.push(a);
           current = a.liveId;
@@ -64,6 +74,8 @@ class LiveFakeHarness extends FakeHarness {
 
 /** FakeChannel that joins "meetings". */
 class MeetingChannel extends FakeChannel {
+  /** Offer frames endpoints instead of webrtc. */
+  frames = false;
   readonly endpoints: (LiveEndpoint & { answers: string[]; closes: string[]; hangUp(reason: string): void })[] = [];
   async openLive(account: string, target: string): Promise<LiveEndpoint> {
     if (target === 'busy') throw new Error('MEETING_PARTICIPANT_BUSY');
@@ -74,7 +86,8 @@ class MeetingChannel extends FakeChannel {
       id: `p${this.endpoints.length + 1}`,
       title: `meeting ${target}`,
       route: { channel: this.id, account, conversationId: `meeting:${target}` },
-      offer: { type: 'webrtc' as const, sdp: 'OFFER' },
+      offer: this.frames ? ({ type: 'frames' as const, audio: { encoding: 'pcm16' as const, rate: 24000 } }) : ({ type: 'webrtc' as const, sdp: 'OFFER' }),
+      ...(this.frames ? { media: { frames: (async function* (): AsyncGenerator<LiveFrame> {})(), send: () => {} } } : {}),
       answers: [] as string[],
       closes: [] as string[],
       ended,
@@ -90,14 +103,18 @@ class MeetingChannel extends FakeChannel {
   }
 }
 
-async function setup(script: FakeTurnScript) {
-  const dir = mkdtempSync(join(tmpdir(), 'aio-live-'));
+async function setup(
+  script: FakeTurnScript,
+  o: { dir?: string; log?: SessionLog; harness?: LiveFakeHarness; chat?: MeetingChannel; policy?: Partial<Policy> } = {},
+) {
+  const dir = o.dir ?? mkdtempSync(join(tmpdir(), 'aio-live-'));
   const base = resolveConfig({ policy: { owners: ['fake:alice'] }, local: { principal: 'me' }, outputTools: true }, { env: {}, baseDir: dir, cwd: dir });
   const config = { ...base, socketPath: join(dir, 'run', 'aio.sock'), blobs: { ...base.blobs, dir: join(dir, 'blobs') } };
-  const chat = new MeetingChannel('fake');
-  const harness = new LiveFakeHarness(script);
-  const gw = await Gateway.start({ config, harness, log: new MemorySessionLog(), channels: [{ adapter: chat }], logger: () => {} });
-  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const chat = o.chat ?? new MeetingChannel('fake');
+  const harness = o.harness ?? new LiveFakeHarness(script);
+  const log = o.log ?? new MemorySessionLog();
+  const gw = await Gateway.start({ config, harness, log, channels: [{ adapter: chat }], logger: () => {}, ...(o.policy ? { policy: o.policy } : {}) });
+  if (!o.dir) cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   cleanups.push(() => gw.stop());
   const c = await LocalClient.connect(config.socketPath);
   cleanups.push(() => c.close());
@@ -106,11 +123,11 @@ async function setup(script: FakeTurnScript) {
   void (async () => {
     for await (const e of sub) events.push(e);
   })();
-  return { gw, chat, harness, events };
+  return { gw, chat, harness, events, log, dir };
 }
 
 describe('live tools (decision 11)', () => {
-  it('live_join pairs the channel peer with the harness voice; the far side hanging up ends both; live_say / live_leave', async () => {
+  it('live_join pairs the channel peer with the harness voice; the far side hanging up ends both; live_say / live_leave #LN-3 #LN-4', async () => {
     const holder: { h?: LiveFakeHarness } = {};
     const results: Record<string, { isError: boolean; text: string }[]> = {};
     const w = await setup(async (t) => {
@@ -158,7 +175,7 @@ describe('live tools (decision 11)', () => {
     expect(w.harness.starts).toHaveLength(1);
   });
 
-  it('two concurrent live_join: one wins, the other is refused without touching the running live or opening an endpoint', async () => {
+  it('two concurrent live_join: one wins, the other is refused without touching the running live or opening an endpoint #LN-3', async () => {
     const holder: { h?: LiveFakeHarness } = {};
     const results: { isError: boolean; text: string }[] = [];
     const w = await setup(async (t) => {
@@ -179,7 +196,7 @@ describe('live tools (decision 11)', () => {
     expect(w.events.some((e) => e.body.t === 'live.ended')).toBe(false);
   });
 
-  it('live_leave ends the live; the gateway stopping ends a running one', async () => {
+  it('live_leave ends the live; the gateway stopping ends a running one #LN-4 #RS-8', async () => {
     const holder: { h?: LiveFakeHarness } = {};
     const results: { isError: boolean; text: string }[] = [];
     const w = await setup(async (t) => {
@@ -206,7 +223,7 @@ describe('live tools (decision 11)', () => {
 });
 
 describe('delegated turns', () => {
-  it('a delegated turn (no reply route) sends to "current" = the chat that opened the live', async () => {
+  it('a delegated turn (no reply route) sends to "current" = the chat that opened the live #LN-6', async () => {
     const holder: { h?: LiveFakeHarness } = {};
     const results: { isError: boolean; text: string }[] = [];
     const w = await setup(async () => {
@@ -230,5 +247,111 @@ describe('delegated turns', () => {
     expect(results[1]!.isError).toBe(false);
     expect(JSON.parse(results[1]!.text)).toMatchObject({ ok: true, delivered: 'fake:default:c1' });
     expect(w.chat.sent.some((m) => m.msg.text === 'result as text' && m.route.conversationId === 'c1')).toBe(true);
+  });
+});
+
+/** A script whose turns run `calls[text]` (tool name, args) over the session's MCP; results by text. */
+function toolTurns(calls: Record<string, [string, Record<string, unknown>]>) {
+  const holder: { h?: LiveFakeHarness } = {};
+  const results: Record<string, { isError: boolean; text: string }> = {};
+  const script: FakeTurnScript = async (t) => {
+    const text = t.inputs.flatMap((i) => i.content).map((c) => (c.type === 'text' ? c.text : '')).join(' ');
+    const call = calls[text];
+    if (call) results[text] = await mcpCall(holder.h!.sessions.at(-1)!.args.mcp, call[0], call[1], `${text}:${Date.now()}`);
+  };
+  return { holder, results, script };
+}
+const from = (chat: FakeChannel, text: string) => chat.inject({ sender: { channelUserId: 'alice', evidence: 'platform_signed' }, text });
+const KEY = 'fake:default:c1';
+const liveIdOf = (e: SessionEvent) => (e.body as { liveId?: string }).liveId;
+
+describe('live: ends, transports and destinations', () => {
+  it('the gateway stopping records live.ended in the log; the harness ending first closes the endpoint too #LN-4', async () => {
+    const t = toolTurns({ join: ['live_join', { target: '7' }] });
+    const w = await setup(t.script);
+    t.holder.h = w.harness;
+    await from(w.chat, 'join');
+    expect((await until(() => t.results['join'])).isError).toBe(false);
+
+    // Harness side first: the voice ends on its own; the gateway closes the channel endpoint.
+    w.harness.endFromHarness('voice closed');
+    await until(() => w.chat.endpoints[0]!.closes.length === 1);
+    expect(w.chat.endpoints[0]!.closes).toEqual(['voice closed']);
+    await until(() => w.log.read(KEY, 0).some((e) => e.body.t === 'live.ended'));
+
+    // A second live, then the daemon stops: the endpoint closes and the log has its live.ended.
+    delete t.results['join'];
+    await from(w.chat, 'join');
+    expect((await until(() => t.results['join'])).isError).toBe(false);
+    const second = w.harness.starts[1]!.liveId;
+    await w.gw.stop();
+    expect(w.chat.endpoints[1]!.closes).toEqual(['gateway stopping']);
+    expect(w.log.read(KEY, 0).filter((e) => e.body.t === 'live.ended').map(liveIdOf)).toContain(second);
+  });
+
+  // INVARIANTS LN-4 不成立（可能）: Codex sends live.ended only after thread/realtime/closed or a 5 s
+  // fallback, past leaveLive's 5 s bound; the fake harness cannot reproduce that timing, so no it.fails yet.
+  it.todo('the gateway stopping records live.ended even when the harness reports it late (Codex realtime) #LN-4');
+
+  it('a live does not survive a restart: no live after it, live_say says there is none, and the log ended it #RS-7', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'aio-live-'));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const t = toolTurns({ join: ['live_join', { target: '8' }], say: ['live_say', { text: 'still there?' }] });
+    const w = await setup(t.script, { dir, log: new SqliteSessionLog({ path: join(dir, 'log.sqlite') }) });
+    t.holder.h = w.harness;
+    await from(w.chat, 'join');
+    expect((await until(() => t.results['join'])).isError).toBe(false);
+    const liveId = w.harness.starts[0]!.liveId;
+    await w.gw.stop();
+
+    const log2 = new SqliteSessionLog({ path: join(dir, 'log.sqlite') });
+    const harness2 = new LiveFakeHarness(t.script);
+    t.holder.h = harness2;
+    const w2 = await setup(t.script, { dir, log: log2, harness: harness2 });
+    expect(log2.read(KEY, 0).some((e) => e.body.t === 'live.ended' && liveIdOf(e) === liveId)).toBe(true);
+    expect(JSON.stringify(log2.snapshot(KEY))).not.toContain(liveId);
+    await from(w2.chat, 'say');
+    const r = await until(() => t.results['say']);
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/no live is running/);
+    expect(harness2.said).toEqual([]);
+    expect(harness2.starts).toEqual([]);
+  });
+
+  it('a frames endpoint for a harness whose live takes webrtc only: refused before start, naming the transport; the endpoint is closed and no live is registered #LN-5', async () => {
+    const t = toolTurns({ join: ['live_join', { target: '5' }], say: ['live_say', { text: 'hi' }], again: ['live_join', { target: '6' }] });
+    const harness = new LiveFakeHarness(t.script);
+    harness.transports = ['webrtc'];
+    const chat = new MeetingChannel('fake');
+    chat.frames = true;
+    const w = await setup(t.script, { harness, chat });
+    t.holder.h = harness;
+    await from(chat, 'join');
+    const r = await until(() => t.results['join']);
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/does not take the frames transport/);
+    expect(r.text).toMatch(/webrtc/);
+    expect(harness.starts).toEqual([]);
+    expect(chat.endpoints[0]!.closes).toHaveLength(1);
+    expect(chat.endpoints[0]!.closes[0]).toMatch(/^join failed: .*frames/);
+    expect(w.events.some((e) => e.body.t === 'live.started')).toBe(false);
+    // Nothing registered: live_say has no live, and another join is not "already in a live".
+    await from(chat, 'say');
+    expect((await until(() => t.results['say'])).text).toMatch(/no live is running/);
+    await from(chat, 'again');
+    const again = await until(() => t.results['again']);
+    expect(again.text).not.toMatch(/already in a live|in progress/);
+    expect(chat.endpoints).toHaveLength(2);
+  });
+
+  // INVARIANTS DL-5 不成立 2: live_join's target (gateway.ts joinLive) never goes through Policy.outbound; turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails('live_join goes through the outbound check: a policy that denies every destination refuses it, no endpoint is opened #DL-5', async () => {
+    const t = toolTurns({ join: ['live_join', { target: '42' }] });
+    const w = await setup(t.script, { policy: { outbound: async () => 'deny' } });
+    t.holder.h = w.harness;
+    await from(w.chat, 'join');
+    const r = await until(() => t.results['join']);
+    expect(w.chat.endpoints).toHaveLength(0);
+    expect(r.isError).toBe(true);
   });
 });

@@ -8,6 +8,8 @@ agents-io 的 agent IO 层（多端输入 / 多端输出 / 过程可见 / 可扩
 
 **动手跑：[E2E.md](E2E.md)**：`packages/daemon`（`aio`，`examples/dev-gateway` 的 `aio-dev` 是它的旧名包装）把全部包接进一个进程，本地两个终端、真实飞书、多端与重启的端到端测试。
 
+**改代码前后：[TESTING.md](TESTING.md)**：测试的四层（core / local / e2e / live）、测试名里的 `#编号` 标签、`pnpm invariants:affected` 和红灯时该做什么。承诺清单在 [INVARIANTS.md](INVARIANTS.md)。
+
 **通道行为：[CHANNELS.md](CHANNELS.md)**：每个通道里 agent 能看到什么、它的输出怎么被渲染，以及和原生启动 harness 的区别。
 
 **再读：[RECOMMENDATION.md](RECOMMENDATION.md)**：边界内的设计，包括对比表、问题解答、架构、核心类型、实时端处理、批评取舍和 MVP 路线（r1 已按定位修订）。

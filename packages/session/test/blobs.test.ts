@@ -8,7 +8,7 @@ const tmp = () => mkdtemp(join(tmpdir(), 'aio-blobs-'));
 const bytes = (s: string) => new TextEncoder().encode(s);
 
 describe('FsBlobStore', () => {
-  it('is content-addressed (sha256), keeps mime and name, and round-trips bytes', async () => {
+  it('is content-addressed (sha256), keeps mime and name, and round-trips bytes #MD-1', async () => {
     const store = new FsBlobStore({ dir: join(await tmp(), 'blobs') });
     const ref = await store.put(bytes('hello'), { mime: 'image/png', name: 'a.png' });
     expect(ref).toBe('sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824');
@@ -22,7 +22,16 @@ describe('FsBlobStore', () => {
     expect(st!.path.endsWith('.png')).toBe(true);
   });
 
-  it('writes files 0600 under 0700 directories', async () => {
+  it('after a restart (a new store on the same directory) a reference reads back the same bytes, mime and name #RS-1', async () => {
+    const dir = join(await tmp(), 'blobs');
+    const data = new Uint8Array([0, 255, 1, 254, 128]);
+    const ref = await new FsBlobStore({ dir }).put(data, { mime: 'image/png', name: 'a.png' });
+    const got = await new FsBlobStore({ dir }).get(ref);
+    expect(got.bytes).toEqual(data);
+    expect(got).toMatchObject({ mime: 'image/png', name: 'a.png' });
+  });
+
+  it('writes files 0600 under 0700 directories #SE-2', async () => {
     const dir = join(await tmp(), 'blobs');
     const store = new FsBlobStore({ dir });
     const ref = await store.put(bytes('x'), { mime: 'application/octet-stream' });
@@ -33,7 +42,7 @@ describe('FsBlobStore', () => {
     expect((await stat(st!.path.replace(/\.bin$/, '.json'))).mode & 0o777).toBe(0o600);
   });
 
-  it('refuses blobs over the size limit, unknown refs and corrupted files', async () => {
+  it('refuses blobs over the size limit, unknown refs and corrupted files #MD-1', async () => {
     const store = new FsBlobStore({ dir: await tmp(), maxBytes: 4 });
     await expect(store.put(bytes('12345'), { mime: 'text/plain' })).rejects.toBeInstanceOf(BlobTooLargeError);
     await expect(store.get('lark-file:m/k')).rejects.toThrow(/not a blob ref/);

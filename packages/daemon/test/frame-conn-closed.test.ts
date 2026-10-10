@@ -3,7 +3,7 @@ import { PROTOCOL_VERSION } from '@agents-io/protocol';
 import { FrameConn, type FrameTransport } from '../src/local-server.js';
 
 describe('FrameConn after it ended', () => {
-  it('a connection replaced by a takeover acts on no more frames, even if its transport still delivers them', async () => {
+  it('a connection replaced by a takeover acts on no more frames, even if its transport still delivers them #HQ-6', async () => {
     const handled: string[] = [];
     const host = {
       hostFrames: {

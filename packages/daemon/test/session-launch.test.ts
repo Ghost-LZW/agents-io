@@ -136,7 +136,7 @@ const boundId = (w: W, key: string) => {
 const matched = (w: W, inputId: string) => w.gw.router.explain(inputId)!.matched.find((m) => m.bindingId === 'ask')!;
 
 describe('session launch: refused without sessionParams (§8.1)', () => {
-  it('a callout launch for an agent without sessionParams goes to onFailure; session.prepare says launch_not_allowed', async () => {
+  it('a callout launch for an agent without sessionParams goes to onFailure; session.prepare says launch_not_allowed #FC-4', async () => {
     const w = await world();
     const { h } = await calloutHost(w, () => ({ on: 'dispatch', agent: 'plain', session: { key: 'P1' }, launch: { cwd: w.fx.a } }));
     const r = await w.chat.inject({ id: 'm1', sender: alice, conversation: group(), text: 'hi' });
@@ -152,7 +152,7 @@ describe('session launch: refused without sessionParams (§8.1)', () => {
 describe('session launch: checks (§8.2–8.4)', () => {
   const prepare = (w: W, launch: SessionLaunch, key = `k${Math.random()}`) => w.gw.prepareSession({ v: 1, type: 'session.prepare', id: 'x', sessionKey: key, agent: 'dev', launch } as never);
 
-  it('cwd: relative, missing, a file, outside the roots, a symlink out of them are refused; a real dir inside (also via a link inside) is pinned by realpath', async () => {
+  it('cwd: relative, missing, a file, outside the roots, a symlink out of them are refused; a real dir inside (also via a link inside) is pinned by realpath #FC-4', async () => {
     const w = await world();
     const fx = w.fx;
     for (const cwd of ['ws/a', join(fx.ws, 'missing'), join(fx.ws, 'file'), fx.out, join(fx.ws, 'escape'), fx.d]) {
@@ -166,7 +166,7 @@ describe('session launch: checks (§8.2–8.4)', () => {
     expect(w.gw.sessions().find((s) => s.sessionKey === 'ok2')).toMatchObject({ live: false, launch: { cwd: fx.b, envKeys: [] } });
   });
 
-  it('env: keys outside envKeys, AGENTS_IO_*, malformed names are refused', async () => {
+  it('env: keys outside envKeys, AGENTS_IO_*, malformed names are refused #FC-4', async () => {
     const w = await world();
     for (const env of [{ HOME: '/x' }, { AGENTS_IO_MCP_TOKEN: 't' }, { '1BAD': 'x' }, { 'A-B': 'x' }]) {
       expect(prepare(w, { env })).toMatchObject({ ok: false, code: 'bad_env' });
@@ -174,7 +174,7 @@ describe('session launch: checks (§8.2–8.4)', () => {
     expect(prepare(w, { env: { GIT_AUTHOR_NAME: 'Ann', TOKEN: SECRET } }, 'e1')).toMatchObject({ ok: true, value: { launch: { envKeys: ['GIT_AUTHOR_NAME', 'TOKEN'] } } });
   });
 
-  it('path-valued env (CLAUDE_CONFIG_DIR): outside its roots, through a link out, missing are refused; inside accepted (realpath)', async () => {
+  it('path-valued env (CLAUDE_CONFIG_DIR): outside its roots, through a link out, missing are refused; inside accepted (realpath) #FC-4', async () => {
     const w = await world();
     const fx = w.fx;
     for (const v of [fx.out, join(fx.homes, 'escape'), join(fx.homes, 'nope'), 'homes/h1', fx.a]) {
@@ -183,10 +183,21 @@ describe('session launch: checks (§8.2–8.4)', () => {
     expect(prepare(w, { env: { CLAUDE_CONFIG_DIR: fx.h1 } }, 'p1')).toMatchObject({ ok: true });
     expect(w.gw.records.launchOf('p1')).toEqual({ env: { CLAUDE_CONFIG_DIR: fx.h1 } });
   });
+
+  // INVARIANTS SE-1 不成立 1: launch.ts underRoots puts the refused path value into the bad_env message; turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails('a refused path-valued env names the key, never the value #SE-1', async () => {
+    const w = await world();
+    for (const v of [w.fx.out, 'homes/h1', join(w.fx.homes, 'nope')]) {
+      const r = prepare(w, { env: { CLAUDE_CONFIG_DIR: v } }) as { ok: false; code: string; message: string };
+      expect(r).toMatchObject({ ok: false, code: 'bad_env' });
+      expect(JSON.stringify(r)).toContain('CLAUDE_CONFIG_DIR');
+      expect(JSON.stringify(r)).not.toContain(v);
+    }
+  });
 });
 
 describe('session launch: the launched adapter is what runs (§8.5)', () => {
-  it('cwd and env reach the harness through harnessFor; another session of the agent keeps its cwd; no restart between turns; another instance chosen by plan keeps the launch', async () => {
+  it('cwd and env reach the harness through harnessFor; another session of the agent keeps its cwd; no restart between turns; another instance chosen by plan keeps the launch #LA-3', async () => {
     const plan: Policy['plan'] = async (d) => {
       const text = d.inputs.flatMap((i) => i.content).map((c) => (c.type === 'text' ? c.text : '')).join(' ');
       return { harness: text.includes('other') ? 'other' : 'claude', model: 'm', profile: 'restricted' };
@@ -224,7 +235,7 @@ describe('session launch: the launched adapter is what runs (§8.5)', () => {
 });
 
 describe('session launch: pinned with the session (§8.6–8.7)', () => {
-  it('the same launch again passes; another one is launch_conflict and the input waits in the host queue; also with the lane live; an existing session without a launch conflicts', async () => {
+  it('the same launch again passes; another one is launch_conflict and the input waits in the host queue; also with the lane live; an existing session without a launch conflicts #LA-1', async () => {
     const w = await world();
     let launch: SessionLaunch = { cwd: w.fx.a };
     let key = 'K1';
@@ -256,7 +267,7 @@ describe('session launch: pinned with the session (§8.6–8.7)', () => {
     expect(matched(w, r2.inputId!).callout).toMatchObject({ outcome: 'error', reason: 'launch_conflict' });
   });
 
-  it('session.prepare: idempotent with the same values, launch_conflict / agent_conflict otherwise; a log-only session conflicts, topic bookkeeping alone does not', async () => {
+  it('session.prepare: idempotent with the same values, launch_conflict / agent_conflict otherwise; a log-only session conflicts, topic bookkeeping alone does not #LA-1', async () => {
     const w = await world({ raw: { agents: agents(fixture(), { dev2: { harness: 'claude', sessionParams: { cwdRoots: ['/'], envKeys: [] } } }) } });
     const h = await w.host();
     const launch = { cwd: w.fx.d };
@@ -273,7 +284,7 @@ describe('session launch: pinned with the session (§8.6–8.7)', () => {
     expect(await h.call('session.prepare', { sessionKey: 'S-topic', agent: 'dev2', launch })).toMatchObject({ created: true });
   });
 
-  it('agent and launch rows are written in one transaction', async () => {
+  it('agent and launch rows are written in one transaction #LA-1', async () => {
     const w = await world();
     const ok = w.gw.prepareSession({ v: 1, type: 'session.prepare', id: 'x', sessionKey: 'A1', agent: 'dev', launch: { cwd: w.fx.a } } as never);
     expect(ok).toMatchObject({ ok: true });
@@ -292,7 +303,7 @@ describe('session launch: pinned with the session (§8.6–8.7)', () => {
 });
 
 describe('session launch: restarts, parked topics and new topics (§8.8–8.9)', () => {
-  it('a restart reopens the session with its launch and resumes it', async () => {
+  it('a restart reopens the session with its launch and resumes it #LA-1 #RS-1', async () => {
     const fx = fixture();
     const dir = tmp();
     const w = await world({ fx, dir });
@@ -314,7 +325,7 @@ describe('session launch: restarts, parked topics and new topics (§8.8–8.9)',
     expect(opened(w2, 'R1')[0]!.args).toMatchObject({ cwd: fx.a, env: { CLAUDE_CONFIG_DIR: fx.h1 }, resume: native });
   });
 
-  it('a new topic keeps the conversation\'s launch (pinned before its lane opens); switching back uses the old topic\'s; a parked topic that idled out reopens with its launch', async () => {
+  it('a new topic keeps the conversation\'s launch (pinned before its lane opens); switching back uses the old topic\'s; a parked topic that idled out reopens with its launch #LA-1 #TP-1', async () => {
     const w = await world({ raw: { topics: { parkedIdleMs: 40 } } });
     const launch = { cwd: w.fx.a, env: { TOKEN: SECRET } };
     await calloutHost(w, () => ({ on: 'dispatch', session: 'topic', launch }));
@@ -355,7 +366,7 @@ describe('session launch: restarts, parked topics and new topics (§8.8–8.9)',
 });
 
 describe('session launch: Codex (§8.10)', () => {
-  it('stdio: a session with env gets its own app-server (env merged, CODEX_HOME as its home), disposed with the lane; cwd only shares the instance', async () => {
+  it('stdio: a session with env gets its own app-server (env merged, CODEX_HOME as its home), disposed with the lane; cwd only shares the instance #LA-3', async () => {
     const fx = fixture();
     const dispose = vi.spyOn(CodexHarness.prototype, 'dispose').mockResolvedValue();
     cleanups.push(() => dispose.mockRestore());
@@ -386,7 +397,7 @@ describe('session launch: Codex (§8.10)', () => {
     expect(w.built.slice(n).filter((i) => i.name === 'cx' && i.env.FOO)).toHaveLength(0);
   });
 
-  it('unix: a launch with env is launch_unsupported; cwd only is fine', async () => {
+  it('unix: a launch with env is launch_unsupported; cwd only is fine #LA-3', async () => {
     const fx = fixture();
     const w = await world({
       fx,
@@ -402,7 +413,7 @@ describe('session launch: Codex (§8.10)', () => {
 });
 
 describe('session launch: visibility and leaks (§8.12–8.13)', () => {
-  it('env values never show in the event log, explain, sessions, the daemon log or the harness argv; keys do', async () => {
+  it('env values never show in the event log, explain, sessions, the daemon log or the harness argv; keys do #SE-1', async () => {
     const w = await world();
     const launch = { cwd: w.fx.a, env: { TOKEN: SECRET, CLAUDE_CONFIG_DIR: w.fx.h1 } };
     await calloutHost(w, () => ({ on: 'dispatch', session: { key: 'L1' }, launch }));
@@ -426,7 +437,8 @@ describe('session launch: visibility and leaks (§8.12–8.13)', () => {
     expect(JSON.stringify(rest)).not.toContain(SECRET);
   });
 
-  it('host.hello advertises session.launch', async () => {
+  // Kept (proposal §3.3 lists it as c1): host-callouts' "… features advertise it" does not check session.launch.
+  it('host.hello advertises session.launch #LA-1', async () => {
     const w = await world();
     const c = await w.client();
     const r = await c.hello({ token: w.gw.token, name: 'xwo' });
@@ -435,7 +447,7 @@ describe('session launch: visibility and leaks (§8.12–8.13)', () => {
 });
 
 describe('session launch: agent gone, skipWhenPinned (§8.14–8.15)', () => {
-  it('a launched session whose agent was removed refuses input instead of falling back to the default agent', async () => {
+  it('a launched session whose agent was removed refuses input instead of falling back to the default agent #FC-1', async () => {
     const fx = fixture();
     const dir = tmp();
     const w = await world({ fx, dir });
@@ -451,7 +463,7 @@ describe('session launch: agent gone, skipWhenPinned (§8.14–8.15)', () => {
     expect(opened(w2, 'G1')).toHaveLength(0);
   });
 
-  it('skipWhenPinned: the host is asked for the first input of a session only; later ones route by the rule with the pinned launch', async () => {
+  it('skipWhenPinned: the host is asked for the first input of a session only; later ones route by the rule with the pinned launch #LA-2', async () => {
     const w = await world();
     const { asked } = await calloutHost(w, () => ({ on: 'dispatch', launch: { cwd: w.fx.a } }), { session: 'per-conversation', callout: { timeoutMs: 2000, onFailure: 'host', skipWhenPinned: true } });
     const key = 'dev:fake:default:g1';

@@ -60,7 +60,7 @@ const deliver = (route: { channel: string; account: string; conversationId: stri
 
 describe('several lark-bot accounts (decision 8)', () => {
 
-  it("an agent account's message declaring one of our sessions is our own echo: never a turn", async () => {
+  it("an agent account's message declaring one of our sessions is our own echo: never a turn #ID-5", async () => {
     // Bot b is another agent account; a rule dispatches everything, so only the self check keeps an echo from looping.
     const w = await bots({ raw: { policy: { owners: ['lark-bot:alice'], agentAccounts: ['lark-bot:botb'] }, bindings: [{ id: 'all', match: {}, on: 'dispatch' }] } });
     const { a } = w.chans as { a: FakeChannel };
@@ -75,7 +75,7 @@ describe('several lark-bot accounts (decision 8)', () => {
     expect(w.gw.router.explain(echo.inputId!)?.matched).toEqual([]);
     expect(w.gw.router.explain(other.inputId!)?.matched.map((m) => m.on)).toEqual(['dispatch']);
   });
-  it('a DM to bot b is answered by b only, and its output-tool messages go out through b', async () => {
+  it('a DM to bot b is answered by b only, and its output-tool messages go out through b #DL-4 #DL-3', async () => {
     const holder: { h?: FakeHarness } = {};
     const tool: { isError: boolean; text: string }[] = [];
     const w = await bots({
@@ -94,7 +94,7 @@ describe('several lark-bot accounts (decision 8)', () => {
     expect(a.sent).toEqual([]);
   });
 
-  it('the same message id arriving at both bots: two inputs, two sessions, two input.verify records', async () => {
+  it('the same message id arriving at both bots: two inputs, two sessions, two input.verify records #IN-5', async () => {
     const w = await bots();
     const { a, b } = w.chans as { a: FakeChannel; b: FakeChannel };
     const ra = await a.inject({ ...alice, id: 'om_same', conversation: { id: 'g1', kind: 'dm' }, text: 'to both' });
@@ -108,7 +108,7 @@ describe('several lark-bot accounts (decision 8)', () => {
     expect(a.sent.every((s) => s.route.account === 'a') && b.sent.every((s) => s.route.account === 'b')).toBe(true);
   });
 
-  it('host deliver: to its own account; an account that is not running is unknown_channel (no fallback with several bots)', async () => {
+  it('host deliver: to its own account; an account that is not running is unknown_channel (no fallback with several bots) #DL-4', async () => {
     const w = await bots();
     const { a, b } = w.chans as { a: FakeChannel; b: FakeChannel };
     expect(await w.gw.deliver('xwo', deliver({ channel: 'lark-bot', account: 'b', conversationId: 'c9' }, 'op1'))).toMatchObject({ ok: true });
@@ -120,7 +120,7 @@ describe('several lark-bot accounts (decision 8)', () => {
     expect(b.sent).toHaveLength(1);
   });
 
-  it('a bot that failed to start is configured but not running: its messages are never sent as the other bot', async () => {
+  it('a bot that failed to start is configured but not running: its messages are never sent as the other bot #DL-4', async () => {
     const w = await bots({ dead: ['b'] });
     const { a } = w.chans as { a: FakeChannel };
     await until(() => ((w.gw as unknown as { channels: { ended?: boolean }[] }).channels.some((c) => c.ended) ? true : undefined));
@@ -139,7 +139,7 @@ describe('several lark-bot accounts (decision 8)', () => {
     expect(a.sent).toHaveLength(1);
   });
 
-  it('every agent-authored message carries the agent identity (SendOp.as); host deliveries and system replies carry none', async () => {
+  it('every agent-authored message carries the agent identity (SendOp.as); host deliveries and system replies carry none #DL-4b', async () => {
     const holder: { h?: FakeHarness } = {};
     const w = await bots({
       script: async (t) => {
@@ -161,14 +161,14 @@ describe('several lark-bot accounts (decision 8)', () => {
     expect(b.sent.at(-1)!.op.as).toBeUndefined();
   });
 
-  it('one bot only: a delivery naming another account still goes out, as that bot\'s account', async () => {
+  it('one bot only: a delivery naming another account still goes out, as that bot\'s account #DL-4', async () => {
     const w = await bots({ accounts: ['solo'] });
     const solo = w.chans.solo!;
     expect(await w.gw.deliver('xwo', deliver({ channel: 'lark-bot', account: 'default', conversationId: 'c9' }, 'op1'))).toMatchObject({ ok: true });
     expect(solo.sent.map((s) => s.route.account)).toEqual(['solo']);
   });
 
-  it('a binding with match.account only takes that bot\'s inputs', async () => {
+  it('a binding with match.account only takes that bot\'s inputs #DL-4 #RT-1', async () => {
     const w = await bots({
       raw: { bindings: [{ id: 'only-a', match: { channel: 'lark-bot', account: 'a' }, on: 'dispatch', session: 'per-conversation' }] },
     });

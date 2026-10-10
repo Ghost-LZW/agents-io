@@ -7,15 +7,12 @@ import { resolveConfig, type HarnessInstance } from '../src/config.js';
 import { Gateway, InstanceHarness } from '../src/gateway.js';
 import { cleanups, tmp, until } from './helpers.js';
 
-/* `type: "module"` channels: an adapter loaded from an external ES module (fixtures/chan-*). */
+/* `type: "module"` channels and `use: "module"` harnesses: adapters loaded from an external ES module (fixtures/chan-*, fixtures/harness-*). */
 
 const here = dirname(fileURLToPath(import.meta.url));
-const fx = join(here, 'fixtures');
 
 type Rec = { via: string; init: { account: string; config: unknown }; closed: boolean; startConfig?: unknown; blobs?: unknown; inject?: (p: object) => Promise<{ accepted: boolean }>; sent: unknown[] };
 const recs = () => ((globalThis as { __chan?: Record<string, Rec> }).__chan ??= {});
-
-const resolve = (channels: unknown[], env: Record<string, string> = {}) => resolveConfig({ channels }, { env, baseDir: here, cwd: here });
 
 async function start(channels: unknown[], o: { env?: Record<string, string>; extra?: { adapter: FakeChannel; account?: string }[] } = {}) {
   const dir = tmp('aio-mc-');
@@ -34,35 +31,8 @@ async function start(channels: unknown[], o: { env?: Record<string, string>; ext
   return gw;
 }
 
-describe('module channel config', () => {
-  it('resolves a relative path against the config dir to the package entry', () => {
-    const c = resolve([{ type: 'module', module: './fixtures/chan-pkg', account: 'lan' }]);
-    expect(c.channels[0]).toMatchObject({ type: 'module', account: 'lan', module: join(fx, 'chan-pkg', 'index.mjs') });
-  });
-
-  it('resolves an exports map with only an import condition, an absolute path, and a file', () => {
-    expect(resolve([{ type: 'module', module: './fixtures/chan-import-only' }]).channels[0]).toMatchObject({ module: join(fx, 'chan-import-only', 'main.mjs') });
-    expect(resolve([{ type: 'module', module: join(fx, 'chan-pkg') }]).channels[0]).toMatchObject({ module: join(fx, 'chan-pkg', 'index.mjs') });
-    expect(resolve([{ type: 'module', module: './fixtures/chan-default-only.mjs' }]).channels[0]).toMatchObject({ module: join(fx, 'chan-default-only.mjs'), account: 'default' });
-  });
-
-  it('substitutes env in config, and a missing variable fails naming it', () => {
-    const c = resolve([{ type: 'module', module: './fixtures/chan-pkg', config: { token: 'env:PLUG_TOKEN' } }], { PLUG_TOKEN: 's3' });
-    expect(c.channels[0]).toMatchObject({ config: { token: 's3' } });
-    expect(() => resolve([{ type: 'module', module: './fixtures/chan-pkg', config: { token: 'env:PLUG_TOKEN' } }])).toThrow(/PLUG_TOKEN/);
-  });
-
-  it('reports a missing module and unknown keys; clients skip channels', () => {
-    expect(() => resolve([{ type: 'module', module: './fixtures/nope' }])).toThrow(/channels\[0\]\.module: .*nope does not exist/);
-    expect(() => resolve([{ type: 'module', module: 'no-such-package-xyz' }])).toThrow(/cannot resolve "no-such-package-xyz"/);
-    expect(() => resolve([{ type: 'module', module: './fixtures/chan-pkg', extra: 1 }])).toThrow(/invalid config/);
-    expect(() => resolve([{ type: 'module' }])).toThrow(/invalid config/);
-    expect(resolveConfig({ channels: [{ type: 'module', module: './nope' }] }, { env: {}, baseDir: here, cwd: here, channels: false }).channels).toEqual([]);
-  });
-});
-
 describe('module channel gateway', () => {
-  it('start() gets account, substituted config and the blob store; its inbound is accepted; close() runs at stop', async () => {
+  it('start() gets account, substituted config and the blob store; its inbound is accepted; close() runs at stop #CF-4 #ID-3', async () => {
     // A module gives platform_signed only when the entry grants it (channel-stamping E3).
     const gw = await start([{ type: 'module', module: './fixtures/chan-pkg', account: 'lan', evidence: ['platform_signed'], config: { id: 'plug', token: 'env:PLUG_TOKEN' } }], { env: { PLUG_TOKEN: 's3' } });
     const r = recs()['plug:lan']!;
@@ -78,7 +48,7 @@ describe('module channel gateway', () => {
     expect(r.closed).toBe(true);
   });
 
-  it('export option picks a named export; default is the fallback; import-only package works', async () => {
+  it('export option picks a named export; default is the fallback; import-only package works #CF-4', async () => {
     await start([
       { type: 'module', module: './fixtures/chan-pkg', export: 'other', config: { id: 'a' } },
       { type: 'module', module: './fixtures/chan-pkg', export: 'missing', config: { id: 'b' } },
@@ -88,13 +58,13 @@ describe('module channel gateway', () => {
     expect(['a', 'b', 'c', 'd'].map((id) => recs()[`${id}:default`]?.via)).toEqual(['other', 'default', 'default-only', 'import-only']);
   });
 
-  it('fails the start for a non-function export, a bad adapter shape, and a throwing factory', async () => {
+  it('fails the start for a non-function export, a bad adapter shape, and a throwing factory #CF-4', async () => {
     await expect(start([{ type: 'module', module: './fixtures/chan-not-fn.mjs' }])).rejects.toThrow(/channels\[0\].*"createChannel" \(or default\) is not a function/);
     await expect(start([{ type: 'module', module: './fixtures/chan-bad-shape.mjs' }])).rejects.toThrow(/did not return a ChannelAdapter \(bad start\)/);
     await expect(start([{ type: 'module', module: './fixtures/chan-throws.mjs' }])).rejects.toThrow(/factory failed: boom/);
   });
 
-  it('fails when two entries give the same (channel, account), also against another channel', async () => {
+  it('fails when two entries give the same (channel, account), also against another channel #ID-3', async () => {
     await expect(
       start([
         { type: 'module', module: './fixtures/chan-pkg', config: { id: 'dup1' } },
@@ -119,7 +89,7 @@ describe('module channel gateway', () => {
     await expect(start([{ type: 'module', module: './fixtures/chan-pkg', config: { id: 'lark-bot' } }])).rejects.toThrow(/"lark-bot" is a built-in channel id/);
   });
 
-  it('without an evidence grant its platform_signed is capped to none (stranger, counted in status, recorded as none)', async () => {
+  it('without an evidence grant its platform_signed is capped to none (stranger, counted in status, recorded as none) #ID-3 #ID-4', async () => {
     const gw = await start([{ type: 'module', module: './fixtures/chan-pkg', account: 'cap', config: { id: 'plug' } }]);
     const r = recs()['plug:cap']!;
     await until(() => r.inject);
@@ -127,5 +97,26 @@ describe('module channel gateway', () => {
     expect(res.accepted).toBe(true);
     expect(gw.records.verify('channel:plug/cap-1').records).toEqual([expect.objectContaining({ evidence: 'none', principal: null })]);
     expect(gw.adminStatus().channels.find((c) => c.id === 'plug')).toMatchObject({ evidenceCapped: 1 });
+  });
+});
+
+describe('module harness (use: "module")', () => {
+  /** Gateway.start with instance `plug` (the default harness) loaded from `module`; no buildHarness, so the gateway loads the module itself. */
+  async function startHarness(module: string) {
+    const dir = tmp('aio-mh-');
+    mkdirSync(join(dir, 'work'), { recursive: true });
+    const raw = { dataDir: dir, local: { principal: 'me' }, cwd: join(dir, 'work'), harnesses: { plug: { use: 'module', module } }, defaultHarness: 'plug' };
+    const base = resolveConfig(raw, { env: {}, baseDir: here, cwd: dir });
+    const gw = await Gateway.start({ config: { ...base, socketPath: join(dir, 'run', 'aio.sock') }, logger: () => {}, listen: false });
+    cleanups.push(() => gw.stop());
+    return gw;
+  }
+
+  it('a missing module, a non-function export, a throwing factory and a value that is not an adapter each fail the start, naming the instance #CF-4', async () => {
+    // A missing module is a config error, caught while resolving the config (before Gateway.start).
+    await expect(startHarness('./fixtures/harness-nope.mjs')).rejects.toThrow(/harnesses\.plug\.module: .*harness-nope\.mjs does not exist/);
+    await expect(startHarness('./fixtures/harness-not-fn.mjs')).rejects.toThrow(/harnesses\.plug \(module .*harness-not-fn\.mjs\): export "createHarness" \(or default\) is not a function/);
+    await expect(startHarness('./fixtures/harness-throws.mjs')).rejects.toThrow(/harnesses\.plug \(module .*\): factory failed: boom/);
+    await expect(startHarness('./fixtures/harness-bad-shape.mjs')).rejects.toThrow(/harnesses\.plug \(module .*\): the factory did not return a HarnessAdapter \(bad open\)/);
   });
 });

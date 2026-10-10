@@ -14,7 +14,7 @@ const script: FakeTurnScript = async (t) => {
 const valid = (type: keyof typeof HOST_RESULT_VALUES, value: unknown) => expect(errors(HOST_RESULT_VALUES[type], value)).toEqual([]);
 
 describe('host result values', () => {
-  it('match the protocol schemas', async () => {
+  it('match the protocol schemas #PR-1', async () => {
     const w = await daemon({ raw: { agents: { chat: { harness: 'claude-code' }, exec: { harness: 'claude-code', mode: 'task' } } }, script });
     const c = await w.client();
     valid('host.hello', await c.hello({ token: w.gw.token, name: 'xwo', consumer: 'xwo' }));

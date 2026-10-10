@@ -32,7 +32,7 @@ const tick = () => new Promise((r) => setTimeout(r, 5));
 const d = (operationId: string) => ({ operationId, sessionKey: 's', route: route(), msg: { text: 'hi' } });
 
 describe('Outbox', () => {
-  it('delivers each operationId once, even when called again or concurrently', async () => {
+  it('delivers each operationId once, even when called again or concurrently #DL-1 #DL-2', async () => {
     const hub = new Hub(new MemorySessionLog());
     const ch = new FlakyChannel(0);
     const ob = new Outbox({ hub, sleep: noSleep });
@@ -46,7 +46,7 @@ describe('Outbox', () => {
     ]);
   });
 
-  it('retries with backoff, then settles', async () => {
+  it('retries with backoff, then settles #DL-1', async () => {
     const delays: number[] = [];
     const ch = new FlakyChannel(2);
     const ob = new Outbox({ sleep: async (ms) => void delays.push(ms), baseDelayMs: 10 });
@@ -54,7 +54,7 @@ describe('Outbox', () => {
     expect(delays).toEqual([10, 20]);
   });
 
-  it('settles as rejected on a non-retryable error and unknown when retries run out', async () => {
+  it('settles as rejected on a non-retryable error and unknown when retries run out #DL-1', async () => {
     const ob = new Outbox({ sleep: noSleep, maxAttempts: 3 });
     const rej = new FlakyChannel(1, () => new DeliveryRejected('chat not found'));
     expect(await ob.send(rej, d('r'))).toMatchObject({ status: 'rejected', attempts: 1, error: 'chat not found' });
@@ -65,7 +65,7 @@ describe('Outbox', () => {
     expect(down.calls).toBe(3);
   });
 
-  it('checks Policy.outbound for sends that come from a turn', async () => {
+  it('checks Policy.outbound for sends that come from a turn #DL-5', async () => {
     const ch = new FlakyChannel(0);
     const ob = new Outbox({ policy: defaultPolicy({ owners: [] }), sleep: noSleep });
     const from = { sessionKey: 's', turnId: 't', run: { harness: 'h', model: 'm', profile: 'p' }, inputs: [], replyRoute: route('mine') };
@@ -74,7 +74,7 @@ describe('Outbox', () => {
     expect(ch.calls).toBe(1);
   });
 
-  it('a crash between the in-flight mark and the settlement: the next process settles it unknown and never resends', async () => {
+  it('a crash between the in-flight mark and the settlement: the next process settles it unknown and never resends #DL-2', async () => {
     const store = new MemoryOutboxStore();
     const first = new HangingChannel();
     const ob1 = new Outbox({ store, sleep: noSleep });
@@ -96,7 +96,7 @@ describe('Outbox', () => {
     expect(again.calls).toBe(0);
   });
 
-  it('the same operationId is not sent again while an earlier process has it in flight, even before recover', async () => {
+  it('the same operationId is not sent again while an earlier process has it in flight, even before recover #DL-2', async () => {
     const store = new MemoryOutboxStore();
     void new Outbox({ store }).send(new HangingChannel(), d('op'));
     await tick();
@@ -110,7 +110,7 @@ describe('Outbox', () => {
     expect(ob2.recover()).toEqual([]);
   });
 
-  it('marks each attempt in flight before calling the adapter, and settling clears the mark', async () => {
+  it('marks each attempt in flight before calling the adapter, and settling clears the mark #DL-2', async () => {
     const store = new MemoryOutboxStore();
     const seen: unknown[] = [];
     const ob = new Outbox({ store, sleep: noSleep });
@@ -124,7 +124,7 @@ describe('Outbox', () => {
     expect(store.inFlight('op')).toBeUndefined();
   });
 
-  it('an attempt that times out settles unknown and is not retried (the platform may have it)', async () => {
+  it('an attempt that times out settles unknown and is not retried (the platform may have it) #DL-1', async () => {
     const ch = new HangingChannel();
     const ob = new Outbox({ sleep: noSleep, attemptTimeoutMs: 20 });
     expect(await ob.send(ch, d('op'))).toMatchObject({ status: 'unknown', attempts: 1, error: 'attempt 1 timed out after 20 ms' });
@@ -135,7 +135,7 @@ describe('Outbox', () => {
     expect(ob.get('op')).toMatchObject({ status: 'unknown' });
   });
 
-  it('an outbound check that throws rejects (fail closed) and is settled', async () => {
+  it('an outbound check that throws rejects (fail closed) and is settled #DL-1 #DL-5', async () => {
     const hub = new Hub(new MemorySessionLog());
     const ch = new FlakyChannel(0);
     const ob = new Outbox({ hub, policy: { outbound: async () => { throw new Error('host gone'); } }, sleep: noSleep });
@@ -145,7 +145,7 @@ describe('Outbox', () => {
     expect(bodies(hub.log.read('s', 0))).toMatchObject([{ t: 'delivery.settled', result: 'rejected' }]);
   });
 
-  it('drain waits for running attempts, stops retries; close leaves what still runs in flight for the next recover', async () => {
+  it('drain waits for running attempts, stops retries; close leaves what still runs in flight for the next recover #DL-1', async () => {
     const store = new MemoryOutboxStore();
     const ob = new Outbox({ store, baseDelayMs: 60_000, maxDelayMs: 60_000 });
     // Running: drain waits for it.

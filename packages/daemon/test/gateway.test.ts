@@ -2,60 +2,20 @@ import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PassThrough } from 'node:stream';
-import { afterEach, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { FrameDecoder, encodeFrame, type Policy, type SessionEvent } from '@agents-io/protocol';
 import { MemorySessionLog, SqliteSessionLog } from '@agents-io/session';
-import { FakeChannel, FakeHarness, assertConformingStream, type FakeTurnScript } from '@agents-io/testkit';
-import { runAttach } from '../src/attach.js';
+import { FakeChannel, FakeHarness, assertConformingStream } from '@agents-io/testkit';
 import { CommandError, LocalClient } from '../src/client.js';
 import { resolveConfig, type HarnessInstance } from '../src/config.js';
 import { Gateway, InstanceHarness, buildHarness as buildRealHarness } from '../src/gateway.js';
-
-const cleanups: (() => Promise<void> | void)[] = [];
-afterEach(async () => {
-  for (const c of cleanups.splice(0).reverse()) await c();
-});
-
-async function until<T>(get: () => T | undefined | false, ms = 3000): Promise<T> {
-  const end = Date.now() + ms;
-  for (;;) {
-    const v = get();
-    if (v !== undefined && v !== false) return v;
-    if (Date.now() > end) throw new Error('timed out');
-    await new Promise((r) => setTimeout(r, 5));
-  }
-}
-
-async function setup(o: { script?: FakeTurnScript; policy?: Partial<Policy> } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'aio-gw-'));
-  const base = resolveConfig({ policy: { owners: ['fake:alice'] }, local: { principal: 'me' } }, { env: {}, baseDir: dir, cwd: dir });
-  const config = { ...base, socketPath: join(dir, 'run', 'aio.sock') };
-  const chat = new FakeChannel('fake');
-  const harness = new FakeHarness(o.script);
-  const gw = await Gateway.start({ config, harness, log: new MemorySessionLog(), channels: [{ adapter: chat }], ...(o.policy ? { policy: o.policy } : {}), logger: () => {} });
-  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-  cleanups.push(() => gw.stop());
-  const client = async () => {
-    const c = await LocalClient.connect(config.socketPath);
-    cleanups.push(() => c.close());
-    return c;
-  };
-  const collect = async (c: LocalClient, sessionKey: string, tier: 'full' | 'final' = 'full') => {
-    const events: SessionEvent[] = [];
-    const sub = await c.subscribe({ sessionKey, tier, fromSeq: 0 });
-    void (async () => {
-      for await (const e of sub) events.push(e);
-    })();
-    return events;
-  };
-  return { gw, chat, harness, config, client, collect, dir };
-}
+import { cleanups, setup, until } from './gateway-helpers.js';
+import { daemon, until as untilD } from './helpers.js';
 
 const of = (evs: SessionEvent[], t: string) => evs.filter((e) => e.body.t === t).map((e) => e.body as never as Record<string, unknown>);
 
 describe('gateway wiring', () => {
-  it('channel input → ingress → lane → harness → compositor card back on the route; local subscriber sees the stream', async () => {
+  it('channel input → ingress → lane → harness → compositor card back on the route; local subscriber sees the stream #DL-3', async () => {
     const w = await setup();
     const c = await w.client();
     const events = await w.collect(c, 'fake:default:c1');
@@ -73,7 +33,7 @@ describe('gateway wiring', () => {
     expect(w.harness.sessions[0]!.args.run.harness).toBe('claude-code');
   });
 
-  it('two local ends on one session: both see every event and both can talk', async () => {
+  it('two local ends on one session: both see every event and both can talk #LN-1 #IN-3', async () => {
     let release!: () => void;
     const hold = new Promise<void>((r) => (release = r));
     const w = await setup({
@@ -100,7 +60,7 @@ describe('gateway wiring', () => {
     expect(of(ea, 'input.admitted').every((x) => x.principalId === 'me')).toBe(true);
   });
 
-  it('human approval reaches a second subscriber at final tier and is resolved through it', async () => {
+  it('human approval reaches a second subscriber at final tier and is resolved through it #RQ-5', async () => {
     const w = await setup({
       script: async (t) => {
         t.emit({ t: 'request.opened', requestId: 'r1', kind: 'tool_approval', title: 'rm -rf build', risk: { writes: true }, allowedDecisions: ['allow_once', 'deny'], allowAlways: false, defaultDeny: true });
@@ -123,7 +83,7 @@ describe('gateway wiring', () => {
     expect(of(ea, 'text.snapshot').at(-1)).toMatchObject({ text: 'got allow_once' });
   });
 
-  it('interrupt from a local end ends the turn interrupted', async () => {
+  it('interrupt from a local end ends the turn interrupted #CT-1', async () => {
     const w = await setup({ script: (t) => new Promise((_, rej) => t.signal.addEventListener('abort', () => rej(new Error('stop')))) });
     const c = await w.client();
     const ev = await w.collect(c, 's');
@@ -135,7 +95,7 @@ describe('gateway wiring', () => {
     await expect(c.command({ type: 'interrupt', sessionKey: 's' })).rejects.toMatchObject({ code: 'no_active_turn' });
   });
 
-  it('reconnecting with fromSeq replays exactly what was missed', async () => {
+  it('reconnecting with fromSeq replays exactly what was missed #LN-1', async () => {
     const w = await setup();
     const c1 = await w.client();
     await c1.input('s', 'one');
@@ -157,7 +117,7 @@ describe('gateway wiring', () => {
     expect(ev.map((e) => e.seq)).toEqual(w.gw.hub.log.read('s', head).map((e) => e.seq));
   });
 
-  it('socket is private, rejects bad frames, and tells subscribers when the gateway stops', async () => {
+  it('socket is private, rejects bad frames, and tells subscribers when the gateway stops #RS-8 #SE-2', async () => {
     const w = await setup();
     expect(statSync(w.config.socketPath).mode & 0o777).toBe(0o600);
     expect(statSync(join(w.dir, 'run')).mode & 0o777).toBe(0o700);
@@ -178,30 +138,25 @@ describe('gateway wiring', () => {
     raw.destroy();
   });
 
-  it('attach end: prints the stream and turns lines into commands', async () => {
-    const w = await setup();
+  it('a turn started from the local terminal sends nothing to a channel, even in the session an owner DM shares #DL-3', async () => {
+    const w = await daemon({ raw: { policy: { owners: ['fake:alice'], ownerSessionKey: 'main' } } });
+    const done = () => w.gw.hub.log.read('main', 0).filter((e) => e.body.t === 'turn.completed').length;
+    // A channel turn in the shared session: its answer goes back to the DM.
+    await w.chat.inject({ sender: { channelUserId: 'alice', evidence: 'platform_signed' }, text: 'from the DM' });
+    await untilD(() => done() === 1 && w.chat.sent.some((s) => s.finalized));
+    const before = JSON.stringify(w.chat.sent);
+    // The terminal (local client) starts the next turn in the same session.
     const c = await w.client();
-    const input = new PassThrough();
-    const output = new PassThrough();
-    let text = '';
-    output.on('data', (d) => (text += d.toString()));
-    const done = runAttach({ client: c, sessionKey: 's', tier: 'full', input, output, color: false });
-    await until(() => text.includes('attached to s'));
-    input.write('hello\n');
-    await until(() => text.includes('turn') && text.includes('completed'));
-    input.write('/bogus\n');
-    input.write('/sessions\n');
-    await until(() => text.includes('* s  idle'));
-    input.write('/quit\n');
-    await done;
-    expect(text).toContain('echo: hello');
-    expect(text).toContain('(input: new_turn)');
-    expect(text).toContain('unknown command /bogus');
+    await c.input('main', 'from the terminal');
+    await untilD(() => done() === 2);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(w.gw.hub.log.read('main', 0).filter((e) => e.body.t === 'turn.started').map((e) => (e.body as { replyRoute: { channel: string } | null }).replyRoute?.channel)).toEqual(['fake', 'local']);
+    expect(JSON.stringify(w.chat.sent)).toBe(before);
   });
 });
 
 describe('named harness instances', () => {
-  it('lanes open the instance the plan names (its cwd, options, id); a restart resumes per instance', async () => {
+  it('lanes open the instance the plan names (its cwd, options, id); a restart resumes per instance #RS-1', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'aio-gwi-'));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
     const config = resolveConfig(
@@ -265,5 +220,18 @@ describe('named harness instances', () => {
     expect(gw2.harness('b').id).toBe('b');
     expect(() => buildRealHarness({ ...config.harnesses.a!, unavailable: 'harnesses.a.env.K: environment variable K is not set' })).toThrow('harness instance a is unavailable: harnesses.a.env.K: environment variable K is not set');
     expect(() => gw2.harness('zzz')).toThrow(/unknown harness instance "zzz" \(configured: a, b\)/);
+  });
+});
+
+describe('persistence', () => {
+  // INVARIANTS RS-9 不成立 1: a non-SQLite log (or logPath ':memory:') keeps the host queue, outbox and records in memory without a warning; turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails('Gateway.start with a MemorySessionLog logs a "not persistent" warning #RS-9', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'aio-gwm-'));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const config = { ...resolveConfig({ local: { principal: 'me' } }, { env: {}, baseDir: dir, cwd: dir }), socketPath: join(dir, 'run', 'aio.sock') };
+    const logs: { level: string; msg: string }[] = [];
+    const gw = await Gateway.start({ config, harness: new FakeHarness(), log: new MemorySessionLog(), channels: [], logger: (level, msg) => void logs.push({ level, msg }) });
+    cleanups.push(() => gw.stop());
+    expect(logs).toContainEqual(expect.objectContaining({ level: 'warn', msg: expect.stringMatching(/not persistent|in memory/i) }));
   });
 });

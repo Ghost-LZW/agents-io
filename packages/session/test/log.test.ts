@@ -16,7 +16,7 @@ const impls: [string, () => SessionLog][] = [
 ];
 
 describe.each(impls)('%s log', (_name, make) => {
-  it('assigns gapless per-session seq to durable events only', () => {
+  it('assigns gapless per-session seq to durable events only #LN-1', () => {
     const log = make();
     const a1 = log.append('a', draft({ t: 'session.state', state: 'running' }));
     const d = log.append('a', draft({ t: 'text.delta', delta: 'x', stream: 'answer' }));
@@ -33,20 +33,20 @@ describe.each(impls)('%s log', (_name, make) => {
     expect(log.ephemeral('a').map((e) => e.body.t)).toEqual(['text.delta', 'headline']);
   });
 
-  it('forces deltas ephemeral and other kinds durable whatever they claim', () => {
+  it('forces deltas ephemeral and other kinds durable whatever they claim #LN-1', () => {
     const log = make();
     log.append('a', draft({ t: 'text.delta', delta: 'x', stream: 'answer' }, { durability: 'durable' }));
     log.append('a', draft({ t: 'turn.started', turnId: 't', inputIds: [], replyRoute: null, run }, { durability: 'ephemeral' }));
     expect(log.read('a', 0).map((e) => e.body.t)).toEqual(['turn.started']);
   });
 
-  it('keeps a bounded ephemeral ring', () => {
+  it('keeps a bounded ephemeral ring #LN-1', () => {
     const log = make();
     for (let i = 0; i < 5; i++) log.append('a', draft({ t: 'text.delta', delta: String(i), stream: 'answer' }));
     expect(log.ephemeral('a').map((e) => (e.body as { delta: string }).delta)).toEqual(['2', '3', '4']);
   });
 
-  it('folds a snapshot for late joiners', () => {
+  it('folds a snapshot for late joiners #LN-1', () => {
     const log = make();
     log.append('a', draft({ t: 'input.admitted', inputId: 'i1', disposition: 'new_turn' }));
     log.append('a', draft({ t: 'input.admitted', inputId: 'i2', disposition: 'queued' }));
@@ -82,7 +82,7 @@ describe.each(impls)('%s log', (_name, make) => {
 });
 
 describe('memory log retention', () => {
-  it('trims to `retain` and reports the floor', () => {
+  it('trims to `retain` and reports the floor #LN-1', () => {
     const log = new MemorySessionLog({ retain: 3 });
     for (let i = 0; i < 10; i++) log.append('a', draft({ t: 'headline', text: `h${i}` }));
     expect(log.floor('a')).toBe(7);
@@ -92,7 +92,7 @@ describe('memory log retention', () => {
 });
 
 describe('sqlite log persistence', () => {
-  it('survives reopen: head, events and fold are restored', () => {
+  it('survives reopen: head, events and fold are restored #LN-1 #RS-1', () => {
     const path = join(dir, 'reopen.db');
     const a = new SqliteSessionLog({ path });
     a.append('s', draft({ t: 'turn.started', turnId: 't1', inputIds: ['i1'], replyRoute: null, run }));
@@ -108,7 +108,20 @@ describe('sqlite log persistence', () => {
     b.close();
   });
 
-  it('compacts old events into a stored snapshot', () => {
+  it('a second writer of the same (session_key, seq) is refused by the primary key; the first event stays #LN-1', () => {
+    const path = join(dir, 'two-writers.db');
+    const a = new SqliteSessionLog({ path });
+    const b = new SqliteSessionLog({ path });
+    expect([a.head('s'), b.head('s')]).toEqual([0, 0]); // both believe seq 1 is next
+    expect(a.append('s', draft({ t: 'headline', text: 'from a' })).seq).toBe(1);
+    expect(() => b.append('s', draft({ t: 'headline', text: 'from b' }))).toThrow(/UNIQUE|PRIMARY KEY/i);
+    expect(b.head('s')).toBe(0);
+    const c = new SqliteSessionLog({ path });
+    expect(c.read('s', 0).map((e) => [e.seq, (e.body as { text: string }).text])).toEqual([[1, 'from a']]);
+    for (const l of [a, b, c]) l.close();
+  });
+
+  it('compacts old events into a stored snapshot #LN-1 #RS-1', () => {
     const path = join(dir, 'compact.db');
     const a = new SqliteSessionLog({ path });
     for (let i = 0; i < 6; i++) a.append('s', draft({ t: 'headline', text: `h${i}` }));

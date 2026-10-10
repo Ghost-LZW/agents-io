@@ -24,13 +24,13 @@ const env = {
 };
 
 describe('schemas', () => {
-  it('accepts a valid envelope and rejects a bad one', () => {
+  it('accepts a valid envelope and rejects a bad one #PR-1', () => {
     expect(errors(InboundEnvelope, env)).toEqual([]);
     expect(check(InboundEnvelope, { ...env, v: 2 })).toBe(false);
     expect(check(InboundEnvelope, { ...env, sender: { channelUserId: 'x' } })).toBe(false);
   });
 
-  it('validates session events', () => {
+  it('validates session events #PR-1', () => {
     const e = {
       v: 1, sessionKey: 's', seq: 1, harness: 'claude-code', generation: 1, visibility: 'participants',
       ts: 1, level: 'primary', audience: 'answer', durability: 'durable',
@@ -40,13 +40,13 @@ describe('schemas', () => {
     expect(check(SessionEvent, { ...e, body: { t: 'nope' } })).toBe(false);
   });
 
-  it('validates bridge frames', () => {
+  it('validates bridge frames #PR-1', () => {
     expect(check(ChannelAdapterFrame, { v: 1, type: 'inbound', id: '1', envelope: env })).toBe(true);
     expect(check(ChannelHostFrame, { v: 1, type: 'send', id: '2', route: env.replyRoute, msg: { text: 'x' }, op: { operationId: 'o' } })).toBe(true);
     expect(check(ChannelHostFrame, { v: 1, type: 'shutdown' })).toBe(true);
   });
 
-  it('accepts a hello that names optional methods this side does not know', () => {
+  it('accepts a hello that names optional methods this side does not know #PR-1', () => {
     const caps = {
       text: { maxChars: 4000, markdown: 'basic' },
       edit: true,
@@ -64,7 +64,7 @@ describe('schemas', () => {
 });
 
 describe('wire', () => {
-  it('round-trips frames across arbitrary chunking and skips garbage', () => {
+  it('round-trips frames across arbitrary chunking and skips garbage #PR-2', () => {
     const bad: string[] = [];
     const d = new FrameDecoder((l) => bad.push(l));
     const text = encodeFrame({ a: 1 }) + 'not json\n' + encodeFrame({ b: 'x\ny' });
@@ -74,13 +74,13 @@ describe('wire', () => {
     expect(bad).toEqual(['not json']);
   });
 
-  it('routeKey ignores reply target', () => {
+  it('routeKey ignores reply target #PR-1', () => {
     expect(routeKey({ channel: 'c', account: 'a', conversationId: 'x', threadId: 't', replyToMessageId: 'm' })).toBe('c:a:x:t');
   });
 });
 
 describe('FrameDecoder line limit', () => {
-  it('drops an oversized line, reports it once, and resumes at the next newline', () => {
+  it('drops an oversized line, reports it once, and resumes at the next newline #PR-2', () => {
     const bad: [string, unknown][] = [];
     const d = new FrameDecoder((l, e) => bad.push([l, e]), { maxLineLength: 20 });
     const out: unknown[] = [];
@@ -92,7 +92,7 @@ describe('FrameDecoder line limit', () => {
     expect(bad[0]![0].length).toBeLessThanOrEqual(200);
   });
 
-  it('keeps lines at the limit and checks a complete long line too', () => {
+  it('keeps lines at the limit and checks a complete long line too #PR-2', () => {
     const bad: string[] = [];
     const d = new FrameDecoder((l) => bad.push(l), { maxLineLength: 12 });
     expect(d.push('{"a":"1234"}\n{"a":"12345678"}\n{"b":2}\n')).toEqual([{ a: '1234' }, { b: 2 }]);
@@ -101,7 +101,7 @@ describe('FrameDecoder line limit', () => {
 });
 
 describe('FrameDecoder bytes', () => {
-  it('keeps multi-byte characters split across chunks', () => {
+  it('keeps multi-byte characters split across chunks #PR-2', () => {
     const bytes = new TextEncoder().encode(encodeFrame({ t: '飞书' }));
     const d = new FrameDecoder();
     const out = [...d.push(bytes.slice(0, 9)), ...d.push(bytes.slice(9))];
@@ -110,7 +110,7 @@ describe('FrameDecoder bytes', () => {
 });
 
 describe('host protocol', () => {
-  it('validates a binding table and host frames', async () => {
+  it('validates a binding table and host frames #PR-1', async () => {
     const { BindingTable, HostRequestFrame, HostEventFrame } = await import('../src/index.js');
     const table = {
       version: '1', onHostDown: 'suspend',
@@ -123,8 +123,15 @@ describe('host protocol', () => {
     };
     expect(errors(BindingTable, table)).toEqual([]);
     expect(check(BindingTable, { ...table, bindings: [{ id: 'x', match: {}, on: 'wake' }] })).toBe(false);
-    expect(check(HostRequestFrame, { v: 1, type: 'run.start', id: '1', runId: 'r1', agent: 'executor', input: [{ type: 'text', text: 'go' }] })).toBe(true);
+    const start = { v: 1, type: 'run.start', id: '1', runId: 'r1', agent: 'executor', input: [{ type: 'text', text: 'go' }] };
+    expect(check(HostRequestFrame, start)).toBe(true);
+    expect(check(HostRequestFrame, { ...start, overrides: { model: 'opus', effort: 'high', profile: 'restricted' } })).toBe(true);
+    expect(check(HostRequestFrame, { ...start, overrides: {} })).toBe(true);
+    expect(check(HostRequestFrame, { ...start, overrides: { model: 1 } })).toBe(false);
     expect(check(HostRequestFrame, { v: 1, type: 'bindings.put', id: '2', table })).toBe(true);
     expect(check(HostEventFrame, { v: 1, type: 'run.ended', runId: 'r1', sessionKey: 'run:r1', status: 'completed', exitCode: 0 })).toBe(true);
+    const ended = { v: 1, type: 'run.ended', runId: 'r1', sessionKey: 'run:r1', status: 'timeout', exitCode: 124, durationMs: 1200, usage: { inputTokens: 10 } };
+    expect(errors(HostEventFrame, ended)).toEqual([]);
+    expect(check(HostEventFrame, { ...ended, status: 'killed' })).toBe(false);
   });
 });

@@ -89,7 +89,7 @@ async function mcpCall(mcp: { url: string; token: string } | undefined, name: st
 const of = (evs: SessionEvent[], t: string) => evs.filter((e) => e.body.t === t).map((e) => e.body as never as Record<string, unknown>);
 
 describe('lark clicks reach the owning session (ownerSessionKey)', () => {
-  it('approval and stop buttons on a DM turn in the owner session', async () => {
+  it('approval and stop buttons on a DM turn in the owner session #RQ-1 #CT-1', async () => {
     const w = await setup(async (t) => {
       const first = t.inputs[0]!.content[0]!;
       if (first.type === 'text' && first.text === 'approve') {
@@ -114,7 +114,7 @@ describe('lark clicks reach the owning session (ownerSessionKey)', () => {
     expect(of(w.events, 'turn.completed')[1]).toMatchObject({ status: 'interrupted' });
   });
 
-  it('an ask_choice button click reaches the asking owner session', async () => {
+  it('an ask_choice button click reaches the asking owner session #RQ-1', async () => {
     const holder: { h?: FakeHarness } = {};
     const w = await setup(async (t) => {
       const first = t.inputs[0]!.content[0]!;

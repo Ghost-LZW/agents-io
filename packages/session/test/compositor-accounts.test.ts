@@ -33,7 +33,7 @@ function rig(log: MemorySessionLog, chans: Record<string, FakeChannel>, account:
 }
 
 describe('compositor accounts', () => {
-  it('a route of account b is rendered by b only', async () => {
+  it('a route of account b is rendered by b only #DL-3 #DL-4', async () => {
     const a = new FakeChannel('lark-bot', defaultChannelCaps);
     const b = new FakeChannel('lark-bot', defaultChannelCaps);
     const w = rig(new MemorySessionLog(), { a, b });
@@ -44,14 +44,14 @@ describe('compositor accounts', () => {
     expect(b.sent).toHaveLength(1);
   });
 
-  it('without account every compositor of the channel id claims the route (unchanged behaviour)', async () => {
+  it('without account every compositor of the channel id claims the route (unchanged behaviour) #DL-4', async () => {
     const a = new FakeChannel('lark-bot', defaultChannelCaps);
     const w = rig(new MemorySessionLog(), { a }, () => undefined);
     w.append({ t: 'turn.started', turnId: 't1', inputIds: [], replyRoute: R });
     await until(() => a.sent.length === 1);
   });
 
-  it('restore: only the route\'s account picks up the open turn and finalizes its card', async () => {
+  it('restore: only the route\'s account picks up the open turn and finalizes its card #DL-4 #RS-1', async () => {
     const log = new MemorySessionLog();
     const b = new FakeChannel('lark-bot', defaultChannelCaps);
     const first = rig(log, { b });
