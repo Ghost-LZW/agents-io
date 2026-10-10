@@ -61,6 +61,22 @@ describe('the outbound index', () => {
     expect(chans.b.sent).toEqual([]);
   });
 
+  it('every part of a split send is indexed: an image sent after the text comes back as ours too #ID-8', async () => {
+    const { gw, chans } = await bots();
+    // Bot a's sends produce two platform messages (text, then an image), as the Lark adapter reports them.
+    const send = chans.a.send.bind(chans.a);
+    chans.a.send = async (...args: Parameters<typeof send>) => {
+      const r = await send(...args);
+      return { ...r, providerMessageIds: [r.providerMessageId!, `${r.providerMessageId}_img`] };
+    };
+    const group = { id: 'g1', kind: 'group' as const };
+    const r = await chans.a.inject({ id: 'om_h', sender: { channelUserId: 'alice', evidence: 'platform_signed' }, conversation: group, text: 'hi', admission: 'dispatch' });
+    const card = await until(() => chans.a.sent[0]);
+    await until(() => gw.records.outboundByOperation(card.op.operationId));
+    const echo = await chans.b.inject({ id: `${card.providerMessageId}_img`, sender: { channelUserId: 'ou_bot_a', isBot: true, evidence: 'platform_signed' }, conversation: group, text: '[image]' });
+    expect(gw.router.explain(echo.inputId!)!).toMatchObject({ principal: expect.stringMatching(/^agent:/), cause: { basis: 'recovered', hop: 1, chain: r.inputId } });
+  });
+
   it('the turn\'s chain and flags are taken at send time: a delivery settling after its lane closed still indexes them #ID-8 #EX-5', async () => {
     const { gw, chans } = await bots();
     // Bot a's sends wait until released: the lane closes (a parked topic, an eviction) before the card settles.

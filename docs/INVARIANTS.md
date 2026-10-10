@@ -298,10 +298,11 @@
 ### ID-8 本部署的消息经通道回来，由出站索引认出
 
 - **承诺**：本部署某个 turn 投递成功、有平台消息 id 的消息，经任何通道账号回来时（同部署的兄弟机器人、邮件回声），只要信封带 `platform_signed` / `dkim_pass` 证据，就按 `(channel, 消息 id)` 在出站索引里认出：`self: true`、`kind: "agent"`、主体为发出它的 agent（同 ID-7 的主体规则）、证据保持通道的、`cause = { basis: "recovered", hop: 那一轮 + 1, chain, from: { sessionKey, turnId }, rootPrincipal, carried }`；不需要手写 `selfAccounts`。路由不变：`self` 永远不开轮（ID-5）。证据不够的同 id 信封（收件人伪造的邮件 Message-ID）不算。
-- **实现**：`packages/daemon/src/records.ts` `daemon_outbound`（`putOutbound`、`outboundByMessage`，保留 30 天）；`packages/session/src/outbox.ts` `onSettled`；`packages/daemon/src/gateway.ts` `indexOutbound`（每次结算都记，带 turn 发送时的来源与链：`provenanceAtSend`，见 EX-5）、`recoverSend`；`packages/session/src/ingress.ts` `process`（`recover`，在 `identify` 之后、路由之前）。
-- **测试**：标签 `#ID-8`；`packages/session/test/agent-messaging.test.ts` "a hit is self, from the agent that sent it, with a recovered cause one hop on — whatever account received it"、"a hit without platform evidence is not ours (a forged copy of a mail Message-ID); a miss from a bot is a broken chain"；`packages/daemon/test/agent-messaging.test.ts` "bot a's reply delivered into a group comes back through bot b: self, from the agent that wrote it, recovered — no selfAccounts needed"。
+- **实现**：`packages/daemon/src/records.ts` `daemon_outbound`、`daemon_outbound_parts`（拆开发送的其余各条；`putOutbound`、`outboundByMessage`，保留 30 天）；`channel/lark-bot/src/adapter.ts` `doSend`（`providerMessageIds`）；`packages/session/src/outbox.ts` `onSettled`；`packages/daemon/src/gateway.ts` `indexOutbound`（每次结算都记，带 turn 发送时的来源与链：`provenanceAtSend`，见 EX-5）、`recoverSend`；`packages/session/src/ingress.ts` `process`（`recover`，在 `identify` 之后、路由之前）。
+- **测试**：标签 `#ID-8`；`packages/session/test/agent-messaging.test.ts` "a hit is self, from the agent that sent it, with a recovered cause one hop on — whatever account received it"、"a hit without platform evidence is not ours (a forged copy of a mail Message-ID); a miss from a bot is a broken chain"；`packages/daemon/test/agent-messaging.test.ts` "bot a's reply delivered into a group comes back through bot b: self, from the agent that wrote it, recovered — no selfAccounts needed"、"every part of a split send is indexed: an image sent after the text comes back as ours too"；`channel/lark-bot/test/output-tools.test.ts` "reports every platform message it produced (caption and file), so the outbound index knows each part as ours"。
 - **状态**：有测试（假通道）。飞书是否把机器人的群消息推给同群其他机器人仍待 live 核实（ROADMAP §4）；不推则飞书上这条路径不出现。
-- **边界**：适配器把长消息拆成多条时只报最后一条的 id，前面几条找不回；出站索引过了保留期、或另一台机器发的，都找不回，落回身份规则。
+- **边界**：适配器把一次发送拆成多条（长文本、图片、文件）时，每一条的 id 都要在 `SendResult.providerMessageIds` 里报出来才认得出（飞书适配器报；只报 `providerMessageId` 的适配器只认得主消息）；出站索引过了保留期、或另一台机器发的，都找不回，落回身份规则。
+- **已修**：~~飞书一次发送的多条消息只索引主消息，同时发的图片、文件回来认不出~~（2026-10-11 合并评审：适配器报全部 id，`daemon_outbound_parts` 逐条索引）。
 
 ---
 

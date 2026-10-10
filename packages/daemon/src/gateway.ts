@@ -1246,6 +1246,7 @@ export class Gateway {
       operationId: rec.operationId,
       channel: rec.route.channel,
       ...(rec.providerMessageId !== undefined ? { providerMessageId: rec.providerMessageId } : {}),
+      ...(rec.providerMessageIds?.length ? { providerMessageIds: rec.providerMessageIds } : {}),
       sessionKey: d.sessionKey,
       ...(d.turnId !== undefined ? { turnId: d.turnId } : {}),
       ...(agent !== undefined ? { agent } : {}),

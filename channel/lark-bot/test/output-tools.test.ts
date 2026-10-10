@@ -47,3 +47,17 @@ describe('send_file on Lark', () => {
     expect(lark.messages).toHaveLength(2);
   });
 });
+
+describe('a send in several parts', () => {
+  it('reports every platform message it produced (caption and file), so the outbound index knows each part as ours #ID-8', async () => {
+    const { lark, adapter, store } = make();
+    const ref = await store.put(new TextEncoder().encode('x'), { mime: 'text/plain', name: 'a.txt' });
+    const r = await adapter.send(route, { text: 'here', attachments: [{ ref, mime: 'text/plain', name: 'a.txt' }] }, { operationId: 'op1' });
+    expect(r.providerMessageId).toBe(lark.messages[0]!.id);
+    expect(r.providerMessageIds).toEqual(lark.messages.map((m) => m.id));
+    expect(r.providerMessageIds).toHaveLength(2);
+    // One part: the primary id alone.
+    const one = await adapter.send(route, { text: 'just text' }, { operationId: 'op2' });
+    expect(one.providerMessageIds).toBeUndefined();
+  });
+});

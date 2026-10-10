@@ -520,16 +520,19 @@ export class LarkBotAdapter implements ChannelAdapter {
     const msg = await this.uploadAttachments(input);
     const { parts, primary } = this.plan(msg);
     let providerMessageId: string | undefined;
+    const all: string[] = [];
     for (const [i, p] of parts.entries()) {
       // Same operationId -> same uuid per part, so Lark itself drops a duplicate within its dedup window.
       const id = await this.sendOne(route, p.out, uuidFor(this.account, op.operationId, i));
+      if (id) all.push(id);
       if (id && op.as) await this.store.set(id, op.as);
       if (i === primary) {
         providerMessageId = id;
         if (id) bounded(this.kinds, id, p.kind);
       }
     }
-    return providerMessageId ? { providerMessageId } : {};
+    // Every part (split text, images, files) is ours: the outbound index recognises each one coming back (ID-8).
+    return { ...(providerMessageId ? { providerMessageId } : {}), ...(all.length > 1 ? { providerMessageIds: all } : {}) };
   }
 
   /** Serialise edits per message and keep `gap` ms between two of them. */

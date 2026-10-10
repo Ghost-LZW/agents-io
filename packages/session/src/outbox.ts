@@ -19,6 +19,8 @@ export interface DeliveryRecord {
   status: DeliveryStatus;
   attempts: number;
   providerMessageId?: string;
+  /** Every platform message the send produced, in order, when the adapter split it (`SendResult.providerMessageIds`). */
+  providerMessageIds?: string[];
   error?: string;
 }
 
@@ -258,6 +260,7 @@ export class Outbox {
           ...rec,
           status: 'delivered',
           ...(r && r.providerMessageId !== undefined ? { providerMessageId: r.providerMessageId } : {}),
+          ...(r && r.providerMessageIds?.length ? { providerMessageIds: [...r.providerMessageIds] } : {}),
         });
       } catch (err) {
         rec.error = err instanceof Error ? err.message : String(err);
