@@ -224,8 +224,7 @@ describe('named harness instances', () => {
 });
 
 describe('persistence', () => {
-  // INVARIANTS RS-9 不成立 1: a non-SQLite log (or logPath ':memory:') keeps the host queue, outbox and records in memory without a warning; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('Gateway.start with a MemorySessionLog logs a "not persistent" warning #RS-9', async () => {
+  it('Gateway.start with a MemorySessionLog logs a "not persistent" warning #RS-9', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'aio-gwm-'));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
     const config = { ...resolveConfig({ local: { principal: 'me' } }, { env: {}, baseDir: dir, cwd: dir }), socketPath: join(dir, 'run', 'aio.sock') };

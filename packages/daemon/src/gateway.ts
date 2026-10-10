@@ -313,6 +313,10 @@ export class Gateway {
     }
     const log = o.log ?? new SqliteSessionLog({ path: c.logPath });
     const db = log instanceof SqliteSessionLog ? { db: log.db } : {};
+    // RS-9: the host queue, outbox, launch records and host table share the log's database.
+    if (!(log instanceof SqliteSessionLog) || (!o.log && c.logPath === ':memory:')) {
+      this.log('warn', 'session log is not persistent (not a SQLite file): the session log, host inbound queue, outbox, launch records and host binding table are kept in memory and lost at stop; a restart may resend or lose deliveries');
+    }
     this.hub = new Hub(log);
     this.records = new DaemonRecords(db);
     this.hostQueue = new HostQueue(db);

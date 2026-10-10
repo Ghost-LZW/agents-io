@@ -549,10 +549,12 @@
 
 ### RS-9 持久化以 SQLite 日志为前提
 
-- **现状**：宿主队列、`DaemonRecords`（outbox、launch、input.verify）、路由表都和日志共用一个 SQLite 库（`gateway.ts:266-270`）。嵌入方传入非 SQLite 的日志或 `logPath: ':memory:'` 时，它们全部在内存里，没有告警。`aio serve` 默认 `dataDir/log.sqlite`（`config.ts:736`），不受影响。
-- **测试**：`it.fails` `packages/daemon/test/gateway.test.ts` "Gateway.start with a MemorySessionLog logs a "not persistent" warning #RS-9"。
-- **状态**：不成立（只有 `it.fails`）。
-- **不成立**：嵌入方用非 SQLite 日志时没有任何告警，宿主队列、outbox、launch 记录、路由表悄悄只在内存里。
+- **现状**：宿主队列、`DaemonRecords`（outbox、launch、input.verify）、路由表都和日志共用一个 SQLite 库（`gateway.ts` 构造函数）。嵌入方传入非 SQLite 的日志或 `logPath: ':memory:'` 时，它们全部在内存里。`aio serve` 默认 `dataDir/log.sqlite`（`config.ts:736`），不受影响。
+- **承诺**：这种情况下 `Gateway.start` 记一条 warn（"session log is not persistent …"），说明哪些东西只在内存里。
+- **实现**：`gateway.ts` 构造函数（`log instanceof SqliteSessionLog`，或没传日志而 `logPath` 是 `:memory:`）。
+- **测试**：`packages/daemon/test/gateway.test.ts` "Gateway.start with a MemorySessionLog logs a "not persistent" warning"（原 `it.fails`，已修）。
+- **状态**：有测试。
+- **注意**：嵌入方自己传入的 `SqliteSessionLog` 若开在 `:memory:` 上，网关认不出，不告警。
 
 ---
 
