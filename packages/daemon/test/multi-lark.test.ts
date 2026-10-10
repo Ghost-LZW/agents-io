@@ -26,10 +26,13 @@ async function mcpCall(mcp: { url: string; token: string } | undefined, name: st
 }
 
 /** A bot whose connection never comes up: `start` rejects, so the instance ends at once (configured, not running). */
-class DeadBot extends FakeChannel {
-  override async start(): Promise<void> {
+/** A lark-bot whose connection fails. Same adapter class as its siblings: one channel id is one adapter (channel-stamping F4). */
+function deadBot(): FakeChannel {
+  const ch = new FakeChannel('lark-bot');
+  ch.start = async () => {
     throw new Error('connect refused');
-  }
+  };
+  return ch;
 }
 
 async function bots(o: { raw?: Record<string, unknown>; script?: FakeTurnScript; accounts?: string[]; dead?: string[] } = {}) {
@@ -39,7 +42,7 @@ async function bots(o: { raw?: Record<string, unknown>; script?: FakeTurnScript;
   const base = resolveConfig(raw, { env: {}, baseDir: dir, cwd: dir });
   const config = { ...base, socketPath: join(dir, 'run', 'aio.sock') };
   const harness = new FakeHarness(o.script);
-  const chans = Object.fromEntries((o.accounts ?? ['a', 'b']).map((acc) => [acc, (o.dead?.includes(acc) ? new DeadBot('lark-bot') : new FakeChannel('lark-bot'))]));
+  const chans = Object.fromEntries((o.accounts ?? ['a', 'b']).map((acc) => [acc, (o.dead?.includes(acc) ? deadBot() : new FakeChannel('lark-bot'))]));
   const gw = await Gateway.start({
     config,
     buildHarness: (i: HarnessInstance) => new InstanceHarness(i, harness),
