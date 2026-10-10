@@ -4,6 +4,7 @@ import { mailauthVerifier } from './auth.js';
 import { ImapSource } from './imap.js';
 import { SENDER_HEADER, parseInbound } from './inbound.js';
 import { addressOf, messageIdFor, renderHtml, renderText, replySubject } from './outbound.js';
+import { HOP_HEADER_NAME, formatHopHeader } from './inbound.js';
 import {
   MemoryMailStore,
   type BlobSink,
@@ -132,7 +133,9 @@ export class MailChannel implements ChannelAdapter {
       text: renderText(msg),
       html: renderHtml(msg),
       ...(attachments.length ? { attachments } : {}),
-      ...(op.as ? { headers: { 'X-Agents-IO-Sender': op.as } } : {}),
+      // Agent-authored: who wrote it, and where it sits in a chain of agent messages (read back only by
+      // deployments that trust this sender as an agent account, on DKIM-signed mail; agent-messaging §4.3.4).
+      ...(op.as ? { headers: { 'X-Agents-IO-Sender': op.as, ...(op.cause ? { [HOP_HEADER_NAME]: formatHopHeader(op.cause) } : {}) } } : {}),
     });
 
     await this.store.putSent(messageId, { operationId: op.operationId, ...(op.as ? { as: op.as } : {}), state: 'sent' });

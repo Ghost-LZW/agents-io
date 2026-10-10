@@ -309,8 +309,7 @@ describe('deliver, input.verify, explain', () => {
     await expect(h.explain('in_nope')).rejects.toBeInstanceOf(CommandError);
   });
 
-  // INVARIANTS EX-2 不成立 1: explain only takes an inputId; no lookup by operationId (nor turnId, requestId), and system replies, host deliver and live_say record no turn at all; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('explain by the operationId of an output-tool send returns the turnId and that turn\'s inputIds #EX-2', async () => {
+  it('explain by the operationId of an output-tool send returns the turnId and that turn\'s inputIds #EX-2', async () => {
     const holder: { w?: World } = {};
     const w = await daemon({
       raw: { outputTools: true },

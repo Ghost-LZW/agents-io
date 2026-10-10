@@ -1,11 +1,13 @@
 import { timingSafeEqual } from 'node:crypto';
 import {
+  ContactCalloutAnswer,
   OutboundCalloutAnswer,
   PROTOCOL_VERSION,
   Resolver,
   check,
   errors,
   type BodyOf,
+  type ContactArgs,
   type HostHelloResult,
   type HostRequestFrame,
   type InboundReadResult,
@@ -51,8 +53,10 @@ export interface HostServiceDeps {
   redispatch(hostName: string, f: Extract<HostRequestFrame, { type: 'inbound.redispatch' }>): Promise<Outcome>;
   /** `policy.answerOnBehalf`: the `resolve.onBehalfOf` feature is advertised only when it is on. */
   answerOnBehalf?: boolean;
-  /** Per-hook timeouts of the `resolve` / `outbound` callouts (config `hostCallouts`). */
-  calloutTimeouts?: { resolve?: number; outbound?: number };
+  /** Per-hook timeouts of the `resolve` / `outbound` / `contact` callouts (config `hostCallouts`). */
+  calloutTimeouts?: { resolve?: number; outbound?: number; contact?: number };
+  /** `explain`: a routing record, a side effect by operationId, or (`chain`) an agent input's chain. */
+  explain(inputId: string, chain: boolean): Outcome;
   log: LogFn;
   /** How long a pushed `inbound` waits for the host's result before it is retried (default 30 s). */
   pushTimeoutMs?: number;
@@ -137,10 +141,8 @@ export class HostService implements HostFrames {
       case 'inbound.ack':
         if (!f.consumer) return fail('invalid_frame', 'consumer is empty');
         return ok({ consumer: f.consumer, acked: this.d.queue.ack(f.consumer, f.cursor) });
-      case 'explain': {
-        const e = this.d.router.explain(f.inputId);
-        return e ? ok(e) : fail('unknown_input', `no routing record for ${f.inputId} (unknown, or older than the retention)`);
-      }
+      case 'explain':
+        return this.d.explain(f.inputId, f.chain === true);
       case 'session.prepare':
         return this.d.prepareSession(f);
       case 'inbound.redispatch':
@@ -247,6 +249,13 @@ export class HostService implements HostFrames {
     return v.verdict;
   }
 
+  /** `Policy.contact` asked of the host (hook `contact`). Throws on no answer or a bad one: the caller's own policy decides. */
+  async contactCallout(a: ContactArgs): Promise<'allow' | 'deny'> {
+    const v = await this.callout('contact', { from: a.from, to: a.to, op: a.op, turn: a.turn ? ctxView(a.turn) : null }, this.d.calloutTimeouts?.contact ?? 2000);
+    if (!check(ContactCalloutAnswer, v)) throw new Error(`bad contact answer: ${errors(ContactCalloutAnswer, v).slice(0, 2).join('; ')}`);
+    return v.verdict;
+  }
+
   private async callout(hook: CalloutHook, args: unknown, timeoutMs: number): Promise<unknown> {
     const h = this.host;
     if (!h || !h.hooks.has(hook)) throw new Error(`no host answers ${hook}`);
@@ -262,11 +271,11 @@ export class HostService implements HostFrames {
 }
 
 /** Capabilities `host.hello` advertises (a host must not rely on one this list lacks); `resolve.onBehalfOf` only with `policy.answerOnBehalf`. */
-export const FEATURES = ['session.launch', 'callouts.resolve', 'callouts.outbound', 'resolve.onBehalfOf', 'inbound.redispatch', 'host.takeover'];
+export const FEATURES = ['session.launch', 'callouts.resolve', 'callouts.outbound', 'callouts.contact', 'resolve.onBehalfOf', 'inbound.redispatch', 'host.takeover', 'explain.chain'];
 
 /** The `policy` hooks a host may answer. */
-export type CalloutHook = 'route' | 'resolve' | 'outbound';
-const HOOKS: readonly CalloutHook[] = ['route', 'resolve', 'outbound'];
+export type CalloutHook = 'route' | 'resolve' | 'outbound' | 'contact';
+const HOOKS: readonly CalloutHook[] = ['route', 'resolve', 'outbound', 'contact'];
 
 /** `host.hello.callouts`: `true` = route only; a list names the hooks (unknown names ignored). */
 export function calloutHooks(c: boolean | string[] | undefined): Set<CalloutHook> {

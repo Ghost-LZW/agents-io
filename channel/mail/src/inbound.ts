@@ -5,6 +5,20 @@ import { splitQuote, truncate } from './quote.js';
 import type { AuthVerdict, BlobSink, MailStore, MailVerifier, MessageMeta } from './types.js';
 
 export const SENDER_HEADER = 'x-agents-io-sender';
+/** `X-Agents-IO-Hop: <hop>; chain=<opaque id>` on agent-authored mail (agent-messaging §4.3.4). */
+export const HOP_HEADER_NAME = 'X-Agents-IO-Hop';
+const HOP_HEADER = HOP_HEADER_NAME.toLowerCase();
+
+export function formatHopHeader(c: { hop: number; chain: string }): string {
+  return `${c.hop}; chain=${c.chain}`;
+}
+
+/** The hop header's claim, if well formed (a positive hop; the chain id a short token). */
+export function parseHopHeader(v: string | undefined): { hop: number; chain?: string } | undefined {
+  const m = v === undefined ? null : /^\s*([1-9]\d{0,5})\s*(?:;\s*chain=([A-Za-z0-9._-]{1,128}))?\s*$/.exec(v);
+  if (!m) return undefined;
+  return { hop: Number(m[1]), ...(m[2] ? { chain: m[2] } : {}) };
+}
 export const QUOTE_MAX_CHARS = 4000;
 
 export interface ParseDeps {
@@ -80,6 +94,8 @@ export async function parseInbound(uid: number, raw: Buffer, deps: ParseDeps): P
   // Recipients see our Message-ID and header, so the echo must also be DKIM-signed for our domain.
   const header = headerString(parsed, SENDER_HEADER)?.trim();
   const declared = ours && verdict.evidence === 'dkim_pass' && header && sent.as === header ? header : undefined;
+  // A hop claim only on authenticated mail; the gateway takes it only from trusted agent accounts (agentAccounts).
+  const hop = verdict.evidence === 'dkim_pass' ? parseHopHeader(headerString(parsed, HOP_HEADER)) : undefined;
 
   const subject = parsed.subject?.trim() ?? '';
   const { body, quoted } = splitQuote(parsed.text ?? '');
@@ -133,6 +149,7 @@ export async function parseInbound(uid: number, raw: Buffer, deps: ParseDeps): P
       ...(from?.name ? { displayName: from.name } : {}),
       evidence: verdict.evidence,
       ...(declared ? { declared } : {}),
+      ...(hop ? { cause: hop } : {}),
     },
     content,
     // Our own mail echoed back must not trigger a reply to ourselves.
