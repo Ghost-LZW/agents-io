@@ -351,7 +351,8 @@ aio-dev watch remove team-digest
 - 每个 harness 绑定（一个 session 的一次 open，即一个 generation）发一个随机 bearer token，token 对应 `(sessionKey, generation)`。每次调用时再取这个 session **当前正在跑的那一轮**，没有在跑的轮次就拒绝（监听工具除外）。没有 token 或 token 不对：HTTP 401。
 - **Claude Code**：通过 SDK `mcpServers` 挂成 `agents_io`（`type: 'http'`，`headers.Authorization`），设 `alwaysLoad: true`（工具总在提示里，不藏在 tool search 后面），并加一条 `allowedTools: mcp__agents_io` 允许规则：这些工具自己按 `Policy.outbound` 检查目的地，不再弹审批。
 - **Codex**：在 `thread/start`（或 `thread/resume`）的 `config` 里按线程覆盖 `mcp_servers.agents_io = { url, http_headers: { Authorization }, default_tools_approval_mode: "approve" }`。已实测（codex-cli 0.160.1）：按线程的配置会启动这个服务（`mcpServer/startupStatus/updated` 显示 `ready`）；不设 `default_tools_approval_mode` 时，非只读的 MCP 工具在 `approvalPolicy: never` 下会被直接拒掉（模型回答"需要审批但无法审批"）。
-- dev-gateway 默认打开（配置 `"outputTools": true`），关掉就不挂。
+- **默认关闭，按 agent 开启**（原则 2，决定 13）：在 agent 上写 `"tools": true` 才挂，例如 `"agents": { "assistant": { "harness": "claude", "tools": true } }`；顶层 `"outputTools": true` 把所有没写 `tools` 的 agent 一起打开（它只是各 agent `tools` 的缺省值），agent 自己的 `tools: false` 仍优先。没有任何 agent 开启时网关不起 MCP 服务。`packages/daemon/aio.config.example.json`（dev-gateway / e2e 用的示例配置）给 `assistant` 开了。
+- **行为变化（2026-10-11）**：此前 `outputTools` 缺省为 `true`，什么都不写的部署所有 agent 都有工具。升级后这样的部署**不再挂任何输出工具**：`ask_choice` 按钮、`send_file`、`mention`、`send_message`、`watch_*`、`session_*`（模型自己切话题；`/new`、`/switch` 聊天命令不受影响）、`live_*` 都没有，话题提示行也不再出现。要保持原样，在配置顶层加 `"outputTools": true`，或给需要的 agent 加 `"tools": true`。
 - **幂等**：每次调用的 operationId 是 `tool:<sessionKey>:<harness 的工具调用 id>`。Claude Code 在 `_meta["claudecode/toolUseId"]` 里给出调用 id，Codex 在 `_meta.callId` 里给出（同时还有 `x-codex-turn-metadata`、`threadId`、`itemId` 等）。都没有时退回 JSON-RPC 请求 id。同一个调用重试不会发出两条消息。
 - **记录**：每条工具发出的消息在 session 日志里记一条 `native` 事件 `agents-io.output`（内容是工具名、operationId、路由、`RenderedMessage`，ask_choice 还有问题和选项），随后 Outbox 写 `delivery.settled`。工具调用本身的 `item.*` 事件照常来自 harness。
 

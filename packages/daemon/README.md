@@ -36,7 +36,8 @@ see `docs/E2E.md` §0). New:
 
 - An **agent** is a named run configuration: harness instance, `model`, `effort`,
   `profile`, `cwd`, `tools` (mount the host MCP output tools; default top-level
-  `outputTools`), `instructionsFile` (Claude: appended to the preset system
+  `outputTools`, which defaults to **false** since 2026-10-11: turn tools on per
+  agent with `"tools": true`, or for all agents with `"outputTools": true`), `instructionsFile` (Claude: appended to the preset system
   prompt; Codex: developer instructions), `mode`.
 - `mode: "task"` agents only run through `run.start` / `aio run`. A binding (config
   or host-pushed, including a callout's `onFailure`) that targets one is rejected

@@ -563,10 +563,10 @@
 ### CF-6 给模型的工具默认关闭，按 agent 开启
 
 - **承诺**：给模型的工具默认关闭、按 agent 配置开启（ROADMAP §1 原则 2）。
-- **实现**：`outputTools` 默认 `true`（`config.ts:727`），每个 agent 只有一个布尔 `tools`（`config.ts:214`、`:806`）；开启时 15 个工具全部注册（`packages/host-mcp/src/server.ts:20-131`），`live_*` 在没有任何通道能开 live 时也出现（`gateway.ts:382-399`）。
-- **测试**：`packages/daemon/test/output-tools.test.ts` "outputTools: false mounts nothing"；`host-mcp.test.ts` "are listed over MCP only when the host provides watches"；`packages/host-mcp/test/topic-tools.test.ts` "are listed over MCP only when the host provides topics"。
-- **状态**：部分覆盖（整体开关有测试；逐个工具的默认关闭不存在）。
-- **不成立**：与原则 2 相反。已列入 ROADMAP §4 第 11 项（工具负担复查）。
+- **实现**：`outputTools` 默认 `false`（`config.ts` `resolveConfig`，决定 13），是每个 agent `tools` 的缺省值（`resolveAgents`）；网关只在有 agent 开了 `tools` 时建 `HostTools` / MCP 服务（`gateway.ts` 构造函数），只给这些 agent 的 harness 挂（`mcp: … agent.tools`）。开启时 15 个工具全部注册（`packages/host-mcp/src/server.ts:20-131`），`live_*` 在没有任何通道能开 live 时也出现（`gateway.ts:382-399`）。
+- **测试**：`packages/daemon/test/output-tools.test.ts` "off by default (decision 13): neither outputTools nor an agent turns them on, nothing is mounted"、"agents.<name>.tools: true turns them on for that agent alone, with outputTools unset"、"outputTools: false mounts nothing"；`packages/daemon/test/topics.test.ts` "agents without the session_* tools get no topic hint"（agent 的 `tools: false` 优先于顶层 `outputTools: true`）；`host-mcp.test.ts` "are listed over MCP only when the host provides watches"；`packages/host-mcp/test/topic-tools.test.ts` "are listed over MCP only when the host provides topics"。
+- **状态**：有测试（按 agent 开关）。逐个工具的开关仍不存在：一个 agent 要么 15 个全有、要么全无，逐个工具的取舍留给 ROADMAP §4 第 11 项（工具负担复查）。
+- **行为变化**：2026-10-11 之前缺省开启；没写 `outputTools` / `tools` 的部署升级后不再有输出工具（CHANNELS §输出工具）。
 
 ---
 
@@ -587,7 +587,7 @@
 11. **没有可用交互 agent 时 `accept` 直接抛错（FC-3，不成立）**。（harness 起不来时只在日志里拒绝的 FC-2 已修。）
 12. **`closeLane` 窗口可能出现同一键两个 lane（LN-2，可能）**；**监听回复可能回到被监听的群（CF-5，可能）**：都需要先写测试复现。
 13. **未测的承诺**：live 传输拒绝与视频过滤（LN-5）、模块 harness 启动失败（CF-4）、Claude Code 停止时的行为（RS-3）、非 SQLite 持久化（RS-9）、模型输入里的 watch 标记（ID-2）。
-14. **文档本身的出入**：决定 12 说 `onBehalfOf` "须显式开启"而它没有开关（RQ-3）；工具默认开启与原则 2 相反（CF-6，ROADMAP 已列复查）；`docs/E2E.md` 的"已知缺口"仍写 outbox 在内存、compositor 不接管旧卡片、没有宿主 MCP 工具，三条都已过时。
+14. **文档本身的出入**：决定 12 说 `onBehalfOf` "须显式开启"而它没有开关（RQ-3）；~~工具默认开启与原则 2 相反（CF-6）~~ 已改为默认关闭（决定 13）；`docs/E2E.md` 的"已知缺口"仍写 outbox 在内存、compositor 不接管旧卡片、没有宿主 MCP 工具，三条都已过时。
 15. **A 组合并评审（2026-10-11）遗留**，按原则 4 记下，未修：
     - **启动时为每个会话折叠全量日志**（`settleLeftoverInputs` 调 `hub.snapshot`）：没有压缩时随日志线性增长；等日志压缩一起做。
     - **崩溃后同一输入两种结局（IN-1，可能）**：digest flush 的 `input.admitted` 落盘后、`endFlush` 前崩溃，重启时 `settleLeftoverInputs` 拒掉该 id，watch 的 redo 又以同一 id 收下并消费（`watch.ts:450`、`:671`）。需先写测试复现。

@@ -38,7 +38,7 @@ function deadBot(): FakeChannel {
 async function bots(o: { raw?: Record<string, unknown>; script?: FakeTurnScript; accounts?: string[]; dead?: string[] } = {}) {
   const dir = tmp('aio-ml-');
   mkdirSync(join(dir, 'work'), { recursive: true });
-  const raw = { dataDir: dir, policy: { owners: ['lark-bot:alice'] }, local: { principal: 'me' }, cwd: join(dir, 'work'), ...o.raw };
+  const raw = { dataDir: dir, policy: { owners: ['lark-bot:alice'] }, local: { principal: 'me' }, cwd: join(dir, 'work'), outputTools: true, ...o.raw };
   const base = resolveConfig(raw, { env: {}, baseDir: dir, cwd: dir });
   const config = { ...base, socketPath: join(dir, 'run', 'aio.sock') };
   const harness = new FakeHarness(o.script);

@@ -92,7 +92,7 @@ class MeetingChannel extends FakeChannel {
 
 async function setup(script: FakeTurnScript) {
   const dir = mkdtempSync(join(tmpdir(), 'aio-live-'));
-  const base = resolveConfig({ policy: { owners: ['fake:alice'] }, local: { principal: 'me' } }, { env: {}, baseDir: dir, cwd: dir });
+  const base = resolveConfig({ policy: { owners: ['fake:alice'] }, local: { principal: 'me' }, outputTools: true }, { env: {}, baseDir: dir, cwd: dir });
   const config = { ...base, socketPath: join(dir, 'run', 'aio.sock'), blobs: { ...base.blobs, dir: join(dir, 'blobs') } };
   const chat = new MeetingChannel('fake');
   const harness = new LiveFakeHarness(script);

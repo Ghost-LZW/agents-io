@@ -227,7 +227,10 @@ const AgentEntry = Type.Object(
     cwd: Type.Optional(Type.String()),
     /** `task`: only `run.start` / `aio run` runs it; no binding may target it. Default `interactive`. */
     mode: Type.Optional(Type.Union([Type.Literal('interactive'), Type.Literal('task')])),
-    /** Mount the host MCP output tools (default: top-level `outputTools`). */
+    /**
+     * Mount the host MCP output tools for this agent (default: top-level `outputTools`,
+     * itself off by default: principle 2, decision 13). This is the per-agent switch.
+     */
     tools: Type.Optional(Type.Boolean()),
     /** Extra system instructions read from this file (Claude: appended to the preset prompt; Codex: developer instructions). */
     instructionsFile: Type.Optional(Type.String()),
@@ -299,8 +302,10 @@ export const ConfigFile = Type.Object(
     identities: Type.Optional(Type.Array(IdentityEntry)),
     channels: Type.Optional(Type.Array(ChannelEntry)),
     /**
-     * Mount the host MCP output tools (send_file, ask_choice, mention, reply_to,
-     * send_message, get_channel_context) into every harness instance (default true).
+     * Default of every agent's `tools`: mount the host MCP output tools (send_file,
+     * ask_choice, mention, reply_to, send_message, watch_*, session_*, live_*…).
+     * Default false since decision 13 (it was true): turn tools on per agent with
+     * `agents.<name>.tools: true`, or set this to true for every agent.
      */
     outputTools: Type.Optional(Type.Boolean()),
     /**
@@ -546,7 +551,7 @@ export interface Config {
   };
   /** Owner watches from the config file. */
   watches: (WatchDraft & { id: string })[];
-  /** Host MCP output tools mounted into every harness instance. */
+  /** The config's `outputTools` (default false): the default of every agent's `tools`. */
   outputTools: boolean;
   /** How long a parked topic's lane stays open while idle (0: until the daemon stops). */
   topics: { parkedIdleMs: number };
@@ -741,7 +746,8 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
 
   const owners = [...(c.policy?.owners ?? []), ...(env.AGENTS_IO_OWNERS ?? '').split(',').map((s) => s.trim()).filter(Boolean)];
   const ownerSessionKey = c.policy?.ownerSessionKey;
-  const outputTools = c.outputTools ?? true;
+  // Off unless asked for (principle 2, decision 13: the default was true before 2026-10-11).
+  const outputTools = c.outputTools ?? false;
   const { agents, defaultAgent } = resolveAgents(c, harnesses, defaultHarness, outputTools, path);
   const identities = c.identities ?? [];
   const localSession = c.local?.session ?? ownerSessionKey ?? 'local:main';

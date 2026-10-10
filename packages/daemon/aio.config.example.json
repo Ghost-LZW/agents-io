@@ -38,7 +38,7 @@
     }
   },
   "agents": {
-    "assistant": { "harness": "claude" },
+    "assistant": { "harness": "claude", "tools": true },
     "executor": { "harness": "claude", "mode": "task", "profile": "bypass" },
     "executor-codex": { "harness": "codex", "mode": "task", "profile": "bypass" }
   },

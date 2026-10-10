@@ -237,7 +237,7 @@ export class Gateway {
   readonly watches: WatchDispatcher;
   /** Inbound media (channels put, harnesses read). */
   readonly blobs: FsBlobStore;
-  /** Host output tools (`config.outputTools`), mounted into every harness binding over MCP. */
+  /** Host output tools, when some agent has `tools` on; mounted over MCP into those agents' harness bindings only. */
   readonly tools: HostTools | undefined;
   private readonly mcp: HostMcpServer | undefined;
   /** The durable host inbound queue (`on: "host"` rules), in the log's database. */
@@ -410,7 +410,8 @@ export class Gateway {
       replyRoute: (w) => this.homeRoute(w.target.sessionKey),
       onError: (err, id) => this.log('warn', `watch ${id}: ${(err as Error).message}`),
     });
-    if (c.outputTools) {
+    // Built when some agent has tools (agents.<name>.tools, default `outputTools`, off); only those agents' harnesses mount them.
+    if (Object.values(c.agents).some((a) => a.tools)) {
       this.tools = new HostTools({
         hub: this.hub,
         outbox: this.outbox,
