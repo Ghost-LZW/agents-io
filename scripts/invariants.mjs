@@ -3,7 +3,7 @@
 //
 //   node scripts/invariants.mjs check              drift report (warnings only for now; exit 0)
 //   node scripts/invariants.mjs affected [files…]  changed files -> invariants -> tests per tier
-//   node scripts/invariants.mjs list [ID…]         the tests tagged with each id
+//   node scripts/invariants.mjs list [ID…|--json]  the tests tagged with each id (or every test as JSON)
 //
 // Ids come from the `### XX-n …` headings of docs/INVARIANTS.md; tags are `#XX-n` in test names.
 // A test's tier is its file suffix: *.test.ts core, *.local.test.ts, *.e2e.test.ts, *.live.test.ts.
@@ -231,21 +231,24 @@ function check() {
     'core tests without an #ID tag (a promise-less test belongs in *.local.test.ts)',
     tests.filter((t) => t.tier === 'core' && t.tags.length === 0).map((t) => `${t.file}:${t.line}  ${t.name}`),
   );
+  const has = (e, kind) => (tagged.get(e.id) ?? []).some((t) => t.kind === kind);
   section(
     'invariants marked 不成立 with no it.fails tagged with them',
-    [...entries.values()]
-      .filter((e) => e.false && !(tagged.get(e.id) ?? []).some((t) => t.kind === 'fails'))
-      .map((e) => `${e.id}  ${e.title}`),
+    [...entries.values()].filter((e) => e.false && !has(e, 'fails') && !has(e, 'todo')).map((e) => `${e.id}  ${e.title}`),
   );
+  const todoOnly = [...entries.values()].filter((e) => e.false && !has(e, 'fails') && has(e, 'todo'));
+  const notes = todoOnly.length ? [`note: 不成立 covered only by it.todo (not reproducible yet): ${todoOnly.map((e) => e.id).join(', ')}`] : [];
   // Quoted test names in INVARIANTS.md that match no test (renamed or deleted).
   const names = tests.map((t) => t.name);
+  const describes = tests.map((t) => t.file).filter((f, i, a) => a.indexOf(f) === i)
+    .flatMap((f) => [...readFileSync(join(root, f), 'utf8').matchAll(/\bdescribe(?:\.\w+)*\(\s*(['"`])((?:(?!\1).)*)\1/g)].map((d) => d[2]));
   const testFields = [...entries.values()].flatMap((e) =>
     Object.entries(e.fields).filter(([k]) => /^(测试|实现与测试|状态)/.test(k)).map(([, v]) => v),
   );
   const quoted = testFields.flatMap((v) => [...v.matchAll(/"((?:[^"\\\n]|\\.){12,}?)"/g)].map((q) => q[1]));
   const lost = [...new Set(quoted)].filter((q) => {
     const plain = q.replace(/\\"/g, '"').split(/\s*…/)[0];
-    return /[a-z]/.test(plain) && !/[一-鿿]/.test(plain) && !names.some((n) => n.includes(plain));
+    return /[a-z]/.test(plain) && !/[一-鿿]/.test(plain) && !names.some((n) => n.includes(plain)) && !describes.some((d) => d.includes(plain));
   });
   section('test names quoted in docs/INVARIANTS.md that match no test', lost.map((q) => `"${q}"`));
 
@@ -254,6 +257,7 @@ function check() {
     `invariants: ${entries.size} ids; tests: ${tests.length} (core ${c.core}, local ${c.local}, e2e ${c.e2e}, live ${c.live}); ` +
       `it.fails ${c.fails}; tagged ${tests.filter((t) => t.tags.length).length}`,
   );
+  for (const n of notes) console.log(n);
   if (warn.length) console.log(warn.join('\n'));
   else console.log('no drift');
   console.log(warn.length ? '\n(warnings only: decision 14 turns these into errors once the backlog is cleared)' : '');
@@ -322,6 +326,10 @@ function affected(args) {
 }
 
 function list(args) {
+  if (args[0] === '--json') {
+    console.log(JSON.stringify(readTests()));
+    return;
+  }
   const { entries } = readInvariants();
   const tagged = byId(readTests());
   for (const id of args.length ? args : [...entries.keys()]) {
