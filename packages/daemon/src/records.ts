@@ -29,6 +29,8 @@ export interface OutboundRecord {
   agent?: string;
   route: ReplyRoute;
   result: 'delivered' | 'rejected' | 'unknown';
+  /** A delivery no turn made that answers inputs (a system reply): which. */
+  inputIds?: string[];
   /** The turn's provenance when it settled: its chain and flags, carried into a recovered input's cause. */
   provenance?: Pick<TurnProvenance, 'external' | 'watched' | 'group' | 'cause'>;
   at: number;

@@ -1251,7 +1251,7 @@ export class Gateway {
       operationId,
       sessionKey: r.sessionKey,
       ...(r.turnId !== undefined ? { turnId: r.turnId } : {}),
-      inputIds: r.turnId !== undefined ? this.turnInputs(r.sessionKey, r.turnId) : [],
+      inputIds: r.turnId !== undefined ? this.turnInputs(r.sessionKey, r.turnId) : (r.inputIds ?? []),
       route: r.route,
       result: r.result,
       ...(r.providerMessageId !== undefined ? { providerMessageId: r.providerMessageId } : {}),
@@ -1381,12 +1381,12 @@ export class Gateway {
         code === 'agent_unavailable'
           ? 'This conversation\'s agent is not available any more, so the message was not delivered. Ask the operator to restore it.'
           : `This conversation could not be started (${code}), so the message was not delivered. Ask the operator.`;
-      await this.systemReply({ route, text, operationId: `${code}:${inputId}`, sessionKey });
+      await this.systemReply({ route, text, operationId: `${code}:${inputId}`, sessionKey, inputId });
     }
   }
 
   /** A topic command's answer: one plain message on the route, through the outbox (recorded in the topic's session). */
-  private async systemReply(a: { route: ReplyRoute; text: string; operationId: string; sessionKey: string }): Promise<void> {
+  private async systemReply(a: { route: ReplyRoute; text: string; operationId: string; sessionKey: string; inputId?: string }): Promise<void> {
     const ch = this.channelFor(a.route);
     if (!ch) {
       // Local ends read their stream; a channel route with no instance is never sent as another account (decision 8).
@@ -1395,6 +1395,9 @@ export class Gateway {
     }
     const { replyToMessageId: _r, ...route } = { ...a.route, account: ch.account };
     await this.outbox.send(ch.adapter, { operationId: a.operationId, sessionKey: a.sessionKey, route, msg: { text: a.text } });
+    // No turn wrote it: explain of its operationId names the input it answers (EX-2).
+    const ob = a.inputId !== undefined ? this.records.outboundByOperation(a.operationId) : undefined;
+    if (ob && !ob.inputIds) this.records.putOutbound({ ...ob, inputIds: [a.inputId!] });
   }
 
   /**

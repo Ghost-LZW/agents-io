@@ -175,6 +175,23 @@ describe('live tools (decision 11)', () => {
     expect(w.harness.starts).toHaveLength(1);
   });
 
+  // INVARIANTS EX-2 不成立 1: live_say goes through no outbox and leaves no record (no operationId, nothing in the log); turns red when fixed — make it `it` and update INVARIANTS.
+  it.fails('live_say is traceable: explain by its tool operationId returns the turn #EX-2', async () => {
+    const holder: { h?: LiveFakeHarness } = {};
+    let said = false;
+    const w = await setup(async () => {
+      const mcp = holder.h!.sessions.at(-1)!.args.mcp;
+      await mcpCall(mcp, 'live_join', { target: '42' }, 'join1');
+      await mcpCall(mcp, 'live_say', { text: 'hello room' }, 'say1');
+      said = true;
+    });
+    holder.h = w.harness;
+    await w.chat.inject({ sender: { channelUserId: 'alice', evidence: 'platform_signed' }, text: 'join' });
+    await until(() => said);
+    const turnId = (w.events.find((e) => e.body.t === 'turn.started')!.body as { turnId: string }).turnId;
+    expect(w.gw.explain('tool:fake:default:c1:say1')).toMatchObject({ ok: true, value: { turnId } });
+  });
+
   it('two concurrent live_join: one wins, the other is refused without touching the running live or opening an endpoint #LN-3', async () => {
     const holder: { h?: LiveFakeHarness } = {};
     const results: { isError: boolean; text: string }[] = [];

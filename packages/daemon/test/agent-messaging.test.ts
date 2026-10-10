@@ -7,6 +7,7 @@ import { FakeChannel, FakeHarness, type FakeTurnScript } from '@agents-io/testki
 import { ConfigError, resolveConfig, type HarnessInstance } from '../src/config.js';
 import { Gateway, InstanceHarness } from '../src/gateway.js';
 import { cleanups, daemon, tmp, until } from './helpers.js';
+import { CONV, alice, turnsIn, world as topicsWorld } from './topics-helpers.js';
 
 /*
  * Agent messaging foundation through the daemon (docs/design/agent-messaging): the outbound
@@ -90,6 +91,22 @@ describe('the outbound index', () => {
     expect(card.op).toMatchObject({ as: expect.stringMatching(/^session:/), cause: { hop: 1, chain: expect.stringMatching(/^[0-9a-f]{16}$/) } });
     await gw.deliver('xwo', { v: 1, type: 'deliver', id: 'x', operationId: 'h1', route: { channel: 'lark-bot', account: 'a', conversationId: 'c9' }, message: { text: 'hi' } } as never);
     expect(chans.a.sent.at(-1)!.op.cause).toBeUndefined();
+  });
+});
+
+describe('explain from a side effect', () => {
+  it('a system reply (a topic command) names the input it answers; a host delivery names no turn #EX-2', async () => {
+    const { w } = await topicsWorld();
+    await w.chat.inject({ sender: alice, text: 'hello' });
+    await until(() => turnsIn(w, CONV).length === 1);
+    const r = await w.chat.inject({ sender: alice, text: '/topics' });
+    const reply = await until(() => w.chat.sent.find((s) => /^Topics/.test(s.msg.text ?? '')));
+    const fx = ok<EffectExplanation>(w.gw.explain(reply.op.operationId));
+    expect(fx).toMatchObject({ inputIds: [r.inputId], result: 'delivered' });
+    expect(fx.turnId).toBeUndefined();
+    const h = await w.host();
+    await h.deliver({ operationId: 'note-1', route: { channel: 'fake', account: 'default', conversationId: 'c7' }, message: { text: 'from the host' } });
+    expect(ok<EffectExplanation>(w.gw.explain('host:note-1'))).toMatchObject({ sessionKey: 'host:xwo', inputIds: [] });
   });
 });
 

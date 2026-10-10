@@ -130,7 +130,7 @@ export interface IngressOptions {
    * is recorded); `operationId` is stable per command input. Without it the
    * command still acts, the reply is only in the result.
    */
-  systemReply?: (a: { route: ReplyRoute; text: string; operationId: string; sessionKey: string }) => Promise<void>;
+  systemReply?: (a: { route: ReplyRoute; text: string; operationId: string; sessionKey: string; inputId?: string }) => Promise<void>;
   /**
    * One line added to inputs routed to a conversation's current topic
    * (`channelContext.topicTools`), telling the model how to move between topics, e.g.
@@ -586,7 +586,7 @@ export class Ingress {
     }
     if (env.replyRoute && this.o.systemReply) {
       try {
-        await this.o.systemReply({ route: env.replyRoute, text: reply, operationId: `topic-cmd:${input.inputId}`, sessionKey: now?.sessionKey ?? d.sessionKey });
+        await this.o.systemReply({ route: env.replyRoute, text: reply, operationId: `topic-cmd:${input.inputId}`, sessionKey: now?.sessionKey ?? d.sessionKey, inputId: input.inputId });
       } catch (e) {
         this.o.onReplyError?.(e);
       }
