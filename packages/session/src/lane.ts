@@ -480,9 +480,32 @@ export class Lane {
   }
 
   /** Have the live's voice say `text`. */
-  async liveSay(text: string): Promise<void> {
-    if (!this.live || !this.session?.live) throw new Error('no live is running in this session');
-    await this.session.live.say(text);
+  /**
+   * Speak `text` in the running live. With an `operationId` (a tool call) it leaves the
+   * record every side effect leaves (EX-2): a `delivery.settled` on the live's route in
+   * this session's log, `delivered`, or `unknown` when the harness failed (it may have
+   * spoken part of it). Returns that outcome.
+   */
+  async liveSay(text: string, o: { operationId?: string; turnId?: string } = {}): Promise<{ route: ReplyRoute; result: 'delivered' | 'unknown' }> {
+    const live = this.live;
+    if (!live || !this.session?.live) throw new Error('no live is running in this session');
+    const record = (result: 'delivered' | 'unknown') => {
+      if (o.operationId === undefined) return;
+      this.emit({
+        ...(o.turnId !== undefined ? { turnId: o.turnId } : {}),
+        level: 'detail',
+        visibility: 'operators',
+        body: { t: 'delivery.settled', operationId: o.operationId, route: live.route, result },
+      });
+    };
+    try {
+      await this.session.live.say(text);
+    } catch (err) {
+      record('unknown');
+      throw err;
+    }
+    record('delivered');
+    return { route: live.route, result: 'delivered' };
   }
 
   /** End the live (its `live.ended` follows from the harness). */
