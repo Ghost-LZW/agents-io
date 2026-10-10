@@ -259,8 +259,7 @@ describe('interactive agents', () => {
     expect(w2.harness.sessions).toHaveLength(0);
   });
 
-  // INVARIANTS FC-3 不成立: with no interactive agent `pickAgent` throws a plain Error, so the input gets no input.rejected and explain no rejection; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('no interactive agent at all (only task agents): a channel input is refused with agent_unavailable, recorded in the log and in explain; accept does not throw #FC-3 #IN-1', async () => {
+  it('no interactive agent at all (only task agents): a channel input is refused with agent_unavailable, recorded in the log and in explain; accept does not throw #FC-3 #IN-1', async () => {
     // Config validation refuses bindings without an agent here, so the channel input reaches a session through a watch trigger.
     const w = await daemon({
       raw: { agents: { exec: AGENTS.exec }, watches: [{ id: 'w', source: { channel: 'fake', conversation: 'g1' }, target: { sessionKey: 'main' }, mode: 'trigger' }] },
@@ -272,6 +271,7 @@ describe('interactive agents', () => {
     expect(w.harness.sessions).toHaveLength(0);
     // The route is the watched group, where a watch never answers (CF-5): no notice is asserted.
     expect(w.gw.router.explain(r.inputId!)!.matched[0]).toMatchObject({ sessionKey: 'main', rejected: { code: 'agent_unavailable' } });
-    expect(w.gw.hub.log.read('main', 0).some((e) => e.body.t === 'input.rejected' && e.body.inputIds.includes(r.inputId!) && e.body.reason === 'agent_unavailable')).toBe(true);
+    // The input the watch would have given the session (its own id, inw_<watch>_…) is the one refused.
+    expect(w.gw.hub.log.read('main', 0).some((e) => e.body.t === 'input.rejected' && e.body.inputIds.some((id) => id.startsWith('inw_w_')) && e.body.reason === 'agent_unavailable')).toBe(true);
   });
 });

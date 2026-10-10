@@ -401,14 +401,17 @@ export class Ingress {
         // No reply summary: it would describe the watched source, not where the reply goes.
         const w = await this.o.watches.deliverWatch(d.watchId, env, origin, channelContext(env, undefined));
         watched.push(w);
-        outcomes.push({ bindingId: d.bindingId, source: d.source, on: d.on, sessionKey: d.sessionKey, ...(w.inputId ? { inputId: w.inputId } : {}), ...(w.result ? { result: w.result } : {}), watch: w });
+        const u = w.unavailable;
+        // The target session refused it (FC-3): recorded and explained like a table delivery.
+        if (u) await Promise.resolve(this.o.onUnavailable?.({ sessionKey: d.sessionKey, on: u.on, code: u.code, message: u.message, input: u.input })).catch((err: unknown) => this.o.onReplyError?.(err));
+        outcomes.push({ bindingId: d.bindingId, source: d.source, on: d.on, sessionKey: d.sessionKey, ...(w.inputId ? { inputId: w.inputId } : {}), ...(w.result ? { result: w.result } : {}), ...(u ? { result: { ok: false, reason: u.code } as CommandResult, unavailable: { code: u.code, message: u.message } } : {}), watch: w });
       } catch (e) {
         this.o.onWatchError?.(e);
       }
     }
 
     // Refused deliveries say so in `explain` (recorded again, same input id).
-    const refused = outcomes.filter((x) => x.unavailable && x.source !== 'watch');
+    const refused = outcomes.filter((x) => x.unavailable);
     if (refused.length) {
       for (const m of explanation.matched) {
         const r = refused.find((x) => x.bindingId === m.bindingId && x.source === m.source);

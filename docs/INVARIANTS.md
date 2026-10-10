@@ -40,7 +40,7 @@
   4. **detach 发生在开轮途中（可能）。** 输入已 `startTurn` 交给 Codex unix、`turn.started` 还没记下时停机：日志里它仍在 `queued`、没有开着的 turn，下次启动记为 `host_restarted`，而 Codex 可能已经在跑它（应为 ambiguous）。没有测试复现。
   5. lane 关闭后到达的输入答 `{ ok: false, reason: 'closed' }`，没进 lane、没有 `input.admitted`；调用方（ingress）是否在原路由上说明不在本条范围内。
   6. **digest flush 崩溃后同一输入两种结局**（第 15 节第 15 项，已复现）：flush 的 `input.admitted` 落盘后、`endFlush` 前崩溃，重启时 `settleLeftoverInputs` 先把该 id 记 `input.rejected host_restarted`，watch 的 redo 又以同一 id 收下并消费（`watch.ts` `flush` / redo）。测试：`it.fails` `packages/session/test/watch.test.ts` "a flush that crashed after input.admitted and before endFlush: after the restart its input has exactly one outcome #IN-1"。
-  7. **没有任何交互 agent 时**（只有任务 agent，watch trigger 能走到这里）`accept` 抛错，输入没有终态，见 FC-3。
+  7. ~~**没有任何交互 agent 时** `accept` 抛错~~：已修，记 `input.rejected agent_unavailable`，见 FC-3。
 
 ### IN-2 未消费的输入重排一次，再拒绝
 
@@ -424,11 +424,11 @@
 
 ### FC-3 没有可用的交互 agent 时明确拒绝
 
-- **承诺**：（隐含于 IN-1）找不到任何交互 agent 时，输入应被明确拒绝。
-- **实现**：`gateway.ts:774` 抛普通 `Error`（不是 `LaneUnavailableError`），`ingress.ts:452-460` 原样抛出，`accept` 整个失败，不写 `input.rejected`、不回说明、explain 没有记录。
-- **测试**：`it.fails` `packages/daemon/test/runs.test.ts` "no interactive agent at all (only task agents): a channel input is refused with agent_unavailable, recorded in the log and in explain; accept does not throw #FC-3 #IN-1"。
-- **状态**：不成立（只有 `it.fails`）。
-- **不成立**：如上。配置校验已拒绝"没有 agent 又没有默认 agent"的绑定，所以渠道输入只能经 watch trigger 走到这里（测试用的就是这条路）；agent 不能热改。本地输入在同样情况下答 `no_agent`。
+- **承诺**：（隐含于 IN-1）找不到任何交互 agent 时，输入被明确拒绝：`input.rejected agent_unavailable` 进会话日志，explain 的对应规则带 `rejected`，`accept` 不抛错；本地输入答 `agent_unavailable`（同样记日志）。
+- **实现**：`gateway.ts` `pickAgent`（抛 `LaneUnavailableError('agent_unavailable', …)`，与"会话的 agent 已不在"同一路径）→ `refuseUnavailable`；watch 投递：`packages/session/src/watch.ts` `deliver`（`lanes` 抛 `LaneUnavailableError` 时返回 `unavailable`，带它本来要交给会话的输入，claim 保留）→ `ingress.ts` watch 循环调 `onUnavailable` 并在 explain 里标 `rejected`。
+- **测试**：`packages/daemon/test/runs.test.ts` "no interactive agent at all (only task agents): a channel input is refused with agent_unavailable, recorded in the log and in explain; accept does not throw"（原 `it.fails`，已修；被拒的是 watch 交给会话的输入 `inw_<watch>_…`）。
+- **状态**：有测试。
+- **注意**：配置校验已拒绝"没有 agent 又没有默认 agent"的绑定，所以渠道输入只能经 watch trigger 走到这里；agent 不能热改。以前本地输入在这种情况下答 `no_agent`、不记日志，现在答 `agent_unavailable` 并记 `input.rejected`。
 
 ### FC-4 launch 不在允许范围就拒绝
 
@@ -757,7 +757,7 @@
 8. ~~**宿主 outbound 在宿主离线时退回本地策略（DL-5，不成立于"fail closed"）；`live_join` 目标不过 outbound 检查。**~~ 已修（2026-10-11）：离线期间只放行本轮回复路由；`live_join` 过 `Policy.outbound`。
 9. **并发 `live_join` 停掉已有 live 并泄漏端点（LN-3，不成立）。** 需要在 `gateway.ts:1168` 检查后同步占位。
 10. **入站去重只在内存，部分失败重试会重复进会话（IN-5，不成立）。**
-11. **没有可用交互 agent 时 `accept` 直接抛错（FC-3，不成立）**。（harness 起不来时只在日志里拒绝的 FC-2 已修。）
+11. ~~**没有可用交互 agent 时 `accept` 直接抛错（FC-3，不成立）**~~ 已修（2026-10-11）。（harness 起不来时只在日志里拒绝的 FC-2 已修。）
 12. **`closeLane` 窗口出现同一键两个 lane（LN-2）**；**监听回复会回到被监听的群（CF-5）**：决定 14 已用 `it.fails` 复现，未修。
 13. ~~**未测的承诺**：live 传输拒绝与视频过滤（LN-5）、模块 harness 启动失败（CF-4）、Claude Code 停止时的行为（RS-3）、非 SQLite 持久化（RS-9）、模型输入里的 watch 标记（ID-2）。~~ 决定 14 都补了测试：LN-5、CF-4、RS-3、ID-2 的 watch 标记成立；RS-9 不成立（`it.fails`）。
 14. **文档本身的出入**：~~决定 12 说 `onBehalfOf` "须显式开启"而它没有开关（RQ-3）~~ 已加 `policy.answerOnBehalf`（决定 13）；~~工具默认开启与原则 2 相反（CF-6）~~ 已改为默认关闭（决定 13）；`docs/E2E.md` 的"已知缺口"仍写 outbox 在内存、compositor 不接管旧卡片、没有宿主 MCP 工具，三条都已过时。

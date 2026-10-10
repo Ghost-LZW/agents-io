@@ -841,7 +841,8 @@ export class Gateway {
     }
     const byPrefix = Object.values(c.agents).find((a) => a.name !== c.defaultAgent && a.mode === 'interactive' && sessionKey.startsWith(`${a.name}:`));
     const agent = usable(wanted) ?? byPrefix ?? usable(c.defaultAgent);
-    if (!agent) throw new Error(`no interactive agent for session ${sessionKey} (configure one, or a defaultAgent)`);
+    // FC-3: refused like a session whose agent is gone (recorded, explained), never a plain throw out of accept.
+    if (!agent) throw new LaneUnavailableError('agent_unavailable', `no interactive agent for session ${sessionKey} (configure one, or a defaultAgent)`);
     return agent;
   }
 

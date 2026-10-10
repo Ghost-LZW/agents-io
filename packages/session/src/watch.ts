@@ -393,6 +393,12 @@ export interface WatchDelivery {
   inputId?: string;
   result?: CommandResult;
   error?: string;
+  /**
+   * The target session refused it before any lane (`LaneUnavailableError` from `lanes`,
+   * e.g. no interactive agent): the input it would have been, for the caller to record
+   * the refusal (FC-3). The claim is kept: the refusal is the outcome.
+   */
+  unavailable?: { code: string; message: string; on: 'dispatch' | 'context'; input: InputRecord };
 }
 
 export type WatchRefusal = { ok: false; code: WatchError['code']; message: string };
@@ -603,10 +609,21 @@ export class WatchDispatcher {
     // Our own echoes may be recorded, never start a turn: a watch can not loop on its own output.
     if (origin.self && verdict === 'trigger') verdict = 'context';
     if (verdict === 'drop') return { watchId: w.id, sessionKey, action: 'drop', inputId: input.inputId };
-    const lane = await this.o.lanes(sessionKey);
+    // A trigger input is a new input even for a revision (the earlier one may already have run).
+    const trigger = async (): Promise<InputRecord> => ({ ...input, inputId: env.revisionOf !== undefined ? watchInputId(w.id, envKey) : input.inputId, replyRoute: await this.route(w) });
+    let lane: Lane;
+    try {
+      lane = await this.o.lanes(sessionKey);
+    } catch (e) {
+      // LaneUnavailableError (ingress.ts; matched by shape to keep the modules acyclic).
+      const code = (e as { code?: unknown }).code;
+      if ((e as Error).name !== 'LaneUnavailableError' || typeof code !== 'string') throw e;
+      const refused = verdict === 'trigger' ? await trigger() : input;
+      const on = verdict === 'trigger' ? ('dispatch' as const) : ('context' as const);
+      return { watchId: w.id, sessionKey, action: 'error', error: (e as Error).message, inputId: refused.inputId, unavailable: { code, message: (e as Error).message, on, input: refused } };
+    }
     if (verdict === 'trigger') {
-      // A trigger input is a new input even for a revision (the earlier one may already have run).
-      const trig: InputRecord = { ...input, inputId: env.revisionOf !== undefined ? watchInputId(w.id, envKey) : input.inputId, replyRoute: await this.route(w) };
+      const trig = await trigger();
       const result = await lane.command({ type: 'input', sessionKey, input: trig, mode: 'queue' });
       return { watchId: w.id, sessionKey, action: 'trigger', inputId: trig.inputId, result };
     }
