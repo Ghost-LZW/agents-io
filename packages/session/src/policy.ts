@@ -131,9 +131,12 @@ export function defaultPolicy(o: DefaultPolicyOptions): FullPolicy {
       const k = routeKey(to);
       if (routes.has(k)) return 'allow';
       if (!from) return 'deny';
-      // A bypass turn (owner-triggered) can already reach anything through its harness; holding back its
-      // sends and lives would cost function without containing risk (decisions 4, 5).
-      if (from.run.profile === 'bypass') return 'allow';
+      // A turn every triggering input of which is from an owner (plan's bypass test) can already reach
+      // anything through its harness; holding back its sends and lives would cost function without
+      // containing risk (decisions 4, 5). The test is on the inputs, not on `run.profile`: a turn that only
+      // inherits a profile (a live delegation runs on the thread's last run, decision 11) is not the
+      // owner speaking, and stays limited to its own reply routes and the preregistered ones.
+      if (from.inputs.length > 0 && from.inputs.every((i) => isOwner(i.origin))) return 'allow';
       const own = [from.replyRoute, ...from.inputs.map((i) => i.replyRoute)];
       return own.some((r) => r && routeKey(r) === k) ? 'allow' : 'deny';
     },

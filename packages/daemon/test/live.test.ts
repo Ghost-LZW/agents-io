@@ -245,7 +245,7 @@ describe('live tools (decision 11)', () => {
 });
 
 describe('delegated turns', () => {
-  it('a delegated turn (no reply route) sends to "current" = the chat that opened the live #LN-6', async () => {
+  it('a delegated turn (no reply route) sends to "current" = the chat that opened the live; it inherits the owner\'s bypass run, not the owner\'s reach: elsewhere is refused #LN-6 #DL-5', async () => {
     const holder: { h?: LiveFakeHarness } = {};
     const results: { isError: boolean; text: string }[] = [];
     const w = await setup(async () => {
@@ -265,7 +265,11 @@ describe('delegated turns', () => {
     await until(() => w.events.some((e) => e.body.t === 'turn.started' && e.turnId === 'codex:d1'));
     const mcp = s.args.mcp;
     results.push(await mcpCall(mcp, 'send_message', { route: 'current', text: 'result as text' }, 'delegated-send'));
+    // The delegated turn runs on the owner turn's (bypass) run, but nobody in it is the owner (DL-5).
+    results.push(await mcpCall(mcp, 'send_message', { route: 'fake:default:elsewhere', text: 'leak' }, 'delegated-elsewhere'));
     ev({ t: 'turn.completed', turnId: 'codex:d1', status: 'completed' }, 'codex:d1');
+    expect(results[2]!.isError).toBe(true);
+    expect(w.chat.sent.some((m) => m.msg.text === 'leak')).toBe(false);
     expect(results[1]!.isError).toBe(false);
     expect(JSON.parse(results[1]!.text)).toMatchObject({ ok: true, delivered: 'fake:default:c1' });
     expect(w.chat.sent.some((m) => m.msg.text === 'result as text' && m.route.conversationId === 'c1')).toBe(true);

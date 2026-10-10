@@ -153,14 +153,14 @@
 
 ### DL-5 外发目的地检查；宿主 outbound 回调失败即拒
 
-- **承诺**：输出工具发往的每个路由都过 `Policy.outbound`（默认：`bypass`（主人触发）的一轮不限；其他轮只允许本轮回复路由与预登记路由），`live_join` 的地点也一样；宿主声明了 `outbound` 钩子时由宿主决定，超时、出错、答复不合 schema 一律拒绝（决定 9）；这个宿主断开期间（含重启后）只放行本轮自己的回复路由，直到它重连或一个不声明 `outbound` 的宿主连上。
+- **承诺**：输出工具发往的每个路由都过 `Policy.outbound`（默认：触发本轮的输入全部来自主人（`inputs` 非空、每条主体带 `owner`，与 `plan` 给 `bypass` 的判据相同）的一轮不限；其他轮只允许本轮回复路由与预登记路由，包括只沿用了 `bypass` 的 live 委托轮次），`live_join` 的地点也一样；宿主声明了 `outbound` 钩子时由宿主决定，超时、出错、答复不合 schema 一律拒绝（决定 9）；这个宿主断开期间（含重启后）只放行本轮自己的回复路由，直到它重连或一个不声明 `outbound` 的宿主连上。
 - **实现**：`gateway.ts` 构造函数里的 `outbound`（`host.outboundHeldBy()`、宿主回调、本地策略）；`packages/daemon/src/host.ts` `outboundHeldBy` 与 `hello`（宿主名记在 `DaemonRecords` 的 `daemon_flags`，跨重启）；`gateway.ts` `joinLive` / `liveAllowed`（通道有 `liveRoute` 时打开之前检查，否则检查打开后的端点路由，被拒即关闭端点）；`packages/host-mcp/src/tools.ts:380-397`（`allowed()`）。
-- **测试**：`packages/daemon/test/host-callouts.test.ts` "the host decides; timeout, error and bad answers deny; without the hook the local policy decides #DL-5"、"a host that only answers route callouts leaves outbound to the local policy #DL-5"、"a host that declared the outbound callout disconnects: a send to a route other than the turn's own is still refused"（原 `it.fails`，已修；也覆盖重启后与交还本地策略）；`packages/daemon/test/live.test.ts` "live_join goes through the outbound check: a policy that denies every destination refuses it, no endpoint is opened"（原 `it.fails`，已修）、"live_join from an owner turn (bypass) reaches a meeting that is not preregistered; a channel that cannot name the route first has its endpoint closed when the check denies"；`host-mcp.test.ts` "denies destinations outside Policy.outbound with a clear error and a notice #DL-5"。
+- **测试**：`packages/daemon/test/host-callouts.test.ts` "the host decides; timeout, error and bad answers deny; without the hook the local policy decides #DL-5"、"a host that only answers route callouts leaves outbound to the local policy #DL-5"、"a host that declared the outbound callout disconnects: a send to a route other than the turn's own is still refused"（原 `it.fails`，已修；也覆盖重启后与交还本地策略）；`packages/daemon/test/live.test.ts` "live_join goes through the outbound check: a policy that denies every destination refuses it, no endpoint is opened"（原 `it.fails`，已修）、"live_join from an owner turn (bypass) reaches a meeting that is not preregistered; a channel that cannot name the route first has its endpoint closed when the check denies"、"a delegated turn (no reply route) sends to \"current\" = the chat that opened the live; it inherits the owner's bypass run, not the owner's reach: elsewhere is refused"；`packages/session/test/policy.test.ts` "allows outbound to the turn’s routes and preregistered ones; a turn whose every input is from an owner anywhere"；`host-mcp.test.ts` "denies destinations outside Policy.outbound with a clear error and a notice #DL-5"。
 - **状态**：有测试。
 - **决定（2026-10-11，依原则 4 与决定 9"`outbound` 任何失败都拒绝"自决；决定 13 冻结回调的扩展，这里是改正确性，不加新能力）**：
   1. 宿主离线时只放行本轮自己的回复路由：回复发问的地方不需要宿主授权，本地策略额外放宽的（预登记路由）正是宿主可能收紧过的，按 fail closed 拒绝。没有加配置开关（`host-callouts` §8 原设想的 `whenOffline`）。
   2. `live_join` 的地点按普通外发目的地处理：机器人在那里说话。缺省策略下要把会议路由预登记进 `policy.routes`，或由宿主 `outbound` 放行；`ChannelAdapter.liveRoute(account, target)`（可选）让网关在打开之前检查。
-- **已修**：~~宿主断线时退回本地策略~~、~~`live_join` 的目标不过 outbound 检查~~（2026-10-11，见上）。
+- **已修**：~~宿主断线时退回本地策略~~、~~`live_join` 的目标不过 outbound 检查~~（2026-10-11，见上）；~~默认策略按 `run.profile === 'bypass'` 放行任何目的地，live 委托轮次沿用主人的 `bypass` 也被放行~~（2026-10-11 合并评审，改为看本轮输入是否全部来自主人，DECISIONS 决定 13 补记的修订）。
 - **注意**：outbox 自带的 outbound 检查只在 `Delivery.from` 存在时生效（`outbox.ts:108`），守护进程里没有调用方传 `from`，实际只靠输出工具的 `allowed()`。
 
 ---
@@ -396,7 +396,7 @@
 
 - **承诺**：语音端每次委托记一条输入：`transcript` 块、`origin.principal = null`、`channelContext.live = true`、回复路由 = 发起 live 的路由；harness 自己开的 turn 交给 lane 当作当前 turn，turn 本身没有回复路由（决定 11）。
 - **实现**：`lane.ts:923-947`、`:960-976`。
-- **测试**：`live.test.ts`（session）"a delegation becomes an input from the far side and the harness-started turn runs as the lane turn #LN-6 #LN-2 #ID-1 #LN-4"；`daemon/test/live.test.ts` "a delegated turn (no reply route) sends to \"current\" = the chat that opened the live #LN-6"。
+- **测试**：`live.test.ts`（session）"a delegation becomes an input from the far side and the harness-started turn runs as the lane turn #LN-6 #LN-2 #ID-1 #LN-4"；`daemon/test/live.test.ts` "a delegated turn (no reply route) sends to \"current\" = the chat that opened the live; it inherits the owner's bypass run, not the owner's reach: elsewhere is refused #LN-6 #DL-5"。
 - **状态**：有测试。
 
 ---
