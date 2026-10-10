@@ -126,7 +126,7 @@ harness 必需集：
 process.env 经 inheritEnv 过滤  <  实例 env（含 run.start.env）  <  configDir / home（CLAUDE_CONFIG_DIR / CODEX_HOME）  <  每次 open 的 env（Claude options.env）
 ```
 
-- `inheritEnv` **只过滤从 `process.env` 继承的那一层**。实例 `env` 里显式写的值（包括 `env:NAME` 引用）、`run.start.env`、`options.env`、适配器自己加的变量（`AGENTS_IO_MCP_TOKEN`，`adapter.ts:180`；`AGENTS_IO_RUN_ID` / `AGENTS_IO_TURN_PROVENANCE`，`gateway.ts:632`）都照常进入。显式即授权。
+- `inheritEnv` **只过滤从 `process.env` 继承的那一层**。实例 `env` 里显式写的值（包括 `env:NAME` 引用）、`run.start.env`、`options.env`、适配器自己加的变量（`AGENTS_IO_MCP_TOKEN`，`adapter.ts:180`；`AGENTS_IO_RUN_ID`，`gateway.ts` `openRunLane`；原有的 `AGENTS_IO_TURN_PROVENANCE` 已删除，决定 13）都照常进入。显式即授权。
 - 值为 `null` 的拒绝位置不变：它在实例 env 这一层（`config.ts:841` 把 `null` 解析为 `undefined`），不在最上层。它能删掉被继承的变量，但其上的层可以把它放回：Claude 侧的 `CLAUDE_CONFIG_DIR` 与每次 open 的 `options.env`（`adapter.ts:128-134`），Codex 侧的 `CODEX_HOME`（`harness.ts:116`）；task run 的 `run.start.env` 并入同一层且在实例 env 之后（`gateway.ts:641`），同样能覆盖。本提案不改这一点；有了 `inheritEnv` 之后，`null` 主要用于删掉基础集或必需集里的个别名字。`CLAUDE_CODE_RESUME_INTERRUPTED_TURN` 照旧在所有层合并之后删除（`adapter.ts:135-136`）。
 - 说明：今天 `run.start.env` 位于 `CLAUDE_CONFIG_DIR` / `CODEX_HOME` **之下**（`gateway.ts:641` 后再经 `adapter.ts:132` / `harness.ts:116` 覆盖），即 task run 不能改写实例的配置目录。本提案保持这一顺序。将来若引入按会话的 env（另案讨论），也属于显式层，不受 `inheritEnv` 过滤。
 - **依赖替换语义**：过滤有效的前提是 harness 把收到的 env 当作子进程的完整环境，而不是叠在自己的 `process.env` 上。Claude Agent SDK 给了 `env` 就用它替代 `process.env`（sdk 0.3.291 中 `env ? {...env} : {...process.env}`）；Codex 的 `spawnTransport` 直接把 env 传给 `spawn`。SDK 若改成合并语义，过滤会静默失效，所以 §9 的 e2e 哨兵测试是必需项，不是可选项。

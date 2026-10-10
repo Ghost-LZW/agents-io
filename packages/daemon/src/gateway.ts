@@ -1061,8 +1061,9 @@ export class Gateway {
     const c = this.o.config;
     const inst = c.harnesses[r.agent.harness];
     if (!inst) throw new Error(`agent ${r.agent.name}: unknown harness instance ${r.agent.harness}`);
-    const provenance: TurnProvenance = { sessionKey: r.sessionKey, turnId: r.turnId, triggeredBy: [`host:${this.host.hostName() ?? 'cli'}`], watched: false, external: false, group: false };
-    const env = { ...r.env, AGENTS_IO_RUN_ID: r.runId, AGENTS_IO_TURN_PROVENANCE: JSON.stringify(provenance) };
+    // AGENTS_IO_RUN_ID lets a host command run in the workspace tie itself to this run. There is no
+    // per-run provenance variable: it was a constant the host that started the run already knows (decision 13).
+    const env = { ...r.env, AGENTS_IO_RUN_ID: r.runId };
     let adapter: HarnessAdapter;
     let own: HarnessAdapter | undefined;
     if (this.o.harness) adapter = this.o.harness;

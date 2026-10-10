@@ -286,8 +286,8 @@
 ### EX-3 宿主写请求附带本轮来源标记
 
 - **承诺**：输出工具的每次调用附带本轮来源摘要（是否含 context / digest / 外部 / 群聊），不拦截（决定 4，HOSTS.md §宿主写命令的来源标记）。
-- **实现**：`tools.ts:404-405`（`provenance` 写进 `agents-io.output` 记录）；`lane.ts:338-353`。任务运行另有 `AGENTS_IO_TURN_PROVENANCE`；交互 session 没有这个变量（按设计，HOSTS.md:139）。
-- **测试**：`host-mcp.test.ts` "tags every write with the turn provenance (never blocks it)"；`context.test.ts` "provenance: flags come from the context actually handed, and stay for later turns"；`routing.test.ts` "an owner DM: triggered by the owner, nothing watched, external or group"、"a watch trigger from a stranger: triggered by null, watched, external"。
+- **实现**：`tools.ts:404-405`（`provenance` 写进 `agents-io.output` 记录）；`lane.ts:338-353`。来源不进 harness 子进程环境：任务运行只带 `AGENTS_IO_RUN_ID`（`gateway.ts` `openRunLane`），`AGENTS_IO_TURN_PROVENANCE` 已删除（决定 13）。
+- **测试**：`host-mcp.test.ts` "tags every write with the turn provenance (never blocks it)"；`packages/daemon/test/runs.test.ts` "env goes into the run child only: the instance built for the run has it; the log, explain records and other instances do not"（带 `AGENTS_IO_RUN_ID`、不带 `AGENTS_IO_TURN_PROVENANCE`）；`context.test.ts` "provenance: flags come from the context actually handed, and stay for later turns"；`routing.test.ts` "an owner DM: triggered by the owner, nothing watched, external or group"、"a watch trigger from a stranger: triggered by null, watched, external"。
 - **状态**：部分覆盖（agent 在工作区里直接调 `x` 这类宿主命令时，交互 session 拿不到本轮来源，宿主无从核查）。
 
 ---

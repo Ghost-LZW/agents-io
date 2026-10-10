@@ -126,7 +126,7 @@ before any host frame; after it, the connection's client frames carry the origin
 - `run.start`: only `mode: task` agents. A fresh session `run:<runId>`, its own
   harness adapter (Codex: its own app-server over stdio) with the request `env`
   over the instance's env, in the child process only (never logged, never on
-  argv; the daemon also sets `AGENTS_IO_RUN_ID` and `AGENTS_IO_TURN_PROVENANCE`).
+  argv; the daemon also sets `AGENTS_IO_RUN_ID`).
   The input is the turn's content; the turn ends → `run.ended { status, exitCode }`
   and the session closes. `runId` is an idempotency key: starting an ended run
   again answers `state: "ended"` with its outcome. `run.cancel` interrupts;
