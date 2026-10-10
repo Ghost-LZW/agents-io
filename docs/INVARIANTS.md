@@ -89,7 +89,7 @@
 - **状态**：有测试（期限之后重试用尽仍会丢，见下）。
 - **决定（2026-10-11，依原则 1 自决）**：`emit` 的结果加 `permanent`，区分"现在不收"与"永远不收"。只把 `accepted: false` 一律当失败会让邮件卡在一封无效信封上、之后的信都进不来；只让网关停止时改为抛错则不满足"`accepted: false` 不确认"。原来 CHANNELS.md 写的"`accepted:false` 是终态"收窄为 `permanent: true` 才是终态。
 - **已修**：
-  1. ~~**停止期间收到的消息被确认后丢失。**~~ `Gateway.stop` 先置 `refusingInbound`，通道还要再连着一段时间（等拒绝提示与收尾卡片发出）；这期间 `Gateway.accept` 答 `{ accepted: false, error: 'gateway stopping' }`，不抛错。飞书 `deliver` 只把抛错当失败，于是 ack 并保留去重键，飞书不再重投；邮件 `onMessage` 照常前移 checkpoint。两者都不会交给下一个进程。测试：`it.fails` `channel/lark-bot/test/inbound.test.ts` "an emit answering accepted:false is not acked and leaves no dedup key, so the redelivery gets in #IN-7"；`it.fails` `channel/mail/test/mail.test.ts` "does not move the checkpoint past a message the host answered accepted:false #IN-7"。
+  1. ~~**停止期间收到的消息被确认后丢失。**~~ 原来 `Gateway.accept` 停止期间答 `{ accepted: false, error: 'gateway stopping' }`，飞书只把抛错当失败（ack 并保留去重键），邮件照常前移 checkpoint。现在这个答复不带 `permanent`，两个适配器都当失败处理，测试见上（原两条 `it.fails`）。
 - **边界**：期限之后重试用尽（`EMIT_RETRIES`）或通道被中止时，飞书已经 ack，这条消息丢失（CHANNELS.md §8 已记）。
 
 ---
