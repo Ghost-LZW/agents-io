@@ -668,6 +668,7 @@ export class Gateway {
    * gateway pass their `source` (channel-stamping); without one the caller is trusted.
    */
   async accept(env: InboundEnvelope, source?: EmitSource): Promise<IngressResult> {
+    if (this.refusingInbound) return { accepted: false, action: 'invalid', error: 'gateway stopping' };
     const r = await this.ingress.accept(env, source);
     if (r.accepted && r.origin && r.action !== 'duplicate') {
       try {
@@ -1232,6 +1233,11 @@ export class Gateway {
     try {
       ch = this.liveChannel(turn, a.channel);
       endpoint = await ch.adapter.openLive!(ch.account, a.target);
+      // stop() already left the lives it knew of: a join that lands after that is closed here.
+      if (this.stopped) {
+        await endpoint.close('gateway stopping').catch(() => undefined);
+        throw new ToolError('the gateway is stopping');
+      }
       this.lives.set(sessionKey, { liveId, endpoint });
     } finally {
       this.joining.delete(sessionKey);
@@ -1263,6 +1269,10 @@ export class Gateway {
       await lane.stopLive().catch(() => undefined);
       await endpoint.close(`join failed: ${(e as Error).message}`).catch(() => undefined);
       throw e;
+    }
+    if (this.stopped) {
+      await this.leaveLive(sessionKey, 'gateway stopping');
+      throw new ToolError('the gateway is stopping');
     }
     this.log('info', `${sessionKey}: live ${liveId} joined ${endpoint.title}`);
     // The far side ended it (left, removed, meeting over): stop the voice; its live.ended closes the rest.
@@ -1652,7 +1662,9 @@ ${a.summary}` }],
         launched.push(e);
       } catch (err) {
         failed.push({ ...ref(w.c), error: (err as Error).message });
-        this.configured.set(`${w.c.type}\0${w.c.account}`, { id: w.c.type, account: w.c.account });
+        // Under its channel id when the entry names one (a bridge's `id`); a module's id is only known once loaded.
+        const id = 'id' in w.c && typeof w.c.id === 'string' ? w.c.id : w.c.type;
+        this.configured.set(`${id}\0${w.c.account}`, { id, account: w.c.account });
         this.log('error', `channel ${w.c.type} (${w.c.account}) not started: ${(err as Error).message}`);
       }
     }
@@ -1703,7 +1715,9 @@ ${a.summary}` }],
 
   private startChannel(ch: { adapter: ChannelAdapter; account: string; owner: ChannelOwner; tier?: Tier; config?: unknown; close?: () => Promise<void> }): RunningChannel {
     const ac = new AbortController();
-    const running = ch.adapter
+    // Built before start(): an adapter may emit synchronously, before its first await.
+    const entry: RunningChannel = { adapter: ch.adapter, account: ch.account, ...(ch.tier ? { tier: ch.tier } : {}), ac, running: Promise.resolve(), state: 'running', owner: ch.owner, rejected: 0, evidenceCapped: 0, ...(ch.close ? { close: ch.close } : {}) };
+    entry.running = ch.adapter
       .start({
         account: ch.account,
         config: ch.config,
@@ -1730,7 +1744,6 @@ ${a.summary}` }],
           this.log('error', `channel ${ch.adapter.id} stopped: ${err.message}`);
         },
       );
-    const entry: RunningChannel = { adapter: ch.adapter, account: ch.account, ...(ch.tier ? { tier: ch.tier } : {}), ac, running, state: 'running', owner: ch.owner, rejected: 0, evidenceCapped: 0, ...(ch.close ? { close: ch.close } : {}) };
     this.channels.push(entry);
     this.configured.set(`${ch.adapter.id}\0${ch.account}`, { id: ch.adapter.id, account: ch.account });
     this.log('info', `channel ${ch.adapter.id} (${ch.account}) started`);
@@ -1936,6 +1949,9 @@ ${a.summary}` }],
    * running and the next gateway adopts them. Other harnesses are closed (their
    * running turn is interrupted and recorded).
    */
+  /** Set by stop(): no new inbound while the last sends go out. */
+  private refusingInbound = false;
+
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
@@ -1955,8 +1971,9 @@ ${a.summary}` }],
     // A live channel apply in progress finishes (it sees `stopped` and launches nothing more)
     // before the channels are aborted, so none starts after the snapshot below.
     await within(this.applying, 5000);
-    for (const ch of this.channels) ch.ac.abort();
-    await within(Promise.all(this.channels.map((c) => c.running)), 3000);
+    // Inbound is refused from here; channels stay connected until the last sends (rejection
+    // notices, finals) are out: a bridge's start() closes its peer as soon as it is aborted.
+    this.refusingInbound = true;
     // A launched session's own app-server (stdio) ends with it: its lane is closed, not detached.
     const own = new Set([...this.launched].filter(([, x]) => x.owns()).map(([k]) => k));
     const codex = (l: Lane) => !own.has(l.sessionKey) && codexOf(this.o.harness ?? this.instances.get(l.harnessId));
@@ -1978,6 +1995,8 @@ ${a.summary}` }],
     await within(Promise.all(this.compositors.map((c) => c.stop())), 5000);
     // Sends still running settle while their channel and the records are open; no more retries.
     await this.outbox.drain(5000);
+    for (const ch of this.channels) ch.ac.abort();
+    await within(Promise.all(this.channels.map((c) => c.running)), 3000);
     for (const ch of this.channels) await within(ch.close?.().catch(() => undefined), 3000);
     await within(this.watches.idle(), 3000);
     await within(this.mcp?.close(), 2000);
@@ -2215,7 +2234,7 @@ async function buildChannel(
     case 'lark-bot':
       return { adapter: new LarkBotAdapter(ch.config), account: ch.account, ...tier };
     case 'mail':
-      return { adapter: new MailChannel({ account: ch.account, ...ch.config } as MailChannelConfig), account: ch.account, ...tier };
+      return { adapter: new MailChannel({ ...ch.config, account: ch.account } as MailChannelConfig), account: ch.account, ...tier };
     case 'bridge': {
       const b = await spawnChannel({
         command: ch.command,

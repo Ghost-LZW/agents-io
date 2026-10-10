@@ -580,3 +580,9 @@
 12. **`closeLane` 窗口可能出现同一键两个 lane（LN-2，可能）**；**监听回复可能回到被监听的群（CF-5，可能）**：都需要先写测试复现。
 13. **未测的承诺**：live 传输拒绝与视频过滤（LN-5）、模块 harness 启动失败（CF-4）、Claude Code 停止时的行为（RS-3）、非 SQLite 持久化（RS-9）、模型输入里的 watch 标记（ID-2）。
 14. **文档本身的出入**：决定 12 说 `onBehalfOf` "须显式开启"而它没有开关（RQ-3）；工具默认开启与原则 2 相反（CF-6，ROADMAP 已列复查）；`docs/E2E.md` 的"已知缺口"仍写 outbox 在内存、compositor 不接管旧卡片、没有宿主 MCP 工具，三条都已过时。
+15. **A 组合并评审（2026-10-11）遗留**，按原则 4 记下，未修：
+    - **启动时为每个会话折叠全量日志**（`settleLeftoverInputs` 调 `hub.snapshot`）：没有压缩时随日志线性增长；等日志压缩一起做。
+    - **崩溃后同一输入两种结局（IN-1，可能）**：digest flush 的 `input.admitted` 落盘后、`endFlush` 前崩溃，重启时 `settleLeftoverInputs` 拒掉该 id，watch 的 redo 又以同一 id 收下并消费（`watch.ts:450`、`:671`）。需先写测试复现。
+    - **同进程兄弟机器人的回流认不出 self（DL-4b）**：lark-bot 的 `declared` 只来自本适配器实例的发送记录，兄弟机器人各有一份，所以兄弟的消息回来不带 `declared`，仍要靠 `selfAccounts`。agent-messaging 提案的出站索引解决它。
+    - **热更新时启动失败的模块通道**按 `type` 记为已配置（模块 id 加载后才知道），同 id 的另一账号仍可能被退回使用（DL-4）。bridge 写了 `id` 时已按 id 记。
+    - 已修：bridge 类通道收不到停止提示（停止时先拒入站、最后才中止通道）；拒绝提示不再带 `as`；`startChannel` 同步 emit 读到未赋值的 `entry`；邮件 `config.account` 覆盖条目账号；停止期间完成的 `live_join` 未关闭。

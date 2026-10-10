@@ -33,6 +33,25 @@ describe('inputs left when the daemon stops or crashes (INVARIANTS IN-1, RS-6)',
     expect(of(w2.gw.hub.log.read(key, 0), 'input.rejected').filter((b) => (b as { reason: string }).reason === 'host_restarted')).toEqual([]);
   });
 
+  it('the stop notice reaches a channel that cannot send once aborted (a bridge closes its peer on abort)', async () => {
+    const w = await daemon({ script: (t) => new Promise((_, reject) => t.signal.addEventListener('abort', () => reject(new Error('aborted')))) });
+    // Like a bridge: once the channel's start() is aborted, sending fails.
+    const send = w.chat.send.bind(w.chat);
+    let aborted = false;
+    w.chat.send = async (...a) => {
+      if (aborted) throw Object.assign(new Error('peer closed'), { code: 'unavailable' });
+      return send(...a);
+    };
+    await w.chat.inject({ sender: alice, text: 'long job' });
+    await until(() => w.chat.sent.length === 1);
+    await w.chat.inject({ sender: alice, text: 'then this' });
+    await until(() => w.gw.hub.log.sessions().some((k) => w.gw.hub.snapshot(k).queued.length === 1));
+    const ctrl = (w.gw as unknown as { channels: { adapter: unknown; ac: AbortController }[] }).channels.find((c) => c.adapter === w.chat)!.ac;
+    ctrl.signal.addEventListener('abort', () => (aborted = true));
+    await w.stop();
+    expect(w.chat.sent.some((s) => s.msg.text === rejectionNotice('lane_closed: gateway stopping'))).toBe(true);
+  });
+
   it('crash leftovers: inputs admitted but never settled by the previous process are rejected (host_restarted) at startup, and the snapshot lists none queued', async () => {
     const dir = tmp();
     // What a crashed process leaves: admissions with no turn, no consumed / rejected record.

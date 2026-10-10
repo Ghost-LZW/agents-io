@@ -452,7 +452,8 @@ export class Compositor {
    */
   private notifyRejected(b: BodyOf<'input.rejected'>, route: ReplyRoute): void {
     const msg: RenderedMessage = { text: rejectionNotice(b.reason) };
-    const op = { operationId: `${this.o.sessionKey}:rejected:${b.inputIds[0] ?? ''}:${routeKey(route)}`, sessionKey: this.o.sessionKey, route, msg, ...(this.o.as !== undefined ? { as: this.o.as } : {}) };
+    // A system notice, not the agent's words: no `as` (an echo must not read as agent output).
+    const op = { operationId: `${this.o.sessionKey}:rejected:${b.inputIds[0] ?? ''}:${routeKey(route)}`, sessionKey: this.o.sessionKey, route, msg };
     this.notices = this.notices.then(async () => {
       await this.o.outbox.send(this.o.adapter, op);
     }).catch((err) => this.o.onError?.(err));
