@@ -265,6 +265,8 @@ export class Gateway {
   /** Adapters of configured agents (their cwd and instructions over the instance's). */
   private readonly agentAdapters = new Map<string, HarnessAdapter>();
   private readonly lanes = new Map<string, Lane>();
+  /** Lanes being closed (parked topics idling out): a new lane for the key waits for the close (LN-2). */
+  private readonly closingLanes = new Map<string, Promise<void>>();
   /** Running lives (decision 11), by session: the channel's media peer of each. */
   /** Sessions with a live_join still opening its endpoint (the claim that keeps it to one live). */
   private readonly joining = new Set<string>();
@@ -428,7 +430,7 @@ export class Gateway {
     this.watches = new WatchDispatcher({
       registry,
       policy: this.policy,
-      lanes: (key) => this.lane(key),
+      lanes: (key) => this.laneAfterClose(key),
       replyRoute: (w) => this.homeRoute(w.target.sessionKey),
       onError: (err, id) => this.log('warn', `watch ${id}: ${(err as Error).message}`),
     });
@@ -479,7 +481,7 @@ export class Gateway {
     this.ingress = new Ingress({
       policy: this.policy,
       router: this.router,
-      lanes: (key, agent, launch) => this.lane(key, agent, launch),
+      lanes: (key, agent, launch) => this.laneAfterClose(key, agent, launch),
       hub: this.hub,
       watches: this.watches,
       onWatchError: (err) => this.log('warn', `watch fan-out failed: ${(err as Error).message}`),
@@ -766,6 +768,12 @@ export class Gateway {
    * `launch` (decision 7) is pinned with a new session and must match an existing
    * one's; a session pinned to a launch always opens with it.
    */
+  /** `lane`, after a close of the key's previous lane finishes: one writer lane per key (LN-2). */
+  async laneAfterClose(sessionKey: string, agentName?: string, launch?: SessionLaunch): Promise<Lane> {
+    for (let c = this.closingLanes.get(sessionKey); c; c = this.closingLanes.get(sessionKey)) await c;
+    return this.lane(sessionKey, agentName, launch);
+  }
+
   lane(sessionKey: string, agentName?: string, launch?: SessionLaunch): Lane {
     // Before the live-lane shortcut: a conflicting launch must not pass silently.
     let fresh: SessionLaunch | undefined;
@@ -1210,7 +1218,7 @@ export class Gateway {
     const handed: string[] = [];
     try {
       // Inside the try: a target topic whose agent is gone (`agent_unavailable`) also sends the conversation back.
-      lane = this.lane(to.sessionKey, to.agent);
+      lane = await this.laneAfterClose(to.sessionKey, to.agent);
       if (context) {
         const r = await lane.observe(context);
         if (!r.ok) throw new Error(r.reason);
@@ -1432,6 +1440,20 @@ ${a.summary}` }],
 
   /** Drop a lane and its renderers, then close its harness session (its log stays: the next lane resumes from it). */
   private async closeLane(sessionKey: string, lane: Lane, reason: string): Promise<void> {
+    // Inputs arriving meanwhile wait for the close (`laneAfterClose`): no second lane on the same native session.
+    const done = this.doCloseLane(sessionKey, lane, reason);
+    const settled: Promise<void> = done.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.closingLanes.set(sessionKey, settled);
+    void settled.then(() => {
+      if (this.closingLanes.get(sessionKey) === settled) this.closingLanes.delete(sessionKey);
+    });
+    return done;
+  }
+
+  private async doCloseLane(sessionKey: string, lane: Lane, reason: string): Promise<void> {
     this.lanes.delete(sessionKey);
     this.laneInfo.delete(sessionKey);
     const launched = this.launched.get(sessionKey);
@@ -1916,7 +1938,7 @@ ${a.summary}` }],
     try {
       const live = this.lanes.get(cmd.sessionKey);
       if (!live && cmd.sessionKey.startsWith('run:')) return fail('no_run', `${cmd.sessionKey} is not running (task run sessions only take commands while their run runs)`);
-      lane = live ?? this.lane(cmd.sessionKey);
+      lane = live ?? (await this.laneAfterClose(cmd.sessionKey));
     } catch (e) {
       if (e instanceof LaneUnavailableError) {
         // Only a refused input is written to the session log; other commands just fail.

@@ -330,10 +330,10 @@
 ### LN-2 一个 session 只有一个写者 lane，同一时刻至多一个 turn
 
 - **承诺**：每个会话键至多一个 `Lane`；命令与 harness 事件在 lane 里逐个处理；同一时刻至多一个 turn。
-- **实现**：`gateway.ts:223`、`:703-736`（同步的取或建）；`lane.ts:455-459`（`serial`）；`lane.ts:833`、`:853`（先置 `this.turn` 再 await）。
-- **测试**：`lane.test.ts` "never merges inputs from two principals or two routes into one turn #IN-3 #LN-2"；`live.test.ts` "a delegation becomes an input from the far side and the harness-started turn runs as the lane turn #LN-6 #LN-2 #ID-1 #LN-4"。"一个键一个 lane"本身没有测试。
-- **状态**：部分覆盖。
-- **不成立**（决定 14 已复现）：`closeLane`（停放话题空闲时关闭）先把 lane 从表里删掉，再最多等 8 s 关闭它（`gateway.ts:1316-1324`）。这期间到达的输入会为同一个键建第二个 `Lane`（`gateway.ts:715`），旧 lane 的事件循环只检查 generation 与 detached、不检查 closed（`lane.ts:885`），两个 harness 会话可能同时续接同一个原生会话。日志 seq 仍单调（共用同步日志），但有两个写者。测试：`it.fails` `packages/daemon/test/topics.test.ts` "an input that arrives while a parked topic's lane is closing does not open a second lane for the same key #LN-2"（让旧会话的 `close()` 卡住，确定地复现）。
+- **实现**：`gateway.ts` `lane`（同步的取或建）与 `laneAfterClose`（键的旧 lane 正在关闭时先等关完再建：ingress、watch、话题转交、本地命令都经它）、`closeLane`（关闭期间登记在 `closingLanes`）；`lane.ts:455-459`（`serial`）；`lane.ts:833`、`:853`（先置 `this.turn` 再 await）。
+- **测试**：`lane.test.ts` "never merges inputs from two principals or two routes into one turn #IN-3 #LN-2"；`live.test.ts` "a delegation becomes an input from the far side and the harness-started turn runs as the lane turn #LN-6 #LN-2 #ID-1 #LN-4"；`packages/daemon/test/topics.test.ts` "an input that arrives while a parked topic's lane is closing does not open a second lane for the same key"（原 `it.fails`，已修）。
+- **状态**：有测试。
+- **已修（2026-10-11）**：~~`closeLane`（停放话题空闲时关闭）先把 lane 从表里删掉、再最多等 8 s 关闭它，期间到达的输入为同一个键建第二个 `Lane`，两个 harness 会话可能同时续接同一个原生会话~~。现在这期间的输入等旧 lane 关完（`closeLane` 各步有上限，合计约 16 s）再建新 lane。代价是这条输入晚到；按原则 1（一条日志一个写者）取正确性。旧 lane 的事件循环仍不检查 closed（`lane.ts:885`），但它的 harness 会话在新 lane 建起之前已经关闭或超时。
 
 ### LN-3 一个 session 至多一个 live
 

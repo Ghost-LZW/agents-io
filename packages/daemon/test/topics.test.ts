@@ -90,8 +90,7 @@ describe('topics in the daemon', () => {
     expect(live(CONV)).toBe(true);
   });
 
-  // INVARIANTS LN-2 不成立 1: closeLane drops the lane from the table before its (up to 8 s) close, so an input arriving meanwhile opens a second Lane and harness session for the key; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('an input that arrives while a parked topic\'s lane is closing does not open a second lane for the same key #LN-2', async () => {
+  it('an input that arrives while a parked topic\'s lane is closing does not open a second lane for the same key #LN-2', async () => {
     const { w } = await world(tmp(), { topics: { parkedIdleMs: 50 } });
     // A's harness session takes its time to close, as a real harness may (closeLane waits up to 8 s).
     let release!: () => void;
