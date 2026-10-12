@@ -56,6 +56,12 @@ export interface LarkBotConfig {
    * card sits below it). Default `turn`.
    */
   cotOn?: 'turn' | 'tool';
+  /**
+   * Reactions that acknowledge inbound messages (`ChannelAdapter.acknowledge`; the daemon's channel
+   * entry turns acknowledgements on with `ack`). Emoji types from Lark's reaction list.
+   * Default `OnIt` / `DONE` / `CrossMark`.
+   */
+  ackEmoji?: { working?: string; done?: string; failed?: string };
   /** Language of the labels the adapter adds (status, panel titles). Default `zh` on feishu, `en` on lark. */
   locale?: 'zh' | 'en';
   /** Decoration the adapter adds to cards: `emoji` (status icons, panel icons) or `plain`. Default `emoji`. */
@@ -94,7 +100,8 @@ export interface LarkBotConfig {
   lookupTimeoutMs?: number;
 }
 
-export interface ResolvedConfig extends Required<Omit<LarkBotConfig, 'encryptKey' | 'verificationToken' | 'botOpenId'>> {
+export interface ResolvedConfig extends Required<Omit<LarkBotConfig, 'encryptKey' | 'verificationToken' | 'botOpenId' | 'ackEmoji'>> {
+  ackEmoji: { working: string; done: string; failed: string };
   encryptKey?: string;
   verificationToken?: string;
   botOpenId?: string;
@@ -125,6 +132,7 @@ export function resolveConfig(c: LarkBotConfig): ResolvedConfig {
     processByChat: c.processByChat ?? {},
     look: c.look ?? 'console',
     cotOn: c.cotOn ?? 'turn',
+    ackEmoji: { working: 'OnIt', done: 'DONE', failed: 'CrossMark', ...c.ackEmoji },
     locale: c.locale ?? (c.domain === 'feishu' ? 'zh' : 'en'),
     style: c.style ?? 'emoji',
     processMaxEntries: c.processMaxEntries ?? 8,

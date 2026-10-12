@@ -175,6 +175,8 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
   - `config.look: "chat"`：卡片只放答案，不带标题、状态行和耗时页脚，只有在等审批、失败、中断时才显示一行状态；
   - `config.cotOn: "tool"`：第一次调用工具时才打开思维链气泡，只思考、直接回答的轮次没有气泡；
   - `config.processByChat`：私聊和群分别设置 `process`，例如群里设 `"off"`。
+  - 通道条目上的 `ack`：收到的消息上点一个表情（默认 `OnIt`），这一轮回复了就撤掉；回复晚于 `doneAfterMs`（默认 60 秒）或这条消息没有单独的回复（并进别的轮、插话）时换成 `DONE`；没完成或被拒换成 `CrossMark`。表情类型可用 `config.ackEmoji` 改，需要 `im:message.reactions:write_only` 权限。
+  - `look: "chat"` 时，第一次发送就已完成、没有按钮的回复（很快答完的）发普通文本，有 markdown 时发富文本（post），不发卡片。
 - **降级**：流式更新失败时退到整卡替换，再失败退到普通消息编辑。失败记录按会话保留 30 分钟，权限类错误对整个应用生效。
 
 ## 3. 邮件（`channel/mail`，档位 `final`）

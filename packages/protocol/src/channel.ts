@@ -177,6 +177,9 @@ export interface ChannelContext {
  * A channel adapter. In-process adapters implement this interface; out-of-process
  * adapters speak the equivalent JSONL frames (see wire.ts).
  */
+/** How an inbound message's handling stands (`ChannelAdapter.acknowledge`). */
+export type AckState = 'working' | 'done' | 'failed' | 'none';
+
 export interface ChannelAdapter {
   readonly id: string;
   caps(account: string): ChannelCaps;
@@ -188,6 +191,12 @@ export interface ChannelAdapter {
   retract?(route: ReplyRoute, providerMessageId: string, outcome: string): Promise<void>;
   speak?(route: ReplyRoute, utterance: { text: string; interruptible: boolean }): Promise<void>;
   typing?(route: ReplyRoute, on: boolean): Promise<void>;
+  /**
+   * Mark an inbound message with how its handling stands (e.g. a reaction on it): `working` once
+   * it is taken, then `done` or `failed`, or `none` to take the mark away (the reply says enough).
+   * Cosmetic: the adapter swallows its own failures.
+   */
+  acknowledge?(route: ReplyRoute, messageId: string, state: AckState): Promise<void>;
   /** After restart: is a previously sent (streaming) message still editable? */
   reconcile?(route: ReplyRoute, providerMessageId: string): Promise<'alive' | 'gone'>;
   /**

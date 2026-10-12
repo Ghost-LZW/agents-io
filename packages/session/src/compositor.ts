@@ -1,6 +1,7 @@
 import {
   routeKey,
   type BodyOf,
+  type AckState,
   type ChannelAdapter,
   type ChannelCaps,
   type DecisionKind,
@@ -356,6 +357,13 @@ export interface CompositorOptions {
    * with no working state before it. Default 0: open as soon as the turn starts.
    */
   openDelayMs?: number;
+  /**
+   * Acknowledge inbound messages on this channel (`ChannelAdapter.acknowledge`): `working` once
+   * admitted; when their turn ends the mark goes away if the turn replied on their route within
+   * `doneAfterMs` of the message, else it becomes `done` (a long task, finished while nobody
+   * watched); `failed` when the turn did not complete or the message was rejected.
+   */
+  ack?: { doneAfterMs: number };
   /** The session's topic title, read at every render (a topic can be renamed). */
   title?: () => string | undefined;
   onError?: (err: unknown) => void;
@@ -400,6 +408,8 @@ export class Compositor {
   private stopped = false;
   /** Rejection notices being sent (they belong to no turn's route state). */
   private notices: Promise<void> = Promise.resolve();
+  /** Acknowledged inbound messages, by input id, until their turn ends. */
+  private readonly acks = new Map<string, { route: ReplyRoute; messageId: string; at: number; turnId?: string }>();
 
   constructor(private readonly o: CompositorOptions) {}
 
@@ -434,6 +444,7 @@ export class Compositor {
   }
 
   private onEvent(e: SessionEvent): void {
+    if (this.o.ack && this.o.adapter.acknowledge) this.ackEvent(e);
     const b = e.body;
     if (b.t === 'turn.started') {
       if (b.replyRoute) this.track(b.turnId, b.replyRoute, e.ts);
@@ -454,6 +465,51 @@ export class Compositor {
       if (!foldTurn(r.view, e)) continue;
       if (b.t === 'turn.completed') this.finish(r);
       else this.changed(r, b.t === 'request.opened' ? b.requestId : undefined);
+    }
+  }
+
+  private ackEvent(e: SessionEvent): void {
+    const b = e.body;
+    const mark = (a: { route: ReplyRoute; messageId: string }, state: AckState) => {
+      this.o.adapter.acknowledge!(a.route, a.messageId, state).catch((err) => this.o.onError?.(err));
+    };
+    const take = (ids: string[], turnId: string) => {
+      for (const id of ids) {
+        const a = this.acks.get(id);
+        if (a) a.turnId = turnId;
+      }
+    };
+    switch (b.t) {
+      case 'input.admitted': {
+        const r = b.input?.replyRoute;
+        if (b.disposition === 'observe_only' || !r?.replyToMessageId || !this.owns(r) || this.acks.has(b.inputId)) return;
+        const a = { route: r, messageId: r.replyToMessageId, at: e.ts };
+        this.acks.set(b.inputId, a);
+        mark(a, 'working');
+        return;
+      }
+      case 'turn.started':
+        return take(b.inputIds, b.turnId);
+      case 'input.consumed':
+        return take(b.inputIds, b.turnId);
+      case 'input.rejected':
+      case 'input.cancelled':
+        for (const id of b.inputIds) {
+          const a = this.acks.get(id);
+          if (!a) continue;
+          this.acks.delete(id);
+          mark(a, b.t === 'input.rejected' ? 'failed' : 'none');
+        }
+        return;
+      case 'turn.completed':
+        for (const [id, a] of this.acks) {
+          if (a.turnId !== b.turnId) continue;
+          this.acks.delete(id);
+          const v = this.routes.get(this.key(b.turnId, a.route))?.view;
+          const replied = !!(v && (v.finalText ?? v.text).trim());
+          mark(a, b.status !== 'completed' ? 'failed' : replied && e.ts - a.at < this.o.ack!.doneAfterMs ? 'none' : 'done');
+        }
+        return;
     }
   }
 
