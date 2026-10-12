@@ -65,6 +65,11 @@ export interface LaneOptions {
   mcp?: LaneMcp | ((args: { sessionKey: string; generation: number; harnessId: string }) => LaneMcp | undefined);
   harnessOptions?: Record<string, unknown>;
   modelReviewer?: ModelReviewer;
+  /**
+   * The route behind a route key a human resolver names, so a request asked of people who are
+   * not in the turn's own conversation (e.g. the owner, about a guest's turn) gets its card there.
+   */
+  routeOf?: (routeKey: string) => ReplyRoute | undefined;
   /** Human/host requests without `expiresAt` are denied after this long (default 10 min). */
   requestTimeoutMs?: number;
   /** How many times an admitted-but-unconsumed input is re-queued before it is rejected (default 1). */
@@ -1469,13 +1474,18 @@ export class Lane {
     }
     if (resolver.kind === 'model' && !this.o.modelReviewer) resolver = await this.escalate(b, ctx);
 
-    // A delegated turn has no reply route: a human request of it is shown where its people are
-    // (the live's control route), so the card with the buttons appears there (decision 11 amendment).
+    // A human request is shown where its people are: the routes the resolver names that the turn
+    // does not reach get the turn's card with the buttons (a delegated turn's live control route,
+    // decision 11 amendment; the owner's chat for a guest's turn, decision 15).
     const t = this.turn && (!e.turnId || this.turn.turnId === e.turnId) ? this.turn : undefined;
-    const at = t?.live?.controlRoute;
-    if (t && at && resolver.kind === 'human' && resolver.routes.includes(routeKey(at)) && !sameRoute(t.replyRoute, at) && !t.deliveries.some((d) => sameRoute(d, at))) {
-      t.deliveries.push(at);
-      this.emit({ turnId: t.turnId, body: { t: 'turn.delivery_added', turnId: t.turnId, route: at, reason: 'approval' } });
+    if (t && resolver.kind === 'human') {
+      const control = t.live?.controlRoute;
+      for (const key of resolver.routes) {
+        const at = control && routeKey(control) === key ? control : this.o.routeOf?.(key);
+        if (!at || sameRoute(t.replyRoute, at) || t.deliveries.some((d) => sameRoute(d, at))) continue;
+        t.deliveries.push(at);
+        this.emit({ turnId: t.turnId, body: { t: 'turn.delivery_added', turnId: t.turnId, route: at, reason: 'approval' } });
+      }
     }
     // A request without a turn id opened during a turn belongs to it; one opened while idle to no turn.
     const p: PendingRequest = { body: b, resolver, turnId: e.turnId ?? this.turn?.turnId, audience: audienceFor(resolver, e.audience) };

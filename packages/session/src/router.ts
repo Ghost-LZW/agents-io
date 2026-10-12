@@ -10,6 +10,7 @@ import {
   type BindingMatch,
   type Evidence,
   type IdentifyArgs,
+  type IdentityEntry,
   type Identity,
   type InboundEnvelope,
   type InputMode,
@@ -263,6 +264,17 @@ export class Router {
   }
 
   /**
+   * Identities the embedder keeps on its own (e.g. people the owner let in, decision 15),
+   * below the config and host maps: their entries win for the same channel identity.
+   */
+  setExtraIdentities(entries: IdentityEntry[]): void {
+    this.extraIdentities = structuredClone(entries);
+    this.rebuildIdentities();
+  }
+
+  private extraIdentities: IdentityEntry[] = [];
+
+  /**
    * `bindings.put`: validate, then atomically replace the host table and persist
    * it. The same version again is a no-op. Throws `RouterError` (and keeps the
    * current table) when the table is invalid.
@@ -334,7 +346,8 @@ export class Router {
       ...(this.o.isSelfDeclared ? { isSelfDeclared: this.o.isSelfDeclared } : {}),
     };
     const host = this.activeHost();
-    this.identities = new IdentityMap([this.config?.identities ?? [], host?.identities ?? []], rules);
+    // Later maps win for the same channel identity: extra < config < host.
+    this.identities = new IdentityMap([this.extraIdentities, this.config?.identities ?? [], host?.identities ?? []], rules);
     this.identitiesExpireAt = host?.expiresAt;
   }
 

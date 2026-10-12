@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, rmSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
@@ -34,6 +35,7 @@ import {
   type Origin,
   type Policy,
   type ReplyRoute,
+  type Resolver,
   type RunSpec,
   type SessionLaunch,
   type SessionPrepare,
@@ -75,6 +77,7 @@ import {
   type FullPolicy,
   type IngressResult,
   type RemoveWatchResult,
+  addressesSelf,
   type SessionLog,
   type TopicChange,
   type TopicRecord,
@@ -101,6 +104,7 @@ import { blobResolvers, type MediaResolvers } from './media.js';
 import { DaemonRecords, type CauseRecord, type OutboundRecord } from './records.js';
 import { checkLaunch, launchView, sameLaunch, type LaunchCheck } from './launch.js';
 import { Runs } from './runs.js';
+import { Strangers } from './strangers.js';
 import { consoleUrlPath, loadOrCreateTokenFile, removeTokenFile, TokenError, tokenPath, writeTokenFile } from './token.js';
 
 export type LogFn = (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
@@ -259,6 +263,8 @@ export class Gateway {
   private readonly mcp: HostMcpServer | undefined;
   /** The durable host inbound queue (`on: "host"` rules), in the log's database. */
   readonly hostQueue: HostQueue;
+  /** `policy.strangers: "ask"`: messages from people the deployment does not know are asked about (decision 15). */
+  private readonly strangers: Strangers | undefined;
   /** Who sent each channel message (`input.verify`), settled deliveries, session → agent. */
   readonly records: DaemonRecords;
   /** The host protocol on the local socket. */
@@ -373,6 +379,8 @@ export class Gateway {
       ...base,
       // The router's identity maps (the owners config; a host's map once one is pushed).
       identify: async (a) => router.identify(a),
+      // With `strangers: ask`, what a non-owner's turn asks for is asked of the owner, in their chat (decision 15).
+      resolve: async (req, ctx) => this.askOwner(ctx) ?? base.resolve(req, ctx),
       // The host (authenticated with the token) may interrupt and cancel what it started and what it watches.
       control: async (a) => (isHostOrigin(a.origin) ? 'allow' : base.control(a)),
       ...o.policy,
@@ -544,7 +552,36 @@ export class Gateway {
       onUnavailable: (a) => this.refuseUnavailable(a.sessionKey, a.code, a.message, a.input.inputId, a.on === 'dispatch' ? a.input.replyRoute : null),
       // Our own messages back through a channel (any bot account): found by platform message id, marked self.
       recover: (channel, id) => this.recoverSend(channel, id),
+      ...(c.policy.strangers === 'ask'
+        ? {
+            onAction: (a) => this.strangers?.action(a),
+            onUndispatched: (a) => this.strangers?.undispatched(a, a.env.conversation.kind === 'dm' || addressesSelf(a.env, new Set(c.policy.selfAccounts))),
+          }
+        : {}),
     });
+    if (c.policy.strangers === 'ask') {
+      if (!c.policy.ownerSessionKey) this.log('warn', 'policy.strangers is "ask" but policy.ownerSessionKey is not set: there is no owner chat to ask in, so strangers are not asked about');
+      this.strangers = new Strangers({
+        db: db.db ?? new DatabaseSync(':memory:'),
+        ownerRoute: () => this.ownerRoute(),
+        send: async (route, msg, operationId) => {
+          const ch = this.channelFor(route);
+          if (!ch) return undefined;
+          const rec = await this.outbox.send(ch.adapter, { operationId, sessionKey: c.policy.ownerSessionKey ?? 'strangers', route, msg });
+          return rec.status === 'delivered' ? rec.providerMessageId : undefined;
+        },
+        edit: async (route, id, msg) => {
+          await this.channelFor(route)?.adapter.edit?.(route, id, msg, { operationId: `stranger:${id}:answered`, sequence: 1 });
+        },
+        admit: async (item, session) => {
+          const r = await this.ingress.redispatch(item, { session, by: 'owner' });
+          if (!r.ok) return { ok: false, message: r.message };
+          return r.outcome.result?.ok === false ? { ok: false, message: r.outcome.result.reason } : { ok: true };
+        },
+        onGuests: (entries) => this.router.setExtraIdentities(entries),
+        log: (level, msg) => this.log(level, msg),
+      });
+    }
     if (c.source) {
       this.configStore = new ConfigStore({ path: c.source.path, ...(c.source.envFile ? { envFile: c.source.envFile } : {}), ...(o.consoleEnv ? { env: o.consoleEnv } : {}) });
       const store = this.configStore;
@@ -842,6 +879,11 @@ export class Gateway {
     const cwd = pinned?.cwd ?? (agent.configured ? (agent.cwd ?? c.harnesses[agent.harness]?.cwd ?? c.cwd) : c.cwd);
     lane = new Lane({
       sessionKey,
+      // A request asked of the owner (a guest's turn, decision 15) gets its card in the owner's chat.
+      routeOf: (key) => {
+        const to = this.ownerRoute();
+        return to && routeKey(to) === key ? to : undefined;
+      },
       // A launched session's adapters go through both: the lane uses `harnessFor` whenever it is set.
       harness: launched ? launched.adapter(agent.harness) : this.agentHarness(agent),
       ...(launched
@@ -2217,6 +2259,29 @@ ${a.summary}` }],
       if (r.ok) this.log('info', `watch ${w.id} → ${w.target.sessionKey} (${w.mode})`);
       else this.log('warn', `config watch ${w.id}: ${r.message}`);
     }
+  }
+
+  /** The owner's own chat with the deployment (the latest routed turn of `ownerSessionKey`), without a reply target. */
+  private ownerRoute(): ReplyRoute | null {
+    const key = this.o.config.policy.ownerSessionKey;
+    const r = key ? this.homeRoute(key) : null;
+    if (!r) return null;
+    const { replyToMessageId: _r, ...route } = r;
+    return route;
+  }
+
+  /**
+   * `strangers: ask`: a turn none of whose inputs is the owner's (a guest's, or one the owner
+   * let in) asks the owner about its requests, in the owner's chat. Owner turns, live
+   * delegations (decision 11 amendment) and turns with no owner chat known keep the local policy.
+   */
+  private askOwner(ctx: TurnContext): Resolver | undefined {
+    const c = this.o.config;
+    if (c.policy.strangers !== 'ask' || ctx.run.profile === 'bypass' || ctx.live) return undefined;
+    if (ctx.inputs.some((i) => (i.origin.principal?.labels ?? []).includes('owner'))) return undefined;
+    const to = this.ownerRoute();
+    if (!to || !c.policy.owners.length) return undefined;
+    return { kind: 'human', principals: [...c.policy.owners], routes: [routeKey(to)] };
   }
 
   /**

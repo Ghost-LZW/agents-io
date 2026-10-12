@@ -118,6 +118,18 @@ export interface IngressOptions {
    * deliveries). Return undefined to leave it unchanged.
    */
   rewrite?: (args: { env: InboundEnvelope; origin: Origin; sessionKey: string }) => InboundRewrite | undefined | Promise<InboundRewrite | undefined>;
+  /**
+   * A click on a button the embedder owns (not an approval or stop button), before routing,
+   * with the stamped origin. A result means it was handled and nothing is routed; undefined
+   * routes it as usual (`actionPrefix` rules).
+   */
+  onAction?: (a: { actionId: string; env: InboundEnvelope; origin: Origin }) => Promise<IngressResult | undefined> | IngressResult | undefined;
+  /**
+   * An input no table rule dispatched and no host took (dropped, or only recorded as context).
+   * The embedder may still act on it, e.g. ask the owner about a stranger's message. Errors it
+   * throws go to `onReplyError`.
+   */
+  onUndispatched?: (a: { env: InboundEnvelope; origin: Origin; input: InputRecord }) => Promise<void> | void;
   /** How many envelope ids to remember for dedup (default 10 000). */
   dedupWindow?: number;
   /** Watches: delivered through when a watch rule wins a session, and the digest machinery of `on: "digest"` rules. */
@@ -372,6 +384,11 @@ export class Ingress {
       const result = await lane.command(cmd);
       return { accepted: true, action, sessionKey: owner, origin, result };
     }
+    const embedderAction = env.admission === 'drop' || origin.self || !this.o.onAction ? undefined : actionIdOf(env);
+    if (embedderAction !== undefined) {
+      const handled = await this.o.onAction!({ actionId: embedderAction, env, origin });
+      if (handled) return handled;
+    }
 
     // The original's id: remembered, else (default ids) derived from it, so a revision still finds it after the window or a restart.
     const revisionOf =
@@ -456,6 +473,14 @@ export class Ingress {
         if (r) m.rejected = { code: r.unavailable!.code, message: r.unavailable!.message };
       }
       this.router.record(explanation);
+    }
+
+    if (this.o.onUndispatched && !host && !outcomes.some((x) => x.on === 'dispatch')) {
+      try {
+        await this.o.onUndispatched({ env, origin, input });
+      } catch (err) {
+        this.o.onReplyError?.(err);
+      }
     }
 
     const first = outcomes.find((x) => x.source !== 'watch' && x.on === 'dispatch') ?? outcomes.find((x) => x.source !== 'watch');
@@ -712,13 +737,18 @@ function capEnvelope(env: InboundEnvelope, s: EmitSource): InboundEnvelope {
   return { ...env, sender: { ...sender, ...(declared !== undefined && !dropDeclared ? { declared } : {}), ...(cause !== undefined && !dropDeclared ? { cause } : {}), evidence } };
 }
 
-function actionClick(env: InboundEnvelope) {
+function actionIdOf(env: InboundEnvelope): string | undefined {
   if (env.content.length !== 1) return undefined;
   const c = env.content[0]!;
-  if (c.type !== 'event' || c.name !== 'action' || typeof c.data.actionId !== 'string') return undefined;
-  const stop = parseInterruptActionId(c.data.actionId);
+  return c.type === 'event' && c.name === 'action' && typeof c.data.actionId === 'string' ? c.data.actionId : undefined;
+}
+
+function actionClick(env: InboundEnvelope) {
+  const id = actionIdOf(env);
+  if (id === undefined) return undefined;
+  const stop = parseInterruptActionId(id);
   if (stop) return { kind: 'interrupt' as const, turnId: stop.turnId };
-  return parseActionId(c.data.actionId);
+  return parseActionId(id);
 }
 
 function channelContext(env: InboundEnvelope, reply: string | undefined): InputRecord['channelContext'] {

@@ -176,3 +176,13 @@
 - **其他情况**（认不出说话人、说话人不是主人、平台不给可信的说话人身份）：`restricted`；需要审批的请求不自动拒绝，而是在发起 live 的那个对话（`controlRoute`）里问主人（`human` resolver，principals 为发起 live 的人），主人批准才执行。
 - 说话人身份由通道的媒体对端提供（可选能力）；没有提供时一律按"认不出"处理。飞书会中语音目前不保证可信的说话人身份，所以实际效果是"受限 + 审批找主人"，直到会议通道能提供为止。
 - **实施（2026-10-12，细节依原则 4 自决，见 INVARIANTS LN-7）**：说话人是媒体对端的可选能力 `LiveEndpoint.speaker(atMs)`，网关按入站同一条路径盖章（证据按条目封顶、`Policy.identify`）。harness 的沙箱在 live 期间设成"没有输入时的档"（`LiveStartArgs.delegationRun`；Codex 用 `thread/settings/update`，文字轮次结束后再设回），委托轮次从这一档开始；放不放行审批由 lane 按计划的档决定；harness 报告的开始档比计划与底档都宽（例如陌生人的委托被并进主人正在跑的 `bypass` 轮）时 lane 立即打断。审批卡片经 `turn.delivery_added { reason: "approval" }` 出现在 `controlRoute`；发起人记在 `live.started.startedBy`，认不出发起人时自动拒绝。
+
+## 决定 15：外部持有的会话；陌生人的消息由主人选择放行
+
+日期：2026-10-13。方案见 `docs/design/external-holder/README.md`。
+
+- **允许外部持有者**（owner）：总体方向"agents-io 是唯一拉起 harness 的地方"修订为"一个会话同一时刻只有一个持有者：agents-io 的 lane，或挂上来的外部进程（原生 TUI、宿主拉起的 agent）；路由、身份、投递、审批对两者相同"。
+- **离开后默认由机器人续接同一段对话**（`whenAway: "lane"`，owner）：lane 用持有者留下的原生会话 id 续接（claude `--resume`、codex `thread/resume`），回来时 TUI 再 resume 同一会话，能看到离开期间的轮次。`queue` 可选。
+- **"离开" = `aio tui` 拉起的 TUI 进程退出**（owner）：不按空闲时长判定；TUI 开着、人走开仍算在场。手动 `/away` 以后需要再加。
+- **Codex（S1）与 Claude（S2）桌面模式同时做**（owner）。
+- **陌生人的消息由主人选择放行**（owner）：`policy.strangers: "drop" | "ask"`，默认 `drop`（现状）。`ask` 时，陌生人私聊机器人或在群里 @ 它，主人的私聊里出现一张卡片：允许这一次 / 以后都允许 / 忽略。允许后原消息按原发送者投到该会话（`restricted`，审批找主人）；"以后都允许"把此人记为带 `guest` 标签的持久身份。谁可信由主人决定，agents-io 只提供"问主人"的机制（POSITIONING §2）。
