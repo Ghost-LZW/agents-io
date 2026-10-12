@@ -433,10 +433,15 @@ aio-dev watch remove team-digest
 agent 自己以语音进一个会议或通话：听得到所有人，用自己的声音说话。语音由 harness 出（目前只有 Codex realtime v3，WebRTC），媒体对端由通道出（`ChannelAdapter.openLive`，例如某个通道的"加入会议"），网关只在两者之间转交 SDP，**音频不经过 agents-io**。
 
 - **开启**：Codex 实例配 `"live": true`（连接改用 Codex 的实验接口）；agent 挂了输出工具（`tools`）。
-- **工具**：`live_join { target, channel?, instructions?, voice? }`：在当前对话的通道（或 `channel` 指定的通道）上打开对端，`target` 由通道解释（如会议号、`new`），挂到本 session 的 Codex thread 上；`live_say { text }`：让语音说一段话；`live_leave`：离开。一个 session 同时至多一个 live。live 的地点（端点的 `route`）和其他外发目的地一样过 `Policy.outbound`（INVARIANTS DL-5）：缺省策略放行输入全部来自主人的一轮去任何会议（委托出来的一轮沿用主人那轮的 `bypass`，但不是主人在说话，不放行），其他轮只放行本轮的回复路由和 `policy.routes` 里预登记的路由，宿主声明了 `outbound` 回调时由宿主决定。通道实现 `liveRoute(account, target)` 时网关在打开之前检查；没有实现的，打开后检查端点的路由，被拒就立即关闭端点。
+- **工具**：`live_join { target, channel?, instructions?, voice? }`：在当前对话的通道（或 `channel` 指定的通道）上打开对端，`target` 由通道解释（如会议号、`new`），挂到本 session 的 Codex thread 上；`live_say { text }`：让语音说一段话；`live_leave`：离开。一个 session 同时至多一个 live。live 的地点（端点的 `route`）和其他外发目的地一样过 `Policy.outbound`（INVARIANTS DL-5）：缺省策略放行输入全部来自主人的一轮去任何会议（委托出来的一轮只有认出说话人是主人时才算主人的输入），其他轮只放行本轮的回复路由和 `policy.routes` 里预登记的路由，宿主声明了 `outbound` 回调时由宿主决定。通道实现 `liveRoute(account, target)` 时网关在打开之前检查；没有实现的，打开后检查端点的路由，被拒就立即关闭端点。
 - **带着上下文进会**：语音挂在这个 session 的 thread 上，知道之前文字里聊过什么；会后在同一个对话里用文字接着问，它也知道会上说了什么。
-- **会里说的话怎么到 agent**：语音端自己能答的直接答；需要查资料、跑工具的，委托给 Codex：每次委托是一条输入（`transcript` 块，`from=unknown`，`channelContext` 带 `live=true`、`liveId`、`liveTitle`，回复路由是发起 live 的那个对话），Codex 随即在 thread 上开一轮，lane 把它当作本 session 的当前轮（排队、工具、来源标记照常）。这一轮**没有回复路由**：答案由语音说出，不自动发到 IM；要落成文字用 `send_message` 发到 `current`。委托时已有一轮在跑，就并进那一轮。
-- **权限**：委托出来的轮次用 thread 当时的设置，与文字轮次相同；来源标记 `external`（决定 4、5：只标记，不降档）。会里任何人都能让它干活，按需给这个 agent 合适的 profile。
+- **会里说的话怎么到 agent**：语音端自己能答的直接答；需要查资料、跑工具的，委托给 Codex：每次委托是一条输入（`transcript` 块，`channelContext` 带 `live=true`、`liveId`、`liveTitle`，回复路由是发起 live 的那个对话；发送者是通道给出的说话人，给不出时 `from=unknown`，见下面"权限"），Codex 随即在 thread 上开一轮，lane 把它当作本 session 的当前轮（排队、工具、来源标记照常）。这一轮**没有回复路由**：答案由语音说出，不自动发到 IM；要落成文字用 `send_message` 发到 `current`。委托时已有一轮在跑，就并进那一轮。
+- **权限**（决定 11 修订，INVARIANTS LN-7）：委托出来的一轮按触发它的输入（说话人）定档，与文字轮次同一个 `Policy.plan`，不沿用 thread 上一轮。
+  - **说话人**：媒体对端可以实现 `LiveEndpoint.speaker(atMs)`，返回 `atMs`（harness 报告委托的时间）时在说话的人 `{ channelUserId, evidence, displayName?, isBot? }`，`channelUserId` 与这个通道入站消息的发送者同一命名空间；拿不准（无人说话、几个人同时说、刚换人）就返回 `undefined`。Codex realtime 的委托不带说话人，只能靠通道。网关像入站消息一样盖章：证据按通道条目封顶（授予 ∩ caps），再按身份映射认人；所以只有通道能给出、且条目授予了 `platform_signed` 时，主人才认得出来。
+  - **认出是主人**：`bypass`，审批照常自动放行。
+  - **其他情况**（没有说话人能力、答不出、说话人不是主人、证据不够）：`restricted`。需要审批的请求不自动拒绝：在发起 live 的那个对话（`controlRoute`）里出一张带按钮的卡片，只有发起 live 的人（调用 `live_join` 那一轮的主体，`live.started.startedBy`）点了才算；发起人认不出时自动拒绝。宿主可以用自己的 `Policy.resolve` 改（`TurnContext.live` 带 `liveId`、`startedBy`、`controlRoute`）。
+  - **在哪里强制**：harness 的沙箱与它自己的审批策略在 live 期间设成"没有任何输入时的档"（默认 `restricted`；Codex 用 `thread/settings/update`，每个文字轮次结束后再设回），委托轮次就从这一档开始；"主人才放行审批"由 lane 按计划的档决定；harness 报告某个委托轮次开始时的档比计划和这个底档都宽（例如陌生人的委托被 Codex 并进了主人正在跑的 `bypass` 轮），lane 立即打断它。所以默认配置下主人的委托是"底档沙箱 + 审批自动放行"（内置的 `bypass` 和默认的 `restricted` 沙箱相同，只差要不要问）。
+  - 来源标记仍是 `external`（决定 4、5）。飞书会议目前给不出说话人，实际效果是"受限 + 审批找发起人"。
 - **日志**：`live.started`（标题、对端路由、发起路由）、`live.transcript`（双方，每句一条）、`live.handoff`、`live.ended`。
 - **结束**：对端离会/会议结束、`live_leave`、harness 关闭、守护进程停止，任一发生都关闭另一端并记 `live.ended`。守护进程重启不恢复 live。
 - **已知限制**：语音转述可能出错（实测把"目录是空的"说成"有个文件"），要紧的结果另发文字；几乎每句实质性的话都委托，回答延迟约 10–20 秒；`appendText` 注入的文字不会触发委托，只有真实语音会。

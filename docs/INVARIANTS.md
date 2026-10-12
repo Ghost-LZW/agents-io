@@ -5,6 +5,7 @@
 > 2026-10-11：agent 通信地基（`docs/design/agent-messaging/`，决定 13）加入 ID-7、ID-8、EX-5、EX-6、IN-8、CF-9；ID-2、EX-2 改为成立（EX-2 仍有 `live_say` 一条不成立）。
 > 2026-10-11：不成立积压清完（IN-1、IN-5、EX-2、LN-4 改为成立，`it.fails` 全部改成 `it`，LN-4 的 `it.todo` 用迟报 `live.ended` 的假 harness 复现并修好）；`pnpm invariants:check` 有漂移即非零退出（决定 14）。
 > 2026-10-11：agent-messaging 合并评审的修复：DL-5（默认外发按输入是否全来自主人）、IN-8（live 委托过检查点、只有有主体的人清零、邮件自动回复标 bot）、EX-5（上下文输入带过来的标记、发送时取来源）、ID-3（保留 `agent` id）、ID-2（Claude Code 说明行 JSON 引号）、ID-8（多条发送全部索引）、EX-6（cause 按 session 存）；未修的记在 §15 第 17 条。
+> 2026-10-12：决定 11 修订（会中委托按说话人定权限）加入 LN-7；LN-6、ID-6、DL-5、IN-8 随之更新（委托轮次不再沿用 thread 上一轮的设置）。
 > 用途：改动 agents-io 的人或 agent 用它判断"这个改动有没有打破某个承诺"。新增承诺先写进这里，再写测试；测试改名时同步改这里。
 
 ## 0. 怎么读
@@ -107,7 +108,7 @@
 - **注意**：成对计数在内存里，重启、lane 关闭再打开（话题停放、空闲回收）都清零（跳数上限随持久化的 cause 仍然有效）；成对上限之下的慢循环不被截停（§15 第 17 条）；合批按最大跳数算，一句人话也会开一条新链。第一步里本部署的 agent 输入只有"回流"一条来路，而回流是 `self`、永远不开轮（ID-5），所以跳数上限现在实际只拦受信 agent 账号声明了跳数的输入；`agent_send` / `agent_run`（ROADMAP §2 第 3、4 项）接上后直接适用。宿主 `input` 帧是 `kind: system`，不开链、不计数、也不清零；本地客户端的输入是有主体的 `human`，清零成对计数。
 - **决定（2026-10-11 合并评审，依原则 4 自决）**：
   1. **谁能清零**：只有"有人在这里写"——`kind: "human"` 且有主体（主人或宿主映射的成员）。原来任何非 agent 输入都清零，系统 digest、宿主输入、陌生人插一句就能让一对 agent 无限来回；没有主体的发送者可能是平台没标出来的机器人，按 fail closed 不算。邮件自动回复本来就丢弃（CHANNELS 邮件一节），现在另标 `isBot`，即使哪天被放进来也是 agent 一侧。
-  2. **live 委托**：决定 11 让委托轮次由 harness 自己开，绕过了 `Lane.input`。委托计入成对计数（peer = 会议路由），因为说话者没有证据、会议另一端可能是另一个语音 agent；截停时 harness 已经开工，只能打断，不另外降档（决定 11 的同权限不变）。代价：一场会里 15 分钟内超过 `pair.maxTurns` 次委托、其间没人在会话里写，会被截停；可调参数。
+  2. **live 委托**：决定 11 让委托轮次由 harness 自己开，绕过了 `Lane.input`。委托计入成对计数（peer = 会议路由），因为说话者没有证据、会议另一端可能是另一个语音 agent；截停时 harness 已经开工，只能打断。（委托轮次的权限后来按说话人定，见 LN-7。）代价：一场会里 15 分钟内超过 `pair.maxTurns` 次委托、其间没人在会话里写，会被截停；可调参数。
 
 ---
 
@@ -161,9 +162,9 @@
 
 ### DL-5 外发目的地检查；宿主 outbound 回调失败即拒
 
-- **承诺**：输出工具发往的每个路由都过 `Policy.outbound`（默认：触发本轮的输入全部来自主人（`inputs` 非空、每条主体带 `owner`，与 `plan` 给 `bypass` 的判据相同）的一轮不限；其他轮只允许本轮回复路由与预登记路由，包括只沿用了 `bypass` 的 live 委托轮次），`live_join` 的地点也一样；宿主声明了 `outbound` 钩子时由宿主决定，超时、出错、答复不合 schema 一律拒绝（决定 9）；这个宿主断开期间（含重启后）只放行本轮自己的回复路由，直到它重连或一个不声明 `outbound` 的宿主连上。
+- **承诺**：输出工具发往的每个路由都过 `Policy.outbound`（默认：触发本轮的输入全部来自主人（`inputs` 非空、每条主体带 `owner`，与 `plan` 给 `bypass` 的判据相同）的一轮不限；其他轮只允许本轮回复路由与预登记路由，包括说话人不是主人的 live 委托轮次），`live_join` 的地点也一样；宿主声明了 `outbound` 钩子时由宿主决定，超时、出错、答复不合 schema 一律拒绝（决定 9）；这个宿主断开期间（含重启后）只放行本轮自己的回复路由，直到它重连或一个不声明 `outbound` 的宿主连上。
 - **实现**：`gateway.ts` 构造函数里的 `outbound`（`host.outboundHeldBy()`、宿主回调、本地策略）；`packages/daemon/src/host.ts` `outboundHeldBy` 与 `hello`（宿主名记在 `DaemonRecords` 的 `daemon_flags`，跨重启）；`gateway.ts` `joinLive` / `liveAllowed`（通道有 `liveRoute` 时打开之前检查，否则检查打开后的端点路由，被拒即关闭端点）；`packages/host-mcp/src/tools.ts:380-397`（`allowed()`）。
-- **测试**：`packages/daemon/test/host-callouts.test.ts` "the host decides; timeout, error and bad answers deny; without the hook the local policy decides #DL-5"、"a host that only answers route callouts leaves outbound to the local policy #DL-5"、"a host that declared the outbound callout disconnects: a send to a route other than the turn's own is still refused"（原 `it.fails`，已修；也覆盖重启后与交还本地策略）；`packages/daemon/test/live.test.ts` "live_join goes through the outbound check: a policy that denies every destination refuses it, no endpoint is opened"（原 `it.fails`，已修）、"live_join from an owner turn (bypass) reaches a meeting that is not preregistered; a channel that cannot name the route first has its endpoint closed when the check denies"、"a delegated turn (no reply route) sends to \"current\" = the chat that opened the live; it inherits the owner's bypass run, not the owner's reach: elsewhere is refused"；`packages/session/test/policy.test.ts` "allows outbound to the turn’s routes and preregistered ones; a turn whose every input is from an owner anywhere"；`host-mcp.test.ts` "denies destinations outside Policy.outbound with a clear error and a notice #DL-5"。
+- **测试**：`packages/daemon/test/host-callouts.test.ts` "the host decides; timeout, error and bad answers deny; without the hook the local policy decides #DL-5"、"a host that only answers route callouts leaves outbound to the local policy #DL-5"、"a host that declared the outbound callout disconnects: a send to a route other than the turn's own is still refused"（原 `it.fails`，已修；也覆盖重启后与交还本地策略）；`packages/daemon/test/live.test.ts` "live_join goes through the outbound check: a policy that denies every destination refuses it, no endpoint is opened"（原 `it.fails`，已修）、"live_join from an owner turn (bypass) reaches a meeting that is not preregistered; a channel that cannot name the route first has its endpoint closed when the check denies"、"a delegated turn (no reply route) sends to \"current\" = the chat that opened the live; an unidentified speaker does not get the owner's reach: elsewhere is refused"；`packages/session/test/policy.test.ts` "allows outbound to the turn’s routes and preregistered ones; a turn whose every input is from an owner anywhere"；`host-mcp.test.ts` "denies destinations outside Policy.outbound with a clear error and a notice #DL-5"。
 - **状态**：有测试。
 - **决定（2026-10-11，依原则 4 与决定 9"`outbound` 任何失败都拒绝"自决；决定 13 冻结回调的扩展，这里是改正确性，不加新能力）**：
   1. 宿主离线时只放行本轮自己的回复路由：回复发问的地方不需要宿主授权，本地策略额外放宽的（预登记路由）正是宿主可能收紧过的，按 fail closed 拒绝。没有加配置开关（`host-callouts` §8 原设想的 `whenOffline`）。
@@ -290,7 +291,7 @@
 - **实现**：`lane.ts:856`（plan 不含 context 记录）、`lane.ts:573-574`；`policy.ts:96-101`。
 - **测试**：`policy.test.ts` "bypass only when every input is from an owner #ID-6"；`watch.test.ts` "a trigger turn keeps the original sender: restricted for a stranger, bypass for the owner #ID-6 #ID-1 #CF-5"；`lane.test.ts` "auto: answers immediately per policy (bypass → allow) #ID-6 #RQ-1"、"auto deny for a restricted turn #ID-6"；`routing.test.ts` "the owner @-ing in a group after strangers talked: tagged watched + external + group (never blocked or downgraded) #EX-3 #ID-6"；`context.test.ts` "stranger messages in the context do not change the plan: the same run as without them #ID-6"；`lane.test.ts` "a steer that would change the turn's profile is queued instead (the profile comes from the turn's own inputs) #ID-6"。
 - **状态**：有测试。
-- **注意**：live 委托 turn 不调 `plan`，沿用 `lastRun`（`lane.ts:968`），所以主人放行的一轮之后，会议里任何人的委托都按 `bypass` 自动放行审批（`policy.ts:106`）。这是决定 11"与文字会话同权限"的字面结果，不算违反，但值得在决定 11 里写明这个后果。
+- **已修（2026-10-12，决定 11 修订）**：~~live 委托 turn 不调 `plan`，沿用 `lastRun`，主人放行的一轮之后，会议里任何人的委托都按 `bypass` 自动放行审批~~。委托轮次现在同样按触发它的输入（说话人）调 `plan`，见 LN-7。
 
 ### ID-7 agent 产生的输入由守护进程盖章；agent 主体永远不是主人
 
@@ -408,8 +409,26 @@
 
 - **承诺**：语音端每次委托记一条输入：`transcript` 块、`origin.principal = null`、`channelContext.live = true`、回复路由 = 发起 live 的路由；harness 自己开的 turn 交给 lane 当作当前 turn，turn 本身没有回复路由（决定 11）。
 - **实现**：`lane.ts:923-947`、`:960-976`。
-- **测试**：`live.test.ts`（session）"a delegation becomes an input from the far side and the harness-started turn runs as the lane turn #LN-6 #LN-2 #ID-1 #LN-4"；`daemon/test/live.test.ts` "a delegated turn (no reply route) sends to \"current\" = the chat that opened the live; it inherits the owner's bypass run, not the owner's reach: elsewhere is refused #LN-6 #DL-5"。
+- **测试**：`live.test.ts`（session）"a delegation becomes an input from the far side and the harness-started turn runs as the lane turn #LN-6 #LN-2 #ID-1 #LN-4"；`daemon/test/live.test.ts` "a delegated turn (no reply route) sends to \"current\" = the chat that opened the live; an unidentified speaker does not get the owner's reach: elsewhere is refused #LN-6 #DL-5"。
 - **状态**：有测试。
+- **修订（2026-10-12）**：`origin.principal = null` 只在通道给不出说话人时成立；通道给出说话人时，来源按 LN-7 盖章（主体、证据、`senderName`）。
+
+### LN-7 委托轮次的权限跟着说话人；认不出的说话人永远拿不到 bypass，审批交给发起 live 的人、在发起的对话里问
+
+- **承诺**（决定 11 修订）：
+  1. **说话人**：每次委托，网关向通道的媒体对端要说话人（可选能力 `LiveEndpoint.speaker(atMs)`，`atMs` = harness 报告委托的时间），按普通入站的路径盖章：证据按通道条目封顶（授予 ∩ caps，否则 `none`，同 ID-3），再 `Policy.identify`（同 ID-4：证据不足的主人是陌生人）；对端没有这个能力、答不出、抛错、或认出的是本部署自己（`self`）时，说话人未知（`principal: null`，`evidence: none`）。
+  2. **定档**：harness 自己为委托开的一轮按它的输入调 `Policy.plan`（与文字轮同一个判据），不沿用 thread 上一轮；默认策略下只有认出是主人才 `bypass`，其他一律 `restricted`。日志的 `turn.started.run` 记计划的档。委托被并进正在跑的一轮时，按这一轮全部输入重新定档。
+  3. **harness 的沙箱**：live 开始时 lane 把"没有任何输入时的档"（`plan` 空输入，默认 `restricted`）作为 `LiveStartArgs.delegationRun` 交给 harness；harness 在 live 期间把它设为 thread 的默认（Codex：`thread/settings/update`，每个 host 开的轮次结束后再设一次，因为 `turn/start` 的覆盖会留在 thread 上），并在委托轮次的 `turn.started.run` 报告它实际开始时用的档。lane 接受"等于计划"或"等于这个底档"（比计划窄：沙箱按底档，审批按计划）；**报告的档比这两者都宽时立即打断这一轮**并记 `notice { code: "live_profile" }`（例如 host 轮刚结束、底档还没设回就来了委托；或陌生人的委托被并进主人正在跑的 `bypass` 轮）。harness 不报告档时（模块 harness、没实现的），只有下面第 4 条成立。
+  4. **审批**：受限的委托轮次（`TurnContext.live` 有值、档不是 `bypass`）里的请求，默认 `Policy.resolve` 不自动拒绝，而是 `human` resolver，`principals` = 发起 live 的人（调用 `live_join` 那一轮的 owner，记在 `live.started.startedBy`），`routes` = live 的 `controlRoute`；lane 为这一轮补一条 `turn.delivery_added { reason: "approval" }` 到 `controlRoute`，卡片和按钮出现在那个对话里；只有发起人的点击生效（RQ-1）。没有认出的发起人时没人可问，自动拒绝。`bypass` 的委托轮次照旧自动放行。宿主可以用自己的 `Policy.resolve` 覆盖（`TurnContextView.live` 也在 resolve 回调里）。
+  5. 外发不变：只有输入全部来自主人的轮次能发到任何地方（DL-5）。
+- **实现**：`packages/protocol/src/channel.ts` `LiveEndpoint.speaker`、`LiveSpeaker`；`packages/protocol/src/harness.ts` `LiveStartArgs.delegationRun`；`packages/protocol/src/policy.ts` `TurnContext.live`；`packages/protocol/src/events.ts`（`live.started.startedBy`、`turn.delivery_added` 的 `approval`、`notice` 的 `live_profile`）；`packages/daemon/src/gateway.ts` `joinLive`（`startedBy`）、`liveSpeaker`；`packages/session/src/lane.ts` `startLive`（`delegationRun`）、`onHarnessEvent` 的 `live.handoff`（`liveSpeaker`、`replanForDelegation`）与 `turn.started { initiator: "harness" }`（`planDelegated`、`checkDelegatedProfile`）、`openRequest`（`approval` 投递）、`context`（`live`）；`packages/session/src/policy.ts` `resolve`；`harness/codex/src/session.ts` `applyDelegation`、`foreignTurn`（报告 `run`）、`startTurn`（等 `settling`）。
+- **测试**：标签 `#LN-7`；`packages/session/test/live.test.ts` "the owner speaking: planned bypass from its own input, its requests are allowed; the harness running it under the live's floor is accepted"、"an unknown speaker: restricted; a request is asked of the live's starter in its control route, never auto-allowed; only the starter's answer counts"、"an identified speaker who is not the owner: restricted, asked of the starter; a live nobody identified started: denied"、"a delegated turn the harness began wider than planned (an unidentified speaker under bypass) is interrupted"、"a stranger's delegation folded into the owner's running bypass turn interrupts it; the owner's folded into a turn for nobody keeps it restricted"；`packages/daemon/test/live.test.ts` "the channel names the owner as the speaker: owner origin through the identity path, bypass, requests allowed"、"no speaker from the channel: restricted; the request's card with buttons appears in the chat that started the live, a stranger's click is refused, the owner's click answers it"、"a speaker the channel names who is not the owner: restricted, the request goes to the starter"；`packages/session/test/policy.test.ts` "resolve: bypass allows; a restricted turn carrying a live's delegation asks the live's starter in its control route; other restricted turns are denied"；`harness/codex/test/codex.test.ts` "keeps the thread's default at the live's delegation run (thread/settings/update), also after a host turn's overrides; a delegated turn reports what it began under"、"a failed settings update leaves a notice, and a delegated turn reports the wider profile it began under"。
+- **状态**：有测试（假 harness、假 app-server、假会议通道）。真实 Codex 上 `thread/settings/update` 对它自己开的委托轮次生效、以及通知与答复的先后，没有 live 测试（见注意）。
+- **注意**：
+  1. **在哪里强制**：沙箱与 Codex 自己的审批策略由 harness 强制（thread 默认 = 底档）；"认出主人才放行审批"由 lane 强制（计划的档 → `resolve`）；"开始得比计划宽"由 lane 打断（事后，几百毫秒内，harness 可能已执行了第一步）。所以主人的委托在默认配置下是"底档沙箱 + 审批自动放行"：内置 `bypass` 与默认 `restricted` 的沙箱都是 `workspace-write`，区别只在要不要问，效果与 `bypass` 相同；部署给 `restricted` 配了更窄的沙箱时，主人的委托也受那个沙箱限制。
+  2. **竞态**：Codex 记的档在 `thread/settings/update` 答复之后才改，期间开始的委托轮次报告的是旧档（可能更宽，按第 3 条打断）。假定 app-server 不会在答复之后才发出一个答复之前就以旧设置开始的轮次的 `turn/started`；未用真实 Codex 核实。
+  3. **并进主人正在跑的轮次**：Codex 把委托并进正在跑的轮次（相当于 steer），lane 改不了它的沙箱，只能打断主人这一轮；主人需要重说。`live_join` 本身就在主人的一轮里，所以入会后几秒内的第一句委托也可能打断那一轮的收尾。
+  4. 飞书会议（open-lark 插件）目前不给说话人，实际效果是"受限 + 审批找发起人"。
 
 ---
 
