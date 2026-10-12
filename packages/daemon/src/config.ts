@@ -348,6 +348,12 @@ export const ConfigFile = Type.Object(
           agentAccounts: Type.Optional(Type.Array(Type.String())),
           /** Put every owner DM (any channel) into this one session. */
           ownerSessionKey: Type.Optional(Type.String()),
+          /**
+           * Messages from people the deployment does not know, addressed to it (a DM, an @ in a group;
+           * not mail): `drop` (default) leaves them as routed; `ask` asks the owner, in the chat of
+           * `ownerSessionKey`, whether to let the agent answer (decision 15).
+           */
+          strangers: Type.Optional(Type.Union([Type.Literal('drop'), Type.Literal('ask')])),
           routes: Type.Optional(Type.Array(Type.String())),
           /**
            * Let a request be answered on someone's behalf (default false, decision 13): a host
@@ -597,6 +603,8 @@ export interface Config {
     selfAccounts: string[];
     agentAccounts: string[];
     ownerSessionKey?: string;
+    /** `policy.strangers` (default `drop`). */
+    strangers: 'drop' | 'ask';
     routes: string[];
     watchAllowlist: Partial<Pick<WatchSource, 'channel' | 'account' | 'conversation' | 'conversationKind'>>[];
     /** `policy.answerOnBehalf` (default false): `resolve { onBehalfOf }` is allowed. */
@@ -832,6 +840,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
       selfAccounts: c.policy?.selfAccounts ?? [],
       agentAccounts: c.policy?.agentAccounts ?? [],
       ...(ownerSessionKey ? { ownerSessionKey } : {}),
+      strangers: c.policy?.strangers ?? 'drop',
       routes: c.policy?.routes ?? [],
       watchAllowlist: c.policy?.watchAllowlist ?? [],
       answerOnBehalf: c.policy?.answerOnBehalf ?? false,

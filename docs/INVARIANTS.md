@@ -310,6 +310,13 @@
 - **边界**：适配器把一次发送拆成多条（长文本、图片、文件）时，每一条的 id 都要在 `SendResult.providerMessageIds` 里报出来才认得出（飞书适配器报；只报 `providerMessageId` 的适配器只认得主消息）；出站索引过了保留期、或另一台机器发的，都找不回，落回身份规则。
 - **已修**：~~飞书一次发送的多条消息只索引主消息，同时发的图片、文件回来认不出~~（2026-10-11 合并评审：适配器报全部 id，`daemon_outbound_parts` 逐条索引）。
 
+### ID-9 陌生人的消息不经主人同意不开轮
+
+- **承诺**：`policy.strangers: "ask"` 时，不认识的人（有平台证据、不是主人、不是本部署）发给本部署的消息（私聊，或群里 @ 本部署；邮件除外）不开轮，只在主人的对话（`ownerSessionKey` 最近一轮的路由）里出一张卡片问主人；同一人在同一对话里的后续消息并进这张卡片。只有主人点的按钮算数。"允许这一次"把这些消息按原发送者投到该对话的会话（`restricted`），"以后都允许"另把此人记为 `guest` 身份（持久），之后的消息不再问、直接投递；"忽略"什么都不投。放行的轮次里需要审批的请求交给主人，卡片出现在主人的对话里（RQ-5）。不在 `ask` 时（默认 `drop`）行为不变。不认识主人的对话时不问（记一条警告）。
+- **实现**：`packages/daemon/src/strangers.ts`；`packages/session/src/ingress.ts` `onUndispatched`、`onAction`；`packages/session/src/router.ts` `setExtraIdentities`（guest 身份在配置与宿主映射之下）；`packages/session/src/lane.ts` `openRequest`（`routeOf`：人工请求点名的路由加进轮次的投递）；`packages/daemon/src/gateway.ts` `askOwner`、`ownerRoute`。
+- **测试**：标签 `#ID-9`；`packages/daemon/test/strangers.test.ts`。
+- **状态**：有测试（假通道）。决定 15。
+
 ---
 
 ## 5. 可解释性（EX）
