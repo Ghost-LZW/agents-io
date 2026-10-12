@@ -731,13 +731,61 @@ describe('live (realtime voice, decision 11)', () => {
       { t: 'live.handoff', liveId: 'L1', inputId: 'live:L1:h1', text: '看看当前目录' },
       { t: 'live.handoff', liveId: 'L1', inputId: 'live:L1:h2', text: '你挂了吧' },
     ]);
-    expect(c.of('turn.started')).toEqual([{ t: 'turn.started', turnId: 'codex:d-1', inputIds: ['live:L1:h1'], replyRoute: null, initiator: 'harness', nativeTurnId: 'd-1' }]);
+    // It reports the run the thread had when Codex began it (decision 11 amendment).
+    expect(c.of('turn.started')).toEqual([
+      { t: 'turn.started', turnId: 'codex:d-1', inputIds: ['live:L1:h1'], replyRoute: null, initiator: 'harness', nativeTurnId: 'd-1', run: expect.objectContaining({ profile: run.profile }) },
+    ]);
     expect(c.of('input.consumed').map((b) => b.inputIds)).toEqual([['live:L1:h1'], ['live:L1:h2']]);
     expect(c.of('turn.completed')[0]).toMatchObject({ turnId: 'codex:d-1', status: 'completed' });
     // a turn with no delegation pending stays foreign
     fake.notify('turn/started', { threadId: 'thr-1', turn: { id: 'tui-2', status: 'inProgress', items: [] } });
     await c.until((e) => e.body.t === 'turn.started' && e.turnId === 'codex:tui-2');
     expect(c.of('turn.started')[1]).toMatchObject({ initiator: 'foreign', inputIds: [] });
+  });
+
+  it("keeps the thread's default at the live's delegation run (thread/settings/update), also after a host turn's overrides; a delegated turn reports what it began under #LN-7", async () => {
+    const { fake, harness } = setup({ live: true });
+    liveServer(fake);
+    fake.handlers['thread/settings/update'] = () => ({});
+    const s = await open(harness); // applied: the open's run (bypass)
+    const c = collector(s);
+    await s.live!.start({ liveId: 'L1', transport: offer, delegationRun: { ...run, profile: 'restricted' } });
+    const restricted = { threadId: 'thr-1', approvalPolicy: 'on-request', approvalsReviewer: 'user', sandboxPolicy: expect.objectContaining({ type: 'workspaceWrite' }) };
+    expect(fake.sent('thread/settings/update').map((m) => m.params)).toEqual([restricted]);
+
+    fake.notify('thread/realtime/itemAdded', { threadId: 'thr-1', item: { type: 'handoff_request', handoff_id: 'h1', input_transcript: 'x' } });
+    fake.notify('turn/started', { threadId: 'thr-1', turn: { id: 'd-1', status: 'inProgress', items: [] } });
+    await c.until((e) => e.body.t === 'turn.started' && e.turnId === 'codex:d-1');
+    expect(c.of('turn.started').at(-1)).toMatchObject({ initiator: 'harness', run: { profile: 'restricted' } });
+    fake.notify('turn/completed', { threadId: 'thr-1', turn: { id: 'd-1', status: 'completed', items: [], error: null } });
+    await c.until((e) => e.body.t === 'turn.completed' && e.turnId === 'codex:d-1');
+
+    // The owner's text turn: its bypass overrides go on turn/start (the thread had the floor) ...
+    await s.startTurn('t1', [input('i1', 'owner asks')], run);
+    await tick();
+    expect(fake.sent('turn/start').at(-1)!.params).toMatchObject({ approvalPolicy: 'never' });
+    fake.completeTurn('thr-1', fake.activeTurn.get('thr-1')!, 'completed');
+    await c.until((e) => e.body.t === 'turn.completed' && e.turnId === 't1');
+    // ... and persist on the thread, so the floor is put back once it ended.
+    await tick();
+    expect(fake.sent('thread/settings/update').map((m) => m.params)).toEqual([restricted, restricted]);
+  });
+
+  it('a failed settings update leaves a notice, and a delegated turn reports the wider profile it began under #LN-7', async () => {
+    const { fake, harness } = setup({ live: true });
+    liveServer(fake);
+    fake.handlers['thread/settings/update'] = () => {
+      throw new FakeRpcError(-32600, 'nope');
+    };
+    const s = await open(harness);
+    const c = collector(s);
+    await s.live!.start({ liveId: 'L1', transport: offer, delegationRun: { ...run, profile: 'restricted' } });
+    await c.until((e) => e.body.t === 'notice');
+    expect(c.of('notice').at(-1)!.message).toMatch(/could not set the thread's settings for delegated turns \(restricted\): nope/);
+    fake.notify('thread/realtime/itemAdded', { threadId: 'thr-1', item: { type: 'handoff_request', handoff_id: 'h1', input_transcript: 'x' } });
+    fake.notify('turn/started', { threadId: 'thr-1', turn: { id: 'd-1', status: 'inProgress', items: [] } });
+    await c.until((e) => e.body.t === 'turn.started');
+    expect(c.of('turn.started').at(-1)).toMatchObject({ run: { profile: 'bypass' } });
   });
 
   it('a start whose answer never comes or fails cleans up; the session closing ends the live #LN-4', async () => {

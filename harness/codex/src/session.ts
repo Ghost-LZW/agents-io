@@ -165,6 +165,8 @@ interface LiveState {
   answer?: { resolve(sdp: string): void; reject(e: Error): void };
   /** A delegation waiting for the turn Codex starts for it. */
   handoff?: { inputId: string };
+  /** The run delegated turns begin under (`LiveStartArgs.delegationRun`), kept as the thread's default while the live runs. */
+  delegation?: RunSpec;
   ended: boolean;
 }
 
@@ -185,6 +187,8 @@ export class CodexSession implements HarnessSession {
   /** File paths of fileChange items, for approval previews. */
   private fileItems = new Map<string, string[]>();
   private liveState: LiveState | undefined;
+  /** A `thread/settings/update` in flight: turn/start waits for it, so its overrides are computed against what the thread has. */
+  private settling: Promise<void> = Promise.resolve();
   readonly live?: HarnessLive;
 
   constructor(
@@ -244,6 +248,7 @@ export class CodexSession implements HarnessSession {
     this.clientIds.set(clientUserMessageId, t.startInputs);
     try {
       const input = await renderInputs(inputs, { resolveMedia: this.opts.resolveMedia, preface: this.opts.preface });
+      await this.settling;
       const params: TurnStartParams = { threadId: this.threadId, input, clientUserMessageId, ...this.overrides(effective) };
       const res = await this.host.rpc.request<TurnStartResponse>('turn/start', params);
       this.applied = { model: effective.model || this.applied.model, effort: effective.effort ?? this.applied.effort, profile: effective.profile };
@@ -696,6 +701,8 @@ export class CodexSession implements HarnessSession {
     this.host.saveTurn?.(this.threadId, undefined);
     this.fileItems.clear();
     t.finish();
+    // A host turn's overrides persist on the thread: put the live's delegation default back.
+    if (this.liveState?.delegation && !this.liveState.ended) void this.applyDelegation();
   }
 
   private saveTurn(t: Turn): void {
@@ -741,11 +748,16 @@ export class CodexSession implements HarnessSession {
     if (this.liveState) this.liveState.handoff = undefined;
     const inputs = handoff ? [handoff.inputId] : [];
     const initiator: Initiator = handoff ? 'harness' : 'foreign';
-    const t = this.newTurn(`codex:${codexTurnId}`, undefined, inputs, initiator);
+    // What the thread's settings were when Codex began it (decision 11 amendment): the session layer
+    // stops a delegated turn that began wider than planned. An update still in flight counts as not applied.
+    const run: RunSpec | undefined = handoff
+      ? { harness: this.args.run.harness, model: this.applied.model ?? this.args.run.model, ...(this.applied.effort ? { effort: this.applied.effort } : {}), profile: this.applied.profile }
+      : undefined;
+    const t = this.newTurn(`codex:${codexTurnId}`, run, inputs, initiator);
     t.bind(codexTurnId);
     this.active = t;
     this.emit(
-      { t: 'turn.started', turnId: t.turnId, inputIds: inputs, replyRoute: null, initiator, nativeTurnId: codexTurnId },
+      { t: 'turn.started', turnId: t.turnId, inputIds: inputs, replyRoute: null, initiator, nativeTurnId: codexTurnId, ...(run ? { run } : {}) },
       { turnId: t.turnId },
     );
     // Codex never echoes a delegation as a userMessage with our clientId: it is consumed by construction.
@@ -778,6 +790,10 @@ export class CodexSession implements HarnessSession {
       });
       const sdp = await answer;
       st.answer = undefined;
+      if (a.delegationRun) {
+        st.delegation = a.delegationRun;
+        await this.applyDelegation();
+      }
       return { answerSdp: sdp };
     } catch (e) {
       st.answer = undefined;
@@ -788,6 +804,37 @@ export class CodexSession implements HarnessSession {
       }
       throw e;
     }
+  }
+
+  /**
+   * Keep the thread's default settings (what turns Codex starts by itself for delegations
+   * begin under) at the live's delegation run (decision 11 amendment): `thread/settings/update`
+   * with the profile's approval policy, reviewer and sandbox. Called when the live starts and
+   * after every turn ends, since a host turn's `turn/start` overrides persist on the thread.
+   * `applied` changes only once Codex answered, so a delegated turn that begins meanwhile is
+   * reported under the old (possibly wider) profile. A failed update leaves a notice.
+   */
+  private applyDelegation(): Promise<void> {
+    const run = async () => {
+      const st = this.liveState;
+      const d = st?.delegation;
+      if (!st || st.ended || !d || this.closed || this.applied.profile === d.profile) return;
+      const p = resolveProfile(d.profile, this.opts.profiles);
+      try {
+        await this.host.rpc.request('thread/settings/update', {
+          threadId: this.threadId,
+          approvalPolicy: p.approvalPolicy ?? FALLBACK_PROFILE.approvalPolicy!,
+          approvalsReviewer: p.approvalsReviewer ?? 'user',
+          sandboxPolicy: sandboxPolicyOf(p) ?? sandboxPolicyOf(FALLBACK_PROFILE)!,
+        });
+        this.applied = { ...this.applied, profile: d.profile };
+      } catch (e) {
+        this.emit({ t: 'notice', code: 'other', message: `could not set the thread's settings for delegated turns (${d.profile}): ${(e as Error).message}` }, { level: 'detail' });
+      }
+    };
+    const next = this.settling.then(run, run);
+    this.settling = next;
+    return next;
   }
 
   private async liveStop(): Promise<void> {
