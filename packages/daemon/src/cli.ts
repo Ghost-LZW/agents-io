@@ -14,6 +14,7 @@ import { consoleProof } from './console.js';
 import { runScenarios } from './e2e.js';
 import { Gateway, buildHarness } from './gateway.js';
 import { TokenError, consoleUrlPath, readTokenFile, tokenPath } from './token.js';
+import { tuiBridge } from './tui-bridge.js';
 import { WATCH_SPEC_HELP, formatWatch, parseDuration, parseWatchSpec } from './watch-spec.js';
 
 const USAGE = `aio: the agents-io daemon and its CLI
@@ -24,7 +25,7 @@ daemon
 
 local ends (as the local principal)
   aio attach    [--session <key>] [--tier full|card|headline|final] [--from <seq>] [--verbose]
-  aio tui       [--session <key>]                                   (the harness's own terminal UI on the session; Codex over unix)
+  aio tui       [--session <key>]                                   (the harness's own terminal UI on the session: Codex over unix, Claude Code)
   aio input     [--session <key>] [--mode queue|steer|interrupt] [--wait] <text…>
   aio sessions
   aio watch     add [--session <target>] key=value… | list [--session <target>] | remove <id>
@@ -273,7 +274,9 @@ async function tui(a: CliArgs): Promise<number> {
     client.close();
   }
   if (process.stderr.isTTY) console.error(`aio: ${t.sessionKey} → ${t.harness} ${t.nativeId}`);
-  const child = spawn(t.command, t.args, { cwd: t.cwd, stdio: 'inherit', env: { ...process.env, ...t.env } });
+  const env = { ...process.env };
+  for (const k of t.unsetEnv ?? []) delete env[k];
+  const child = spawn(t.command, t.args, { cwd: t.cwd, stdio: 'inherit', env: { ...env, ...t.env } });
   return new Promise((done, fail) => {
     child.on('error', (e) => fail(new CommandError('spawn_failed', `${t.command}: ${e.message}`)));
     child.on('exit', (code, signal) => done(code ?? (signal ? 128 + (osConstants.signals[signal] ?? 0) : 1)));
@@ -610,7 +613,7 @@ async function e2e(a: CliArgs): Promise<number> {
   return n('FAIL') ? 1 : 0;
 }
 
-const COMMANDS: Record<string, (a: CliArgs) => Promise<number>> = { serve, attach, tui, input, sessions, watch, e2e, run: runCmd, send, tail, ack, redispatch, bindings, explain, verify, 'console-link': consoleLink, console: consoleLink };
+const COMMANDS: Record<string, (a: CliArgs) => Promise<number>> = { serve, attach, tui, 'tui-bridge': () => tuiBridge(), input, sessions, watch, e2e, run: runCmd, send, tail, ack, redispatch, bindings, explain, verify, 'console-link': consoleLink, console: consoleLink };
 
 export async function main(argv: string[]): Promise<number> {
   const a = parseCli(argv);

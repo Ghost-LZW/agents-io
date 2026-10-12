@@ -1,6 +1,6 @@
 # 外部持有的会话：原生 TUI 与宿主自己拉起的 agent 接入 agents-io
 
-> 状态：已采纳（2026-10-13，决定 15：§9 四项按推荐）。§5、§6 已按两次实测修订（§10）。
+> 状态：已采纳并实现 S1、S2（2026-10-13，决定 15：§9 四项按推荐；INVARIANTS LN-8、LN-9）。§5、§6 已按两次实测修订（§10）。S3 的状态机按实现简化：持有者 = lane 背后的 harness 适配器（Codex 终端是同一 thread 的另一个客户端，lane 不变；Claude 终端持有期间 lane 的该实例就是终端，退出即回到无头）；S4（宿主拉起）未做。
 > 依据：`docs/POSITIONING.md` §3（"只要观察"用法）；`docs/design/locus/DECISIONS.md` 总体方向（"agents-io 是唯一拉起 harness 的地方"）、决定 12；`docs/ROADMAP.md` §0、原则 1、2；`docs/research/claude-code.md` §3、§5、§6；`docs/design/thin-bridge.md` §5（`codex --remote`）。
 
 ## 1. 一句话

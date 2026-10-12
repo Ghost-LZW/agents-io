@@ -443,7 +443,14 @@
 - **承诺**：`tui.attach`（决定 15）只答本机主人（带宿主 token 的连接答 `forbidden`）。守护进程先打开该会话的 harness 绑定，再答复启动原生 TUI 的命令；TUI 作为同一原生会话的另一个客户端加入，不另开会话、不夺走 lane：渠道输入照常经 lane 进入，TUI 里输入的轮次以 foreign 轮次记进日志。从未跑过轮次的会话先注入一条上下文说明，使原生会话可续接（Codex 空 thread 没有 rollout）。harness 不能让终端加入时答 `unsupported`。
 - **实现**：`packages/protocol/src/harness.ts` `HarnessAdapter.nativeClient`；`harness/codex/src/harness.ts` `CodexHarness.nativeClient`（unix 传输）；`packages/session/src/lane.ts` `attachPoint`、`injectContext`；`packages/daemon/src/gateway.ts` `tuiAttach`；`packages/daemon/src/local-server.ts`（`tui.attach`）；`packages/daemon/src/cli.ts` `aio tui`。
 - **测试**：标签 `#LN-8`；`packages/daemon/test/tui.test.ts`。真实 Codex（0.160.1）手工核对：TUI 恢复出历史，`aio input` 的一轮在 TUI 里实时出现（`docs/design/external-holder/` §10.1）。
-- **状态**：有测试（假 harness）。Claude Code 的终端加入（S2）待实现。
+- **状态**：有测试（假 harness）。Claude Code 的终端不是加入而是接管，见 LN-9。
+
+### LN-9 Claude Code 终端接管会话；离开后由无头续接同一会话
+
+- **承诺**：claude-code 实例的会话 `tui.attach` 时，等 lane 空闲后释放无头绑定，终端以同一 Claude 会话 id 启动（有过就 `--resume`，否则 `--session-id`），只对这次启动生效的 hooks 与 bridge（不改用户设置；去掉调用方所在 Claude 会话的标记，否则不存对话记录）。持有期间 lane 的轮次进终端：每轮一条 inbox 消息（带来源行与轮次标记，写入即算消费），hooks 回成事件（工具、`Stop` 的最后回答即答案、终端里敲的轮次为 foreign、权限请求为人工请求，终端先答则请求结束）。一个会话同时至多一个连着的终端（再 attach 答 `conflict`）；别的 Claude 会话的 hook 不算。终端退出（bridge 的流断开）即离开：持有结束，下一轮用无头适配器 `--resume` 同一会话；再 attach 时终端里能看到离开期间的轮次。终端连不上时消息等 30 秒后该轮失败，60 秒没连上则持有结束。
+- **实现**：`harness/claude-code/src/tui.ts`（`ClaudeTuiSession`）；`packages/daemon/src/tui-claude.ts`（`ClaudeTuiService`、`TuiHold`：本机 HTTP 端点收 hooks、流给 bridge）；`packages/daemon/src/tui-bridge.ts`（`aio tui-bridge`：终端的子进程，持终端的 inbox token）；`packages/daemon/src/gateway.ts` `claudeTuiAttach`、lane 的 `harnessFor`（持有期间该实例即终端）；`packages/session/src/lane.ts` `release`。
+- **测试**：标签 `#LN-9`；`harness/claude-code/test/tui.test.ts`；`packages/daemon/test/tui-claude.test.ts`。真实 Claude Code（2.1.296）手工核对：终端里答复、经 `Stop` 回到 `aio input`；退出后无头续接记得终端里说过的话；再 attach 看到无头那一轮（`docs/design/external-holder/` §10.2）。
+- **状态**：有测试（假终端、真 HTTP）。终端里的轮次不能从外部打断（只能在终端按 Esc）。
 ---
 
 ## 7. 审批（RQ）

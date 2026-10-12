@@ -3,3 +3,4 @@ export { ClaudeCodeSession, defaultProfile, mapAnswers } from './session.js';
 export { CONTEXT_LABEL, inputUuid, preface, convertBlock, toUserMessage } from './content.js';
 export * from './tools.js';
 export type * from './types.js';
+export * from './tui.js';
