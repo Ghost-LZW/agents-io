@@ -824,7 +824,7 @@ export class Lane {
       }
       if (allowed) {
         this.queue.unshift({ input, attempts: 0 });
-        this.emit({ body: { t: 'input.admitted', inputId: input.inputId, disposition: 'queued', ...pid(input) } });
+        this.emit({ body: { t: 'input.admitted', inputId: input.inputId, disposition: 'queued', ...pid(input), input } });
         await this.interruptTurn(t);
         return { ok: true, disposition: 'queued' };
       }
@@ -847,7 +847,7 @@ export class Lane {
     const idle = !this.turn && this.queue.length === 0;
     this.queue.push({ input, attempts: 0 });
     const disposition = idle ? 'new_turn' : 'queued';
-    this.emit({ body: { t: 'input.admitted', inputId: input.inputId, disposition, ...pid(input) } });
+    this.emit({ body: { t: 'input.admitted', inputId: input.inputId, disposition, ...pid(input), input } });
     if (idle) await this.pump();
     return { ok: true, disposition };
   }
@@ -878,7 +878,7 @@ export class Lane {
     t.inputs.push(input);
     this.track(t.turnId, t.inputs, t.context);
     t.attempts.set(input.inputId, 0);
-    this.emit({ turnId: t.turnId, body: { t: 'input.admitted', inputId: input.inputId, disposition: 'steer', ...pid(input) } });
+    this.emit({ turnId: t.turnId, body: { t: 'input.admitted', inputId: input.inputId, disposition: 'steer', ...pid(input), input } });
     const extra = input.replyRoute;
     if (extra && !sameRoute(extra, t.replyRoute) && !t.deliveries.some((d) => sameRoute(d, extra))) {
       t.deliveries.push(extra);

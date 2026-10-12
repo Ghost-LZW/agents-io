@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import type { AckState, InputRecord, ReplyRoute } from '@agents-io/protocol';
-import { FakeChannel, defaultChannelCaps } from '@agents-io/testkit';
-import { Compositor, Hub, MemorySessionLog, Outbox } from '../src/index.js';
-import { until } from './helpers.js';
+import { FakeChannel, FakeHarness, defaultChannelCaps } from '@agents-io/testkit';
+import { Compositor, Hub, Ingress, Lane, MemorySessionLog, Outbox, defaultPolicy } from '../src/index.js';
+import { RUN, until } from './helpers.js';
 
 /*
  * Acknowledgements (`ack`): a mark on each inbound message while it is handled; taken away once a
@@ -85,5 +85,35 @@ describe('compositor ack', () => {
     await until(() => w.channel.marks.length === 1);
     await new Promise((r) => setTimeout(r, 20));
     expect(w.channel.marks).toEqual(['m1:working']);
+  });
+});
+
+describe('compositor ack through ingress and a lane', () => {
+  it('a channel message gets working, then nothing once replied (the lane carries the input on input.admitted)', async () => {
+    const hub = new Hub(new MemorySessionLog());
+    const policy = defaultPolicy({ owners: ['fake:alice'], run: RUN });
+    const lanes = new Map<string, Lane>();
+    const harness = new FakeHarness();
+    const ingress = new Ingress({
+      policy,
+      lanes: (key) => {
+        let l = lanes.get(key);
+        if (!l) lanes.set(key, (l = new Lane({ sessionKey: key, harness, hub, policy })));
+        return l;
+      },
+    });
+    const channel = new AckChannel('fake', defaultChannelCaps);
+    const c = new Compositor({ hub, sessionKey: SESSION, adapter: channel, outbox: new Outbox({ hub, sleep: async () => {} }), throttleMs: 1, ack: { doneAfterMs: 60_000 } });
+    c.start();
+    const ac = new AbortController();
+    void channel.start({ account: 'default', config: {}, signal: ac.signal, emit: ingress.emitter(), log: () => {} });
+    cleanups.push(async () => {
+      ac.abort();
+      await c.stop();
+      for (const l of lanes.values()) await l.close();
+    });
+    await channel.inject({ id: 'm1', sender: { channelUserId: 'alice', evidence: 'platform_signed' }, text: 'hi', replyRoute: R('m1') });
+    await until(() => channel.marks.length === 2);
+    expect(channel.marks).toEqual(['m1:working', 'm1:none']);
   });
 });
