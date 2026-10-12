@@ -33,6 +33,11 @@ export const TENANT_SCOPES: readonly ScopeRequirement[] = [
     why: 'sender display names (contact.v3.user.get) in the input preface; without it only ids are shown',
   },
   {
+    name: 'im:message.reactions:write_only',
+    tier: 'optional',
+    why: 'acknowledgement reactions on inbound messages (im.v1.messageReaction create/delete, channel entry `ack`); without it there are none',
+  },
+  {
     name: 'cardkit:card:write',
     tier: 'optional',
     why: 'process cards as CardKit entities (create, streaming typewriter answer, element updates, card.update); without it they fall back to message patch (no typewriter, whole-card updates every editMinIntervalMs)',

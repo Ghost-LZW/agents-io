@@ -111,12 +111,18 @@ export interface LarkImageApi {
   create(payload: { data: { image_type: 'message' | 'avatar'; image: Buffer } }): Promise<LarkUploadResponse<'image_key'>>;
 }
 
+/** `im.v1.messageReaction`: reactions the bot puts on messages (acknowledgements). */
+export interface LarkReactionApi {
+  create(payload: { path: { message_id: string }; data: { reaction_type: { emoji_type: string } } }): Promise<LarkApiResponse<{ reaction_id?: string }>>;
+  delete(payload: { path: { message_id: string; reaction_id: string } }): Promise<LarkApiResponse<unknown>>;
+}
+
 export interface LarkClientLike {
   /**
    * `messageResource` is optional so narrow test clients need not provide it (media then keep `lark-file:` refs).
    * `file` / `image` upload host blobs for outbound attachments; absent → such attachments fail to send.
    */
-  im: { v1: { message: LarkMessageApi; messageResource?: LarkMessageResourceApi; file?: LarkFileApi; image?: LarkImageApi } };
+  im: { v1: { message: LarkMessageApi; messageResource?: LarkMessageResourceApi; file?: LarkFileApi; image?: LarkImageApi; messageReaction?: LarkReactionApi } };
   /** Contact lookups for sender names; absent → names stay unset. */
   contact?: { v3: { user: LarkContactUserApi } };
   /** CardKit. Absent on a client that predates it: process cards then use message patch. */

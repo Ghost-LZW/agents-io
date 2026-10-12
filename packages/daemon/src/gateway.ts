@@ -1880,6 +1880,7 @@ ${a.summary}` }],
   private compose(sessionKey: string, ch: RunningChannel): void {
     const { adapter, tier, account } = ch;
     const openDelayMs = ch.source?.openDelayMs;
+    const ack = ch.source?.ack;
     const c = new Compositor({
       hub: this.hub,
       sessionKey,
@@ -1891,6 +1892,7 @@ ${a.summary}` }],
       as: agentIdentity(sessionKey),
       ...(tier ? { tier } : {}),
       ...(openDelayMs ? { openDelayMs } : {}),
+      ...(ack ? { ack: { doneAfterMs: (typeof ack === 'object' ? ack.doneAfterMs : undefined) ?? 60_000 } } : {}),
       // A stop button on streaming cards; Ingress turns its click into an `interrupt` command.
       interruptButton: true,
       // Cards of a topic session carry the topic's title (Lark: the card header).

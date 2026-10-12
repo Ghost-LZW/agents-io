@@ -45,12 +45,14 @@ Three settings make the bot read more like a person than a console; all default 
 |---|---|
 | `look: 'chat'` | The card is the answer alone: no header (a topic keeps its title), no status line, no elapsed / tool-count footer, no plan once done. A status line appears only while an approval waits, or when the turn failed, was interrupted or has an unknown outcome. Buttons stay. Default `console`. |
 | `cotOn: 'tool'` | The thinking bubble opens at the turn's first tool call, so a turn that only thinks and answers shows none. A bubble opened after the reply card sits below it. Default `turn`. |
+| `look: 'chat'` (plain replies) | A reply whose first message is already its last, completed, with nothing to click (a quick answer) goes as a text message, or rich text (`post`) when it has markdown, instead of a card. |
+| `ackEmoji: { working?, done?, failed? }` | Reactions used to acknowledge inbound messages when the daemon's channel entry sets `ack` (default `OnIt` / `DONE` / `CrossMark`). Needs `im:message.reactions:write_only`; without it a warning is logged once and there are none. |
 | `processByChat: { dm?, group? }` | `process` per kind of chat, e.g. `{ "group": "off" }` for no process at all in groups. A chat's kind is learnt from its messages; a chat the bot has not heard from uses `process`. |
 
 With the daemon's `openDelayMs` on the channel entry (the compositor holds each turn's first message: answer text or an approval opens it earlier, a turn that ends within it gets one final message), a quick reply arrives as one message and a bubble opened at the first tool call usually still sits above the card:
 
 ```jsonc
-{ "type": "lark-bot", "openDelayMs": 3000, "config": { "look": "chat", "cotOn": "tool", "processByChat": { "group": "off" } } }
+{ "type": "lark-bot", "openDelayMs": 3000, "ack": true, "config": { "look": "chat", "cotOn": "tool", "processByChat": { "group": "off" } } }
 ```
 
 Buttons in `actions` (approvals, and the stop button `turn:<turnId>:interrupt` when the compositor runs with `interruptButton: true`) come back as `action` events, which `Ingress` turns into `resolve` / `interrupt` commands.

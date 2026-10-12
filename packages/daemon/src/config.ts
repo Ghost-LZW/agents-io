@@ -157,6 +157,12 @@ const ChannelCommon = {
    */
   openDelayMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 60_000 })),
   /**
+   * Acknowledge inbound messages (Lark: a reaction on them): working while handled; taken away
+   * once a reply came, or `done` when the reply took longer than `doneAfterMs` (default 60000);
+   * `failed` when it did not complete. `true` for the defaults.
+   */
+  ack: Type.Optional(Type.Union([Type.Boolean(), Type.Object({ doneAfterMs: Type.Optional(Type.Integer({ minimum: 0 })) }, Closed)])),
+  /**
    * Sender evidence this channel may give (channel-stamping): the cap is this ∩ the
    * adapter's `caps.evidence`, and stronger claims become `none`. Default: lark-bot and
    * mail `caps.evidence`; bridge and module channels only `device_only` (never

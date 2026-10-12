@@ -51,6 +51,8 @@ export class FakeLark {
   readonly users = new Map<string, { name: string }>();
   /** Calls of the inbound lookups, e.g. `resource:om_1/img_1:image`, `get:om_p`, `user:on_alice:union_id`. */
   readonly lookups: string[] = [];
+  /** Reactions on messages, live ones only: `messageId:emoji` by reaction id. */
+  readonly reactions = new Map<string, string>();
   wsStarts = 0;
   wsFailuresLeft = 0;
   private seq = 0;
@@ -234,6 +236,21 @@ export class FakeLark {
             const key = `img_v3_${this.uploads.length + 1}`;
             this.uploads.push({ kind: 'image', bytes: data.image.byteLength, key });
             return { image_key: key };
+          },
+        },
+        messageReaction: {
+          create: async ({ path, data }) => {
+            const f = this.failing('messageReaction.create');
+            if (f) return f;
+            const id = `rx_${++this.seq}`;
+            this.reactions.set(id, `${path.message_id}:${data.reaction_type.emoji_type}`);
+            this.log.push(`reaction+ ${path.message_id}:${data.reaction_type.emoji_type}`);
+            return { code: 0, data: { reaction_id: id } };
+          },
+          delete: async ({ path }) => {
+            this.log.push(`reaction- ${this.reactions.get(path.reaction_id)}`);
+            this.reactions.delete(path.reaction_id);
+            return { code: 0, data: {} };
           },
         },
         messageResource: {

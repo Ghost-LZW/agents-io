@@ -1,4 +1,5 @@
 import type {
+  AckState,
   BlobStore,
   ChannelAdapter,
   ChannelCaps,
@@ -162,6 +163,10 @@ export class LarkBotAdapter implements ChannelAdapter {
   private readonly inboundTails = new Map<string, Promise<void>>();
   /** chat id → its kind, learnt from inbound messages (`processByChat`). */
   private readonly chatKinds = new Map<string, 'dm' | 'group'>();
+  /** Inbound message id → the reaction this bot put on it as an acknowledgement. */
+  private readonly ackReactions = new Map<string, string>();
+  /** Reactions failed for want of the permission: acknowledgements stay off until a restart. */
+  private acksOff = false;
 
   constructor(config: LarkBotConfig, opts: LarkBotOptions = {}) {
     this.cfg = resolveConfig(config);
@@ -509,7 +514,8 @@ export class LarkBotAdapter implements ChannelAdapter {
     }
     const prior = this.sends.get(op.operationId);
     if (prior) return prior;
-    const run = this.useProcess(route, msg) ? this.sendProcess(route, msg, op) : this.doSend(route, msg, op);
+    const plain = this.plainReply(msg) && !isLarkCard(msg.channelData);
+    const run = this.useProcess(route, msg) ? this.sendProcess(route, msg, op) : this.doSend(route, plain ? { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) } : msg, op);
     this.sends.set(op.operationId, run);
     if (this.sends.size > BOUND) {
       const oldest = this.sends.keys().next();
@@ -640,6 +646,39 @@ export class LarkBotAdapter implements ChannelAdapter {
     while (this.cotTasks.size) await Promise.all([...this.cotTasks]);
   }
 
+  // ---- acknowledgements --------------------------------------------------------------------
+
+  /**
+   * A reaction on the inbound message: `working`, then `done` / `failed`, or removed (`none`).
+   * One per message: the previous one goes first. Cosmetic, never throws; a missing permission
+   * turns them off for this app.
+   */
+  async acknowledge(_route: ReplyRoute, messageId: string, state: AckState): Promise<void> {
+    const api = this.client.im.v1.messageReaction;
+    if (!api || this.acksOff) return;
+    await this.serial(
+      `ack:${messageId}`,
+      async () => {
+        try {
+          const prev = this.ackReactions.get(messageId);
+          if (prev) {
+            this.ackReactions.delete(messageId);
+            await this.api('messageReaction.delete', () => api.delete({ path: { message_id: messageId, reaction_id: prev } }));
+          }
+          if (state === 'none') return;
+          const res = await this.api('messageReaction.create', () => api.create({ path: { message_id: messageId }, data: { reaction_type: { emoji_type: this.cfg.ackEmoji[state] } } }));
+          if (res.data?.reaction_id) bounded(this.ackReactions, messageId, res.data.reaction_id);
+        } catch (err) {
+          if (isPermissionError(err)) {
+            this.acksOff = true;
+            this.log('warn', `lark reactions not permitted (add im:message.reactions:write_only to the app); acknowledgements off: ${(err as Error).message}`);
+          } else this.log('warn', `lark reaction on ${messageId} failed: ${(err as Error).message}`);
+        }
+      },
+      0,
+    ).catch(() => undefined);
+  }
+
   // ---- process cards ----------------------------------------------------------------------
 
   private anyProcess(): boolean {
@@ -653,7 +692,15 @@ export class LarkBotAdapter implements ChannelAdapter {
   }
 
   private useProcess(route: ReplyRoute, msg: RenderedMessage): boolean {
-    return this.processFor(route) !== 'off' && !!msg.progress && !isLarkCard(msg.channelData);
+    return this.processFor(route) !== 'off' && !!msg.progress && !isLarkCard(msg.channelData) && !this.plainReply(msg);
+  }
+
+  /**
+   * `look: chat`: a reply whose first message is already its last, done well and with nothing
+   * to click, goes as a plain text (or rich text) message, like a person's.
+   */
+  private plainReply(msg: RenderedMessage): boolean {
+    return this.cfg.look === 'chat' && msg.progress?.status === 'completed' && !msg.actions?.length && !!msg.text.trim();
   }
 
   private isProcessMessage(route: ReplyRoute, id: string, msg: RenderedMessage): boolean {
