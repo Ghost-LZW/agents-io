@@ -12,6 +12,7 @@ import {
   type InputRecord,
   type LiveFrame,
   type LiveStartArgs,
+  type LiveTurnContext,
   type LoopGuardTrip,
   type Origin,
   type ReplyRoute,
@@ -83,6 +84,12 @@ export interface LaneOptions {
   /** A live (realtime voice) on this session ended, whichever side ended it (decision 11). */
   onLiveEnded?: (liveId: string, reason: string) => void;
   /**
+   * Who spoke the delegation the harness just reported (decision 11 amendment), stamped like
+   * an inbound sender (channel's `LiveEndpoint.speaker`, evidence capped, `Policy.identify`).
+   * `atMs` is when the harness reported it. Undefined (or a throw): unknown speaker.
+   */
+  liveSpeaker?: (a: { liveId: string; atMs: number }) => Promise<LiveSpeakerOrigin | undefined>;
+  /**
    * Hop and same-pair limits checked on every input that would start or join a turn
    * (docs/design/agent-messaging §4.4); defaults `LOOP_GUARD_DEFAULTS`. `false` turns it off.
    */
@@ -105,6 +112,16 @@ export interface LiveInfo {
   route: ReplyRoute;
   /** Route of the turn that opened it: delegated turns may send text there. */
   controlRoute: ReplyRoute | null;
+  /** Principal id of whoever started it (the owner of the turn that called `live_join`); approvals of delegated turns are asked of them. */
+  startedBy?: string | null;
+}
+
+/** A delegation's speaker as identified (`LaneOptions.liveSpeaker`). */
+export interface LiveSpeakerOrigin {
+  kind: Origin['kind'];
+  principal: Origin['principal'];
+  evidence: Origin['evidence'];
+  displayName?: string;
 }
 
 export interface LaneMcp {
@@ -159,6 +176,13 @@ interface ActiveTurn {
   foreignConsumed: boolean;
   /** Input ids of a turn adopted from a previous host; their records are not in memory. */
   adopted?: Set<string>;
+  /**
+   * The profile the harness actually runs the turn under, when known: the planned one for a turn
+   * the lane started, the one the harness reports for a turn it started itself (a delegation).
+   */
+  harnessProfile?: string;
+  /** The turn carries a delegation of this live (decision 11 amendment): approvals go to its starter. */
+  live?: LiveTurnContext;
   /**
    * Context records handed ahead of the inputs (ids as handed). The harness may report
    * them consumed or not: neither requeues them nor makes the turn ambiguous.
@@ -239,6 +263,8 @@ export class Lane {
   /** Original ids of context inputs already handed to a turn (bounded). */
   private handedCtx = new Set<string>();
   private live: LiveInfo | undefined;
+  /** The run delegated turns begin under while the live runs (`LiveStartArgs.delegationRun`): plan over no inputs. */
+  private delegationRun: RunSpec | undefined;
   /** Delegations (live.handoff) waiting for the turn the harness starts for them. */
   private handoffs = new Map<string, InputRecord>();
   /** Lives the lane itself recorded as ended (closing with one open). */
@@ -472,14 +498,19 @@ export class Lane {
       if (!takes.includes(args.transport.type))
         throw new LiveTransportError(`harness ${this.adapter.id}'s live does not take the ${args.transport.type} transport (it takes: ${takes.join(', ')})`);
       this.live = info;
+      // Delegated turns begin under the floor (decision 11 amendment): what the plan gives nobody.
+      this.delegationRun = await this.policy.plan({ sessionKey: this.sessionKey, inputs: [], ...(this.lastRun ? { previous: this.lastRun } : {}) }).catch(() => undefined);
       return s;
     });
+    const delegationRun = this.delegationRun;
     const t = args.transport;
     const transport = t.type === 'frames' && !s.live!.video ? { ...t, media: { frames: audioOnly(t.media.frames), send: (f: LiveFrame) => t.media.send(f) } } : t;
     try {
-      const r = await s.live!.start({ liveId: info.liveId, ...args, transport });
+      const r = await s.live!.start({ liveId: info.liveId, ...args, transport, ...(delegationRun ? { delegationRun } : {}) });
       await this.serial(async () => {
-        this.emit({ body: { t: 'live.started', liveId: info.liveId, title: info.title, route: info.route, controlRoute: info.controlRoute } });
+        this.emit({
+          body: { t: 'live.started', liveId: info.liveId, title: info.title, route: info.route, controlRoute: info.controlRoute, ...(info.startedBy ? { startedBy: info.startedBy } : {}) },
+        });
       });
       return r;
     } catch (e) {
@@ -690,6 +721,7 @@ export class Lane {
       replyRoute: t?.replyRoute ?? null,
       ...(t?.owner != null ? { owner: t.owner } : {}),
       deliveries: t ? [...t.deliveries] : [],
+      ...(t?.live ? { live: t.live } : {}),
     };
   }
 
@@ -836,6 +868,51 @@ export class Lane {
    * any channel: a breaker that talks may feed the agent on the other side; the voice side
    * learns the delegation ended from the interrupted turn.
    */
+  /** The live a delegated turn's approvals refer to (its starter and control route). */
+  private liveTurn(liveId: string): LiveTurnContext {
+    const live = this.live?.liveId === liveId ? this.live : undefined;
+    return { liveId, startedBy: live?.startedBy ?? null, controlRoute: live?.controlRoute ?? null };
+  }
+
+  /** `Policy.plan` for a turn the harness started for delegations; a failing plan gives the floor (restricted). */
+  private async planDelegated(inputs: InputRecord[]): Promise<RunSpec> {
+    try {
+      return await this.policy.plan({ sessionKey: this.sessionKey, inputs, ...(this.lastRun ? { previous: this.lastRun } : {}) });
+    } catch {
+      const base = this.delegationRun ?? this.lastRun ?? { harness: this.adapter.id, model: 'default', profile: 'restricted' };
+      return { ...base, profile: this.delegationRun?.profile ?? 'restricted' };
+    }
+  }
+
+  /**
+   * A delegation was folded into the running turn: re-plan over all of its inputs. The turn's
+   * approvals follow the new plan; if the harness runs it under a profile neither planned nor the
+   * live's floor (e.g. an owner's bypass turn a stranger's delegation joined), it is interrupted.
+   */
+  private async replanForDelegation(t: ActiveTurn, liveId: string): Promise<void> {
+    t.live ??= this.liveTurn(liveId);
+    const run = await this.planDelegated(t.inputs);
+    if (t.run && run.profile === t.run.profile) return;
+    t.run = run;
+    await this.checkDelegatedProfile(t, t.harnessProfile);
+  }
+
+  /**
+   * Decision 11 amendment: a turn carrying a delegation must not run wider than planned. The
+   * harness began it under `actual` (when it says); accepted when that is the planned profile or
+   * the live's floor (narrower: the plan's approvals still apply), otherwise interrupted.
+   */
+  private async checkDelegatedProfile(t: ActiveTurn, actual: string | undefined): Promise<void> {
+    const planned = t.run?.profile;
+    if (actual === undefined || planned === undefined || actual === planned) return;
+    if (actual === this.delegationRun?.profile) {
+      this.emit({ turnId: t.turnId, level: 'detail', visibility: 'operators', body: { t: 'notice', code: 'live_profile', message: `delegated turn ${t.turnId} planned ${planned}; the harness runs it under the live's ${actual} profile (sandbox), approvals per the plan` } });
+      return;
+    }
+    this.emit({ turnId: t.turnId, level: 'detail', visibility: 'operators', body: { t: 'notice', code: 'live_profile', message: `turn ${t.turnId} carries a delegation planned ${planned} but runs under ${actual}; interrupted` } });
+    if (t.turnId === this.turn?.turnId) await this.interruptTurn(t).catch(() => undefined);
+  }
+
   private async interruptStopped(turnId: string, inputIds: string[]): Promise<void> {
     this.emit({ turnId, level: 'detail', visibility: 'operators', body: { t: 'notice', code: 'loop_guard', message: `loop guard: turn ${turnId} carries stopped delegation ${inputIds.join(', ')}; interrupted` } });
     try {
@@ -1094,6 +1171,7 @@ export class Lane {
       try {
         const run = await this.policy.plan({ sessionKey: this.sessionKey, inputs, ...(this.lastRun ? { previous: this.lastRun } : {}) });
         t.run = run;
+        t.harnessProfile = run.profile;
         this.lastRun = run;
         const s = await this.ensureSession(run);
         await s.startTurn(t.turnId, [...ctx.records, ...inputs], run);
@@ -1163,18 +1241,26 @@ export class Lane {
       case 'live.handoff': {
         // The voice side delegated (decision 11): one input from the far side, no principal.
         const live = this.live?.liveId === b.liveId ? this.live : undefined;
+        // Who spoke it, when the channel can tell (decision 11 amendment); otherwise unknown.
+        const speaker = live && this.o.liveSpeaker ? await this.o.liveSpeaker({ liveId: b.liveId, atMs: e.ts }).catch(() => undefined) : undefined;
         const record: InputRecord = {
           inputId: b.inputId,
           origin: {
-            kind: 'human',
-            principal: null,
-            evidence: 'none',
+            kind: speaker?.kind ?? 'human',
+            principal: speaker?.principal ?? null,
+            evidence: speaker?.evidence ?? 'none',
             via: live ? routeKey(live.route) : `live:${b.liveId}`,
             adapter: live?.route.channel ?? 'live',
           },
           content: [{ type: 'transcript', text: b.text, startMs: 0, endMs: 0, stable: true }],
           replyRoute: live?.controlRoute ?? null,
-          channelContext: { live: true, liveId: b.liveId, conversationKind: 'meeting', ...(live ? { liveTitle: live.title } : {}) },
+          channelContext: {
+            live: true,
+            liveId: b.liveId,
+            conversationKind: 'meeting',
+            ...(live ? { liveTitle: live.title } : {}),
+            ...(speaker?.displayName ? { senderName: speaker.displayName } : {}),
+          },
         };
         // The same loop checkpoint as `input` (IN-8). The harness has started (or merged) the
         // delegation already: a stopped one is recorded as context like any stopped input, and
@@ -1193,8 +1279,11 @@ export class Lane {
         }
         this.emit({ body: { t: 'input.admitted', inputId: b.inputId, disposition: t ? 'steer' : 'new_turn', input: record } });
         this.emitHarness(e, gen);
-        if (t) t.inputs.push(record);
-        else {
+        if (t) {
+          // The harness folded it into the running turn: that turn's profile now follows all its inputs.
+          t.inputs.push(record);
+          await this.replanForDelegation(t, b.liveId);
+        } else {
           this.handoffs.set(b.inputId, record);
           const evicted: string[] = [];
           for (const k of this.handoffs.keys()) {
@@ -1220,13 +1309,20 @@ export class Lane {
           // waits, tools and provenance see it). No reply route: the voice speaks the answer.
           const inputs = b.inputIds.map((id) => this.handoffs.get(id)).filter((r): r is InputRecord => !!r);
           for (const id of b.inputIds) this.handoffs.delete(id);
+          const liveId = inputs.find((i) => i.channelContext.live === true)?.channelContext.liveId;
+          const live = typeof liveId === 'string' ? this.liveTurn(liveId) : undefined;
+          // Decision 11 amendment: planned from its own inputs like a text turn (the speaker's
+          // identity), not inherited from the thread's last turn.
+          const run = await this.planDelegated(inputs);
           this.turn = {
             turnId: b.turnId,
             inputs,
             attempts: new Map(),
             owner: null,
             replyRoute: null,
-            run: this.lastRun,
+            run,
+            ...(b.run ? { harnessProfile: b.run.profile } : {}),
+            ...(live ? { live } : {}),
             starting: false,
             interruptRequested: false,
             deliveries: [],
@@ -1235,10 +1331,12 @@ export class Lane {
             context: [],
           };
           this.track(b.turnId, inputs);
-          this.emitHarness(e, gen);
+          // The log records the run the lane planned; the harness's own (what it began under) is in the notice below when it differs.
+          this.emitHarness(e, gen, { body: { ...b, run } });
           this.refreshState();
           const stopped = b.inputIds.filter((id) => this.stoppedHandoffs.has(id));
           if (stopped.length) await this.interruptStopped(b.turnId, stopped);
+          else await this.checkDelegatedProfile(this.turn, b.run?.profile);
           return;
         }
         const ours = t && t.turnId === b.turnId;
@@ -1371,6 +1469,14 @@ export class Lane {
     }
     if (resolver.kind === 'model' && !this.o.modelReviewer) resolver = await this.escalate(b, ctx);
 
+    // A delegated turn has no reply route: a human request of it is shown where its people are
+    // (the live's control route), so the card with the buttons appears there (decision 11 amendment).
+    const t = this.turn && (!e.turnId || this.turn.turnId === e.turnId) ? this.turn : undefined;
+    const at = t?.live?.controlRoute;
+    if (t && at && resolver.kind === 'human' && resolver.routes.includes(routeKey(at)) && !sameRoute(t.replyRoute, at) && !t.deliveries.some((d) => sameRoute(d, at))) {
+      t.deliveries.push(at);
+      this.emit({ turnId: t.turnId, body: { t: 'turn.delivery_added', turnId: t.turnId, route: at, reason: 'approval' } });
+    }
     // A request without a turn id opened during a turn belongs to it; one opened while idle to no turn.
     const p: PendingRequest = { body: b, resolver, turnId: e.turnId ?? this.turn?.turnId, audience: audienceFor(resolver, e.audience) };
     this.requests.set(b.requestId, p);

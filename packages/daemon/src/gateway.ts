@@ -27,6 +27,7 @@ import {
   type InboundEnvelope,
   type InputRecord,
   type LiveEndpoint,
+  type LiveSpeaker,
   type LiveStartArgs,
   type LoopGuardTrip,
   type HarnessFactory,
@@ -55,6 +56,7 @@ import {
   Lane,
   LaneUnavailableError,
   LiveTransportError,
+  type LiveSpeakerOrigin,
   Outbox,
   Router,
   SqliteSessionLog,
@@ -281,7 +283,7 @@ export class Gateway {
   /** Running lives (decision 11), by session: the channel's media peer of each. */
   /** Sessions with a live_join still opening its endpoint (the claim that keeps it to one live). */
   private readonly joining = new Set<string>();
-  private readonly lives = new Map<string, { liveId: string; endpoint: LiveEndpoint }>();
+  private readonly lives = new Map<string, { liveId: string; endpoint: LiveEndpoint; channel: RunningChannel }>();
   /** Agent and working directory of each live lane. */
   private readonly laneInfo = new Map<string, { agent: AgentConfig; cwd?: string }>();
   /** Per-session adapters of launched sessions (decision 7), closed with their lane. */
@@ -853,6 +855,7 @@ export class Gateway {
       cwd,
       ...(this.mcp && agent.tools ? { mcp: (a: { sessionKey: string; generation: number; harnessId: string }) => this.mcp!.mcpFor(a, agent.toolNames) } : {}),
       onLiveEnded: (liveId, reason) => this.liveEnded(sessionKey, liveId, reason),
+      liveSpeaker: (a) => this.liveSpeaker(sessionKey, a.liveId, a.atMs),
       ...this.causeHooks(),
       onHarnessEvent: (e) => {
         // A topic remembers its harness session id (switching back resumes it; the lane resumes from the log).
@@ -1551,7 +1554,7 @@ export class Gateway {
         await endpoint.close('gateway stopping').catch(() => undefined);
         throw new ToolError('the gateway is stopping');
       }
-      this.lives.set(sessionKey, { liveId, endpoint });
+      this.lives.set(sessionKey, { liveId, endpoint, channel: ch });
     } finally {
       this.joining.delete(sessionKey);
     }
@@ -1566,7 +1569,8 @@ export class Gateway {
       // The lane refuses a transport the harness's live does not list, before `start`.
       const { answerSdp } = await lane
         .startLive(
-          { liveId, title: endpoint.title, route: endpoint.route, controlRoute: turn.replyRoute },
+          // The live's starter: approvals of delegated turns whose speaker is not the owner are asked of them (decision 11 amendment).
+          { liveId, title: endpoint.title, route: endpoint.route, controlRoute: turn.replyRoute, startedBy: turn.owner ?? null },
           { transport, instructions: a.instructions ?? DEFAULT_LIVE_INSTRUCTIONS, ...(a.voice ? { voice: a.voice } : {}) },
         )
         .catch((e: Error) => {
@@ -1629,6 +1633,38 @@ export class Gateway {
     await this.lanes.get(sessionKey)?.stopLive().catch(() => undefined);
     await cur.endpoint.close(reason).catch((e: Error) => this.log('warn', `${sessionKey}: closing live ${cur.liveId}: ${e.message}`));
     return true;
+  }
+
+  /**
+   * Who spoke a live's delegation (decision 11 amendment): the channel's active speaker
+   * (`LiveEndpoint.speaker`), stamped through the normal identity path: evidence capped by the
+   * channel entry like an inbound envelope's (grant ∩ caps, else `none`), then `Policy.identify`.
+   * No speaker (or the channel cannot tell): undefined, the lane records an unknown sender.
+   */
+  private async liveSpeaker(sessionKey: string, liveId: string, atMs: number): Promise<LiveSpeakerOrigin | undefined> {
+    const cur = this.lives.get(sessionKey);
+    if (!cur || cur.liveId !== liveId || typeof cur.endpoint.speaker !== 'function') return undefined;
+    let sp: LiveSpeaker | undefined;
+    try {
+      sp = cur.endpoint.speaker(atMs);
+    } catch (e) {
+      this.log('warn', `${sessionKey}: live ${liveId} speaker lookup failed: ${(e as Error).message}`);
+      return undefined;
+    }
+    if (!sp || typeof sp.channelUserId !== 'string' || !sp.channelUserId) return undefined;
+    const route = cur.endpoint.route;
+    const allowed = this.emitSource(cur.channel).evidence;
+    const evidence = allowed.includes(sp.evidence) ? sp.evidence : 'none';
+    const id = await this.policy.identify({
+      channel: route.channel,
+      account: route.account,
+      channelUserId: sp.channelUserId,
+      evidence,
+      ...(sp.isBot !== undefined ? { isBot: sp.isBot } : {}),
+    });
+    // Our own voice (or another of this deployment's accounts) attributed as the speaker: unknown.
+    if (id.self) return undefined;
+    return { kind: id.kind, principal: id.principal, evidence, ...(sp.displayName ? { displayName: sp.displayName } : {}) };
   }
 
   /** The harness ended the live (voice closed, harness gone): leave the channel side too. */

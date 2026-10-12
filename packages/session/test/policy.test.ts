@@ -72,13 +72,22 @@ describe('defaultPolicy.plan / resolve / outbound', () => {
     expect(await p.outbound({ from: ctx('restricted'), to: route('elsewhere') })).toBe('deny');
     const owner = input('o', { principal: 'fake:alice' });
     expect(await p.outbound({ from: ctx('bypass', { inputs: [owner] }), to: route('elsewhere') })).toBe('allow');
-    // The profile alone is not enough: a live delegation (no principal) runs on the thread's last (bypass) run.
+    // The profile alone is not enough: a turn may carry a bypass run its inputs do not justify (e.g. a live delegation folded into one).
     const delegation = input('d', { principal: null });
     expect(await p.outbound({ from: ctx('bypass', { inputs: [delegation] }), to: route('elsewhere') })).toBe('deny');
     expect(await p.outbound({ from: ctx('bypass', { inputs: [owner, delegation] }), to: route('elsewhere') })).toBe('deny');
     expect(await p.outbound({ from: ctx('bypass'), to: route('elsewhere') })).toBe('deny');
     expect(await p.outbound({ from: null, to: { channel: 'mail', account: 'default', conversationId: 'me@example.com' } })).toBe('allow');
     expect(await p.outbound({ from: null, to: route() })).toBe('deny');
+  });
+
+  it("resolve: bypass allows; a restricted turn carrying a live's delegation asks the live's starter in its control route; other restricted turns are denied #LN-7 #ID-6", async () => {
+    const req = { t: 'request.opened' as const, requestId: 'r', kind: 'tool_approval' as const, title: 'x', risk: {}, allowedDecisions: [], allowAlways: false, defaultDeny: true };
+    expect(await p.resolve(req, ctx('bypass'))).toEqual({ kind: 'auto', decision: { kind: 'allow_once' } });
+    expect(await p.resolve(req, ctx('restricted'))).toMatchObject({ kind: 'auto', decision: { kind: 'deny' } });
+    const live = { liveId: 'L1', startedBy: 'fake:alice', controlRoute: route('c9') };
+    expect(await p.resolve(req, ctx('restricted', { live, replyRoute: null }))).toEqual({ kind: 'human', principals: ['fake:alice'], routes: ['fake:default:c9'] });
+    expect(await p.resolve(req, ctx('restricted', { live: { ...live, startedBy: null } }))).toMatchObject({ kind: 'auto', decision: { kind: 'deny' } });
   });
 
   it('control: owners and turn owners may interrupt #CT-1', async () => {

@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { HarnessOpenArgs, HarnessSession, LiveEndpoint, LiveFrame, LiveStartArgs, LiveTransport, Policy, SessionEvent } from '@agents-io/protocol';
+import type { HarnessOpenArgs, HarnessSession, LiveEndpoint, LiveFrame, LiveSpeaker, LiveStartArgs, LiveTransport, Policy, SessionEvent } from '@agents-io/protocol';
 import { MemorySessionLog, SqliteSessionLog, type SessionLog } from '@agents-io/session';
 import { FakeChannel, FakeHarness, type FakeHarnessSession, type FakeTurnScript } from '@agents-io/testkit';
 import { LocalClient } from '../src/client.js';
@@ -81,6 +81,8 @@ class LiveFakeHarness extends FakeHarness {
 class MeetingChannel extends FakeChannel {
   /** Offer frames endpoints instead of webrtc. */
   frames = false;
+  /** Endpoints report an active speaker (`LiveEndpoint.speaker`): this one. Unset: no speaker capability. */
+  speakers?: { now: LiveSpeaker | undefined; asked: number[] };
   readonly endpoints: (LiveEndpoint & { answers: string[]; closes: string[]; hangUp(reason: string): void })[] = [];
   liveRoute(account: string, target: string) {
     return { channel: this.id, account, conversationId: `meeting:${target}` };
@@ -101,6 +103,14 @@ class MeetingChannel extends FakeChannel {
       ended,
       hangUp: (r: string) => hangUp(r),
       answer: async (sdp: string) => void ep.answers.push(sdp),
+      ...(this.speakers
+        ? {
+            speaker: (atMs: number) => {
+              this.speakers!.asked.push(atMs);
+              return this.speakers!.now;
+            },
+          }
+        : {}),
       close: async (reason: string) => {
         ep.closes.push(reason);
         hangUp(reason);
@@ -162,7 +172,9 @@ describe('live tools (decision 11)', () => {
     expect(r[1]!.text).toMatch(/already in a live \(meeting 42\)/);
     expect(r[2]!.isError).toBe(false);
     expect(w.harness.said).toEqual(['hello room']);
-    expect(w.harness.starts).toEqual([{ liveId: expect.stringMatching(/^live_/), transport: { type: 'webrtc', sdp: 'OFFER' }, instructions: 'speak Chinese' }]);
+    expect(w.harness.starts).toEqual([
+      { liveId: expect.stringMatching(/^live_/), transport: { type: 'webrtc', sdp: 'OFFER' }, instructions: 'speak Chinese', delegationRun: expect.objectContaining({ profile: 'restricted' }) },
+    ]);
     const ep = w.chat.endpoints[0]!;
     expect(ep.answers).toEqual(['ANSWER']);
     const started = await until(() => w.events.find((e) => e.body.t === 'live.started'));
@@ -252,7 +264,7 @@ describe('live tools (decision 11)', () => {
 });
 
 describe('delegated turns', () => {
-  it('a delegated turn (no reply route) sends to "current" = the chat that opened the live; it inherits the owner\'s bypass run, not the owner\'s reach: elsewhere is refused #LN-6 #DL-5', async () => {
+  it('a delegated turn (no reply route) sends to "current" = the chat that opened the live; an unidentified speaker does not get the owner\'s reach: elsewhere is refused #LN-6 #DL-5', async () => {
     const holder: { h?: LiveFakeHarness } = {};
     const results: { isError: boolean; text: string }[] = [];
     const w = await setup(async () => {
@@ -272,7 +284,7 @@ describe('delegated turns', () => {
     await until(() => w.events.some((e) => e.body.t === 'turn.started' && e.turnId === 'codex:d1'));
     const mcp = s.args.mcp;
     results.push(await mcpCall(mcp, 'send_message', { route: 'current', text: 'result as text' }, 'delegated-send'));
-    // The delegated turn runs on the owner turn's (bypass) run, but nobody in it is the owner (DL-5).
+    // Nobody in the delegated turn is the owner (DL-5): only its own route is open.
     results.push(await mcpCall(mcp, 'send_message', { route: 'fake:default:elsewhere', text: 'leak' }, 'delegated-elsewhere'));
     ev({ t: 'turn.completed', turnId: 'codex:d1', status: 'completed' }, 'codex:d1');
     expect(results[2]!.isError).toBe(true);
@@ -416,5 +428,90 @@ describe('live: ends, transports and destinations', () => {
     const r = await until(() => t.results['join']);
     expect(w.chat.endpoints).toHaveLength(0);
     expect(r.isError).toBe(true);
+  });
+});
+
+describe("delegated turns: the profile follows the speaker (decision 11 amendment)", () => {
+  /** Join a live from alice's chat, then delegate as the fake Codex would. */
+  async function meeting(speakers?: MeetingChannel['speakers']) {
+    const t = toolTurns({ join: ['live_join', { target: '9' }] });
+    const chat = new MeetingChannel('fake');
+    if (speakers) chat.speakers = speakers;
+    const w = await setup(t.script, { chat });
+    t.holder.h = w.harness;
+    await from(chat, 'join');
+    expect((await until(() => t.results['join'])).isError).toBe(false);
+    await until(() => w.events.some((e) => e.body.t === 'turn.completed'));
+    const s = w.harness.sessions[0]!;
+    const liveId = w.harness.starts[0]!.liveId;
+    const ev = (body: any, turnId?: string) => s.queue.push({ ts: Date.now(), level: 'primary', audience: 'status', durability: 'durable', ...(turnId ? { turnId } : {}), body });
+    let n = 0;
+    const delegate = async (text: string) => {
+      const turnId = `codex:d${++n}`;
+      const inputId = `live:${liveId}:h${n}`;
+      ev({ t: 'live.handoff', liveId, inputId, text });
+      ev({ t: 'turn.started', turnId, inputIds: [inputId], replyRoute: null, initiator: 'harness' }, turnId);
+      const started = await until(() => w.events.find((e) => e.body.t === 'turn.started' && e.turnId === turnId));
+      const admitted = w.events.find((e) => e.body.t === 'input.admitted' && e.body.inputId === inputId)!;
+      return { turnId, run: (started.body as { run?: { profile: string } }).run, origin: (admitted.body as { input: { origin: unknown } }).input.origin };
+    };
+    const ask = (turnId: string, requestId: string) =>
+      ev({ t: 'request.opened', requestId, kind: 'tool_approval', title: 'rm -rf build', risk: {}, allowedDecisions: ['allow_once', 'deny'], allowAlways: false, defaultDeny: true }, turnId);
+    const resolved = (requestId: string) => until(() => w.events.find((e) => e.body.t === 'request.resolved' && e.body.requestId === requestId));
+    return { ...w, chat, ev, delegate, ask, resolved };
+  }
+
+  it('the channel names the owner as the speaker: owner origin through the identity path, bypass, requests allowed #LN-7 #ID-4', async () => {
+    const speakers = { now: { channelUserId: 'alice', evidence: 'platform_signed' as const, displayName: 'Alice' }, asked: [] as number[] };
+    const w = await meeting(speakers);
+    const d = await w.delegate('run the tests');
+    expect(speakers.asked).toHaveLength(1);
+    expect(d.origin).toMatchObject({ kind: 'human', principal: { id: 'fake:alice', labels: ['owner'] }, evidence: 'platform_signed', via: 'fake:default:meeting:9' });
+    expect(d.run).toMatchObject({ profile: 'bypass' });
+    w.ask(d.turnId, 'r1');
+    expect((await w.resolved('r1')).body).toMatchObject({ decision: { kind: 'allow_once' }, by: { kind: 'auto' } });
+
+    // The same member without platform evidence is not the owner (ID-4): restricted, asked of the starter.
+    speakers.now = { channelUserId: 'alice', evidence: 'none' as never, displayName: 'Alice' };
+    w.ev({ t: 'turn.completed', turnId: d.turnId, status: 'completed' }, d.turnId);
+    await until(() => w.events.some((e) => e.body.t === 'turn.completed' && e.body.turnId === d.turnId));
+    const d2 = await w.delegate('again');
+    expect(d2.origin).toMatchObject({ principal: null, evidence: 'none' });
+    expect(d2.run).toMatchObject({ profile: 'restricted' });
+  });
+
+  it("no speaker from the channel: restricted; the request's card with buttons appears in the chat that started the live, a stranger's click is refused, the owner's click answers it #LN-7 #RQ-1 #RQ-5", async () => {
+    const w = await meeting();
+    const started = await until(() => w.events.find((e) => e.body.t === 'live.started'));
+    expect(started.body).toMatchObject({ startedBy: 'fake:alice', controlRoute: { conversationId: 'c1' } });
+    const d = await w.delegate('删掉 build 目录');
+    expect(d.origin).toMatchObject({ principal: null, evidence: 'none' });
+    expect(d.run).toMatchObject({ profile: 'restricted' });
+    w.ask(d.turnId, 'r1');
+    const opened = await until(() => w.events.find((e) => e.body.t === 'request.opened' && e.body.requestId === 'r1'));
+    expect(opened.body).toMatchObject({ resolver: { kind: 'human', principals: ['fake:alice'], routes: ['fake:default:c1'] } });
+    const card = await until(() =>
+      w.chat.sent.find((m) => m.op.operationId.includes(`:${d.turnId}:`) && m.route.conversationId === 'c1' && (m.edits.at(-1) ?? m.msg).actions?.some((a) => a.label === 'Allow')),
+    );
+    const actions = (card.edits.at(-1) ?? card.msg).actions!;
+    const allow = actions.find((a) => a.label === 'Allow')!;
+    const click = (channelUserId: string) =>
+      w.chat.inject({ sender: { channelUserId, evidence: 'platform_signed' }, content: [{ type: 'event', name: 'action', data: { actionId: allow.id, messageId: card.providerMessageId } }] });
+    await click('eve');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(w.events.some((e) => e.body.t === 'request.resolved' && e.body.requestId === 'r1')).toBe(false);
+    await click('alice');
+    expect((await w.resolved('r1')).body).toMatchObject({ decision: { kind: 'allow_once' }, by: { kind: 'human', id: 'fake:alice' } });
+  });
+
+  it('a speaker the channel names who is not the owner: restricted, the request goes to the starter #LN-7', async () => {
+    const w = await meeting({ now: { channelUserId: 'bob', evidence: 'platform_signed' }, asked: [] });
+    const d = await w.delegate('x');
+    expect(d.origin).toMatchObject({ kind: 'human', principal: null, evidence: 'platform_signed' });
+    expect(d.run).toMatchObject({ profile: 'restricted' });
+    w.ask(d.turnId, 'r1');
+    const opened = await until(() => w.events.find((e) => e.body.t === 'request.opened' && e.body.requestId === 'r1'));
+    expect(opened.body).toMatchObject({ resolver: { kind: 'human', principals: ['fake:alice'] } });
+    expect(w.events.some((e) => e.body.t === 'request.resolved' && e.body.requestId === 'r1')).toBe(false);
   });
 });
