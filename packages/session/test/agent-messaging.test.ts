@@ -158,6 +158,22 @@ describe('cause chains', () => {
     await lane.close();
   });
 
+  it('flags carried by a context input count too: a recovered echo of an external turn (agent principal) still makes the next turn external #EX-5 #EX-3', async () => {
+    const { lane, events } = setup();
+    // What the outbound index makes of our own message coming back: kind agent, the agent's principal, self, context only.
+    const echo = agentIn(1, { id: 'echo', basis: 'recovered', carried: { external: true, watched: false, group: true } });
+    await lane.observe({ ...echo, origin: { ...echo.origin, self: true } });
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('what was that?'), mode: 'queue' });
+    await until(() => events().some((e) => e.body.t === 'turn.completed'));
+    const turnId = (events().find((e) => e.body.t === 'turn.started')!.body as { turnId: string }).turnId;
+    expect(lane.provenance(turnId)).toMatchObject({ triggeredBy: ['fake:alice'], external: true, group: true });
+    // And for later turns: the echo stays in the harness conversation.
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('and now?'), mode: 'queue' });
+    await until(() => events().filter((e) => e.body.t === 'turn.completed').length === 2);
+    const second = (events().filter((e) => e.body.t === 'turn.started')[1]!.body as { turnId: string }).turnId;
+    expect(lane.provenance(second)).toMatchObject({ external: true, group: true });
+  });
+
   it('a human input is the root of its own chain (hop 0, chain = its input id) #EX-5', async () => {
     const { lane, events } = setup();
     const i = input('hi', { id: 'h1' });
@@ -248,6 +264,22 @@ describe('loop guard at the lane', () => {
     // Human input clears.
     expect(g.check(i)).toMatchObject({ tripped: 'pair' });
     expect(g.check(input('hi'))).toBeUndefined();
+    expect(g.check(i)).toBeUndefined();
+  });
+
+  it('only a person writing here lifts a pair stop: a system digest, a host input or a stranger does not; an identified person does #IN-8', () => {
+    const g = new LoopGuard({ pair: { maxTurns: 1 } });
+    const i = agentIn(1);
+    expect(g.check(i)).toBeUndefined();
+    expect(g.check(i)).toMatchObject({ tripped: 'pair' });
+    const digest: InputRecord = { ...input('3 new messages'), origin: { kind: 'system', principal: null, evidence: 'none', via: 'watch:w1', adapter: 'watch' } };
+    const host: InputRecord = { ...input('from the host'), origin: { kind: 'system', principal: null, evidence: 'device_only', via: 'host:xwo', adapter: 'host' } };
+    const stranger = input('hello', { principal: null });
+    for (const x of [digest, host, stranger]) {
+      expect(g.check(x)).toBeUndefined();
+      expect(g.check(i)).toMatchObject({ tripped: 'pair' });
+    }
+    expect(g.check(input('carry on', { principal: 'fake:bob', labels: [] }))).toBeUndefined();
     expect(g.check(i)).toBeUndefined();
   });
 

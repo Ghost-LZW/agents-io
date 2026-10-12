@@ -31,11 +31,11 @@ harness 事件 ──▶ SessionLog（seq）──▶ Compositor（读全量，�
 每条输入在发给 harness 前，前面加一行发送者说明，后面是转换过的内容块：
 
 ```
-[agents-io input from=lark-bot:on_bc38… kind=human evidence=platform_signed via=lark-bot:default:oc_7a1… ref=channel:lark-bot/om_5f2… channel=lark-bot conversationKind=dm conversationId=oc_7a1… senderName=张三 sentAt=1791… reply=card markdown=basic maxChars=4000 buttons=yes media=image,file,audio]
+[agents-io input from=lark-bot:on_bc38… kind=human evidence=platform_signed via=lark-bot:default:oc_7a1… ref=channel:lark-bot/om_5f2… channel="lark-bot" conversationKind="dm" conversationId="oc_7a1…" senderName="张三" sentAt=1791… reply="card" markdown="basic" maxChars=4000 buttons="yes" media="image,file,audio"]
 列出当前目录下的文件，然后用一句话总结
 ```
 
-（Codex 上这一行以 `[sender …]` 开头，字段相同。）
+（Codex 上这一行以 `[sender …]` 开头，字段相同。通道上下文的值写成 JSON：字符串带引号并转义，发送者自己取的名字关不掉这一行。）
 
 - `from`：宿主策略认定的主体。认不出的发送者是 `unknown`。
 - `kind`：`human`、`agent`、`channel_event` 等。
@@ -96,7 +96,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 
   ```
   [agents-io context, not addressed to you: recorded in the conversation; read it, do not reply to it unless the addressed input asks]
-  [agents-io input from=unknown kind=human via=lark-bot:default:oc_7a1… channel=lark-bot conversationKind=group senderName=Eve context=true]
+  [agents-io input from=unknown kind=human via=lark-bot:default:oc_7a1… channel="lark-bot" conversationKind="group" senderName="Eve" context=true]
   发布会改到周四了
   ```
 
@@ -179,7 +179,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 - 正文第一行是 `Subject: 主题`，下面是正文。
 - 引用的历史邮件（`>` 行、"某某写道："之后的部分、Outlook 头部块）被剥离成一个截断的引用块，只保留新写的内容作为正文。
 - 附件存进网关的 blob 存储，变成 `file`（图片类型是 `image`）块，带 `sha256:` 引用、类型和文件名，agent 按 §1 的方式拿到。超过 blob 上限或存储失败的附件保留 `mail-attachment:<uid>/<序号>` 引用，后面加一行 `[attachment 名称 (类型, 字节数) not stored: 原因]`。HTML 正文里内嵌的图片不算附件。
-- 自动回复、退信、群发（`Auto-Submitted`、`Precedence: bulk`、`MAILER-DAEMON`）直接丢弃。
+- 自动回复、退信、群发（`Auto-Submitted`、`Precedence: bulk` / `auto_reply` / `junk` / `list`、`X-Autoreply`、`multipart/report`、`MAILER-DAEMON`）直接丢弃，发送者另标 `isBot`（机器写的，不算有人在写，INVARIANTS IN-8）。
 - 身份证据：只有发件域的 DKIM/DMARC 对齐通过才算 `dkim_pass`，否则是 `none`。
   - 可选的 `internalDelivery: { domains: [...] }`：发件域在列表里、且邮件完全没有 `Received` 和 `Authentication-Results` 头（即在邮件服务商内部投递，外部来信必然经过服务商 MX 而带上这两种头）时，证据记为 `platform_signed`。默认关闭；只在腾讯企业邮上核实过，换服务商前需重新确认。用于同一企业邮域内部互发、没有 DKIM 签名的情况。认不认这个人，由宿主策略决定。
 - 自己发出的邮件回流时只记录不触发，`declared` 只在 Message-ID 是我们发出的那封时才采信。DKIM 通过的回声还由出站索引认出是哪一轮发的（`self`、带回流的 cause，见 §5 下"本部署的回流"）。
@@ -227,7 +227,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 适用于所有通道（内置、bridge、module、嵌入方传入的适配器）：
 
 - **信封属于发出它的通道。** 守护进程按"它是从哪个通道实例发出来的"核对信封：`channel`、`account` 必须是该通道的 id 与配置账号，`replyRoute`（若有）也必须指向同一 `(channel, account)`。不符即拒收：`emit` 返回 `{ accepted: false }`（bridge 收到 `result ok:true value {accepted:false}`），不进任何 session、不进去重表、不写 `input.verify`，日志 `warn`（同一通道同一原因每分钟一条），`aio status` / `GET /api/status` 的通道上 `rejected` 计数。这类拒收带 `permanent: true`（`{ accepted: false, permanent: true, error }`）：**是终态，适配器照常向平台确认、不重试**。没有 `permanent` 的 `accepted: false` 是"现在不收"（目前只有守护进程停止期间的 `error: "gateway stopping"`）：**和抛错一样，适配器不得确认**（飞书不 ack、删去重键，邮件不前移 checkpoint），让平台重投或下次重取交给下一个进程（INVARIANTS IN-7）。bridge 侧"现在不收"直接答 `ok:false`、`retryable:true`，旧的 bridge 对端不用改。不支持信封自带跨通道回复路由：在 A 收、在 B 答用 Binding 的 `replyTo` 或宿主 `deliver`。
-- **一个通道 id 只属于一种适配器，只有账号不同。** 内置 id `lark-bot`、`mail`、`local` 保留，bridge 与 module 不得使用；同 id 的 bridge 条目必须是同一程序（`command`/`args` 相同）；同 id 的 module 条目必须是同一模块与导出；嵌入方传入的适配器按类区分。冲突在配置校验（bridge 的 `id`）或启动时（module 的 id、已连上的 bridge 的 hello id）报配置错误；live apply 时进 `failed`；bridge 运行中 hello 换成冲突的 id 按 `bad_hello` 拒绝。
+- **一个通道 id 只属于一种适配器，只有账号不同。** 内置 id `lark-bot`、`mail`、`local` 与 `agent`（agent 地址、守护进程盖章的 agent 身份）保留，bridge 与 module 不得使用（配置的 `id` 与 hello 声明的 id 都拒）；同 id 的 bridge 条目必须是同一程序（`command`/`args` 相同）；同 id 的 module 条目必须是同一模块与导出；嵌入方传入的适配器按类区分。冲突在配置校验（bridge 的 `id`）或启动时（module 的 id、已连上的 bridge 的 hello id）报配置错误；live apply 时进 `failed`；bridge 运行中 hello 换成冲突的 id 按 `bad_hello` 拒绝。
 - **证据按通道封顶。** 通道条目可写 `"evidence": ["platform_signed"]` 等（任何通道类型都可写）。适配器能提交的证据 = 条目的 `evidence` ∩ `caps.evidence`，外加 `none`；不写时 lark-bot、mail 与嵌入方适配器取 `caps.evidence`，**bridge 与 module 只有 `device_only`**（强证据必须显式授予）。超出上限的证据降为 `none`（消息照收，按外部来源处理，决定 3），`aio explain` 里 `claimedEvidence` 记原本声明的值，通道上 `evidenceCapped` 计数；`input.verify` 与宿主入站队列看到的是封顶后的值。授予了 caps 没有的证据会在启动（bridge：连上时）告警并忽略。`caps.declaresSender` 为 false 的通道，入站的 `sender.declared` 被丢弃。
 - 一致性套件（`packages/testkit` `runChannelConformance`）检查 `inbound.channel_id`、`inbound.account`、`inbound.evidence_in_caps`，适配器作者在本地就能发现问题。
 
@@ -377,7 +377,7 @@ aio-dev watch remove team-digest
 | `watch_add / watch_remove / watch_list` | 见下面"agent 自己建监听" | 永远是自己的 session |
 | `live_join / live_say / live_leave` | 以语音进出会议或通话，见 §7a | 通道的媒体对端 |
 
-目的地一律过 `Policy.outbound`。默认策略：主人触发的一轮（`bypass`）可以发往任何地方（它的 harness 本来就能访问一切，拦住只减功能、不减风险，决定 4、5）；其他轮只允许本轮的回复路由（以及本轮输入带来的路由）和主人在 `policy.routes` 里预登记的路由。被拒时工具返回错误，错误里写明被拒的路由、允许的是哪些，并让模型不要换个目的地重试；日志里记一条 `notice`。
+目的地一律过 `Policy.outbound`。默认策略：触发本轮的输入全部来自主人的一轮可以发往任何地方（它的 harness 本来就能访问一切，拦住只减功能、不减风险，决定 4、5）；只沿用了 `bypass` 档、触发它的不是主人的一轮（live 委托）不算；其他轮只允许本轮的回复路由（以及本轮输入带来的路由）和主人在 `policy.routes` 里预登记的路由。被拒时工具返回错误，错误里写明被拒的路由、允许的是哪些，并让模型不要换个目的地重试；日志里记一条 `notice`。
 
 ### 各通道怎么呈现
 
@@ -433,7 +433,7 @@ aio-dev watch remove team-digest
 agent 自己以语音进一个会议或通话：听得到所有人，用自己的声音说话。语音由 harness 出（目前只有 Codex realtime v3，WebRTC），媒体对端由通道出（`ChannelAdapter.openLive`，例如某个通道的"加入会议"），网关只在两者之间转交 SDP，**音频不经过 agents-io**。
 
 - **开启**：Codex 实例配 `"live": true`（连接改用 Codex 的实验接口）；agent 挂了输出工具（`tools`）。
-- **工具**：`live_join { target, channel?, instructions?, voice? }`：在当前对话的通道（或 `channel` 指定的通道）上打开对端，`target` 由通道解释（如会议号、`new`），挂到本 session 的 Codex thread 上；`live_say { text }`：让语音说一段话；`live_leave`：离开。一个 session 同时至多一个 live。live 的地点（端点的 `route`）和其他外发目的地一样过 `Policy.outbound`（INVARIANTS DL-5）：缺省策略放行主人触发的一轮（`bypass`）去任何会议，其他轮只放行本轮的回复路由和 `policy.routes` 里预登记的路由，宿主声明了 `outbound` 回调时由宿主决定。通道实现 `liveRoute(account, target)` 时网关在打开之前检查；没有实现的，打开后检查端点的路由，被拒就立即关闭端点。
+- **工具**：`live_join { target, channel?, instructions?, voice? }`：在当前对话的通道（或 `channel` 指定的通道）上打开对端，`target` 由通道解释（如会议号、`new`），挂到本 session 的 Codex thread 上；`live_say { text }`：让语音说一段话；`live_leave`：离开。一个 session 同时至多一个 live。live 的地点（端点的 `route`）和其他外发目的地一样过 `Policy.outbound`（INVARIANTS DL-5）：缺省策略放行输入全部来自主人的一轮去任何会议（委托出来的一轮沿用主人那轮的 `bypass`，但不是主人在说话，不放行），其他轮只放行本轮的回复路由和 `policy.routes` 里预登记的路由，宿主声明了 `outbound` 回调时由宿主决定。通道实现 `liveRoute(account, target)` 时网关在打开之前检查；没有实现的，打开后检查端点的路由，被拒就立即关闭端点。
 - **带着上下文进会**：语音挂在这个 session 的 thread 上，知道之前文字里聊过什么；会后在同一个对话里用文字接着问，它也知道会上说了什么。
 - **会里说的话怎么到 agent**：语音端自己能答的直接答；需要查资料、跑工具的，委托给 Codex：每次委托是一条输入（`transcript` 块，`from=unknown`，`channelContext` 带 `live=true`、`liveId`、`liveTitle`，回复路由是发起 live 的那个对话），Codex 随即在 thread 上开一轮，lane 把它当作本 session 的当前轮（排队、工具、来源标记照常）。这一轮**没有回复路由**：答案由语音说出，不自动发到 IM；要落成文字用 `send_message` 发到 `current`。委托时已有一轮在跑，就并进那一轮。
 - **权限**：委托出来的轮次用 thread 当时的设置，与文字轮次相同；来源标记 `external`（决定 4、5：只标记，不降档）。会里任何人都能让它干活，按需给这个 agent 合适的 profile。

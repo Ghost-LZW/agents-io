@@ -243,6 +243,12 @@ export class Lane {
   private handoffs = new Map<string, InputRecord>();
   /** Lives the lane itself recorded as ended (closing with one open). */
   private endedLives = new Set<string>();
+  /**
+   * Delegations the loop guard stopped (bounded): recorded as context, but the harness has
+   * them already, so a turn that carries one is interrupted and its consumed reports are
+   * not this turn's inputs.
+   */
+  private stoppedHandoffs = new Set<string>();
   private readonly guard: LoopGuard | undefined;
   /** The chain of the last turn: an adopted turn (no inputs in memory) keeps it. */
   private lastCause: TurnCause | undefined;
@@ -394,20 +400,25 @@ export class Lane {
     return id === undefined ? undefined : this.provenances.get(id);
   }
 
+  /** The provenance of the most recent turns (up to 8, newest last), e.g. to keep it past the lane's close. */
+  recentProvenance(): TurnProvenance[] {
+    return [...this.provenances.values()].slice(-8);
+  }
+
   /** `inputs` triggered the turn; `context` was handed ahead of them. */
   private track(turnId: string, inputs: InputRecord[], context: InputRecord[] = []): void {
     const ctx = context.filter((c) => c.channelContext.contextOmitted === undefined);
-    // Relayed inputs bring the producing turn's flags along: an agent passing on a stranger's words is not a clean source.
-    const carried = (k: 'external' | 'watched' | 'group') => inputs.some((i) => i.cause?.carried?.[k] === true);
+    // Relayed inputs (triggering or context) bring the producing turn's flags along (`isExternal` and the
+    // others read `cause.carried`): an agent passing on a stranger's words is not a clean source.
     const cause = inputs.length ? turnCause(inputs) : this.lastCause;
     if (cause) this.lastCause = cause;
     const p: TurnProvenance = {
       sessionKey: this.sessionKey,
       turnId,
       triggeredBy: inputs.map((i) => i.origin.principal?.id ?? null),
-      watched: this.ctxSeen.any || context.length > 0 || inputs.some(isWatched) || carried('watched'),
-      external: this.ctxSeen.external || ctx.some(isExternal) || inputs.some(isExternal) || carried('external'),
-      group: this.ctxSeen.group || ctx.some(isGroup) || inputs.some(isGroup) || carried('group'),
+      watched: this.ctxSeen.any || context.length > 0 || inputs.some(isWatched),
+      external: this.ctxSeen.external || ctx.some(isExternal) || inputs.some(isExternal),
+      group: this.ctxSeen.group || ctx.some(isGroup) || inputs.some(isGroup),
       ...(cause ? { cause } : {}),
     };
     this.provenances.set(turnId, p);
@@ -819,6 +830,21 @@ export class Lane {
     return { ok: true };
   }
 
+  /**
+   * A turn the harness runs carries delegations the loop guard stopped: interrupt it (the
+   * stop is in the log already as a `loop_guard` notice). Nothing is said on the live or
+   * any channel: a breaker that talks may feed the agent on the other side; the voice side
+   * learns the delegation ended from the interrupted turn.
+   */
+  private async interruptStopped(turnId: string, inputIds: string[]): Promise<void> {
+    this.emit({ turnId, level: 'detail', visibility: 'operators', body: { t: 'notice', code: 'loop_guard', message: `loop guard: turn ${turnId} carries stopped delegation ${inputIds.join(', ')}; interrupted` } });
+    try {
+      await this.session?.interrupt(turnId);
+    } catch {
+      // the harness reports how the turn ended
+    }
+  }
+
   private async interruptTurn(t: ActiveTurn): Promise<void> {
     if (t.starting) {
       t.interruptRequested = true;
@@ -1150,6 +1176,21 @@ export class Lane {
           replyRoute: live?.controlRoute ?? null,
           channelContext: { live: true, liveId: b.liveId, conversationKind: 'meeting', ...(live ? { liveTitle: live.title } : {}) },
         };
+        // The same loop checkpoint as `input` (IN-8). The harness has started (or merged) the
+        // delegation already: a stopped one is recorded as context like any stopped input, and
+        // the turn that carries it is interrupted (here, or when the harness starts it).
+        const trip = this.guard?.check(record, { delegation: true });
+        if (trip) {
+          this.stoppedHandoffs.add(b.inputId);
+          for (const k of this.stoppedHandoffs) {
+            if (this.stoppedHandoffs.size <= 64) break;
+            this.stoppedHandoffs.delete(k);
+          }
+          this.guarded(record, trip);
+          this.emitHarness(e, gen);
+          if (t) await this.interruptStopped(t.turnId, [b.inputId]);
+          return;
+        }
         this.emit({ body: { t: 'input.admitted', inputId: b.inputId, disposition: t ? 'steer' : 'new_turn', input: record } });
         this.emitHarness(e, gen);
         if (t) t.inputs.push(record);
@@ -1196,6 +1237,8 @@ export class Lane {
           this.track(b.turnId, inputs);
           this.emitHarness(e, gen);
           this.refreshState();
+          const stopped = b.inputIds.filter((id) => this.stoppedHandoffs.has(id));
+          if (stopped.length) await this.interruptStopped(b.turnId, stopped);
           return;
         }
         const ours = t && t.turnId === b.turnId;
@@ -1237,6 +1280,7 @@ export class Lane {
         if (t && t.turnId === b.turnId) {
           for (const id of b.inputIds) {
             if (t.context.some((c) => c.inputId === id)) continue; // context: consumed or not, nothing to reconcile
+            if (this.stoppedHandoffs.has(id)) continue; // a stopped delegation is context too
             if (t.inputs.some((i) => i.inputId === id) || t.adopted?.has(id)) t.consumed.add(id);
             else t.foreignConsumed = true;
           }
@@ -1536,15 +1580,23 @@ function pid(i: InputRecord): { principalId?: string; input?: InputRecord } {
   return { ...(id === undefined ? {} : { principalId: id }), ...(i.channelContext.watch !== undefined || i.cause ? { input: i } : {}) };
 }
 
-/** Arrived through a watch (context, trigger) or is a digest of watched items. */
-const isWatched = (i: InputRecord) => i.channelContext.watch !== undefined;
+/**
+ * A flag the turn that produced `i` had (agent-messaging §4.7): an input relayed by an agent
+ * carries it whether it triggers a turn or is handed as context. An agent principal (stamped
+ * by the daemon, or recovered from the outbound index) is not external by itself; what it
+ * carries still counts, so relaying never launders a source.
+ */
+const carried = (i: InputRecord, k: 'external' | 'watched' | 'group') => i.cause?.carried?.[k] === true;
 
-/** From a sender without a principal; a digest carries its senders' content. Host/system inputs are not external. */
-const isExternal = (i: InputRecord) => i.origin.principal === null && (i.origin.kind !== 'system' || i.origin.adapter === 'watch');
+/** Arrived through a watch (context, trigger), is a digest of watched items, or relays a watched turn. */
+const isWatched = (i: InputRecord) => i.channelContext.watch !== undefined || carried(i, 'watched');
+
+/** From a sender without a principal (a digest carries its senders' content), or relays an external turn. Host/system inputs are not external. */
+const isExternal = (i: InputRecord) => (i.origin.principal === null && (i.origin.kind !== 'system' || i.origin.adapter === 'watch')) || carried(i, 'external');
 
 const isGroup = (i: InputRecord) => {
   const k = i.channelContext.conversationKind;
-  return (typeof k === 'string' && GROUPISH.has(k)) || i.channelContext.watchGroup === true;
+  return (typeof k === 'string' && GROUPISH.has(k)) || i.channelContext.watchGroup === true || carried(i, 'group');
 };
 
 /** Characters of content counted against `context.maxChars` (a media block counts as a short label). */

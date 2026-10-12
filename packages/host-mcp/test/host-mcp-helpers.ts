@@ -19,8 +19,11 @@ export function input(r: ReplyRoute | null, principal = 'fake:alice'): InputReco
   };
 }
 
+/** A turn as the default plan makes it: bypass from an owner's input, restricted from someone else's. */
 export function turnOf(r: ReplyRoute | null, profile = 'bypass'): TurnContext {
-  return { sessionKey: SK, turnId: 't1', run: { harness: 'fake', model: 'm', profile }, inputs: [input(r)], replyRoute: r, deliveries: [] };
+  const i = input(r);
+  const from = profile === 'bypass' ? i : { ...i, origin: { ...i.origin, principal: { id: 'fake:bob', labels: [] } } };
+  return { sessionKey: SK, turnId: 't1', run: { harness: 'fake', model: 'm', profile }, inputs: [from], replyRoute: r, deliveries: [] };
 }
 
 const NO_MEDIA: ChannelCaps = { ...defaultChannelCaps, buttons: false, media: { in: [], out: [] } };

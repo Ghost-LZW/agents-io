@@ -23,6 +23,8 @@ export interface OutboundRecord {
   operationId: string;
   channel: string;
   providerMessageId?: string;
+  /** Every platform message of the send when it was split (split text, images, files): each is a key of the index. */
+  providerMessageIds?: string[];
   sessionKey: string;
   turnId?: string;
   /** The agent of the session (when it has one). */
@@ -58,7 +60,7 @@ export class DaemonRecords implements OutboxStore {
   private q: Record<
     | 'inPut' | 'inGet' | 'inPrune' | 'outGet' | 'outPut' | 'outPrune' | 'flyPut' | 'flyGet' | 'flyAll' | 'flyDel' | 'agentGet' | 'agentPut' | 'launchGet' | 'launchPut' | 'launchKeys'
     | 'flagGet' | 'flagPut' | 'flagDel'
-    | 'obPut' | 'obByOp' | 'obByMsg' | 'obPrune' | 'causePut' | 'causeGet' | 'causePrune',
+    | 'obPut' | 'obByOp' | 'obByMsg' | 'obPrune' | 'obPartPut' | 'obByPart' | 'obPartPrune' | 'causePut' | 'causeGet' | 'causeAll' | 'causePrune',
     StatementSync
   >;
   /** Tests: called between the agent row and the launch row of `pin` (a throw rolls both back). */
@@ -77,8 +79,20 @@ export class DaemonRecords implements OutboxStore {
       CREATE TABLE IF NOT EXISTS daemon_flags (name TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS daemon_outbound (operation_id TEXT PRIMARY KEY, channel TEXT NOT NULL, provider_message_id TEXT, at INTEGER NOT NULL, json TEXT NOT NULL) WITHOUT ROWID;
       CREATE INDEX IF NOT EXISTS daemon_outbound_msg ON daemon_outbound (channel, provider_message_id);
-      CREATE TABLE IF NOT EXISTS daemon_causes (input_id TEXT PRIMARY KEY, chain TEXT, hop INTEGER, session_key TEXT NOT NULL, at INTEGER NOT NULL, json TEXT NOT NULL) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS daemon_outbound_parts (channel TEXT NOT NULL, provider_message_id TEXT NOT NULL, operation_id TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (channel, provider_message_id, operation_id)) WITHOUT ROWID;
     `);
+    // One envelope may reach several sessions (a dispatch and a watch): a cause record per (input, session).
+    // A table from before keyed by input_id alone is moved over.
+    const pk = (this.db.prepare('PRAGMA table_info(daemon_causes)').all() as { name: string; pk: number }[]).filter((c) => c.pk > 0).map((c) => c.name);
+    if (pk.length === 1 && pk[0] === 'input_id') {
+      this.db.exec(`
+        ALTER TABLE daemon_causes RENAME TO daemon_causes_v1;
+        CREATE TABLE daemon_causes (input_id TEXT NOT NULL, session_key TEXT NOT NULL, chain TEXT, hop INTEGER, at INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY (input_id, session_key)) WITHOUT ROWID;
+        INSERT INTO daemon_causes (input_id, session_key, chain, hop, at, json) SELECT input_id, session_key, chain, hop, at, json FROM daemon_causes_v1;
+        DROP TABLE daemon_causes_v1;
+      `);
+    }
+    this.db.exec('CREATE TABLE IF NOT EXISTS daemon_causes (input_id TEXT NOT NULL, session_key TEXT NOT NULL, chain TEXT, hop INTEGER, at INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY (input_id, session_key)) WITHOUT ROWID;');
     const p = (sql: string) => this.db.prepare(sql);
     this.q = {
       // First copy wins: a redelivered message keeps the record of its first arrival.
@@ -109,8 +123,13 @@ export class DaemonRecords implements OutboxStore {
       // Only messages a turn delivered name a turn; the newest wins if a platform id was ever reused.
       obByMsg: p('SELECT json FROM daemon_outbound WHERE channel = ? AND provider_message_id = ? ORDER BY at DESC LIMIT 1'),
       obPrune: p('DELETE FROM daemon_outbound WHERE at < ?'),
-      causePut: p('INSERT INTO daemon_causes (input_id, chain, hop, session_key, at, json) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(input_id) DO UPDATE SET chain = excluded.chain, hop = excluded.hop, session_key = excluded.session_key, json = excluded.json'),
-      causeGet: p('SELECT json FROM daemon_causes WHERE input_id = ?'),
+      // The other parts of a split send (the main row keys the primary one).
+      obPartPut: p('INSERT INTO daemon_outbound_parts (channel, provider_message_id, operation_id, at) VALUES (?, ?, ?, ?) ON CONFLICT(channel, provider_message_id, operation_id) DO UPDATE SET at = excluded.at'),
+      obByPart: p('SELECT o.json FROM daemon_outbound_parts p JOIN daemon_outbound o ON o.operation_id = p.operation_id WHERE p.channel = ? AND p.provider_message_id = ? ORDER BY p.at DESC LIMIT 1'),
+      obPartPrune: p('DELETE FROM daemon_outbound_parts WHERE at < ?'),
+      causePut: p('INSERT INTO daemon_causes (input_id, chain, hop, session_key, at, json) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(input_id, session_key) DO UPDATE SET chain = excluded.chain, hop = excluded.hop, json = excluded.json'),
+      causeGet: p('SELECT json FROM daemon_causes WHERE input_id = ? AND session_key = ?'),
+      causeAll: p('SELECT json FROM daemon_causes WHERE input_id = ? ORDER BY at, session_key'),
       causePrune: p('DELETE FROM daemon_causes WHERE at < ?'),
     };
     const retain = o.retainMs ?? 30 * DAY;
@@ -118,6 +137,7 @@ export class DaemonRecords implements OutboxStore {
     this.q.outPrune.run(Date.now() - retain);
     // The outbound index lives as long as the outbox records; causes as long as routing explanations (7 days).
     this.q.obPrune.run(Date.now() - retain);
+    this.q.obPartPrune.run(Date.now() - retain);
     this.q.causePrune.run(Date.now() - (o.causeRetainMs ?? 7 * DAY));
   }
 
@@ -127,6 +147,8 @@ export class DaemonRecords implements OutboxStore {
     // Only a delivered message a turn made is a key the index answers by.
     const msg = r.result === 'delivered' && r.turnId !== undefined && r.providerMessageId !== undefined ? r.providerMessageId : null;
     this.q.obPut.run(r.operationId, r.channel, msg, r.at, JSON.stringify(r));
+    if (msg === null) return;
+    for (const id of r.providerMessageIds ?? []) if (id !== msg) this.q.obPartPut.run(r.channel, id, r.operationId, r.at);
   }
 
   /** The delivery an operationId names, if it settled. */
@@ -137,7 +159,7 @@ export class DaemonRecords implements OutboxStore {
 
   /** The turn that delivered platform message `id` on `channel` (any account of it), if this daemon did. */
   outboundByMessage(channel: string, providerMessageId: string): OutboundRecord | undefined {
-    const r = this.q.obByMsg.get(channel, providerMessageId) as { json: string } | undefined;
+    const r = (this.q.obByMsg.get(channel, providerMessageId) ?? this.q.obByPart.get(channel, providerMessageId)) as { json: string } | undefined;
     return r ? (JSON.parse(r.json) as OutboundRecord) : undefined;
   }
 
@@ -145,9 +167,16 @@ export class DaemonRecords implements OutboxStore {
     this.q.causePut.run(r.inputId, r.cause.chain ?? null, r.cause.hop ?? null, r.sessionKey, r.at, JSON.stringify(r));
   }
 
-  causeOf(inputId: string): CauseRecord | undefined {
-    const r = this.q.causeGet.get(inputId) as { json: string } | undefined;
+  /** The cause record of `inputId` in `sessionKey`; without a session, the first one recorded (any session). */
+  causeOf(inputId: string, sessionKey?: string): CauseRecord | undefined {
+    if (sessionKey === undefined) return this.causesOf(inputId)[0];
+    const r = this.q.causeGet.get(inputId, sessionKey) as { json: string } | undefined;
     return r ? (JSON.parse(r.json) as CauseRecord) : undefined;
+  }
+
+  /** Every session's cause record of `inputId` (one envelope may reach several sessions), first recorded first. */
+  causesOf(inputId: string): CauseRecord[] {
+    return (this.q.causeAll.all(inputId) as { json: string }[]).map((r) => JSON.parse(r.json) as CauseRecord);
   }
 
   /** Record who sent an accepted envelope (no content, no raw payload). */

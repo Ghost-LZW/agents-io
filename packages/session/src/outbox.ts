@@ -19,6 +19,8 @@ export interface DeliveryRecord {
   status: DeliveryStatus;
   attempts: number;
   providerMessageId?: string;
+  /** Every platform message the send produced, in order, when the adapter split it (`SendResult.providerMessageIds`). */
+  providerMessageIds?: string[];
   error?: string;
 }
 
@@ -100,7 +102,13 @@ export interface OutboxOptions {
    * index which turn sent which platform message (agent-messaging §4.3.3) and to explain a
    * side effect by its operationId. Errors are ignored.
    */
-  onSettled?: (d: Pick<Delivery, 'sessionKey' | 'turnId'>, rec: DeliveryRecord) => void;
+  onSettled?: (d: Pick<Delivery, 'sessionKey' | 'turnId'>, rec: DeliveryRecord, atSend?: unknown) => void;
+  /**
+   * Taken once when a delivery starts (send time), handed back to `onSettled` as `atSend`:
+   * what the sending turn was then (its provenance), which may be gone by the time the
+   * delivery settles (the lane closed). Errors are ignored.
+   */
+  atSend?: (d: Pick<Delivery, 'sessionKey' | 'turnId'>) => unknown;
   /** The chain position an agent-authored send (`as` set) carries out-of-band (`SendOp.cause`). */
   causeOf?: (d: Delivery) => SendOp['cause'] | undefined;
 }
@@ -213,6 +221,13 @@ export class Outbox {
     const timeout = this.o.attemptTimeoutMs ?? 60_000;
     const sleep = this.o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
     const rec: DeliveryRecord = { operationId: d.operationId, sessionKey: d.sessionKey, route: d.route, status: 'unknown', attempts: 0 };
+    let atSend: unknown;
+    try {
+      atSend = this.o.atSend?.(d);
+    } catch {
+      // best effort, like onSettled
+    }
+    const settle = (rec: DeliveryRecord) => this.settle(d, rec, atSend);
 
     if (d.from !== undefined && this.o.policy?.outbound) {
       let verdict: string;
@@ -220,9 +235,9 @@ export class Outbox {
         verdict = await this.o.policy.outbound({ from: d.from, to: d.route });
       } catch (err) {
         // Fail closed: a check that cannot answer denies.
-        return this.settle(d, { ...rec, status: 'rejected', error: `outbound check failed: ${err instanceof Error ? err.message : String(err)}` });
+        return settle({ ...rec, status: 'rejected', error: `outbound check failed: ${err instanceof Error ? err.message : String(err)}` });
       }
-      if (verdict !== 'allow') return this.settle(d, { ...rec, status: 'rejected', error: `outbound denied: ${routeKey(d.route)}` });
+      if (verdict !== 'allow') return settle({ ...rec, status: 'rejected', error: `outbound denied: ${routeKey(d.route)}` });
     }
 
     for (let n = 1; n <= max; n++) {
@@ -240,30 +255,31 @@ export class Outbox {
       try {
         const r = await withTimeout(Promise.resolve().then(() => attempt(n)), timeout);
         // The platform may have it: unknown, not retried.
-        if (r === TIMED_OUT) return this.settle(d, { ...rec, error: `attempt ${n} timed out after ${timeout} ms` });
-        return this.settle(d, {
+        if (r === TIMED_OUT) return settle({ ...rec, error: `attempt ${n} timed out after ${timeout} ms` });
+        return settle({
           ...rec,
           status: 'delivered',
           ...(r && r.providerMessageId !== undefined ? { providerMessageId: r.providerMessageId } : {}),
+          ...(r && r.providerMessageIds?.length ? { providerMessageIds: [...r.providerMessageIds] } : {}),
         });
       } catch (err) {
         rec.error = err instanceof Error ? err.message : String(err);
-        if ((err as { retryable?: unknown })?.retryable === false) return this.settle(d, { ...rec, status: 'rejected' });
+        if ((err as { retryable?: unknown })?.retryable === false) return settle({ ...rec, status: 'rejected' });
         if (n < max) {
           if (!this.draining) await Promise.race([sleep(Math.min(cap, base * 2 ** (n - 1))), this.stopping]);
-          if (this.draining) return this.settle(d, { ...rec, error: `${rec.error}; not retried: stopping` });
+          if (this.draining) return settle({ ...rec, error: `${rec.error}; not retried: stopping` });
         }
       }
     }
-    return this.settle(d, rec);
+    return settle(rec);
   }
 
-  private settle(d: Pick<Delivery, 'sessionKey' | 'turnId'>, rec: DeliveryRecord): DeliveryRecord {
+  private settle(d: Pick<Delivery, 'sessionKey' | 'turnId'>, rec: DeliveryRecord, atSend?: unknown): DeliveryRecord {
     // Closed: the in-flight mark stays, and the next process settles it as unknown.
     if (this.closed) return rec;
     this.store.put(rec);
     try {
-      this.o.onSettled?.(d, rec);
+      this.o.onSettled?.(d, rec, atSend);
     } catch {
       // an index is best effort; the outcome is recorded
     }

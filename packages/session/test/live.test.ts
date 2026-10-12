@@ -151,9 +151,55 @@ describe('Lane: live (decision 11)', () => {
     expect(withVideo.session!.framesIn.map((f) => f.kind)).toEqual(['audio', 'video', 'audio']);
   });
 
+  it('delegations reach the loop checkpoint: past the pair limit one is context labelled loopGuard, and the turn the harness runs for it is interrupted #IN-8 #LN-6', async () => {
+    const h = new LiveHarness();
+    const { lane, events } = setup({ harness: h, loopGuard: { pair: { maxTurns: 2 } } });
+    await lane.startLive(info, { transport: { type: 'webrtc', sdp: 'OFFER' } });
+    const s = h.session!;
+    const delegate = async (n: number) => {
+      s.push({ t: 'live.handoff', liveId: 'L1', inputId: `live:L1:h${n}`, text: `ask ${n}` });
+      s.push({ t: 'turn.started', turnId: `codex:d${n}`, inputIds: [`live:L1:h${n}`], replyRoute: null, initiator: 'harness' }, { turnId: `codex:d${n}` });
+      await until(() => lane.currentTurn()?.turnId === `codex:d${n}`);
+    };
+    const finish = async (n: number) => {
+      s.push({ t: 'input.consumed', inputIds: [`live:L1:h${n}`], turnId: `codex:d${n}` }, { turnId: `codex:d${n}` });
+      s.push({ t: 'turn.completed', turnId: `codex:d${n}`, status: s.interrupts.includes(`codex:d${n}`) ? 'interrupted' : 'completed' }, { turnId: `codex:d${n}` });
+      await until(() => !lane.currentTurn());
+    };
+    await delegate(1);
+    await finish(1);
+    await delegate(2);
+    await finish(2);
+    expect(s.interrupts).toEqual([]);
+    // The third delegation from the same meeting, with nobody identified writing here in between.
+    await delegate(3);
+    const a = bodies(events(), 'input.admitted').find((x) => x.inputId === 'live:L1:h3')!;
+    expect(a).toMatchObject({ disposition: 'observe_only', input: { channelContext: { loopGuard: 'pair', live: true } } });
+    expect(s.interrupts).toEqual(['codex:d3']);
+    expect(lane.currentTurn()!.inputs).toEqual([]);
+    // A stopped delegation the harness merges into a running turn interrupts that turn too,
+    // and its consumed report does not make the turn ambiguous.
+    s.push({ t: 'live.handoff', liveId: 'L1', inputId: 'live:L1:h4', text: 'ask 4' });
+    await until(() => s.interrupts.length === 2);
+    expect(s.interrupts[1]).toBe('codex:d3');
+    s.push({ t: 'input.consumed', inputIds: ['live:L1:h4'], turnId: 'codex:d3' }, { turnId: 'codex:d3' });
+    await finish(3);
+    expect(bodies(events(), 'turn.completed').at(-1)).toMatchObject({ turnId: 'codex:d3', status: 'interrupted' });
+    // The owner writes here: the meeting may delegate again.
+    const owner = input('from the owner');
+    await lane.command({ type: 'input', sessionKey: 's1', input: owner, mode: 'queue' });
+    await until(() => s.starts.length === 1);
+    s.complete(s.starts[0]!.turnId, [owner.inputId]);
+    await until(() => !lane.currentTurn());
+    await delegate(5);
+    expect(s.interrupts).toHaveLength(2);
+  });
+
+
   it('the 33rd pending delegation pushes the oldest out, and the evicted one still gets a terminal state #IN-1', async () => {
     const h = new LiveHarness();
-    const { lane, events } = setup({ harness: h });
+    // The pair limit is out of the way: this is about the pending bound, not the loop guard (IN-8).
+    const { lane, events } = setup({ harness: h, loopGuard: { pair: { maxTurns: 100 } } });
     await lane.startLive(info, { transport: { type: 'webrtc', sdp: 'OFFER' } });
     for (let i = 0; i < 33; i++) h.session!.push({ t: 'live.handoff', liveId: 'L1', inputId: `live:L1:h${i}`, text: `ask ${i}` });
     await until(() => bodies(events(), 'input.admitted').length === 33);

@@ -147,6 +147,9 @@ export async function parseInbound(uid: number, raw: Buffer, deps: ParseDeps): P
     sender: {
       channelUserId: fromAddress,
       ...(from?.name ? { displayName: from.name } : {}),
+      // An auto-reply, bounce or bulk mail is written by a machine: never a person (the loop guard's
+      // same-pair stop lifts only when a person writes, INVARIANTS IN-8). It is also dropped (`admission`).
+      ...(automated ? { isBot: true } : {}),
       evidence: verdict.evidence,
       ...(declared ? { declared } : {}),
       ...(hop ? { cause: hop } : {}),

@@ -91,6 +91,17 @@ describe('inbound', () => {
     expect(verdictFromAuth(res(dmarc('pass')), 'other.com').evidence).toBe('none');
   });
 
+  it('auto-replies, bounces and bulk mail are marked as a bot sender (and dropped); ordinary mail is not #IN-8', async () => {
+    const h = await harness();
+    const auto = await h.next({ uid: 1, raw: raw({ 'Message-ID': '<oo@x>', 'Auto-Submitted': 'auto-replied' }, 'out of office') });
+    expect(auto).toMatchObject({ admission: 'drop', sender: { isBot: true } });
+    const bulk = await h.next({ uid: 2, raw: raw({ 'Message-ID': '<ar@x>', Precedence: 'auto_reply' }, 'away') });
+    expect(bulk).toMatchObject({ admission: 'drop', sender: { isBot: true } });
+    const person = await h.next({ uid: 3, raw: raw({ 'Message-ID': '<ok@x>', 'Auto-Submitted': 'no' }, 'normal') });
+    expect(person.sender.isBot).toBeUndefined();
+    await h.stop();
+  });
+
   it('persists a checkpoint after the host accepts each message #IN-7', async () => {
     const h = await harness();
     await h.next({ uid: 7, raw: raw({ 'Message-ID': '<cp@x>' }, 'x') });

@@ -89,6 +89,15 @@ describe('channel-stamping: an envelope belongs to the channel that emitted it',
     expect(w.gw.adminStatus().channels.filter((c) => c.id === 'lark-bot').map((c) => c.account)).toEqual(['main']);
   });
 
+  it('a bridge whose hello claims the agent id is failed: it can never speak as an agent address #ID-3 #ID-7', async () => {
+    const forge = inbound({ channel: 'agent', account: 'x', sender: { channelUserId: 'writer', evidence: 'platform_signed' } });
+    const w = await start({ channels: [bridge('x', { ADAPTER_ID: 'agent', INBOUND: forge })] });
+    const st = w.gw.adminStatus().channels.find((c) => c.account === 'x');
+    expect(st).toMatchObject({ id: 'bridge', state: 'failed', error: expect.stringMatching(/"agent" is a built-in channel id/) });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(w.gw.sessions()).toEqual([]);
+  });
+
   it('a bridge whose hello takes the id of another running adapter fails the start (F4) #ID-3', async () => {
     await expect(start({ extra: [{ adapter: new FakeChannel('raw'), account: 'main' }], channels: [bridge('x')] })).rejects.toThrow(/channel id "raw" belongs to bridge:.*; embedded adapter FakeChannel cannot use it too/);
   });
@@ -105,6 +114,10 @@ describe('channel-stamping: F4 in the config', () => {
 
   it('a bridge may not use a built-in channel id #ID-3', () => {
     for (const id of ['lark-bot', 'mail', 'local']) expect(() => resolve([bridge('a', {}, { id })])).toThrow(new RegExp(`bridge id "${id}" is a built-in channel id`));
+  });
+
+  it('the agent channel id (agent addresses, the identity namespace the daemon stamps) is reserved: refused in a bridge entry #ID-3 #ID-7', () => {
+    expect(() => resolve([bridge('a', {}, { id: 'agent' })])).toThrow(/bridge id "agent" is a built-in channel id/);
   });
 
   it('two different bridge programs may not share a channel id; one program with two accounts may #ID-3', () => {

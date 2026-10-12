@@ -64,7 +64,7 @@ describe('HostTools', () => {
   });
 
   it('denies destinations outside Policy.outbound with a clear error and a notice #DL-5', async () => {
-    // A restricted turn: a bypass (owner) turn may send anywhere under the default policy.
+    // Someone else's turn: a turn whose every input is from an owner may send anywhere under the default policy.
     const w = world({ turn: turnOf(route(), 'restricted') });
     const err = await call(w, 'send_message', { route: 'fake:default:other', text: 'leak' }).catch((e) => e);
     expect(err).toBeInstanceOf(ToolError);

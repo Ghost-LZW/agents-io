@@ -159,8 +159,11 @@ const ChannelCommon = {
   evidence: Type.Optional(Type.Array(Evidence)),
 };
 
-/** Channel ids of the built-in adapters (and local ends): no bridge or module channel may use them. */
-export const RESERVED_CHANNEL_IDS: readonly string[] = ['lark-bot', 'mail', 'local'];
+/**
+ * Channel ids of the built-in adapters, local ends and agent addresses (`agent:<agent>:<sessionKey>`
+ * routes, the `agent` identity namespace the daemon stamps, ID-7): no bridge or module channel may use them.
+ */
+export const RESERVED_CHANNEL_IDS: readonly string[] = ['lark-bot', 'mail', 'local', 'agent'];
 /** Evidence a bridge or module channel may give without an `evidence` grant. */
 export const UNGRANTED_EVIDENCE: readonly Evidence[] = ['device_only', 'none'];
 

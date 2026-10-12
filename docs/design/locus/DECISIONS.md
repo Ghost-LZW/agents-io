@@ -162,6 +162,7 @@
 - **分类按 §3.1 的判据逐条重读**，各文件 a/b/c2/d 的个数与 §2 表有出入（例如飞书的群提及门控、邮件的自动回复过滤没有承诺，进 local）；没有承诺的留在 core 的一条也没有。
 - **"不成立"都写成了 `it.fails`**（25 条，含读新编号时发现的 IN-7、SE-1）；LN-4 的 Codex 迟到 `live.ended` 用假 harness 复现不了，写成 `it.todo`。原以为不成立或未测、写测试后发现成立的：DL-3、HQ-1（网关层跨重启）、ID-6、LN-1、LN-5、RS-3（现状如实）、RS-7、RS-8、CF-4、RS-1 的 blob。
 
-- 补记（2026-10-11，决定 13 的 DL-5 修复）：默认 `Policy.outbound` 对 `bypass` 一轮（只有全部输入来自主人时才是这一档）放行任何目的地，包括 `live_join` 的会议。依据决定 4、5：这一轮的 harness 已能联网、执行命令，agents-io 再拦外发只减功能、不减风险。其他轮仍只放行本轮回复路由与预登记路由；宿主声明了 `outbound` 时由宿主决定。
+- 补记（2026-10-11，决定 13 的 DL-5 修复）：默认 `Policy.outbound` 对触发本轮的输入全部来自主人的一轮（与 `plan` 给 `bypass` 的判据相同：`inputs` 非空且每条的主体带 `owner`）放行任何目的地，包括 `live_join` 的会议。依据决定 4、5：这一轮的 harness 已能联网、执行命令，agents-io 再拦外发只减功能、不减风险。其他轮仍只放行本轮回复路由与预登记路由；宿主声明了 `outbound` 时由宿主决定。
+  - 修订（2026-10-11，合并评审）：判据看本轮的输入，不看 `run.profile`。live 委托的一轮沿用 thread 上一轮的设置（决定 11，可能是主人那轮的 `bypass`），但触发它的是会议里的委托（`principal = null`）；只按 profile 放行，会议里任何人都能借主人的档把消息发到任何地方。决定 11 的"同权限"指 harness 权限，不改；外发目的地是 agents-io 自己的检查（原则 4），按"是不是主人在说话"判断。
 
 - 补记（2026-10-11，不成立积压清完）：剩下的 `it.fails`（IN-1 五条、IN-5 两条、EX-2 一条）都修好改成 `it`；LN-4 的 `it.todo` 其实能用假 harness 复现（`stop()` 先返回、`live.ended` 后到），修好后也是 `it`。依原则自决的细节记在 INVARIANTS 各条的"决定"：入站去重键放在守护进程的 session 日志里（input id 由 `(channel, account, 消息 id)` 派生，lane 打开时从日志重建已接纳的 id），不另建表（IN-5）；接纳途中策略钩子抛错是拒绝（`policy_error`），id 不占用（IN-1）；`live_say` 不经 outbox，但留下与投递相同的日志与 `daemon_outbound` 记录（EX-2）。积压清空，按上表 `pnpm invariants:check` 改为有漂移即退出码 1；没有 `it.todo` 留下，所以没有保留"只警告"的一档。

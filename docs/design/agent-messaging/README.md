@@ -347,7 +347,7 @@ e2e（`aio e2e`，`packages/daemon/src/e2e.ts` 加场景 `agent-loop-guard`）�
 | 回流命中出站索引即 `self`（§4.2、§4.3.3） | 另要求信封证据是 `platform_signed` / `dkim_pass` | 决定 3、ID-4：邮件的 Message-ID 收件人都看得到，伪造一封同 id 的信不能借到本部署 agent 的主体与链 |
 | `SendOp.as = agent:<agent>`（§4.2） | 保持 DL-4b 现行的 `session:<sessionKey>`，没有改 | 守护进程已经设置 `as`（A 组），且 `agentAccounts` 声明本部署 `session:<key>` 即认作 self 的规则依赖它；出站索引让本机找回不再依赖 `as` 的格式。邮件头带出 sessionKey 的问题仍在，留作后续（改格式要同时迁移飞书适配器的发送记录与 `isSelfDeclared`） |
 | 跨部署的跳数头 `X-Agents-IO-Hop`（§4.3.4） | 适配器只在 DKIM 通过时把它读成 `InboundEnvelope.sender.cause`（任何发件人，不只本部署的回声）；网关只在 `Identity.trustedAgent`（`agentAccounts`）、证据为 `platform_signed` / `dkim_pass`、通道 `caps.declaresSender` 时采信为 `basis: declared`。链 id 对外是 `sha256` 截断的 16 位十六进制 | 与 `declared` 同一信任规则；对外不暴露本部署的 inputId（原则 2、7） |
-| 成对计数"由这个 peer 的 agent 输入触发的 turn 数"（§4.4.2） | 每条到达 `Lane.input`、本会开轮或并入轮次的 agent 输入计一次（在入口计，不在开轮时计）；任何非 agent 输入到达即清零 | 入口计数是保守的一侧：排队中的一串输入在开轮之前就被拦住，不会一次放过 `maxTurns` 条以上 |
+| 成对计数"由这个 peer 的 agent 输入触发的 turn 数"（§4.4.2） | 每条到达 `Lane.input`、本会开轮或并入轮次的 agent 输入计一次（在入口计，不在开轮时计）；任何非 agent 输入到达即清零（2026-10-11 合并评审改为：只有有主体的 `human` 输入清零；live 委托也计数，见 INVARIANTS IN-8 的决定） | 入口计数是保守的一侧：排队中的一串输入在开轮之前就被拦住，不会一次放过 `maxTurns` 条以上 |
 | `policy.loopGuard.announce`（§4.4.3、待拍板 3） | 没有做 | 待拍板 3 推荐默认不说；没有使用者的开关不留（原则 4，决定 13 删 `lease` 同理） |
 | explain 的 `loopGuard`（§4.4.3） | 截停记在 cause 索引（`daemon_causes`）里，`explain` 时并进路由记录 | 截停发生在投递途中，路由记录可能稍后才（重）写（`inbound.redispatch`） |
 | `aio explain --chain` 按 chain id 列出整条链（§4.8 "往前走"） | 没有做；`daemon_causes` 已按 chain 存，查询留到有使用者时 | 原则 4：先兑现"从副作用追溯到根"的那一半 |
@@ -362,3 +362,5 @@ e2e（`aio e2e`，`packages/daemon/src/e2e.ts` 加场景 `agent-loop-guard`）�
 - **客户端不能贴 `loopGuard` 标签**：适配器的 `context` 与本地 / 宿主客户端的 `channelContext` 里的 `loopGuard` 都被去掉，只有 lane 截停时会写。
 
 测试（§9 各条）：1、2、3、4、5、6（watch 转投、`inbound.redispatch`；话题换手只靠代码路径，同 `channelRef`）、7、8、9（通道规则、watch trigger、`inbound.redispatch`；宿主 `input` 帧与本地输入是 system / human，只清零成对计数）、10、11、12（cause 与 explain 跨重启；成对计数清零未单独测）、13（两跳）、14（`SendOp.cause`；`as` 见上表）、16 都有 core 测试，带 `#ID-7`、`#ID-8`、`#EX-5`、`#EX-6`、`#IN-8`、`#CF-9`。15（`announce`）没有做。
+
+**合并评审后的修订（2026-10-11）**：live 委托也过 lane 的截停检查点（按会议计成对次数，截停即打断 harness 已开的轮次）；只有有主体的人清零成对计数；上下文输入带过来的 `carried` 同样并进来源；出站索引在发送时取来源、索引一次发送的每一条平台消息；cause 记录按 `(input_id, session_key)` 存；`agent` 通道 id 保留；默认 `Policy.outbound` 按"本轮输入全部来自主人"放行任何目的地。依据与测试见 `docs/INVARIANTS.md` IN-8、EX-5、EX-6、ID-3、ID-8、DL-5 与 §15 第 17 条（未修的几项）。

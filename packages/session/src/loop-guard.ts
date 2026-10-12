@@ -71,11 +71,16 @@ export class LoopGuard {
 
   /**
    * An input about to start (or join) a turn: the trip if it must not, else undefined
-   * (and it is counted). A non-agent input clears every pair count: a person is back.
+   * (and it is counted). Counted: agent inputs, and live delegations (`delegation`: the
+   * voice side's words, whose speaker nothing attests — the far side of a meeting may be
+   * another agent), per peer. Only a person writing here clears the pair counts: a human
+   * input with a principal (an identified person). Strangers, system inputs (digests,
+   * host inputs, notices) and delegations do not: an unidentified sender may be a bot
+   * the platform does not flag, and a loop must not be kept going by interleaving them.
    */
-  check(input: InputRecord): LoopGuardTrip | undefined {
-    if (input.origin.kind !== 'agent') {
-      this.pairs.clear();
+  check(input: InputRecord, o: { delegation?: boolean } = {}): LoopGuardTrip | undefined {
+    if (input.origin.kind !== 'agent' && !o.delegation) {
+      if (isPersonHere(input)) this.pairs.clear();
       return undefined;
     }
     const hop = input.cause?.hop;
@@ -98,6 +103,11 @@ export class LoopGuard {
     e.times.push(t);
     return undefined;
   }
+}
+
+/** What lifts the same-pair stop: an identified person (a human input with a principal), never an agent, system or unidentified sender. */
+export function isPersonHere(input: InputRecord): boolean {
+  return input.origin.kind === 'human' && input.origin.principal !== null;
 }
 
 /** One line for the `loop_guard` notice: what tripped, and what lifts it. */

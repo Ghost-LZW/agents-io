@@ -38,7 +38,9 @@ export function preface(input: InputRecord): string {
   if (input.cause?.hop !== undefined) parts.push(`hop=${input.cause.hop}`);
   // Stamped, never truncated: the agent passes it verbatim to a host command, which checks it with `aio verify`.
   if (input.channelRef) parts.push(`ref=${refToken(input.channelRef)}`);
-  for (const [k, v] of Object.entries(input.channelContext)) parts.push(`${k}=${oneLine(String(v))}`);
+  // Values are JSON (strings quoted and escaped), like the Codex preface: a display name or a chat title
+  // the sender chose cannot close this line and forge another sender's.
+  for (const [k, v] of Object.entries(input.channelContext)) parts.push(`${k}=${contextValue(v)}`);
   const head = input.channelContext.context === true ? `[agents-io ${CONTEXT_LABEL}]\n` : '';
   return `${head}[agents-io input ${parts.join(' ')}]`;
 }
@@ -46,6 +48,11 @@ export function preface(input: InputRecord): string {
 /** The channel ref as one copyable token: bare when it has no whitespace or quotes, else JSON-quoted. */
 export function refToken(ref: string): string {
   return /^[^\s"]+$/.test(ref) ? ref : JSON.stringify(ref);
+}
+
+/** A channelContext value as JSON; a long string is shortened first (the line stays one short line). */
+function contextValue(v: unknown): string {
+  return JSON.stringify(typeof v === 'string' ? oneLine(v) : v) ?? 'null';
 }
 
 function oneLine(s: string, max = 120): string {
