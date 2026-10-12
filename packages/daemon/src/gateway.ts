@@ -866,7 +866,7 @@ export class Gateway {
     this.lanes.set(sessionKey, lane);
     this.laneInfo.set(sessionKey, { agent, ...(agent.configured ? { cwd } : {}) });
     if (launched) this.launched.set(sessionKey, launched);
-    for (const ch of this.channels) this.compose(sessionKey, ch.adapter, ch.tier, ch.account);
+    for (const ch of this.channels) this.compose(sessionKey, ch);
     // A parked topic's lane opened again (an answer to a question it asked): it idles out like any parked one.
     if (this.topics.bySession(sessionKey)?.state === 'parked') this.idleOut(sessionKey);
     return lane;
@@ -1180,7 +1180,7 @@ export class Gateway {
     });
     this.lanes.set(r.sessionKey, lane);
     this.laneInfo.set(r.sessionKey, { agent: r.agent, cwd: r.cwd });
-    for (const ch of this.channels) this.compose(r.sessionKey, ch.adapter, ch.tier, ch.account);
+    for (const ch of this.channels) this.compose(r.sessionKey, ch);
     return {
       lane,
       dispose: async () => {
@@ -1817,7 +1817,9 @@ ${a.summary}` }],
     return id;
   }
 
-  private compose(sessionKey: string, adapter: ChannelAdapter, tier: Tier | undefined, account: string): void {
+  private compose(sessionKey: string, ch: RunningChannel): void {
+    const { adapter, tier, account } = ch;
+    const openDelayMs = ch.source?.openDelayMs;
     const c = new Compositor({
       hub: this.hub,
       sessionKey,
@@ -1828,6 +1830,7 @@ ${a.summary}` }],
       // Every message the session's agent produces says who wrote it (POSITIONING §2 identity declaration).
       as: agentIdentity(sessionKey),
       ...(tier ? { tier } : {}),
+      ...(openDelayMs ? { openDelayMs } : {}),
       // A stop button on streaming cards; Ingress turns its click into an `interrupt` command.
       interruptButton: true,
       // Cards of a topic session carry the topic's title (Lark: the card header).
@@ -2034,7 +2037,7 @@ ${a.summary}` }],
       try {
         const e = await this.startConfigChannel(w.c, w.index);
         // Sessions already open render to it too, as if it had been there at their start.
-        for (const key of this.lanes.keys()) this.compose(key, e.adapter, e.tier, e.account);
+        for (const key of this.lanes.keys()) this.compose(key, e);
         launched.push(e);
       } catch (err) {
         failed.push({ ...ref(w.c), error: (err as Error).message });

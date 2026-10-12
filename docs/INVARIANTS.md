@@ -466,8 +466,8 @@
 ### RQ-5 打开的人工审批立刻对每个层级、每个订阅者、每个通道可见
 
 - **承诺**：交给人的请求（`resolver.kind = human` 的 `request.opened`）不被任何层级（含 `final`）或过滤器滤掉，每个订阅者都收到；不能编辑的通道与 `final` 层级为它单独发一条消息；能编辑的通道立刻刷新卡片（不等节流），流式编辑失败时重试，按钮不会因为一次失败的编辑而不出现。
-- **实现**：`packages/session/src/tier.ts` `mustDeliver`、`passes`（必须送达的事件先于层级与过滤判断）；`packages/session/src/compositor.ts` `changed`（不能编辑时以 operationId `…:req:<requestId>` 经 outbox 单发一条）、流式编辑的重试（不经 outbox，在 compositor 里退避重试）、`renderTurn`（未答的人工请求总是显示）。
-- **测试**：标签 `#RQ-5`；例：`packages/session/test/hub.test.ts` "filters by tier and never filters out human approvals #RQ-5"；`packages/session/test/e2e.test.ts` "final-tier channel without edit: one message per turn, plus one per human request #RQ-5"、"retries a failed streaming edit, so the approval buttons still appear #RQ-5"、"shows an approval at once even when a throttled edit is already scheduled #RQ-5"；`packages/daemon/test/gateway.test.ts` "human approval reaches a second subscriber at final tier and is resolved through it #RQ-5"。
+- **实现**：`packages/session/src/tier.ts` `mustDeliver`、`passes`（必须送达的事件先于层级与过滤判断）；`packages/session/src/compositor.ts` `changed`（不能编辑时以 operationId `…:req:<requestId>` 经 outbox 单发一条；`openDelayMs` 暂缓首条消息时，请求打开即刻发出）、流式编辑的重试（不经 outbox，在 compositor 里退避重试）、`renderTurn`（未答的人工请求总是显示）。
+- **测试**：标签 `#RQ-5`；例：`packages/session/test/hub.test.ts` "filters by tier and never filters out human approvals #RQ-5"；`packages/session/test/e2e.test.ts` "final-tier channel without edit: one message per turn, plus one per human request #RQ-5"、"retries a failed streaming edit, so the approval buttons still appear #RQ-5"、"shows an approval at once even when a throttled edit is already scheduled #RQ-5"；`packages/session/test/compositor-open-delay.test.ts` "a request someone must answer opens it at once #RQ-5"；`packages/daemon/test/gateway.test.ts` "human approval reaches a second subscriber at final tier and is resolved through it #RQ-5"。
 - **状态**：有测试。
 
 ---
