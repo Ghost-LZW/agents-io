@@ -50,3 +50,4 @@ agents-io 的 agent IO 层（多端输入 / 多端输出 / 过程可见 / 可扩
 | [design/channel-stamping/](design/channel-stamping/README.md) | 通道实例只能以自己的 `(channel, account)` 盖章；待拍板 |
 | [design/harness-env/](design/harness-env/README.md) | harness 子进程继承哪些环境变量（inheritEnv）；待拍板 |
 | [design/multi-lark-bot/](design/multi-lark-bot/README.md) §6 | 多机器人第二阶段：识别同部署的其他机器人；等 live 核实 |
+| [design/external-holder/](design/external-holder/README.md) | 外部持有的会话：原生 TUI（桌面模式）与宿主自己拉起的 agent 挂到 agents-io 上做 IO；待拍板 |

@@ -80,6 +80,7 @@ agents-io 要在任何通道、任何模态上给出同样的可信度，健壮�
 ### 待拍板
 
 - **harness-env / inheritEnv**（`docs/design/harness-env/`）：session-launch §8.11 在等它。
+- **外部持有的会话**（`docs/design/external-holder/`）：桌面模式（原生 TUI 里收各渠道消息与文件）和宿主自己拉起的 agent；修订总体方向"agents-io 是唯一拉起 harness 的地方"。
 
 ### 被外部条件挡住
 
