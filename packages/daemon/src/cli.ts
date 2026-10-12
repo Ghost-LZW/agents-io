@@ -1,11 +1,12 @@
 #!/usr/bin/env node
+import { spawn } from 'node:child_process';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { readFileSync, realpathSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { constants as osConstants, homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
-import type { ContentBlock, RenderedMessage, ReplyRoute, RunEnded, SessionEvent, SessionLaunch, SessionScope, Tier } from '@agents-io/protocol';
+import type { ContentBlock, RenderedMessage, ReplyRoute, RunEnded, SessionEvent, SessionLaunch, SessionScope, Tier, TuiAttach } from '@agents-io/protocol';
 import { runAttach } from './attach.js';
 import { CommandError, DaemonUnavailable, LocalClient } from './client.js';
 import { ConfigError, defaultInstance, loadConfig, type LoadOptions } from './config.js';
@@ -23,6 +24,7 @@ daemon
 
 local ends (as the local principal)
   aio attach    [--session <key>] [--tier full|card|headline|final] [--from <seq>] [--verbose]
+  aio tui       [--session <key>]                                   (the harness's own terminal UI on the session; Codex over unix)
   aio input     [--session <key>] [--mode queue|steer|interrupt] [--wait] <text…>
   aio sessions
   aio watch     add [--session <target>] key=value… | list [--session <target>] | remove <id>
@@ -255,6 +257,27 @@ async function input(a: CliArgs): Promise<number> {
   } finally {
     client.close();
   }
+}
+
+/**
+ * `aio tui`: the harness's own terminal UI on a session (decision 15). The daemon keeps the
+ * session and its channels; the TUI is one more client of the same thread, so channel messages
+ * show up in it and what is typed there is in the session's log.
+ */
+async function tui(a: CliArgs): Promise<number> {
+  const client = await LocalClient.connect(socketOf(a));
+  let t: TuiAttach;
+  try {
+    t = await client.tuiAttach(str(a, 'session'));
+  } finally {
+    client.close();
+  }
+  if (process.stderr.isTTY) console.error(`aio: ${t.sessionKey} → ${t.harness} ${t.nativeId}`);
+  const child = spawn(t.command, t.args, { cwd: t.cwd, stdio: 'inherit', env: { ...process.env, ...t.env } });
+  return new Promise((done, fail) => {
+    child.on('error', (e) => fail(new CommandError('spawn_failed', `${t.command}: ${e.message}`)));
+    child.on('exit', (code, signal) => done(code ?? (signal ? 128 + (osConstants.signals[signal] ?? 0) : 1)));
+  });
 }
 
 async function sessions(a: CliArgs): Promise<number> {
@@ -587,7 +610,7 @@ async function e2e(a: CliArgs): Promise<number> {
   return n('FAIL') ? 1 : 0;
 }
 
-const COMMANDS: Record<string, (a: CliArgs) => Promise<number>> = { serve, attach, input, sessions, watch, e2e, run: runCmd, send, tail, ack, redispatch, bindings, explain, verify, 'console-link': consoleLink, console: consoleLink };
+const COMMANDS: Record<string, (a: CliArgs) => Promise<number>> = { serve, attach, tui, input, sessions, watch, e2e, run: runCmd, send, tail, ack, redispatch, bindings, explain, verify, 'console-link': consoleLink, console: consoleLink };
 
 export async function main(argv: string[]): Promise<number> {
   const a = parseCli(argv);

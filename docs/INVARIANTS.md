@@ -437,6 +437,13 @@
   3. **并进主人正在跑的轮次**：Codex 把委托并进正在跑的轮次（相当于 steer），lane 改不了它的沙箱，只能打断主人这一轮；主人需要重说。`live_join` 本身就在主人的一轮里，所以入会后几秒内的第一句委托也可能打断那一轮的收尾。
   4. 飞书会议（open-lark 插件）目前不给说话人，实际效果是"受限 + 审批找发起人"。
 
+
+### LN-8 原生终端加入会话，会话仍由守护进程持有
+
+- **承诺**：`tui.attach`（决定 15）只答本机主人（带宿主 token 的连接答 `forbidden`）。守护进程先打开该会话的 harness 绑定，再答复启动原生 TUI 的命令；TUI 作为同一原生会话的另一个客户端加入，不另开会话、不夺走 lane：渠道输入照常经 lane 进入，TUI 里输入的轮次以 foreign 轮次记进日志。从未跑过轮次的会话先注入一条上下文说明，使原生会话可续接（Codex 空 thread 没有 rollout）。harness 不能让终端加入时答 `unsupported`。
+- **实现**：`packages/protocol/src/harness.ts` `HarnessAdapter.nativeClient`；`harness/codex/src/harness.ts` `CodexHarness.nativeClient`（unix 传输）；`packages/session/src/lane.ts` `attachPoint`、`injectContext`；`packages/daemon/src/gateway.ts` `tuiAttach`；`packages/daemon/src/local-server.ts`（`tui.attach`）；`packages/daemon/src/cli.ts` `aio tui`。
+- **测试**：标签 `#LN-8`；`packages/daemon/test/tui.test.ts`。真实 Codex（0.160.1）手工核对：TUI 恢复出历史，`aio input` 的一轮在 TUI 里实时出现（`docs/design/external-holder/` §10.1）。
+- **状态**：有测试（假 harness）。Claude Code 的终端加入（S2）待实现。
 ---
 
 ## 7. 审批（RQ）

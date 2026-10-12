@@ -76,6 +76,20 @@ export interface HarnessAdapter {
   /** Version assertion; refuse to start on unknown versions. */
   probe(): Promise<{ version: string; caps: HarnessCaps }>;
   open(args: HarnessOpenArgs): Promise<HarnessSession>;
+  /**
+   * How to start the harness's own terminal UI as another client of an open session
+   * (decision 15), when the harness has several clients per session (Codex: `--remote` on
+   * the app-server). Undefined when it cannot, or no server is running yet.
+   */
+  nativeClient?(nativeId: string): NativeClient | undefined;
+}
+
+/** A command that starts a harness's terminal UI attached to a running session. */
+export interface NativeClient {
+  command: string;
+  args: string[];
+  /** Over the caller's environment (e.g. CODEX_HOME), never secrets. */
+  env?: Record<string, string>;
 }
 
 export interface HarnessSession {

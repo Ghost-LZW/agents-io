@@ -115,8 +115,29 @@ export const ClientFrame = Type.Union([
    */
   Type.Object({ v: V, type: Type.Literal('topic.list'), id: Type.String(), conversation: Type.Optional(Type.String()), sessionKey: Type.Optional(Type.String()) }),
   TopicSwitchFrame,
+  /**
+   * The harness's own terminal UI on a session (decision 15; local owner only): the daemon
+   * opens the session's harness and answers how to start the TUI on it. Value: `TuiAttach`.
+   * Default session: the local one.
+   */
+  Type.Object({ v: V, type: Type.Literal('tui.attach'), id: Type.String(), sessionKey: Type.Optional(Type.String()) }),
 ]);
 export type ClientFrame = Static<typeof ClientFrame>;
+
+/** How to start a harness's terminal UI attached to a session (`tui.attach`). */
+export const TuiAttach = Type.Object({
+  sessionKey: Type.String(),
+  /** The harness instance. */
+  harness: Type.String(),
+  /** Native session or thread id the TUI attaches to. */
+  nativeId: Type.String(),
+  cwd: Type.String(),
+  command: Type.String(),
+  args: Type.Array(Type.String()),
+  /** Over the client's environment. */
+  env: Type.Optional(Type.Record(Type.String(), Type.String())),
+});
+export type TuiAttach = Static<typeof TuiAttach>;
 
 export const SessionInfo = Type.Object({
   sessionKey: Type.String(),
@@ -139,7 +160,7 @@ export const ServerFrame = Type.Union([
   /**
    * Answer to a request. Values: input → `{ inputId, disposition }`; subscribe →
    * `{ head }`; sessions → `SessionInfo[]`; topic.list → `Topic[]`; topic.switch →
-   * `TopicSwitchResult`; others → `{}`. Errors carry the lane's
+   * `TopicSwitchResult`; tui.attach → `TuiAttach`; others → `{}`. Errors carry the lane's
    * reason as `code` (`forbidden`, `not_eligible`, `no_active_turn`, …).
    */
   ResultFrame,
@@ -150,5 +171,5 @@ export const ServerFrame = Type.Union([
 ]);
 export type ServerFrame = Static<typeof ServerFrame>;
 
-export const CLIENT_FRAME_TYPES = ['command', 'sessions', 'watch.add', 'watch.remove', 'watch.list', 'topic.list', 'topic.switch'] as const;
+export const CLIENT_FRAME_TYPES = ['command', 'sessions', 'watch.add', 'watch.remove', 'watch.list', 'topic.list', 'topic.switch', 'tui.attach'] as const;
 export const SERVER_FRAME_TYPES = ['result', 'event', 'closed'] as const;

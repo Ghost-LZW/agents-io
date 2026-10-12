@@ -923,6 +923,10 @@
                         {
                           "const": "mirror",
                           "type": "string"
+                        },
+                        {
+                          "const": "approval",
+                          "type": "string"
                         }
                       ]
                     }
@@ -1965,6 +1969,10 @@
                           "type": "string"
                         },
                         {
+                          "const": "live_profile",
+                          "type": "string"
+                        },
+                        {
                           "const": "other",
                           "type": "string"
                         }
@@ -2205,6 +2213,9 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "startedBy": {
+                      "type": "string"
                     }
                   }
                 },
