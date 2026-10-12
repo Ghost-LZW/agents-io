@@ -8,6 +8,14 @@
  */
 export type ProcessMode = 'auto' | 'cot' | 'panels' | 'off';
 
+/**
+ * What surrounds the answer on a reply card:
+ * - `console`: a coloured status header, a status line and an elapsed / tool-count footer.
+ * - `chat`: the answer alone, like a person's reply; a status line only while an approval
+ *   waits or when the turn failed, was interrupted or has an unknown outcome. Buttons stay.
+ */
+export type ReplyLook = 'console' | 'chat';
+
 export interface LarkBotConfig {
   appId: string;
   appSecret: string;
@@ -38,6 +46,16 @@ export interface LarkBotConfig {
 
   /** Native process rendering. Default `auto`. */
   process?: ProcessMode;
+  /** `process` per kind of chat (a chat's kind is learnt from its messages; unknown chats use `process`). */
+  processByChat?: { dm?: ProcessMode; group?: ProcessMode };
+  /** Default `console`. */
+  look?: ReplyLook;
+  /**
+   * When the thinking bubble opens: `turn` = with the reply card, above it; `tool` = at the turn's
+   * first tool call, so a turn that only thinks and answers shows no bubble (one opened after the
+   * card sits below it). Default `turn`.
+   */
+  cotOn?: 'turn' | 'tool';
   /** Language of the labels the adapter adds (status, panel titles). Default `zh` on feishu, `en` on lark. */
   locale?: 'zh' | 'en';
   /** Decoration the adapter adds to cards: `emoji` (status icons, panel icons) or `plain`. Default `emoji`. */
@@ -88,9 +106,11 @@ export function resolveConfig(c: LarkBotConfig): ResolvedConfig {
   if (!c.appId || !c.appSecret) throw new Error('lark-bot: appId and appSecret are required');
   if (c.domain !== 'feishu' && c.domain !== 'lark') throw new Error(`lark-bot: domain must be 'feishu' or 'lark'`);
   if (c.style !== undefined && c.style !== 'emoji' && c.style !== 'plain') throw new Error('lark-bot: style must be emoji or plain');
-  if (c.process !== undefined && !PROCESS_MODES.includes(c.process)) {
-    throw new Error(`lark-bot: process must be one of ${PROCESS_MODES.join(', ')}`);
+  for (const [key, mode] of [['process', c.process], ['processByChat.dm', c.processByChat?.dm], ['processByChat.group', c.processByChat?.group]] as const) {
+    if (mode !== undefined && !PROCESS_MODES.includes(mode)) throw new Error(`lark-bot: ${key} must be one of ${PROCESS_MODES.join(', ')}`);
   }
+  if (c.look !== undefined && c.look !== 'console' && c.look !== 'chat') throw new Error('lark-bot: look must be console or chat');
+  if (c.cotOn !== undefined && c.cotOn !== 'turn' && c.cotOn !== 'tool') throw new Error('lark-bot: cotOn must be turn or tool');
   return {
     ...c,
     maxChars: c.maxChars ?? 4000,
@@ -102,6 +122,9 @@ export function resolveConfig(c: LarkBotConfig): ResolvedConfig {
     // 230011 / 231003: message recalled / deleted (documented Lark im error codes).
     goneCodes: c.goneCodes ?? [230011, 231003],
     process: c.process ?? 'auto',
+    processByChat: c.processByChat ?? {},
+    look: c.look ?? 'console',
+    cotOn: c.cotOn ?? 'turn',
     locale: c.locale ?? (c.domain === 'feishu' ? 'zh' : 'en'),
     style: c.style ?? 'emoji',
     processMaxEntries: c.processMaxEntries ?? 8,

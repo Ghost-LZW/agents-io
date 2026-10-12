@@ -12,7 +12,7 @@ import type {
   SendResult,
 } from '@agents-io/protocol';
 import { CardKitCard, LarkApiError, errCode } from './cardkit.js';
-import { resolveConfig, type LarkBotConfig, type ResolvedConfig } from './config.js';
+import { resolveConfig, type LarkBotConfig, type ProcessMode, type ResolvedConfig } from './config.js';
 import { CotBubble } from './cot.js';
 import { InboundEnricher } from './enrich.js';
 import { CHANNEL_ID, mapCardAction, mapMessageEvent } from './inbound.js';
@@ -160,6 +160,8 @@ export class LarkBotAdapter implements ChannelAdapter {
   private readonly enricher: InboundEnricher;
   /** chat id → enrichment of its previous message, so messages reach the host in order. */
   private readonly inboundTails = new Map<string, Promise<void>>();
+  /** chat id → its kind, learnt from inbound messages (`processByChat`). */
+  private readonly chatKinds = new Map<string, 'dm' | 'group'>();
 
   constructor(config: LarkBotConfig, opts: LarkBotOptions = {}) {
     this.cfg = resolveConfig(config);
@@ -179,7 +181,7 @@ export class LarkBotAdapter implements ChannelAdapter {
       text: { maxChars: this.cfg.maxChars, markdown: 'basic' },
       edit: true,
       // Process cards stream the answer natively; the host may edit as often as this.
-      ...(this.cfg.process !== 'off' ? { nativeStream: { minIntervalMs: this.cfg.streamTextIntervalMs, maxBytes: this.cfg.maxCardKitBytes } } : {}),
+      ...(this.anyProcess() ? { nativeStream: { minIntervalMs: this.cfg.streamTextIntervalMs, maxBytes: this.cfg.maxCardKitBytes } } : {}),
       buttons: true,
       media: { in: ['image', 'file', 'audio'], out: ['image', 'file', 'audio'] },
       voiceOut: 'none',
@@ -317,6 +319,7 @@ export class LarkBotAdapter implements ChannelAdapter {
       this.dedup.delete(key);
       return;
     }
+    bounded(this.chatKinds, env.conversation.id, env.conversation.kind === 'dm' ? 'dm' : 'group');
     await this.deliver(ctx, key, () => this.enrichThenEmit(ctx, ev.message.chat_id, env));
   }
 
@@ -506,7 +509,7 @@ export class LarkBotAdapter implements ChannelAdapter {
     }
     const prior = this.sends.get(op.operationId);
     if (prior) return prior;
-    const run = this.useProcess(msg) ? this.sendProcess(route, msg, op) : this.doSend(route, msg, op);
+    const run = this.useProcess(route, msg) ? this.sendProcess(route, msg, op) : this.doSend(route, msg, op);
     this.sends.set(op.operationId, run);
     if (this.sends.size > BOUND) {
       const oldest = this.sends.keys().next();
@@ -568,7 +571,7 @@ export class LarkBotAdapter implements ChannelAdapter {
   /** Streaming updates: the target must have been sent as a card (`sections`/`actions`/`link`/`channelData`/`progress`). */
   async edit(route: ReplyRoute, providerMessageId: string, msg: RenderedMessage, op: SendOp & { sequence: number }): Promise<void> {
     this.ownRoute('edit', route);
-    const proc = this.isProcessMessage(providerMessageId, msg);
+    const proc = this.isProcessMessage(route, providerMessageId, msg);
     const gap = this.procs.get(providerMessageId)?.level === 'stream' ? this.cfg.streamTextIntervalMs : this.cfg.editMinIntervalMs;
     await this.serial(
       providerMessageId,
@@ -585,7 +588,7 @@ export class LarkBotAdapter implements ChannelAdapter {
 
   async finalize(route: ReplyRoute, providerMessageId: string, msg: RenderedMessage): Promise<void> {
     this.ownRoute('finalize', route);
-    const proc = this.isProcessMessage(providerMessageId, msg);
+    const proc = this.isProcessMessage(route, providerMessageId, msg);
     await this.serial(providerMessageId, () => (proc ? this.editProcess(route, providerMessageId, msg, true) : this.patch(providerMessageId, msg)));
     this.forget(providerMessageId);
   }
@@ -639,14 +642,24 @@ export class LarkBotAdapter implements ChannelAdapter {
 
   // ---- process cards ----------------------------------------------------------------------
 
-  private useProcess(msg: RenderedMessage): boolean {
-    return this.cfg.process !== 'off' && !!msg.progress && !isLarkCard(msg.channelData);
+  private anyProcess(): boolean {
+    const { process, processByChat } = this.cfg;
+    return [process, processByChat.dm ?? process, processByChat.group ?? process].some((m) => m !== 'off');
   }
 
-  private isProcessMessage(id: string, msg: RenderedMessage): boolean {
+  private processFor(route: ReplyRoute): ProcessMode {
+    const kind = this.chatKinds.get(route.conversationId);
+    return (kind && this.cfg.processByChat[kind]) ?? this.cfg.process;
+  }
+
+  private useProcess(route: ReplyRoute, msg: RenderedMessage): boolean {
+    return this.processFor(route) !== 'off' && !!msg.progress && !isLarkCard(msg.channelData);
+  }
+
+  private isProcessMessage(route: ReplyRoute, id: string, msg: RenderedMessage): boolean {
     if (this.procs.has(id)) return true;
     const kind = this.kinds.get(id);
-    return this.useProcess(msg) && kind !== 'text' && kind !== 'post';
+    return this.useProcess(route, msg) && kind !== 'text' && kind !== 'post';
   }
 
   private floorOf(route: ReplyRoute): CardLevel {
@@ -687,9 +700,12 @@ export class LarkBotAdapter implements ChannelAdapter {
   }
 
   private newState(route: ReplyRoute, progress: ProgressView, level: CardLevel): ProcState {
-    const mode = this.cfg.process === 'off' ? 'panels' : this.cfg.process;
+    const process = this.processFor(route);
+    const mode = process === 'off' ? 'panels' : process;
     const st: ProcState = { route, level, mode, sent: new Map(), panels: new Set(), actions: [], lastAuxAt: this.now() };
-    if (mode !== 'panels' && this.cotAllowed(route)) {
+    // A turn whose first message is already its last (it ended quickly) gets no bubble.
+    const running = progress.status === 'running' || progress.status === 'requires_action';
+    if (mode !== 'panels' && running && this.cotAllowed(route)) {
       st.cot = new CotBubble({
         client: this.client,
         route,
@@ -704,8 +720,14 @@ export class LarkBotAdapter implements ChannelAdapter {
     return st;
   }
 
+  /** `cotOn: tool`: a turn that only thinks and answers shows no bubble. */
+  private cotDue(p: ProgressView): boolean {
+    return this.cfg.cotOn === 'turn' || p.steps.some((s) => s.kind === 'tool');
+  }
+
   private feedCot(st: ProcState, p: ProgressView, final: boolean): void {
     if (!st.cot) return;
+    if (!st.cot.created && !this.cotDue(p)) return;
     if (!final) return st.cot.push(p);
     const task = st.cot.finish(p).finally(() => this.cotTasks.delete(task));
     this.cotTasks.add(task);
@@ -715,6 +737,7 @@ export class LarkBotAdapter implements ChannelAdapter {
     const base = {
       locale: this.cfg.locale,
       style: this.cfg.style,
+      look: this.cfg.look,
       processElsewhere: st.mode === 'cot' || (!!st.cot && !st.cot.failed),
       maxEntries: this.cfg.processMaxEntries,
       panelMaxChars: this.cfg.processPanelMaxChars,
@@ -740,7 +763,8 @@ export class LarkBotAdapter implements ChannelAdapter {
     if (!prior) {
       bounded(this.pendingProcs, op.operationId, pending);
       // The bubble goes first so it sits above the reply card; if it fails the card shows the process.
-      if (st.cot) await st.cot.open();
+      // With `cotOn: tool` it may open later, at the first tool call, below the card.
+      if (st.cot && this.cotDue(p)) await st.cot.open();
     }
     this.feedCot(st, p, false);
     let id: string | undefined;
