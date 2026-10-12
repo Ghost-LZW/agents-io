@@ -151,8 +151,7 @@ describe('Lane: live (decision 11)', () => {
     expect(withVideo.session!.framesIn.map((f) => f.kind)).toEqual(['audio', 'video', 'audio']);
   });
 
-  // INVARIANTS IN-1 不成立 2: `handoffs` keeps at most 32 delegations the harness has not started a turn for; the oldest is dropped with only its `input.admitted new_turn`; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('the 33rd pending delegation pushes the oldest out, and the evicted one still gets a terminal state #IN-1', async () => {
+  it('the 33rd pending delegation pushes the oldest out, and the evicted one still gets a terminal state #IN-1', async () => {
     const h = new LiveHarness();
     const { lane, events } = setup({ harness: h });
     await lane.startLive(info, { transport: { type: 'webrtc', sdp: 'OFFER' } });
@@ -160,6 +159,25 @@ describe('Lane: live (decision 11)', () => {
     await until(() => bodies(events(), 'input.admitted').length === 33);
     await lane.whenIdle();
     const terminal = bodies(events()).filter((b) => (b.t === 'input.consumed' || b.t === 'input.rejected' || b.t === 'input.cancelled') && (b as { inputIds: string[] }).inputIds.includes('live:L1:h0'));
-    expect(terminal).not.toEqual([]);
+    expect(terminal).toEqual([{ t: 'input.rejected', inputIds: ['live:L1:h0'], reason: 'handoff_overflow' }]);
+  });
+
+  it('delegations no turn took are rejected when their live ends, or when the lane closes #IN-1', async () => {
+    const h = new LiveHarness();
+    const { lane, events } = setup({ harness: h });
+    await lane.startLive(info, { transport: { type: 'webrtc', sdp: 'OFFER' } });
+    h.session!.push({ t: 'live.handoff', liveId: 'L1', inputId: 'live:L1:a', text: 'a' });
+    await until(() => bodies(events(), 'input.admitted').length === 1);
+    await lane.stopLive();
+    await until(() => bodies(events(), 'input.rejected').length === 1);
+    expect(bodies(events(), 'input.rejected')).toEqual([{ t: 'input.rejected', inputIds: ['live:L1:a'], reason: 'live_ended' }]);
+
+    await lane.startLive({ ...info, liveId: 'L2' }, { transport: { type: 'webrtc', sdp: 'OFFER' } });
+    h.session!.push({ t: 'live.handoff', liveId: 'L2', inputId: 'live:L2:b', text: 'b' });
+    await until(() => bodies(events(), 'input.admitted').length === 2);
+    await lane.close('gateway stopping');
+    expect(bodies(events(), 'input.rejected').at(-1)).toEqual({ t: 'input.rejected', inputIds: ['live:L2:b'], reason: 'lane_closed: gateway stopping' });
+    // The lane recorded the open live as ended when it closed (#LN-4).
+    expect(bodies(events(), 'live.ended').map((b) => (b as BodyOf<'live.ended'>).liveId)).toEqual(['L1', 'L2']);
   });
 });

@@ -114,7 +114,8 @@ export interface HostToolsOptions {
 export interface LiveControl {
   /** Open a live on `channel` (default: the turn's reply channel) and attach it to this session's harness thread. */
   join(sessionKey: string, turn: TurnContext, a: { target: string; channel?: string; instructions?: string; voice?: string }): Promise<{ liveId: string; title: string; route: string }>;
-  say(sessionKey: string, text: string): Promise<void>;
+  /** Speak in the session's live. `operationId` names the side effect (`explain`, EX-2); a retried call with the same one does not speak again. */
+  say(sessionKey: string, text: string, a: { operationId: string; turnId: string }): Promise<void>;
   /** Ends the session's live; false when none runs. */
   leave(sessionKey: string): Promise<boolean>;
 }
@@ -269,7 +270,7 @@ export class HostTools {
       case 'live_join':
       case 'live_say':
       case 'live_leave':
-        return json(await this.liveTool(b, turn, name, args));
+        return json(await this.liveTool(b, turn, name, args, operationId));
       default:
         throw new ToolError(`unknown tool ${name}`);
     }
@@ -277,7 +278,7 @@ export class HostTools {
 
   // ---- live (decision 11) ------------------------------------------------------------------
 
-  private async liveTool(b: ToolBinding, turn: TurnContext, name: 'live_join' | 'live_say' | 'live_leave', args: Record<string, unknown>) {
+  private async liveTool(b: ToolBinding, turn: TurnContext, name: 'live_join' | 'live_say' | 'live_leave', args: Record<string, unknown>, operationId: string) {
     const live = this.o.live;
     if (!live) throw new ToolError('live sessions are not available in this deployment');
     try {
@@ -297,7 +298,7 @@ export class HostTools {
           };
         }
         case 'live_say':
-          await live.say(b.sessionKey, str(args.text, 'text')!);
+          await live.say(b.sessionKey, str(args.text, 'text')!, { operationId, turnId: turn.turnId });
           return { ok: true };
         case 'live_leave':
           return { ok: true, left: await live.leave(b.sessionKey) };

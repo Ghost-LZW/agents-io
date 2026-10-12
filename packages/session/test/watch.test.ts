@@ -192,8 +192,7 @@ describe('digest watches', () => {
     await two.close();
   });
 
-  // INVARIANTS IN-1 (§12 item 15, reproduced): settleLeftoverInputs rejects the digest id (host_restarted), then the watch's redo admits the same id again and it is consumed — two outcomes; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('a flush that crashed after input.admitted and before endFlush: after the restart its input has exactly one outcome #IN-1', async () => {
+  it('a flush that crashed after input.admitted and before endFlush: after the restart its input has exactly one outcome #IN-1', async () => {
     const path = tempPath();
     const one = world({ path });
     await one.watches.add(OWNER, draft({ mode: 'digest', digest: { everyMs: 3_600_000 } }));

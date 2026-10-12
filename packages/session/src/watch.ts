@@ -746,6 +746,13 @@ export class WatchDispatcher {
       this.registry.abortFlush(id, flushId);
       throw new Error(`digest for watch ${id} not queued: ${r.reason}`);
     }
+    if (r.disposition === 'duplicate') {
+      // A redo whose id the earlier process already admitted (it crashed before endFlush): that id
+      // keeps its one outcome there (settled at startup as host_restarted, or its turn's); the items
+      // go again under a fresh id rather than being lost (IN-1).
+      this.registry.abortFlush(id, flushId);
+      return this.doFlush(id);
+    }
     this.registry.endFlush(id, flushId, this.now());
     if (this.registry.isExpired(w) && !this.registry.bufferedCount(id)) this.registry.remove(id);
   }

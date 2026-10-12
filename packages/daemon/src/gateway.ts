@@ -492,10 +492,18 @@ export class Gateway {
         // Decision 9: realtime voice on the session's harness, the media peer from a channel.
         live: {
           join: (key, turn, a) => this.joinLive(key, turn, a),
-          say: async (key, text) => {
+          say: async (key, text, a) => {
             const lane = this.lanes.get(key);
             if (!lane?.liveInfo()) throw new ToolError('no live is running in this session; live_join first');
-            await lane.liveSay(text);
+            // Same operationId = the same call retried: said once (DL-2), and explainable either way (EX-2).
+            if (this.records.outboundByOperation(a.operationId)) return;
+            let result: 'delivered' | 'unknown' = 'unknown';
+            const route = lane.liveInfo()!.route;
+            try {
+              result = (await lane.liveSay(text, a)).result;
+            } finally {
+              this.indexOutbound({ sessionKey: key, turnId: a.turnId }, { operationId: a.operationId, sessionKey: key, route, status: result, attempts: 1 });
+            }
           },
           leave: (key) => this.leaveLive(key, 'left by the agent'),
         },

@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { FakeHarness, assertConformingStream, fakeHarnessCaps } from '@agents-io/testkit';
-import type { BodyOf, Decision } from '@agents-io/protocol';
+import type { BodyOf, Decision, HarnessOpenArgs, InputRecord, RunSpec } from '@agents-io/protocol';
 import { Lane, settleLeftoverInputs, type ModelReviewer } from '../src/index.js';
-import { ManualHarness, RUN, SteerableHarness, bodies, gate, input, origin, policy, route, setup, until } from './helpers.js';
+import { ManualHarness, ManualSession, RUN, SteerableHarness, bodies, gate, input, origin, policy, route, setup, until } from './helpers.js';
 
 const turnsOf = (evs: ReturnType<ReturnType<typeof setup>['events']>) =>
   bodies(evs, 'turn.started').map((b) => (b as BodyOf<'turn.started'>).inputIds);
@@ -473,8 +473,7 @@ describe('Lane: host restart', () => {
     expect(a.hub.snapshot('s1').turn?.inputIds).toEqual(['x']);
     expect(settleLeftoverInputs(a.hub, 's1')).toEqual([]); // idempotent
   });
-  // INVARIANTS IN-1 不成立 3: an adopted turn starts with `inputs: []`, so its inputs the harness never reports consumed get no terminal state when it ends; turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('an adopted turn that ends without reporting its inputs consumed settles them #IN-1 #RS-2', async () => {
+  it('an adopted turn that ends without reporting its inputs consumed settles them #IN-1 #RS-2', async () => {
     const a = await firstHost();
     const h2 = new ManualHarness();
     const lane2 = nextLane(a.hub, h2);
@@ -485,6 +484,43 @@ describe('Lane: host restart', () => {
     await until(() => bodies(a.events(), 'turn.completed').length === 1);
     await lane2.whenIdle();
     expect(terminalOf(a.events(), 'x')).not.toEqual([]);
+  });
+
+  it('detach while a turn is still starting: the turn is recorded open, so the next host adopts or settles it, never rejecting its inputs as leftovers #IN-1 #RS-2', async () => {
+    const g = gate();
+    class SlowStart extends ManualSession {
+      override async startTurn(turnId: string, inputs: InputRecord[], run?: RunSpec) {
+        this.starts.push({ turnId, inputs, ...(run ? { run } : {}) });
+        await g.promise; // handed to the harness; its turn.started has not come back yet
+      }
+    }
+    class SlowHarness extends ManualHarness {
+      override async open(args: HarnessOpenArgs) {
+        this.session = new SlowStart(args);
+        return this.session;
+      }
+    }
+    const h1 = new SlowHarness();
+    const a = setup({ harness: h1 });
+    void a.lane.command({ type: 'input', sessionKey: 's1', input: input('long job', { id: 'x' }), mode: 'queue' });
+    await until(() => h1.session?.starts.length === 1);
+    const turnId = h1.session!.starts[0]!.turnId;
+    a.lane.detach('gateway stopping');
+    g.open();
+    await h1.session!.close();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(a.hub.snapshot('s1').turn).toMatchObject({ turnId, inputIds: ['x'] });
+    expect(settleLeftoverInputs(a.hub, 's1')).toEqual([]);
+
+    const h2 = new ManualHarness();
+    const lane2 = nextLane(a.hub, h2);
+    await lane2.open();
+    h2.session!.push({ t: 'turn.adopted', turnId, nativeTurnId: 'n1', inputIds: ['x'] }, { turnId });
+    await until(() => lane2.activeTurn()?.turnId === turnId);
+    h2.session!.complete(turnId, ['x']);
+    await until(() => bodies(a.events(), 'turn.completed').length === 1);
+    await lane2.whenIdle();
+    expect(terminalOf(a.events(), 'x').map((b) => b.t)).toEqual(['input.consumed']);
   });
 
   it('a leftover turn nobody adopts is settled ambiguous once the lane opens, without waiting for a new input #RS-5', async () => {
@@ -753,8 +789,7 @@ describe('Lane: robustness', () => {
     expect(turnsOf(events()).at(-1)).toEqual(['d1']);
     await lane.close();
   });
-  // INVARIANTS IN-1 不成立 1: `known.add` runs before an unguarded `await policy.control` (interrupt mode); a throw records nothing and burns the id (a retry answers duplicate); turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('a throwing policy.control on an interrupt-mode input still settles it (input.rejected); a retry with the same id is not a duplicate #IN-1', async () => {
+  it('a throwing policy.control on an interrupt-mode input still settles it (input.rejected); a retry with the same id is not a duplicate #IN-1', async () => {
     const { lane, events } = setup({
       harness: blocking(),
       policy: policy({
@@ -775,8 +810,7 @@ describe('Lane: robustness', () => {
     }
   });
 
-  // INVARIANTS IN-1 不成立 1: `known.add` runs before an unguarded `await policy.plan` (the steer's re-plan); a throw records nothing and burns the id (a retry answers duplicate); turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('a throwing policy.plan on a steer still settles the input (input.rejected); a retry with the same id is not a duplicate #IN-1', async () => {
+  it('a throwing policy.plan on a steer still settles the input (input.rejected); a retry with the same id is not a duplicate #IN-1', async () => {
     const g = gate();
     let plans = 0;
     const { lane, events } = setup({

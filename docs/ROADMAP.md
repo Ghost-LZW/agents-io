@@ -48,10 +48,10 @@ agents-io 要在任何通道、任何模态上给出同样的可信度，健壮�
 
 ### 现在
 
-1. **不变量清单**（§3，已汇总为 `docs/INVARIANTS.md`：58 条，29 有测试 / 19 部分 / 9 没有，21 条代码路径不成立）。先修最危险的缺口：
+1. **不变量清单**（§3，已汇总为 `docs/INVARIANTS.md`：58 条，29 有测试 / 19 部分 / 9 没有，21 条代码路径不成立；2026-10-11 不成立积压清完，`invariants:check` 有漂移即报错）。先修最危险的缺口：
    - ~~通道可冒充别的通道与主人（ID-3）~~ → 已落地 channel-stamping（决定 13）；
    - lane 关闭或重启时排队输入静默丢失（IN-1 / RS-6）；
-   - ~~`aio explain` 不能从副作用反查（EX-2）~~ → 已按 operationId 反查到轮次与输入（系统回复、宿主 `deliver` 也有记录）；剩 `live_say` 无痕；
+   - ~~`aio explain` 不能从副作用反查（EX-2）~~ → 已按 operationId 反查到轮次与输入（系统回复、宿主 `deliver`、`live_say` 也有记录）；
    - outbox 只在结算时落记录，崩溃后重发（Lark 上传、邮件真的会发两次）；多机器人时停掉的账号被改写成另一个账号发出；
    - 守护进程从不设 `SendOp.as`（agent 身份未随附）。
    宿主接口复查见 `docs/design/host-surface-review/`（删 `lease`、删 `AGENTS_IO_TURN_PROVENANCE`、冻结 resolve/outbound 回调、来源行加 `ref=`）。

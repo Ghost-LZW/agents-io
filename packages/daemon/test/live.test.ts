@@ -41,6 +41,8 @@ class LiveFakeHarness extends FakeHarness {
   readonly said: string[] = [];
   /** Transports the fake's live takes (undefined: the default, webrtc only). */
   transports?: LiveTransport[];
+  /** `stop()` returns at once and `live.ended` comes this much later (Codex: after thread/realtime/closed or its fallback). */
+  lateEndMs?: number;
   private readonly enders: ((reason: string) => void)[] = [];
   /** The harness side ends every running live on its own (voice closed, harness gone). */
   endFromHarness(reason: string): void {
@@ -65,7 +67,10 @@ class LiveFakeHarness extends FakeHarness {
           return { answerSdp: 'ANSWER' };
         },
         say: async (t: string) => void this.said.push(t),
-        stop: async () => end('requested'),
+        stop: async () => {
+          if (this.lateEndMs === undefined) return end('requested');
+          setTimeout(() => end('requested'), this.lateEndMs);
+        },
       },
     });
     return s;
@@ -180,8 +185,7 @@ describe('live tools (decision 11)', () => {
     expect(w.harness.starts).toHaveLength(1);
   });
 
-  // INVARIANTS EX-2 不成立 1: live_say goes through no outbox and leaves no record (no operationId, nothing in the log); turns red when fixed — make it `it` and update INVARIANTS.
-  it.fails('live_say is traceable: explain by its tool operationId returns the turn #EX-2', async () => {
+  it('live_say is traceable: explain by its tool operationId returns the turn #EX-2', async () => {
     const holder: { h?: LiveFakeHarness } = {};
     let said = false;
     const w = await setup(async () => {
@@ -194,7 +198,10 @@ describe('live tools (decision 11)', () => {
     await w.chat.inject({ sender: { channelUserId: 'alice', evidence: 'platform_signed' }, text: 'join' });
     await until(() => said);
     const turnId = (w.events.find((e) => e.body.t === 'turn.started')!.body as { turnId: string }).turnId;
-    expect(w.gw.explain('tool:fake:default:c1:say1')).toMatchObject({ ok: true, value: { turnId } });
+    expect(w.gw.explain('tool:fake:default:c1:say1')).toMatchObject({ ok: true, value: { turnId, route: { conversationId: 'meeting:42' }, result: 'delivered' } });
+    // The log has it too, in the turn that said it.
+    const settled = await until(() => w.events.find((e) => e.body.t === 'delivery.settled' && e.body.operationId === 'tool:fake:default:c1:say1'));
+    expect(settled.turnId).toBe(turnId);
   });
 
   it('two concurrent live_join: one wins, the other is refused without touching the running live or opening an endpoint #LN-3', async () => {
@@ -311,9 +318,19 @@ describe('live: ends, transports and destinations', () => {
     expect(w.log.read(KEY, 0).filter((e) => e.body.t === 'live.ended').map(liveIdOf)).toContain(second);
   });
 
-  // INVARIANTS LN-4 不成立（可能）: Codex sends live.ended only after thread/realtime/closed or a 5 s
-  // fallback, past leaveLive's 5 s bound; the fake harness cannot reproduce that timing, so no it.fails yet.
-  it.todo('the gateway stopping records live.ended even when the harness reports it late (Codex realtime) #LN-4');
+  it('the gateway stopping records live.ended even when the harness reports it late (Codex realtime) #LN-4', async () => {
+    const t = toolTurns({ join: ['live_join', { target: '7' }] });
+    const harness = new LiveFakeHarness(t.script);
+    harness.lateEndMs = 2_000; // after the lane is gone
+    const w = await setup(t.script, { harness });
+    t.holder.h = w.harness;
+    await from(w.chat, 'join');
+    expect((await until(() => t.results['join'])).isError).toBe(false);
+    const liveId = w.harness.starts[0]!.liveId;
+    await w.gw.stop();
+    expect(w.chat.endpoints[0]!.closes).toEqual(['gateway stopping']);
+    expect(w.log.read(KEY, 0).filter((e) => e.body.t === 'live.ended').map(liveIdOf)).toEqual([liveId]);
+  });
 
   it('a live does not survive a restart: no live after it, live_say says there is none, and the log ended it #RS-7', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'aio-live-'));

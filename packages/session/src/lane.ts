@@ -241,6 +241,8 @@ export class Lane {
   private live: LiveInfo | undefined;
   /** Delegations (live.handoff) waiting for the turn the harness starts for them. */
   private handoffs = new Map<string, InputRecord>();
+  /** Lives the lane itself recorded as ended (closing with one open). */
+  private endedLives = new Set<string>();
   private readonly guard: LoopGuard | undefined;
   /** The chain of the last turn: an adopted turn (no inputs in memory) keeps it. */
   private lastCause: TurnCause | undefined;
@@ -261,7 +263,8 @@ export class Lane {
       maxItems: Math.max(0, o.context?.maxItems ?? CONTEXT_DEFAULTS.maxItems),
       maxChars: Math.max(1, o.context?.maxChars ?? CONTEXT_DEFAULTS.maxChars),
     };
-    // Context recorded but not handed over before the previous host stopped is still handed to the next turn.
+    // Context recorded but not handed over before the previous host stopped is still handed to the next turn;
+    // the ids it admitted stay known.
     if (snap.seq > 0) this.rebuildContext(o.hub.log.read(o.sessionKey, 0));
   }
 
@@ -280,6 +283,9 @@ export class Lane {
    */
   observe(input: InputRecord): Promise<CommandResult> {
     return this.serial(async () => {
+      // The same message again (a redelivery, also after a restart): not a revision.
+      const prior = this.observedInputs.get(input.inputId);
+      if (prior && sameContent(prior, input)) return { ok: true, disposition: 'duplicate' } as const;
       this.recordContext(input);
       this.indexCause(input);
       return { ok: true, disposition: 'observe_only' } as const;
@@ -474,9 +480,32 @@ export class Lane {
   }
 
   /** Have the live's voice say `text`. */
-  async liveSay(text: string): Promise<void> {
-    if (!this.live || !this.session?.live) throw new Error('no live is running in this session');
-    await this.session.live.say(text);
+  /**
+   * Speak `text` in the running live. With an `operationId` (a tool call) it leaves the
+   * record every side effect leaves (EX-2): a `delivery.settled` on the live's route in
+   * this session's log, `delivered`, or `unknown` when the harness failed (it may have
+   * spoken part of it). Returns that outcome.
+   */
+  async liveSay(text: string, o: { operationId?: string; turnId?: string } = {}): Promise<{ route: ReplyRoute; result: 'delivered' | 'unknown' }> {
+    const live = this.live;
+    if (!live || !this.session?.live) throw new Error('no live is running in this session');
+    const record = (result: 'delivered' | 'unknown') => {
+      if (o.operationId === undefined) return;
+      this.emit({
+        ...(o.turnId !== undefined ? { turnId: o.turnId } : {}),
+        level: 'detail',
+        visibility: 'operators',
+        body: { t: 'delivery.settled', operationId: o.operationId, route: live.route, result },
+      });
+    };
+    try {
+      await this.session.live.say(text);
+    } catch (err) {
+      record('unknown');
+      throw err;
+    }
+    record('delivered');
+    return { route: live.route, result: 'delivered' };
   }
 
   /** End the live (its `live.ended` follows from the harness). */
@@ -522,6 +551,16 @@ export class Lane {
    */
   detach(reason = 'detached'): void {
     this.detached = true;
+    // Detached while its start was in flight: the harness may already run it, and its own
+    // `turn.started` will not reach the log any more. Recorded open, so the next host adopts it
+    // or settles it as ambiguous, never rejects its inputs as if they never ran (IN-1).
+    const t = this.turn;
+    if (t?.starting) {
+      this.emit({
+        turnId: t.turnId,
+        body: { t: 'turn.started', turnId: t.turnId, inputIds: t.inputs.map((i) => i.inputId), replyRoute: t.replyRoute, initiator: 'host', ...(t.run ? { run: t.run } : {}), ...(t.owner !== null ? { owner: t.owner } : {}) },
+      });
+    }
     this.stopTimers(reason);
   }
 
@@ -537,6 +576,37 @@ export class Lane {
       p.abort?.abort();
     }
     this.rejectQueue();
+    this.rejectHandoffs([...this.handoffs.keys()], `${LANE_CLOSED}: ${reason}`);
+    this.endLive(reason);
+  }
+
+  /**
+   * The lane stops listening with a live still open (the harness has not reported its
+   * `live.ended` yet, e.g. Codex waits for thread/realtime/closed): the lane records it now,
+   * since a late one from the harness would not reach the log (LN-4). Lives do not survive
+   * the lane (RS-7). A later `live.ended` from the harness for it is not recorded again.
+   */
+  private endLive(reason: string): void {
+    const live = this.live;
+    if (!live) return;
+    this.live = undefined;
+    this.endedLives.add(live.liveId);
+    this.emit({ body: { t: 'live.ended', liveId: live.liveId, reason } });
+    try {
+      this.o.onLiveEnded?.(live.liveId, reason);
+    } catch {
+      // the log has it
+    }
+  }
+
+  /**
+   * Live delegations (`live.handoff`) the harness never started a turn for, dropped: pushed
+   * out by the bound, their live ended, or the lane closed. No route: the voice side asked.
+   */
+  private rejectHandoffs(ids: string[], reason: string): void {
+    if (!ids.length) return;
+    for (const id of ids) this.handoffs.delete(id);
+    this.emit({ body: { t: 'input.rejected', inputIds: ids, reason } });
   }
 
   /**
@@ -645,11 +715,21 @@ export class Lane {
     this.indexCause(input);
 
     if (mode === 'steer') {
-      const r = await this.trySteer(input, expectedTurnId);
+      let r: CommandResult | undefined;
+      try {
+        r = await this.trySteer(input, expectedTurnId);
+      } catch (err) {
+        return this.hookFailed(input, err);
+      }
       if (r) return r;
     } else if (mode === 'interrupt' && this.turn) {
       const t = this.turn;
-      const allowed = (await this.policy.control({ sessionKey: this.sessionKey, op: 'interrupt', origin: input.origin, turn: this.context() })) === 'allow';
+      let allowed: boolean;
+      try {
+        allowed = (await this.policy.control({ sessionKey: this.sessionKey, op: 'interrupt', origin: input.origin, turn: this.context() })) === 'allow';
+      } catch (err) {
+        return this.hookFailed(input, err);
+      }
       if (allowed) {
         this.queue.unshift({ input, attempts: 0 });
         this.emit({ body: { t: 'input.admitted', inputId: input.inputId, disposition: 'queued', ...pid(input) } });
@@ -658,6 +738,17 @@ export class Lane {
       }
     }
     return this.enqueue(input);
+  }
+
+  /**
+   * A policy hook threw while admitting `input` (before it was queued or steered): it is
+   * settled at once (`input.rejected policy_error`, with its route so the sender is told,
+   * like a turn that fails to start), and its id is forgotten so a retry is not a duplicate.
+   */
+  private hookFailed(input: InputRecord, err: unknown): CommandResult {
+    this.known.delete(input.inputId);
+    this.emit({ body: { t: 'input.rejected', inputIds: [input.inputId], reason: `policy_error: ${errMsg(err)}`, ...(input.replyRoute ? { replyRoute: input.replyRoute } : {}) } });
+    return { ok: false, reason: 'policy_error' };
   }
 
   private async enqueue(input: InputRecord): Promise<CommandResult> {
@@ -839,6 +930,8 @@ export class Lane {
     const records = new Map<string, InputRecord>();
     for (const e of events) {
       const b = e.body;
+      // Admitted by an earlier host: the same input id again is a duplicate (IN-5 across restarts).
+      if (b.t === 'input.admitted' && b.disposition !== 'observe_only') this.known.add(b.inputId);
       if (b.t === 'input.admitted' && b.input) {
         records.set(b.inputId, b.input);
         if (b.disposition === 'observe_only') {
@@ -1062,16 +1155,22 @@ export class Lane {
         if (t) t.inputs.push(record);
         else {
           this.handoffs.set(b.inputId, record);
+          const evicted: string[] = [];
           for (const k of this.handoffs.keys()) {
-            if (this.handoffs.size <= 32) break;
+            if (this.handoffs.size <= MAX_HANDOFFS) break;
             this.handoffs.delete(k);
+            evicted.push(k);
           }
+          this.rejectHandoffs(evicted, 'handoff_overflow');
         }
         return;
       }
       case 'live.ended':
+        if (this.endedLives.has(b.liveId)) return; // the lane already recorded it as it closed
         if (this.live?.liveId === b.liveId) this.live = undefined;
         this.emitHarness(e, gen);
+        // Delegations of that live no turn took will never get one now.
+        this.rejectHandoffs([...this.handoffs].filter(([, r]) => r.channelContext.liveId === b.liveId).map(([id]) => id), 'live_ended');
         this.o.onLiveEnded?.(b.liveId, b.reason);
         return;
       case 'turn.started': {
@@ -1193,6 +1292,13 @@ export class Lane {
       const attempts = t.attempts.get(i.inputId) ?? 0;
       if (retry && attempts < limit) requeue.push({ input: i, attempts: attempts + 1 });
       else rejected.push(i.inputId);
+    }
+    // Adopted from an earlier host: no records to requeue, and an earlier process may already have
+    // recorded some consumed, so the log (not this process's `consumed`) says which are still open.
+    if (t.adopted?.size) {
+      const open = [...t.adopted].filter((id) => !t.consumed.has(id));
+      const mine = new Set(t.inputs.map((i) => i.inputId)); // steered in by this process: settled above
+      if (open.length) rejected.push(...unsettledInputsOf(this.o.hub.log.read(this.sessionKey, 0), t.turnId, open).filter((id) => !mine.has(id)));
     }
     if (rejected.length) {
       const reason = status === 'completed' || status === 'failed' ? 'not_consumed' : status;
@@ -1384,6 +1490,14 @@ function byRoute(inputs: InputRecord[]): { route: ReplyRoute | null; ids: string
   }
   return [...groups.values()];
 }
+
+/** Same content, reply route and context: a context input delivered again, not revised. */
+function sameContent(a: InputRecord, b: InputRecord): boolean {
+  return JSON.stringify([a.content, a.replyRoute, a.channelContext]) === JSON.stringify([b.content, b.replyRoute, b.channelContext]);
+}
+
+/** Live delegations kept waiting for the turn the harness starts for them. */
+const MAX_HANDOFFS = 32;
 
 /** Inputs of `turnId` (started with `inputIds`, plus any steered into it) with no consumed / rejected / cancelled record. */
 function unsettledInputsOf(events: SessionEvent[], turnId: string, inputIds: string[]): string[] {
