@@ -122,9 +122,15 @@ export function defaultPolicy(o: DefaultPolicyOptions): FullPolicy {
     },
 
     async resolve(_req: BodyOf<'request.opened'>, ctx: TurnContext): Promise<Resolver> {
-      return ctx.run.profile === 'bypass'
-        ? { kind: 'auto', decision: { kind: 'allow_once' } }
-        : { kind: 'auto', decision: { kind: 'deny', message: 'not allowed in restricted profile' } };
+      if (ctx.run.profile === 'bypass') return { kind: 'auto', decision: { kind: 'allow_once' } };
+      // A turn carrying a live's delegation (decision 11 amendment): the speaker was not the owner,
+      // or could not be told. Not denied outright: asked of whoever started the live, in the chat
+      // they started it from, where the request's card shows up. No identified starter: nobody to ask.
+      const live = ctx.live;
+      if (live?.startedBy) {
+        return { kind: 'human', principals: [live.startedBy], routes: live.controlRoute ? [routeKey(live.controlRoute)] : [] };
+      }
+      return { kind: 'auto', decision: { kind: 'deny', message: 'not allowed in restricted profile' } };
     },
 
     async outbound({ from, to }: { from: TurnContext | null; to: ReplyRoute }): Promise<'allow' | 'deny'> {
@@ -133,9 +139,9 @@ export function defaultPolicy(o: DefaultPolicyOptions): FullPolicy {
       if (!from) return 'deny';
       // A turn every triggering input of which is from an owner (plan's bypass test) can already reach
       // anything through its harness; holding back its sends and lives would cost function without
-      // containing risk (decisions 4, 5). The test is on the inputs, not on `run.profile`: a turn that only
-      // inherits a profile (a live delegation runs on the thread's last run, decision 11) is not the
-      // owner speaking, and stays limited to its own reply routes and the preregistered ones.
+      // containing risk (decisions 4, 5). The test is on the inputs, not on `run.profile`: a turn whose
+      // profile its inputs do not justify (e.g. a live delegation folded into an owner's bypass turn) is
+      // not the owner speaking, and stays limited to its own reply routes and the preregistered ones.
       if (from.inputs.length > 0 && from.inputs.every((i) => isOwner(i.origin))) return 'allow';
       const own = [from.replyRoute, ...from.inputs.map((i) => i.replyRoute)];
       return own.some((r) => r && routeKey(r) === k) ? 'allow' : 'deny';

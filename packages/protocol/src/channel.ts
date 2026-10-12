@@ -244,6 +244,27 @@ export interface LiveEndpoint {
   close(reason: string): Promise<void>;
   /** Resolves with a reason when the far side ends it (left, removed, meeting over), or after `close`. */
   readonly ended: Promise<string>;
+  /**
+   * Optional: who was speaking at `atMs` (Unix ms, when the harness reported a delegation),
+   * as the channel knows it (its active-speaker signal). The harness's voice side reports no
+   * speaker (Codex realtime's `handoff_request` carries only the transcript), so this is the
+   * only source of a delegation's sender (decision 11 amendment). Answer the participant whose
+   * utterance ended last at or before `atMs`; answer `undefined` when the channel cannot tell,
+   * or when more than one person spoke in the window it would attribute (fail closed: unknown
+   * speaker → restricted). The gateway caps `evidence` like an inbound envelope's (the
+   * channel entry's grant ∩ caps) and identifies the speaker with `Policy.identify`.
+   */
+  speaker?(atMs: number): LiveSpeaker | undefined;
+}
+
+/** A live's active speaker, in the channel's own identity namespace (`LiveEndpoint.speaker`). */
+export interface LiveSpeaker {
+  /** Same namespace as `InboundEnvelope.sender.channelUserId` of this channel. */
+  channelUserId: string;
+  /** What the channel can prove about this attribution (`platform_signed` only if the platform says who spoke). */
+  evidence: Evidence;
+  displayName?: string;
+  isBot?: boolean;
 }
 
 /** Passed to a channel plugin's factory. */

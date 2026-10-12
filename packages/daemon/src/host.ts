@@ -308,6 +308,7 @@ function ctxView(c: TurnContext): TurnContext {
     ...(c.owner !== undefined ? { owner: c.owner } : {}),
     deliveries: c.deliveries,
     ...(c.provenance ? { provenance: c.provenance } : {}),
+    ...(c.live ? { live: c.live } : {}),
   };
 }
 

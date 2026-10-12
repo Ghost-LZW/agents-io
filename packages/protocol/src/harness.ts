@@ -35,6 +35,15 @@ export interface LiveStartArgs {
   /** Instructions for the voice side (spoken style, what to delegate). */
   instructions?: string;
   voice?: string;
+  /**
+   * The run turns the harness starts by itself for delegations begin under (decision 11
+   * amendment): the session layer's floor, `Policy.plan` over no inputs (the default policy:
+   * `restricted`). A harness that can set its native thread's defaults applies it while the
+   * live runs, also again after each turn the host started (whose own run may differ and may
+   * persist on the thread), and reports in `turn.started.run` of each delegated turn the run it
+   * actually began under, so the session layer can stop one that began wider than planned.
+   */
+  delegationRun?: RunSpec;
 }
 
 export type LiveTransport = 'webrtc' | 'frames';
