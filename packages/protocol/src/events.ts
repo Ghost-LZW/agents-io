@@ -113,7 +113,8 @@ export const Body = Type.Union([
   T('turn.delivery_added', {
     turnId: Type.String(),
     route: ReplyRoute,
-    reason: Type.Union([Type.Literal('steer'), Type.Literal('handoff'), Type.Literal('mirror')]),
+    /** approval: a human request of a delegated turn is shown where its resolver's people are (the live's control route). */
+    reason: Type.Union([Type.Literal('steer'), Type.Literal('handoff'), Type.Literal('mirror'), Type.Literal('approval')]),
   }),
   T('turn.completed', {
     turnId: Type.String(),
@@ -190,6 +191,8 @@ export const Body = Type.Union([
       Type.Literal('continuity'),
       /** An agent-originated input was stopped from starting a turn (hop or same-pair limit); recorded as context. */
       Type.Literal('loop_guard'),
+      /** A turn carrying a live's delegation began under a wider profile than its speaker gets; interrupted (decision 11 amendment). */
+      Type.Literal('live_profile'),
       Type.Literal('other'),
     ]),
     message: Type.String(),
@@ -228,6 +231,8 @@ export const Body = Type.Union([
     route: ReplyRoute,
     /** Route of the turn that opened it; delegated turns may send text there. */
     controlRoute: Type.Union([ReplyRoute, Type.Null()]),
+    /** Principal id of whoever started it (the owner of the turn that called `live_join`): approvals of delegated turns are asked of them. */
+    startedBy: Type.Optional(Type.String()),
   }),
   /** One finished utterance of the live: `user` = the far side (everyone else, mixed), `assistant` = the voice. */
   T('live.transcript', { liveId: Type.String(), role: Type.Union([Type.Literal('user'), Type.Literal('assistant')]), text: Type.String() }),

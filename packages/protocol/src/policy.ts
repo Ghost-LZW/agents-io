@@ -67,6 +67,18 @@ export interface TurnContext {
   deliveries: ReplyRoute[];
   /** Where the turn's inputs came from (tag only, never used to block). */
   provenance?: TurnProvenance;
+  /**
+   * The turn carries a live's delegation (decision 11 amendment): who started the live
+   * (principal id, null when nobody identified did) and the chat it was started from.
+   * The default `resolve` asks the starter there instead of denying a restricted turn's requests.
+   */
+  live?: LiveTurnContext;
+}
+
+export interface LiveTurnContext {
+  liveId: string;
+  startedBy: string | null;
+  controlRoute: ReplyRoute | null;
 }
 
 export interface ControlArgs {

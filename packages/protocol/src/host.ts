@@ -409,6 +409,7 @@ export const TurnContextView = Type.Object({
   owner: Type.Optional(Type.String()),
   deliveries: Type.Array(ReplyRoute),
   provenance: Type.Optional(TurnProvenance),
+  live: Type.Optional(Type.Object({ liveId: Type.String(), startedBy: Type.Union([Type.String(), Type.Null()]), controlRoute: Type.Union([ReplyRoute, Type.Null()]) })),
 });
 
 /**
