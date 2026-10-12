@@ -69,6 +69,8 @@ agents-io 要在任何通道、任何模态上给出同样的可信度，健壮�
 
 ### 下一个 session 先做
 
+- **支持 codex-cli 0.162**：本机 codex 在 2026-10-13 自动升到 0.162.1，适配器只认 0.160.x（`SUPPORTED_CODEX_LINES`），部署暂把 `executable` 钉在 0.160.1 的发布目录。按 `harness/codex/scripts/gen-types.sh` 重新生成类型、核对差异后放开；顺带核实 `codex --remote` 的 TUI 挂上时是否覆盖 thread 的审批 / 沙箱设置（external-holder §10.1 未核实项）。
+
 - **live 录音挂点**（下面第 8 项）：归 live 这一块。通道的媒体对端或 harness 把音轨落成 blob，挂到 `live.*` 事件上，默认关闭；同时作为宿主自己判定说话人（如按主人音色）的音频入口。
 - **测试泄漏子进程**：`console.e2e.test.ts` / `live-channels-helpers.ts` 用到的 `fake-create-lark-bot.mjs` 在测试结束后仍在运行（2026-10-13 发现两个残留进程）。补一条不变量：测试和守护进程停止后不留子进程。
 
