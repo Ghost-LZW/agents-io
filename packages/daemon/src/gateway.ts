@@ -34,6 +34,7 @@ import {
   type HarnessFactory,
   type Origin,
   type Policy,
+  type NativeClient,
   type ReplyRoute,
   type Resolver,
   type RunSpec,
@@ -2261,6 +2262,40 @@ ${a.summary}` }],
     }
   }
 
+  /**
+   * `tui.attach` (decision 15): open the session's harness and say how to start the harness's own
+   * terminal UI on it. Codex: the TUI is another client of the same thread (`--remote`); a thread
+   * that never ran a turn gets a context note first, or it has no rollout to resume.
+   */
+  async tuiAttach(sessionKey?: string): Promise<Outcome> {
+    const key = sessionKey ?? this.o.config.local.session;
+    let lane: Lane;
+    try {
+      lane = await this.laneAfterClose(key);
+    } catch (e) {
+      return { ok: false, code: e instanceof LaneUnavailableError ? e.code : 'internal', message: (e as Error).message };
+    }
+    const { harnessId, nativeId } = await lane.attachPoint();
+    if (!nativeId) return { ok: false, code: 'unsupported', message: `${key}: harness ${harnessId} reported no session id to attach to` };
+    const adapter = this.launched.get(key)?.adapter(harnessId) ?? this.harness(harnessId);
+    const client = adapter.nativeClient?.(nativeId);
+    if (!client) return { ok: false, code: 'unsupported', message: `harness ${harnessId} has no terminal UI that can attach to a running session (Codex needs transport unix)` };
+    if (!this.hub.log.read(key, 0).some((e) => e.body.t === 'turn.started')) {
+      await lane.injectContext([
+        {
+          inputId: `tui_${randomUUID()}`,
+          origin: { kind: 'system', principal: null, evidence: 'none', via: 'tui', adapter: 'daemon' },
+          content: [{ type: 'text', text: '[agents-io] A terminal UI attached to this conversation; messages from other channels may arrive here too.' }],
+          replyRoute: null,
+          channelContext: {},
+        },
+      ]);
+    }
+    const cwd = this.laneInfo.get(key)?.cwd ?? this.o.config.cwd;
+    this.log('info', `${key}: terminal UI attaching to ${harnessId} ${nativeId}`);
+    return { ok: true, value: { sessionKey: key, harness: harnessId, nativeId, cwd, ...client } };
+  }
+
   /** The owner's own chat with the deployment (the latest routed turn of `ownerSessionKey`), without a reply target. */
   private ownerRoute(): ReplyRoute | null {
     const key = this.o.config.policy.ownerSessionKey;
@@ -2557,6 +2592,10 @@ class LaunchEnvHarness implements HarnessAdapter {
     return this.inner.probe();
   }
 
+  nativeClient(nativeId: string): NativeClient | undefined {
+    return this.inner.nativeClient?.(nativeId);
+  }
+
   open(args: HarnessOpenArgs): Promise<HarnessSession> {
     return this.inner.open({ ...args, env: { ...args.env, ...this.env } });
   }
@@ -2586,6 +2625,10 @@ export class InstanceHarness implements HarnessAdapter {
 
   probe(): Promise<{ version: string; caps: HarnessCaps }> {
     return this.inner.probe();
+  }
+
+  nativeClient(nativeId: string): NativeClient | undefined {
+    return this.inner.nativeClient?.(nativeId);
   }
 
   open(args: HarnessOpenArgs): Promise<HarnessSession> {

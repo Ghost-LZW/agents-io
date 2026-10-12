@@ -19,6 +19,7 @@ import {
   type Tier,
   type Topic,
   type TopicSwitchResult,
+  type TuiAttach,
   type Watch,
   type WatchDraft,
 } from '@agents-io/protocol';
@@ -181,6 +182,11 @@ export class LocalClient {
     const r = await this.request(frame);
     if (!r.ok) throw new CommandError(r.error?.code ?? 'error', r.error?.message ?? 'error');
     return r.value as T;
+  }
+
+  /** How to start the harness's own terminal UI on a session (decision 15). */
+  tuiAttach(sessionKey?: string): Promise<TuiAttach> {
+    return this.value({ type: 'tui.attach', ...(sessionKey !== undefined ? { sessionKey } : {}) });
   }
 
   /** Create (or replace, same id) a watch as this connection's principal. */

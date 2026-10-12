@@ -40,6 +40,8 @@ export interface LocalHost {
   listWatches(sessionKey?: string): Watch[];
   /** Host protocol; without it host frames are answered `unsupported`. */
   readonly hostFrames?: HostFrames;
+  /** `tui.attach` (decision 15); without it the frame is answered `unsupported`. */
+  tuiAttach?(sessionKey: string | undefined): Promise<Outcome>;
   /** Topic frames; without it they are answered `unsupported`. */
   readonly topicFrames?: {
     topicList(f: { conversation?: string; sessionKey?: string }): Topic[];
@@ -285,6 +287,16 @@ export class FrameConn implements Peer {
       }
     } catch (e) {
       return this.result(f.id, { ok: false, code: 'internal', message: (e as Error).message });
+    }
+    if (f.type === 'tui.attach') {
+      // The owner at this machine only: a host connection (token) does not open terminals.
+      if (this.auth || !(this.origin('').principal?.labels ?? []).includes('owner')) return this.result(f.id, { ok: false, code: 'forbidden', message: 'tui.attach is for the local owner' });
+      if (!this.host.tuiAttach) return this.result(f.id, { ok: false, code: 'unsupported', message: 'tui.attach is not supported by this server' });
+      try {
+        return this.result(f.id, await this.host.tuiAttach(f.sessionKey));
+      } catch (e) {
+        return this.result(f.id, { ok: false, code: 'internal', message: (e as Error).message });
+      }
     }
     // Topics (decision 6): a switch is checked by Policy.control against this connection's origin.
     if (f.type === 'topic.list' || f.type === 'topic.switch') {

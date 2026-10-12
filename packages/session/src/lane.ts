@@ -580,6 +580,50 @@ export class Lane {
   }
 
   /**
+   * Where a native client (a terminal UI) can attach to this session (decision 15): the
+   * harness binding, opened now when there is none, and its native session or thread id.
+   */
+  attachPoint(): Promise<{ harnessId: string; nativeId: string | undefined }> {
+    return this.serial(async () => {
+      if (this.closed) throw new Error(`${this.sessionKey}: ${LANE_CLOSED}`);
+      const s = await this.ensureSession(this.lastRun ?? (await this.policy.plan({ sessionKey: this.sessionKey, inputs: [] })));
+      return { harnessId: this.adapter.id, nativeId: s.nativeId() };
+    });
+  }
+
+  /**
+   * Add context to the open binding without a turn (`caps.injectWithoutTurn`), e.g. so a new
+   * Codex thread gets a rollout a terminal can resume. False when there is no binding or the
+   * harness cannot. Not an input: nothing is admitted or recorded as one.
+   */
+  injectContext(inputs: InputRecord[]): Promise<boolean> {
+    return this.serial(async () => {
+      const s = this.session;
+      if (!s?.inject || !this.caps?.injectWithoutTurn) return false;
+      await s.inject(inputs);
+      return true;
+    });
+  }
+
+  /**
+   * End the harness binding but keep the lane (decision 15): a native client takes the native
+   * session over, and the next turn opens a binding again (`harnessFor` picks the adapter).
+   * Refused while a turn runs or a live is open.
+   */
+  release(reason: string): Promise<{ ok: true } | { ok: false; reason: 'busy' }> {
+    return this.serial(async () => {
+      if (this.turn || this.live) return { ok: false, reason: 'busy' } as const;
+      const s = this.session;
+      if (!s) return { ok: true } as const;
+      this.session = undefined;
+      this.generation++;
+      this.emit({ level: 'detail', body: { t: 'notice', code: 'runtime_restart', message: `harness binding released: ${reason}` } });
+      await s.close(reason).catch(() => undefined);
+      return { ok: true } as const;
+    });
+  }
+
+  /**
    * Settle a turn an earlier host left open and nobody adopted (`turn.completed ambiguous
    * host_restarted`), without opening the harness: for a host that knows its harness cannot
    * adopt (its process died with the previous host). No-op when there is none or one runs.

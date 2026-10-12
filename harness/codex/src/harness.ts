@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { join } from 'node:path';
-import type { HarnessAdapter, HarnessCaps, HarnessOpenArgs, HarnessSession } from '@agents-io/protocol';
+import type { HarnessAdapter, HarnessCaps, HarnessOpenArgs, HarnessSession, NativeClient } from '@agents-io/protocol';
 import type { ClientInfo } from './generated/ClientInfo.js';
 import type { InitializeParams } from './generated/InitializeParams.js';
 import type { InitializeResponse } from './generated/InitializeResponse.js';
@@ -114,6 +115,8 @@ interface Connector {
   turnsDir?: string;
   /** Stop the server once no session uses it (stdio child only). */
   stopWhenIdle: boolean;
+  /** The Unix socket last connected to (unix transports): where a terminal client attaches too. */
+  socket?: string;
 }
 
 /** `env` over process.env, `CODEX_HOME` from `codexHome`, undefined values removed. */
@@ -215,9 +218,12 @@ function makeConnector(opts: CodexHarnessOptions): Connector {
     else if (t.spawn === 'daemon') path = t.path ?? (await startDaemon(bin, env)).socket;
     else path = t.path ?? defaultCodexSocket(env);
     if (!t.allowInsecureSocket) assertPrivateSocket(path);
-    return connectUnix(path, opts.handshakeTimeoutMs ?? 10_000);
+    const transport = await connectUnix(path, opts.handshakeTimeoutMs ?? 10_000);
+    connector.socket = path;
+    return transport;
   };
-  return { open, reconnect: true, reconnectWindowMs: t.reconnectWindowMs ?? 60_000, turnsDir: join(stateDir, 'turns'), stopWhenIdle: false };
+  const connector: Connector = { open, reconnect: true, reconnectWindowMs: t.reconnectWindowMs ?? 60_000, turnsDir: join(stateDir, 'turns'), stopWhenIdle: false };
+  return connector;
 }
 
 async function handshake(transport: Transport, opts: CodexHarnessOptions): Promise<{ rpc: RpcClient; init: InitializeResponse; version: string }> {
@@ -384,6 +390,21 @@ export class CodexHarness implements HarnessAdapter {
 
   constructor(private readonly opts: CodexHarnessOptions = {}) {
     this.connector = makeConnector(opts);
+  }
+
+  /**
+   * The Codex TUI on the same app-server and thread (`codex --remote … resume <thread>`), for
+   * unix transports once connected. The update check is off: its dialog blocks the attach.
+   */
+  nativeClient(nativeId: string): NativeClient | undefined {
+    const socket = this.connector.socket;
+    if (!socket) return undefined;
+    const home = this.opts.codexHome ?? this.opts.env?.CODEX_HOME;
+    return {
+      command: this.opts.bin ?? 'codex',
+      args: ['-c', 'check_for_update_on_startup=false', '--remote', `unix://${realpathSync(socket)}`, 'resume', nativeId],
+      ...(home ? { env: { CODEX_HOME: home } } : {}),
+    };
   }
 
   async probe(): Promise<{ version: string; caps: HarnessCaps }> {

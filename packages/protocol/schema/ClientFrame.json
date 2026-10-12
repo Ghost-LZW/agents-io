@@ -831,6 +831,30 @@
           }
         }
       ]
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "tui.attach",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "sessionKey": {
+          "type": "string"
+        }
+      }
     }
   ]
 }

@@ -576,6 +576,61 @@
           }
         }
       }
+    },
+    "live": {
+      "type": "object",
+      "required": [
+        "liveId",
+        "startedBy",
+        "controlRoute"
+      ],
+      "properties": {
+        "liveId": {
+          "type": "string"
+        },
+        "startedBy": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "controlRoute": {
+          "anyOf": [
+            {
+              "type": "object",
+              "required": [
+                "channel",
+                "account",
+                "conversationId"
+              ],
+              "properties": {
+                "channel": {
+                  "type": "string"
+                },
+                "account": {
+                  "type": "string"
+                },
+                "conversationId": {
+                  "type": "string"
+                },
+                "threadId": {
+                  "type": "string"
+                },
+                "replyToMessageId": {
+                  "type": "string"
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
     }
   }
 }
