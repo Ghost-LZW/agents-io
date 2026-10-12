@@ -35,7 +35,11 @@ class AttachableHarness extends FakeHarness {
 
 async function setup(harness: FakeHarness) {
   const dir = mkdtempSync(join(tmpdir(), 'aio-tui-'));
-  const base = resolveConfig({ policy: { owners: ['fake:alice'], ownerSessionKey: 'main' }, local: { principal: 'fake:alice' } }, { env: {}, baseDir: dir, cwd: dir });
+  // A Codex instance (the fake harness stands in for it): its TUI joins, it does not take over.
+  const base = resolveConfig(
+    { harnesses: { codex: { use: 'codex', transport: { kind: 'unix', spawn: 'none', path: join(dir, 'x.sock') } } }, policy: { owners: ['fake:alice'], ownerSessionKey: 'main' }, local: { principal: 'fake:alice' } },
+    { env: {}, baseDir: dir, cwd: dir },
+  );
   const config = { ...base, socketPath: join(dir, 'run', 'aio.sock') };
   const chat = new FakeChannel('fake');
   const gw = await Gateway.start({ config, harness, log: new MemorySessionLog(), channels: [{ adapter: chat }], logger: () => {} });

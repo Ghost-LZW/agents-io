@@ -136,6 +136,8 @@ export const TuiAttach = Type.Object({
   args: Type.Array(Type.String()),
   /** Over the client's environment. */
   env: Type.Optional(Type.Record(Type.String(), Type.String())),
+  /** Removed from the client's environment first (e.g. markers of a Claude session the client runs inside). */
+  unsetEnv: Type.Optional(Type.Array(Type.String())),
 });
 export type TuiAttach = Static<typeof TuiAttach>;
 

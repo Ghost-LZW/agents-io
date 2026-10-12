@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, rmSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { dirname, join, resolve as resolvePath } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   PROTOCOL_VERSION,
   formatAddress,
@@ -106,6 +106,7 @@ import { DaemonRecords, type CauseRecord, type OutboundRecord } from './records.
 import { checkLaunch, launchView, sameLaunch, type LaunchCheck } from './launch.js';
 import { Runs } from './runs.js';
 import { Strangers } from './strangers.js';
+import { ClaudeTuiService } from './tui-claude.js';
 import { consoleUrlPath, loadOrCreateTokenFile, removeTokenFile, TokenError, tokenPath, writeTokenFile } from './token.js';
 
 export type LogFn = (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
@@ -266,6 +267,8 @@ export class Gateway {
   readonly hostQueue: HostQueue;
   /** `policy.strangers: "ask"`: messages from people the deployment does not know are asked about (decision 15). */
   private readonly strangers: Strangers | undefined;
+  /** Claude Code TUIs attached to sessions (decision 15, S2). */
+  private readonly claudeTui: ClaudeTuiService;
   /** Who sent each channel message (`input.verify`), settled deliveries, session → agent. */
   readonly records: DaemonRecords;
   /** The host protocol on the local socket. */
@@ -469,6 +472,14 @@ export class Gateway {
       ...(o.hostPush?.retryMs !== undefined ? { pushRetryMs: o.hostPush.retryMs } : {}),
     });
     this.blobs = new FsBlobStore(c.blobs);
+    this.claudeTui = new ClaudeTuiService({
+      dir: join(c.dataDir, 'tui'),
+      // The bridge runs as this CLI (`aio tui-bridge`), next to this module in dist/.
+      cli: fileURLToPath(new URL('./cli.js', import.meta.url)),
+      fileOf: (ref) => this.blobs.stat(ref),
+      onEnd: (h, reason) => this.log('info', `${h.sessionKey}: terminal UI left (${reason}); the session goes on headless`),
+      log: (level, msg) => this.log(level, msg),
+    });
     // Watches live next to the log (same SQLite file), so they and their digest buffers survive a restart.
     const registry = o.watches ?? new WatchRegistry(log instanceof SqliteSessionLog ? { db: log.db } : {});
     this.watches = new WatchDispatcher({
@@ -887,11 +898,17 @@ export class Gateway {
       },
       // A launched session's adapters go through both: the lane uses `harnessFor` whenever it is set.
       harness: launched ? launched.adapter(agent.harness) : this.agentHarness(agent),
-      ...(launched
-        ? { harnessFor: (name: string) => launched.adapter(name) }
-        : this.o.harness
-          ? {}
-          : { harnessFor: (name: string) => (name === agent.harness ? this.agentHarness(agent) : this.harness(name)) }),
+      // While a Claude Code TUI holds the session, its instance is that TUI (decision 15).
+      harnessFor: (name: string) =>
+        this.claudeTui.holdOf(sessionKey)?.instance === name
+          ? this.claudeTui.holdOf(sessionKey)!.harness
+          : launched
+            ? launched.adapter(name)
+            : this.o.harness
+              ? this.o.harness
+              : name === agent.harness
+                ? this.agentHarness(agent)
+                : this.harness(name),
       resumeFor: (id) => this.nativeIdOf(sessionKey, id),
       hub: this.hub,
       policy: this.agentPolicy(agent),
@@ -2275,6 +2292,10 @@ ${a.summary}` }],
     } catch (e) {
       return { ok: false, code: e instanceof LaneUnavailableError ? e.code : 'internal', message: (e as Error).message };
     }
+    // Claude Code's TUI takes the session over; other harnesses say how their own TUI joins a running session.
+    const agent = this.laneInfo.get(key)?.agent;
+    const inst = agent ? this.o.config.harnesses[agent.harness] : undefined;
+    if (inst?.kind === 'claude-code') return this.claudeTuiAttach(key, lane, inst);
     const { harnessId, nativeId } = await lane.attachPoint();
     if (!nativeId) return { ok: false, code: 'unsupported', message: `${key}: harness ${harnessId} reported no session id to attach to` };
     const adapter = this.launched.get(key)?.adapter(harnessId) ?? this.harness(harnessId);
@@ -2294,6 +2315,36 @@ ${a.summary}` }],
     const cwd = this.laneInfo.get(key)?.cwd ?? this.o.config.cwd;
     this.log('info', `${key}: terminal UI attaching to ${harnessId} ${nativeId}`);
     return { ok: true, value: { sessionKey: key, harness: harnessId, nativeId, cwd, ...client } };
+  }
+
+  /**
+   * Claude Code's TUI takes the session (S2): the headless binding is released once idle, the TUI
+   * starts on the same Claude session id (`--resume`, or `--session-id` for a new one) with this
+   * launch's hooks and bridge, and the lane's turns go to it until it exits.
+   */
+  private async claudeTuiAttach(key: string, lane: Lane, inst: Extract<HarnessInstance, { kind: 'claude-code' }>): Promise<Outcome> {
+    if (this.claudeTui.holdOf(key)?.connected) return { ok: false, code: 'conflict', message: `${key}: a terminal UI is already attached` };
+    this.claudeTui.holdOf(key)?.end('replaced by a new attach');
+    await lane.whenIdle();
+    const released = await lane.release('a terminal UI takes the session');
+    if (!released.ok) return { ok: false, code: 'busy', message: `${key}: a turn is running; try again when it ends` };
+    const prior = this.nativeIdOf(key, inst.name);
+    const hold = await this.claudeTui.hold(key, inst.name, prior ?? randomUUID());
+    try {
+      await lane.attachPoint();
+    } catch (e) {
+      hold.end('attach failed');
+      throw e;
+    }
+    const launch = this.claudeTui.launch(hold, {
+      executable: inst.claude.claudePath ?? 'claude',
+      resume: prior !== undefined,
+      ...(inst.run.model ? { model: inst.run.model } : {}),
+      ...(inst.claude.configDir ? { configDir: inst.claude.configDir } : {}),
+    });
+    const cwd = this.laneInfo.get(key)?.cwd ?? this.o.config.cwd;
+    this.log('info', `${key}: Claude Code TUI attaching to ${inst.name} ${hold.nativeId}`);
+    return { ok: true, value: { sessionKey: key, harness: inst.name, nativeId: hold.nativeId, cwd, ...launch } };
   }
 
   /** The owner's own chat with the deployment (the latest routed turn of `ownerSessionKey`), without a reply target. */
@@ -2452,6 +2503,7 @@ ${a.summary}` }],
     for (const t of this.parkedTimers.values()) clearTimeout(t);
     this.parkedTimers.clear();
     this.host.close();
+    await this.claudeTui.close();
     // Lives end first: the voice runs in the harness and the media peer in a channel, both about to go.
     await within(Promise.all([...this.lives.keys()].map((k) => this.leaveLive(k, 'gateway stopping'))), 5000);
     // Runs end (interrupted) while their connections can still hear run.ended.

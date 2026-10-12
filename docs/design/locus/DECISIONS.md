@@ -186,3 +186,4 @@
 - **"离开" = `aio tui` 拉起的 TUI 进程退出**（owner）：不按空闲时长判定；TUI 开着、人走开仍算在场。手动 `/away` 以后需要再加。
 - **Codex（S1）与 Claude（S2）桌面模式同时做**（owner）。
 - **陌生人的消息由主人选择放行**（owner）：`policy.strangers: "drop" | "ask"`，默认 `drop`（现状）。`ask` 时，陌生人私聊机器人或在群里 @ 它，主人的私聊里出现一张卡片：允许这一次 / 以后都允许 / 忽略。允许后原消息按原发送者投到该会话（`restricted`，审批找主人）；"以后都允许"把此人记为带 `guest` 标签的持久身份。谁可信由主人决定，agents-io 只提供"问主人"的机制（POSITIONING §2）。
+- **实施（2026-10-13）**：`aio tui`。Codex：终端是同一 app-server thread 的另一个客户端（`HarnessAdapter.nativeClient`），会话仍由 lane 驱动，终端退出不影响会话（LN-8）。Claude Code：终端接管，持有者就是 lane 该实例的适配器（`ClaudeTuiHarness`），输入经终端自己拉起的 bridge 写 inbox，过程与审批经 hooks；终端退出即"离开"，下一轮无头 `--resume` 同一会话（LN-9）。陌生人放行（ID-9）。没有单独的持有者状态机：lane 的"一个 session 一个写者"已经保证 HD-1/HD-2，持有者变化记为 `runtime_restart` 通知与 `session.bound`。
