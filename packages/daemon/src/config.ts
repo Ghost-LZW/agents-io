@@ -151,6 +151,12 @@ const ChannelCommon = {
   /** Rendering tier for this channel (default: the adapter's `caps.defaultTier`). */
   tier: Type.Optional(Tier),
   /**
+   * Hold each turn's first message this long (ms) on streaming tiers: answer text or an approval
+   * opens it earlier, and a turn that ends within it gets one final message (no working card first).
+   * Default 0.
+   */
+  openDelayMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 60_000 })),
+  /**
    * Sender evidence this channel may give (channel-stamping): the cap is this ∩ the
    * adapter's `caps.evidence`, and stronger claims become `none`. Default: lark-bot and
    * mail `caps.evidence`; bridge and module channels only `device_only` (never

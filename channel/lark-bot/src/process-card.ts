@@ -1,4 +1,5 @@
 import type { ProgressStep, ProgressView, RenderedMessage } from '@agents-io/protocol';
+import type { ReplyLook } from './config.js';
 import { TOPIC_KEY, neutral, type TopicCardData } from './render.js';
 
 /**
@@ -77,6 +78,8 @@ const PLAN_MARK = { pending: '○', in_progress: '◐', completed: '●' } as co
 export interface ProcessModel {
   status: Status;
   done: boolean;
+  /** The card has a header (`chat` look: only a topic's title). */
+  header: boolean;
   /** Header title: the topic's title when the turn's session is a topic, else the status. */
   title: string;
   /** Header subtitle: the status, when the title is the topic's. */
@@ -96,6 +99,8 @@ export interface ModelOptions {
   locale: Locale;
   /** Default `emoji`. */
   style?: CardStyle;
+  /** Default `console`. */
+  look?: ReplyLook;
   /** Leave thinking/tools out of the card (the native thinking bubble shows them). */
   processElsewhere: boolean;
   maxEntries: number;
@@ -213,7 +218,10 @@ export function buildModel(msg: RenderedMessage, p: ProgressView, o: ModelOption
   const topic = typeof topicTitle === 'string' && topicTitle.trim() ? clip(oneLine(topicTitle), 60) : undefined;
   const current = done ? t.status[status] : (statusSection ?? p.headline ?? t.working);
   const plain = o.style === 'plain';
-  const banner = plain ? current : `${ICON[status]} ${current}`;
+  const chat = o.look === 'chat';
+  // A chat reply says nothing about its own state unless someone must act or it did not end well.
+  const quiet = chat && status !== 'requires_action' && (!done || status === 'completed');
+  const banner = quiet ? '' : plain ? current : `${ICON[status]} ${current}`;
   const panelTitle = (k: PanelKey) => (plain ? t.panel[k] : `${PANEL_ICON[k]} ${t.panel[k]}`);
 
   const panels: ProcessModel['panels'] = [];
@@ -223,7 +231,7 @@ export function buildModel(msg: RenderedMessage, p: ProgressView, o: ModelOption
     const tl = toolsBody(p.steps, o);
     if (tl) panels.push({ key: 'tools', title: panelTitle('tools'), body: tl });
   }
-  const pl = planBody(p);
+  const pl = chat && done ? '' : planBody(p);
   if (pl) panels.push({ key: 'plan', title: panelTitle('plan'), body: pl });
 
   const full = (done ? p.answer || msg.text : p.answer).trim();
@@ -239,14 +247,15 @@ export function buildModel(msg: RenderedMessage, p: ProgressView, o: ModelOption
   const footerParts = done
     ? [plain ? t.status[status] : `${ICON[status]} ${t.status[status]}`, elapsed ? `${t.elapsed} ${elapsed}` : '', toolCount ? t.tools(toolCount) : '']
     : [elapsed ? `${t.running} ${elapsed}` : '', toolCount ? t.tools(toolCount) : ''];
-  const footer = footerParts.filter(Boolean).join(' · ') || ' ';
+  const footer = chat ? '' : footerParts.filter(Boolean).join(' · ') || ' ';
 
   return {
     status,
     done,
+    header: !chat || topic !== undefined,
     title: topic ?? t.status[status],
-    ...(topic !== undefined ? { subtitle: t.status[status] } : {}),
-    template: TEMPLATE[status],
+    ...(topic !== undefined && !chat ? { subtitle: t.status[status] } : {}),
+    template: chat ? 'default' : TEMPLATE[status],
     summary: clip(oneLine(done ? full || t.status[status] : current), 60),
     banner,
     panels,
@@ -259,12 +268,13 @@ export function buildModel(msg: RenderedMessage, p: ProgressView, o: ModelOption
 
 const md = (id: string, content: string, extra: Record<string, unknown> = {}) => ({ tag: 'markdown', element_id: id, content, ...extra });
 
+// An empty status or footer still has its element on a streaming card: panels and buttons are inserted next to them.
 export function statusElement(m: ProcessModel) {
-  return md(EL.status, m.banner, { text_size: 'notation' });
+  return md(EL.status, m.banner || ' ', { text_size: 'notation' });
 }
 
 export function footerElement(m: ProcessModel) {
-  return md(EL.footer, m.footer, { text_size: 'notation' });
+  return md(EL.footer, m.footer || ' ', { text_size: 'notation' });
 }
 
 export function panelElement(panel: ProcessModel['panels'][number]) {
@@ -311,14 +321,14 @@ export const STREAMING_CONFIG = {
 
 /** Card JSON 2.0 for the model. `streaming` turns on CardKit streaming mode (CardKit cards only). */
 export function processCard(m: ProcessModel, o: { streaming?: boolean } = {}): Record<string, unknown> {
-  const elements: unknown[] = [statusElement(m)];
+  const elements: unknown[] = m.banner || o.streaming ? [statusElement(m)] : [];
   for (const k of PANEL_ORDER) {
     const p = m.panels.find((x) => x.key === k);
     if (p) elements.push(panelElement(p));
   }
   elements.push(md(EL.answer, m.answer));
   for (const a of m.actions) elements.push(actionElement(a));
-  elements.push(footerElement(m));
+  if (m.footer || o.streaming) elements.push(footerElement(m));
   return {
     schema: '2.0',
     config: {
@@ -327,7 +337,9 @@ export function processCard(m: ProcessModel, o: { streaming?: boolean } = {}): R
       summary: { content: m.summary },
       ...(o.streaming ? { streaming_mode: true, streaming_config: STREAMING_CONFIG } : {}),
     },
-    header: { title: { tag: 'plain_text', content: m.title }, ...(m.subtitle !== undefined ? { subtitle: { tag: 'plain_text', content: m.subtitle } } : {}), template: m.template },
+    ...(m.header
+      ? { header: { title: { tag: 'plain_text', content: m.title }, ...(m.subtitle !== undefined ? { subtitle: { tag: 'plain_text', content: m.subtitle } } : {}), template: m.template } }
+      : {}),
     body: { elements },
   };
 }

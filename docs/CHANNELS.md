@@ -170,6 +170,11 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
   - 工具输出只显示预览，出错时才显示；
   - 不显示 diff 和 token 用量。
 - **装饰**：`config.style` 可选 `emoji`（默认，带状态和面板图标）或 `plain`（只用文字，状态由标题颜色表示）。
+- **像人一样回复**（都默认关闭，配置见 `channel/lark-bot/README.md` "Quieter replies"）：
+  - 通道条目上的 `openDelayMs`：先不出卡片，等回答开始流出或需要审批时再出；在这段时间内就结束的轮次只发一条最终消息；
+  - `config.look: "chat"`：卡片只放答案，不带标题、状态行和耗时页脚，只有在等审批、失败、中断时才显示一行状态；
+  - `config.cotOn: "tool"`：第一次调用工具时才打开思维链气泡，只思考、直接回答的轮次没有气泡；
+  - `config.processByChat`：私聊和群分别设置 `process`，例如群里设 `"off"`。
 - **降级**：流式更新失败时退到整卡替换，再失败退到普通消息编辑。失败记录按会话保留 30 分钟，权限类错误对整个应用生效。
 
 ## 3. 邮件（`channel/mail`，档位 `final`）

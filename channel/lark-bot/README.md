@@ -35,7 +35,23 @@ A message that carries `progress` (the session compositor attaches it on `card`/
 | `panels` | same, plus collapsed thinking and tool-call panels (last `processMaxEntries` entries, `processPanelMaxChars` each) | on the card |
 | `off` | the flat text/sections card | not shown |
 
-The reply card is a CardKit card in streaming mode (`cardkit:card:write`): the answer streams with the typewriter effect, other parts update on their own element ids. On failure it degrades per chat (per app for permission errors, for `degradeTtlMs`): streaming → full `card.update` → an ordinary card replaced by `im.message.patch`. Thinking-bubble failures are remembered the same way and never affect the reply card. An answer larger than the card continues in follow-up cards when the turn ends. The bubble is opened on the first process step, so in the chat it appears below the reply card; it settles with the turn (`RUN_FINISHED`).
+The reply card is a CardKit card in streaming mode (`cardkit:card:write`): the answer streams with the typewriter effect, other parts update on their own element ids. On failure it degrades per chat (per app for permission errors, for `degradeTtlMs`): streaming → full `card.update` → an ordinary card replaced by `im.message.patch`. Thinking-bubble failures are remembered the same way and never affect the reply card. An answer larger than the card continues in follow-up cards when the turn ends. The bubble opens with the reply card, above it, and settles with the turn (`RUN_FINISHED`); a turn whose first message is already final (it ended quickly) gets no bubble.
+
+### Quieter replies
+
+Three settings make the bot read more like a person than a console; all default to the console behaviour above.
+
+| Setting | Effect |
+|---|---|
+| `look: 'chat'` | The card is the answer alone: no header (a topic keeps its title), no status line, no elapsed / tool-count footer, no plan once done. A status line appears only while an approval waits, or when the turn failed, was interrupted or has an unknown outcome. Buttons stay. Default `console`. |
+| `cotOn: 'tool'` | The thinking bubble opens at the turn's first tool call, so a turn that only thinks and answers shows none. A bubble opened after the reply card sits below it. Default `turn`. |
+| `processByChat: { dm?, group? }` | `process` per kind of chat, e.g. `{ "group": "off" }` for no process at all in groups. A chat's kind is learnt from its messages; a chat the bot has not heard from uses `process`. |
+
+With the daemon's `openDelayMs` on the channel entry (the compositor holds each turn's first message: answer text or an approval opens it earlier, a turn that ends within it gets one final message), a quick reply arrives as one message and a bubble opened at the first tool call usually still sits above the card:
+
+```jsonc
+{ "type": "lark-bot", "openDelayMs": 3000, "config": { "look": "chat", "cotOn": "tool", "processByChat": { "group": "off" } } }
+```
 
 Buttons in `actions` (approvals, and the stop button `turn:<turnId>:interrupt` when the compositor runs with `interruptButton: true`) come back as `action` events, which `Ingress` turns into `resolve` / `interrupt` commands.
 

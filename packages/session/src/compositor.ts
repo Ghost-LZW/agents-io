@@ -350,6 +350,12 @@ export interface CompositorOptions {
   as?: string;
   /** Put a stop button on streaming cards while the turn runs (see `interruptActionId`). Default false. */
   interruptButton?: boolean;
+  /**
+   * Hold a streaming turn's first message this long (ms): it opens earlier when answer text
+   * starts or a request opens, and a turn that ends within the delay gets one final message
+   * with no working state before it. Default 0: open as soon as the turn starts.
+   */
+  openDelayMs?: number;
   /** The session's topic title, read at every render (a topic can be renamed). */
   title?: () => string | undefined;
   onError?: (err: unknown) => void;
@@ -361,6 +367,9 @@ interface RouteState {
   caps: ChannelCaps;
   tier: Tier;
   streaming: boolean;
+  /** The first message was queued (or an earlier process sent it). */
+  opened: boolean;
+  openTimer?: ReturnType<typeof setTimeout>;
   messageId?: string;
   editSeq: number;
   lastEditAt: number;
@@ -408,7 +417,10 @@ export class Compositor {
     this.stopped = true;
     this.sub?.close();
     await this.loop;
-    for (const r of this.routes.values()) if (r.timer) clearTimeout(r.timer);
+    for (const r of this.routes.values()) {
+      if (r.timer) clearTimeout(r.timer);
+      if (r.openTimer) clearTimeout(r.openTimer);
+    }
     await this.flush();
   }
 
@@ -497,6 +509,7 @@ export class Compositor {
       caps,
       tier,
       streaming: caps.edit && !!this.o.adapter.edit && tier !== 'final',
+      opened: restored !== undefined,
       editSeq: 0,
       lastEditAt: 0,
       chain: Promise.resolve(),
@@ -506,8 +519,19 @@ export class Compositor {
       ...(restored ? { messageId: restored } : {}),
     };
     this.routes.set(k, r);
-    // Send right away so the end is never blank while the harness thinks.
-    if (r.streaming && restored === undefined) this.enqueue(r, () => this.sendCard(r));
+    if (!r.streaming || r.opened) return;
+    const delay = this.o.openDelayMs ?? 0;
+    // Without a delay, send right away so the end is never blank while the harness thinks.
+    if (delay <= 0) this.open(r);
+    else r.openTimer = setTimeout(() => this.open(r), delay);
+  }
+
+  private open(r: RouteState): void {
+    if (r.opened || r.finished || this.stopped) return;
+    if (r.openTimer) clearTimeout(r.openTimer);
+    r.openTimer = undefined;
+    r.opened = true;
+    this.enqueue(r, () => this.sendCard(r));
   }
 
   private interval(r: RouteState): number {
@@ -573,6 +597,11 @@ export class Compositor {
       }
       return;
     }
+    if (!r.opened) {
+      // Still holding the first message: answer text or a request someone must act on opens it.
+      if (openedRequest || r.view.answer || r.view.text) this.open(r);
+      return;
+    }
     // Approvals skip the throttle, even past an edit already scheduled: they are what a person is waiting to act on.
     if (r.timer && !openedRequest) return; // an edit is already scheduled and will pick up this change
     const wait = Math.max(0, r.lastEditAt + this.interval(r) - Date.now());
@@ -617,6 +646,9 @@ export class Compositor {
     r.finished = true;
     if (r.timer) clearTimeout(r.timer);
     r.timer = undefined;
+    // A turn that ended before its first message opened gets one final message.
+    if (r.openTimer) clearTimeout(r.openTimer);
+    r.openTimer = undefined;
     this.enqueue(r, async () => {
       const msg = this.render(r);
       const d = { operationId: `${this.base(r)}:final`, sessionKey: this.o.sessionKey, turnId: r.view.turnId, route: r.route };
