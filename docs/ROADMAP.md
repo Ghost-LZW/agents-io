@@ -67,6 +67,11 @@ agents-io 要在任何通道、任何模态上给出同样的可信度，健壮�
 8. **live 录音挂点**：音频不经过 agents-io，日志只有转写；加可选挂点让通道或 harness 把音轨落成 blob 挂到 `live.*` 事件上，默认关闭。
 9. **lane `control` 命令**：`set_model`、切换 harness 实例（现返回 `unsupported`）。
 
+### 下一个 session 先做
+
+- **live 录音挂点**（下面第 8 项）：归 live 这一块。通道的媒体对端或 harness 把音轨落成 blob，挂到 `live.*` 事件上，默认关闭；同时作为宿主自己判定说话人（如按主人音色）的音频入口。
+- **测试泄漏子进程**：`console.e2e.test.ts` / `live-channels-helpers.ts` 用到的 `fake-create-lark-bot.mjs` 在测试结束后仍在运行（2026-10-13 发现两个残留进程）。补一条不变量：测试和守护进程停止后不留子进程。
+
 ### 之后
 
 10. **对外 MCP 端点**：外部 agent 用同一组通信原语。
