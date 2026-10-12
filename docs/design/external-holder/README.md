@@ -1,6 +1,6 @@
 # 外部持有的会话：原生 TUI 与宿主自己拉起的 agent 接入 agents-io
 
-> 状态：草案（2026-10-13），待 owner 拍板 §9。
+> 状态：已采纳（2026-10-13，决定 15：§9 四项按推荐）。§5、§6 已按两次实测修订（§10）。
 > 依据：`docs/POSITIONING.md` §3（"只要观察"用法）；`docs/design/locus/DECISIONS.md` 总体方向（"agents-io 是唯一拉起 harness 的地方"）、决定 12；`docs/ROADMAP.md` §0、原则 1、2；`docs/research/claude-code.md` §3、§5、§6；`docs/design/thin-bridge.md` §5（`codex --remote`）。
 
 ## 1. 一句话
@@ -42,8 +42,8 @@ type Holder =
 
 | 持有者 | 注入口 | 运行中 | 空闲时 | 需要核实 |
 |---|---|---|---|---|
-| Codex TUI | agents-io 作为同一 app-server thread 的另一个客户端（Codex 原生多客户端） | `turn/steer` | `turn/start` | `codex --remote` 挂上 agents-io 自己起的 app-server；空 thread 没有 rollout 时能否 resume（botmux 实测不能，需要先跑一轮） |
-| Claude TUI | ① cross-session inbox socket（`CLAUDE_CODE_MESSAGING_SOCKET`，交互模式默认就有）；② Channels（`notifications/claude/channel`） | 在工具调用之间读到 | 新开一轮 | ① 帧格式文档没写全；② 自研 channel 需要 `--dangerously-load-development-channels` 或进 allowlist，还要确认当前版本是否仍是 research preview |
+| Codex TUI | agents-io 作为同一 app-server thread 的另一个客户端（Codex 原生多客户端） | `turn/steer { expectedTurnId }` | `turn/start` | 已实测（§10.1） |
+| Claude TUI | cross-session inbox socket，由 TUI 拉起的 agents-io stdio MCP 子进程用继承的 `CLAUDE_CODE_MESSAGING_TOKEN` 写入 | 在工具调用之间读到（同一轮） | 新开一轮 | 已实测（§10.2）；Channels 在本机登录方式下不可用，不用 |
 | 宿主拉起 | 宿主自己决定 | — | — | — |
 
 - Codex 侧的大部分机制已经有了：`harness/codex` 会把别的客户端开的轮次映射成 `turn.started{initiator:'foreign'}`（`harness/codex/src/session.ts` `foreignTurn`），过程、审批、结束都正常进日志。缺的是"agents-io 不开 lane、只当一个客户端"的启动方式，以及给人用的入口 `aio tui codex [session]`：确保 app-server 和 thread 存在，然后 exec `codex --remote … resume <threadId>`。
@@ -55,11 +55,11 @@ type Holder =
 - **回复**：外部 harness 里的 agent 调 host-mcp 现有的 `reply_to` / `send_message` / `send_file`。这些调用照常经过 outbox（幂等、`delivery.settled`）、`Policy.outbound`、身份随附（`as`），`aio explain` 能从发出的消息追溯到触发它的输入。默认目的地是最近一条渠道输入的回复路由，和 lane 里"回到来源"一致。
 - **过程（给飞书上的对方看的卡片 / CoT）**：
   - Codex：agents-io 本来就是 thread 上的客户端，事件流完整，渲染方式和 lane 一样。人在 TUI 里自己敲的轮次没有回复路由，所以不会出现在任何渠道上，只留在日志里。
-  - Claude：交互式 TUI 不对外给事件流。v1 用 hooks（`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`Stop`，以 http hook 发给本地 socket）得到工具时间线和轮次边界，回答文字以 `reply_to` 的内容为准。可选 v2：读 transcript JSONL（hooks 输入里带 `transcript_path`）补上 thinking 和文字。日志里用 `session.bound{ fidelity: 'hooks' | 'transcript' | 'native' }` 记下这一路过程的完整程度，投影据此知道自己缺了什么（ROADMAP 原则 1）。
+  - Claude：交互式 TUI 不对外给事件流。v1 用 http hooks（`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`Stop`，发给守护进程的本机端口）得到工具时间线和轮次边界；`Stop` 带 `last_assistant_message`，就是这一轮的回答。可选 v2：读 transcript JSONL（hooks 输入里带 `transcript_path`）补上 thinking 和文字。日志里用 `session.bound{ fidelity: 'hooks' | 'transcript' | 'native' }` 记下这一路过程的完整程度，投影据此知道自己缺了什么（ROADMAP 原则 1）。
   - 配合 `look: chat` 和 `cotOn: tool`，对方通常只看到回答；有工具调用时，才出现一个折叠的 CoT。
 - **审批**：
   - Codex：app-server 把请求广播给所有客户端，TUI 和飞书按钮都能答，先到的生效（`serverRequest/resolved`）。这和现有的 RQ-1 一致。
-  - Claude：Channels 的 permission relay（声明 `claude/channel/permission`）同样是终端对话框和远端同时生效、先到为准。没有启用 Channels 时，审批只在 TUI 里出现。人就在电脑前，这样也合理。
+  - Claude：`PermissionRequest` hook（http）挂住不答，守护进程开一个 `request.opened`，飞书按钮或 TUI 对话框先答者生效：TUI 先答时 hook 的迟到答复被忽略（已实测）。不需要 Channels。
 
 ## 7. 不变量增补（草案）
 
@@ -85,3 +85,21 @@ type Holder =
 2. **`whenAway` 默认值**：推荐 `lane`（离开电脑后由机器人接着处理，上下文连续）；`queue` 适合"我不在时谁也别动这个对话"。
 3. **"离开"怎么判定**：推荐只看 TUI 进程是否退出（可靠、可解释）。按空闲时长判定先不做：TUI 开着但人走开时，Claude 的会话只能有一个写者，lane 没法接手。
 4. **S1 和 S2 的先后**：推荐先做 S1（Codex 原生多客户端，代码里大部分已经有了），再做 S2。
+
+## 10. 实测记录（2026-10-13）
+
+### 10.1 Codex（codex-cli 0.160.1）
+
+- `codex app-server --listen unix:///abs.sock`；TUI：`codex -c check_for_update_on_startup=false --remote unix:///abs.sock resume <threadId>`（不关更新检查时，更新对话框会挡住挂接）。unix socket 没有 token，只靠文件权限（`harness/codex/src/unix.ts` `assertPrivateSocket`）。
+- **空 thread 不能 resume**：`thread/start` 之后 rollout 文件并未写出，`thread/resume` 与 TUI 都报 `no rollout found`。`thread/inject_items`（一条 developer 消息，不调模型）写出 rollout，之后 TUI 能挂上。最后一个订阅者断开约 60 秒后 thread 卸载，没有 rollout 的 thread 就丢了。所以 agents-io 在交出前要先 inject，并在持有期间一直订阅。
+- 双向可见：agents-io 的 `turn/start` 在 TUI 里显示为用户输入加回答；TUI 里敲的轮次以 `turn/started`、`item/*`、`turn/completed` 到 agents-io，`clientId` 不是我们的，走 `foreignTurn`。`turn/steer` 在 TUI 的轮次里生效（工具调用后插入），必须带 `expectedTurnId`。
+- 未核实：审批在两个客户端之间先到为准（只有假服务器测试）；TUI 自己的 `thread/resume` 是否用它的配置覆盖 thread 的审批、沙箱、模型设置（决定 11 的档位依赖它）。
+
+### 10.2 Claude Code（2.1.296）
+
+- **inbox socket**：交互模式与 `-p` 默认都有（`--bare` 除外），路径默认 `/tmp/cc-socks/<pid>.sock`；隐藏参数 `--messaging-socket-path <abs>` 可固定（目录须 0700）。帧：每行一个 JSON，`{"type":"auth","token":…}`（可选）后接 `{"type":"user","message":{"role":"user","content":"…"},"from":"agents-io","session_id":"<uuid>"}`；`session_id` 不符则丢弃。**没有回执**。
+- **谁能送进去**：TUI 的子进程（我们的 stdio MCP server，继承 `CLAUDE_CODE_MESSAGING_SOCKET` / `_TOKEN`）带 token 写入，任何权限模式都直接送达，transcript 记 `origin.kind: "peer"`。外部进程不带 token 时，bypass 模式下会被挂起等 TUI 里确认。
+- **模型看到的**：`Another Claude session sent a message:` 加正文，再加一段提示（不是用户本人、不能批准、不能改配置）；`from` 不显示；斜杠命令不执行。所以注入的文字要自带来源行（与 lane 相同的前言）。
+- **hooks**：33 种事件；`type: "http"` 可用（`SessionStart` 只能用 command / mcp_tool）。所有输入带 `session_id`、`transcript_path`、`cwd`、`prompt_id`、`permission_mode`。`Stop` 带 `last_assistant_message`。`UserPromptSubmit` 对注入的消息也触发（无来源字段，按正文里的 `ref=` 对上，作为送达回执）。`PermissionRequest` 可挂住答复，与终端对话框先到为准；中断后 `Stop` 不触发。
+- **只对这一次启动生效**：`--settings <file>`（hooks 与用户自己的合并）加 `--mcp-config <file> --strict-mcp-config`，不改用户设置。`--session-id <uuid>` 预先指定会话 id，之后 `--resume <uuid>` 可用。
+- Channels：仍是 research preview，自研 server 要 `--dangerously-load-development-channels`；本机（经 `ANTHROPIC_BASE_URL` 登录）提示 "Channels are not currently available"。不用。
