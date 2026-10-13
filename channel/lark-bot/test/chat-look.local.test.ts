@@ -17,17 +17,25 @@ describe('chat look', () => {
     expect(FakeLark.element(final, 'answer').content).toBe('Found a.ts and more.');
   });
 
-  it('while running the status and footer stay empty; a waiting approval and a failure are said', async () => {
+  it('keeps the running card compact, then adds status for approval and failure', async () => {
     const { lark, adapter } = make({ process: 'cot', look: 'chat' });
     const t = turn();
     const { providerMessageId: id } = await adapter.send(route, t.msg(), { operationId: 'o' });
     const card = cardOf(lark, id!);
     expect(card.json.header).toBeUndefined();
-    expect(FakeLark.element(card.json, 'status').content).toBe(' ');
-    expect(FakeLark.element(card.json, 'footer').content).toBe(' ');
+    expect(ids(card.json)).toEqual(['answer']);
+    expect(card.json.config.streaming_config).toMatchObject({
+      print_frequency_ms: { default: 50 },
+      print_step: { default: 1 },
+    });
     t.p.status = 'requires_action';
-    await adapter.edit(route, id!, t.msg({ sections: [{ kind: 'status', text: 'Approval needed: Bash' }] }), { operationId: 'e1', sequence: 1 });
+    await adapter.edit(route, id!, t.msg({
+      sections: [{ kind: 'status', text: 'Approval needed: Bash' }],
+      actions: [{ id: 'allow:bash', label: 'Allow', style: 'primary' }],
+    }), { operationId: 'e1', sequence: 1 });
     expect(FakeLark.element(card.json, 'status').content).toContain('Approval needed: Bash');
+    expect(ids(card.json).slice(0, 2)).toEqual(['status', 'answer']);
+    expect(ids(card.json).at(-1)).toMatch(/^act_/);
     t.p.status = 'failed';
     await adapter.finalize(route, id!, t.msg());
     await adapter.settled();
@@ -40,6 +48,7 @@ describe('chat look', () => {
     const { providerMessageId: id } = await adapter.send(route, turn().msg({ channelData: { 'agents-io/topic': { title: 'Flaky test' } } }), { operationId: 'o' });
     const header = cardOf(lark, id!).json.header;
     expect(header.title.content).toBe('Flaky test');
+    expect(header.template).toBe('blue');
     expect(header.subtitle).toBeUndefined();
   });
 });

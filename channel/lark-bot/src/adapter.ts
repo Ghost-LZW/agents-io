@@ -999,14 +999,18 @@ export class LarkBotAdapter implements ChannelAdapter {
       st.actions = st.actions.filter((a) => a !== gone);
     }
     for (const a of m.actions.filter((x) => !st.actions.includes(x.id))) {
-      await card.createElements([actionElement(a)], { type: 'insert_before', target: EL.footer });
+      await card.createElements([actionElement(a)], st.sent.get(EL.footer)
+        ? { type: 'insert_before', target: EL.footer }
+        : { type: 'append' });
       st.actions.push(a.id);
     }
     const statusChanged = st.sent.get(EL.status) !== m.banner;
     if (!statusChanged && this.now() - st.lastAuxAt < this.cfg.streamAuxIntervalMs) return;
     st.lastAuxAt = this.now();
     if (statusChanged) {
-      await card.updateElement(EL.status, statusElement(m));
+      if (!st.sent.get(EL.status)) await card.createElements([statusElement(m)], { type: 'insert_before', target: EL.answer });
+      else if (!m.banner) await card.deleteElement(EL.status);
+      else await card.updateElement(EL.status, statusElement(m));
       st.sent.set(EL.status, m.banner);
     }
     for (const panel of m.panels) {
@@ -1015,7 +1019,9 @@ export class LarkBotAdapter implements ChannelAdapter {
       st.sent.set(EL.panelBody(panel.key), panel.body);
     }
     if (st.sent.get(EL.footer) !== m.footer) {
-      await card.updateElement(EL.footer, footerElement(m));
+      if (!st.sent.get(EL.footer)) await card.createElements([footerElement(m)], { type: 'append' });
+      else if (!m.footer) await card.deleteElement(EL.footer);
+      else await card.updateElement(EL.footer, footerElement(m));
       st.sent.set(EL.footer, m.footer);
     }
   }

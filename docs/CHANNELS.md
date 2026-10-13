@@ -172,7 +172,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 - **装饰**：`config.style` 可选 `emoji`（默认，带状态和面板图标）或 `plain`（只用文字，状态由标题颜色表示）。
 - **像人一样回复**（守护进程的飞书通道默认启用，配置见 `channel/lark-bot/README.md` "Reply timing in the daemon"）：
   - 通道条目上的 `openDelayMs` 默认 5000、`previewDelayMs` 默认 2000：短回复完成后直接发最终消息；答案片段不会让卡片提前出现。其他通道不采用这两个默认值；
-  - `config.look: "chat"` 默认启用：卡片只放答案，不带标题、状态行和耗时页脚，只有在等审批、失败、中断时才显示一行状态；
+  - `config.look: "chat"` 默认启用：卡片以答案为主体，不留空的状态行和页脚；话题标题用蓝色标题栏，只有在等审批、失败、中断时才显示一行状态；
   - `config.cotOn: "tool"`：第一次调用工具时才打开思维链气泡，只思考、直接回答的轮次没有气泡；
   - `config.processByChat`：私聊和群分别设置 `process`，例如群里设 `"off"`。
   - 通道条目上的 `ack`：收到的消息上点一个表情（默认 `OnIt`），这一轮回复了就撤掉；回复晚于 `doneAfterMs`（默认 60 秒）或这条消息没有单独的回复（并进别的轮、插话）时换成 `DONE`；没完成或被拒换成 `CrossMark`。表情类型可用 `config.ackEmoji` 改，需要 `im:message.reactions:write_only` 权限。

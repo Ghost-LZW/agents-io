@@ -255,7 +255,7 @@ export function buildModel(msg: RenderedMessage, p: ProgressView, o: ModelOption
     header: !chat || topic !== undefined,
     title: topic ?? t.status[status],
     ...(topic !== undefined && !chat ? { subtitle: t.status[status] } : {}),
-    template: chat ? 'default' : TEMPLATE[status],
+    template: chat ? 'blue' : TEMPLATE[status],
     summary: clip(oneLine(done ? full || t.status[status] : current), 60),
     banner,
     panels,
@@ -268,7 +268,7 @@ export function buildModel(msg: RenderedMessage, p: ProgressView, o: ModelOption
 
 const md = (id: string, content: string, extra: Record<string, unknown> = {}) => ({ tag: 'markdown', element_id: id, content, ...extra });
 
-// An empty status or footer still has its element on a streaming card: panels and buttons are inserted next to them.
+// Status and footer appear only when they have content; chat cards stay body-first and compact.
 export function statusElement(m: ProcessModel) {
   return md(EL.status, m.banner || ' ', { text_size: 'notation' });
 }
@@ -314,21 +314,20 @@ export function actionElement(a: NonNullable<RenderedMessage['actions']>[number]
 
 /** Typewriter tuning for CardKit streaming mode (per platform). */
 export const STREAMING_CONFIG = {
-  print_frequency_ms: { default: 30, android: 25, ios: 40, pc: 50 },
-  print_step: { default: 2, android: 3, ios: 4, pc: 5 },
-  print_strategy: 'fast',
+  print_frequency_ms: { default: 50 },
+  print_step: { default: 1 },
 };
 
 /** Card JSON 2.0 for the model. `streaming` turns on CardKit streaming mode (CardKit cards only). */
 export function processCard(m: ProcessModel, o: { streaming?: boolean } = {}): Record<string, unknown> {
-  const elements: unknown[] = m.banner || o.streaming ? [statusElement(m)] : [];
+  const elements: unknown[] = m.banner ? [statusElement(m)] : [];
   elements.push(md(EL.answer, m.answer));
   for (const k of PANEL_ORDER) {
     const p = m.panels.find((x) => x.key === k);
     if (p) elements.push(panelElement(p));
   }
   for (const a of m.actions) elements.push(actionElement(a));
-  if (m.footer || o.streaming) elements.push(footerElement(m));
+  if (m.footer) elements.push(footerElement(m));
   return {
     schema: '2.0',
     config: {
