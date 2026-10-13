@@ -1,6 +1,9 @@
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { splitMarkdown } from '../src/index.js';
-import { FakeLark } from './fake-lark.js';
+import { FakeLark, startAdapter } from './fake-lark.js';
 import { cardOf, make, route, run, turn } from './process-helpers.js';
 
 /* CardKit streaming, degradation and thinking-bubble rendering: feature paths with no promise behind them
@@ -320,3 +323,54 @@ describe('thinking bubble: long content', () => {
     expect(logs.some((l) => l.includes('sent shortened'))).toBe(true);
   });
 });
+
+describe('thinking bubbles left open by a restart', () => {
+  it('an open bubble is recorded under stateDir and forgotten once settled', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'aio-lark-state-'));
+    try {
+      const { lark, adapter } = make({ process: 'cot' }, undefined, { stateDir: dir });
+      const t = turn();
+      t.p.steps.push({ kind: 'reasoning', id: 'r0', text: 'hmm', done: false });
+      const { providerMessageId: id } = await adapter.send(route, t.msg(), { operationId: 'o' });
+      await adapter.settled();
+      expect(readdirSync(join(dir, 'open-bubbles'))).toHaveLength(1);
+      t.p.status = 'completed';
+      await adapter.finalize(route, id!, t.msg());
+      await adapter.settled();
+      expect(readdirSync(join(dir, 'open-bubbles'))).toHaveLength(0);
+      expect(lark.cots).toHaveLength(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('the next process closes it at start, as finished with a line saying why, not failed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'aio-lark-state-'));
+    try {
+      const lark = new FakeLark();
+      const first = make({ process: 'cot' }, lark, { stateDir: dir }).adapter;
+      const t = turn();
+      t.p.steps.push({ kind: 'reasoning', id: 'r0', text: 'working on it', done: false });
+      await first.send(route, t.msg(), { operationId: 'o' });
+      await first.settled(); // the process stops here, mid-turn
+
+      const second = make({ process: 'cot' }, lark, { stateDir: dir }).adapter;
+      const run = startAdapter(second);
+      await waitFor(() => lark.cots[0]!.completed === 'finished');
+      expect(lark.cots[0]!.events.map((e) => e.event_type).slice(-2)).toEqual(['REASONING_END', 'RUN_FINISHED']);
+      expect(JSON.stringify(lark.cots[0]!.events)).toContain('重启');
+      expect(readdirSync(join(dir, 'open-bubbles'))).toHaveLength(0);
+      run.ctl.abort();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+async function waitFor(cond: () => boolean, ms = 2000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error('timed out');
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}

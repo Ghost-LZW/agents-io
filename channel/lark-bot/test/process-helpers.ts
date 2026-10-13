@@ -1,5 +1,5 @@
 import type { ProgressView, RenderedMessage, ReplyRoute } from '@agents-io/protocol';
-import { LarkBotAdapter, type LarkBotConfig } from '../src/index.js';
+import { LarkBotAdapter, type LarkBotConfig, type LarkBotOptions } from '../src/index.js';
 import { FakeLark } from './fake-lark.js';
 
 /* Shared by process.test.ts (core) and process.local.test.ts. */
@@ -14,9 +14,9 @@ export const cfg = {
 };
 export const route: ReplyRoute = { channel: 'lark-bot', account: 'acct', conversationId: 'oc_chat', replyToMessageId: 'om_in1' };
 
-export function make(config: Partial<LarkBotConfig> = {}, lark = new FakeLark()) {
+export function make(config: Partial<LarkBotConfig> = {}, lark = new FakeLark(), opts: Partial<LarkBotOptions> = {}) {
   const logs: string[] = [];
-  const adapter = new LarkBotAdapter({ ...cfg, ...config }, { deps: lark.deps, sleep: async () => {}, log: (l, m) => logs.push(`${l}: ${m}`) });
+  const adapter = new LarkBotAdapter({ ...cfg, ...config }, { deps: lark.deps, sleep: async () => {}, log: (l, m) => logs.push(`${l}: ${m}`), ...opts });
   return { lark, adapter, logs };
 }
 
