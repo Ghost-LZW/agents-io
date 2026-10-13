@@ -95,6 +95,23 @@ describe('commands', () => {
     await until(() => w.gw.sessions().every((s) => s.state !== 'running'));
   });
 
+  it('/stop with nothing running says so; it stops a turn still running in an earlier topic of the chat #CT-2 #CT-1', async () => {
+    const w = await setup({
+      script: async (t) => {
+        await new Promise<void>((resolve) => t.signal.addEventListener('abort', () => resolve()));
+      },
+    });
+    await w.say('/stop');
+    await until(() => w.replies().includes('Nothing is running.'));
+    await w.say('long job');
+    await until(() => w.gw.sessions().some((s) => s.state === 'running'));
+    await w.say('/new something else');
+    await until(() => w.replies().some((t) => t.startsWith('New topic')));
+    await w.say('/stop'); // e.g. the Stop of the first topic's thinking bubble
+    await until(() => w.replies().some((t) => t === 'Stopped (in another topic of this chat).'));
+    await until(() => w.gw.sessions().every((s) => s.state !== 'running'));
+  });
+
   it('with a fixed owner session, topic and agent commands say why they do nothing #CT-2', async () => {
     const w = await setup({ fixed: true });
     await w.say('/new @coder x');

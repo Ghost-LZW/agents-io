@@ -2423,6 +2423,11 @@ ${a.summary}` }],
         const r = await this.command({ type: 'interrupt', sessionKey, ...(clear ? { cancelQueue: true } : {}) }, origin);
         return r.ok ? { ok: true } : { ok: false, reason: r.code };
       },
+      running: (conversation) =>
+        this.topics
+          .list({ conversation })
+          .map((t) => t.sessionKey)
+          .filter((k) => !!this.lanes.get(k)?.activeTurn()),
       input: async (d, input, mode) => {
         const lane = await this.laneAfterClose(d.sessionKey, d.agent, d.launch);
         return lane.command({ type: 'input', sessionKey: d.sessionKey, input, mode });
