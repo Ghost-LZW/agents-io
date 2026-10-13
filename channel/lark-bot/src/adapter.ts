@@ -1,3 +1,5 @@
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type {
   AckState,
   BlobStore,
@@ -15,7 +17,7 @@ import type {
 import { routeKey } from '@agents-io/protocol';
 import { CardKitCard, LarkApiError, errCode } from './cardkit.js';
 import { resolveConfig, type LarkBotConfig, type ProcessMode, type ResolvedConfig } from './config.js';
-import { CotBubble } from './cot.js';
+import { CotBubble, closeOpenBubble, type OpenBubble } from './cot.js';
 import { InboundEnricher } from './enrich.js';
 import { CHANNEL_ID, mapCardAction, mapMessageEvent } from './inbound.js';
 import {
@@ -63,6 +65,11 @@ export interface LarkBotOptions {
   deps?: LarkDeps;
   /** Where declared senders are recorded. Default: bounded in-memory. */
   store?: DeclaredSenderStore;
+  /**
+   * A directory of this adapter's own (0700): thinking bubbles still open are recorded there, so
+   * a restarted process closes the ones the previous one left spinning. Default: none (they spin).
+   */
+  stateDir?: string;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   /** Where degradations are reported before `start()` supplies the host's logger. */
@@ -157,6 +164,7 @@ export class LarkBotAdapter implements ChannelAdapter {
   private readonly cotOff = new Map<string, number>();
   private readonly cotTasks = new Set<Promise<void>>();
   private blobs: BlobStore | undefined;
+  private readonly stateDir: string | undefined;
   /** union_id / user_id → open_id, learned from inbound events (at tags need an open_id). */
   private readonly openIds = new Map<string, string>();
   /** blob ref → uploaded Lark key, so a retried send does not upload again. */
@@ -181,6 +189,7 @@ export class LarkBotAdapter implements ChannelAdapter {
     this.botOpenId = this.cfg.botOpenId;
     this.logFn = opts.log;
     this.blobs = opts.blobs;
+    this.stateDir = opts.stateDir;
     this.enricher = new InboundEnricher({ client: () => this.client, store: this.store, cfg: this.cfg, now: this.now, log: (l, m) => this.log(l, m) });
   }
 
@@ -227,6 +236,7 @@ export class LarkBotAdapter implements ChannelAdapter {
     this.logFn = ctx.log;
     this.blobs ??= ctx.blobs;
     if (!this.botOpenId) await this.discoverBot(ctx);
+    void this.sweepOpenBubbles();
 
     const dispatcher = this.deps.createDispatcher(this.params());
     dispatcher.register({
@@ -660,6 +670,53 @@ export class LarkBotAdapter implements ChannelAdapter {
     while (this.cotTasks.size) await Promise.all([...this.cotTasks]);
   }
 
+  // ---- bubbles left open by an earlier process ---------------------------------------------
+
+  private bubbleDir(): string | undefined {
+    return this.stateDir ? join(this.stateDir, 'open-bubbles') : undefined;
+  }
+
+  private markBubble(b: OpenBubble): void {
+    const dir = this.bubbleDir();
+    if (!dir) return;
+    try {
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(dir, `${encodeURIComponent(b.cotId)}.json`), JSON.stringify(b), { mode: 0o600 });
+    } catch (e) {
+      this.log('warn', `recording open thinking bubble ${b.cotId}: ${(e as Error).message}`);
+    }
+  }
+
+  private unmarkBubble(cotId: string): void {
+    const dir = this.bubbleDir();
+    if (dir) rmSync(join(dir, `${encodeURIComponent(cotId)}.json`), { force: true });
+  }
+
+  /** At start: close the bubbles the previous process left open (it stopped mid-turn). */
+  private async sweepOpenBubbles(): Promise<void> {
+    const dir = this.bubbleDir();
+    if (!dir) return;
+    let files: string[];
+    try {
+      files = readdirSync(dir).filter((f) => f.endsWith('.json'));
+    } catch {
+      return;
+    }
+    for (const f of files) {
+      const p = join(dir, f);
+      let b: OpenBubble | undefined;
+      try {
+        b = JSON.parse(readFileSync(p, 'utf8')) as OpenBubble;
+      } catch {
+        rmSync(p, { force: true });
+        continue;
+      }
+      const ok = await closeOpenBubble(this.client, b, { locale: this.cfg.locale, timeoutMs: this.cfg.processRequestTimeoutMs, now: this.now });
+      this.log(ok ? 'info' : 'warn', `${ok ? 'closed' : 'could not close'} thinking bubble ${b.cotId} left open by an earlier process`);
+      rmSync(p, { force: true });
+    }
+  }
+
   // ---- acknowledgements --------------------------------------------------------------------
 
   /**
@@ -779,6 +836,8 @@ export class LarkBotAdapter implements ChannelAdapter {
         now: this.now,
         log: (m) => this.log('warn', m),
         onCreateFailed: (err) => this.degrade(route, 'cot', err),
+        onOpened: (b) => this.markBubble(b),
+        onClosed: (id) => this.unmarkBubble(id),
       });
     }
     return st;

@@ -38,6 +38,7 @@ const L = {
     cotThinking: '思考中…',
     cotDone: '✓ 已完成',
     cotFailed: '✗ 失败',
+    cotRestarted: '（agents-io 重启了，这一轮后面的过程不在这里显示）',
     toolStatus: { running: '运行中', completed: '', failed: '失败', declined: '已拒绝', skipped: '已跳过' },
   },
   en: {
@@ -54,6 +55,7 @@ const L = {
     cotThinking: 'Thinking…',
     cotDone: '✓ Done',
     cotFailed: '✗ Failed',
+    cotRestarted: '(agents-io restarted; the rest of this turn’s process is not shown here)',
     toolStatus: { running: 'running', completed: '', failed: 'failed', declined: 'declined', skipped: 'skipped' },
   },
 } as const;
@@ -239,7 +241,8 @@ export function buildModel(msg: RenderedMessage, p: ProgressView, o: ModelOption
   let answer = pages[0] ?? '';
   const overflow = done ? pages.slice(1) : [];
   if (pages.length > 1) answer += `\n\n${done ? t.continued : t.continuing}`;
-  if (!answer) answer = done ? `_${t.status[status]}_` : '…';
+  // No answer yet while running: an empty body (the bubble or the status shows the work), not a placeholder.
+  if (!answer) answer = done ? `_${t.status[status]}_` : '';
 
   const toolCount = p.steps.filter((s) => s.kind === 'tool').length;
   const started = p.startedAt;

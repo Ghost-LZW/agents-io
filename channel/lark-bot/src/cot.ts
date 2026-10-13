@@ -45,6 +45,19 @@ export interface CotOptions {
   log: (msg: string) => void;
   /** Called once when creating the bubble failed (the adapter remembers it per chat/app). */
   onCreateFailed: (err: LarkApiError) => void;
+  /** The bubble exists and is open: what a later process needs to close it (`sweepOpenBubbles`). */
+  onOpened?: (b: OpenBubble) => void;
+  /** The bubble is closed (settled or failed): it no longer needs closing. */
+  onClosed?: (cotId: string) => void;
+}
+
+/** A bubble left open, as recorded to close it after a restart. */
+export interface OpenBubble {
+  cotId: string;
+  messageId: string;
+  /** AG-UI thread and run ids it was started with (RUN_FINISHED must match them). */
+  threadId: string;
+  runId: string;
 }
 
 const ICONS: Record<Extract<ProgressStep, { kind: 'tool' }>['type'], string> = {
@@ -230,7 +243,10 @@ export class CotBubble {
           events.push(this.ev('RUN_FINISHED', { threadId: this.o.route.conversationId, runId: this.o.turnId, status: p.status === 'completed' ? 'done' : 'interrupted' }));
         }
         await this.put(events);
-        if (final) this.state = 'settled';
+        if (final) {
+          this.state = 'settled';
+          this.o.onClosed?.(this.cotId!);
+        }
       }
     } catch (err) {
       await this.fail(err);
@@ -248,7 +264,10 @@ export class CotBubble {
     this.state = 'failed';
     this.o.log(`thinking bubble off for turn ${this.o.turnId}: ${e.message}`);
     if (!wasCreated) this.o.onCreateFailed(e);
-    else await this.complete('error').catch(() => undefined);
+    else {
+      await this.complete('error').catch(() => undefined);
+      this.o.onClosed?.(this.cotId!);
+    }
   }
 
   private firstMid(): string {
@@ -274,6 +293,7 @@ export class CotBubble {
     this.cotId = cotId;
     this.messageId = messageId;
     this.state = 'live';
+    this.o.onOpened?.({ cotId, messageId, threadId: this.o.route.conversationId, runId: this.o.turnId });
   }
 
   private async put(events: CotEvent[]): Promise<void> {
@@ -378,5 +398,45 @@ export class CotBubble {
       }
     });
     return out;
+  }
+}
+
+/**
+ * Close a bubble an earlier process left open (it was running a turn when the daemon stopped, and
+ * nobody here knows it): a closing line, then RUN_FINISHED with its own ids so Lark settles it as
+ * finished rather than failed; the explicit completion when that is refused. Never throws.
+ */
+export async function closeOpenBubble(client: LarkClientLike, b: OpenBubble, o: { locale: Locale; timeoutMs: number; now: () => number }): Promise<boolean> {
+  const ev = (type: string, content: unknown): CotEvent => ({ event_type: type, content: JSON.stringify(content), timestamp: o.now() });
+  const mid = `rs-restart-${b.runId}`;
+  try {
+    await call('message_cot.append', o.timeoutMs, async () =>
+      (await client.request({
+        method: 'PUT',
+        url: COT_URL,
+        data: {
+          cot_id: b.cotId,
+          message_id: b.messageId,
+          events: [
+            ev('REASONING_MESSAGE_START', { messageId: mid, role: 'reasoning' }),
+            ev('REASONING_MESSAGE_CONTENT', { messageId: mid, delta: labels(o.locale).cotRestarted }),
+            ev('REASONING_MESSAGE_END', { messageId: mid }),
+            ev('REASONING_END', { messageId: mid }),
+            ev('RUN_FINISHED', { threadId: b.threadId, runId: b.runId, status: 'done' }),
+          ],
+        },
+        timeout: o.timeoutMs,
+      })) as { code?: number; msg?: string },
+    );
+    return true;
+  } catch {
+    try {
+      await call('message_cot.complete', o.timeoutMs, async () =>
+        (await client.request({ method: 'POST', url: `${COT_URL}/complete/${encodeURIComponent(b.cotId)}`, params: { message_id: b.messageId, reason: 'done' }, timeout: o.timeoutMs })) as { code?: number; msg?: string },
+      );
+      return true;
+    } catch {
+      return false;
+    }
   }
 }

@@ -1960,7 +1960,7 @@ ${a.summary}` }],
     // Each hello's id is checked against the running channels (a bridge without `id` learns its id there).
     const acceptId = (id: string) => idConflict(id, owner, cfg.account, this.channels.filter((e) => e !== entry));
     const own = this.o.channelAdapter?.(cfg);
-    const built = own ? { adapter: own, account: cfg.account, ...(cfg.tier ? { tier: cfg.tier } : {}) } : await buildChannel(cfg, index, (l, m, d) => this.log(l, m, d), onState, acceptId);
+    const built = own ? { adapter: own, account: cfg.account, ...(cfg.tier ? { tier: cfg.tier } : {}) } : await buildChannel(cfg, index, (l, m, d) => this.log(l, m, d), onState, acceptId, join(this.o.config.dataDir, 'channels'));
     return {
       ...built,
       owner,
@@ -2915,11 +2915,21 @@ async function buildChannel(
   log: (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void,
   onState?: (s: BridgeState) => void,
   acceptId?: (id: string) => string | undefined,
+  /** Under the data directory: each built-in channel account gets a directory of its own here. */
+  channelsDir?: string,
 ): Promise<{ adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }> {
   const tier = ch.tier ? { tier: ch.tier } : {};
   switch (ch.type) {
     case 'lark-bot':
-      return { adapter: new LarkBotAdapter({ ...ch.config, look: (ch.config.look ?? 'chat') as 'console' | 'chat' }), account: ch.account, ...tier };
+      return {
+        adapter: new LarkBotAdapter(
+          { ...ch.config, look: (ch.config.look ?? 'chat') as 'console' | 'chat' },
+          // Open thinking bubbles are recorded here, so a restart closes the ones left spinning.
+          channelsDir ? { stateDir: join(channelsDir, `lark-bot.${encodeURIComponent(ch.account)}`) } : {},
+        ),
+        account: ch.account,
+        ...tier,
+      };
     case 'mail':
       return { adapter: new MailChannel({ ...ch.config, account: ch.account } as MailChannelConfig), account: ch.account, ...tier };
     case 'bridge': {
