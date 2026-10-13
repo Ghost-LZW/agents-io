@@ -106,6 +106,7 @@ import { DaemonRecords, type CauseRecord, type OutboundRecord } from './records.
 import { checkLaunch, launchView, sameLaunch, type LaunchCheck } from './launch.js';
 import { Runs } from './runs.js';
 import { Strangers } from './strangers.js';
+import { runCommand, type CommandHost } from './commands.js';
 import { ClaudeTuiService } from './tui-claude.js';
 import { consoleUrlPath, loadOrCreateTokenFile, removeTokenFile, TokenError, tokenPath, writeTokenFile } from './token.js';
 
@@ -564,6 +565,8 @@ export class Gateway {
       onUnavailable: (a) => this.refuseUnavailable(a.sessionKey, a.code, a.message, a.input.inputId, a.on === 'dispatch' ? a.input.replyRoute : null),
       // Our own messages back through a channel (any bot account): found by platform message id, marked self.
       recover: (channel, id) => this.recoverSend(channel, id),
+      // `/help`, `/status`, `/stop`, `/model`… from the owner, answered on the route they came from.
+      onCommand: (a) => this.command$(a),
       ...(c.policy.strangers === 'ask'
         ? {
             onAction: (a) => this.strangers?.action(a),
@@ -572,7 +575,6 @@ export class Gateway {
         : {}),
     });
     if (c.policy.strangers === 'ask') {
-      if (!c.policy.ownerSessionKey) this.log('warn', 'policy.strangers is "ask" but policy.ownerSessionKey is not set: there is no owner chat to ask in, so strangers are not asked about');
       this.strangers = new Strangers({
         db: db.db ?? new DatabaseSync(':memory:'),
         ownerRoute: () => this.ownerRoute(),
@@ -790,6 +792,12 @@ export class Gateway {
   async accept(env: InboundEnvelope, source?: EmitSource): Promise<IngressResult> {
     if (this.refusingInbound) return { accepted: false, action: 'invalid', error: GATEWAY_STOPPING };
     const r = await this.ingress.accept(env, source);
+    // The owner's own chat with the deployment (where strangers and approvals are asked), when no fixed session names it.
+    if (r.accepted && env.conversation.kind === 'dm' && env.replyRoute && (r.origin?.principal?.labels ?? []).includes('owner')) {
+      const { replyToMessageId: _r, ...route } = env.replyRoute;
+      const json = JSON.stringify(route);
+      if (this.records.flag(OWNER_DM_FLAG) !== json) this.records.setFlag(OWNER_DM_FLAG, json);
+    }
     if (r.accepted && r.origin && r.action !== 'duplicate') {
       try {
         // As stamped (evidence capped), not as claimed: hosts verify authors with it.
@@ -911,7 +919,7 @@ export class Gateway {
                 : this.harness(name),
       resumeFor: (id) => this.nativeIdOf(sessionKey, id),
       hub: this.hub,
-      policy: this.agentPolicy(agent),
+      policy: this.withRunOverride(this.agentPolicy(agent), sessionKey),
       cwd,
       ...(this.mcp && agent.tools ? { mcp: (a: { sessionKey: string; generation: number; harnessId: string }) => this.mcp!.mcpFor(a, agent.toolNames) } : {}),
       onLiveEnded: (liveId, reason) => this.liveEnded(sessionKey, liveId, reason),
@@ -2287,7 +2295,7 @@ ${a.summary}` }],
    * that never ran a turn gets a context note first, or it has no rollout to resume.
    */
   async tuiAttach(sessionKey?: string): Promise<Outcome> {
-    const key = sessionKey ?? this.o.config.local.session;
+    const key = sessionKey ?? this.ownerCurrentSession() ?? this.o.config.local.session;
     let lane: Lane;
     try {
       lane = await this.laneAfterClose(key);
@@ -2349,10 +2357,103 @@ ${a.summary}` }],
     return { ok: true, value: { sessionKey: key, harness: inst.name, nativeId: hold.nativeId, cwd, ...launch } };
   }
 
+  /** Where the owner's own chat goes now: its current topic (of the agent it talks to), without a fixed session. */
+  private ownerCurrentSession(): string | undefined {
+    const route = this.ownerRoute();
+    if (!route || this.o.config.policy.ownerSessionKey) return this.o.config.policy.ownerSessionKey;
+    const conversation = routeKey({ channel: route.channel, account: route.account, conversationId: route.conversationId });
+    const agent = this.router.conversationAgent(conversation) ?? this.o.config.defaultAgent ?? 'default';
+    return this.topics.current(conversation, agent)?.sessionKey;
+  }
+
+  /** A configured run override (`/model`, `/effort`) of one session. */
+  private runOverride(sessionKey: string): { model?: string; effort?: string } {
+    const v = this.records.flag(`run:${sessionKey}`);
+    return v ? (JSON.parse(v) as { model?: string; effort?: string }) : {};
+  }
+
+  /** The session's turns plan with its `/model` / `/effort` over the agent's. */
+  private withRunOverride(p: FullPolicy, sessionKey: string): FullPolicy {
+    return {
+      ...p,
+      plan: async (d) => {
+        const run = await p.plan(d);
+        const o = this.runOverride(sessionKey);
+        return { ...run, ...(o.model ? { model: o.model } : {}), ...(o.effort ? { effort: o.effort } : {}) };
+      },
+    };
+  }
+
+  private command$(a: Parameters<typeof runCommand>[1]): Promise<{ ok: boolean; reply: string } | undefined> {
+    return runCommand(this.commandHost, a).then(async (r) => {
+      if (r && a.env.replyRoute) {
+        await this.systemReply({ route: a.env.replyRoute, text: r.reply, operationId: `cmd:${a.input.inputId}`, sessionKey: a.delivery.sessionKey, inputId: a.input.inputId }).catch((e: Error) =>
+          this.log('warn', `command reply failed: ${e.message}`),
+        );
+      }
+      return r;
+    });
+  }
+
+  private get commandHost(): CommandHost {
+    const c = this.o.config;
+    const agentOf = (key: string) => this.laneInfo.get(key)?.agent ?? this.pickAgent(key, undefined);
+    return {
+      allowed: async (sessionKey, origin) => (await this.policy.control({ sessionKey, op: 'reset', origin })) === 'allow',
+      status: (key, d) => {
+        const info = this.sessions().find((x) => x.sessionKey === key);
+        const run = this.commandHost.run(key);
+        const topic = this.topics.bySession(key);
+        const native = this.nativeIdOf(key, run.harness);
+        return [
+          `session ${key}${topic ? ` · topic ${topic.title ?? topic.id}` : ''}`,
+          `agent ${d.agent ?? agentOf(key).name} · ${run.harness} (${run.kind}) · model ${run.model ?? 'default'}${run.effort ? ` · effort ${run.effort}` : ''}${run.overridden ? ' (set here)' : ''}`,
+          `cwd ${this.laneInfo.get(key)?.cwd ?? agentOf(key).cwd ?? c.cwd}`,
+          `state ${info?.state ?? 'not open'}${info?.turnId ? ` · turn ${info.turnId}` : ''}${info?.queued ? ` · ${info.queued} queued` : ''}${info?.pendingRequests.length ? ` · waiting on ${info.pendingRequests.length} approval(s)` : ''}`,
+          ...(native ? [`native session ${native}`] : []),
+          ...(this.claudeTui.holdOf(key)?.connected ? ['a terminal UI holds this session'] : []),
+        ].join('\n');
+      },
+      interrupt: async (sessionKey, origin, clear) => {
+        const r = await this.command({ type: 'interrupt', sessionKey, ...(clear ? { cancelQueue: true } : {}) }, origin);
+        return r.ok ? { ok: true } : { ok: false, reason: r.code };
+      },
+      input: async (d, input, mode) => {
+        const lane = await this.laneAfterClose(d.sessionKey, d.agent, d.launch);
+        return lane.command({ type: 'input', sessionKey: d.sessionKey, input, mode });
+      },
+      run: (key) => {
+        const agent = agentOf(key);
+        const inst = c.harnesses[agent.harness] ?? c.harnesses[c.defaultHarness]!;
+        const base = agentRun(agent, inst);
+        const o = this.runOverride(key);
+        const model = o.model ?? base.model;
+        const effort = o.effort ?? base.effort;
+        return { harness: inst.name, kind: inst.kind, ...(model ? { model } : {}), ...(effort ? { effort } : {}), overridden: !!(o.model || o.effort) };
+      },
+      setRun: (key, o) => {
+        const cur = this.runOverride(key);
+        const next = { ...cur };
+        if (o.model !== undefined) o.model === null ? delete next.model : (next.model = o.model);
+        if (o.effort !== undefined) o.effort === null ? delete next.effort : (next.effort = o.effort);
+        this.records.setFlag(`run:${key}`, Object.keys(next).length ? JSON.stringify(next) : undefined);
+      },
+      agents: () => {
+        const names = Object.values(c.agents).filter((a) => a.mode !== 'task').map((a) => a.name);
+        return names.length ? names : [c.defaultAgent ?? 'default'];
+      },
+      conversationAgent: (conversation) => this.router.conversationAgent(conversation),
+      setConversationAgent: (conversation, agent) => this.router.setConversationAgent(conversation, agent),
+      newTopic: (agent, conversation, title) => this.router.newTopic(agent, conversation, title !== undefined ? { title } : {}, 'user').topic.id,
+      tuiHint: (key) => `On your computer: aio tui --session ${key}  (with AIO_CONFIG set to this deployment's config)`,
+    };
+  }
+
   /** The owner's own chat with the deployment (the latest routed turn of `ownerSessionKey`), without a reply target. */
   private ownerRoute(): ReplyRoute | null {
     const key = this.o.config.policy.ownerSessionKey;
-    const r = key ? this.homeRoute(key) : null;
+    const flag = this.records.flag(OWNER_DM_FLAG);
+    const r = key ? this.homeRoute(key) : flag ? (JSON.parse(flag) as ReplyRoute) : null;
     if (!r) return null;
     const { replyToMessageId: _r, ...route } = r;
     return route;
@@ -2441,7 +2542,7 @@ ${a.summary}` }],
           content,
           replyRoute: localRoute(cmd.sessionKey),
           // Field by field: a client never sets origin, cause or channelRef; `loopGuard` is the lane's label.
-          channelContext: { channel: 'local', ...withoutKey(cmd.input.channelContext, 'loopGuard') },
+          channelContext: { channel: 'local', ...withoutKey(withoutKey(cmd.input.channelContext, 'loopGuard'), 'nativeCommand') },
         };
         const r =
           cmd.mode === 'observe'
@@ -2602,6 +2703,9 @@ function agentRun(agent: AgentConfig, inst: HarnessInstance): Omit<RunSpec, 'pro
  * instructions (Claude: appended to the preset system prompt; Codex: developer
  * instructions) over the instance's. Other adapters (tests) are used as they are.
  */
+/** `daemon_flags` key of the owner's own chat with the deployment (its latest DM route). */
+const OWNER_DM_FLAG = 'owner-dm-route';
+
 export function withAgent(a: HarnessAdapter, agent: AgentConfig, cwd: string | undefined): HarnessAdapter {
   if (!(a instanceof InstanceHarness)) return a;
   const i = a.instance;
