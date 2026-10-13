@@ -28,6 +28,8 @@ export interface CommandHost {
   allowed(sessionKey: string, origin: Origin): Promise<boolean>;
   status(sessionKey: string, delivery: RouteDelivery): string;
   interrupt(sessionKey: string, origin: Origin, clear: boolean): Promise<CommandResult>;
+  /** Sessions of this flat conversation (its topics) with a turn running, the most recent first. */
+  running(conversation: string): string[];
   /** Deliver an input to the session (the delivery's lane), with a mode. */
   input(delivery: RouteDelivery, input: InputRecord, mode: 'steer' | 'queue'): Promise<CommandResult>;
   run(sessionKey: string): { harness: string; kind: string; model?: string; effort?: string; overridden: boolean };
@@ -62,8 +64,16 @@ export async function runCommand(
       return ok(COMMAND_HELP);
     case 'status':
       return ok(h.status(key, delivery));
-    case 'stop':
-      return res(await h.interrupt(key, a.origin, args === '--clear'), args === '--clear' ? 'Stopped; the queue is cleared.' : 'Stopped.');
+    case 'stop': {
+      // Lark's thinking bubble has a Stop that sends a plain `/stop`: it may belong to a topic left
+      // running behind the current one, so with nothing running here the chat's running turn stops.
+      const others = topicConversation ? h.running(topicConversation).filter((k) => k !== key) : [];
+      const target = h.running(topicConversation ?? '').includes(key) || !others.length ? key : others[0]!;
+      const r = await h.interrupt(target, a.origin, args === '--clear');
+      if (!r.ok && /no_active_turn|stale_turn/.test(r.reason)) return ok('Nothing is running.');
+      const where = target === key ? '' : ` (in another topic of this chat)`;
+      return res(r, args === '--clear' ? `Stopped${where}; the queue is cleared.` : `Stopped${where}.`);
+    }
     case 'steer': {
       if (!args) return no('Usage: /steer <text>');
       const r = await h.input(delivery, { ...a.input, content: [{ type: 'text', text: args }] }, 'steer');
