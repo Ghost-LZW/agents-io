@@ -63,3 +63,49 @@ describe('compositor openDelayMs', () => {
     expect(channel.sent[0]!.msg.progress?.status).toBe('running');
   });
 });
+
+describe('delayed process preview', () => {
+  it('holds answer text until the card deadline and previews process earlier', async () => {
+    const hub = new Hub(new MemorySessionLog());
+    const channel = new FakeChannel('fake', defaultChannelCaps);
+    const previews: { final: boolean; steps: number }[] = [];
+    channel.previewProgress = async (_route, progress, final) => { previews.push({ final, steps: progress.steps.length }); };
+    const c = new Compositor({
+      hub, sessionKey: SESSION, adapter: channel, outbox: new Outbox({ hub, sleep: async () => {} }),
+      throttleMs: 1, previewDelayMs: 20, openDelayMs: 80, holdAnswerUntilOpen: true,
+    });
+    c.start();
+    cleanups.push(() => c.stop());
+    const append = (body: Parameters<Hub['append']>[1]['body']) => hub.append(SESSION, { ts: Date.now(), ...ev, body });
+    append({ t: 'turn.started', turnId: 't1', inputIds: [], replyRoute: R });
+    append({ t: 'text.delta', stream: 'reasoning', delta: 'Checking', });
+    append({ t: 'text.delta', stream: 'answer', delta: 'Partial answer' });
+    await until(() => previews.length > 0);
+    expect(channel.sent).toHaveLength(0);
+    expect(previews[0]).toEqual({ final: false, steps: 1 });
+    await until(() => channel.sent.length === 1);
+    expect(channel.sent[0]!.msg.progress?.status).toBe('running');
+    append({ t: 'turn.completed', turnId: 't1', status: 'completed' });
+    await until(() => channel.sent[0]!.finalized === true);
+  });
+
+  it('settles an early preview and sends only the final message', async () => {
+    const hub = new Hub(new MemorySessionLog());
+    const channel = new FakeChannel('fake', defaultChannelCaps);
+    const previews: boolean[] = [];
+    channel.previewProgress = async (_route, _progress, final) => { previews.push(final); };
+    const c = new Compositor({
+      hub, sessionKey: SESSION, adapter: channel, outbox: new Outbox({ hub, sleep: async () => {} }),
+      previewDelayMs: 10, openDelayMs: 100, holdAnswerUntilOpen: true,
+    });
+    c.start();
+    cleanups.push(() => c.stop());
+    const append = (body: Parameters<Hub['append']>[1]['body']) => hub.append(SESSION, { ts: Date.now(), ...ev, body });
+    append({ t: 'turn.started', turnId: 't1', inputIds: [], replyRoute: R });
+    await until(() => previews.length === 1);
+    append({ t: 'turn.completed', turnId: 't1', status: 'completed' });
+    await until(() => channel.sent.length === 1);
+    expect(previews).toEqual([false, true]);
+    expect(channel.sent[0]!.msg.progress?.status).toBe('completed');
+  });
+});

@@ -35,24 +35,26 @@ A message that carries `progress` (the session compositor attaches it on `card`/
 | `panels` | same, plus collapsed thinking and tool-call panels (last `processMaxEntries` entries, `processPanelMaxChars` each) | on the card |
 | `off` | the flat text/sections card | not shown |
 
-The reply card is a CardKit card in streaming mode (`cardkit:card:write`): the answer streams with the typewriter effect, other parts update on their own element ids. On failure it degrades per chat (per app for permission errors, for `degradeTtlMs`): streaming → full `card.update` → an ordinary card replaced by `im.message.patch`. Thinking-bubble failures are remembered the same way and never affect the reply card. An answer larger than the card continues in follow-up cards when the turn ends. The bubble opens with the reply card, above it, and settles with the turn (`RUN_FINISHED`); a turn whose first message is already final (it ended quickly) gets no bubble.
+The reply card is a CardKit card in streaming mode (`cardkit:card:write`): the answer appears before the collapsed process details and streams with the typewriter effect. Text updates default to 1.2 seconds apart; mutations of one card are serialized with at least 120 ms between requests. CardKit JSON defaults to a 28 KB budget. On failure it degrades per chat (per app for permission errors, for `degradeTtlMs`): streaming → full `card.update` → an ordinary card replaced by `im.message.patch`. Thinking-bubble failures are remembered the same way and never affect the reply card. An answer larger than the card continues in follow-up cards when the turn ends. The bubble can open before the reply card and settles with the turn (`RUN_FINISHED`); a turn that completes before the preview delay gets no bubble.
 
-### Quieter replies
+### Reply timing in the daemon
 
-Three settings make the bot read more like a person than a console; all default to the console behaviour above.
+The daemon waits up to 5 seconds before opening the first reply card. After 2 seconds, native CoT opens if there is reasoning text or a tool call to show. Answer text alone does not open the card early. An approval opens it immediately. A turn that finishes before the card opens gets one final reply: prose and ordinary Markdown up to one message (default 4000 characters) use text or a rich-text post; code blocks, tables and longer answers use a card. `openDelayMs` and `previewDelayMs` on the channel entry override the 5-second and 2-second defaults; `openDelayMs: 0` restores immediate cards. The daemon also defaults to `look: "chat"` unless configured otherwise.
+
+The adapter's direct-use defaults remain unchanged. These settings can be adjusted for a bot:
 
 | Setting | Effect |
 |---|---|
-| `look: 'chat'` | The card is the answer alone: no header (a topic keeps its title), no status line, no elapsed / tool-count footer, no plan once done. A status line appears only while an approval waits, or when the turn failed, was interrupted or has an unknown outcome. Buttons stay. Default `console`. |
+| `look: 'chat'` | The card is the answer alone: no header (a topic keeps its title), no status line, no elapsed / tool-count footer, no plan once done. A status line appears only while an approval waits, or when the turn failed, was interrupted or has an unknown outcome. Buttons stay. The direct adapter defaults to `console`; the daemon defaults to `chat`. |
 | `cotOn: 'tool'` | The thinking bubble opens at the turn's first tool call, so a turn that only thinks and answers shows none. A bubble opened after the reply card sits below it. Default `turn`. |
-| `look: 'chat'` (plain replies) | A reply whose first message is already its last, completed, with nothing to click (a quick answer) goes as a text message, or rich text (`post`) when it has markdown, instead of a card. |
+| `look: 'chat'` (plain replies) | A completed reply within one message, without fenced code, tables or buttons, goes as a text message or rich text (`post`). Other replies use a card. |
 | `ackEmoji: { working?, done?, failed? }` | Reactions used to acknowledge inbound messages when the daemon's channel entry sets `ack` (default `OnIt` / `DONE` / `CrossMark`). Needs `im:message.reactions:write_only`; without it a warning is logged once and there are none. |
 | `processByChat: { dm?, group? }` | `process` per kind of chat, e.g. `{ "group": "off" }` for no process at all in groups. A chat's kind is learnt from its messages; a chat the bot has not heard from uses `process`. |
 
-With the daemon's `openDelayMs` on the channel entry (the compositor holds each turn's first message: answer text or an approval opens it earlier, a turn that ends within it gets one final message), a quick reply arrives as one message and a bubble opened at the first tool call usually still sits above the card:
+For example, to open CoT only on tool calls and disable process rendering in groups:
 
 ```jsonc
-{ "type": "lark-bot", "openDelayMs": 3000, "ack": true, "config": { "look": "chat", "cotOn": "tool", "processByChat": { "group": "off" } } }
+{ "type": "lark-bot", "ack": true, "config": { "cotOn": "tool", "processByChat": { "group": "off" } } }
 ```
 
 Buttons in `actions` (approvals, and the stop button `turn:<turnId>:interrupt` when the compositor runs with `interruptButton: true`) come back as `action` events, which `Ingress` turns into `resolve` / `interrupt` commands.

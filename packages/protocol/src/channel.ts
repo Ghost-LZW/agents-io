@@ -186,6 +186,8 @@ export interface ChannelAdapter {
   /** Runs until ctx.signal aborts. Must reconnect on its own and never throw for transient errors. */
   start(ctx: ChannelContext): Promise<void>;
   send(route: ReplyRoute, msg: RenderedMessage, op: SendOp): Promise<SendResult>;
+  /** Cosmetic process preview before the first reply message; `final` settles it if the turn ends early. */
+  previewProgress?(route: ReplyRoute, progress: ProgressView, final: boolean): Promise<void>;
   edit?(route: ReplyRoute, providerMessageId: string, msg: RenderedMessage, op: SendOp & { sequence: number }): Promise<void>;
   finalize?(route: ReplyRoute, providerMessageId: string, msg: RenderedMessage): Promise<void>;
   retract?(route: ReplyRoute, providerMessageId: string, outcome: string): Promise<void>;

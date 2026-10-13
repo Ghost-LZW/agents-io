@@ -51,6 +51,8 @@ export class FakeLark {
   readonly users = new Map<string, { name: string }>();
   /** Calls of the inbound lookups, e.g. `resource:om_1/img_1:image`, `get:om_p`, `user:on_alice:union_id`. */
   readonly lookups: string[] = [];
+  /** Longest event content `message_cot` takes (UTF-8 bytes); Lark's real limit is not documented. */
+  cotContentMax = Infinity;
   /** Reactions on messages, live ones only: `messageId:emoji` by reaction id. */
   readonly reactions = new Map<string, string>();
   wsStarts = 0;
@@ -162,6 +164,8 @@ export class FakeLark {
       if (!rec) return { code: 230002, msg: 'cot not found' };
       if (rec.completed) return { code: 230099, msg: 'COT already in terminal state' };
       if (opts.data.events.length > 50) return { code: 99992402, msg: 'too many events' };
+      const long = opts.data.events.findIndex((e: { content: string }) => Buffer.byteLength(e.content) > this.cotContentMax);
+      if (long >= 0) return { code: 10001, msg: `Your request contains an invalid request parameter, ext=AppendCOTEvents: event[${long}] content too long` };
       for (const e of opts.data.events) {
         rec.events.push({ event_type: e.event_type, content: JSON.parse(e.content) });
         if (e.event_type === 'RUN_FINISHED') rec.completed = 'finished';

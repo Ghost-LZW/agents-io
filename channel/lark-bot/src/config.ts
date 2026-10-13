@@ -70,11 +70,11 @@ export interface LarkBotConfig {
   processMaxEntries?: number;
   /** Characters per panel body. Default 3000. */
   processPanelMaxChars?: number;
-  /** Minimum gap between answer (typewriter) updates of a streaming card. Default 600. */
+  /** Minimum gap between answer (typewriter) updates of a streaming card. Default 1200. */
   streamTextIntervalMs?: number;
   /** Minimum gap between status/panel/footer updates of a streaming card (status changes skip it). Default 1500. */
   streamAuxIntervalMs?: number;
-  /** Largest CardKit card JSON (UTF-8 bytes); a longer answer continues in follow-up messages. Default 100000. */
+  /** Largest CardKit card JSON (UTF-8 bytes); a longer answer continues in follow-up messages. Default 28000. */
   maxCardKitBytes?: number;
   /** How long a failed CardKit level or thinking bubble is remembered per chat (per app for permission errors). Default 1800000 (30 min). */
   degradeTtlMs?: number;
@@ -137,9 +137,9 @@ export function resolveConfig(c: LarkBotConfig): ResolvedConfig {
     style: c.style ?? 'emoji',
     processMaxEntries: c.processMaxEntries ?? 8,
     processPanelMaxChars: c.processPanelMaxChars ?? 3000,
-    streamTextIntervalMs: c.streamTextIntervalMs ?? 600,
+    streamTextIntervalMs: c.streamTextIntervalMs ?? 1200,
     streamAuxIntervalMs: c.streamAuxIntervalMs ?? 1500,
-    maxCardKitBytes: c.maxCardKitBytes ?? 100_000,
+    maxCardKitBytes: c.maxCardKitBytes ?? 28_000,
     degradeTtlMs: c.degradeTtlMs ?? 1_800_000,
     processRequestTimeoutMs: c.processRequestTimeoutMs ?? 15_000,
     mediaMaxBytes: c.mediaMaxBytes ?? 20 * 1024 * 1024,

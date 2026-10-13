@@ -12,6 +12,7 @@ import type {
   SendOp,
   SendResult,
 } from '@agents-io/protocol';
+import { routeKey } from '@agents-io/protocol';
 import { CardKitCard, LarkApiError, errCode } from './cardkit.js';
 import { resolveConfig, type LarkBotConfig, type ProcessMode, type ResolvedConfig } from './config.js';
 import { CotBubble } from './cot.js';
@@ -142,6 +143,8 @@ export class LarkBotAdapter implements ChannelAdapter {
   private readonly lastPatchAt = new Map<string, number>();
   private readonly lastSeq = new Map<string, number>();
   private readonly procs = new Map<string, ProcState>();
+  /** Process state opened before the reply card, keyed by route and turn. */
+  private readonly previews = new Map<string, ProcState>();
   /**
    * operationId → the process state (bubble) and CardKit card of a send not yet confirmed. A retry
    * reuses them: Lark's uuid dedup returns the message first sent, which shows that card, and
@@ -515,7 +518,18 @@ export class LarkBotAdapter implements ChannelAdapter {
     const prior = this.sends.get(op.operationId);
     if (prior) return prior;
     const plain = this.plainReply(msg) && !isLarkCard(msg.channelData);
-    const run = this.useProcess(route, msg) ? this.sendProcess(route, msg, op) : this.doSend(route, plain ? { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) } : msg, op);
+    const process = this.useProcess(route, msg);
+    const run = (async () => {
+      // The turn can finish while its delayed card is queued. A plain final reply must settle
+      // the earlier bubble because there will be no process card to finalize it.
+      if (!process && msg.progress && !['running', 'requires_action'].includes(msg.progress.status) &&
+          this.previews.has(this.previewKey(route, msg.progress.turnId))) {
+        await this.previewProgress(route, msg.progress, true);
+      }
+      return process
+        ? this.sendProcess(route, msg, op)
+        : this.doSend(route, plain ? { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) } : msg, op);
+    })();
     this.sends.set(op.operationId, run);
     if (this.sends.size > BOUND) {
       const oldest = this.sends.keys().next();
@@ -700,7 +714,10 @@ export class LarkBotAdapter implements ChannelAdapter {
    * to click, goes as a plain text (or rich text) message, like a person's.
    */
   private plainReply(msg: RenderedMessage): boolean {
-    return this.cfg.look === 'chat' && msg.progress?.status === 'completed' && !msg.actions?.length && !!msg.text.trim();
+    const text = msg.text.trim();
+    return this.cfg.look === 'chat' && msg.progress?.status === 'completed' && !msg.actions?.length &&
+      !!text && text.length <= Math.min(this.cfg.maxChars, 4000) &&
+      !/^\s*(?:```|~~~)/m.test(text) && !/\|[^\n]*\|\s*\n\s*\|[\s:|-]+\|/.test(text);
   }
 
   private isProcessMessage(route: ReplyRoute, id: string, msg: RenderedMessage): boolean {
@@ -767,6 +784,35 @@ export class LarkBotAdapter implements ChannelAdapter {
     return st;
   }
 
+  private previewKey(route: ReplyRoute, turnId: string): string {
+    return `${routeKey(route)}\u0000${turnId}`;
+  }
+
+  /** Native CoT can precede the reply card. An empty process leaves the chat quiet. */
+  async previewProgress(route: ReplyRoute, p: ProgressView, final: boolean): Promise<void> {
+    this.ownRoute('previewProgress', route);
+    const key = this.previewKey(route, p.turnId);
+    let st = this.previews.get(key);
+    if (final) {
+      if (st?.cot && (st.cot.created || st.cot.opening)) this.feedCot(st, p, true);
+      this.previews.delete(key);
+      return;
+    }
+    if (this.processFor(route) === 'off' || this.processFor(route) === 'panels') return;
+    if (!st) {
+      st = this.newState(route, p, this.floorOf(route));
+      this.previews.set(key, st);
+    }
+    if (!st.cot || !this.cotDue(p)) return;
+    const hasProcess = p.steps.some((s) => s.kind === 'tool' || !!s.text.trim());
+    if (!st.cot.created && !hasProcess) return;
+    if (!st.cot.created && !st.cot.opening) {
+      const task = st.cot.open().finally(() => this.cotTasks.delete(task));
+      this.cotTasks.add(task);
+    }
+    this.feedCot(st, p, false);
+  }
+
   /** `cotOn: tool`: a turn that only thinks and answers shows no bubble. */
   private cotDue(p: ProgressView): boolean {
     return this.cfg.cotOn === 'turn' || p.steps.some((s) => s.kind === 'tool');
@@ -802,16 +848,18 @@ export class LarkBotAdapter implements ChannelAdapter {
 
   private async sendProcess(route: ReplyRoute, msg: RenderedMessage, op: SendOp): Promise<SendResult> {
     const p = msg.progress!;
+    const previewKey = this.previewKey(route, p.turnId);
+    const preview = this.previews.get(previewKey);
     const uuid = uuidFor(this.account, op.operationId, 0);
     const prior = this.pendingProcs.get(op.operationId);
     let level = prior?.level ?? this.floorOf(route);
-    const st = prior?.st ?? this.newState(route, p, level);
+    const st = prior?.st ?? preview ?? this.newState(route, p, level);
     const pending = prior ?? { st };
     if (!prior) {
       bounded(this.pendingProcs, op.operationId, pending);
-      // The bubble goes first so it sits above the reply card; if it fails the card shows the process.
-      // With `cotOn: tool` it may open later, at the first tool call, below the card.
-      if (st.cot && this.cotDue(p)) await st.cot.open();
+      // Without an earlier preview, open the bubble before the card. A preview is already
+      // opening independently, so its request must not hold up the reply card.
+      if (!preview && st.cot && this.cotDue(p)) await st.cot.open();
     }
     this.feedCot(st, p, false);
     let id: string | undefined;
@@ -861,6 +909,7 @@ export class LarkBotAdapter implements ChannelAdapter {
     }
     if (op.as) await this.store.set(id, op.as);
     bounded(this.procs, id, st);
+    this.previews.delete(previewKey);
     // A reused card shows what it was created with, so the first edit sends the differences from that.
     this.initSent(st, (st.card && st.card === pending.card && pending.shown) || this.model(msg, p, st));
     for (const [i, part] of this.attachmentParts(msg).entries()) await this.sendOne(route, part.out, uuidFor(this.account, op.operationId, i + 1));
@@ -936,7 +985,7 @@ export class LarkBotAdapter implements ChannelAdapter {
       const panel = m.panels.find((x) => x.key === key);
       if (!panel || st.panels.has(key)) continue;
       const before = PANEL_ORDER.slice(0, i).reverse().find((k) => st.panels.has(k));
-      await card.createElements([panelElement(panel)], { type: 'insert_after', target: before ? EL.panel(before) : EL.status });
+      await card.createElements([panelElement(panel)], { type: 'insert_after', target: before ? EL.panel(before) : EL.answer });
       st.panels.add(key);
       st.sent.set(EL.panelBody(key), panel.body);
     }

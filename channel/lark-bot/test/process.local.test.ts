@@ -20,7 +20,7 @@ describe('process card: CardKit streaming (panels)', () => {
     // Created in streaming mode with the stop button.
     expect(lark.log[0]).toBe('card.create');
     const ops = card.ops.map((o) => `${o.op}${o.elementId ? `:${o.elementId}` : ''}`);
-    expect(ops).toContain('cardElement.create:status'); // thinking panel inserted after the status banner
+    expect(ops).toContain('cardElement.create:answer'); // thinking panel inserted after the answer
     expect(ops).toContain('cardElement.content:answer');
     expect(ops).toContain('cardElement.update:status');
     expect(ops).toContain('cardElement.content:p_thinking_md');
@@ -35,7 +35,7 @@ describe('process card: CardKit streaming (panels)', () => {
     expect(final.config.streaming_mode).toBeUndefined();
     expect(final.header).toMatchObject({ title: { content: '已完成' }, template: 'green' });
     const els = final.body.elements.map((e: any) => e.element_id);
-    expect(els).toEqual(['status', 'p_thinking', 'p_tools', 'p_plan', 'answer', 'footer']); // stop button gone
+    expect(els).toEqual(['status', 'answer', 'p_thinking', 'p_tools', 'p_plan', 'footer']); // stop button gone
     expect(FakeLark.element(final, 'answer').content).toBe('Found a.ts and more.');
     expect(FakeLark.element(final, 'p_tools_md').content).toContain('✅ `Bash: ls`');
     expect(FakeLark.element(final, 'p_thinking_md').content).toContain('Thinking about it');
@@ -73,6 +73,21 @@ describe('process card: CardKit streaming (panels)', () => {
     for (const page of [first, ...rest]) expect((page.match(/```/g) ?? []).length % 2).toBe(0);
     expect(rest.join('\n')).toContain('Outro');
     for (const m of lark.messages.slice(1)) expect(Buffer.byteLength(m.content)).toBeLessThanOrEqual(5000);
+  });
+
+  it('keeps a long Chinese answer within the default CardKit byte budget', async () => {
+    const { lark, adapter } = make({ process: 'panels' });
+    const t = turn();
+    t.p.steps.push({ kind: 'reasoning', id: 'r0', text: '检查'.repeat(1500), done: false });
+    const { providerMessageId: id } = await adapter.send(route, t.msg(), { operationId: 'o' });
+    t.p.answer = '结果'.repeat(15_000);
+    await adapter.edit(route, id!, t.msg(), { operationId: 'e', sequence: 1 });
+    const live = cardOf(lark, id!).json;
+    expect(Buffer.byteLength(JSON.stringify(live))).toBeLessThanOrEqual(28_000);
+    t.p.status = 'completed';
+    await adapter.finalize(route, id!, t.msg());
+    expect(Buffer.byteLength(JSON.stringify(cardOf(lark, id!).json))).toBeLessThanOrEqual(28_000);
+    expect(lark.messages.length).toBeGreaterThan(1);
   });
 });
 
@@ -146,7 +161,7 @@ describe('process card: degradation', () => {
   it("process: 'off' keeps the flat card and advertises no native stream", async () => {
     const { lark, adapter } = make({ process: 'off' });
     expect(adapter.caps().nativeStream).toBeUndefined();
-    expect(make().adapter.caps().nativeStream).toEqual({ minIntervalMs: 0, maxBytes: 100_000 });
+    expect(make().adapter.caps().nativeStream).toEqual({ minIntervalMs: 0, maxBytes: 28_000 });
     await adapter.send(route, turn().msg(), { operationId: 'o' });
     expect(lark.cards.size).toBe(0);
     expect(JSON.parse(lark.messages[0]!.content).body.elements.some((e: any) => e.element_id === 'answer')).toBe(false);
@@ -178,7 +193,7 @@ describe('native thinking bubble (message_cot)', () => {
     expect(cot.completed).toBe('finished');
 
     const final = cardOf(lark, id).json;
-    expect(final.body.elements.map((e: any) => e.element_id)).toEqual(['status', 'p_plan', 'answer', 'footer']);
+    expect(final.body.elements.map((e: any) => e.element_id)).toEqual(['status', 'answer', 'p_plan', 'footer']);
   });
 
   it('streams a growing reasoning block as deltas and places the bubble inside a thread', async () => {
@@ -218,7 +233,7 @@ describe('native thinking bubble (message_cot)', () => {
     lark.fail.set('cot.create', [230027]);
     const id = await run(adapter, turn());
     const final = cardOf(lark, id).json;
-    expect(final.body.elements.map((e: any) => e.element_id)).toEqual(['status', 'p_thinking', 'p_tools', 'p_plan', 'answer', 'footer']);
+    expect(final.body.elements.map((e: any) => e.element_id)).toEqual(['status', 'answer', 'p_thinking', 'p_tools', 'p_plan', 'footer']);
     expect(logs.some((l) => l.includes('thinking bubble failed for chat:oc_chat'))).toBe(true);
     const creates = lark.log.filter((x) => x === 'cot.create').length;
     await run(adapter, turn('t2'));
@@ -249,7 +264,7 @@ describe('native thinking bubble (message_cot)', () => {
     lark.fail.set('cot.put', [0, 0, 99991400]); // prologue and first batch pass, then a failure
     const id = await run(adapter, turn());
     const final = cardOf(lark, id).json;
-    expect(final.body.elements.map((e: any) => e.element_id)).toEqual(['status', 'p_plan', 'answer', 'footer']);
+    expect(final.body.elements.map((e: any) => e.element_id)).toEqual(['status', 'answer', 'p_plan', 'footer']);
     expect(FakeLark.element(final, 'answer').content).toBe('Found a.ts and more.');
     expect(lark.cots[0]!.completed).toBe('error');
     expect(lark.log).toContain('cot.complete');
@@ -269,5 +284,39 @@ describe('splitMarkdown', () => {
     expect(pages.some((p) => p.startsWith('```py\n'))).toBe(true);
     expect(pages.join('').replace(/```py\n|```\n?/g, '')).toContain('print(199)');
     expect(splitMarkdown('short', 600)).toEqual(['short']);
+  });
+});
+
+describe('thinking bubble: long content', () => {
+  it('long reasoning and tool output go in pieces small enough for Lark; the bubble ends done, not failed', async () => {
+    const { lark, adapter } = make({ process: 'cot' });
+    lark.cotContentMax = 4000;
+    const t = turn();
+    const { providerMessageId: id } = await adapter.send(route, t.msg(), { operationId: 'o' });
+    t.p.steps.push({ kind: 'reasoning', id: 'r0', text: '思考'.repeat(6000), done: true });
+    t.p.steps.push({ kind: 'tool', itemId: 'i1', type: 'command', title: 'Bash: cat big.txt', status: 'completed', inputSummary: 'cat big.txt', resultPreview: '输出'.repeat(5000) });
+    await adapter.edit(route, id!, t.msg(), { operationId: 'e1', sequence: 1 });
+    t.p.status = 'completed';
+    await adapter.finalize(route, id!, t.msg());
+    await adapter.settled();
+    const cot = lark.cots[0]!;
+    expect(cot.completed).toBe('finished'); // settled by RUN_FINISHED, never closed as an error
+    expect(cot.events.at(-1)!.event_type).toBe('RUN_FINISHED');
+    expect(cot.events.filter((e) => e.event_type === 'REASONING_MESSAGE_CONTENT').map((e) => e.content.delta).join('')).toBe('思考'.repeat(6000));
+  });
+
+  it('when Lark still finds an event too long, the batch is sent again shortened and the bubble goes on', async () => {
+    const { lark, adapter, logs } = make({ process: 'cot' });
+    lark.cotContentMax = 300;
+    const t = turn();
+    const { providerMessageId: id } = await adapter.send(route, t.msg(), { operationId: 'o' });
+    t.p.steps.push({ kind: 'tool', itemId: 'i1', type: 'command', title: 'Bash: ls', status: 'completed', inputSummary: 'ls', resultPreview: 'x'.repeat(900) });
+    await adapter.edit(route, id!, t.msg(), { operationId: 'e1', sequence: 1 });
+    t.p.status = 'completed';
+    await adapter.finalize(route, id!, t.msg());
+    await adapter.settled();
+    expect(lark.cots[0]!.completed).toBe('finished');
+    expect(lark.cots[0]!.events.at(-1)!.event_type).toBe('RUN_FINISHED');
+    expect(logs.some((l) => l.includes('sent shortened'))).toBe(true);
   });
 });
