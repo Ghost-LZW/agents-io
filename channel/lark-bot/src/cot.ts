@@ -17,9 +17,17 @@ import type { LarkClientLike } from './types.js';
 
 const COT_URL = '/open-apis/im/v1/message_cot';
 const MAX_EVENTS_PER_PUT = 50;
-const MAX_DELTA = 8000;
-const MAX_RESULT = 4000;
+/**
+ * Lark refuses an event whose content is too long (code 10001 "content too long"); the limit is
+ * not documented, and content is JSON (a tool result twice over), so these are UTF-8 bytes of the
+ * raw text with room for escaping.
+ */
+const MAX_DELTA_BYTES = 1500;
+const MAX_RESULT_BYTES = 1000;
+const MAX_ARGS_BYTES = 500;
 const MAX_TITLE = 100;
+/** What an event is cut to when Lark still finds a batch too long. */
+const SHRUNK_BYTES = 200;
 
 interface CotEvent {
   event_type: string;
@@ -64,6 +72,50 @@ function toolIcon(s: Extract<ProgressStep, { kind: 'tool' }>): string {
 }
 
 const oneLine = (s: string) => s.replace(/\s+/g, ' ').trim();
+
+const utf8 = (s: string) => Buffer.byteLength(s);
+
+/** `s` cut to at most `max` UTF-8 bytes (never inside a code point), with `…` when cut. */
+export function clipBytes(s: string, max: number): string {
+  if (utf8(s) <= max) return s;
+  let out = '';
+  let n = 0;
+  for (const ch of s) {
+    const b = utf8(ch);
+    if (n + b > max - 3) break;
+    out += ch;
+    n += b;
+  }
+  return `${out}…`;
+}
+
+/** `s` in pieces of at most `max` UTF-8 bytes each. */
+export function splitBytes(s: string, max: number): string[] {
+  const out: string[] = [];
+  let cur = '';
+  let n = 0;
+  for (const ch of s) {
+    const b = utf8(ch);
+    if (cur && n + b > max) {
+      out.push(cur);
+      cur = '';
+      n = 0;
+    }
+    cur += ch;
+    n += b;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/** An event with its long text fields cut to `SHRUNK_BYTES` (a tool result becomes a short note). */
+function shrink(e: CotEvent): CotEvent {
+  const c = JSON.parse(e.content) as Record<string, unknown>;
+  if (typeof c.delta === 'string') c.delta = clipBytes(c.delta, SHRUNK_BYTES);
+  if (typeof c.content === 'string') c.content = JSON.stringify({ type: 'text', text: '(output too long to show)' });
+  if (typeof c.title === 'string') c.title = clipBytes(c.title, SHRUNK_BYTES);
+  return { ...e, content: JSON.stringify(c) };
+}
 const clip = (s: string, max: number) => (s.length > max ? `${s.slice(0, max - 1)}…` : s);
 
 export class CotBubble {
@@ -227,14 +279,23 @@ export class CotBubble {
   private async put(events: CotEvent[]): Promise<void> {
     for (let i = 0; i < events.length; i += MAX_EVENTS_PER_PUT) {
       const batch = events.slice(i, i + MAX_EVENTS_PER_PUT);
-      await call('message_cot.append', this.o.timeoutMs, async () =>
-        (await this.o.client.request({
-          method: 'PUT',
-          url: COT_URL,
-          data: { cot_id: this.cotId, message_id: this.messageId, events: batch },
-          timeout: this.o.timeoutMs,
-        })) as { code?: number; msg?: string },
-      );
+      const send = (b: CotEvent[]) =>
+        call('message_cot.append', this.o.timeoutMs, async () =>
+          (await this.o.client.request({
+            method: 'PUT',
+            url: COT_URL,
+            data: { cot_id: this.cotId, message_id: this.messageId, events: b },
+            timeout: this.o.timeoutMs,
+          })) as { code?: number; msg?: string },
+        );
+      try {
+        await send(batch);
+      } catch (err) {
+        // Still too long for Lark: the same events, cut short, once; the bubble stays on.
+        if (!(err instanceof LarkApiError) || !/too long/i.test(err.message)) throw err;
+        this.o.log(`thinking bubble for turn ${this.o.turnId}: an event was too long for Lark; sent shortened`);
+        await send(batch.map(shrink));
+      }
     }
   }
 
@@ -271,7 +332,7 @@ export class CotBubble {
         // Append-only: a rewritten block (not an extension of what was sent) keeps what was sent.
         if (text.length > st.sent.length && text.startsWith(st.sent)) {
           const delta = text.slice(st.sent.length);
-          for (let k = 0; k < delta.length; k += MAX_DELTA) out.push(this.ev('REASONING_MESSAGE_CONTENT', { messageId: st.mid, delta: delta.slice(k, k + MAX_DELTA) }));
+          for (const piece of splitBytes(delta, MAX_DELTA_BYTES)) out.push(this.ev('REASONING_MESSAGE_CONTENT', { messageId: st.mid, delta: piece }));
           st.sent = text;
         }
         this.lastReasoning = st.mid;
@@ -299,7 +360,7 @@ export class CotBubble {
         const title = clip(oneLine(`${s.parentItemId ? '↳ ' : ''}${s.title}`), MAX_TITLE);
         out.push(
           this.ev('TOOL_CALL_START', { toolCallId: s.itemId, icon: toolIcon(s), title, toolCallName: s.type, parentMessageId: this.lastReasoning }),
-          ...(s.inputSummary ? [this.ev('TOOL_CALL_ARGS', { toolCallId: s.itemId, delta: s.inputSummary })] : []),
+          ...(s.inputSummary ? [this.ev('TOOL_CALL_ARGS', { toolCallId: s.itemId, delta: clipBytes(s.inputSummary, MAX_ARGS_BYTES) })] : []),
           this.ev('TOOL_CALL_END', { toolCallId: s.itemId }),
         );
         st = { resulted: false };
@@ -310,7 +371,7 @@ export class CotBubble {
         const preview = s.resultPreview?.trim();
         const failed = s.status === 'failed' || s.status === 'declined' || s.isError === true;
         const content = preview
-          ? { type: 'code', ...(s.type === 'command' ? { language: 'bash' } : {}), code: clip(preview, MAX_RESULT) }
+          ? { type: 'code', ...(s.type === 'command' ? { language: 'bash' } : {}), code: clipBytes(preview, MAX_RESULT_BYTES) }
           : { type: 'text', text: failed ? t.cotFailed : t.cotDone };
         out.push(this.ev('TOOL_CALL_RESULT', { messageId: `tr-${s.itemId}`, toolCallId: s.itemId, role: 'tool', content: JSON.stringify(content) }));
         st.resulted = true;

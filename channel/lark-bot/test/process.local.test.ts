@@ -286,3 +286,37 @@ describe('splitMarkdown', () => {
     expect(splitMarkdown('short', 600)).toEqual(['short']);
   });
 });
+
+describe('thinking bubble: long content', () => {
+  it('long reasoning and tool output go in pieces small enough for Lark; the bubble ends done, not failed', async () => {
+    const { lark, adapter } = make({ process: 'cot' });
+    lark.cotContentMax = 4000;
+    const t = turn();
+    const { providerMessageId: id } = await adapter.send(route, t.msg(), { operationId: 'o' });
+    t.p.steps.push({ kind: 'reasoning', id: 'r0', text: '思考'.repeat(6000), done: true });
+    t.p.steps.push({ kind: 'tool', itemId: 'i1', type: 'command', title: 'Bash: cat big.txt', status: 'completed', inputSummary: 'cat big.txt', resultPreview: '输出'.repeat(5000) });
+    await adapter.edit(route, id!, t.msg(), { operationId: 'e1', sequence: 1 });
+    t.p.status = 'completed';
+    await adapter.finalize(route, id!, t.msg());
+    await adapter.settled();
+    const cot = lark.cots[0]!;
+    expect(cot.completed).toBe('finished'); // settled by RUN_FINISHED, never closed as an error
+    expect(cot.events.at(-1)!.event_type).toBe('RUN_FINISHED');
+    expect(cot.events.filter((e) => e.event_type === 'REASONING_MESSAGE_CONTENT').map((e) => e.content.delta).join('')).toBe('思考'.repeat(6000));
+  });
+
+  it('when Lark still finds an event too long, the batch is sent again shortened and the bubble goes on', async () => {
+    const { lark, adapter, logs } = make({ process: 'cot' });
+    lark.cotContentMax = 300;
+    const t = turn();
+    const { providerMessageId: id } = await adapter.send(route, t.msg(), { operationId: 'o' });
+    t.p.steps.push({ kind: 'tool', itemId: 'i1', type: 'command', title: 'Bash: ls', status: 'completed', inputSummary: 'ls', resultPreview: 'x'.repeat(900) });
+    await adapter.edit(route, id!, t.msg(), { operationId: 'e1', sequence: 1 });
+    t.p.status = 'completed';
+    await adapter.finalize(route, id!, t.msg());
+    await adapter.settled();
+    expect(lark.cots[0]!.completed).toBe('finished');
+    expect(lark.cots[0]!.events.at(-1)!.event_type).toBe('RUN_FINISHED');
+    expect(logs.some((l) => l.includes('sent shortened'))).toBe(true);
+  });
+});
