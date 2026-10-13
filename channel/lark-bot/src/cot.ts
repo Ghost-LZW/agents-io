@@ -90,6 +90,10 @@ export class CotBubble {
     return this.cotId !== undefined;
   }
 
+  get opening(): boolean {
+    return this.state === 'idle' && this.pumping !== undefined;
+  }
+
   /** Feed the latest cumulative view. Never throws, never waits. */
   push(p: ProgressView): void {
     if (this.state === 'failed' || this.state === 'settled' || this.final) return;
@@ -111,6 +115,7 @@ export class CotBubble {
    * the card in the chat. Resolves once open or failed; never rejects.
    */
   async open(): Promise<void> {
+    if (this.pumping) return this.pumping;
     if (this.state !== 'idle' || this.cotId) return;
     this.pumping = (async () => {
       try {
@@ -120,6 +125,7 @@ export class CotBubble {
       }
     })().finally(() => {
       this.pumping = undefined;
+      if (this.pending && this.state !== 'failed' && this.state !== 'settled') this.kick();
     });
     await this.pumping;
   }

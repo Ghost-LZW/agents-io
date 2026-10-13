@@ -352,11 +352,15 @@ export interface CompositorOptions {
   /** Put a stop button on streaming cards while the turn runs (see `interruptActionId`). Default false. */
   interruptButton?: boolean;
   /**
-   * Hold a streaming turn's first message this long (ms): it opens earlier when answer text
-   * starts or a request opens, and a turn that ends within the delay gets one final message
-   * with no working state before it. Default 0: open as soon as the turn starts.
+   * Hold a streaming turn's first message this long (ms). A request opens it immediately;
+   * answer text opens it early unless `holdAnswerUntilOpen` is set. A turn that ends during
+   * the delay gets one final message. Default 0: open as soon as the turn starts.
    */
   openDelayMs?: number;
+  /** Show native process progress after this delay, before the first reply message. */
+  previewDelayMs?: number;
+  /** Keep answer deltas within `openDelayMs` from opening the first message early. */
+  holdAnswerUntilOpen?: boolean;
   /**
    * Acknowledge inbound messages on this channel (`ChannelAdapter.acknowledge`): `working` once
    * admitted; when their turn ends the mark goes away if the turn replied on their route within
@@ -378,6 +382,8 @@ interface RouteState {
   /** The first message was queued (or an earlier process sent it). */
   opened: boolean;
   openTimer?: ReturnType<typeof setTimeout>;
+  previewTimer?: ReturnType<typeof setTimeout>;
+  previewDue: boolean;
   messageId?: string;
   editSeq: number;
   lastEditAt: number;
@@ -430,6 +436,7 @@ export class Compositor {
     for (const r of this.routes.values()) {
       if (r.timer) clearTimeout(r.timer);
       if (r.openTimer) clearTimeout(r.openTimer);
+      if (r.previewTimer) clearTimeout(r.previewTimer);
     }
     await this.flush();
   }
@@ -566,6 +573,7 @@ export class Compositor {
       tier,
       streaming: caps.edit && !!this.o.adapter.edit && tier !== 'final',
       opened: restored !== undefined,
+      previewDue: false,
       editSeq: 0,
       lastEditAt: 0,
       chain: Promise.resolve(),
@@ -580,12 +588,28 @@ export class Compositor {
     // Without a delay, send right away so the end is never blank while the harness thinks.
     if (delay <= 0) this.open(r);
     else r.openTimer = setTimeout(() => this.open(r), delay);
+    const previewDelay = this.o.previewDelayMs;
+    if (previewDelay !== undefined && this.o.adapter.previewProgress && previewDelay < delay) {
+      r.previewTimer = setTimeout(() => {
+        r.previewTimer = undefined;
+        if (r.finished || r.opened || this.stopped) return;
+        r.previewDue = true;
+        this.preview(r, false);
+      }, Math.max(0, previewDelay));
+    }
+  }
+
+  private preview(r: RouteState, final: boolean): void {
+    if (!this.o.adapter.previewProgress || (!r.previewDue && !final)) return;
+    this.enqueue(r, () => this.o.adapter.previewProgress!(r.route, progressOf(r.view), final));
   }
 
   private open(r: RouteState): void {
     if (r.opened || r.finished || this.stopped) return;
     if (r.openTimer) clearTimeout(r.openTimer);
     r.openTimer = undefined;
+    if (r.previewTimer) clearTimeout(r.previewTimer);
+    r.previewTimer = undefined;
     r.opened = true;
     this.enqueue(r, () => this.sendCard(r));
   }
@@ -654,8 +678,9 @@ export class Compositor {
       return;
     }
     if (!r.opened) {
-      // Still holding the first message: answer text or a request someone must act on opens it.
-      if (openedRequest || r.view.answer || r.view.text) this.open(r);
+      // Still holding the first message: an approval opens it; answer text may do so.
+      if (openedRequest || (!this.o.holdAnswerUntilOpen && (r.view.answer || r.view.text))) this.open(r);
+      else if (r.previewDue) this.preview(r, false);
       return;
     }
     // Approvals skip the throttle, even past an edit already scheduled: they are what a person is waiting to act on.
@@ -705,6 +730,9 @@ export class Compositor {
     // A turn that ended before its first message opened gets one final message.
     if (r.openTimer) clearTimeout(r.openTimer);
     r.openTimer = undefined;
+    if (r.previewTimer) clearTimeout(r.previewTimer);
+    r.previewTimer = undefined;
+    if (!r.opened && r.previewDue) this.preview(r, true);
     this.enqueue(r, async () => {
       const msg = this.render(r);
       const d = { operationId: `${this.base(r)}:final`, sessionKey: this.o.sessionKey, turnId: r.view.turnId, route: r.route };

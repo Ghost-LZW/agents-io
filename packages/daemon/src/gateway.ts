@@ -1887,7 +1887,9 @@ ${a.summary}` }],
 
   private compose(sessionKey: string, ch: RunningChannel): void {
     const { adapter, tier, account } = ch;
-    const openDelayMs = ch.source?.openDelayMs;
+    const isLark = adapter instanceof LarkBotAdapter;
+    const openDelayMs = ch.source?.openDelayMs ?? (isLark ? 5000 : undefined);
+    const previewDelayMs = ch.source?.previewDelayMs ?? (isLark ? 2000 : undefined);
     const ack = ch.source?.ack;
     const c = new Compositor({
       hub: this.hub,
@@ -1899,7 +1901,9 @@ ${a.summary}` }],
       // Every message the session's agent produces says who wrote it (POSITIONING §2 identity declaration).
       as: agentIdentity(sessionKey),
       ...(tier ? { tier } : {}),
-      ...(openDelayMs ? { openDelayMs } : {}),
+      ...(openDelayMs !== undefined ? { openDelayMs } : {}),
+      ...(previewDelayMs !== undefined ? { previewDelayMs } : {}),
+      ...(isLark ? { holdAnswerUntilOpen: true } : {}),
       ...(ack ? { ack: { doneAfterMs: (typeof ack === 'object' ? ack.doneAfterMs : undefined) ?? 60_000 } } : {}),
       // A stop button on streaming cards; Ingress turns its click into an `interrupt` command.
       interruptButton: true,
@@ -2914,7 +2918,7 @@ async function buildChannel(
   const tier = ch.tier ? { tier: ch.tier } : {};
   switch (ch.type) {
     case 'lark-bot':
-      return { adapter: new LarkBotAdapter(ch.config), account: ch.account, ...tier };
+      return { adapter: new LarkBotAdapter({ ...ch.config, look: (ch.config.look ?? 'chat') as 'console' | 'chat' }), account: ch.account, ...tier };
     case 'mail':
       return { adapter: new MailChannel({ ...ch.config, account: ch.account } as MailChannelConfig), account: ch.account, ...tier };
     case 'bridge': {

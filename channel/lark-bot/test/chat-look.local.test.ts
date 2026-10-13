@@ -81,6 +81,120 @@ describe('a first message that is already final', () => {
   });
 });
 
+describe('CoT before the reply card', () => {
+  it('opens only after process appears, then reuses the same bubble for the card', async () => {
+    const { lark, adapter } = make({ process: 'auto', look: 'chat' });
+    const t = turn();
+    await adapter.previewProgress(route, t.p, false);
+    expect(lark.cots).toHaveLength(0);
+    t.p.steps.push({ kind: 'reasoning', id: 'r0', text: 'Checking files', done: false });
+    await adapter.previewProgress(route, t.p, false);
+    expect(lark.cots).toHaveLength(1);
+    expect(lark.messages).toHaveLength(0);
+    const { providerMessageId: id } = await adapter.send(route, t.msg(), { operationId: 'o' });
+    expect(lark.cots).toHaveLength(1);
+    t.p.answer = 'Found it.';
+    t.p.status = 'completed';
+    await adapter.finalize(route, id!, t.msg());
+    await adapter.settled();
+    expect(lark.cots[0]!.completed).toBe('finished');
+  });
+
+  it('settles a preview when a short answer completes before any card', async () => {
+    const { lark, adapter } = make({ process: 'auto', look: 'chat' });
+    const t = turn();
+    t.p.steps.push({ kind: 'tool', itemId: 'i1', type: 'command', title: 'Bash: pwd', status: 'running' });
+    await adapter.previewProgress(route, t.p, false);
+    t.p.answer = 'Done.';
+    t.p.status = 'completed';
+    await adapter.previewProgress(route, t.p, true);
+    await adapter.send(route, t.msg({ text: 'Done.' }), { operationId: 'o' });
+    await adapter.settled();
+    expect(lark.cots).toHaveLength(1);
+    expect(lark.cots[0]!.completed).toBe('finished');
+    expect(lark.messages.map((m) => m.msg_type)).toEqual(['text']);
+  });
+
+  it('settles a preview if completion wins the queued-card race', async () => {
+    const { lark, adapter } = make({ process: 'auto', look: 'chat' });
+    const t = turn();
+    t.p.steps.push({ kind: 'reasoning', id: 'r0', text: 'Checking', done: false });
+    await adapter.previewProgress(route, t.p, false);
+    t.p.answer = 'Done.';
+    t.p.status = 'completed';
+    await adapter.send(route, t.msg({ text: 'Done.' }), { operationId: 'o' });
+    await adapter.settled();
+    expect(lark.cots[0]!.completed).toBe('finished');
+    expect(lark.messages.map((m) => m.msg_type)).toEqual(['text']);
+  });
+
+  it('does not delay the reply card while the CoT request is slow', async () => {
+    const lark = new FakeLark();
+    const request = lark.client.request!;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    lark.client.request = async (o) => {
+      if (o.method === 'POST' && o.url === '/open-apis/im/v1/message_cot') await gate;
+      return request(o);
+    };
+    const { adapter } = make({ process: 'auto', look: 'chat' }, lark);
+    const t = turn();
+    t.p.steps.push({ kind: 'reasoning', id: 'r0', text: 'Working', done: false });
+    await adapter.previewProgress(route, t.p, false);
+    const { providerMessageId: id } = await adapter.send(route, t.msg(), { operationId: 'o' });
+    expect(id).toBeTruthy();
+    expect(lark.cots).toHaveLength(0);
+    release();
+    t.p.answer = 'Done.';
+    t.p.status = 'completed';
+    await adapter.finalize(route, id!, t.msg());
+    await adapter.settled();
+    expect(lark.cots[0]!.completed).toBe('finished');
+  });
+
+  it('uses a text message for completed prose longer than 500 characters', async () => {
+    const { lark, adapter } = make({ process: 'auto', look: 'chat' });
+    const t = turn();
+    t.p.answer = 'x'.repeat(501);
+    t.p.status = 'completed';
+    await adapter.send(route, t.msg({ text: t.p.answer }), { operationId: 'o' });
+    expect(lark.messages[0]?.msg_type).toBe('text');
+  });
+
+  it('uses a rich-text post for a completed Markdown list', async () => {
+    const { lark, adapter } = make({ process: 'auto', look: 'chat' });
+    const t = turn();
+    t.p.status = 'completed';
+    await adapter.send(route, t.msg({ text: '## Results\n- one\n- two' }), { operationId: 'o' });
+    expect(lark.messages[0]?.msg_type).toBe('post');
+  });
+
+  it('uses a card for completed prose beyond one message', async () => {
+    const { lark, adapter } = make({ process: 'auto', look: 'chat' });
+    const t = turn();
+    t.p.answer = 'x'.repeat(4001);
+    t.p.status = 'completed';
+    await adapter.send(route, t.msg({ text: t.p.answer }), { operationId: 'o' });
+    expect(lark.messages[0]?.msg_type).toBe('interactive');
+  });
+
+  it('uses a card for a short answer with structured Markdown', async () => {
+    const { lark, adapter } = make({ process: 'auto', look: 'chat' });
+    const t = turn();
+    t.p.status = 'completed';
+    await adapter.send(route, t.msg({ text: '```ts\nconst x = 1;\n```' }), { operationId: 'o' });
+    expect(lark.messages[0]?.msg_type).toBe('interactive');
+  });
+
+  it('uses a card for a Markdown table', async () => {
+    const { lark, adapter } = make({ process: 'auto', look: 'chat' });
+    const t = turn();
+    t.p.status = 'completed';
+    await adapter.send(route, t.msg({ text: '| A | B |\n|---|---|\n| 1 | 2 |' }), { operationId: 'o' });
+    expect(lark.messages[0]?.msg_type).toBe('interactive');
+  });
+});
+
 describe('processByChat', () => {
   async function started(config: object) {
     const lark = new FakeLark();

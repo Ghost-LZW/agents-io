@@ -322,11 +322,11 @@ export const STREAMING_CONFIG = {
 /** Card JSON 2.0 for the model. `streaming` turns on CardKit streaming mode (CardKit cards only). */
 export function processCard(m: ProcessModel, o: { streaming?: boolean } = {}): Record<string, unknown> {
   const elements: unknown[] = m.banner || o.streaming ? [statusElement(m)] : [];
+  elements.push(md(EL.answer, m.answer));
   for (const k of PANEL_ORDER) {
     const p = m.panels.find((x) => x.key === k);
     if (p) elements.push(panelElement(p));
   }
-  elements.push(md(EL.answer, m.answer));
   for (const a of m.actions) elements.push(actionElement(a));
   if (m.footer || o.streaming) elements.push(footerElement(m));
   return {

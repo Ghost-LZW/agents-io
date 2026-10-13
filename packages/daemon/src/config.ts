@@ -151,11 +151,13 @@ const ChannelCommon = {
   /** Rendering tier for this channel (default: the adapter's `caps.defaultTier`). */
   tier: Type.Optional(Tier),
   /**
-   * Hold each turn's first message this long (ms) on streaming tiers: answer text or an approval
-   * opens it earlier, and a turn that ends within it gets one final message (no working card first).
-   * Default 0.
+   * Hold each turn's first message this long (ms) on streaming tiers. Lark defaults to 5000
+   * and waits through answer deltas; an approval still opens immediately. Other channels
+   * default to 0 and answer text opens early.
    */
   openDelayMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 60_000 })),
+  /** Lark native process preview delay (ms), before the reply card. Default 2000. */
+  previewDelayMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 60_000 })),
   /**
    * Acknowledge inbound messages (Lark: a reaction on them): working while handled; taken away
    * once a reply came, or `done` when the reply took longer than `doneAfterMs` (default 60000);

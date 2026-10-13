@@ -28,6 +28,9 @@ const STREAM_CLOSED_CODES = new Set([200850, 300309]);
 export interface CardKitOptions {
   timeoutMs: number;
   sleep: (ms: number) => Promise<void>;
+  /** Keep all mutations of one card below the platform's per-card request rate. Default 120. */
+  minMutationIntervalMs?: number;
+  now?: () => number;
 }
 
 /** Run a Lark call with a timeout; reject non-zero codes as LarkApiError. */
@@ -60,6 +63,8 @@ export function adoptedSequence(now = Date.now()): number {
  */
 export class CardKitCard {
   private seq: number;
+  private chain: Promise<void> = Promise.resolve();
+  private lastMutationAt = -Infinity;
 
   private constructor(
     private readonly api: LarkCardKitApi,
@@ -74,7 +79,9 @@ export class CardKitCard {
     const res = await call('cardkit.card.create', o.timeoutMs, () => api.card.create({ data: { type: 'card_json', data: JSON.stringify(card) } }));
     const id = res.data?.card_id;
     if (!id) throw new LarkApiError('cardkit.card.create', undefined, 'no card_id returned');
-    return new CardKitCard(api, id, 1, o);
+    const entity = new CardKitCard(api, id, 1, o);
+    entity.lastMutationAt = (o.now ?? Date.now)();
+    return entity;
   }
 
   /** Take over a card this process did not create (e.g. after a restart). */
@@ -86,19 +93,27 @@ export class CardKitCard {
     return this.seq;
   }
 
-  private async mutate(op: string, send: (m: { sequence: number; uuid: string }) => Promise<LarkApiResponse>): Promise<void> {
-    const sequence = ++this.seq;
-    const uuid = `c${createHash('sha256').update(`${this.cardId}\0${sequence}\0${op}`).digest('hex').slice(0, 32)}`;
-    for (let attempt = 0; ; attempt++) {
-      try {
-        await call(`cardkit.${op}`, this.o.timeoutMs, () => send({ sequence, uuid }));
-        return;
-      } catch (err) {
-        // An explicit "not now" was not applied: retry the very same mutation.
-        if (attempt >= 3 || !(err instanceof LarkApiError) || err.code === undefined || !RETRY_CODES.has(err.code)) throw err;
-        await this.o.sleep(250 * 2 ** attempt);
+  private mutate(op: string, send: (m: { sequence: number; uuid: string }) => Promise<LarkApiResponse>): Promise<void> {
+    const run = this.chain.then(async () => {
+      const sequence = ++this.seq;
+      const uuid = `c${createHash('sha256').update(`${this.cardId}\0${sequence}\0${op}`).digest('hex').slice(0, 32)}`;
+      for (let attempt = 0; ; attempt++) {
+        const now = (this.o.now ?? Date.now)();
+        const wait = this.lastMutationAt + (this.o.minMutationIntervalMs ?? 120) - now;
+        if (wait > 0) await this.o.sleep(wait);
+        this.lastMutationAt = (this.o.now ?? Date.now)();
+        try {
+          await call(`cardkit.${op}`, this.o.timeoutMs, () => send({ sequence, uuid }));
+          return;
+        } catch (err) {
+          // An explicit "not now" was not applied: retry the very same mutation.
+          if (attempt >= 3 || !(err instanceof LarkApiError) || err.code === undefined || !RETRY_CODES.has(err.code)) throw err;
+          await this.o.sleep(250 * 2 ** attempt);
+        }
       }
-    }
+    });
+    this.chain = run.then(() => undefined, () => undefined);
+    return run;
   }
 
   /** Stream a text element's full content; reopens streaming once if the platform closed it. */
