@@ -179,6 +179,10 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
   - `look: "chat"` 时，第一次发送就已完成、没有按钮的回复（很快答完的）发普通文本，有 markdown 时发富文本（post），不发卡片。
 - **降级**：流式更新失败时退到整卡替换，再失败退到普通消息编辑。失败记录按会话保留 30 分钟，权限类错误对整个应用生效。
 
+### 对话里的命令（主人）
+
+整条消息是一个命令时，守护进程直接回一条短文本，不开轮（INVARIANTS CT-2）。`/help` 列出全部：`/status`（会话、agent、harness、模型、在跑什么、排队与等审批）、`/stop [--clear]`、`/steer <文字>`、`/new [@agent] [标题]`、`/topics`、`/switch <n>`、`/agent [名字]`、`/model [名字|default]`、`/effort [档位|default]`、`/compact`（Claude Code）、`/tui`。话题与切 agent 需要平铺对话按话题分会话（不设 `policy.ownerSessionKey`）；不设时，陌生人放行与访客的审批问到主人最近一次私聊的那个对话。
+
 ## 3. 邮件（`channel/mail`，档位 `final`）
 
 ### agent 能看到什么

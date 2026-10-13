@@ -130,6 +130,12 @@ export interface IngressOptions {
    * throws go to `onReplyError`.
    */
   onUndispatched?: (a: { env: InboundEnvelope; origin: Origin; input: InputRecord }) => Promise<void> | void;
+  /**
+   * A `/command` addressed to a session (the primary delivery is a dispatch), before topic
+   * commands and before it reaches the lane. A result means it was handled (the embedder
+   * answered on the route); undefined delivers it as usual (an unknown command is plain text).
+   */
+  onCommand?: (a: { name: string; args: string; env: InboundEnvelope; origin: Origin; input: InputRecord; delivery: RouteDelivery }) => Promise<{ ok: boolean; reply: string } | undefined>;
   /** How many envelope ids to remember for dedup (default 10 000). */
   dedupWindow?: number;
   /** Watches: delivered through when a watch rule wins a session, and the digest machinery of `on: "digest"` rules. */
@@ -236,8 +242,8 @@ export interface IngressResult {
   host?: { cursor: number; duplicate: boolean; bindingId: string };
   /** Why (also persisted: `Router.explain(inputId)`). */
   explanation?: Explanation;
-  /** A topic command was answered instead of delivering the input. */
-  command?: { name: TopicCommand['name']; ok: boolean; reply: string; topic?: string };
+  /** A command (topic or embedder) was answered instead of delivering the input. */
+  command?: { name: string; ok: boolean; reply: string; topic?: string };
   /**
    * The envelope as processed: with an `EmitSource`, evidence capped and `declared`
    * dropped. What the input, the host queue and records hold. The caller's object
@@ -415,6 +421,11 @@ export class Ingress {
 
     // The strongest table delivery is the input's own place (where a click on a choice is rewritten to).
     const primary = own.find((d) => d.on === 'dispatch') ?? own.find((d) => d.on === 'digest') ?? own[0];
+    const slash = primary?.on === 'dispatch' && this.o.onCommand ? slashCommand(env.content) : undefined;
+    if (slash && primary) {
+      const handled = await this.o.onCommand!({ ...slash, env, origin, input, delivery: primary });
+      if (handled) return { accepted: true, action: 'command', sessionKey: primary.sessionKey, inputId: input.inputId, origin, command: { name: slash.name, ...handled }, explanation };
+    }
     // `/new`, `/topics`, `/switch` addressed to a topic session act on its conversation's topics; nothing is delivered.
     const cmd = primary?.on === 'dispatch' && primary.topic && this.router.topics ? parseTopicCommand(env.content) : undefined;
     if (cmd && primary) return this.topicCommand(cmd, primary, env, origin, input, explanation);
@@ -737,6 +748,13 @@ function capEnvelope(env: InboundEnvelope, s: EmitSource): InboundEnvelope {
   return { ...env, sender: { ...sender, ...(declared !== undefined && !dropDeclared ? { declared } : {}), ...(cause !== undefined && !dropDeclared ? { cause } : {}), evidence } };
 }
 
+/** `/name args` as the whole text of a message (one text block), else undefined. */
+export function slashCommand(content: ContentBlock[]): { name: string; args: string } | undefined {
+  if (content.length !== 1 || content[0]!.type !== 'text') return undefined;
+  const m = /^\/([a-z][a-z0-9_-]*)(?:\s+([\s\S]*))?$/i.exec(content[0]!.text.trim());
+  return m ? { name: m[1]!.toLowerCase(), args: (m[2] ?? '').trim() } : undefined;
+}
+
 function actionIdOf(env: InboundEnvelope): string | undefined {
   if (env.content.length !== 1) return undefined;
   const c = env.content[0]!;
@@ -761,6 +779,8 @@ function channelContext(env: InboundEnvelope, reply: string | undefined): InputR
   };
   // Set by the lane when the loop guard stops an input; an adapter can not claim it.
   delete ctx.loopGuard;
+  // Set by the daemon only, for the owner's own harness command (passed to the harness as typed).
+  delete ctx.nativeCommand;
   if (env.sender.displayName !== undefined) ctx.senderName = env.sender.displayName;
   if (env.sender.isBot !== undefined) ctx.senderIsBot = env.sender.isBot;
   if (env.sentAt !== undefined) ctx.sentAt = env.sentAt;

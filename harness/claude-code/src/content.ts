@@ -142,6 +142,19 @@ export async function toUserMessage(
   input: InputRecord,
   opts: UserMessageOpts,
 ): Promise<{ message: SDKUserMessage; notices: string[] }> {
+  // The owner's own harness command (`/compact`), set only by the daemon: the text as typed, so the CLI runs it.
+  if (input.channelContext.nativeCommand === true) {
+    const text = input.content.map((c) => (c.type === 'text' ? c.text : '')).join('').trim();
+    const message: SDKUserMessage = {
+      type: 'user',
+      message: { role: 'user', content: text },
+      parent_tool_use_id: null,
+      priority: opts.priority,
+      uuid: inputUuid(input.inputId) as SDKUserMessage['uuid'],
+      timestamp: new Date().toISOString(),
+    };
+    return { message, notices: [] };
+  }
   const blocks: UserBlock[] = [{ type: 'text', text: preface(input) }];
   const notices: string[] = [];
   for (const c of input.content) {

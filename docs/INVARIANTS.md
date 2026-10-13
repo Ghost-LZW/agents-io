@@ -802,6 +802,13 @@
 - **测试**：标签 `#CT-1`；例：`packages/session/test/lane.test.ts` "refuses interrupts from someone who is neither turn owner nor owner #CT-1"、"interrupt with cancelQueue is authorised as cancel_queue: a turn owner who is not an owner cancels only their own queued inputs #CT-1"；`packages/session/test/policy.test.ts` "control: owners and turn owners may interrupt #CT-1"；`packages/session/test/topics.test.ts` "Policy.control decides who may use them (owner by default) #CT-1"。
 - **状态**：有测试。
 
+
+### CT-2 对话里的命令只有主人能用，命令本身不开轮
+
+- **承诺**：发给本部署、整条消息是 `/名字 参数` 的文字，若名字是守护进程的命令（`/help`、`/status`、`/stop`、`/steer`、`/model`、`/effort`、`/compact`、`/agent`、`/new @agent`、`/tui`），只在 `Policy.control` 放行（主人）时执行，在原路由回一条短文本，不进 lane、不开轮；别人发的同样文字是普通消息。`/model`、`/effort` 只改这个会话、从下一轮起生效（存在日志库里）。`/agent`、`/new @agent` 让这个平铺对话之后交给所选 agent（存在路由表库里），固定会话（`ownerSessionKey`）下说明做不到。`/compact` 是唯一原样交给 harness 的文字：只能由守护进程标记（`channelContext.nativeCommand`），适配器的 `context`、本地与宿主客户端的输入都去掉这个键。
+- **实现**：`packages/daemon/src/commands.ts`；`packages/session/src/ingress.ts` `onCommand`、`slashCommand`、`channelContext`（去掉 `nativeCommand`）；`packages/session/src/router.ts` `conversationAgent`、`setConversationAgent`、`place`；`packages/daemon/src/gateway.ts` `commandHost`、`withRunOverride`；`harness/claude-code/src/content.ts` `toUserMessage`。
+- **测试**：标签 `#CT-2`；`packages/daemon/test/commands.test.ts`。
+- **状态**：有测试（假通道）。Codex 没有 `/compact`（生成的协议类型里没有压缩请求）。
 ### OB-1 "卡住了"可观察
 
 - **承诺**：有未答的人工请求时，lane 状态与进度视图报 `requires_action`，不是 `running`；没有文字就结束的轮次（失败、打断……）在 `final` 层级也说明它怎么结束的，不留空白。

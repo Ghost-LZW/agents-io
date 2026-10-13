@@ -205,7 +205,7 @@ export class Router {
   private host: { table: BindingTable; putAt: number } | undefined;
   private connected: boolean;
   private identities!: IdentityMap;
-  private q: Record<'tablePut' | 'tableGet' | 'tableDel' | 'explainPut' | 'explainGet' | 'explainPrune', StatementSync>;
+  private q: Record<'tablePut' | 'tableGet' | 'tableDel' | 'explainPut' | 'explainGet' | 'explainPrune' | 'convAgentGet' | 'convAgentPut' | 'convAgentDel', StatementSync>;
   private records = 0;
 
   constructor(private readonly o: RouterOptions) {
@@ -224,6 +224,7 @@ export class Router {
       CREATE TABLE IF NOT EXISTS router_tables (source TEXT PRIMARY KEY, json TEXT NOT NULL, put_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS router_explain (input_id TEXT PRIMARY KEY, at INTEGER NOT NULL, json TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS router_explain_at ON router_explain (at);
+      CREATE TABLE IF NOT EXISTS router_conversation_agents (conversation TEXT PRIMARY KEY, agent TEXT NOT NULL) WITHOUT ROWID;
     `);
     const p = (sql: string) => this.db.prepare(sql);
     this.q = {
@@ -233,6 +234,9 @@ export class Router {
       explainPut: p('INSERT INTO router_explain (input_id, at, json) VALUES (?, ?, ?) ON CONFLICT(input_id) DO UPDATE SET at = excluded.at, json = excluded.json'),
       explainGet: p('SELECT json FROM router_explain WHERE input_id = ?'),
       explainPrune: p('DELETE FROM router_explain WHERE at < ?'),
+      convAgentGet: p('SELECT agent FROM router_conversation_agents WHERE conversation = ?'),
+      convAgentPut: p('INSERT INTO router_conversation_agents (conversation, agent) VALUES (?, ?) ON CONFLICT(conversation) DO UPDATE SET agent = excluded.agent'),
+      convAgentDel: p('DELETE FROM router_conversation_agents WHERE conversation = ?'),
     };
     if (o.config) this.validate(o.config, 'config');
     this.config = o.config && structuredClone(o.config);
@@ -529,7 +533,12 @@ export class Router {
     if (origin.self && on === 'dispatch') on = 'context';
     const entry: RouteExplanation['matched'][number] = { bindingId: r.binding.id, source: r.source, on, ...(r.callout ? { callout: r.callout } : {}) };
     if (!targets(on)) return { on, entry };
-    const agent = r.watchId !== undefined || r.legacyKey !== undefined ? undefined : this.agents.get(r.agent ?? this.o.defaultAgent ?? '');
+    let agent = r.watchId !== undefined || r.legacyKey !== undefined ? undefined : this.agents.get(r.agent ?? this.o.defaultAgent ?? '');
+    // A flat conversation whose agent was chosen (`/agent`) goes to that agent, for every table rule.
+    if (agent && env.conversation.threadId === undefined) {
+      const chosen = this.conversationAgent(topicConversation(env));
+      if (chosen) agent = this.agents.get(chosen) ?? agent;
+    }
     const scope = r.legacyKey !== undefined ? { sessionKey: r.legacyKey } : this.scope(r.session, agent, env, on);
     const sessionKey = scope.sessionKey;
     if (agent) entry.agent = agent.name;
@@ -661,6 +670,25 @@ export class Router {
   topicKey(agentName: string, conversation: string) {
     const prefix = this.agents.get(agentName)?.sessionPrefix ?? `${agentName}:`;
     return ({ topicId, first }: { topicId: string; first: boolean }) => (first ? prefix + conversation : `${prefix}${conversation}#${topicId}`);
+  }
+
+  /**
+   * The agent a flat conversation talks to, when someone chose one (`/agent`): its turns, topics
+   * and context go to that agent instead of the rule's. Undefined: the rules decide.
+   */
+  conversationAgent(conversation: string): string | undefined {
+    const a = (this.q.convAgentGet.get(conversation) as { agent: string } | undefined)?.agent;
+    return a !== undefined && this.agents.get(a)?.mode !== 'task' && this.agents.has(a) ? a : undefined;
+  }
+
+  /** Choose the agent of a flat conversation (undefined: back to the rules). Throws for an unknown or task agent. */
+  setConversationAgent(conversation: string, agent: string | undefined): void {
+    if (agent === undefined) {
+      this.q.convAgentDel.run(conversation);
+      return;
+    }
+    this.target(agent, 'conversation agent');
+    this.q.convAgentPut.run(conversation, agent);
   }
 
   /** Start a new topic in a conversation (it becomes current). Throws without a topic table. */
