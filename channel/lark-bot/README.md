@@ -39,7 +39,7 @@ The reply card is a CardKit card in streaming mode (`cardkit:card:write`): the a
 
 ### Reply timing in the daemon
 
-The daemon waits up to 5 seconds before opening the first reply card. After 2 seconds, native CoT opens if there is reasoning text or a tool call to show. Answer text alone does not open the card early. An approval opens it immediately. A turn that finishes before the card opens gets one final reply: prose and ordinary Markdown up to one message (default 4000 characters) use text or a rich-text post; code blocks, tables and longer answers use a card. `openDelayMs` and `previewDelayMs` on the channel entry override the 5-second and 2-second defaults; `openDelayMs: 0` restores immediate cards. The daemon also defaults to `look: "chat"` unless configured otherwise.
+The daemon waits at least 5 seconds before opening the first reply card, then opens it when answer text arrives. After 2 seconds, native CoT opens if there is reasoning text or a tool call to show. An approval opens the card immediately. The Lark reply card has no Stop button. A turn that finishes before the card opens gets one final reply: prose and ordinary Markdown up to one message (default 4000 characters) use text or a rich-text post; code blocks, tables and longer answers use a card. `openDelayMs` and `previewDelayMs` on the channel entry override the 5-second and 2-second defaults; `openDelayMs: 0` restores immediate cards. The daemon also defaults to `look: "chat"` unless configured otherwise.
 
 The adapter's direct-use defaults remain unchanged. These settings can be adjusted for a bot:
 

@@ -361,6 +361,8 @@ export interface CompositorOptions {
   previewDelayMs?: number;
   /** Keep answer deltas within `openDelayMs` from opening the first message early. */
   holdAnswerUntilOpen?: boolean;
+  /** Once the delay expires, wait for answer text instead of opening an empty working card. */
+  requireAnswerToOpen?: boolean;
   /**
    * Acknowledge inbound messages on this channel (`ChannelAdapter.acknowledge`): `working` once
    * admitted; when their turn ends the mark goes away if the turn replied on their route within
@@ -381,6 +383,7 @@ interface RouteState {
   streaming: boolean;
   /** The first message was queued (or an earlier process sent it). */
   opened: boolean;
+  openReady: boolean;
   openTimer?: ReturnType<typeof setTimeout>;
   previewTimer?: ReturnType<typeof setTimeout>;
   previewDue: boolean;
@@ -573,6 +576,7 @@ export class Compositor {
       tier,
       streaming: caps.edit && !!this.o.adapter.edit && tier !== 'final',
       opened: restored !== undefined,
+      openReady: false,
       previewDue: false,
       editSeq: 0,
       lastEditAt: 0,
@@ -587,7 +591,11 @@ export class Compositor {
     const delay = this.o.openDelayMs ?? 0;
     // Without a delay, send right away so the end is never blank while the harness thinks.
     if (delay <= 0) this.open(r);
-    else r.openTimer = setTimeout(() => this.open(r), delay);
+    else r.openTimer = setTimeout(() => {
+      r.openTimer = undefined;
+      r.openReady = true;
+      if (!this.o.requireAnswerToOpen || r.view.answer.trim()) this.open(r);
+    }, delay);
     const previewDelay = this.o.previewDelayMs;
     if (previewDelay !== undefined && this.o.adapter.previewProgress && previewDelay < delay) {
       r.previewTimer = setTimeout(() => {
@@ -679,7 +687,9 @@ export class Compositor {
     }
     if (!r.opened) {
       // Still holding the first message: an approval opens it; answer text may do so.
-      if (openedRequest || (!this.o.holdAnswerUntilOpen && (r.view.answer || r.view.text))) this.open(r);
+      if (openedRequest || (this.o.requireAnswerToOpen
+        ? r.openReady && !!r.view.answer.trim()
+        : !this.o.holdAnswerUntilOpen && !!(r.view.answer || r.view.text))) this.open(r);
       else if (r.previewDue) this.preview(r, false);
       return;
     }

@@ -65,6 +65,26 @@ describe('compositor openDelayMs', () => {
 });
 
 describe('delayed process preview', () => {
+  it('waits past the deadline for actual answer text instead of sending an empty card', async () => {
+    const hub = new Hub(new MemorySessionLog());
+    const channel = new FakeChannel('fake', defaultChannelCaps);
+    const c = new Compositor({
+      hub, sessionKey: SESSION, adapter: channel, outbox: new Outbox({ hub, sleep: async () => {} }),
+      previewDelayMs: 10, openDelayMs: 30, holdAnswerUntilOpen: true, requireAnswerToOpen: true,
+    });
+    c.start();
+    cleanups.push(() => c.stop());
+    const append = (body: Parameters<Hub['append']>[1]['body']) => hub.append(SESSION, { ts: Date.now(), ...ev, body });
+    append({ t: 'turn.started', turnId: 't1', inputIds: [], replyRoute: R });
+    append({ t: 'item.started', item: { itemId: 'i1', type: 'command', title: 'Bash: ls', status: 'running' } });
+    await new Promise((resolve) => setTimeout(resolve, 55));
+    expect(channel.sent).toHaveLength(0);
+    append({ t: 'text.delta', stream: 'answer', delta: 'Found it.' });
+    await until(() => channel.sent.length === 1);
+    expect(channel.sent[0]!.msg.text).toContain('Found it.');
+    expect(channel.sent[0]!.msg.actions).toBeUndefined();
+  });
+
   it('holds answer text until the card deadline and previews process earlier', async () => {
     const hub = new Hub(new MemorySessionLog());
     const channel = new FakeChannel('fake', defaultChannelCaps);

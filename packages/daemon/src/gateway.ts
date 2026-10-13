@@ -1904,9 +1904,10 @@ ${a.summary}` }],
       ...(openDelayMs !== undefined ? { openDelayMs } : {}),
       ...(previewDelayMs !== undefined ? { previewDelayMs } : {}),
       ...(isLark ? { holdAnswerUntilOpen: true } : {}),
+      ...(isLark && (openDelayMs ?? 0) > 0 ? { requireAnswerToOpen: true } : {}),
       ...(ack ? { ack: { doneAfterMs: (typeof ack === 'object' ? ack.doneAfterMs : undefined) ?? 60_000 } } : {}),
-      // A stop button on streaming cards; Ingress turns its click into an `interrupt` command.
-      interruptButton: true,
+      // In Lark, the early process bubble carries progress; keep the reply card free of Stop controls.
+      interruptButton: !isLark,
       // Cards of a topic session carry the topic's title (Lark: the card header).
       title: () => this.topics.bySession(sessionKey)?.title,
       onError: (err) => this.log('warn', `render to ${adapter.id} failed: ${(err as Error).message}`),

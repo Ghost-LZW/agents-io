@@ -152,7 +152,7 @@ const ChannelCommon = {
   tier: Type.Optional(Tier),
   /**
    * Hold each turn's first message this long (ms) on streaming tiers. Lark defaults to 5000
-   * and waits through answer deltas; an approval still opens immediately. Other channels
+   * and waits through answer deltas, then opens with the first answer text; an approval still opens immediately. Other channels
    * default to 0 and answer text opens early.
    */
   openDelayMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 60_000 })),
