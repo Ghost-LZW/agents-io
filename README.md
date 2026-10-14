@@ -1,47 +1,54 @@
 # agents-io
 
-Agent 的输入输出基建：把任何通道的输入变成统一信封，把任何 harness（Claude Code、Codex 本体）会话的过程变成可订阅、可续传的事件流，再把输出投递到任何通道。
+**English** | [简体中文](README.zh-CN.md)
 
-agents-io 只提供机制。信任、审批、模型选择、任务与记忆都是宿主的事，通过 `Policy` 钩子接入。边界见 [docs/POSITIONING.md](docs/POSITIONING.md)。
+**Input and output infrastructure for agents.** Turn messages from different channels into a common envelope, expose Claude Code and Codex sessions as subscribable, resumable event streams, and deliver responses back to channels.
 
+agents-io provides the plumbing. The host owns trust, approvals, model selection, tasks, and memory, and connects them through `Policy` hooks. See [Project scope](docs/POSITIONING.md) for the boundary.
+
+## How it works
+
+```text
+Lark / email / private channel (JSONL) / terminal
+                       │
+                       ▼
+                InboundEnvelope ─▶ Ingress (Policy) ─▶ Lane (one queue per session)
+                                                              │ startTurn / steer / interrupt / respond
+                                                              ▼
+                                                   Claude Code / Codex harness
+                                                              │ HarnessEvent
+                                                              ▼
+                          Multi-client subscriptions ◀── Hub (fromSeq, tier) ◀── SessionLog (seq)
+                          Channel delivery           ◀── Compositor + Outbox (streaming cards, idempotency)
 ```
-飞书 / 邮件 / 私有通道(JSONL) / 终端 ─▶ InboundEnvelope ─▶ Ingress(Policy) ─▶ Lane(每 session 一条队列)
-                                                                        │ startTurn / steer / interrupt / respond
-                                                                        ▼
-                                                     Claude Code / Codex（harness 本体）
-                                                                        │ HarnessEvent
-                                                                        ▼
-                         多端订阅 ◀── Hub(subscribe fromSeq, tier) ◀── SessionLog(seq)
-                         通道投递 ◀── Compositor + Outbox（流式卡片、幂等）
-```
 
-## 包
+## Packages
 
-| 包 | 内容 |
-|---|---|
-| `packages/protocol` | 协议：入站信封、会话事件、命令、通道/harness 接口、Policy 钩子、进程外 JSONL 帧、客户端帧；`schema/` 下有 JSON Schema |
-| `packages/testkit` | 事件流与通道一致性检查、`FakeChannel` / `FakeHarness` |
-| `packages/session` | 带 seq 的日志（内存 / SQLite）、订阅与快照、Lane（合批、steer、对账、审批 resolver）、默认策略、Outbox、Compositor |
-| `harness/claude-code` | 基于 Claude Agent SDK 驱动 Claude Code |
-| `harness/codex` | 基于 `codex app-server`（stdio 或 unix socket，宿主重启不打断轮次） |
-| `channel/lark-bot` | 官方飞书/Lark 机器人（长连接、流式卡片）；应用用 [create-lark-bot](https://github.com/Ghost-LZW/create-lark-bot) 创建 |
-| `channel/mail` | IMAP 收、SMTP 发，DKIM/DMARC 作为身份证据 |
-| `channel/jsonl-bridge` | 进程外通道：任何语言写的私有通道经 stdio/socket 接入 |
-| `packages/daemon` | `aio`：守护进程与命令行（通道、Binding 表、宿主协议、task run、宿主入站队列、终端端点、端到端场景） |
-| `examples/dev-gateway` | `aio-dev`：`aio` 的旧名包装 |
+| Package | Purpose |
+| --- | --- |
+| `packages/protocol` | Inbound envelopes, session events, commands, channel and harness interfaces, `Policy` hooks, out-of-process JSONL frames, and client frames. JSON Schemas live in `schema/`. |
+| `packages/testkit` | Event stream and channel conformance checks; `FakeChannel` and `FakeHarness`. |
+| `packages/session` | In-memory or SQLite sequenced logs, subscriptions and snapshots, Lane batching, steering, reconciliation, and approval resolution, plus default policy, Outbox, and Compositor. |
+| `harness/claude-code` | Runs Claude Code through the Claude Agent SDK. |
+| `harness/codex` | Uses `codex app-server` over stdio or a Unix socket; a host restart does not interrupt an active turn. |
+| `channel/lark-bot` | Official Lark/Feishu bot with a long-lived connection and streaming cards. Create an app with [create-lark-bot](https://github.com/Ghost-LZW/create-lark-bot). |
+| `channel/mail` | Receives via IMAP and sends via SMTP, using DKIM/DMARC as identity evidence. |
+| `channel/jsonl-bridge` | Connects private channels written in any language over stdio or a socket. |
+| `packages/daemon` | The `aio` daemon and CLI: channels, bindings, host protocol, task runs, host inbound queue, terminal endpoints, and end-to-end scenarios. |
+| `examples/dev-gateway` | `aio-dev`, a compatibility wrapper for the former name of `aio`. |
 
-## 开始
+## Getting started
 
-需要 Node.js 24+ 和 pnpm。
+Requires **Node.js 24+** and **pnpm**.
 
 ```sh
 pnpm install
 pnpm build
-pnpm test                 # 单元测试（真机测试默认跳过）
+pnpm test                 # Unit tests; live tests are skipped by default
 ```
 
-端到端测试（真实 Claude Code / Codex、真实飞书、多端与重启）见 [docs/E2E.md](docs/E2E.md)。设计与调研过程见 [docs/](docs/README.md)。
+For a full setup and end-to-end tests with real Claude Code, Codex, and Lark, see the [E2E guide](docs/E2E.md). The [documentation index](docs/README.md) covers the design and research. These detailed guides are currently in Chinese.
 
-## 许可
+## License
 
-MIT
+[MIT](LICENSE)
