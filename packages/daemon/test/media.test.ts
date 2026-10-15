@@ -3,9 +3,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { InputRecord } from '@agents-io/protocol';
-import { FsBlobStore } from '@agents-io/session';
+import { FsBlobStore, MemorySessionLog } from '@agents-io/session';
 import { toUserMessage } from '@agents-io/harness-claude-code';
 import { renderInputs } from '@agents-io/harness-codex';
+import { resolveConfig } from '../src/config.js';
+import { Gateway, InstanceHarness } from '../src/gateway.js';
 import { CLAUDE_IMAGE_MAX_BYTES, blobResolvers } from '../src/media.js';
 
 const cleanups: (() => Promise<void> | void)[] = [];
@@ -30,6 +32,23 @@ const input = (content: InputRecord['content']): InputRecord => ({
 });
 
 describe('media through the gateway blob store', () => {
+  it('wires the default harness to the initialized blob store #MD-1', async () => {
+    const dir = tmp();
+    const config = resolveConfig(
+      { harnesses: { codex: { use: 'codex' } }, defaultHarness: 'codex', local: { principal: 'me' } },
+      { env: {}, baseDir: dir, cwd: dir },
+    );
+    const gw = await Gateway.start({ config, log: new MemorySessionLog(), listen: false, logger: () => {} });
+    cleanups.push(() => gw.stop());
+    const ref = await gw.blobs.put(PNG, { mime: 'image/png' });
+    const inner = (gw.harness() as InstanceHarness).inner as unknown as {
+      opts: { resolveMedia: (block: { type: 'image'; ref: string; mime: string }) => Promise<{ path: string } | null> };
+    };
+    const resolved = await inner.opts.resolveMedia({ type: 'image', ref, mime: 'image/png' });
+    expect(resolved).not.toBeNull();
+    expect(readFileSync(resolved!.path).equals(PNG)).toBe(true);
+  });
+
   it('Claude receives a real image block and a file path; Codex a localImage with the stored bytes #MD-1', async () => {
     const store = new FsBlobStore({ dir: join(tmp(), 'blobs') });
     const img = await store.put(PNG, { mime: 'image/png' });

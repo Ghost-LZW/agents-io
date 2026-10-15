@@ -324,6 +324,8 @@ export class Gateway {
 
   private constructor(private readonly o: GatewayOptions) {
     const c = o.config;
+    // The default harness is built below and captures its media resolvers now.
+    this.blobs = new FsBlobStore(c.blobs);
     // The default instance must be usable (e.g. its env refs set); others fail when a turn names them.
     // A module default is checked in `start`, once its module is loaded.
     if (o.harness || o.buildHarness || c.harnesses[c.defaultHarness]?.kind !== 'module') this.harness();
@@ -472,7 +474,6 @@ export class Gateway {
       ...(o.hostPush?.timeoutMs !== undefined ? { pushTimeoutMs: o.hostPush.timeoutMs } : {}),
       ...(o.hostPush?.retryMs !== undefined ? { pushRetryMs: o.hostPush.retryMs } : {}),
     });
-    this.blobs = new FsBlobStore(c.blobs);
     this.claudeTui = new ClaudeTuiService({
       dir: join(c.dataDir, 'tui'),
       // The bridge runs as this CLI (`aio tui-bridge`), next to this module in dist/.
