@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import type { SessionEvent } from '@agents-io/protocol';
+import type { AckState, ReplyRoute, SessionEvent } from '@agents-io/protocol';
 import { Ingress, MemorySessionLog, defaultPolicy } from '@agents-io/session';
 import { FakeChannel, FakeHarness, fakeEnvelope, type FakeTurnScript } from '@agents-io/testkit';
 import { resolveConfig } from '../src/config.js';
@@ -14,24 +14,37 @@ import { cleanups, until } from './gateway-helpers.js';
 const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };
 const dm = { conversation: { id: 'c-alice', kind: 'dm' as const } };
 
-async function setup(o: { fixed?: boolean; script?: FakeTurnScript } = {}) {
+class MarkedChannel extends FakeChannel {
+  readonly marks: string[] = [];
+  async acknowledge(_route: ReplyRoute, messageId: string, state: AckState) {
+    this.marks.push(`${messageId}:${state}`);
+  }
+}
+
+async function setup(o: { fixed?: boolean; script?: FakeTurnScript; marked?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'aio-cmd-'));
+  const channelId = o.marked ? 'lark-bot' : 'fake';
   const base = resolveConfig(
     {
       agents: { helper: { harness: 'claude-code' }, coder: { harness: 'claude-code', model: 'sonnet' } },
       defaultAgent: 'helper',
-      policy: { owners: ['fake:alice'], ...(o.fixed ? { ownerSessionKey: 'main' } : {}), strangers: 'ask' },
-      local: { principal: 'fake:alice' },
+      policy: { owners: [`${channelId}:alice`], ...(o.fixed ? { ownerSessionKey: 'main' } : {}), strangers: 'ask' },
+      local: { principal: `${channelId}:alice` },
+      ...(o.marked ? { channels: [{ type: 'lark-bot' as const, ack: true, config: { appId: 'test-app', appSecret: 'test-secret' } }] } : {}),
     },
     { env: {}, baseDir: dir, cwd: dir },
   );
   const config = { ...base, socketPath: join(dir, 'run', 'aio.sock') };
-  const chat = new FakeChannel('fake');
+  const chat = o.marked ? new MarkedChannel(channelId) : new FakeChannel(channelId);
   const harness = new FakeHarness(o.script);
-  const gw = await Gateway.start({ config, harness, log: new MemorySessionLog(), channels: [{ adapter: chat }], logger: () => {} });
+  const gw = await Gateway.start({ config, harness, log: new MemorySessionLog(), ...(o.marked ? { channelAdapter: () => chat } : { channels: [{ adapter: chat }] }), logger: () => {} });
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   cleanups.push(() => gw.stop());
-  const say = (text: string, sender = alice, where = dm) => chat.inject({ ...where, sender, text });
+  let nextMessage = 0;
+  const say = (text: string, sender = alice, where = dm) => {
+    const id = `in${++nextMessage}`;
+    return chat.inject({ ...where, sender, text, ...(o.marked ? { id, replyRoute: { channel: channelId, account: 'default', conversationId: where.conversation.id, replyToMessageId: id } } : {}) });
+  };
   const replies = () => chat.sent.map((s) => s.edits.at(-1)?.text ?? s.msg.text);
   return { gw, chat, harness, say, replies };
 }
@@ -95,8 +108,21 @@ describe('commands', () => {
     await until(() => w.gw.sessions().every((s) => s.state !== 'running'));
   });
 
-  it('a successful /steer sends no separate confirmation reply #CT-2', async () => {
+  it('a channel without message marks still gets a /steer confirmation #CT-2', async () => {
     const w = await setup({
+      script: async (t) => {
+        await new Promise<void>((resolve) => t.signal.addEventListener('abort', () => resolve()));
+      },
+    });
+    await w.say('long job');
+    await until(() => w.gw.sessions().some((s) => s.state === 'running'));
+    await w.say('/steer also check this');
+    await until(() => w.replies().some((t) => t.includes('Nothing was running: it starts a turn.')));
+  });
+
+  it('a channel with message marks sends no separate /steer confirmation #CT-2', async () => {
+    const w = await setup({
+      marked: true,
       script: async (t) => {
         await new Promise<void>((resolve) => t.signal.addEventListener('abort', () => resolve()));
       },

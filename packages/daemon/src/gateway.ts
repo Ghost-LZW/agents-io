@@ -2392,10 +2392,13 @@ ${a.summary}` }],
 
   private command$(a: Parameters<typeof runCommand>[1]): Promise<{ ok: boolean; reply: string } | undefined> {
     return runCommand(this.commandHost, a).then(async (r) => {
-      // A successful /steer is acknowledged on its inbound message by the compositor:
-      // working while the turn runs, DONE when it completes. Do not add a second reply.
-      if (r && !(a.name === 'steer' && r.ok) && a.env.replyRoute) {
-        await this.systemReply({ route: a.env.replyRoute, text: r.reply, operationId: `cmd:${a.input.inputId}`, sessionKey: a.delivery.sessionKey, inputId: a.input.inputId }).catch((e: Error) =>
+      const route = a.env.replyRoute;
+      const ch = route && this.channelFor(route);
+      // Only channels configured to mark the inbound message can skip the text receipt.
+      // The compositor turns that mark from working to DONE when the steered turn ends.
+      const markedSteer = a.name === 'steer' && r?.ok && !!route?.replyToMessageId && !!ch?.source?.ack && !!ch.adapter.acknowledge;
+      if (r && !markedSteer && route) {
+        await this.systemReply({ route, text: r.reply, operationId: `cmd:${a.input.inputId}`, sessionKey: a.delivery.sessionKey, inputId: a.input.inputId }).catch((e: Error) =>
           this.log('warn', `command reply failed: ${e.message}`),
         );
       }
