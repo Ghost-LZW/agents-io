@@ -22,7 +22,7 @@ npx github:Ghost-LZW/create-lark-bot#v0.2.3 verify --live
 
 `messaging` covers every scope, event and callback in `requirements.ts`; `contact` lets the tool resolve your union_id, which it writes as the owner key.
 
-Inbound `merge_forward` messages are expanded with `im.v1.message.get`: the agent receives the child messages in order, with sender IDs and text, rich text, and placeholders for media. Expansion is capped at 100 messages and 16,000 characters. If the bot cannot read the forwarded content, the input says so explicitly. Media in merged-forward child messages are not downloaded by this adapter.
+Inbound `merge_forward` messages are expanded with `im.v1.message.get`: the agent receives the child messages in order, with sender IDs, text, and rich text. The first four images/files/audio/video resources (including those in rich text) are downloaded using the outer forwarded message ID and attached after the text, labeled by child message number. Text is capped at 100 messages and 16,000 characters. If the bot cannot read the forwarded content or download a resource, the input says so explicitly.
 
 Then give the adapter the credentials (`appId`, `appSecret`, `domain` in its config; the aio daemon reads them per channel entry, or from `LARK_APP_ID` / `LARK_APP_SECRET` / `LARK_DOMAIN` for a single entry). An adapter sends only to routes of the account it was started with (several bots in one daemon each have their own account). The owner key that `defaultPolicy({ owners })` from `@agents-io/session` matches is `lark-bot:<union_id>`, because the adapter identifies senders by `union_id` first (falling back to `open_id`).
 

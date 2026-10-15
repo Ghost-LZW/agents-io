@@ -1,5 +1,5 @@
 import type { BlobStore, ContentBlock, InboundEnvelope } from '@agents-io/protocol';
-import { messageText } from './inbound.js';
+import { messageMedia, messageText } from './inbound.js';
 import type { ResolvedConfig } from './config.js';
 import type { DeclaredSenderStore } from './store.js';
 import type { LarkClientLike, LarkMessageItem } from './types.js';
@@ -23,6 +23,7 @@ const CACHE_MAX = 2000;
 const NAME_FAIL_TTL_MS = 10 * 60_000;
 const MERGED_FORWARD_MAX_ITEMS = 100;
 const MERGED_FORWARD_MAX_CHARS = 16_000;
+const MERGED_FORWARD_MAX_MEDIA = 4;
 
 class TimeoutError extends Error {
   override name = 'TimeoutError';
@@ -149,7 +150,7 @@ export class InboundEnricher {
     const out: ContentBlock[] = [];
     for (const b of env.content) {
       if (b.type === 'text' && b.text === '[merged forward message]' && (env.raw as { messageType?: string } | undefined)?.messageType === 'merge_forward') {
-        out.push({ type: 'text', text: await this.mergedForward(env.id) });
+        out.push(...(await this.mergedForward(env.id, blobs)));
         continue;
       }
       if (b.type === 'quote' && b.fromMessageId && !b.text) {
@@ -262,7 +263,7 @@ export class InboundEnricher {
     return text;
   }
 
-  private async mergedForward(messageId: string): Promise<string> {
+  private async mergedForward(messageId: string, blobs: BlobStore | undefined): Promise<ContentBlock[]> {
     try {
       const res = await withTimeout(
         this.d.client().im.v1.message.get({ path: { message_id: messageId }, params: { card_msg_content_type: 'user_card_content' } }),
@@ -270,12 +271,26 @@ export class InboundEnricher {
         'merged message.get',
       );
       if (res?.code) throw new Error(`message.get ${res.code}: ${res.msg ?? ''}`);
-      const text = this.mergedForwardText(res?.data?.items ?? [], messageId);
+      const items = res?.data?.items ?? [];
+      const text = this.mergedForwardText(items, messageId);
       if (!text) throw new Error('message.get returned no merged-forward children');
-      return text;
+      const out: ContentBlock[] = [{ type: 'text', text }];
+      if (!blobs) return out;
+      const children = items.filter((item) => item.message_id && item.message_id !== messageId).slice(0, MERGED_FORWARD_MAX_ITEMS);
+      const media = children.flatMap((item, index) =>
+        item.deleted ? [] : messageMedia(item.msg_type, item.body?.content, messageId).map((block) => ({ index: index + 1, block })),
+      );
+      const attached = await Promise.all(media.slice(0, MERGED_FORWARD_MAX_MEDIA).map(async ({ index, block }): Promise<ContentBlock[]> => [
+        { type: 'text', text: this.d.cfg.locale === 'zh' ? `转发第 ${index} 条的媒体：` : `Media from forwarded message ${index}:` },
+        ...(await this.media(block as Extract<ContentBlock, { ref: string }>, blobs)),
+      ]));
+      for (const blocks of attached) out.push(...blocks);
+      if (media.length > MERGED_FORWARD_MAX_MEDIA)
+        out.push({ type: 'text', text: this.d.cfg.locale === 'zh' ? `[其余 ${media.length - MERGED_FORWARD_MAX_MEDIA} 个媒体已省略]` : `[${media.length - MERGED_FORWARD_MAX_MEDIA} more media omitted]` });
+      return out;
     } catch (e) {
       this.d.log('warn', `merged forward ${messageId} not fetched: ${errText(e)}`);
-      return this.d.cfg.locale === 'zh' ? '[合并转发内容无法读取]' : '[Merged forward content unavailable]';
+      return [{ type: 'text', text: this.d.cfg.locale === 'zh' ? '[合并转发内容无法读取]' : '[Merged forward content unavailable]' }];
     }
   }
 

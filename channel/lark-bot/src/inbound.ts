@@ -151,6 +151,25 @@ export function messageText(msgType: string | undefined, rawContent: string | un
   }
 }
 
+/** Media keys in a message fetched with `message.get`, using the containing message as the resource owner. */
+export function messageMedia(msgType: string | undefined, rawContent: string | undefined, messageId: string): ContentBlock[] {
+  const c = safeParse(rawContent ?? '');
+  switch (msgType) {
+    case 'post':
+      return flattenPost(c, messageId, [], undefined).media;
+    case 'image':
+      return c.image_key ? [{ type: 'image', ref: larkFileRef(messageId, c.image_key), mime: 'image/*' }] : [];
+    case 'file':
+      return c.file_key ? [{ type: 'file', ref: larkFileRef(messageId, c.file_key), mime: 'application/octet-stream', ...(c.file_name ? { name: String(c.file_name) } : {}) }] : [];
+    case 'audio':
+      return c.file_key ? [{ type: 'audio', ref: larkFileRef(messageId, c.file_key), mime: 'audio/*' }] : [];
+    case 'media':
+      return c.file_key ? [{ type: 'file', ref: larkFileRef(messageId, c.file_key), mime: 'video/*', ...(c.file_name ? { name: String(c.file_name) } : {}) }] : [];
+    default:
+      return [];
+  }
+}
+
 export function mapMessageEvent(ev: RawMessageEvent, ctx: MapContext): InboundEnvelope | undefined {
   const msg = ev.message;
   if (!msg?.message_id || !msg.chat_id) return undefined;

@@ -39,6 +39,27 @@ const OGG = Buffer.from('OggS....');
 const sha = (b: Buffer) => `sha256:${createHash('sha256').update(b).digest('hex')}`;
 
 describe('inbound enrichment', () => {
+  it('downloads an image in a merged forward using the outer message id #MD-1', async () => {
+    const blobs = memoryBlobs();
+    const { lark, envs, ctl, done } = await setup({ blobs });
+    lark.foreign.set('om_forward', [
+      { message_id: 'om_forward', msg_type: 'merge_forward', body: { content: 'Merged and Forwarded Message' } },
+      { message_id: 'om_child', upper_message_id: 'om_forward', msg_type: 'image', body: { content: JSON.stringify({ image_key: 'img_1' }) } },
+    ]);
+    lark.resources.set('om_forward/img_1', { bytes: PNG, headers: { 'content-type': 'image/png' } });
+    await lark.fire('im.message.receive_v1', messageEvent({ id: 'om_forward', type: 'merge_forward' }));
+    expect(envs[0]!.content).toEqual([
+      { type: 'text', text: '合并转发（1 条消息）\n\n1. 未知发送者 (image)\n[image]' },
+      { type: 'text', text: '转发第 1 条的媒体：' },
+      { type: 'image', ref: sha(PNG), mime: 'image/png' },
+    ]);
+    expect(lark.lookups).toContain('resource:om_forward/img_1:image');
+    expect(lark.lookups).not.toContain('resource:om_child/img_1:image');
+    expect(Buffer.from(blobs.items.get(sha(PNG))!.bytes).equals(PNG)).toBe(true);
+    ctl.abort();
+    await done;
+  });
+
   it('expands merged-forward children into attributed text, including non-text placeholders', async () => {
     const { lark, envs, ctl, done } = await setup();
     lark.foreign.set('om_forward', [
