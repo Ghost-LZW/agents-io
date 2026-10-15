@@ -28,6 +28,7 @@ export interface LarkMessageItem {
   message_id?: string;
   msg_type?: string;
   deleted?: boolean;
+  upper_message_id?: string;
   chat_id?: string;
   sender?: { id: string; id_type: string; sender_type: string };
   body?: { content: string };

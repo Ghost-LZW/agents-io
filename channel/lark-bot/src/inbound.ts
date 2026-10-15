@@ -196,6 +196,11 @@ export function mapMessageEvent(ev: RawMessageEvent, ctx: MapContext): InboundEn
           ...(parsed.file_name ? { name: String(parsed.file_name) } : {}),
         });
       break;
+    case 'merge_forward':
+      // The receive event contains only a fixed placeholder. Enrichment fetches the
+      // outer message and its children with im.v1.message.get.
+      content.push({ type: 'text', text: '[merged forward message]' });
+      break;
     default:
       content.push({ type: 'text', text: `[unsupported ${msg.message_type} message]` });
   }

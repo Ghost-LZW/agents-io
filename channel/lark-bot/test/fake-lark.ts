@@ -41,8 +41,8 @@ export class FakeLark {
   /** Every CardKit / CoT call in order, for asserting sequences. */
   readonly log: string[] = [];
   botOpenId = 'ou_bot';
-  /** Messages other users sent, as `message.get` returns them (for quote lookups). */
-  readonly foreign = new Map<string, LarkMessageItem>();
+  /** Messages other users sent, as `message.get` returns them (including merged-forward children). */
+  readonly foreign = new Map<string, LarkMessageItem | LarkMessageItem[]>();
   /** `${messageId}/${fileKey}` → resource bytes and headers (`messageResource.get`). */
   readonly resources = new Map<string, { bytes: Buffer; headers?: Record<string, string>; hang?: boolean }>();
   /** `im.v1.file.create` / `image.create` calls, in order. */
@@ -208,7 +208,7 @@ export class FakeLark {
           get: async ({ path }): Promise<LarkApiResponse<{ items?: LarkMessageItem[] }>> => {
             this.lookups.push(`get:${path.message_id}`);
             const other = this.foreign.get(path.message_id);
-            if (other) return { code: 0, data: { items: [other] } };
+            if (other) return { code: 0, data: { items: Array.isArray(other) ? other : [other] } };
             const m = this.find(path.message_id);
             if (!m) return { code: 230011, msg: 'recalled' };
             return {

@@ -18,7 +18,7 @@ export interface ScopeRequirement {
 
 export const TENANT_SCOPES: readonly ScopeRequirement[] = [
   { name: 'im:message:send_as_bot', tier: 'runtime', why: 'message.create / message.reply as the bot' },
-  { name: 'im:message', tier: 'runtime', why: 'patch/update/get of messages the bot sent (streaming edits, reconcile); get of replied-to messages for quote text' },
+  { name: 'im:message', tier: 'runtime', why: 'patch/update/get of messages the bot sent (streaming edits, reconcile); get of replied-to messages and merged-forward children' },
   { name: 'im:message.p2p_msg:readonly', tier: 'runtime', why: 'receive direct messages (im.message.receive_v1)' },
   { name: 'im:message.group_at_msg:readonly', tier: 'runtime', why: 'receive group messages that @ the bot' },
   { name: 'im:message.group_msg', tier: 'optional', why: 'receive group messages that do not @ the bot (observe-only); without it the bot only sees @mentions' },

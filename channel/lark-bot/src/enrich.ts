@@ -2,7 +2,7 @@ import type { BlobStore, ContentBlock, InboundEnvelope } from '@agents-io/protoc
 import { messageText } from './inbound.js';
 import type { ResolvedConfig } from './config.js';
 import type { DeclaredSenderStore } from './store.js';
-import type { LarkClientLike } from './types.js';
+import type { LarkClientLike, LarkMessageItem } from './types.js';
 
 /**
  * Inbound enrichment that needs the network: attachment download into the host's
@@ -21,6 +21,8 @@ export interface EnrichDeps {
 const LARK_FILE = /^lark-file:([^/]+)\/(.+)$/;
 const CACHE_MAX = 2000;
 const NAME_FAIL_TTL_MS = 10 * 60_000;
+const MERGED_FORWARD_MAX_ITEMS = 100;
+const MERGED_FORWARD_MAX_CHARS = 16_000;
 
 class TimeoutError extends Error {
   override name = 'TimeoutError';
@@ -146,6 +148,10 @@ export class InboundEnricher {
   private async content(env: InboundEnvelope, blobs: BlobStore | undefined): Promise<ContentBlock[]> {
     const out: ContentBlock[] = [];
     for (const b of env.content) {
+      if (b.type === 'text' && b.text === '[merged forward message]' && (env.raw as { messageType?: string } | undefined)?.messageType === 'merge_forward') {
+        out.push({ type: 'text', text: await this.mergedForward(env.id) });
+        continue;
+      }
       if (b.type === 'quote' && b.fromMessageId && !b.text) {
         out.push(await this.quote(b.fromMessageId));
         continue;
@@ -230,6 +236,49 @@ export class InboundEnricher {
 
   // ---- quotes -----------------------------------------------------------------------------
 
+  /** A merged forward's children are returned with its outer message by message.get. */
+  private mergedForwardText(items: LarkMessageItem[], messageId: string): string | undefined {
+    const root = items.find((item) => item.message_id === messageId);
+    if (root?.msg_type !== 'merge_forward') return undefined;
+    const children = items.filter((item) => item.message_id && item.message_id !== messageId);
+    if (!children.length) return undefined;
+    const heading = this.d.cfg.locale === 'zh' ? `合并转发（${children.length} 条消息）` : `Merged forward (${children.length} messages)`;
+    const truncated = this.d.cfg.locale === 'zh' ? '[转发内容已截断]' : '[Forwarded content truncated]';
+    let text = heading;
+    for (const [index, item] of children.entries()) {
+      if (index >= MERGED_FORWARD_MAX_ITEMS) {
+        text += `\n\n${truncated}`;
+        break;
+      }
+      const sender = item.sender?.id || (this.d.cfg.locale === 'zh' ? '未知发送者' : 'unknown sender');
+      const body = item.deleted ? '[deleted message]' : messageText(item.msg_type, item.body?.content, item.mentions);
+      const line = `\n\n${index + 1}. ${sender} (${item.msg_type ?? 'unknown'})\n${body}`;
+      if (text.length + line.length > MERGED_FORWARD_MAX_CHARS) {
+        text += `${line.slice(0, Math.max(0, MERGED_FORWARD_MAX_CHARS - text.length - truncated.length - 2))}\n\n${truncated}`;
+        break;
+      }
+      text += line;
+    }
+    return text;
+  }
+
+  private async mergedForward(messageId: string): Promise<string> {
+    try {
+      const res = await withTimeout(
+        this.d.client().im.v1.message.get({ path: { message_id: messageId }, params: { card_msg_content_type: 'user_card_content' } }),
+        this.d.cfg.lookupTimeoutMs,
+        'merged message.get',
+      );
+      if (res?.code) throw new Error(`message.get ${res.code}: ${res.msg ?? ''}`);
+      const text = this.mergedForwardText(res?.data?.items ?? [], messageId);
+      if (!text) throw new Error('message.get returned no merged-forward children');
+      return text;
+    } catch (e) {
+      this.d.log('warn', `merged forward ${messageId} not fetched: ${errText(e)}`);
+      return this.d.cfg.locale === 'zh' ? '[合并转发内容无法读取]' : '[Merged forward content unavailable]';
+    }
+  }
+
   /** The replied-to message as a quote: text from `im.v1.message.get`, `declared` from our own store. */
   private async quote(parentId: string): Promise<ContentBlock> {
     let declared: string | undefined;
@@ -245,9 +294,10 @@ export class InboundEnricher {
     try {
       const res = await withTimeout(this.d.client().im.v1.message.get({ path: { message_id: parentId }, params: { card_msg_content_type: 'user_card_content' } }), this.d.cfg.lookupTimeoutMs, 'message.get');
       if (res?.code) throw new Error(`message.get ${res.code}: ${res.msg ?? ''}`);
-      const item = res?.data?.items?.[0];
+      const items = res?.data?.items ?? [];
+      const item = items.find((candidate) => candidate.message_id === parentId) ?? items[0];
       if (!item) throw new Error('message.get returned no item');
-      const raw = (item.deleted ? '[deleted message]' : messageText(item.msg_type, item.body?.content, item.mentions)).replace(/\n{3,}/g, '\n\n').trim();
+      const raw = (item.deleted ? '[deleted message]' : item.msg_type === 'merge_forward' ? this.mergedForwardText(items, parentId) ?? '[merged forward message]' : messageText(item.msg_type, item.body?.content, item.mentions)).replace(/\n{3,}/g, '\n\n').trim();
       const max = this.d.cfg.quoteMaxChars;
       const text = raw.length > max ? raw.slice(0, max - 1).trimEnd() + '…' : raw;
       put(this.quotes, parentId, { text });
