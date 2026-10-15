@@ -60,6 +60,28 @@ describe('inbound enrichment', () => {
     await done;
   });
 
+  it('keeps nested merged forwards in their message hierarchy and downloads nested images #MD-1', async () => {
+    const blobs = memoryBlobs();
+    const { lark, envs, ctl, done } = await setup({ blobs });
+    lark.foreign.set('om_outer', [
+      { message_id: 'om_outer', msg_type: 'merge_forward', body: { content: 'Merged and Forwarded Message' } },
+      { message_id: 'om_first', upper_message_id: 'om_outer', msg_type: 'text', body: { content: JSON.stringify({ text: 'first' }) } },
+      { message_id: 'om_nested', upper_message_id: 'om_outer', msg_type: 'merge_forward', body: { content: 'Merged and Forwarded Message' } },
+      { message_id: 'om_image', upper_message_id: 'om_nested', msg_type: 'image', body: { content: JSON.stringify({ image_key: 'img_nested' }) } },
+      { message_id: 'om_last', upper_message_id: 'om_nested', msg_type: 'text', body: { content: JSON.stringify({ text: 'last' }) } },
+    ]);
+    lark.resources.set('om_outer/img_nested', { bytes: PNG, headers: { 'content-type': 'image/png' } });
+    await lark.fire('im.message.receive_v1', messageEvent({ id: 'om_outer', type: 'merge_forward' }));
+    expect(envs[0]!.content).toEqual([
+      { type: 'text', text: '合并转发（2 条消息）\n\n1. 未知发送者 (text)\nfirst\n\n2. 未知发送者 (merge_forward，2 条子消息)\n\n  2.1. 未知发送者 (image)\n  [image]\n\n  2.2. 未知发送者 (text)\n  last' },
+      { type: 'text', text: '转发第 2.1 条的媒体：' },
+      { type: 'image', ref: sha(PNG), mime: 'image/png' },
+    ]);
+    expect(lark.lookups).toContain('resource:om_outer/img_nested:image');
+    ctl.abort();
+    await done;
+  });
+
   it('expands merged-forward children into attributed text, including non-text placeholders', async () => {
     const { lark, envs, ctl, done } = await setup();
     lark.foreign.set('om_forward', [
