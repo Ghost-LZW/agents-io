@@ -232,7 +232,8 @@ async function handshake(transport: Transport, opts: CodexHarnessOptions): Promi
     const params: InitializeParams = {
       clientInfo: opts.clientInfo ?? { name: 'agents_io', title: 'agents-io', version: '0.1.0' },
       capabilities: {
-        experimentalApi: !!opts.live,
+        // Plan collaboration mode on turn/start is experimental even without realtime live.
+        experimentalApi: true,
         requestAttestation: false,
         optOutNotificationMethods: (opts.optOutNotificationMethods ?? DEFAULT_OPT_OUT).filter((m) => !opts.live || !LIVE_NOTIFICATIONS.includes(m)),
       },

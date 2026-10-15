@@ -70,6 +70,7 @@ import {
   WatchDispatcher,
   WatchRegistry,
   defaultPolicy,
+  OWNER_LABEL,
   parseQuestionActionId,
   questionTextAnswer,
   type AddWatchResult,
@@ -2378,20 +2379,21 @@ ${a.summary}` }],
     return this.topics.current(conversation, agent)?.sessionKey;
   }
 
-  /** A configured run override (`/model`, `/effort`) of one session. */
-  private runOverride(sessionKey: string): { model?: string; effort?: string } {
+  /** Chat command overrides of one session's future turns. */
+  private runOverride(sessionKey: string): { model?: string; effort?: string; mode?: 'default' | 'plan'; profile?: 'bypass' | 'restricted' } {
     const v = this.records.flag(`run:${sessionKey}`);
-    return v ? (JSON.parse(v) as { model?: string; effort?: string }) : {};
+    return v ? (JSON.parse(v) as { model?: string; effort?: string; mode?: 'default' | 'plan'; profile?: 'bypass' | 'restricted' }) : {};
   }
 
-  /** The session's turns plan with its `/model` / `/effort` over the agent's. */
+  /** Apply owner chat overrides after the agent's policy; guests retain their policy profile. */
   private withRunOverride(p: FullPolicy, sessionKey: string): FullPolicy {
     return {
       ...p,
       plan: async (d) => {
         const run = await p.plan(d);
         const o = this.runOverride(sessionKey);
-        return { ...run, ...(o.model ? { model: o.model } : {}), ...(o.effort ? { effort: o.effort } : {}) };
+        const allOwner = d.inputs.length > 0 && d.inputs.every((i) => i.origin.principal?.labels.includes(OWNER_LABEL));
+        return { ...run, ...(o.model ? { model: o.model } : {}), ...(o.effort ? { effort: o.effort } : {}), ...(o.mode ? { mode: o.mode } : {}), ...(o.profile && allOwner ? { profile: o.profile } : {}) };
       },
     };
   }
@@ -2425,6 +2427,7 @@ ${a.summary}` }],
         return [
           `session ${key}${topic ? ` · topic ${topic.title ?? topic.id}` : ''}`,
           `agent ${d.agent ?? agentOf(key).name} · ${run.harness} (${run.kind}) · model ${run.model ?? 'default'}${run.effort ? ` · effort ${run.effort}` : ''}${run.overridden ? ' (set here)' : ''}`,
+          `Plan mode ${run.kind === 'codex' ? run.mode === 'plan' ? 'on' : 'off' : 'unavailable'} · bypass ${run.profile ?? 'default (agent policy)'}`,
           `cwd ${this.laneInfo.get(key)?.cwd ?? agentOf(key).cwd ?? c.cwd}`,
           `state ${info?.state ?? 'not open'}${info?.turnId ? ` · turn ${info.turnId}` : ''}${info?.queued ? ` · ${info.queued} queued` : ''}${info?.pendingRequests.length ? ` · waiting on ${info.pendingRequests.length} approval(s)` : ''}`,
           ...(native ? [`native session ${native}`] : []),
@@ -2461,13 +2464,15 @@ ${a.summary}` }],
         const o = this.runOverride(key);
         const model = o.model ?? base.model;
         const effort = o.effort ?? base.effort;
-        return { harness: inst.name, kind: inst.kind, ...(model ? { model } : {}), ...(effort ? { effort } : {}), overridden: !!(o.model || o.effort) };
+        return { harness: inst.name, kind: inst.kind, ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(o.mode ? { mode: o.mode } : {}), ...(o.profile ? { profile: o.profile } : {}), overridden: !!(o.model || o.effort || o.mode || o.profile) };
       },
       setRun: (key, o) => {
         const cur = this.runOverride(key);
         const next = { ...cur };
         if (o.model !== undefined) o.model === null ? delete next.model : (next.model = o.model);
         if (o.effort !== undefined) o.effort === null ? delete next.effort : (next.effort = o.effort);
+        if (o.mode !== undefined) next.mode = o.mode;
+        if (o.profile !== undefined) o.profile === null ? delete next.profile : (next.profile = o.profile);
         this.records.setFlag(`run:${key}`, Object.keys(next).length ? JSON.stringify(next) : undefined);
       },
       agents: () => {

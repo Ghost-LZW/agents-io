@@ -15,6 +15,7 @@ import type {
   SteerResult,
 } from '@agents-io/protocol';
 import type { RequestId } from './generated/RequestId.js';
+import type { CollaborationMode } from './generated/CollaborationMode.js';
 import type { ThreadStatus } from './generated/v2/ThreadStatus.js';
 import type { TurnError } from './generated/v2/TurnError.js';
 import type { TurnStartParams } from './generated/v2/TurnStartParams.js';
@@ -249,7 +250,22 @@ export class CodexSession implements HarnessSession {
     try {
       const input = await renderInputs(inputs, { resolveMedia: this.opts.resolveMedia, preface: this.opts.preface });
       await this.settling;
-      const params: TurnStartParams = { threadId: this.threadId, input, clientUserMessageId, ...this.overrides(effective) };
+      // collaborationMode is in Codex's experimental 0.160 schema; the checked-in
+      // stable TurnStartParams generator omits that one field.
+      const params: TurnStartParams & { collaborationMode?: CollaborationMode } = {
+        threadId: this.threadId,
+        input,
+        clientUserMessageId,
+        ...this.overrides(effective),
+        ...(effective.mode ? { collaborationMode: {
+          mode: effective.mode,
+          settings: {
+            model: effective.model === 'default' ? (this.applied.model ?? effective.model) : effective.model,
+            reasoning_effort: (effective.effort ?? this.applied.effort ?? null) as CollaborationMode['settings']['reasoning_effort'],
+            developer_instructions: null,
+          },
+        } } : {}),
+      };
       const res = await this.host.rpc.request<TurnStartResponse>('turn/start', params);
       this.applied = { model: effective.model || this.applied.model, effort: effective.effort ?? this.applied.effort, profile: effective.profile };
       if (!t.codexTurnId) t.bind(res.turn.id);

@@ -18,6 +18,8 @@ export const COMMAND_HELP = [
   '/topics, /switch <n> — list topics, go back to one',
   '/agent [name] — which agent this chat talks to; with a name, switch (new turns go to its current topic)',
   '/model [name], /effort [level] — show, or set for this session from the next turn (/model default to undo)',
+  '/plan [on|off] — show or set Codex Plan mode from the next turn',
+  '/bypass [on|off|default] — show or set Codex permissions for owner turns',
   '/compact — compact the harness context (Claude Code)',
   '/tui — how to open this session in the harness’s own terminal UI',
 ].join('\n');
@@ -35,8 +37,8 @@ export interface CommandHost {
   input(delivery: RouteDelivery, input: InputRecord, mode: 'steer' | 'queue'): Promise<CommandResult>;
   /** The question code names its original session, even if the chat has switched topics. */
   answer(code: string, text: string, origin: Origin): Promise<CommandResult>;
-  run(sessionKey: string): { harness: string; kind: string; model?: string; effort?: string; overridden: boolean };
-  setRun(sessionKey: string, o: { model?: string | null; effort?: string | null }): void;
+  run(sessionKey: string): { harness: string; kind: string; model?: string; effort?: string; mode?: 'default' | 'plan'; profile?: 'bypass' | 'restricted'; overridden: boolean };
+  setRun(sessionKey: string, o: { model?: string | null; effort?: string | null; mode?: 'default' | 'plan'; profile?: 'bypass' | 'restricted' | null }): void;
   agents(): string[];
   conversationAgent(conversation: string): string | undefined;
   setConversationAgent(conversation: string, agent: string): void;
@@ -51,7 +53,7 @@ export async function runCommand(
   const { name, args, delivery } = a;
   const key = delivery.sessionKey;
   const topicConversation = delivery.topic?.conversation;
-  const known = ['help', 'status', 'stop', 'steer', 'answer', 'model', 'effort', 'compact', 'agent', 'tui', 'new', 'topics', 'switch'];
+  const known = ['help', 'status', 'stop', 'steer', 'answer', 'model', 'effort', 'plan', 'bypass', 'compact', 'agent', 'tui', 'new', 'topics', 'switch'];
   if (!known.includes(name)) return undefined;
   // The lane checks the question's resolver principal. A guest may answer a question
   // addressed to them even though they cannot operate owner-only chat commands.
@@ -98,6 +100,22 @@ export async function runCommand(
       const value = args === 'default' ? null : args;
       h.setRun(key, name === 'model' ? { model: value } : { effort: value });
       return ok(value === null ? `${name} back to the agent's default from the next turn.` : `${name} ${value} from the next turn.`);
+    }
+    case 'plan': {
+      const cur = h.run(key);
+      if (cur.kind !== 'codex') return no(`/plan is available only on Codex (this agent uses ${cur.kind}).`);
+      if (!args) return ok(`Plan mode ${cur.mode === 'plan' ? 'on' : 'off'} for this session.`);
+      if (args !== 'on' && args !== 'off') return no('Usage: /plan [on|off]');
+      h.setRun(key, { mode: args === 'on' ? 'plan' : 'default' });
+      return ok(`Plan mode ${args} from the next turn.`);
+    }
+    case 'bypass': {
+      const cur = h.run(key);
+      if (cur.kind !== 'codex') return no(`/bypass is available only on Codex (this agent uses ${cur.kind}).`);
+      if (!args) return ok(`Bypass ${cur.profile ?? 'default'} for owner turns in this session.`);
+      if (args !== 'on' && args !== 'off' && args !== 'default') return no('Usage: /bypass [on|off|default]');
+      h.setRun(key, { profile: args === 'default' ? null : args === 'on' ? 'bypass' : 'restricted' });
+      return ok(args === 'default' ? 'Bypass back to the agent policy from the next turn.' : `Bypass ${args} for owner turns from the next turn.`);
     }
     case 'compact': {
       const cur = h.run(key);

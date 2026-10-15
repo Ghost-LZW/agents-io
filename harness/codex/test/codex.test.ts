@@ -14,7 +14,7 @@ describe('handshake and probe', () => {
     expect(p.caps).toMatchObject({ steer: 'native', interrupt: true, approvals: true, questions: true, tokenDeltas: true, injectWithoutTurn: true, resume: true, switchModelMidSession: true, cancelQueued: false });
     const init = fake.sent('initialize')[0]!;
     expect(init.params.clientInfo).toMatchObject({ name: 'agents_io' });
-    expect(init.params.capabilities).toMatchObject({ experimentalApi: false });
+    expect(init.params.capabilities).toMatchObject({ experimentalApi: true });
     expect(init.params.capabilities.optOutNotificationMethods).toContain('thread/realtime/started');
     const idx = fake.received.findIndex((m) => m.method === 'initialized');
     expect(idx).toBeGreaterThan(fake.received.indexOf(init));
@@ -167,6 +167,24 @@ describe('turn mapping', () => {
       approvalsReviewer: 'user',
       sandboxPolicy: { type: 'workspaceWrite' },
     });
+  });
+
+  it('sends Plan and Default collaboration modes on successive turns', async () => {
+    const { fake, harness } = setup();
+    const s = await open(harness);
+    const c = collector(s);
+    fake.onTurnStart = (p, tid) => {
+      fake.echoUser(p.threadId, tid, p.clientUserMessageId);
+      fake.completeTurn(p.threadId, tid, 'completed');
+    };
+    await s.startTurn('T1', [input('i1', 'plan')], { ...run, mode: 'plan' });
+    await c.until((e) => isCompleted(e) && e.turnId === 'T1');
+    await s.startTurn('T2', [input('i2', 'execute')], { ...run, mode: 'default' });
+    await c.until((e) => isCompleted(e) && e.turnId === 'T2');
+    expect(fake.sent('turn/start').map((m) => m.params.collaborationMode)).toEqual([
+      { mode: 'plan', settings: { model: run.model, reasoning_effort: run.effort, developer_instructions: null } },
+      { mode: 'default', settings: { model: run.model, reasoning_effort: run.effort, developer_instructions: null } },
+    ]);
   });
 
   it('maps failed turns with code and retryable #HC-1 #IN-2', async () => {
