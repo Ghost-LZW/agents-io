@@ -7,6 +7,7 @@ export * from './lane.js';
 export * from './ingress.js';
 export * from './outbox.js';
 export * from './compositor.js';
+export * from './question.js';
 export * from './watch.js';
 export * from './blobs.js';
 export * from './identity.js';

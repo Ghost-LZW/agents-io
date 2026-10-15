@@ -150,6 +150,8 @@ export interface BlobStore {
 export interface EmitResult {
   accepted: boolean;
   inputId?: string;
+  /** Outcome of a direct card action; the adapter may give immediate click feedback. */
+  actionResult?: { ok: boolean; reason?: string };
   /** With `accepted: false`: why. */
   error?: string;
   /** With `accepted: false`: this envelope will never be accepted (confirming it loses nothing the host would take). */

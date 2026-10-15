@@ -13,6 +13,7 @@ export const COMMAND_HELP = [
   '/status — this conversation: session, agent, harness, model, what runs, what waits',
   '/stop [--clear] — stop the running turn (--clear also drops what is queued)',
   '/steer <text> — add to the running turn instead of queueing',
+  '/answer <question-code> <answer> — answer a native Codex / Claude Code question',
   '/new [@agent] [title] — a new topic (with @agent: talk to that agent from now on)',
   '/topics, /switch <n> — list topics, go back to one',
   '/agent [name] — which agent this chat talks to; with a name, switch (new turns go to its current topic)',
@@ -32,6 +33,8 @@ export interface CommandHost {
   running(conversation: string): string[];
   /** Deliver an input to the session (the delivery's lane), with a mode. */
   input(delivery: RouteDelivery, input: InputRecord, mode: 'steer' | 'queue'): Promise<CommandResult>;
+  /** The question code names its original session, even if the chat has switched topics. */
+  answer(code: string, text: string, origin: Origin): Promise<CommandResult>;
   run(sessionKey: string): { harness: string; kind: string; model?: string; effort?: string; overridden: boolean };
   setRun(sessionKey: string, o: { model?: string | null; effort?: string | null }): void;
   agents(): string[];
@@ -48,8 +51,16 @@ export async function runCommand(
   const { name, args, delivery } = a;
   const key = delivery.sessionKey;
   const topicConversation = delivery.topic?.conversation;
-  const known = ['help', 'status', 'stop', 'steer', 'model', 'effort', 'compact', 'agent', 'tui', 'new', 'topics', 'switch'];
+  const known = ['help', 'status', 'stop', 'steer', 'answer', 'model', 'effort', 'compact', 'agent', 'tui', 'new', 'topics', 'switch'];
   if (!known.includes(name)) return undefined;
+  // The lane checks the question's resolver principal. A guest may answer a question
+  // addressed to them even though they cannot operate owner-only chat commands.
+  if (name === 'answer') {
+    const split = args.search(/\s/);
+    if (split < 0 || !args.slice(split).trim()) return { ok: false, reply: 'Usage: /answer <question-code> <answer>' };
+    const r = await h.answer(args.slice(0, split), args.slice(split).trim(), a.origin);
+    return r.ok ? { ok: true, reply: 'Answer submitted.' } : { ok: false, reply: `Answer not submitted: ${r.reason ?? 'refused'}.` };
+  }
   // Plain topic commands in a chat that keeps topics: Ingress answers them.
   if ((name === 'new' && !args.startsWith('@')) || name === 'topics' || name === 'switch') {
     if (topicConversation) return undefined;

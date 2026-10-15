@@ -190,6 +190,15 @@ export class ClaudeCodeSession implements HarnessSession {
         ? oneLine(opts.title.replace(ANSI, ''), 200)
         : itemTitle(toolName, input);
     const parentItemId = this.items.get(opts.toolUseID)?.parentItemId;
+    const questions = isQuestion && Array.isArray(input.questions)
+      ? (input.questions as Array<Record<string, unknown>>).map((q, index) => ({
+          id: String(index),
+          text: String(q.question ?? ''),
+          ...(typeof q.header === 'string' ? { header: q.header } : {}),
+          ...(Array.isArray(q.options) ? { options: q.options.map((o) => ({ label: String((o as Record<string, unknown>).label ?? ''), ...((o as Record<string, unknown>).description ? { description: String((o as Record<string, unknown>).description) } : {}) })) } : {}),
+          ...(q.multiSelect === true ? { multiSelect: true } : {}),
+        }))
+      : undefined;
     this.emit(
       {
         t: 'request.opened',
@@ -198,6 +207,7 @@ export class ClaudeCodeSession implements HarnessSession {
         title,
         risk: riskOf(toolName, input, opts.blockedPath),
         allowedDecisions: isQuestion ? ['answer', 'deny'] : ['allow_once', ...(allowAlways ? ['allow_session'] : []), 'deny'],
+        ...(questions ? { questions } : {}),
         allowAlways,
         defaultDeny: opts.defaultToNo === true,
       },
@@ -810,4 +820,3 @@ export function mapAnswers(
 function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms).unref?.());
 }
-

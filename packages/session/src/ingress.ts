@@ -6,6 +6,7 @@ import {
   type Command,
   type ContentBlock,
   type DecisionKind,
+  type Decision,
   type EmitResult,
   type InputRecord,
   type ChannelCaps,
@@ -26,6 +27,7 @@ import { conversationRouteKey, withDefaults, type FullPolicy, type SessionPolicy
 import { Router, RouterError, defaultBindings, sourceOf, type Explanation, type RouteDelivery } from './router.js';
 import type { TopicRecord } from './topics.js';
 import { contentText, type WatchDelivery, type WatchDispatcher } from './watch.js';
+import { parseQuestionActionId, questionFormAnswer } from './question.js';
 
 const ACTION_PREFIX = 'req:';
 
@@ -103,7 +105,7 @@ export interface IngressOptions {
    * session that owns the request or turn (`Hub.locate`), not to the click's
    * conversation (card callbacks often carry another conversation kind, no thread).
    */
-  hub?: Pick<Hub, 'locate'>;
+  hub?: Pick<Hub, 'locate' | 'snapshot'>;
   /**
    * Input ids. Default: derived from `(channel, account, envelope id)` ({@link envelopeInputId}),
    * so a redelivery of the same message (also after a restart, or after a partial fan-out)
@@ -288,7 +290,9 @@ export class Ingress {
     return async (env) => {
       const r = await this.accept(env, source);
       // accept refuses only invalid envelopes: never taken, so `permanent` (IN-7).
-      return r.accepted ? { accepted: true, ...(r.inputId !== undefined ? { inputId: r.inputId } : {}) } : { accepted: false, permanent: true, ...(r.error !== undefined ? { error: r.error } : {}) };
+      return r.accepted
+        ? { accepted: true, ...(r.inputId !== undefined ? { inputId: r.inputId } : {}), ...(r.action === 'resolve' && r.result ? { actionResult: { ok: r.result.ok, ...(!r.result.ok && r.result.reason ? { reason: r.result.reason } : {}) } } : {}) }
+        : { accepted: false, permanent: true, ...(r.error !== undefined ? { error: r.error } : {}) };
     };
   }
 
@@ -372,7 +376,8 @@ export class Ingress {
     // the running turn). Other action ids are inputs and route through the bindings (`actionPrefix`).
     const click = env.admission === 'drop' || origin.self ? undefined : actionClick(env);
     if (click) {
-      const owner = this.o.hub ? this.o.hub.locate(click.kind === 'interrupt' ? { turnId: click.turnId } : { requestId: click.requestId }) : conversationRouteKey(env);
+      const owner = click.kind === 'question' ? click.sessionKey
+        : this.o.hub ? this.o.hub.locate(click.kind === 'interrupt' ? { turnId: click.turnId } : { requestId: click.requestId }) : conversationRouteKey(env);
       const action = click.kind === 'interrupt' ? ('interrupt' as const) : ('resolve' as const);
       // Unknown id: answer without creating a lane for the click's conversation.
       if (owner === undefined) return { accepted: true, action, origin, result: { ok: false, reason: click.kind === 'interrupt' ? 'stale_turn' : 'unknown_request' } };
@@ -383,10 +388,20 @@ export class Ingress {
         if (!(e instanceof LaneUnavailableError)) throw e;
         return { accepted: true, action, sessionKey: owner, origin, result: { ok: false, reason: e.code } };
       }
+      let answer: Decision | undefined;
+      if (click.kind === 'question') {
+        const req = this.o.hub?.snapshot(owner).pendingRequests.find((r) => r.requestId === click.requestId && r.kind === 'question');
+        if (!req) return { accepted: true, action, sessionKey: owner, origin, result: { ok: false, reason: 'already_resolved_or_unknown_request' } };
+        const event = env.content[0];
+        const form = event?.type === 'event' && event.name === 'action' ? event.data.formValue : undefined;
+        const parsed = questionFormAnswer(req, form && typeof form === 'object' && !Array.isArray(form) ? form as Record<string, unknown> : {});
+        if (typeof parsed === 'string') return { accepted: true, action, sessionKey: owner, origin, result: { ok: false, reason: `bad_answer: ${parsed}` } };
+        answer = parsed;
+      }
       const cmd: Command =
         click.kind === 'interrupt'
           ? { type: 'interrupt', sessionKey: owner, turnId: click.turnId, origin }
-          : { type: 'resolve', sessionKey: owner, requestId: click.requestId, decision: { kind: click.kind }, origin };
+          : { type: 'resolve', sessionKey: owner, requestId: click.requestId, decision: click.kind === 'question' ? answer! : { kind: click.kind }, origin };
       const result = await lane.command(cmd);
       return { accepted: true, action, sessionKey: owner, origin, result };
     }
@@ -766,6 +781,8 @@ function actionClick(env: InboundEnvelope) {
   if (id === undefined) return undefined;
   const stop = parseInterruptActionId(id);
   if (stop) return { kind: 'interrupt' as const, turnId: stop.turnId };
+  const question = parseQuestionActionId(id);
+  if (question) return { kind: 'question' as const, ...question };
   return parseActionId(id);
 }
 

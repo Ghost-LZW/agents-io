@@ -37,12 +37,15 @@ import {
 } from './process-card.js';
 import {
   CHOICE_KEY,
+  QUESTION_KEY,
   MENTIONS_KEY,
   choiceFormCard,
+  questionFormCard,
   larkFileType,
   mentionMessage,
   neutral,
   type ChoiceData,
+  type QuestionData,
   type MentionsData,
   cardMessage,
   fitCard,
@@ -282,7 +285,7 @@ export class LarkBotAdapter implements ChannelAdapter {
    * adapter keeps the dedup key and retries the emit itself. An answer of `accepted: false`
    * (not `permanent`) counts as a failure too (IN-7: e.g. the daemon is stopping).
    */
-  private async deliver(ctx: ChannelContext, key: string, emit: () => Promise<unknown>): Promise<void> {
+  private async deliver(ctx: ChannelContext, key: string, emit: () => Promise<unknown>): Promise<unknown> {
     let acked = false;
     const attempt = (n: number): Promise<unknown> =>
       emit()
@@ -303,12 +306,13 @@ export class LarkBotAdapter implements ChannelAdapter {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<'late'>((resolve) => (timer = setTimeout(() => ((acked = true), resolve('late')), this.cfg.ackTimeoutMs)));
     try {
-      const res = await Promise.race([p.then(() => 'done' as const, (err: unknown) => ({ err })), deadline]);
-      if (typeof res === 'object') {
+      const res = await Promise.race([p.then((value) => ({ value }), (err: unknown) => ({ err })), deadline]);
+      if (typeof res === 'object' && 'err' in res) {
         this.dedup.delete(key); // let the platform's redelivery retry it
         ctx.log('error', `emit failed for ${key}: ${String(res.err)}`);
         throw res.err;
       }
+      return typeof res === 'object' ? res.value : undefined;
     } finally {
       clearTimeout(timer);
     }
@@ -418,14 +422,24 @@ export class LarkBotAdapter implements ChannelAdapter {
     return { ...msg, attachments: out };
   }
 
-  private async onCardAction(ctx: ChannelContext, ev: RawCardActionEvent): Promise<Record<string, never>> {
+  private async onCardAction(ctx: ChannelContext, ev: RawCardActionEvent): Promise<Record<string, unknown>> {
     const key = `card:${ev?.event_id ?? ev?.token ?? ''}`;
     if (key !== 'card:') {
       if (this.dedup.has(key)) return {};
       this.dedup.add(key);
     }
     const env = mapCardAction(ev, { account: ctx.account });
-    if (env) await this.deliver(ctx, key, () => ctx.emit(env));
+    if (env) {
+      const result = await this.deliver(ctx, key, () => ctx.emit(env)) as EmitResult | undefined;
+      const actionId = (env.content[0]?.type === 'event' ? env.content[0].data.actionId : undefined);
+      if (typeof actionId === 'string' && actionId.startsWith('ask:') && result?.actionResult) {
+        const outcome = result.actionResult;
+        const content = outcome.ok ? '答案已提交' : outcome.reason === 'not_eligible' ? '你没有权限回答此问题'
+          : outcome.reason === 'already_resolved_or_unknown_request' ? '问题已结束，请勿重复提交'
+          : outcome.reason?.startsWith('bad_answer:') ? '请填写全部答案后重试' : '提交失败，请重试';
+        return { toast: { type: outcome.ok ? 'success' : 'error', content } };
+      }
+    }
     return {};
   }
 
@@ -482,10 +496,15 @@ export class LarkBotAdapter implements ChannelAdapter {
     const parts: { out: OutMessage; kind: MsgKind }[] = [];
     const mentions = neutral<MentionsData>(msg, MENTIONS_KEY);
     const choice = neutral<ChoiceData>(msg, CHOICE_KEY);
+    const question = neutral<QuestionData>(msg, QUESTION_KEY);
     if (!msg.text.trim() && msg.attachments?.length && !needsCard(msg) && !isLarkCard(msg.channelData)) {
       // A bare file: no empty text message in front of it.
       const files = this.attachmentParts(msg);
       return { parts: files, primary: 0 };
+    } else if (question?.questions?.length && question.actionId) {
+      const card = questionFormCard(question);
+      if (Buffer.byteLength(JSON.stringify(card)) <= this.cfg.maxCardBytes) parts.push({ out: cardMessage(card), kind: 'card' });
+      else parts.push({ out: textMessage(msg.text), kind: 'text' });
     } else if (choice?.multi && msg.actions?.length) {
       parts.push({ out: cardMessage(choiceFormCard(choice)), kind: 'card' });
     } else if (mentions && !needsCard(msg)) {

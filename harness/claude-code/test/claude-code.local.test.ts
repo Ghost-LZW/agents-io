@@ -128,7 +128,13 @@ describe('approvals', () => {
     ];
     const { p } = ask(q, 'AskUserQuestion', { questions }, { requestId: 'r5' });
     const opened = (await collectUntil(it, (e) => e.body.t === 'request.opened')).at(-1)!.body;
-    expect(opened).toMatchObject({ kind: 'question', title: 'Question: Which DB?', allowedDecisions: ['answer', 'deny'], allowAlways: false });
+    expect(opened).toMatchObject({
+      kind: 'question', title: 'Question: Which DB?', allowedDecisions: ['answer', 'deny'], allowAlways: false,
+      questions: [
+        { id: '0', text: 'Which DB?', header: 'DB', options: [{ label: 'pg' }, { label: 'sqlite' }] },
+        { id: '1', text: 'Which features?', header: 'Feat', multiSelect: true },
+      ],
+    });
     await s.respond('r5', { kind: 'answer', answers: { DB: 'pg', '1': ['a', 'b'] } });
     expect(await p).toEqual({ behavior: 'allow', updatedInput: { questions, answers: { 'Which DB?': 'pg', 'Which features?': 'a, b' } } });
     expect(mapAnswers({ questions }, { 'Which DB?': 'sqlite' })).toEqual({ 'Which DB?': 'sqlite' });

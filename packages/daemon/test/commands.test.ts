@@ -134,6 +134,23 @@ describe('commands', () => {
     expect(w.replies()).not.toContain('Nothing was running: it starts a turn.');
   });
 
+  it('/answer returns a native question answer to the waiting turn', async () => {
+    const w = await setup({
+      script: async (t) => {
+        t.emit({ t: 'request.opened', requestId: 'q1', kind: 'question', title: 'Which DB?', risk: {}, questions: [{ id: 'db', text: 'Which DB?' }], allowedDecisions: ['answer', 'deny'], allowAlways: false, defaultDeny: false });
+        const d = await t.waitDecision('q1');
+        t.emit({ t: 'text.snapshot', text: JSON.stringify(d), final: true }, { audience: 'answer' });
+      },
+    });
+    await w.say('ask me');
+    const question = await until(() => w.replies().find((text) => text.includes('/answer ask:')));
+    const code = /\/answer (ask:[A-Za-z0-9_-]+)/.exec(question)?.[1];
+    expect(code).toBeDefined();
+    await w.say(`/answer ${code} SQLite`);
+    await until(() => w.replies().includes('{"kind":"answer","answers":{"db":"SQLite"}}'));
+    expect(turns(w.gw)).toHaveLength(1);
+  });
+
   it('/stop with nothing running says so; it stops a turn still running in an earlier topic of the chat #CT-2 #CT-1', async () => {
     const w = await setup({
       script: async (t) => {

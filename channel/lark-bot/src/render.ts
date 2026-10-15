@@ -143,6 +143,8 @@ export function outcomeCard(outcome: string): Record<string, unknown> {
  */
 export const MENTIONS_KEY = 'agents-io/mentions';
 export const CHOICE_KEY = 'agents-io/choice';
+/** From the session compositor: a native Codex / Claude Code question awaiting this user's answer. */
+export const QUESTION_KEY = 'agents-io/question';
 /** From the session compositor (`@agents-io/session` TOPIC_KEY): the title of the topic a turn's card belongs to. */
 export const TOPIC_KEY = 'agents-io/topic';
 export interface TopicCardData {
@@ -158,6 +160,12 @@ export interface ChoiceData {
   question: string;
   options: string[];
   multi: boolean;
+}
+
+export interface QuestionData {
+  actionId: string;
+  title: string;
+  questions: { id: string; text: string; header?: string; options?: { label: string; description?: string }[]; multiSelect?: boolean; secret?: boolean }[];
 }
 
 export function neutral<T>(msg: RenderedMessage, key: string): T | undefined {
@@ -212,6 +220,34 @@ export function choiceFormCard(c: ChoiceData): Record<string, unknown> {
         },
       ],
     },
+  };
+}
+
+/** A separate, stable form: progress-card edits never erase text someone is typing. */
+export function questionFormCard(q: QuestionData): Record<string, unknown> {
+  const elements: unknown[] = [];
+  const fields: unknown[] = [];
+  q.questions.forEach((question, i) => {
+    elements.push(md(`${i + 1}. ${question.text}${question.options?.length ? `\n${question.options.map((o) => `• ${o.label}${o.description ? ` — ${o.description}` : ''}`).join('\n')}` : ''}${question.multiSelect ? '\n(多选请每行填写一个答案)' : ''}`));
+    fields.push({
+      tag: 'input',
+      name: `q${i}`,
+      label: { tag: 'plain_text', content: (question.header || `Answer ${i + 1}`).slice(0, 80) },
+      placeholder: { tag: 'plain_text', content: question.multiSelect ? '每行填写一个答案' : '填写答案' },
+      input_type: question.secret ? 'password' : 'multiline_text',
+      max_length: 1000,
+    });
+  });
+  fields.push({
+    tag: 'button', name: 'answer_submit', text: { tag: 'plain_text', content: '提交答案' },
+    type: 'primary', form_action_type: 'submit',
+    behaviors: [{ type: 'callback', value: { actionId: q.actionId } }],
+  });
+  elements.push({ tag: 'form', name: 'native_question', elements: fields });
+  return {
+    schema: '2.0',
+    config: { update_multi: true, summary: { content: q.title.slice(0, 80) } },
+    body: { elements },
   };
 }
 

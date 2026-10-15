@@ -15,6 +15,7 @@ import {
 } from '@agents-io/protocol';
 import type { Hub, Subscription } from './hub.js';
 import { actionId, interruptActionId } from './ingress.js';
+import { QUESTION_KEY, questionActionId, questionPrompt, type QuestionData } from './question.js';
 import type { Outbox } from './outbox.js';
 
 /** What one turn looks like to a rendering end. */
@@ -284,7 +285,7 @@ export function renderTurn(v: TurnView, tier: Tier, o: RenderOptions = {}): Rend
   const actions: NonNullable<RenderedMessage['actions']> = [];
   const asks: string[] = [];
   for (const r of v.pending) {
-    asks.push(`Approval needed: ${r.title}`);
+    asks.push(`${r.kind === 'question' ? 'Answer needed' : 'Approval needed'}: ${r.title}`);
     const routes = r.resolver?.kind === 'human' ? r.resolver.routes : [];
     // Buttons only where the resolver said people answer; elsewhere just say it is waiting.
     if (o.caps?.buttons === false || (routes.length && here && !routes.includes(here))) continue;
@@ -473,6 +474,7 @@ export class Compositor {
     for (const r of this.routes.values()) {
       if (r.view.turnId !== turnId || r.finished) continue;
       if (!foldTurn(r.view, e)) continue;
+      if (b.t === 'request.opened' && b.kind === 'question') this.sendQuestion(r, b);
       if (b.t === 'turn.completed') this.finish(r);
       else this.changed(r, b.t === 'request.opened' ? b.requestId : undefined);
     }
@@ -535,6 +537,26 @@ export class Compositor {
     this.notices = this.notices.then(async () => {
       await this.o.outbox.send(this.o.adapter, op);
     }).catch((err) => this.o.onError?.(err));
+  }
+
+  /** Keep the native question in its own message so progress edits cannot reset a form being filled. */
+  private sendQuestion(r: RouteState, req: BodyOf<'request.opened'>): void {
+    if (req.resolver?.kind !== 'human' || r.sentRequests.has(req.requestId)) return;
+    if (req.resolver.routes.length && !req.resolver.routes.includes(routeKey(r.route))) return;
+    r.sentRequests.add(req.requestId);
+    const actionId = questionActionId(this.o.sessionKey, req.requestId);
+    const data: QuestionData = { actionId, title: req.title, questions: req.questions?.length ? req.questions : [{ id: '0', text: req.title }] };
+    const msg: RenderedMessage = { text: questionPrompt(req, actionId), channelData: { [QUESTION_KEY]: data } };
+    this.enqueue(r, async () => {
+      await this.o.outbox.send(this.o.adapter, {
+        operationId: `${this.base(r)}:question:${req.requestId}`,
+        sessionKey: this.o.sessionKey,
+        turnId: r.view.turnId,
+        route: r.route,
+        msg,
+        ...(this.o.as !== undefined ? { as: this.o.as } : {}),
+      });
+    });
   }
 
   /**
@@ -669,7 +691,7 @@ export class Compositor {
     if (!r.streaming) {
       // No edits: a human request still has to reach people, as its own message.
       const req = openedRequest && r.view.pending.find((p) => p.requestId === openedRequest);
-      if (req && !r.sentRequests.has(req.requestId)) {
+      if (req && req.kind !== 'question' && !r.sentRequests.has(req.requestId)) {
         r.sentRequests.add(req.requestId);
         const msg = renderTurn({ ...r.view, pending: [req] }, 'final', { route: r.route, caps: r.caps });
         this.enqueue(r, async () => {

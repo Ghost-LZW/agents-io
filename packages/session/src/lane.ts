@@ -1517,6 +1517,9 @@ export class Lane {
       resolver = { kind: 'auto', decision: { kind: 'deny', message: `policy error: ${errMsg(err)}` } };
     }
     if (resolver.kind === 'model' && !this.o.modelReviewer) resolver = await this.escalate(b, ctx);
+    if (b.kind === 'question' && resolver.kind === 'auto' && !decisionAllowed(b, resolver.decision)) {
+      resolver = { kind: 'auto', decision: { kind: 'deny', message: 'Question resolver returned no answer.' } };
+    }
 
     // A human request is shown where its people are: the routes the resolver names that the turn
     // does not reach get the turn's card with the buttons (a delegated turn's live control route,
@@ -1621,7 +1624,10 @@ export class Lane {
     if (!p) return false;
     this.dropPending(id, p);
     this.resolved.add(id);
-    this.emit({ turnId: p.turnId, audience: p.audience, body: { t: 'request.resolved', requestId: id, decision, by } });
+    // The native answer still goes to the harness, but a secret field never enters
+    // the durable session event log or another channel's event stream.
+    const recorded = p.body.questions?.some((q) => q.secret) && decision.kind === 'answer' ? null : decision;
+    this.emit({ turnId: p.turnId, audience: p.audience, body: { t: 'request.resolved', requestId: id, decision: recorded, by } });
     try {
       await this.session?.respond(id, decision);
     } catch (err) {

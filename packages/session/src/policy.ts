@@ -121,7 +121,16 @@ export function defaultPolicy(o: DefaultPolicyOptions): FullPolicy {
       };
     },
 
-    async resolve(_req: BodyOf<'request.opened'>, ctx: TurnContext): Promise<Resolver> {
+    async resolve(req: BodyOf<'request.opened'>, ctx: TurnContext): Promise<Resolver> {
+      // A question needs an actual answer from the turn's person. Auto-approving it gives
+      // neither Codex nor Claude Code an answer and leaves their native request unresolved.
+      if (req.kind === 'question') {
+        const principal = ctx.live?.startedBy ?? ctx.owner ?? ctx.inputs.find((i) => i.origin.principal)?.origin.principal?.id;
+        const route = ctx.live?.controlRoute ?? ctx.replyRoute;
+        return principal && route
+          ? { kind: 'human', principals: [principal], routes: [routeKey(route)] }
+          : { kind: 'auto', decision: { kind: 'deny', message: 'No reachable person can answer this question.' } };
+      }
       if (ctx.run.profile === 'bypass') return { kind: 'auto', decision: { kind: 'allow_once' } };
       // A turn carrying a live's delegation (decision 11 amendment): the speaker was not the owner,
       // or could not be told. Not denied outright: asked of whoever started the live, in the chat

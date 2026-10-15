@@ -6,7 +6,7 @@
 
 agents-io 启动的就是 harness 本体：Claude Code 通过 Agent SDK 拉起本机 `claude` CLI，Codex 拉起 `codex app-server`。模型、工具、CLAUDE.md / AGENTS.md、会话记录都和你在终端里直接运行时一样。差别只在 harness 外面三处：
 
-1. **输入被包装、排队**：每条输入前加一行发送者说明（见 §1）。同一个人连发的几条由网关合成一轮，运行中插话走 steer。只有映射过的几个命令（`/steer`、`/interrupt`、`/approve`、`/deny`），TUI 的其他斜杠命令和交互不可用。
+1. **输入被包装、排队**：每条输入前加一行发送者说明（见 §1）。同一个人连发的几条由网关合成一轮，运行中插话走 steer。只有映射过的命令可用；原生提问可用 `/answer` 作答，TUI 的其他斜杠命令和交互不可用。
 2. **权限和运行环境由配置决定**：宿主的 `Policy.plan` 为每轮选 harness 实例、模型和权限 profile。默认策略是主人放行、外部来源受限。harness 原本在终端里弹出的确认，改由策略自动处理，或推给人点按钮。
 3. **输出由各通道重新渲染**：harness 产生的事件写进 session 日志，每个端按自己的档位重新画出来。harness 自己的 TUI 不参与。卡片上的状态、面板、图标都是渲染器加的，不是模型写的。
 
@@ -80,7 +80,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 
 - "对本部署说话"指：消息 @ 了本部署自己的账号（`policy.selfAccounts`）；或适配器的提示是 `dispatch`（飞书：私聊、@ 机器人、卡片点击）；或适配器不给提示（邮件、私有通道：收到的默认就是发给本部署的）。飞书群里不 @ 机器人的消息提示是 `observe`，所以只记录。
 - 陌生人的私聊、本部署自己的回流（规则的 `includeSelf` 默认关）不命中任何规则，丢弃。**`policy.strangers: "ask"`**（决定 15，INVARIANTS ID-9）时，陌生人发给本部署的消息（私聊、群里 @，邮件除外）不丢，改为在主人的对话（`ownerSessionKey` 最近一轮的路由）里出一张卡片：允许这一次 / 以后都允许 / 忽略。放行后按原发送者投到该对话的会话（私聊按会话、群按话题串），`restricted`，审批找主人；"以后都允许"把此人记为 `guest`（存在日志库里），之后直接投递。即使某条规则包括回流，回流也只会被记录，不会开轮。适配器自己标了 drop 的（自动回复、退信、群发）在匹配之前就丢弃。
-- 审批和停止按钮（`req:…`、`turn:…`）不走表，直接按请求或轮次找到所属的 session，由那里再检查谁能点。其他按钮 id 作为普通输入走表（规则可用 `actionPrefix` 匹配）。
+- 审批、停止和原生问题的提交按钮（`req:…`、`turn:…`、`ask:…`）不走表，直接找到所属的 session，由那里再检查谁能点。其他按钮 id 作为普通输入走表（规则可用 `actionPrefix` 匹配）。
 - 身份：`policy.owners` 就是最简的身份映射（`通道:用户 id` → 主体，标签 `owner`），证据默认要求 `platform_signed` 或 `dkim_pass`。宿主推送的身份映射对同一个渠道身份优先；同一张表里一个渠道身份出现两次，整张表被拒绝。
 - 每条输入的路由解释（命中了哪些规则、表版本、回调结果、主体、证据，没投递时还有原因）写进日志所在的 SQLite，重启后仍能用 `Router.explain(inputId)` 查到。
 - 宿主应用自己实现的 `Policy.admit` 只在没有任何表时生效（dev-gateway 传入 `policy.admit` 时不再生成默认表，监听照常生效）。这是兼容旧接口，新代码请写 Binding 规则。
@@ -148,7 +148,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 | 图片 / 文件 / 语音 / 视频（含富文本里的图片） | 用 `im.v1.messageResource.get` 下载进 blob 存储，变成带真实类型和文件名的 `sha256:` 引用（类型取响应头，没有就按文件头识别；语音默认 `audio/opus`，视频 `video/mp4`）。单个上限 20MB（`mediaMaxBytes`），30 秒超时（`mediaTimeoutMs`）。下载失败、超限或没有 blob 存储时保留 `lark-file:` 引用，并在后面加一行 `[image 键 not downloaded: 原因]` 说明 |
 | 合并转发 | 用 `im.v1.message.get` 读取外层消息及子消息，按 `upper_message_id` 保留嵌套层级，用 `2.3` 这样的编号列出发送者 id 和内容；文字、富文本展开。前 4 个图片、文件、语音或视频用外层消息 ID 下载，并按相同层级编号附在文字之后。最多 100 条、16,000 字，超出会标注截断；查询或下载失败会明确写出原因。群内非 @ 消息仍只作 observe |
 | 回复某条消息 | 前面加一个引用块：用 `im.v1.message.get` 取回被回复的消息，拍平成文字（卡片取它显示的文字，图片文件变成 `[image]`、`[file 名称]`），最多 500 字（`quoteMaxChars`），按消息 id 缓存。被回复的是本机器人发出、且记录过发送身份的消息时，引用块带 `declared`。取不到时退回只有消息 id 的空引用块 |
-| 卡片按钮 | 审批按钮变成 resolve 命令，"停止"按钮变成 interrupt 命令，都不会作为文字发给 agent；其他按钮变成 `[event action] …` |
+| 卡片按钮 | 审批按钮变成 resolve 命令，"停止"按钮变成 interrupt 命令，原生提问的表单提交变成 answer 命令，都不会作为文字发给 agent；其他按钮变成 `[event action] …` |
 | 其他消息类型（表情包、分享卡片等） | `[unsupported 类型 message]` |
 
 飞书事件不带发送者名字，适配器用 `contact.v3.user.get` 按 union_id / open_id 查显示名（需要 `contact:user.base:readonly`，`messaging,contact` 预设已包含），缓存 6 小时，查不到的 10 分钟内不再查。查询失败时说明行里没有 `senderName`，agent 只知道身份 id。机器人发送者不查。
@@ -182,7 +182,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 
 ### 对话里的命令（主人）
 
-整条消息是一个命令时，守护进程直接回一条短文本，不开轮（INVARIANTS CT-2）。`/help` 列出全部：`/status`（会话、agent、harness、模型、在跑什么、排队与等审批）、`/stop [--clear]`、`/steer <文字>`、`/new [@agent] [标题]`、`/topics`、`/switch <n>`、`/agent [名字]`、`/model [名字|default]`、`/effort [档位|default]`、`/compact`（Claude Code）、`/tui`。话题与切 agent 需要平铺对话按话题分会话（不设 `policy.ownerSessionKey`）；不设时，陌生人放行与访客的审批问到主人最近一次私聊的那个对话。
+整条消息是一个命令时，守护进程直接回一条短文本，不开轮（INVARIANTS CT-2）。`/help` 列出全部：`/status`（会话、agent、harness、模型、在跑什么、排队与等审批）、`/stop [--clear]`、`/steer <文字>`、`/answer <问题代码> <答案>`、`/new [@agent] [标题]`、`/topics`、`/switch <n>`、`/agent [名字]`、`/model [名字|default]`、`/effort [档位|default]`、`/compact`（Claude Code）、`/tui`。原生 Codex / Claude Code 提问会在当前轮次等待指定的人作答；飞书发送独立表单卡片，其他通道按提示使用 `/answer`。多题用问题 ID 为键的 JSON 对象，多选题的值用字符串数组。答案回到原轮次，不开启新轮次；秘密题的答案不写进会话事件日志。话题与切 agent 需要平铺对话按话题分会话（不设 `policy.ownerSessionKey`）；不设时，陌生人放行与访客的审批问到主人最近一次私聊的那个对话。
 
 ## 3. 邮件（`channel/mail`，档位 `final`）
 
@@ -435,6 +435,7 @@ aio-dev watch remove team-digest
 | 键 | 内容 |
 |---|---|
 | `agents-io/choice` | `{ choiceId, question, options[], multi }`；按钮的 action id 为 `choice:<choiceId>:<n>`（1 起），多选表单提交为 `choice:<choiceId>:form` |
+| `agents-io/question` | `{ actionId, title, questions[] }`；原生问题的独立表单，提交后 resolve 同一轮次里的请求 |
 | `agents-io/mentions` | `{ targets: [{ id, name? }], text }`；`text` 是去掉 @ 之后的正文，`RenderedMessage.text` 是 `@名字 … 正文` 的退化形式 |
 | `agents-io/output` | `{ tool }`：这条消息出自哪个输出工具 |
 

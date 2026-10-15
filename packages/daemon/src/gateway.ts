@@ -70,6 +70,8 @@ import {
   WatchDispatcher,
   WatchRegistry,
   defaultPolicy,
+  parseQuestionActionId,
+  questionTextAnswer,
   type AddWatchResult,
   type DeliveryRecord,
   type EmitSource,
@@ -2182,7 +2184,11 @@ ${a.summary}` }],
         emit: async (env) => {
           const r = await this.accept(env, this.emitSource(entry));
           this.stamped(entry, env, r);
-          if (r.accepted) return { accepted: true, ...(r.inputId !== undefined ? { inputId: r.inputId } : {}) };
+          if (r.accepted) return {
+            accepted: true,
+            ...(r.inputId !== undefined ? { inputId: r.inputId } : {}),
+            ...(r.action === 'resolve' && r.result ? { actionResult: { ok: r.result.ok, ...(!r.result.ok && r.result.reason ? { reason: r.result.reason } : {}) } } : {}),
+          };
           // Stopping is "not now" (the next process takes the redelivery); an invalid envelope is never taken.
           return { accepted: false, ...(r.error !== undefined ? { error: r.error } : {}), ...(r.error !== GATEWAY_STOPPING ? { permanent: true } : {}) };
         },
@@ -2437,6 +2443,16 @@ ${a.summary}` }],
       input: async (d, input, mode) => {
         const lane = await this.laneAfterClose(d.sessionKey, d.agent, d.launch);
         return lane.command({ type: 'input', sessionKey: d.sessionKey, input, mode });
+      },
+      answer: async (code, text, origin) => {
+        const ref = parseQuestionActionId(code);
+        if (!ref) return { ok: false, reason: 'invalid_question_code' };
+        const req = this.hub.snapshot(ref.sessionKey).pendingRequests.find((r) => r.requestId === ref.requestId && r.kind === 'question');
+        if (!req) return { ok: false, reason: 'already_resolved_or_unknown_request' };
+        const decision = questionTextAnswer(req, text);
+        if (typeof decision === 'string') return { ok: false, reason: `bad_answer: ${decision}` };
+        const lane = await this.laneAfterClose(ref.sessionKey);
+        return lane.command({ type: 'resolve', sessionKey: ref.sessionKey, requestId: ref.requestId, decision, origin });
       },
       run: (key) => {
         const agent = agentOf(key);
