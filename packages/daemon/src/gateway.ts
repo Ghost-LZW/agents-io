@@ -2392,7 +2392,9 @@ ${a.summary}` }],
 
   private command$(a: Parameters<typeof runCommand>[1]): Promise<{ ok: boolean; reply: string } | undefined> {
     return runCommand(this.commandHost, a).then(async (r) => {
-      if (r && a.env.replyRoute) {
+      // A successful /steer is acknowledged on its inbound message by the compositor:
+      // working while the turn runs, DONE when it completes. Do not add a second reply.
+      if (r && !(a.name === 'steer' && r.ok) && a.env.replyRoute) {
         await this.systemReply({ route: a.env.replyRoute, text: r.reply, operationId: `cmd:${a.input.inputId}`, sessionKey: a.delivery.sessionKey, inputId: a.input.inputId }).catch((e: Error) =>
           this.log('warn', `command reply failed: ${e.message}`),
         );

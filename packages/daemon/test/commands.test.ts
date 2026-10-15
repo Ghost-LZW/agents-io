@@ -95,6 +95,19 @@ describe('commands', () => {
     await until(() => w.gw.sessions().every((s) => s.state !== 'running'));
   });
 
+  it('a successful /steer sends no separate confirmation reply #CT-2', async () => {
+    const w = await setup({
+      script: async (t) => {
+        await new Promise<void>((resolve) => t.signal.addEventListener('abort', () => resolve()));
+      },
+    });
+    await w.say('long job');
+    await until(() => w.gw.sessions().some((s) => s.state === 'running'));
+    await w.say('/steer also check this');
+    expect(w.replies()).not.toContain('Added to the running turn.');
+    expect(w.replies()).not.toContain('Nothing was running: it starts a turn.');
+  });
+
   it('/stop with nothing running says so; it stops a turn still running in an earlier topic of the chat #CT-2 #CT-1', async () => {
     const w = await setup({
       script: async (t) => {

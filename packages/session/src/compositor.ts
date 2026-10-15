@@ -366,8 +366,8 @@ export interface CompositorOptions {
   /**
    * Acknowledge inbound messages on this channel (`ChannelAdapter.acknowledge`): `working` once
    * admitted; when their turn ends the mark goes away if the turn replied on their route within
-   * `doneAfterMs` of the message, else it becomes `done` (a long task, finished while nobody
-   * watched); `failed` when the turn did not complete or the message was rejected.
+   * `doneAfterMs` of the message, else it becomes `done` (a long task, a steer folded into
+   * another turn); `failed` when the turn did not complete or the message was rejected.
    */
   ack?: { doneAfterMs: number };
   /** The session's topic title, read at every render (a topic can be renamed). */
@@ -418,7 +418,7 @@ export class Compositor {
   /** Rejection notices being sent (they belong to no turn's route state). */
   private notices: Promise<void> = Promise.resolve();
   /** Acknowledged inbound messages, by input id, until their turn ends. */
-  private readonly acks = new Map<string, { route: ReplyRoute; messageId: string; at: number; turnId?: string }>();
+  private readonly acks = new Map<string, { route: ReplyRoute; messageId: string; at: number; steer: boolean; turnId?: string }>();
 
   constructor(private readonly o: CompositorOptions) {}
 
@@ -493,7 +493,7 @@ export class Compositor {
       case 'input.admitted': {
         const r = b.input?.replyRoute;
         if (b.disposition === 'observe_only' || !r?.replyToMessageId || !this.owns(r) || this.acks.has(b.inputId)) return;
-        const a = { route: r, messageId: r.replyToMessageId, at: e.ts };
+        const a = { route: r, messageId: r.replyToMessageId, at: e.ts, steer: b.disposition === 'steer' };
         this.acks.set(b.inputId, a);
         mark(a, 'working');
         return;
@@ -517,7 +517,7 @@ export class Compositor {
           this.acks.delete(id);
           const v = this.routes.get(this.key(b.turnId, a.route))?.view;
           const replied = !!(v && (v.finalText ?? v.text).trim());
-          mark(a, b.status !== 'completed' ? 'failed' : replied && e.ts - a.at < this.o.ack!.doneAfterMs ? 'none' : 'done');
+          mark(a, b.status !== 'completed' ? 'failed' : !a.steer && replied && e.ts - a.at < this.o.ack!.doneAfterMs ? 'none' : 'done');
         }
         return;
     }

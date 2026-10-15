@@ -65,6 +65,18 @@ describe('compositor ack', () => {
     expect(w.channel.marks.slice(2).sort()).toEqual(['m1:done', 'm2:done']);
   });
 
+  it('a steer ends DONE even when the turn replies quickly on the same route', async () => {
+    const w = rig();
+    w.admit('i1', 'm1');
+    w.append({ t: 'turn.started', turnId: 't1', inputIds: ['i1'], replyRoute: R('m1') }, { turnId: 't1' });
+    w.admit('i2', 'm2', 'steer');
+    w.append({ t: 'input.consumed', inputIds: ['i2'], turnId: 't1' }, { turnId: 't1' });
+    w.append({ t: 'text.snapshot', text: 'done with both', final: true }, { turnId: 't1' });
+    w.append({ t: 'turn.completed', turnId: 't1', status: 'completed' }, { turnId: 't1' });
+    await until(() => w.channel.marks.length === 4);
+    expect(w.channel.marks).toEqual(['m1:working', 'm2:working', 'm1:none', 'm2:done']);
+  });
+
   it('failed when the turn does not complete or the message is rejected', async () => {
     const w = rig();
     w.admit('i1', 'm1');
