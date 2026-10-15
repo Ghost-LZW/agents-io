@@ -260,7 +260,7 @@ export class CodexSession implements HarnessSession {
         ...(effective.mode ? { collaborationMode: {
           mode: effective.mode,
           settings: {
-            model: effective.model === 'default' ? (this.applied.model ?? effective.model) : effective.model,
+            model: effective.model && effective.model !== 'default' ? effective.model : (this.applied.model ?? effective.model),
             reasoning_effort: (effective.effort ?? this.applied.effort ?? null) as CollaborationMode['settings']['reasoning_effort'],
             developer_instructions: null,
           },

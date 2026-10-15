@@ -187,6 +187,19 @@ describe('turn mapping', () => {
     ]);
   });
 
+  it('uses the resolved thread model for Plan when the configured model is empty', async () => {
+    const { fake, harness } = setup();
+    const s = await open(harness, { run: { ...run, model: '' } });
+    const c = collector(s);
+    fake.onTurnStart = (p, tid) => {
+      fake.echoUser(p.threadId, tid, p.clientUserMessageId);
+      fake.completeTurn(p.threadId, tid, 'completed');
+    };
+    await s.startTurn('T1', [input('i1', 'plan')], { ...run, model: '', mode: 'plan' });
+    await c.until(isCompleted);
+    expect(fake.sent('turn/start')[0]!.params.collaborationMode.settings.model).toBe('gpt-default');
+  });
+
   it('maps failed turns with code and retryable #HC-1 #IN-2', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
