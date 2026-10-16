@@ -20,9 +20,12 @@ import { TOOL_NAMES } from '@agents-io/host-mcp';
  * `settings.env`, codex `env_http_headers` / `bearer_token_env_var` /
  * `env_key` / `env_vars`); where that is impossible "env:" is refused.
  *
- * Agents (`agents: { <name>: { harness, model?, effort?, profile?, cwd?, mode?,
- * tools?, instructionsFile? } }`) are named run configurations over the
- * instances; `bindings` (+ `identities`) is the local binding table
+ * Agents (`agents: { <name>: { harness | preset, model?, effort?, profile?, cwd?,
+ * mode?, tools?, instructionsFile? } }`) are named run configurations over the
+ * instances. Presets (`presets: { <name>: { harness, model?, effort? } }`) name
+ * one harness instance + model + effort: an agent may take its defaults from
+ * one, and the owner switches a session to another with `/preset <name>`.
+ * `bindings` (+ `identities`) is the local binding table
  * (docs/HOSTS.md §2). Without `bindings` the owners-based default table routes
  * to the default agent. Without `agents` there is one agent, `default`, on the
  * default instance (as before).
@@ -229,11 +232,28 @@ const ChannelEntry = Type.Union([
 ]);
 export type ChannelEntry = Static<typeof ChannelEntry>;
 
-const AgentEntry = Type.Object(
+/** A named run preset: one harness instance with its model and effort (`presets.<name>`). */
+const PresetEntry = Type.Object(
   {
     /** Harness instance (a name from `harnesses`). */
     harness: Type.String(),
     /** Over the instance's `run.model`. */
+    model: Type.Optional(Type.String()),
+    /** Over the instance's `run.effort`. */
+    effort: Type.Optional(Type.String()),
+    /** One line `/preset` shows next to it. */
+    description: Type.Optional(Type.String()),
+  },
+  Closed,
+);
+
+const AgentEntry = Type.Object(
+  {
+    /** Harness instance (a name from `harnesses`). Give this or `preset`. */
+    harness: Type.Optional(Type.String()),
+    /** Preset (a name from `presets`) giving the harness, model and effort; the agent's own `model` / `effort` win. Give this or `harness`. */
+    preset: Type.Optional(Type.String()),
+    /** Over the instance's (or preset's) model. */
     model: Type.Optional(Type.String()),
     effort: Type.Optional(Type.String()),
     /**
@@ -311,6 +331,11 @@ export const ConfigFile = Type.Object(
         Closed,
       ),
     ),
+    /**
+     * Named presets: harness instance + model + effort. An agent's `preset` is its default;
+     * the owner switches one session to another with `/preset <name>` (`default` is reserved).
+     */
+    presets: Type.Optional(Type.Record(Type.String(), PresetEntry)),
     /** Named run configurations (agents); see AgentEntry. */
     agents: Type.Optional(Type.Record(Type.String(), AgentEntry)),
     /** Agent of the owners default table and of rules that name none (default: the first interactive agent). */
@@ -552,11 +577,23 @@ export interface ModuleLaunch {
 export type HarnessInstance = InstanceBase &
   ({ kind: 'claude-code'; claude: ClaudeLaunch } | { kind: 'codex'; codex: CodexLaunch } | { kind: 'module'; module: ModuleLaunch });
 
-/** A named run configuration. */
-export interface AgentConfig {
+/** A named run preset (`presets.<name>`). */
+export interface PresetConfig {
   name: string;
   /** Harness instance name. */
   harness: string;
+  model?: string;
+  effort?: string;
+  description?: string;
+}
+
+/** A named run configuration. */
+export interface AgentConfig {
+  name: string;
+  /** Harness instance name (the preset's, when the agent names one). */
+  harness: string;
+  /** The preset `harness`, `model` and `effort` came from (the agent's own `model` / `effort` win). */
+  preset?: string;
   model?: string;
   effort?: string;
   profile?: string;
@@ -597,6 +634,8 @@ export interface Config {
   harnesses: Record<string, HarnessInstance>;
   /** The instance the default policy plans. */
   defaultHarness: string;
+  /** Named presets (harness instance + model + effort), in config order. */
+  presets: Record<string, PresetConfig>;
   /** Named agents (without `agents` in the file: one, `default`, on the default instance). */
   agents: Record<string, AgentConfig>;
   /** Agent of the default table and of rules naming none; undefined when there is no interactive agent. */
@@ -821,7 +860,8 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
   const ownerSessionKey = c.policy?.ownerSessionKey;
   // Off unless asked for (principle 2, decision 13: the default was true before 2026-10-11).
   const outputTools = c.outputTools ?? false;
-  const { agents, defaultAgent } = resolveAgents(c, harnesses, defaultHarness, outputTools, path);
+  const presets = resolvePresets(c, harnesses);
+  const { agents, defaultAgent } = resolveAgents(c, harnesses, presets, defaultHarness, outputTools, path);
   const identities = c.identities ?? [];
   const localSession = c.local?.session ?? ownerSessionKey ?? 'local:main';
   const table: BindingTable | undefined = c.bindings ? { version: 'config', bindings: c.bindings, identities: [] } : undefined;
@@ -835,6 +875,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     cwd: path(c.cwd ?? ctx.cwd ?? process.cwd()),
     harnesses,
     defaultHarness,
+    presets,
     agents,
     defaultAgent,
     ...(table ? { table } : {}),
@@ -869,9 +910,31 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
 /** The synthesized agent of a config without `agents`: the default instance, bare route-key sessions. */
 export const DEFAULT_AGENT = 'default';
 
+/** `/preset default` goes back to the agent's own: no preset may have this name. */
+export const DEFAULT_PRESET = 'default';
+
+function resolvePresets(c: ConfigFile, harnesses: Record<string, HarnessInstance>): Record<string, PresetConfig> {
+  const presets: Record<string, PresetConfig> = {};
+  for (const [name, p] of Object.entries(c.presets ?? {})) {
+    const where = `presets.${name}`;
+    if (!INSTANCE_NAME.test(name)) fail(`${where}: preset names are letters, digits, '.', '_' and '-' (at most 64)`);
+    if (name === DEFAULT_PRESET) fail(`${where}: "${DEFAULT_PRESET}" is reserved (\`/preset ${DEFAULT_PRESET}\` goes back to the agent's own)`);
+    if (!harnesses[p.harness]) fail(`${where}.harness: unknown harness instance ${JSON.stringify(p.harness)} (configured: ${Object.keys(harnesses).join(', ')})`);
+    presets[name] = {
+      name,
+      harness: p.harness,
+      ...(p.model !== undefined ? { model: p.model } : {}),
+      ...(p.effort !== undefined ? { effort: p.effort } : {}),
+      ...(p.description !== undefined ? { description: p.description } : {}),
+    };
+  }
+  return presets;
+}
+
 function resolveAgents(
   c: ConfigFile,
   harnesses: Record<string, HarnessInstance>,
+  presets: Record<string, PresetConfig>,
   defaultHarness: string,
   outputTools: boolean,
   path: (p: string) => string,
@@ -884,7 +947,14 @@ function resolveAgents(
   for (const [name, a] of Object.entries(c.agents)) {
     const where = `agents.${name}`;
     if (!INSTANCE_NAME.test(name)) fail(`${where}: agent names are letters, digits, '.', '_' and '-' (at most 64)`);
-    if (!harnesses[a.harness]) fail(`${where}.harness: unknown harness instance ${JSON.stringify(a.harness)} (configured: ${Object.keys(harnesses).join(', ')})`);
+    if ((a.harness === undefined) === (a.preset === undefined)) fail(`${where}: give either \`harness\` or \`preset\``);
+    let preset: PresetConfig | undefined;
+    if (a.preset !== undefined) {
+      preset = presets[a.preset];
+      if (!preset) fail(`${where}.preset: unknown preset ${JSON.stringify(a.preset)} (${Object.keys(presets).length ? `configured: ${Object.keys(presets).join(', ')}` : 'no `presets` configured'})`);
+    } else if (!harnesses[a.harness!]) fail(`${where}.harness: unknown harness instance ${JSON.stringify(a.harness)} (configured: ${Object.keys(harnesses).join(', ')})`);
+    const model = a.model ?? preset?.model;
+    const effort = a.effort ?? preset?.effort;
     let instructions: string | undefined;
     if (a.instructionsFile !== undefined) {
       const file = path(a.instructionsFile);
@@ -903,9 +973,10 @@ function resolveAgents(
     }
     agents[name] = {
       name,
-      harness: a.harness,
-      ...(a.model !== undefined ? { model: a.model } : {}),
-      ...(a.effort !== undefined ? { effort: a.effort } : {}),
+      harness: preset?.harness ?? a.harness!,
+      ...(preset ? { preset: preset.name } : {}),
+      ...(model !== undefined ? { model } : {}),
+      ...(effort !== undefined ? { effort } : {}),
       ...(a.profile !== undefined ? { profile: a.profile } : {}),
       ...(a.cwd !== undefined ? { cwd: path(a.cwd) } : {}),
       mode: a.mode ?? 'interactive',

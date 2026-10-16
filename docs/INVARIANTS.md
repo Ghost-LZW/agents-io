@@ -805,7 +805,7 @@
 
 ### CT-2 对话里的命令只有主人能用，命令本身不开轮
 
-- **承诺**：发给本部署、整条消息是 `/名字 参数` 的文字，若名字是守护进程的命令（`/help`、`/status`、`/stop`、`/steer`、`/model`、`/effort`、`/compact`、`/agent`、`/new @agent`、`/tui`），只在 `Policy.control` 放行（主人）时执行，在原路由回一条短文本，不进 lane、不开轮；别人发的同样文字是普通消息。`/model`、`/effort` 只改这个会话、从下一轮起生效（存在日志库里）。`/agent`、`/new @agent` 让这个平铺对话之后交给所选 agent（存在路由表库里），固定会话（`ownerSessionKey`）下说明做不到。`/compact` 是唯一原样交给 harness 的文字：只能由守护进程标记（`channelContext.nativeCommand`），适配器的 `context`、本地与宿主客户端的输入都去掉这个键。
+- **承诺**：发给本部署、整条消息是 `/名字 参数` 的文字，若名字是守护进程的命令（`/help`、`/status`、`/stop`、`/steer`、`/preset`、`/model`、`/effort`、`/compact`、`/agent`、`/new @agent`、`/tui`），只在 `Policy.control` 放行（主人）时执行，在原路由回一条短文本，不进 lane、不开轮；别人发的同样文字是普通消息。`/preset`、`/model`、`/effort` 只改这个会话、从下一轮起生效（存在日志库里）；`/preset` 换掉 harness 实例、model 和 effort，并清掉本会话 `/model`、`/effort` 设过的值，换到的实例仍以该会话 agent 的 cwd、指令和工具运行，权限 profile 不变。`/agent`、`/new @agent` 让这个平铺对话之后交给所选 agent（存在路由表库里），固定会话（`ownerSessionKey`）下说明做不到。`/compact` 是唯一原样交给 harness 的文字：只能由守护进程标记（`channelContext.nativeCommand`），适配器的 `context`、本地与宿主客户端的输入都去掉这个键。
 - **实现**：`packages/daemon/src/commands.ts`；`packages/session/src/ingress.ts` `onCommand`、`slashCommand`、`channelContext`（去掉 `nativeCommand`）；`packages/session/src/router.ts` `conversationAgent`、`setConversationAgent`、`place`；`packages/daemon/src/gateway.ts` `commandHost`、`withRunOverride`；`harness/claude-code/src/content.ts` `toUserMessage`。
 - **测试**：标签 `#CT-2`；`packages/daemon/test/commands.test.ts`。
 - **状态**：有测试（假通道）。Codex 没有 `/compact`（生成的协议类型里没有压缩请求）。

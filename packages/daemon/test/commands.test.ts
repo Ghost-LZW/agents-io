@@ -1,12 +1,12 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { AckState, ReplyRoute, SessionEvent } from '@agents-io/protocol';
 import { Ingress, MemorySessionLog, defaultPolicy } from '@agents-io/session';
 import { FakeChannel, FakeHarness, fakeEnvelope, type FakeTurnScript } from '@agents-io/testkit';
-import { resolveConfig } from '../src/config.js';
-import { Gateway } from '../src/gateway.js';
+import { resolveConfig, type HarnessInstance } from '../src/config.js';
+import { Gateway, InstanceHarness } from '../src/gateway.js';
 import { cleanups, until } from './gateway-helpers.js';
 
 /* `/commands` in a chat with the deployment: the owner operates the session and its harness. */
@@ -107,6 +107,82 @@ describe('commands', () => {
     await w.say('/bypass off');
     await until(() => w.replies().length === 2);
     expect(w.replies().every((t) => t.includes('available only on Codex'))).toBe(true);
+  });
+
+  it('/preset switches the session to another harness, model and effort as its agent (cwd, instructions); /preset default goes back #CT-2', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'aio-cmd-'));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const work = join(dir, 'work');
+    mkdirSync(work);
+    writeFileSync(join(dir, 'helper.md'), 'Be brief.');
+    const config = {
+      ...resolveConfig(
+        {
+          harnesses: { cx: { use: 'codex' }, cc: { use: 'claude-code', run: { model: 'sonnet' } } },
+          presets: { fast: { harness: 'cx', model: 'gpt-x', effort: 'low' }, claude: { harness: 'cc', model: 'opus', effort: 'high', description: 'Claude on the gateway' } },
+          agents: { helper: { preset: 'fast', cwd: 'work', instructionsFile: 'helper.md' } },
+          policy: { owners: ['fake:alice'] },
+          local: { principal: 'fake:alice' },
+        },
+        { env: {}, baseDir: dir, cwd: dir },
+      ),
+      socketPath: join(dir, 'run', 'aio.sock'),
+    };
+    const fakes: Record<string, FakeHarness> = {};
+    const chat = new FakeChannel('fake');
+    const gw = await Gateway.start({ config, buildHarness: (i: HarnessInstance) => new InstanceHarness(i, (fakes[i.name] ??= new FakeHarness())), log: new MemorySessionLog(), channels: [{ adapter: chat }], logger: () => {} });
+    cleanups.push(() => gw.stop());
+    const say = (text: string) => chat.inject({ ...dm, sender: alice, text });
+    const replies = () => chat.sent.map((x) => x.edits.at(-1)?.text ?? x.msg.text);
+    const reply = (prefix: string) => until(() => replies().find((t) => t.startsWith(prefix)));
+
+    await say('hi');
+    await until(() => turns(gw).length === 1);
+    expect(turns(gw)[0]!.run).toMatchObject({ harness: 'cx', model: 'gpt-x', effort: 'low' });
+    expect(fakes.cx!.sessions[0]!.args.cwd).toBe(work);
+
+    await say('/preset');
+    const list = await reply('This session: preset fast, cx (codex) · model gpt-x · effort low');
+    expect(list).toContain('- fast: cx (codex) · model gpt-x · effort low');
+    expect(list).toContain('- claude: cc (claude-code) · model opus · effort high — Claude on the gateway');
+
+    // What /model set goes with the old preset.
+    await say('/model gpt-y');
+    await reply('model gpt-y from the next turn');
+    await say('/preset claude');
+    expect(await reply('Preset claude from the next turn')).toBe(
+      'Preset claude from the next turn: cc (claude-code) · model opus · effort high. The harness changes (cx → cc); each keeps its own context, so cc has not seen what was said on cx. /new starts a clean topic.',
+    );
+    await say('again');
+    await until(() => turns(gw).length === 2);
+    expect(turns(gw)[1]!.run).toMatchObject({ harness: 'cc', model: 'opus', effort: 'high' });
+    // The other instance runs as the same agent: its cwd and instructions.
+    const opened = fakes.cc!.sessions[0]!.args;
+    expect(opened.cwd).toBe(work);
+    expect((opened.options as { sdk?: { systemPrompt?: { append?: string } } }).sdk?.systemPrompt?.append).toBe('Be brief.');
+
+    await say('/status');
+    expect(await reply('session ')).toContain('agent helper · preset claude · cc (claude-code) · model opus · effort high (set here)');
+    await say('/plan on');
+    await reply('/plan is available only on Codex (this session runs claude-code)');
+    await say('/preset nope');
+    await reply('No preset nope. Presets: fast, claude');
+
+    await say('/preset default');
+    expect(await reply('Back to the agent’s own')).toBe(
+      'Back to the agent’s own from the next turn: cx (codex) · model gpt-x · effort low. The harness changes (cc → cx); each keeps its own context, so cx has not seen what was said on cc. /new starts a clean topic.',
+    );
+    await say('third');
+    await until(() => turns(gw).length === 3);
+    expect(turns(gw)[2]!.run).toMatchObject({ harness: 'cx', model: 'gpt-x', effort: 'low' });
+  });
+
+  it('/preset without presets configured says so #CT-2', async () => {
+    const w = await setup();
+    await w.say('/preset');
+    await until(() => w.replies().some((t) => t.startsWith('No presets configured (config `presets`). This session runs claude-code (claude-code) · model haiku')));
+    await w.say('/preset fast');
+    await until(() => w.replies().includes('No presets configured (config `presets`).'));
   });
 
   it('/new @agent switches the chat to that agent in a new topic; /agent says which #CT-2 #TP-1', async () => {

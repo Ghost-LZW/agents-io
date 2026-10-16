@@ -18,9 +18,14 @@ see `docs/E2E.md` §0). New:
 
 ```jsonc
 {
+  "presets": {                          // harness instance + model + effort; `/preset <name>` switches a session
+    "codex-high": { "harness": "codex", "model": "gpt-6-sol", "effort": "high" },
+    "claude":     { "harness": "claude", "model": "opus", "description": "for reviews" }
+  },
   "agents": {
     "assistant": { "harness": "claude" },                                   // interactive (default mode)
     "helper":    { "harness": "claude", "model": "opus", "cwd": "~/work", "instructionsFile": "helper.md" },
+    "coder":     { "preset": "codex-high", "cwd": "~/repos" },               // harness, model, effort from the preset
     "executor":  { "harness": "codex", "mode": "task", "profile": "bypass", "tools": false }
   },
   "defaultAgent": "assistant",          // default: the first interactive agent
@@ -34,7 +39,17 @@ see `docs/E2E.md` §0). New:
 }
 ```
 
-- An **agent** is a named run configuration: harness instance, `model`, `effort`,
+- A **preset** names a harness instance with its `model` and `effort` (and a
+  `description` for `/preset`); unset ones come from the instance's `run`. An agent
+  gives either `harness` or `preset` (its own `model` / `effort` still win over the
+  preset's). In a chat the owner lists them with `/preset` and switches the current
+  session (topic) with `/preset <name>` from the next turn, dropping what `/model` and
+  `/effort` set there; `/preset default` goes back to the agent's own. Another instance
+  opens its own harness session (it has not seen what was said on the previous one;
+  switching back resumes that one) with the agent's cwd, instructions and tools; the
+  permission profile does not change with the preset. `default` is not a preset name.
+  See `docs/E2E.md` (预设).
+- An **agent** is a named run configuration: harness instance (or `preset`), `model`, `effort`,
   `profile`, `cwd`, `tools` (mount the host MCP output tools; default top-level
   `outputTools`, which defaults to **false** since 2026-10-11: turn tools on per
   agent with `"tools": true`, or for all agents with `"outputTools": true`), `instructionsFile` (Claude: appended to the preset system
@@ -76,9 +91,10 @@ see `docs/E2E.md` §0). New:
   them, never through the daemon. What people say there is delegated by the voice
   into turns of the same session (same permissions as its text turns; inputs carry
   `live=true`, no principal). See `docs/CHANNELS.md` §7a.
-- Interactive turns plan `{ harness, model, effort }` from the agent; the profile
-  is the agent's `profile`, else the policy's (owners only → `bypass`). Task runs
-  use the agent's `profile`, default `restricted`.
+- Interactive turns plan `{ harness, model, effort }` from the agent (or the preset
+  `/preset` set for the session); the profile is the agent's `profile`, else the
+  policy's (owners only → `bypass`). Task runs use the agent's `profile`, default
+  `restricted`.
 - Default `dataDir` is `~/.agents-io/aio`; the socket defaults to
   `<dataDir>/run/aio.sock` (directory 0700, socket 0600).
 

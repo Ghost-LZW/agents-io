@@ -99,6 +99,8 @@ export const AdminAgent = Type.Object({
   /** Harness instance id. */
   harness: Type.String(),
   mode: Type.Union([Type.Literal('interactive'), Type.Literal('task')]),
+  /** The preset its harness, model and effort come from (config `presets`). */
+  preset: Type.Optional(Type.String()),
   model: Type.Optional(Type.String()),
   effort: Type.Optional(Type.String()),
   profile: Type.Optional(Type.String()),

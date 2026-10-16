@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { codexStateDir, defaultInstance, findEnvFile, loadConfig, resolveConfig, substituteEnv } from '../src/config.js';
+import { ConfigError, codexStateDir, defaultInstance, findEnvFile, loadConfig, resolveConfig, substituteEnv } from '../src/config.js';
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -137,6 +137,45 @@ describe('config', () => {
     expect(resolve(raw, {}, { harness: 'b' }).defaultHarness).toBe('b');
     expect(resolve(raw, {}, { harness: 'codex' }).defaultHarness).toBe('b');
     expect(() => resolve(raw, {}, { harness: 'nope' })).toThrow('unknown harness instance "nope" (configured: a, b)');
+  });
+
+  describe('presets', () => {
+    const harnesses = { cx: { use: 'codex', run: { effort: 'medium' } }, cc: { use: 'claude-code', run: { model: 'sonnet' } } };
+    const bad = (raw: Record<string, unknown>) => {
+      try {
+        resolve({ harnesses, ...raw });
+      } catch (e) {
+        expect(e).toBeInstanceOf(ConfigError);
+        return (e as Error).message;
+      }
+      return 'no error';
+    };
+
+    it('an agent takes its harness, model and effort from its preset; its own model / effort win', () => {
+      const c = resolve({
+        harnesses,
+        presets: { 'codex-high': { harness: 'cx', model: 'gpt-6-sol', effort: 'high', description: 'AsterGate' }, claude: { harness: 'cc' } },
+        agents: { a: { preset: 'codex-high' }, b: { preset: 'claude', effort: 'low' }, c: { harness: 'cx' } },
+      });
+      expect(Object.keys(c.presets)).toEqual(['codex-high', 'claude']);
+      expect(c.presets['codex-high']).toEqual({ name: 'codex-high', harness: 'cx', model: 'gpt-6-sol', effort: 'high', description: 'AsterGate' });
+      expect(c.agents.a).toMatchObject({ harness: 'cx', preset: 'codex-high', model: 'gpt-6-sol', effort: 'high' });
+      expect(c.agents.b).toMatchObject({ harness: 'cc', preset: 'claude', effort: 'low' });
+      expect(c.agents.b!.model).toBeUndefined(); // the instance's run.model applies when the turn is planned
+      expect(c.agents.c!.preset).toBeUndefined();
+      expect(resolve({ harnesses }).presets).toEqual({});
+    });
+
+    it('names the key at fault: unknown preset or instance, both or neither of harness / preset, the reserved name', () => {
+      expect(bad({ presets: { p: { harness: 'nope' } } })).toMatch(/presets\.p\.harness: unknown harness instance "nope" \(configured: cx, cc\)/);
+      expect(bad({ presets: { default: { harness: 'cx' } } })).toMatch(/presets\.default: "default" is reserved/);
+      expect(bad({ presets: { 'a/b': { harness: 'cx' } } })).toMatch(/preset names/);
+      expect(bad({ presets: { p: { harness: 'cx', temperature: 1 } } })).toMatch(/invalid config/);
+      expect(bad({ agents: { a: { preset: 'p' } } })).toMatch(/agents\.a\.preset: unknown preset "p" \(no `presets` configured\)/);
+      expect(bad({ presets: { q: { harness: 'cx' } }, agents: { a: { preset: 'p' } } })).toMatch(/unknown preset "p" \(configured: q\)/);
+      expect(bad({ presets: { q: { harness: 'cx' } }, agents: { a: { preset: 'q', harness: 'cx' } } })).toMatch(/agents\.a: give either `harness` or `preset`/);
+      expect(bad({ agents: { a: {} } })).toMatch(/agents\.a: give either `harness` or `preset`/);
+    });
   });
 
   it('lark-bot takes credentials from the environment and names a missing one', () => {

@@ -97,7 +97,7 @@ import { loadChannelModule } from './channel-module.js';
 import { LarkBotAdapter } from '@agents-io/channel-lark-bot';
 import { MailChannel, type MailChannelConfig } from '@agents-io/channel-mail';
 import { spawnChannel, type BridgedChannel, type BridgeState } from '@agents-io/channel-jsonl-bridge';
-import { ConfigError, RESERVED_CHANNEL_IDS, UNGRANTED_EVIDENCE, agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type ResolvedChannel } from './config.js';
+import { ConfigError, RESERVED_CHANNEL_IDS, UNGRANTED_EVIDENCE, agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type PresetConfig, type ResolvedChannel } from './config.js';
 import { ConsoleServer } from './console.js';
 import { ConfigStore, canonical } from './console-config.js';
 import { LarkBotJobs } from './provision.js';
@@ -172,6 +172,15 @@ export interface GatewayOptions {
 
 /** Outcome of a local command, mapped 1:1 onto a `result` frame. */
 export type Outcome = { ok: true; value: unknown } | { ok: false; code: string; message: string };
+
+/** Owner chat overrides of one session's future turns (`/preset`, `/model`, `/effort`, `/plan`, `/bypass`), kept in the records. */
+interface RunOverride {
+  preset?: string;
+  model?: string;
+  effort?: string;
+  mode?: 'default' | 'plan';
+  profile?: 'bypass' | 'restricted';
+}
 
 interface RunningChannel {
   adapter: ChannelAdapter;
@@ -733,6 +742,7 @@ export class Gateway {
         name: a.name,
         harness: a.harness,
         mode: a.mode,
+        ...(a.preset !== undefined ? { preset: a.preset } : {}),
         ...(a.model !== undefined ? { model: a.model } : {}),
         ...(a.effort !== undefined ? { effort: a.effort } : {}),
         ...(a.profile !== undefined ? { profile: a.profile } : {}),
@@ -918,11 +928,7 @@ export class Gateway {
           ? this.claudeTui.holdOf(sessionKey)!.harness
           : launched
             ? launched.adapter(name)
-            : this.o.harness
-              ? this.o.harness
-              : name === agent.harness
-                ? this.agentHarness(agent)
-                : this.harness(name),
+            : this.agentHarness(agent, name),
       resumeFor: (id) => this.nativeIdOf(sessionKey, id),
       hub: this.hub,
       policy: this.withRunOverride(this.agentPolicy(agent), sessionKey),
@@ -1169,8 +1175,8 @@ export class Gateway {
           owned.push(base);
           perOpen = undefined;
         } else base = this.harness(name);
-        const cwd = launch.cwd ?? (name === agent.harness ? agent.cwd : undefined);
-        a = withLaunch(name === agent.harness ? withAgent(base, agent, agent.cwd) : base, cwd, perOpen);
+        // Any instance (a session's preset may name another than the agent's) runs as the agent.
+        a = withLaunch(withAgent(base, agent, agent.cwd), launch.cwd ?? agent.cwd, perOpen);
       }
       cache.set(key, a);
       return a;
@@ -1184,13 +1190,17 @@ export class Gateway {
     };
   }
 
-  /** The adapter an agent's sessions open: its instance's, with the agent's cwd and instructions. */
-  private agentHarness(agent: AgentConfig): HarnessAdapter {
-    if (this.o.harness || !agent.configured) return this.harness(agent.harness);
-    let a = this.agentAdapters.get(agent.name);
+  /**
+   * The adapter an agent's sessions open on an instance (default: its own; a session's preset may
+   * name another), with the agent's cwd and instructions.
+   */
+  private agentHarness(agent: AgentConfig, name: string = agent.harness): HarnessAdapter {
+    if (this.o.harness || !agent.configured) return this.harness(name);
+    const key = `${agent.name}\u0000${name}`;
+    let a = this.agentAdapters.get(key);
     if (!a) {
-      a = withAgent(this.harness(agent.harness), agent, agent.cwd);
-      this.agentAdapters.set(agent.name, a);
+      a = withAgent(this.harness(name), agent, agent.cwd);
+      this.agentAdapters.set(key, a);
     }
     return a;
   }
@@ -1806,19 +1816,20 @@ ${a.summary}` }],
     const topic = this.topics.bySession(sessionKey);
     const info = this.laneInfo.get(sessionKey);
     if (!topic || this.topics.titleSource(topic.id) !== 'auto' || !info?.agent.configured || this.titleJobs.has(topic.id)) return;
-    const adapter = this.launched.get(sessionKey)?.adapter(info.agent.harness) ?? this.agentHarness(info.agent);
-    if (!codexOf(adapter)) return;
     const events = this.hub.log.read(sessionKey, 0);
     const started = events.find((e) => e.body.t === 'turn.started' && e.body.turnId === turnId);
     if (started?.body.t !== 'turn.started' || !started.body.inputIds.length) return;
+    // The turn's own instance: a session's preset may have moved it off the agent's.
+    const name = started.body.run?.harness ?? info.agent.harness;
+    const adapter = this.launched.get(sessionKey)?.adapter(name) ?? this.agentHarness(info.agent, name);
+    if (!codexOf(adapter)) return;
     const eligible = new Set(events.filter((e) => e.body.t === 'turn.started' && e.body.inputIds.length > 0).map((e) => e.body.t === 'turn.started' ? e.body.turnId : ''));
     const completed = events.filter((e) => e.body.t === 'turn.completed' && e.body.status === 'completed' && eligible.has(e.body.turnId)).length;
     if (completed !== 1 && completed % 3 !== 1) return;
     const expected = topic.title;
     const prompt = topicTitlePrompt(events, expected);
     if (!prompt) return;
-    const inst = this.o.config.harnesses[info.agent.harness]!;
-    const run = started.body.run ?? { ...agentRun(info.agent, inst), profile: 'restricted' };
+    const run = started.body.run ?? { ...agentRun(info.agent, this.o.config.harnesses[name]!), profile: 'restricted' };
     this.titleJobs.add(topic.id);
     try {
       const title = await generateTopicTitle(adapter, { cwd: info.cwd ?? this.o.config.cwd, run, prompt });
@@ -2349,9 +2360,10 @@ ${a.summary}` }],
       return { ok: false, code: e instanceof LaneUnavailableError ? e.code : 'internal', message: (e as Error).message };
     }
     // Claude Code's TUI takes the session over; other harnesses say how their own TUI joins a running session.
-    const agent = this.laneInfo.get(key)?.agent;
-    const inst = agent ? this.o.config.harnesses[agent.harness] : undefined;
-    if (inst?.kind === 'claude-code') return this.claudeTuiAttach(key, lane, inst);
+    // The instance is the session's (a preset set here may name another than the agent's).
+    const run = this.commandHost.run(key);
+    const inst = this.o.config.harnesses[run.harness];
+    if (inst?.kind === 'claude-code') return this.claudeTuiAttach(key, lane, inst, run.model);
     const { harnessId, nativeId } = await lane.attachPoint();
     if (!nativeId) return { ok: false, code: 'unsupported', message: `${key}: harness ${harnessId} reported no session id to attach to` };
     const adapter = this.launched.get(key)?.adapter(harnessId) ?? this.harness(harnessId);
@@ -2378,7 +2390,7 @@ ${a.summary}` }],
    * starts on the same Claude session id (`--resume`, or `--session-id` for a new one) with this
    * launch's hooks and bridge, and the lane's turns go to it until it exits.
    */
-  private async claudeTuiAttach(key: string, lane: Lane, inst: Extract<HarnessInstance, { kind: 'claude-code' }>): Promise<Outcome> {
+  private async claudeTuiAttach(key: string, lane: Lane, inst: Extract<HarnessInstance, { kind: 'claude-code' }>, model: string | undefined): Promise<Outcome> {
     if (this.claudeTui.holdOf(key)?.connected) return { ok: false, code: 'conflict', message: `${key}: a terminal UI is already attached` };
     this.claudeTui.holdOf(key)?.end('replaced by a new attach');
     await lane.whenIdle();
@@ -2395,7 +2407,7 @@ ${a.summary}` }],
     const launch = this.claudeTui.launch(hold, {
       executable: inst.claude.claudePath ?? 'claude',
       resume: prior !== undefined,
-      ...(inst.run.model ? { model: inst.run.model } : {}),
+      ...(model ? { model } : {}),
       ...(inst.claude.configDir ? { configDir: inst.claude.configDir } : {}),
     });
     const cwd = this.laneInfo.get(key)?.cwd ?? this.o.config.cwd;
@@ -2413,18 +2425,32 @@ ${a.summary}` }],
   }
 
   /** Chat command overrides of one session's future turns. */
-  private runOverride(sessionKey: string): { model?: string; effort?: string; mode?: 'default' | 'plan'; profile?: 'bypass' | 'restricted' } {
+  private runOverride(sessionKey: string): RunOverride {
     const v = this.records.flag(`run:${sessionKey}`);
-    return v ? (JSON.parse(v) as { model?: string; effort?: string; mode?: 'default' | 'plan'; profile?: 'bypass' | 'restricted' }) : {};
+    return v ? (JSON.parse(v) as RunOverride) : {};
   }
 
-  /** Apply owner chat overrides after the agent's policy; guests retain their policy profile. */
+  /** The configured preset a session override names, with its instance (one no longer configured is ignored). */
+  private overridePreset(o: RunOverride): { preset: PresetConfig; inst: HarnessInstance } | undefined {
+    const preset = o.preset !== undefined ? this.o.config.presets[o.preset] : undefined;
+    return preset && { preset, inst: this.o.config.harnesses[preset.harness]! };
+  }
+
+  /**
+   * Apply owner chat overrides after the agent's policy: a preset replaces the harness, model and
+   * effort, `/model` and `/effort` go over that; guests retain their policy profile.
+   */
   private withRunOverride(p: FullPolicy, sessionKey: string): FullPolicy {
     return {
       ...p,
       plan: async (d) => {
-        const run = await p.plan(d);
+        let run = await p.plan(d);
         const o = this.runOverride(sessionKey);
+        const set = this.overridePreset(o);
+        if (set) {
+          const { effort: _effort, ...rest } = run;
+          run = { ...rest, ...agentRun(set.preset, set.inst) };
+        }
         const allOwner = d.inputs.length > 0 && d.inputs.every((i) => i.origin.principal?.labels.includes(OWNER_LABEL));
         return { ...run, ...(o.model ? { model: o.model } : {}), ...(o.effort ? { effort: o.effort } : {}), ...(o.mode ? { mode: o.mode } : {}), ...(o.profile && allOwner ? { profile: o.profile } : {}) };
       },
@@ -2459,7 +2485,7 @@ ${a.summary}` }],
         const native = this.nativeIdOf(key, run.harness);
         return [
           `session ${key}${topic ? ` · topic ${topic.title ?? topic.id}` : ''}`,
-          `agent ${d.agent ?? agentOf(key).name} · ${run.harness} (${run.kind}) · model ${run.model ?? 'default'}${run.effort ? ` · effort ${run.effort}` : ''}${run.overridden ? ' (set here)' : ''}`,
+          `agent ${d.agent ?? agentOf(key).name}${run.preset ? ` · preset ${run.preset}` : ''} · ${run.harness} (${run.kind}) · model ${run.model ?? 'default'}${run.effort ? ` · effort ${run.effort}` : ''}${run.overridden ? ' (set here)' : ''}`,
           `Plan mode ${run.kind === 'codex' ? run.mode === 'plan' ? 'on' : 'off' : 'unavailable'} · bypass ${run.profile ?? 'default (agent policy)'}`,
           `cwd ${this.laneInfo.get(key)?.cwd ?? agentOf(key).cwd ?? c.cwd}`,
           `state ${info?.state ?? 'not open'}${info?.turnId ? ` · turn ${info.turnId}` : ''}${info?.queued ? ` · ${info.queued} queued` : ''}${info?.pendingRequests.length ? ` · waiting on ${info.pendingRequests.length} approval(s)` : ''}`,
@@ -2492,22 +2518,41 @@ ${a.summary}` }],
       },
       run: (key) => {
         const agent = agentOf(key);
-        const inst = c.harnesses[agent.harness] ?? c.harnesses[c.defaultHarness]!;
-        const base = agentRun(agent, inst);
         const o = this.runOverride(key);
+        const set = this.overridePreset(o);
+        const inst = set?.inst ?? c.harnesses[agent.harness] ?? c.harnesses[c.defaultHarness]!;
+        const base = agentRun(set?.preset ?? agent, inst);
         const model = o.model ?? base.model;
         const effort = o.effort ?? base.effort;
-        return { harness: inst.name, kind: inst.kind, ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(o.mode ? { mode: o.mode } : {}), ...(o.profile ? { profile: o.profile } : {}), overridden: !!(o.model || o.effort || o.mode || o.profile) };
+        const preset = set?.preset.name ?? agent.preset;
+        return {
+          harness: inst.name,
+          kind: inst.kind,
+          ...(preset ? { preset } : {}),
+          ...(model ? { model } : {}),
+          ...(effort ? { effort } : {}),
+          ...(o.mode ? { mode: o.mode } : {}),
+          ...(o.profile ? { profile: o.profile } : {}),
+          ...(o.preset !== undefined && !set ? { stalePreset: o.preset } : {}),
+          overridden: !!(set || o.model || o.effort || o.mode || o.profile),
+        };
       },
       setRun: (key, o) => {
         const cur = this.runOverride(key);
         const next = { ...cur };
+        if (o.preset !== undefined) o.preset === null ? delete next.preset : (next.preset = o.preset);
         if (o.model !== undefined) o.model === null ? delete next.model : (next.model = o.model);
         if (o.effort !== undefined) o.effort === null ? delete next.effort : (next.effort = o.effort);
         if (o.mode !== undefined) next.mode = o.mode;
         if (o.profile !== undefined) o.profile === null ? delete next.profile : (next.profile = o.profile);
         this.records.setFlag(`run:${key}`, Object.keys(next).length ? JSON.stringify(next) : undefined);
       },
+      presets: () =>
+        Object.values(c.presets).map((p) => {
+          const inst = c.harnesses[p.harness]!;
+          const run = agentRun(p, inst);
+          return { name: p.name, harness: inst.name, kind: inst.kind, ...(run.model ? { model: run.model } : {}), ...(run.effort ? { effort: run.effort } : {}), ...(p.description ? { description: p.description } : {}) };
+        }),
       agents: () => {
         const names = Object.values(c.agents).filter((a) => a.mode !== 'task').map((a) => a.name);
         return names.length ? names : [c.defaultAgent ?? 'default'];
@@ -2762,8 +2807,8 @@ function fail(code: string, message = code): Outcome {
   return { ok: false, code, message };
 }
 
-/** An agent's RunSpec over its instance's defaults (without the profile). */
-function agentRun(agent: AgentConfig, inst: HarnessInstance): Omit<RunSpec, 'profile'> {
+/** An agent's (or a preset's) RunSpec over its instance's defaults (without the profile). */
+function agentRun(agent: Pick<AgentConfig, 'model' | 'effort'>, inst: HarnessInstance): Omit<RunSpec, 'profile'> {
   const effort = agent.effort ?? inst.run.effort;
   return { harness: inst.name, model: agent.model ?? inst.run.model, ...(effort !== undefined ? { effort } : {}) };
 }

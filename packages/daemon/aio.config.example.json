@@ -37,8 +37,14 @@
       "transport": { "kind": "unix", "spawn": "own" }
     }
   },
+  "presets": {
+    "claude-opus": { "harness": "claude", "model": "opus", "description": "Claude Code on Opus" },
+    "gateway-flash": { "harness": "claude-gateway", "model": "gemini-3.8-flash-high" },
+    "codex-high": { "harness": "codex", "effort": "high" }
+  },
   "agents": {
     "assistant": { "harness": "claude", "tools": true },
+    "coder": { "preset": "codex-high" },
     "executor": { "harness": "claude", "mode": "task", "profile": "bypass" },
     "executor-codex": { "harness": "codex", "mode": "task", "profile": "bypass" }
   },

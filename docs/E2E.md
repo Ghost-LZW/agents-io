@@ -49,6 +49,31 @@ alias aio="node $PWD/packages/daemon/dist/cli.js"        # examples/dev-gateway 
 - 主人：`policy.owners` 加上 `AGENTS_IO_OWNERS`（逗号分隔），键是 `<channel>:<channelUserId>`。
 - 本地端（attach/send）以 `local.principal` 的身份说话，默认是第一个主人（没有主人时是 `local:owner`），labels 默认 `['owner']`。默认 session 是 `policy.ownerSessionKey`，否则 `local:main`。
 
+### 预设（presets）
+
+```jsonc
+"harnesses": {
+  "codex-aster":  { "use": "codex", "home": "~/.config/codex", "transport": { "kind": "unix", "spawn": "own" },
+                    "profiles": { "bypass": { "approvalPolicy": "never", "sandbox": "danger-full-access" } } },
+  "claude-aster": { "use": "claude-code", "configDir": "~/.config/claude", "settings": "~/.config/claude/setting.json" }
+},
+"presets": {
+  "codex":      { "harness": "codex-aster", "model": "gpt-6-sol", "effort": "high", "description": "AsterGate GPT-6 Sol" },
+  "codex-fast": { "harness": "codex-aster", "model": "gpt-6-sol", "effort": "low" },
+  "claude":     { "harness": "claude-aster", "model": "opus", "effort": "xhigh" }
+},
+"agents": {
+  "assistant": { "preset": "codex", "cwd": "~/repos", "tools": true },
+  "aio-dev":   { "preset": "claude", "cwd": "~/repos/agents-io", "tools": true }
+}
+```
+
+- 预设 = 一个 harness 实例 + `model` + `effort`（可选 `description`，`/preset` 列表里显示）。没写的 model / effort 用实例的 `run`（claude 默认 `haiku`；codex 不传，用 `CODEX_HOME` 里 config.toml 的设置）。上例的两个实例相当于 shell 里的 `codex-aster`（`CODEX_HOME=~/.config/codex codex --yolo`）和 `claude-aster`（`CLAUDE_CONFIG_DIR=~/.config/claude claude --settings … --dangerously-skip-permissions`）；权限由下面说的 profile 决定，主人的轮次默认就是 `bypass`。codex 内置的 `bypass` 是 `workspace-write` 沙箱，要和 `--yolo` 一样就像上例那样把它设成 `danger-full-access`。
+- agent 写 `preset` 或 `harness`，二选一；写 `preset` 时 agent 自己的 `model` / `effort` 仍然优先于预设的。
+- 对话里，主人发 `/preset` 列出全部预设和本会话当前用的；`/preset <名字>` 让本会话从下一轮起换成该预设，并清掉本会话 `/model`、`/effort` 设过的值；`/preset default` 回到 agent 自己的。只改这一个会话（话题），存在日志库里，重启后还在；新话题仍用 agent 的默认。
+- 换到另一个实例时，lane 关掉旧绑定、在新实例上开会话（`notice runtime_restart`）。新实例看不到在旧实例上聊过的内容（回复里会提示，`/new` 开干净的话题）；以后换回来时，续接那个实例在本会话里的原生会话。cwd、`instructionsFile`、工具仍是 agent 的。权限不跟着预设走，仍由 agent 的 `profile`、策略（只有主人时是 `bypass`）和 `/bypass` 决定。
+- 预设名的规则同实例名，`default` 保留。配置里删掉某个会话正在用的预设后，这个会话回到 agent 自己的设置（`/preset` 会说明）。
+
 ## Tier 1：本地（不需要任何外部账号）
 
 ### 1.1 自动场景

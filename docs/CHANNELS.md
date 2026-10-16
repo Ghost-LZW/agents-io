@@ -190,7 +190,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 
 ### 对话里的命令（主人）
 
-整条消息是一个命令时，守护进程直接回一条短文本，不开轮（INVARIANTS CT-2）。`/help` 列出全部：`/status`（会话、agent、harness、模型、在跑什么、排队与等审批）、`/stop [--clear]`、`/steer <文字>`、`/answer <问题代码> <答案>`、`/new [@agent] [标题]`、`/topics`、`/switch <n>`、`/agent [名字]`、`/model [名字|default]`、`/effort [档位|default]`、`/compact`（Claude Code）、`/tui`。原生 Codex / Claude Code 提问会在当前轮次等待指定的人作答；飞书发送独立表单卡片，其他通道按提示使用 `/answer`。多题用问题 ID 为键的 JSON 对象，多选题的值用字符串数组。答案回到原轮次，不开启新轮次；秘密题的答案不写进会话事件日志。话题与切 agent 需要平铺对话按话题分会话（不设 `policy.ownerSessionKey`）；不设时，陌生人放行与访客的审批问到主人最近一次私聊的那个对话。
+整条消息是一个命令时，守护进程直接回一条短文本，不开轮（INVARIANTS CT-2）。`/help` 列出全部：`/status`（会话、agent、harness、模型、在跑什么、排队与等审批）、`/stop [--clear]`、`/steer <文字>`、`/answer <问题代码> <答案>`、`/new [@agent] [标题]`、`/topics`、`/switch <n>`、`/agent [名字]`、`/preset [名字|default]`（列出预设，或让本会话换成另一个 harness 实例 + 模型 + effort，见 E2E.md「预设」）、`/model [名字|default]`、`/effort [档位|default]`、`/compact`（Claude Code）、`/tui`。原生 Codex / Claude Code 提问会在当前轮次等待指定的人作答；飞书发送独立表单卡片，其他通道按提示使用 `/answer`。多题用问题 ID 为键的 JSON 对象，多选题的值用字符串数组。答案回到原轮次，不开启新轮次；秘密题的答案不写进会话事件日志。话题与切 agent 需要平铺对话按话题分会话（不设 `policy.ownerSessionKey`）；不设时，陌生人放行与访客的审批问到主人最近一次私聊的那个对话。
 
 ## 3. 邮件（`channel/mail`，档位 `final`）
 
