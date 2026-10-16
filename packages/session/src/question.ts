@@ -6,6 +6,7 @@ export interface QuestionData {
   actionId: string;
   title: string;
   questions: RequestQuestion[];
+  state?: 'submitted' | 'ended';
 }
 
 /** Includes the session so simultaneous native requests with the same id cannot cross topics. */
@@ -57,7 +58,24 @@ function checked(req: BodyOf<'request.opened'>, values: Record<string, unknown>)
 /** Values from a Lark form use q0, q1…; no field name is trusted as a question id. */
 export function questionFormAnswer(req: BodyOf<'request.opened'>, form: Record<string, unknown>): Decision | string {
   const questions = req.questions?.length ? req.questions : [{ id: '0', text: req.title }];
-  return checked(req, Object.fromEntries(questions.map((q, i) => [q.id, form[`q${i}`]])));
+  const values: Record<string, unknown> = {};
+  for (const [i, q] of questions.entries()) {
+    const legacy = form[`q${i}`];
+    if (!q.options?.length || q.secret || (form[`q${i}_choice`] === undefined && form[`q${i}_other`] === undefined)) {
+      values[q.id] = legacy;
+      continue;
+    }
+    const selected = form[`q${i}_choice`];
+    const indexes = selected === undefined || selected === null || selected === '' ? [] : Array.isArray(selected) ? selected : [selected];
+    if (indexes.some((v) => typeof v !== 'string' || !/^\d+$/.test(v) || !q.options![Number(v)])) return `Question ${i + 1} has an invalid option.`;
+    if (!q.multiSelect && indexes.length > 1) return `Question ${i + 1} has an invalid option.`;
+    const labels = indexes.map((v) => q.options![Number(v)]!.label);
+    const other = typeof form[`q${i}_other`] === 'string' ? (form[`q${i}_other`] as string).trim() : '';
+    values[q.id] = q.multiSelect
+      ? [...new Set([...labels, ...other.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)])]
+      : other || labels[0];
+  }
+  return checked(req, values);
 }
 
 export function questionTextAnswer(req: BodyOf<'request.opened'>, text: string): Decision | string {

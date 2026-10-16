@@ -655,7 +655,7 @@ export class Router {
     }
     if (s === 'topic') {
       const title = titleFrom(contentText(env.content, 400));
-      const { topic, created } = this.o.topics!.ensureCurrent(conversation, name, this.topicKey(name, conversation), title !== undefined ? { title } : {});
+      const { topic, created } = this.o.topics!.ensureCurrent(conversation, name, this.topicKey(name, conversation), { ...(title !== undefined ? { title } : {}), titleSource: 'auto' });
       if (!created) this.o.topics!.touch(topic.sessionKey);
       return { sessionKey: topic.sessionKey, topic };
     }

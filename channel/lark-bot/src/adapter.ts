@@ -607,7 +607,9 @@ export class LarkBotAdapter implements ChannelAdapter {
     const kind = this.kinds.get(id) ?? 'card';
     const api = this.client.im.v1.message;
     if (kind === 'card' || kind === 'cardkit') {
-      const card = isLarkCard(msg.channelData) ? msg.channelData : fitCard(msg, msg.text, this.cfg.maxCardBytes);
+      const question = neutral<QuestionData>(msg, QUESTION_KEY);
+      const card = question?.questions?.length && question.actionId ? questionFormCard(question)
+        : isLarkCard(msg.channelData) ? msg.channelData : fitCard(msg, msg.text, this.cfg.maxCardBytes);
       await this.api('message.patch', () => api.patch({ data: { content: JSON.stringify(card) }, path: { message_id: id } }));
     } else {
       const out = textMessage(splitText(msg.text, this.cfg.maxChars)[0] ?? '');

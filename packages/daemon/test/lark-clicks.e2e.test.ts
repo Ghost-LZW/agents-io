@@ -149,30 +149,33 @@ describe('lark clicks reach the owning session (ownerSessionKey)', () => {
     await w.lark.fire('im.message.receive_v1', messageEvent({ id: 'om_q', content: { text: 'ask me' } }));
     const actionId = await until(() => actionIds(w.lark).find((a) => a.startsWith('ask:')));
     const card = await until(() => w.lark.messages.find((m) => m.content.includes(actionId)));
-    expect(card.content).toContain('"name":"q0"');
-    expect(card.content).toContain('"name":"q1"');
+    expect(card.content).toContain('"tag":"select_static","name":"q0_choice"');
+    expect(card.content).toContain('"tag":"multi_select_static","name":"q1_choice"');
+    expect(card.content).toContain('"name":"q0_other"');
     const bad = await w.lark.fire('card.action.trigger', {
       event_id: 'ev_question_bad', operator: { open_id: 'ou_alice', union_id: 'on_alice' },
-      action: { tag: 'button', value: { actionId }, form_value: { q0: 'SQLite' } },
+      action: { tag: 'button', value: { actionId }, form_value: { q0_choice: '1', q0_other: '' } },
       context: { open_message_id: card.id, open_chat_id: 'oc_chat' },
     });
     expect(bad).toEqual({ toast: { type: 'error', content: '请填写全部答案后重试' } });
     const guest = await w.lark.fire('card.action.trigger', {
       event_id: 'ev_question_guest', operator: { open_id: 'ou_bob', union_id: 'on_bob' },
-      action: { tag: 'button', value: { actionId }, form_value: { q0: 'Postgres', q1: 'Search' } },
+      action: { tag: 'button', value: { actionId }, form_value: { q0_choice: '0', q0_other: '', q1_choice: ['0'] } },
       context: { open_message_id: card.id, open_chat_id: 'oc_chat' },
     });
     expect(guest).toEqual({ toast: { type: 'error', content: '你没有权限回答此问题' } });
     expect(of(w.events, 'request.resolved')).toHaveLength(0);
     const accepted = await w.lark.fire('card.action.trigger', {
       event_id: 'ev_question', operator: { open_id: 'ou_alice', union_id: 'on_alice' },
-      action: { tag: 'button', value: { actionId }, form_value: { q0: 'SQLite', q1: 'Search\nExport' } },
+      action: { tag: 'button', value: { actionId }, form_value: { q0_choice: '1', q0_other: '', q1_choice: ['0', '1'], q1_other: '' } },
       context: { open_message_id: card.id, open_chat_id: 'oc_chat' },
     });
     expect(accepted).toEqual({ toast: { type: 'success', content: '答案已提交' } });
     await until(() => of(w.events, 'turn.completed').length === 1);
     expect(of(w.events, 'request.resolved')[0]).toMatchObject({ requestId: 'q1', decision: { kind: 'answer', answers: { database: 'SQLite', features: ['Search', 'Export'] } }, by: { kind: 'human', id: 'lark-bot:on_alice' } });
     expect(of(w.events, 'turn.started')).toHaveLength(1);
+    await until(() => card.patches.some((p) => p.includes('"disabled":true')));
+    expect(card.patches.at(-1)).toContain('"content":"已提交"');
   });
 
   it('keeps a secret answer out of the durable session log', async () => {

@@ -396,6 +396,7 @@ interface RouteState {
   timer?: ReturnType<typeof setTimeout>;
   chain: Promise<void>;
   sentRequests: Set<string>;
+  questions: Map<string, BodyOf<'request.opened'>>;
   finished: boolean;
   /** Consecutive failed edits; the next retry backs off by this. */
   editFailures: number;
@@ -450,6 +451,30 @@ export class Compositor {
     await Promise.all([...this.routes.values()].map((r) => r.chain).concat(this.notices));
   }
 
+  /** Refresh the latest completed card after a background topic title change. */
+  async refreshLatestTitle(): Promise<void> {
+    const title = this.o.title?.();
+    if (!title || !this.o.adapter.edit) return;
+    await this.flush();
+    const events = this.o.hub.log.read(this.o.sessionKey, 0);
+    const completed = [...events].reverse().find((e) => e.body.t === 'turn.completed');
+    if (!completed || completed.body.t !== 'turn.completed') return;
+    const turnId = completed.body.turnId;
+    const start = events.find((e) => e.body.t === 'turn.started' && e.body.turnId === turnId);
+    if (start?.body.t !== 'turn.started' || !start.body.replyRoute || !this.owns(start.body.replyRoute)) return;
+    const route = start.body.replyRoute;
+    const base = `${this.o.sessionKey}:${turnId}:${routeKey(route)}`;
+    const anchor = [...events].reverse().find((e) => e.body.t === 'render.anchor' && e.body.turnId === turnId && routeKey(e.body.route) === routeKey(route));
+    const id = anchor?.body.t === 'render.anchor' ? anchor.body.providerMessageId : this.o.outbox.get(`${base}:final`)?.providerMessageId;
+    if (!id) return;
+    const view = newTurnView(turnId, start.ts);
+    for (const e of events) if (e.turnId === turnId || (e.body.t === 'turn.completed' && e.body.turnId === turnId)) foldTurn(view, e);
+    const caps = this.o.adapter.caps(route.account);
+    const msg = renderTurn(view, this.o.tier ?? caps.defaultTier, { route, caps, title });
+    if (!msg.channelData) return;
+    await this.o.adapter.edit(route, id, msg, { operationId: `${base}:title`, sequence: Date.now() });
+  }
+
   private key(turnId: string, route: ReplyRoute) {
     return `${turnId}\u0000${routeKey(route)}`;
   }
@@ -475,6 +500,8 @@ export class Compositor {
       if (r.view.turnId !== turnId || r.finished) continue;
       if (!foldTurn(r.view, e)) continue;
       if (b.t === 'request.opened' && b.kind === 'question') this.sendQuestion(r, b);
+      if (b.t === 'request.resolved') this.closeQuestion(r, b.requestId, b.decision?.kind === 'answer' || (b.decision === null && typeof b.by === 'object' && b.by.kind === 'human') ? 'submitted' : 'ended');
+      if (b.t === 'turn.completed') for (const requestId of r.questions.keys()) this.closeQuestion(r, requestId, 'ended');
       if (b.t === 'turn.completed') this.finish(r);
       else this.changed(r, b.t === 'request.opened' ? b.requestId : undefined);
     }
@@ -544,6 +571,7 @@ export class Compositor {
     if (req.resolver?.kind !== 'human' || r.sentRequests.has(req.requestId)) return;
     if (req.resolver.routes.length && !req.resolver.routes.includes(routeKey(r.route))) return;
     r.sentRequests.add(req.requestId);
+    r.questions.set(req.requestId, req);
     const actionId = questionActionId(this.o.sessionKey, req.requestId);
     const data: QuestionData = { actionId, title: req.title, questions: req.questions?.length ? req.questions : [{ id: '0', text: req.title }] };
     const msg: RenderedMessage = { text: questionPrompt(req, actionId), channelData: { [QUESTION_KEY]: data } };
@@ -559,23 +587,48 @@ export class Compositor {
     });
   }
 
+  /** Close the separate question card as soon as its request settles. */
+  private closeQuestion(r: RouteState, requestId: string, state: 'submitted' | 'ended'): void {
+    const req = r.questions.get(requestId);
+    if (!req) return;
+    r.questions.delete(requestId);
+    this.enqueue(r, async () => {
+      const sent = this.o.outbox.get(`${this.base(r)}:question:${requestId}`);
+      if (sent?.status !== 'delivered' || !sent.providerMessageId || !this.o.adapter.edit) return;
+      const data: QuestionData = { actionId: questionActionId(this.o.sessionKey, requestId), title: req.title, questions: req.questions?.length ? req.questions : [{ id: '0', text: req.title }], state };
+      const msg: RenderedMessage = { text: questionPrompt(req, data.actionId), channelData: { [QUESTION_KEY]: data } };
+      await this.o.outbox.deliver({ operationId: `${this.base(r)}:question:${requestId}:closed`, sessionKey: this.o.sessionKey, route: r.route }, async () => {
+        await this.o.adapter.edit!(r.route, sent.providerMessageId!, msg, { operationId: `${this.base(r)}:question:${requestId}:closed`, sequence: ++r.editSeq });
+        return { providerMessageId: sent.providerMessageId };
+      });
+    });
+  }
+
   /**
    * A turn the log shows still open was started by an earlier host process: pick up
    * its routes (and, from `render.anchor`, the message already sent) so its end, an
    * ambiguous settle or an adopted turn completing, finalizes the existing card.
    */
   private restore(): void {
-    const turn = this.o.hub.snapshot(this.o.sessionKey).turn;
+    const snapshot = this.o.hub.snapshot(this.o.sessionKey);
+    const turn = snapshot.turn;
     if (!turn) return;
     const routes = [turn.replyRoute, ...turn.deliveries].filter((r): r is ReplyRoute => !!r && this.owns(r));
     if (!routes.length) return;
     const anchors = new Map<string, string>();
+    const pending = new Set(snapshot.pendingRequests.map((req) => req.requestId));
     for (const e of this.o.hub.log.read(this.o.sessionKey, 0)) {
       if (e.body.t === 'render.anchor' && e.body.turnId === turn.turnId) anchors.set(routeKey(e.body.route), e.body.providerMessageId);
     }
     for (const route of routes) {
       const messageId = anchors.get(routeKey(route));
       this.track(turn.turnId, route, Date.now(), messageId ?? null);
+      const r = this.routes.get(this.key(turn.turnId, route));
+      if (!r) continue;
+      for (const e of this.o.hub.log.read(this.o.sessionKey, 0)) {
+        if (e.turnId !== turn.turnId || e.body.t !== 'request.opened' || e.body.kind !== 'question' || !pending.has(e.body.requestId)) continue;
+        this.sendQuestion(r, e.body);
+      }
     }
   }
 
@@ -604,6 +657,7 @@ export class Compositor {
       lastEditAt: 0,
       chain: Promise.resolve(),
       sentRequests: new Set(),
+      questions: new Map(),
       finished: false,
       editFailures: 0,
       ...(restored ? { messageId: restored } : {}),

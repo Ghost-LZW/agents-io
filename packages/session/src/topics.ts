@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import type { Topic, TopicChangeReason, TopicSwitchResult } from '@agents-io/protocol';
 import type { Hub } from './hub.js';
+import { contentText } from './watch.js';
 
 /*
  * Topics (docs/design/locus/DECISIONS.md decision 6). A flat conversation holds
@@ -46,7 +47,7 @@ export interface TopicRegistryOptions {
   /** SQLite file or `:memory:` (default) when no `db` is given. */
   path?: string;
   /** When given, every change appends `topic.changed` to the session left and the one now current. */
-  hub?: Pick<Hub, 'append'>;
+  hub?: Pick<Hub, 'append' | 'log'>;
   now?: () => number;
   newId?: () => string;
   onChange?: (c: TopicChange) => void;
@@ -55,6 +56,8 @@ export interface TopicRegistryOptions {
 /** Fields of a new topic. */
 export interface TopicDraft {
   title?: string;
+  /** A title inferred from the first input may be refined; named topics stay named. */
+  titleSource?: 'auto' | 'explicit';
 }
 
 /** A running turn and the session it runs in. */
@@ -83,6 +86,7 @@ interface Row {
   agent: string;
   session_key: string;
   title: string | null;
+  title_source: string;
   summary: string | null;
   native_id: string | null;
   state: string;
@@ -124,7 +128,8 @@ export class TopicRegistry {
   private readonly newId: () => string;
   private readonly byId = new Map<string, TopicRecord>();
   private readonly bySessionKey = new Map<string, TopicRecord>();
-  private q: Record<'insert' | 'state' | 'touch' | 'native' | 'title' | 'summary' | 'all', StatementSync>;
+  private readonly sources = new Map<string, 'auto' | 'explicit'>();
+  private q: Record<'insert' | 'state' | 'touch' | 'native' | 'title' | 'summary' | 'all' | 'source', StatementSync>;
 
   constructor(private readonly o: TopicRegistryOptions = {}) {
     this.ownsDb = !o.db;
@@ -138,6 +143,7 @@ export class TopicRegistry {
         agent TEXT NOT NULL,
         session_key TEXT NOT NULL UNIQUE,
         title TEXT,
+        title_source TEXT NOT NULL DEFAULT 'legacy',
         summary TEXT,
         native_id TEXT,
         state TEXT NOT NULL,
@@ -146,17 +152,33 @@ export class TopicRegistry {
       );
       CREATE INDEX IF NOT EXISTS topics_conversation ON topics (conversation, agent);
     `);
+    // Existing databases predate title provenance. Keep an explicit title unless its
+    // value is exactly what the opening message's titleFrom() would have made.
+    if (!(this.db.prepare('PRAGMA table_info(topics)').all() as unknown as { name: string }[]).some((c) => c.name === 'title_source')) {
+      this.db.exec("ALTER TABLE topics ADD COLUMN title_source TEXT NOT NULL DEFAULT 'legacy'");
+    }
     const p = (sql: string) => this.db.prepare(sql);
     this.q = {
-      insert: p('INSERT INTO topics (id, conversation, agent, session_key, title, summary, native_id, state, created_at, last_active_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'),
+      insert: p('INSERT INTO topics (id, conversation, agent, session_key, title, title_source, summary, native_id, state, created_at, last_active_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'),
       state: p('UPDATE topics SET state = ?, last_active_at = ? WHERE id = ?'),
       touch: p('UPDATE topics SET last_active_at = ? WHERE id = ?'),
       native: p('UPDATE topics SET native_id = ? WHERE id = ?'),
       title: p('UPDATE topics SET title = ? WHERE id = ?'),
+      source: p('UPDATE topics SET title_source = ? WHERE id = ?'),
       summary: p('UPDATE topics SET summary = ? WHERE id = ?'),
       all: p('SELECT * FROM topics'),
     };
-    for (const r of this.q.all.all() as unknown as Row[]) this.remember(fromRow(r));
+    for (const r of this.q.all.all() as unknown as Row[]) {
+      this.remember(fromRow(r));
+      let source = r.title_source;
+      if (source === 'legacy') {
+        const first = o.hub?.log.read(r.session_key, 0).find((e) => e.body.t === 'input.admitted' && e.body.input && e.body.input.origin.kind === 'human');
+        const inferred = first?.body.t === 'input.admitted' && first.body.input ? titleFrom(contentText(first.body.input.content, 400)) : undefined;
+        source = !r.title || (inferred !== undefined && r.title === inferred) ? 'auto' : 'explicit';
+        this.q.source.run(source, r.id);
+      }
+      this.sources.set(r.id, source === 'auto' ? 'auto' : 'explicit');
+    }
   }
 
   private remember(t: TopicRecord): void {
@@ -168,6 +190,10 @@ export class TopicRegistry {
 
   get(topicId: string): TopicRecord | undefined {
     return this.byId.get(topicId);
+  }
+
+  titleSource(topicId: string): 'auto' | 'explicit' | undefined {
+    return this.sources.get(topicId);
   }
 
   /** The topic whose session this is, if the session is one. */
@@ -234,7 +260,7 @@ export class TopicRegistry {
     try {
       if (previous) this.q.state.run('parked', previous.lastActiveAt, previous.id);
       if (previous && summary) this.q.summary.run(summary, previous.id);
-      this.q.insert.run(t.id, conversation, agent, key, t.title ?? null, null, null, 'current', at, at);
+      this.q.insert.run(t.id, conversation, agent, key, t.title ?? null, draft.titleSource ?? (t.title ? 'explicit' : 'auto'), null, null, 'current', at, at);
       this.db.exec('COMMIT');
     } catch (e) {
       this.db.exec('ROLLBACK');
@@ -243,6 +269,7 @@ export class TopicRegistry {
     if (previous) previous.state = 'parked';
     if (previous && summary) previous.summary = summary;
     this.remember(t);
+    this.sources.set(t.id, draft.titleSource ?? (t.title ? 'explicit' : 'auto'));
     this.changed({ conversation, agent, ...(previous ? { from: previous } : {}), to: t, reason, ...(opts.turn ? { turn: opts.turn } : {}), created: true });
     return { topic: t, ...(previous ? { previous } : {}), created: true };
   }
@@ -293,6 +320,18 @@ export class TopicRegistry {
     if (v === undefined) delete t.title;
     else t.title = v;
     this.q.title.run(v ?? null, t.id);
+    this.sources.set(topicId, 'explicit');
+    this.q.source.run('explicit', topicId);
+  }
+
+  /** A background title result applies only while its topic is still auto-named. */
+  setAutoTitle(topicId: string, expected: string | undefined, title: string): boolean {
+    const t = this.byId.get(topicId);
+    const next = clean(title);
+    if (!t || this.sources.get(topicId) !== 'auto' || t.title !== expected || !next || t.title === next) return false;
+    this.q.title.run(next, t.id);
+    t.title = next;
+    return true;
   }
 
   close(): void {

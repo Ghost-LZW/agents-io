@@ -3,6 +3,7 @@ import { readFileSync, rmSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { generateTopicTitle, topicTitlePrompt } from './topic-title.js';
 import {
   PROTOCOL_VERSION,
   formatAddress,
@@ -324,6 +325,7 @@ export class Gateway {
   private stopped = false;
   /** Parked topic sessions whose lane closes when this fires (`topics.parkedIdleMs`). */
   private readonly parkedTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly titleJobs = new Set<string>();
 
   private constructor(private readonly o: GatewayOptions) {
     const c = o.config;
@@ -933,6 +935,9 @@ export class Gateway {
         // A topic remembers its harness session id (switching back resumes it; the lane resumes from the log).
         if (e.body.t === 'session.bound') this.topics.setNativeId(sessionKey, e.body.nativeId);
         this.o.onHarnessEvent?.(sessionKey, e);
+      },
+      onTurnCompleted: (turnId, status) => {
+        if (status === 'completed') void this.updateTopicTitle(sessionKey, turnId).catch((e) => this.log('warn', `${sessionKey}: title update failed: ${(e as Error).message}`));
       },
     });
     this.lanes.set(sessionKey, lane);
@@ -1795,6 +1800,34 @@ ${a.summary}` }],
     if (t) clearTimeout(t);
     this.parkedTimers.delete(c.to.sessionKey);
     if (c.from && c.from.sessionKey !== c.to.sessionKey && this.lanes.has(c.from.sessionKey)) this.idleOut(c.from.sessionKey);
+  }
+
+  private async updateTopicTitle(sessionKey: string, turnId: string): Promise<void> {
+    const topic = this.topics.bySession(sessionKey);
+    const info = this.laneInfo.get(sessionKey);
+    if (!topic || this.topics.titleSource(topic.id) !== 'auto' || !info?.agent.configured || this.titleJobs.has(topic.id)) return;
+    const adapter = this.launched.get(sessionKey)?.adapter(info.agent.harness) ?? this.agentHarness(info.agent);
+    if (!codexOf(adapter)) return;
+    const events = this.hub.log.read(sessionKey, 0);
+    const started = events.find((e) => e.body.t === 'turn.started' && e.body.turnId === turnId);
+    if (started?.body.t !== 'turn.started' || !started.body.inputIds.length) return;
+    const eligible = new Set(events.filter((e) => e.body.t === 'turn.started' && e.body.inputIds.length > 0).map((e) => e.body.t === 'turn.started' ? e.body.turnId : ''));
+    const completed = events.filter((e) => e.body.t === 'turn.completed' && e.body.status === 'completed' && eligible.has(e.body.turnId)).length;
+    if (completed !== 1 && completed % 3 !== 1) return;
+    const expected = topic.title;
+    const prompt = topicTitlePrompt(events, expected);
+    if (!prompt) return;
+    const inst = this.o.config.harnesses[info.agent.harness]!;
+    const run = started.body.run ?? { ...agentRun(info.agent, inst), profile: 'restricted' };
+    this.titleJobs.add(topic.id);
+    try {
+      const title = await generateTopicTitle(adapter, { cwd: info.cwd ?? this.o.config.cwd, run, prompt });
+      if (!this.stopped && title && this.topics.setAutoTitle(topic.id, expected, title)) {
+        for (const c of this.sessionCompositors.get(sessionKey) ?? []) void c.refreshLatestTitle().catch((e) => this.log('warn', `${sessionKey}: title card refresh failed: ${(e as Error).message}`));
+      }
+    } finally {
+      this.titleJobs.delete(topic.id);
+    }
   }
 
   /** Close a parked topic's lane after `topics.parkedIdleMs` (later while it still has work); switching back reopens and resumes it. */

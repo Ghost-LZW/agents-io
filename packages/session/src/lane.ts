@@ -86,6 +86,8 @@ export interface LaneOptions {
   context?: { maxItems?: number; maxChars?: number };
   /** Tee of raw harness events (conformance checks, debugging). */
   onHarnessEvent?: (e: HarnessEvent) => void;
+  /** Called after the completed turn has been written to the session log. */
+  onTurnCompleted?: (turnId: string, status: BodyOf<'turn.completed'>['status']) => void;
   /** A live (realtime voice) on this session ended, whichever side ended it (decision 11). */
   onLiveEnded?: (liveId: string, reason: string) => void;
   /**
@@ -1473,6 +1475,7 @@ export class Lane {
     const body = { ...b, status };
     if (e) this.emitHarness(e, gen, { body });
     else this.emit({ turnId: t.turnId, body });
+    this.o.onTurnCompleted?.(t.turnId, status);
 
     const unconsumed = t.inputs.filter((i) => !t.consumed.has(i.inputId));
     const retry = status === 'completed' || (status === 'failed' && b.error?.retryable === true);

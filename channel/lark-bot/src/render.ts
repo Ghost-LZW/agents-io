@@ -166,6 +166,7 @@ export interface QuestionData {
   actionId: string;
   title: string;
   questions: { id: string; text: string; header?: string; options?: { label: string; description?: string }[]; multiSelect?: boolean; secret?: boolean }[];
+  state?: 'submitted' | 'ended';
 }
 
 export function neutral<T>(msg: RenderedMessage, key: string): T | undefined {
@@ -228,19 +229,28 @@ export function questionFormCard(q: QuestionData): Record<string, unknown> {
   const elements: unknown[] = [];
   const fields: unknown[] = [];
   q.questions.forEach((question, i) => {
-    elements.push(md(`${i + 1}. ${question.text}${question.options?.length ? `\n${question.options.map((o) => `• ${o.label}${o.description ? ` — ${o.description}` : ''}`).join('\n')}` : ''}${question.multiSelect ? '\n(多选请每行填写一个答案)' : ''}`));
+    elements.push(md(`${i + 1}. ${question.text}${question.options?.length ? `\n${question.options.map((o) => `• ${o.label}${o.description ? ` — ${o.description}` : ''}`).join('\n')}` : ''}`));
+    if (question.options?.length && !question.secret) {
+      fields.push({
+        tag: question.multiSelect ? 'multi_select_static' : 'select_static',
+        name: `q${i}_choice`,
+        placeholder: { tag: 'plain_text', content: question.multiSelect ? '选择一个或多个选项' : '选择一个选项' },
+        options: question.options.map((o, n) => ({ text: { tag: 'plain_text', content: o.label }, value: String(n) })),
+      });
+    }
     fields.push({
       tag: 'input',
-      name: `q${i}`,
-      label: { tag: 'plain_text', content: (question.header || `Answer ${i + 1}`).slice(0, 80) },
-      placeholder: { tag: 'plain_text', content: question.multiSelect ? '每行填写一个答案' : '填写答案' },
+      name: question.options?.length && !question.secret ? `q${i}_other` : `q${i}`,
+      label: { tag: 'plain_text', content: (question.options?.length && !question.secret ? '其他答案' : question.header || `Answer ${i + 1}`).slice(0, 80) },
+      placeholder: { tag: 'plain_text', content: question.options?.length && !question.secret ? '可填写自定义答案' : question.multiSelect ? '每行填写一个答案' : '填写答案' },
       input_type: question.secret ? 'password' : 'multiline_text',
       max_length: 1000,
     });
   });
   fields.push({
-    tag: 'button', name: 'answer_submit', text: { tag: 'plain_text', content: '提交答案' },
-    type: 'primary', form_action_type: 'submit',
+    tag: 'button', name: 'answer_submit', text: { tag: 'plain_text', content: q.state === 'submitted' ? '已提交' : q.state === 'ended' ? '已结束' : '提交答案' },
+    type: q.state ? 'default' : 'primary', form_action_type: 'submit',
+    ...(q.state ? { disabled: true } : {}),
     behaviors: [{ type: 'callback', value: { actionId: q.actionId } }],
   });
   elements.push({ tag: 'form', name: 'native_question', elements: fields });
