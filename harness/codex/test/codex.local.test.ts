@@ -16,6 +16,8 @@ describe('open', () => {
     const p = fake.sent('thread/start')[0]!.params;
     expect(p).toMatchObject({ model: 'gpt-5.5', cwd: '/work', approvalPolicy: 'never', sandbox: 'workspace-write' });
     expect(p.config.mcp_servers.agents_io).toEqual({ url: 'http://127.0.0.1:9/mcp', http_headers: { Authorization: 'Bearer tok' }, default_tools_approval_mode: 'approve' });
+    // null keeps Codex's own base prompt (checked: codex-cli 0.162 records its ~20k-character prompt).
+    expect(p).toMatchObject({ baseInstructions: null, developerInstructions: null });
   });
 });
 

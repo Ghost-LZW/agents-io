@@ -38,7 +38,8 @@ see `docs/E2E.md` §0). New:
   `profile`, `cwd`, `tools` (mount the host MCP output tools; default top-level
   `outputTools`, which defaults to **false** since 2026-10-11: turn tools on per
   agent with `"tools": true`, or for all agents with `"outputTools": true`), `instructionsFile` (Claude: appended to the preset system
-  prompt; Codex: developer instructions), `mode`.
+  prompt; Codex: developer instructions), `mode`. Without `instructionsFile` the
+  harness keeps its own system prompt (Claude Code's preset, Codex's base instructions).
 - `mode: "task"` agents only run through `run.start` / `aio run`. A binding (config
   or host-pushed, including a callout's `onFailure`) that targets one is rejected
   when the config loads.

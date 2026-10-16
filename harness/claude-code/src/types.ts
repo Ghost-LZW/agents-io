@@ -51,7 +51,10 @@ export interface ClaudeCodeOptions {
   clientComposed?: boolean;
   /** Extra environment for the CLI. `CLAUDE_CODE_RESUME_INTERRUPTED_TURN` is always removed. */
   env?: Record<string, string | undefined>;
-  /** Raw SDK options merged last (escape hatch; adapter-owned fields win). */
+  /**
+   * Raw SDK options merged last (escape hatch; adapter-owned fields win). `systemPrompt` defaults to
+   * Claude Code's own (`{ type: 'preset', preset: 'claude_code' }`); set it here to append or replace.
+   */
   sdk?: Partial<Options>;
   /** Max chars of a tool result preview (default 400). */
   previewChars?: number;

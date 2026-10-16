@@ -197,6 +197,8 @@ export class ClaudeCodeHarness implements HarnessAdapter {
       ...(c.plugins?.length ? { plugins: c.plugins.map((path) => ({ type: 'local' as const, path })) } : {}),
       ...(c.skills !== undefined ? { skills: c.skills } : {}),
       ...(c.extraArgs ? { extraArgs: c.extraArgs } : {}),
+      // Without a systemPrompt the SDK sends an empty one: no Claude Code prompt, no tool guidance.
+      systemPrompt: { type: 'preset', preset: 'claude_code' },
       ...options.sdk,
       cwd: args.cwd,
       model: args.run.model,

@@ -50,6 +50,14 @@ describe('open → SDK options', () => {
     }
   });
 
+  it("runs on Claude Code's own system prompt unless options.sdk sets one", async () => {
+    // The SDK turns an absent systemPrompt into an empty one (no tool guidance, no sub-agents).
+    const { q } = await setup();
+    expect(q.options.systemPrompt).toEqual({ type: 'preset', preset: 'claude_code' });
+    const custom = await setup({}, { sdk: { systemPrompt: { type: 'preset', preset: 'claude_code', append: 'Be brief.' } } });
+    expect(custom.q.options.systemPrompt).toEqual({ type: 'preset', preset: 'claude_code', append: 'Be brief.' });
+  });
+
   it('host MCP token is passed through the env, never in mcpServers (the SDK puts those on the CLI argv) #SE-1', async () => {
     const { q } = await setup({ run, mcp: { url: 'http://h/mcp', token: 'sekrit-token-123' } });
     const o = q.options;
