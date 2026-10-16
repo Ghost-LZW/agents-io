@@ -118,10 +118,10 @@ describe('helpers', () => {
 });
 
 describe('live (realtime voice, decision 11)', () => {
-  it('is only offered when enabled, and opts the connection into the experimental API', async () => {
+  it('is only offered when enabled; the connection always opts into the experimental API (Plan mode needs it too)', async () => {
     const off = setup();
     expect((await open(off.harness)).live).toBeUndefined();
-    expect(off.fake.sent('initialize')[0]!.params.capabilities.experimentalApi).toBe(false);
+    expect(off.fake.sent('initialize')[0]!.params.capabilities.experimentalApi).toBe(true);
     const on = setup({ live: true });
     const s = await open(on.harness);
     expect(s.live).toBeDefined();
