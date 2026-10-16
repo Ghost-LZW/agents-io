@@ -10,6 +10,7 @@ import type {
   RunSpec,
   SteerResult,
 } from '@agents-io/protocol';
+import { PrefaceMemo } from '@agents-io/protocol';
 import type { CanUseTool, EffortLevel, PermissionUpdate, SDKResultMessage } from '@anthropic-ai/claude-agent-sdk';
 import { toUserMessage } from './content.js';
 import { AsyncQueue } from './queue.js';
@@ -136,6 +137,8 @@ export class ClaudeCodeSession implements HarnessSession {
   private profile: ClaudeProfile;
   /** Unconsumed inputs of turns that already ended (interrupted / failed). */
   private stray = new Map<string, string>();
+  /** What the model was already shown in input prefaces; reset when it may have lost it. */
+  private memo = new PrefaceMemo();
   private items = new Map<string, { item: ItemSummary; parentItemId?: string; turnId?: string }>();
   private requests = new Map<string, OpenRequest>();
   private declined = new Set<string>();
@@ -262,6 +265,7 @@ export class ClaudeCodeSession implements HarnessSession {
       this.write(t, msgs);
     } catch (err) {
       if (this.turn === t) this.turn = undefined;
+      this.memo.reset();
       throw err;
     }
   }
@@ -272,6 +276,8 @@ export class ClaudeCodeSession implements HarnessSession {
     if (t.turnId !== expectedTurnId) return 'stale';
     if (t.interrupting) return 'not_steerable';
     const msgs = await this.convert(inputs, 'next');
+    // Rendered but not written: the model never saw these prefaces.
+    if (this.turn !== t || t.interrupting) this.memo.reset();
     if (this.turn !== t) return this.turn ? 'stale' : 'no_active_turn';
     if (t.interrupting) return 'not_steerable';
     this.write(t, msgs);
@@ -367,6 +373,7 @@ export class ClaudeCodeSession implements HarnessSession {
         resolveImage: this.init.options.resolveImage,
         resolveFile: this.init.options.resolveFile,
         clientComposed: this.init.options.clientComposed,
+        memo: this.memo,
       });
       for (const n of notices) this.emit({ t: 'notice', code: 'other', message: n });
       out.push({ inputId: input.inputId, message });
@@ -397,6 +404,7 @@ export class ClaudeCodeSession implements HarnessSession {
       }
     }
     if (cancelled.length) {
+      this.memo.reset();
       this.emit(
         { t: 'input.cancelled', inputIds: cancelled, reason },
         t && this.turn === t ? { turnId: t.turnId } : { turnId: undefined },
@@ -503,6 +511,7 @@ export class ClaudeCodeSession implements HarnessSession {
         );
       case 'compact_boundary': {
         const c = m.compact_metadata;
+        this.memo.reset();
         return this.emit(
           {
             t: 'notice',

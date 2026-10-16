@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { HarnessSession } from '@agents-io/protocol';
+import { PrefaceMemo, type HarnessSession, type InputRecord } from '@agents-io/protocol';
 import { assertConformingStream } from '@agents-io/testkit';
 import { Hub, Lane, MemorySessionLog, defaultPolicy } from '@agents-io/session';
 import { UnsupportedCodexVersionError, renderInputs } from '../src/index.js';
@@ -678,6 +678,24 @@ describe('helpers', () => {
     expect(first!.text).toMatch(/ evidence=("?)platform_signed\1/);
     const echo = { ...input('i2', 'x'), origin: { kind: 'agent' as const, principal: null, evidence: 'platform_signed' as const, self: true, via: 'lark:a:c1', adapter: 'lark' } };
     expect(((await renderInputs([echo]))[0] as { text: string }).text).toMatch(/ self=true/);
+  });
+
+  it('with a memo, conversation-wide context is shown when it changes, like Claude Code #ID-2', async () => {
+    const memo = new PrefaceMemo();
+    const lark = (id: string, ctx: Record<string, string | number> = {}) =>
+      input(id, id, { channelContext: { channel: 'lark', conversationKind: 'dm', conversationId: 'c1', senderName: 'Ann', sentAt: 1, reply: 'card', ...ctx } });
+    const head = async (i: InputRecord) => ((await renderInputs([i], { memo }))[0] as { text: string }).text.split('\n')[0];
+    // `via` names the channel and the conversation: they are not repeated.
+    expect(await head(lark('i1'))).toBe('[sender from=owner kind=human evidence=platform_signed via=lark:a:c1 conversationKind="dm" senderName="Ann" sentAt=1 reply="card"]');
+    expect(await head(lark('i2', { sentAt: 2, reply: 'final' }))).toBe('[sender from=owner kind=human evidence=platform_signed via=lark:a:c1 sentAt=2 reply="final"]');
+    // Another conversation shows its own; another sender its name.
+    expect(await head({ ...lark('i3'), origin: { ...lark('i3').origin, via: 'lark:a:c2', principal: { id: 'bob', labels: [] } } })).toBe(
+      '[sender from=bob kind=human evidence=platform_signed via=lark:a:c2 conversationKind="dm" conversationId="c1" senderName="Ann" sentAt=1 reply="card"]',
+    );
+    memo.reset();
+    expect(await head(lark('i4', { reply: 'final' }))).toMatch(/ conversationKind="dm" senderName="Ann" sentAt=1 reply="final"\]$/);
+    // Without a memo (the default), everything but what `via` names.
+    expect(((await renderInputs([lark('i5')]))[0] as { text: string }).text).toMatch(/ conversationKind="dm" senderName="Ann" sentAt=1 reply="card"\]\ni5$/);
   });
 
   it('preface: false still marks a watched input as watched #ID-2', async () => {

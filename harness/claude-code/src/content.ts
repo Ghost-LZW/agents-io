@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { ContentBlock, InputRecord } from '@agents-io/protocol';
+import { prefaceContext, type ContentBlock, type InputRecord, type PrefaceMemo } from '@agents-io/protocol';
 import type { FileResolver, ImageResolver, SDKUserMessage } from './types.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -27,8 +27,11 @@ const EVENT_JSON_MAX = 4000;
 /** Label of context-only inputs (`channelContext.context`): seen in the conversation, not said to the agent. */
 export const CONTEXT_LABEL = 'context, not addressed to you: recorded in the conversation; read it, do not reply to it unless the addressed input asks';
 
-/** Short structured preface naming who sent the input and from where (and that it is context, if so). */
-export function preface(input: InputRecord): string {
+/**
+ * Short structured preface naming who sent the input and from where (and that it is context, if so).
+ * With a memo, conversation-wide keys are shown only when they change (`prefaceContext`).
+ */
+export function preface(input: InputRecord, memo?: PrefaceMemo): string {
   const o = input.origin;
   // Evidence is part of the source (decision 5): what the channel proved, or `daemon` for this daemon's own agents.
   const parts = [`from=${o.principal?.id ?? 'unknown'}`, `kind=${o.kind}`, `evidence=${o.evidence}`, `via=${o.via}`];
@@ -40,7 +43,7 @@ export function preface(input: InputRecord): string {
   if (input.channelRef) parts.push(`ref=${refToken(input.channelRef)}`);
   // Values are JSON (strings quoted and escaped), like the Codex preface: a display name or a chat title
   // the sender chose cannot close this line and forge another sender's.
-  for (const [k, v] of Object.entries(input.channelContext)) parts.push(`${k}=${contextValue(v)}`);
+  for (const [k, v] of prefaceContext(input, memo, contextValue)) parts.push(`${k}=${v}`);
   const head = input.channelContext.context === true ? `[agents-io ${CONTEXT_LABEL}]\n` : '';
   return `${head}[agents-io input ${parts.join(' ')}]`;
 }
@@ -135,6 +138,8 @@ export interface UserMessageOpts {
   resolveImage?: ImageResolver;
   resolveFile?: FileResolver;
   clientComposed?: boolean;
+  /** What this session already showed the model (see `preface`). */
+  memo?: PrefaceMemo;
 }
 
 /** One SDKUserMessage per input, `uuid` bound to the inputId, priority always explicit. */
@@ -155,7 +160,7 @@ export async function toUserMessage(
     };
     return { message, notices: [] };
   }
-  const blocks: UserBlock[] = [{ type: 'text', text: preface(input) }];
+  const blocks: UserBlock[] = [{ type: 'text', text: preface(input, opts.memo) }];
   const notices: string[] = [];
   for (const c of input.content) {
     const r = await convertBlock(c, opts.resolveImage, opts.resolveFile);

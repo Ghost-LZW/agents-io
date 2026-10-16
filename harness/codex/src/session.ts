@@ -14,6 +14,7 @@ import type {
   RunSpec,
   SteerResult,
 } from '@agents-io/protocol';
+import { PrefaceMemo } from '@agents-io/protocol';
 import type { RequestId } from './generated/RequestId.js';
 import type { CollaborationMode } from './generated/CollaborationMode.js';
 import type { ThreadStatus } from './generated/v2/ThreadStatus.js';
@@ -182,6 +183,8 @@ export class CodexSession implements HarnessSession {
   private active: Turn | undefined;
   private requests = new Map<string, PendingRequest>();
   private clientIds = new Map<string, string[]>();
+  /** What the model was already shown in input prefaces; reset when it may have lost it. */
+  private memo = new PrefaceMemo();
   private state: BodyOf<'session.state'>['state'] | undefined;
   private closed = false;
   private finishedCodexTurns = new Set<string>();
@@ -248,7 +251,7 @@ export class CodexSession implements HarnessSession {
     const clientUserMessageId = encodeClientId(t.startInputs);
     this.clientIds.set(clientUserMessageId, t.startInputs);
     try {
-      const input = await renderInputs(inputs, { resolveMedia: this.opts.resolveMedia, preface: this.opts.preface });
+      const input = await renderInputs(inputs, { resolveMedia: this.opts.resolveMedia, preface: this.opts.preface, memo: this.memo });
       await this.settling;
       // collaborationMode is in Codex's experimental 0.160 schema; the checked-in
       // stable TurnStartParams generator omits that one field.
@@ -272,6 +275,7 @@ export class CodexSession implements HarnessSession {
       this.saveTurn(t);
     } catch (e) {
       t.bind(undefined);
+      this.memo.reset();
       if (t.done) return;
       const unknown = !(e instanceof RpcError);
       this.finishTurn(t, unknown ? 'ambiguous' : 'failed', {
@@ -293,12 +297,13 @@ export class CodexSession implements HarnessSession {
     this.clientIds.set(clientUserMessageId, ids);
     for (const id of ids) t.steerInputs.add(id);
     const rollback = () => {
+      this.memo.reset();
       for (const id of ids) t.steerInputs.delete(id);
       this.clientIds.delete(clientUserMessageId);
     };
     let params: TurnSteerParams;
     try {
-      const input = await renderInputs(inputs, { resolveMedia: this.opts.resolveMedia, preface: this.opts.preface });
+      const input = await renderInputs(inputs, { resolveMedia: this.opts.resolveMedia, preface: this.opts.preface, memo: this.memo });
       params = { threadId: this.threadId, expectedTurnId: codexTurnId, clientUserMessageId, input };
     } catch (e) {
       rollback();
@@ -313,6 +318,7 @@ export class CodexSession implements HarnessSession {
         // Outcome unknown (timed out, connection lost): Codex may have taken it. Keep the
         // inputs on the turn so a later userMessage echo of the clientId still counts them as
         // consumed; whatever is never echoed is unconsumed at turn end and reconciled there.
+        this.memo.reset();
         this.saveTurn(t);
         this.emit(
           { t: 'notice', code: 'continuity', message: `codex steer of ${ids.join(', ')} unconfirmed (${(e as Error).message})` },
@@ -628,12 +634,17 @@ export class CodexSession implements HarnessSession {
   /** Add context to the thread without starting a turn (`thread/inject_items`, raw Responses API items). */
   async inject(inputs: InputRecord[]): Promise<void> {
     if (this.closed) throw new Error('codex session is closed');
-    const rendered = await renderInputs(inputs, { resolveMedia: this.opts.resolveMedia, preface: this.opts.preface });
+    const rendered = await renderInputs(inputs, { resolveMedia: this.opts.resolveMedia, preface: this.opts.preface, memo: this.memo });
     const content = rendered.map((u) =>
       u.type === 'text' ? { type: 'input_text', text: u.text } : u.type === 'image' && 'url' in u ? { type: 'input_image', image_url: u.url } : { type: 'input_text', text: `[${u.type} not injectable]` },
     );
     const params: ThreadInjectItemsParams = { threadId: this.threadId, items: [{ type: 'message', role: 'user', content }] };
-    await this.host.rpc.request('thread/inject_items', params);
+    try {
+      await this.host.rpc.request('thread/inject_items', params);
+    } catch (e) {
+      this.memo.reset();
+      throw e;
+    }
   }
 
   // ---- internals ----------------------------------------------------------------
@@ -666,6 +677,7 @@ export class CodexSession implements HarnessSession {
       t.openItems.set(item.id, m.summary);
       t.itemAudience.set(item.id, m.audience);
       this.emit({ t: 'item.started', item: asStarted(m.summary) }, extra);
+      if (item.type === 'contextCompaction') this.memo.reset();
       if (item.type === 'contextCompaction') this.emit({ t: 'notice', code: 'compacting', message: 'compacting context' }, { turnId: t.turnId, level: 'detail' });
       return;
     }
@@ -694,6 +706,8 @@ export class CodexSession implements HarnessSession {
       t.openItems.clear();
     }
     const missing = t.startInputs.filter((id) => !t.consumed.has(id));
+    // An input the model may not have read took its preface with it.
+    if (missing.length || [...t.steerInputs].some((id) => !t.consumed.has(id))) this.memo.reset();
     if (status === 'completed' && missing.length) {
       // admitted ≠ consumed: Codex did not echo these inputs' clientId, so we cannot claim the turn used them.
       this.emit({ t: 'notice', code: 'continuity', message: `codex did not confirm inputs ${missing.join(', ')}` }, { turnId: t.turnId, level: 'detail' });
@@ -1047,4 +1061,3 @@ export function classifySteerError(e: unknown): SteerResult | undefined {
 }
 
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref());
-

@@ -31,11 +31,19 @@ harness 事件 ──▶ SessionLog（seq）──▶ Compositor（读全量，�
 每条输入在发给 harness 前，前面加一行发送者说明，后面是转换过的内容块：
 
 ```
-[agents-io input from=lark-bot:on_bc38… kind=human evidence=platform_signed via=lark-bot:default:oc_7a1… ref=channel:lark-bot/om_5f2… channel="lark-bot" conversationKind="dm" conversationId="oc_7a1…" senderName="张三" sentAt=1791… reply="card" markdown="basic" maxChars=4000 buttons="yes" media="image,file,audio"]
+[agents-io input from=lark-bot:on_bc38… kind=human evidence=platform_signed via=lark-bot:default:oc_7a1… ref=channel:lark-bot/om_5f2… conversationKind="dm" senderName="张三" sentAt=1791… reply="card markdown=basic maxChars=4000 buttons=yes media=image,file,audio"]
 列出当前目录下的文件，然后用一句话总结
 ```
 
+同一会话里的下一条只剩每条都会变的字段：
+
+```
+[agents-io input from=lark-bot:on_bc38… kind=human evidence=platform_signed via=lark-bot:default:oc_7a1… ref=channel:lark-bot/om_9c4… sentAt=1791…]
+```
+
 （Codex 上这一行以 `[sender …]` 开头，字段相同。通道上下文的值写成 JSON：字符串带引号并转义，发送者自己取的名字关不掉这一行。）
+
+**只在变化时出现的字段**（`@agents-io/protocol` 的 `prefaceContext`）：发送者字段（`from` 到 `ref`）每条都有；`via` 已经写明的 `channel`、`conversationId` 不再重复；`conversationKind`、`reply`、`topic`、`topicTitle`、`topicTools` 每个会话（按 `via`）只在第一次和值变了时出现，`senderName`、`senderIsBot` 每个发送者同理。harness 会话记着已经给模型看过什么，模型可能丢了这些内容时清空重来：上下文压缩（Claude Code `compact_boundary`、Codex `contextCompaction`）、渲染好的输入没送到模型（撤回、开轮或插话失败、轮次结束时没确认消费）、harness 会话重开。
 
 - `from`：宿主策略认定的主体。认不出的发送者是 `unknown`。
 - `kind`：`human`、`agent`、`channel_event` 等。
@@ -96,7 +104,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 
   ```
   [agents-io context, not addressed to you: recorded in the conversation; read it, do not reply to it unless the addressed input asks]
-  [agents-io input from=unknown kind=human via=lark-bot:default:oc_7a1… channel="lark-bot" conversationKind="group" senderName="Eve" context=true]
+  [agents-io input from=unknown kind=human via=lark-bot:default:oc_7a1… conversationKind="group" senderName="Eve" context=true]
   发布会改到周四了
   ```
 

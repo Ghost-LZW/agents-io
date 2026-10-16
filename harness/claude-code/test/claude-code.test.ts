@@ -229,6 +229,30 @@ describe('input writing', () => {
     expect(preface({ ...input('x', ''), origin: agent, cause, channelContext: { context: true, loopGuard: 'pair' } })).toMatch(/ hop=3 .*loopGuard="pair"\]$/);
   });
 
+  it('conversation-wide context is shown when it changes, and again after a compaction #ID-2', async () => {
+    const { s, q, it: evs, give } = await setup();
+    const lark = (id: string, ctx: Record<string, string | number>) =>
+      input(id, id, { channelContext: { channel: 'fake', conversationKind: 'dm', conversationId: 'c1', senderName: 'Ann', sentAt: 1, reply: 'card', ...ctx } });
+    const head = (i: number) => (q.written[i]!.message.content as { text: string }[])[0]!.text;
+    const turn = async (n: number, id: string, ctx: Record<string, string | number> = {}, ...before: unknown[]) => {
+      give(`t${n}`, id);
+      await s.startTurn(`t${n}`, [lark(id, ctx)]);
+      await q.waitWritten(n);
+      q.push(...before, sdk.result({ uuids: [uuidOf(q, n - 1)], result: 'ok' }));
+      await collectUntil(evs, isTurnCompleted);
+    };
+    await turn(1, 'i1');
+    // `via` names the channel and the conversation: they are not repeated.
+    expect(head(0)).toBe('[agents-io input from=owner kind=human evidence=platform_signed via=fake:a:c1 conversationKind="dm" senderName="Ann" sentAt=1 reply="card"]');
+    await turn(2, 'i2', { sentAt: 2 }, sdk.system('compact_boundary', { compact_metadata: { trigger: 'auto', pre_tokens: 1000, post_tokens: 100 } }));
+    expect(head(1)).toBe('[agents-io input from=owner kind=human evidence=platform_signed via=fake:a:c1 sentAt=2]');
+    // The compaction in turn 2 may have dropped what turn 1 showed; a changed value is shown anyway.
+    await turn(3, 'i3', { sentAt: 3 });
+    expect(head(2)).toBe('[agents-io input from=owner kind=human evidence=platform_signed via=fake:a:c1 conversationKind="dm" senderName="Ann" sentAt=3 reply="card"]');
+    await turn(4, 'i4', { sentAt: 4, reply: 'final' });
+    expect(head(3)).toBe('[agents-io input from=owner kind=human evidence=platform_signed via=fake:a:c1 sentAt=4 reply="final"]');
+  });
+
   it('startTurn only when idle #HC-1', async () => {
     const { s } = await setup();
     await s.startTurn('t1', [input('i1', 'a')]);

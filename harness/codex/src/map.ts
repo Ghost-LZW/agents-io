@@ -1,4 +1,4 @@
-import type { Audience, BodyOf, ContentBlock, InputRecord, ItemSummary, Level } from '@agents-io/protocol';
+import { prefaceContext, type Audience, type BodyOf, type ContentBlock, type InputRecord, type ItemSummary, type Level, type PrefaceMemo } from '@agents-io/protocol';
 import type { ThreadItem } from './generated/v2/ThreadItem.js';
 import type { UserInput } from './generated/v2/UserInput.js';
 import type { TurnError } from './generated/v2/TurnError.js';
@@ -21,8 +21,11 @@ export type MediaResolver = (block: { ref: string; mime: string; name?: string; 
 
 const text = (t: string): UserInput => ({ type: 'text', text: t, text_elements: [] });
 
-/** One-line, structured sender context so the model knows who is talking and from where. */
-export function senderPreface(input: InputRecord): string {
+/**
+ * One-line, structured sender context so the model knows who is talking and from where.
+ * With a memo, conversation-wide keys are shown only when they change (`prefaceContext`).
+ */
+export function senderPreface(input: InputRecord, memo?: PrefaceMemo): string {
   const o = input.origin;
   // Same fields as the Claude Code preface: evidence (decision 5), self, and the hop of an agent message (agent-messaging §4.5).
   const parts = [`from=${o.principal?.id ?? 'unknown'}`, `kind=${o.kind}`, `evidence=${o.evidence}`, `via=${o.via}`];
@@ -31,7 +34,7 @@ export function senderPreface(input: InputRecord): string {
   if (input.cause?.hop !== undefined) parts.push(`hop=${input.cause.hop}`);
   // Bare like the Claude Code preface, so the agent can pass it verbatim to a host command (`aio verify`).
   if (input.channelRef) parts.push(`ref=${/^[^\s"]+$/.test(input.channelRef) ? input.channelRef : JSON.stringify(input.channelRef)}`);
-  for (const [k, v] of Object.entries(input.channelContext)) parts.push(`${k}=${JSON.stringify(v)}`);
+  for (const [k, v] of prefaceContext(input, memo)) parts.push(`${k}=${v}`);
   return `[sender ${parts.join(' ')}]`;
 }
 
@@ -64,14 +67,14 @@ function blockText(b: Exclude<ContentBlock, { ref: string; mime: string }>): str
 /** Renders input records to Codex `UserInput` items: text-like blocks become text, images go through the resolver. */
 export async function renderInputs(
   inputs: InputRecord[],
-  opts: { resolveMedia?: MediaResolver; preface?: boolean } = {},
+  opts: { resolveMedia?: MediaResolver; preface?: boolean; memo?: PrefaceMemo } = {},
 ): Promise<UserInput[]> {
   const out: UserInput[] = [];
   for (const input of inputs) {
     const lines: string[] = [];
     // The context label stays even without the sender preface: the model must not take context as a request.
     if (input.channelContext.context === true) lines.push(CONTEXT_LABEL);
-    if (opts.preface !== false) lines.push(senderPreface(input));
+    if (opts.preface !== false) lines.push(senderPreface(input, opts.memo));
     else {
       // Without the sender preface, a watched or loop-guarded input still says so (decision 5: watched content is marked).
       const marks = MARK_KEYS.filter((k) => input.channelContext[k] !== undefined).map((k) => `${k}=${JSON.stringify(input.channelContext[k])}`);
