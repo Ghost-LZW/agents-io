@@ -6,6 +6,7 @@
 > 2026-10-11：不成立积压清完（IN-1、IN-5、EX-2、LN-4 改为成立，`it.fails` 全部改成 `it`，LN-4 的 `it.todo` 用迟报 `live.ended` 的假 harness 复现并修好）；`pnpm invariants:check` 有漂移即非零退出（决定 14）。
 > 2026-10-11：agent-messaging 合并评审的修复：DL-5（默认外发按输入是否全来自主人）、IN-8（live 委托过检查点、只有有主体的人清零、邮件自动回复标 bot）、EX-5（上下文输入带过来的标记、发送时取来源）、ID-3（保留 `agent` id）、ID-2（Claude Code 说明行 JSON 引号）、ID-8（多条发送全部索引）、EX-6（cause 按 session 存）；未修的记在 §15 第 17 条。
 > 2026-10-12：决定 11 修订（会中委托按说话人定权限）加入 LN-7；LN-6、ID-6、DL-5、IN-8 随之更新（委托轮次不再沿用 thread 上一轮的设置）。
+> 2026-10-19：任务运行的覆盖项、用量与关联 id（`docs/design/run-overrides/`）加入 RN-2、RN-3、EX-7；RN-1 的超时改报协议里早就有的 `status: "timeout"`。
 > 用途：改动 agents-io 的人或 agent 用它判断"这个改动有没有打破某个承诺"。新增承诺先写进这里，再写测试；测试改名时同步改这里。
 
 ## 0. 怎么读
@@ -369,6 +370,14 @@
 - **测试**：标签 `#EX-6`；`packages/daemon/test/agent-messaging.test.ts` "explain by the operationId of a reply card: its turn and that turn's inputs; explain --chain walks a recovered input back to the root"、"a trip leaves a loop_guard notice in the receiving and the sending session, explain shows it (also after a restart), nothing goes to a channel"、"one envelope in two sessions keeps a cause record in each; explain --chain follows the session the producing turn ran in"、"a cause table from before (keyed by input alone) is moved over on start, its records kept"。
 - **已修**：~~一个信封进了几个 session 时 cause 记录按 `input_id` 互相覆盖，`explain --chain` 可能走到错的 session（没有 turnId、截停标记张冠李戴）~~（2026-10-11 合并评审）。
 - **状态**：部分覆盖（只测了两跳；按 chain id 列出整条链——提案 §4.8 的"往前走"——没有做，`daemon_causes` 已按 chain 存）。
+
+### EX-7 任务运行的输入有路由记录：explain 说出是哪次运行、宿主的关联 id
+
+- **承诺**：`run.start` 的输入像渠道输入一样有一条持久的路由记录：`aio explain <inputId>` 答 `matched: [{ bindingId: "host:run", source: "host", on: "dispatch", agent, sessionKey: "run:<runId>" }]`、主体（`host:<名字>`）、证据，以及 `run: { runId, correlation? }`；开轮失败时这一条的 `rejected` 记 `start_failed`。`explain --chain` 走到这样的根时，根那一级带同样的 `run`。宿主给的 `inputId` 原样使用（这次运行产生的 cause 链以它为 chain id）：不是普通记号（1–256 个字母、数字、`.`、`_`、`:`、`-`，以字母或数字开头，不是守护进程自用的 `ctxo_…`）答 `bad_input_id`；别的输入已经有这个 id 的路由记录答 `input_id_taken`（同一 runId 重发不算）。`correlation`（1–256 字、无控制字符，否则 `bad_correlation`）记在 `InputRecord.correlation` 上，进日志（`input.admitted.input`）与宿主回调里的 `ctx.inputs`，不进 `channelContext`，两个 harness 都不给模型看。`host.hello` 的 `features` 列 `run.correlation`。
+- **实现**：`packages/daemon/src/runs.ts` `start`（`INPUT_ID`、`RESERVED_INPUT_ID`、`CORRELATION`；`explained` 查重与 `recordRunInput` 都在第一个 await 之前，并发的同 id 请求看得到前一个的记录）；`packages/daemon/src/gateway.ts` `recordRunInput`（`RUN_RULE`）、`explainChain`（根一级的 `run`）；`harness/claude-code/src/content.ts` `preface`、`harness/codex/src/map.ts` `renderInputs`（只取固定的来源字段与 `channelContext`）。
+- **测试**：标签 `#EX-7`；`packages/daemon/test/runs.test.ts` "the input is the host's: its id and correlation id are kept (not in what the model is shown), echoed by run.ended, and explain names the run"、"refuses an inputId another input has, ids that are not plain tokens and bad correlation ids; nothing runs"；`harness/claude-code/test/claude-code.test.ts` 与 `harness/codex/test/codex.test.ts` "a task run's correlation id never reaches the model"。
+- **状态**：有测试。
+- **注意**：`input_id_taken` 只看路由记录（保留 7 天，同 EX-1）；更早的输入、本地客户端输入（没有路由记录）的 id 查不到。宿主应在自己的命名空间里取 id。
 
 ---
 
@@ -825,11 +834,26 @@
 
 ### RN-1 任务运行的结局
 
-- **承诺**：`run.start` 在新的 `run:<id>` session 里跑一轮任务 agent；退出码含义固定：0 完成、1 失败、3 ambiguous（含上一个进程留下的）、124 超时、130 取消；发起的连接离开后运行继续，`run.ended` 交给宿主；守护进程停止时运行被打断，告知仍连着的发起者；`aio run` 阻塞到 `run.ended` 并以它的退出码退出。
+- **承诺**：`run.start` 在新的 `run:<id>` session 里跑一轮任务 agent；退出码含义固定：0 完成、1 失败、3 ambiguous（含上一个进程留下的）、124 超时（`status: "timeout"`）、130 取消；发起的连接离开后运行继续，`run.ended` 交给宿主；守护进程停止时运行被打断，告知仍连着的发起者；`aio run` 阻塞到 `run.ended` 并以它的退出码退出。
 - **实现**：`packages/daemon/src/runs.ts` `exitCodeOf`、`end`（发给仍连着的发起者，否则发给宿主）、`peerGone`、`stop`（`daemon_stopping`）、启动时结算遗留（RS-5）；`packages/daemon/src/cli.ts` `aio run` 与 `exitCodeFor`。
 - **测试**：标签 `#RN-1`；例：`packages/daemon/test/runs.test.ts` `run.start` 组："runs one turn of a task agent in a fresh session run:<id> with its run config and the given cwd; run.ended exit 0; the session is closed #RN-1"、"exit codes: a failing turn is 1, a cancel is 130, a timeout 124 #RN-1"、"agent instructions reach the harness; observe routes render the run on a channel; run.ended goes to the host when the asking connection left #RN-1"、"a run an earlier daemon left mid-turn is ambiguous (exit 3) after the restart #RS-5 #RN-1"、"daemon stop interrupts running runs and tells their connections #RN-1"；`packages/daemon/test/cli.test.ts` "maps errors to exit codes #RN-1"、"aio run blocks until run.ended, prints the answer, streams progress to stderr, exits with the run exit code #RN-1"。
 - **状态**：有测试。
 - **注意**：`run.ended` 不进宿主入站队列：结束时既没有发起者也没有宿主连着，这一帧就没人收到，只能从会话日志（`turn.completed`）和守护进程日志查。
+
+### RN-2 任务运行的覆盖项要么生效，要么整个请求被拒
+
+- **承诺**：`run.start.overrides` 只作用于这一次运行：`preset` 把 harness 实例、模型、力度换成那个 preset 的（运行仍以这个 agent 的身份：cwd、指令），`model` / `effort` 再盖在上面（原样传下去，守护进程不解释模型名），`profile` 缺省取 agent 的、再缺省 `restricted`。实际用的 RunSpec 就是 harness 打开会话时收到的 `run`、日志里 `turn.started.run`、`run.start` 答复里的 `run`。值不是一个普通记号（空、含空白或控制字符、超过 256 字）、preset 没有配置，或者（带 `profile` 或 `preset` 时）profile 既不是这次运行所在实例 `profiles` 里定义的、也不是内置的（`bypass`、`restricted`），整个请求答 `bad_override`：不建会话、不起 harness，从不静默退回缺省。同一 agent 的其他运行、交互会话与配置不受影响。`host.hello` 的 `features` 列 `run.overrides`；没有这一项的守护进程会忽略 `overrides`，宿主不得依赖。
+- **实现**：`packages/daemon/src/gateway.ts` `runSpec`（`BUILTIN_PROFILES`、`OVERRIDE_VALUE`）、`openRunLane`（按 spec 的实例为这次运行建适配器，`policy.plan` 恒为这个 spec）；`packages/daemon/src/runs.ts` `start`（在 cwd、建 lane 之前算 spec；运行中重发同一 runId 答第一次的 spec）；`packages/daemon/src/host.ts` `FEATURES`；`packages/daemon/src/cli.ts` `runRequest`（`--preset`、`--model`、`--effort`、`--profile`）。
+- **测试**：标签 `#RN-2`；`packages/daemon/test/runs.test.ts` `run.start overrides` 组："apply to that run only: model, effort, profile and preset reach the harness and turn.started.run; the answer says what runs; without them the agent defaults hold"、"one that cannot apply fails the request with bad_override and nothing runs; never a silent fallback"。
+- **状态**：有测试。
+- **注意**：`overrides.profile` 能把一次运行升到 `bypass`。这没有超出宿主已有的权力：宿主本来就能给运行指定任意 cwd 和子进程环境变量。部署方不想让宿主这样做，就不要把 task agent 交给不信任的宿主连接。
+
+### RN-3 `run.ended` 说清哪一轮、跑了多久、用了多少；重发的 `run.start` 答同一帧
+
+- **承诺**：`run.ended` 带 `inputId`、`turnId`（开了轮才有）、`durationMs`（从这次运行日志的第一条记录，即输入被接纳，到结束的那一条：`turn.completed`，或开轮前的 `input.rejected` / `input.cancelled`）、`usage`（这一轮 `turn.completed.usage` 原样转出；harness 没报就没有）、`correlation`（宿主在 `run.start` 给了才有）。`timeoutMs` 到期时，先在会话日志里记一条 `notice { code: "run_timeout" }` 再打断，结局为 `status: "timeout"`（退出码 124，`error.code` 仍是 `timeout`）；到期时这一轮已经自己完成或失败的，按它自己的结局。同一 runId 再发 `run.start`（也包括守护进程重启之后）从日志按同一套规则重建，得到与第一次发出的 `run.ended` 相同的帧；开轮前被取消的运行重答 `interrupted`，不是 `ambiguous`。上一个进程留下、启动时才结算为 `ambiguous` 的运行没有 `durationMs`（结束时刻不知道）。`host.hello` 的 `features` 列 `run.ended.usage`。
+- **实现**：`packages/daemon/src/runs.ts` `onEvent`（`firstTs`、`endTs`、`usage`）、`end`、`outcome`（从日志读，规则相同）、`start`（超时计时器写 `run_timeout`）；`packages/protocol/src/host.ts` `RunEnded`、`RunStartResult`；`packages/protocol/src/events.ts` `notice` 的 `run_timeout`；`packages/testkit/src/fakes.ts` `FakeTurnApi.usage`。
+- **测试**：标签 `#RN-3`；`packages/daemon/test/runs.test.ts` `run.ended` 组："carries the run's turn, input, duration and the harness's usage; a re-sent run.start answers the same frame from the log, also after a restart"、"a run a previous daemon left mid-turn has no duration (its end is not known)"；"the input is the host's: its id and correlation id are kept (not in what the model is shown), echoed by run.ended, and explain names the run"（`correlation` 的回带）。
+- **状态**：部分覆盖（开轮前被取消、开轮前超时这两条重答路径没有测试：假 harness 收到输入立刻开轮）。
 
 ### TP-1 话题切换不丢上下文、不来回转
 

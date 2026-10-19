@@ -99,7 +99,7 @@ e2e 跑的是默认实例（`--harness` 可换），保留它的 `env`、`config
 | g | reconnect-from-seq | 订阅者断开，带 `fromSeq` 重连 → durable 事件一个不少，没有多余快照 |
 | h | codex-restart-adopt | 仅 codex：unix own app-server；turn 中途停网关（detach），新网关启动后 `turn.adopted` 并 completed，log 里该 turn 只结束一次 |
 | j | context-listen | 陌生人在群里不 @ 机器人发两句话 → 只记录（`observe_only`，带整条记录），不开轮；主人随后 @ 机器人问"他们说了什么" → 一个 turn，`inputIds` 依次是两条 context 和提问（`docs/CHANNELS.md` §1b）；turn completed、无 rejected；回答提到两句话的内容（Friday、ORCHID-77） |
-| r | task-run | 宿主协议：带 token 的连接 `run.start` 一个 `mode: task` agent（默认实例、`bypass`），`env` 里的值只进子进程：shell 里 `echo` 出来的值出现在回答里，日志里只出现在工具输出和回答中；`run.ended` 退出码 0，session `run:<id>` 关闭；同一 runId 再 start 直接报告结果；交互 agent 被拒（`not_task_agent`） |
+| r | task-run | 宿主协议：带 token 的连接 `run.start` 一个 `mode: task` agent（默认实例、`bypass`），`env` 里的值只进子进程：shell 里 `echo` 出来的值出现在回答里，日志里只出现在工具输出和回答中；`run.ended` 退出码 0，带宿主给的 `inputId` 与 `correlation`、`turnId`、`durationMs`（harness 报了用量就带 `usage`），session `run:<id>` 关闭；同一 runId 再 start 直接报告结果，与 `run.ended` 是同一帧；交互 agent 被拒（`not_task_agent`） |
 | m | output-ask-choice | 输出工具：模型调 `ask_choice` → 通道上出现 red/blue 按钮（`choice:` action id），该轮结束；模拟点击 blue → 新一轮的输入是 `choice` 事件，回答含 blue；`delivery.settled` delivered；报告 harness 在 `_meta` 里带了哪些键 |
 | n | output-send-file | 输出工具：工作目录里写 README.md，模型调 `send_file` → 通道收到附件，blob 字节与文件一致，delivery settled |
 | o | output-terminal-choose | 输出工具：本地路由上 `ask_choice` 只写 `agents-io.output` 事件；`/choose <id> <n>` 等价的输入 → 新一轮回答含所选项；越界序号被拒（`bad_choice`） |
@@ -123,6 +123,9 @@ aio run --agent executor --env PROBE=hi -- 'Run: echo $PROBE and reply with only
 aio run --agent executor --timeout 5s -- 'Run: sleep 60'                # 退出码 124
 aio run --agent assistant -- x                                          # 交互 agent：not_task_agent，退出码 2
 aio run --agent executor --run-id try-1 -- x                            # 同一 runId：直接报告上次的结果
+aio run --agent executor --model <另一个模型> --effort low -- "reply with exactly: pong"   # stderr 的 started 行是这个模型与力度
+aio run --agent executor --profile nope -- x                            # bad_override，退出码 2，什么都不起
+aio run --agent executor --input-id try-in-2 --correlation job-7 -- x && aio explain try-in-2   # explain 带 run: { runId, correlation: "job-7" }
 aio send --route '{"channel":"lark-bot","account":"default","conversationId":"oc_…"}' --operation-id op-1 --text hi
 aio bindings put --file table.json && aio bindings get
 aio tail --consumer xwo --once     # 命中 on: host 规则的输入，一行一条 JSON（带 cursor）

@@ -237,6 +237,13 @@ describe('input writing', () => {
     expect(preface({ ...input('x', ''), origin: agent, cause, channelContext: { context: true, loopGuard: 'pair' } })).toMatch(/ hop=3 .*loopGuard="pair"\]$/);
   });
 
+  it("a task run's correlation id never reaches the model #EX-7", () => {
+    const host = { kind: 'system' as const, principal: { id: 'host:h', labels: ['host'] }, evidence: 'device_only' as const, via: 'host:h', adapter: 'host' };
+    const p = preface({ ...input('lbg_42', 'go'), origin: host, correlation: 'deleg-7', channelContext: { channel: 'host', runId: 'r1', agent: 'exec' } });
+    expect(p).toMatch(/^\[agents-io input from=host:h kind=system evidence=device_only via=host:h .*runId="r1"/);
+    expect(p).not.toContain('deleg-7');
+  });
+
   it('conversation-wide context is shown when it changes, and again after a compaction #ID-2', async () => {
     const { s, q, it: evs, give } = await setup();
     const lark = (id: string, ctx: Record<string, string | number>) =>

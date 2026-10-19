@@ -6,7 +6,7 @@ import { constants as osConstants, homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
-import type { ContentBlock, RenderedMessage, ReplyRoute, RunEnded, SessionEvent, SessionLaunch, SessionScope, Tier, TuiAttach } from '@agents-io/protocol';
+import type { RenderedMessage, ReplyRoute, RunEnded, RunStart, SessionEvent, SessionLaunch, SessionScope, Tier, TuiAttach } from '@agents-io/protocol';
 import { runAttach } from './attach.js';
 import { CommandError, DaemonUnavailable, LocalClient } from './client.js';
 import { ConfigError, defaultInstance, loadConfig, type LoadOptions } from './config.js';
@@ -32,7 +32,9 @@ local ends (as the local principal)
 
 host commands (authenticate with the token file next to the socket; docs/HOSTS.md §5)
   aio run       --agent <task agent> [--run-id <id>] [--cwd <dir>] [--env K=V …] [--timeout 10m]
-                [--observe <route json> …] -- <instruction text>     (blocks; exits with the run's exit code)
+                [--observe <route json> …] [--preset <name>] [--model <m>] [--effort <e>] [--profile <p>]
+                [--input-id <id>] [--correlation <id>] -- <instruction text>
+                                                                      (blocks; exits with the run's exit code)
   aio send      --route <route json> --operation-id <id> [--file message.json|-] [--text <text>]
   aio tail      --consumer <name> [--from <cursor>] [--once]          (JSON lines, each with its cursor)
   aio ack       --consumer <name> <cursor>
@@ -101,6 +103,12 @@ export function parseCli(argv: string[]): CliArgs {
         limit: { type: 'string' },
         'token-file': { type: 'string' },
         chain: { type: 'boolean' },
+        preset: { type: 'string' },
+        model: { type: 'string' },
+        effort: { type: 'string' },
+        profile: { type: 'string' },
+        'input-id': { type: 'string' },
+        correlation: { type: 'string' },
       },
     });
   } catch (e) {
@@ -339,13 +347,15 @@ export function parseEnvPairs(pairs: string[]): Record<string, string> {
 }
 
 /** The run request `aio run` sends, from its arguments. */
-export function runRequest(a: CliArgs, cwd = process.cwd()): { runId: string; agent: string; input: ContentBlock[]; cwd?: string; env?: Record<string, string>; observe?: { routes: ReplyRoute[] }; timeoutMs?: number } {
+export function runRequest(a: CliArgs, cwd = process.cwd()): Omit<RunStart, 'v' | 'type' | 'id'> {
   const agent = need(a, 'agent');
   const text = a.rest.join(' ').trim();
   if (!text) throw new ConfigError('run: no instruction (put it after --: aio run --agent <name> -- <instruction>)');
   const env = parseEnvPairs(list(a, 'env'));
   const routes = list(a, 'observe').map((r) => json<ReplyRoute>(r, '--observe'));
   const timeout = str(a, 'timeout');
+  // The daemon checks them (`bad_override`); an older one ignores them (feature `run.overrides`).
+  const overrides = Object.fromEntries((['preset', 'model', 'effort', 'profile'] as const).flatMap((k) => (str(a, k) !== undefined ? [[k, str(a, k)!]] : [])));
   return {
     runId: str(a, 'run-id') ?? `run_${randomUUID()}`,
     agent,
@@ -354,6 +364,9 @@ export function runRequest(a: CliArgs, cwd = process.cwd()): { runId: string; ag
     ...(Object.keys(env).length ? { env } : {}),
     ...(routes.length ? { observe: { routes } } : {}),
     ...(timeout !== undefined ? { timeoutMs: parseDuration(timeout) } : {}),
+    ...(Object.keys(overrides).length ? { overrides } : {}),
+    ...(str(a, 'input-id') !== undefined ? { inputId: str(a, 'input-id')! } : {}),
+    ...(str(a, 'correlation') !== undefined ? { correlation: str(a, 'correlation')! } : {}),
   };
 }
 
@@ -363,7 +376,7 @@ export function progressLine(e: SessionEvent): string | undefined {
   const cut = (s: string, n = 120) => (s.length > n ? `${s.slice(0, n - 1)}…` : s).replace(/\s+/g, ' ');
   switch (b.t) {
     case 'turn.started':
-      return `▸ started${b.run ? ` (${b.run.harness}, ${b.run.model || 'default model'}, ${b.run.profile})` : ''}`;
+      return `▸ started${b.run ? ` (${b.run.harness}, ${b.run.model || 'default model'}${b.run.effort ? `, effort ${b.run.effort}` : ''}, ${b.run.profile})` : ''}`;
     case 'item.started':
       return b.item.type === 'reasoning' || b.item.type === 'agent_message' ? undefined : `  · ${b.item.type}: ${cut(b.item.title)}`;
     case 'item.completed':
@@ -636,7 +649,7 @@ export function exitCodeFor(e: unknown): number {
   if (e instanceof ConfigError) return 2;
   if (e instanceof DaemonUnavailable || e instanceof TokenError) return 69;
   if (e instanceof CommandError && e.code === 'unauthorized') return 77;
-  if (e instanceof CommandError && ['unknown_agent', 'not_task_agent', 'bad_cwd', 'bad_env', 'bad_run_id', 'invalid_frame', 'invalid', 'task_agent', 'unknown_agent', 'conflict', 'empty_input'].includes(e.code)) return 2;
+  if (e instanceof CommandError && ['unknown_agent', 'not_task_agent', 'bad_cwd', 'bad_env', 'bad_run_id', 'invalid_frame', 'invalid', 'task_agent', 'unknown_agent', 'conflict', 'empty_input', 'bad_override', 'bad_input_id', 'bad_correlation', 'input_id_taken'].includes(e.code)) return 2;
   return 1;
 }
 

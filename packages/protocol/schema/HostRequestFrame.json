@@ -626,8 +626,17 @@
             },
             "profile": {
               "type": "string"
+            },
+            "preset": {
+              "type": "string"
             }
           }
+        },
+        "inputId": {
+          "type": "string"
+        },
+        "correlation": {
+          "type": "string"
         }
       }
     },

@@ -38,5 +38,10 @@ describe('host result values', () => {
     valid('run.start', await t.runStart({ runId: 'r1', agent: 'exec', cwd: w.dir, input: [{ type: 'text', text: 'go' }] }));
     expect(errors(RunEnded, await t.runEndedOf('r1'))).toEqual([]);
     valid('run.start', await t.runStart({ runId: 'r1', agent: 'exec', input: [{ type: 'text', text: 'go' }] }));
+    // With the host's input id, correlation id and overrides: the answer, run.ended and explain of the run's input.
+    valid('run.start', await t.runStart({ runId: 'r2', agent: 'exec', input: [{ type: 'text', text: 'go' }], inputId: 'h-1', correlation: 'c-1', overrides: { model: 'm', effort: 'e' } }));
+    expect(errors(RunEnded, await t.runEndedOf('r2'))).toEqual([]);
+    valid('explain', await t.explain('h-1'));
+    valid('explain', await t.explain('h-1', { chain: true }));
   });
 });

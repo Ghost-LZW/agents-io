@@ -193,6 +193,8 @@ export const Body = Type.Union([
       Type.Literal('loop_guard'),
       /** A turn carrying a live's delegation began under a wider profile than its speaker gets; interrupted (decision 11 amendment). */
       Type.Literal('live_profile'),
+      /** A task run's `run.start.timeoutMs` elapsed; the run is interrupted and ends `timeout`. */
+      Type.Literal('run_timeout'),
       Type.Literal('other'),
     ]),
     message: Type.String(),

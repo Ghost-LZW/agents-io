@@ -150,6 +150,9 @@ export const LoopGuardTrip = Type.Object({
 export type LoopGuardTrip = Static<typeof LoopGuardTrip>;
 
 /** Why an input went where it went (`aio explain`). */
+/** The task run an input started (`run.start`), and the correlation id its host gave. */
+export const RunOfInput = Type.Object({ runId: Type.String(), correlation: Type.Optional(Type.String()) });
+
 export const RouteExplanation = Type.Object({
   inputId: Type.String(),
   tableVersions: Type.Array(Type.String()),
@@ -210,6 +213,8 @@ export const RouteExplanation = Type.Object({
   cause: Type.Optional(InputCause),
   /** The loop guard stopped it from starting a turn (it was recorded as context). */
   loopGuard: Type.Optional(LoopGuardTrip),
+  /** The input of a task run (`run.start`; `matched` names the `host:run` rule and the run's session): its run id and the host's correlation id. */
+  run: Type.Optional(RunOfInput),
 });
 export type RouteExplanation = Static<typeof RouteExplanation>;
 
@@ -280,10 +285,33 @@ export const RunStart = Type.Object({
   /** Render the run's progress on these routes (observation only). */
   observe: Type.Optional(Type.Object({ routes: Type.Array(ReplyRoute) })),
   timeoutMs: Type.Optional(Type.Number()),
-  /** Replace the agent's run defaults for this run only. `profile` must be one the deployment config defines. */
+  /**
+   * Replace the agent's run defaults for this run only (feature `run.overrides`; an older daemon
+   * ignores them). `preset`: a configured preset's harness instance, model and effort; `model` /
+   * `effort` go over that (passed through, never interpreted); `profile` must be one the run's
+   * instance defines in `profiles`, or built in (`bypass`, `restricted`). A value the daemon cannot
+   * apply fails the request with `bad_override`.
+   */
   overrides: Type.Optional(
-    Type.Object({ model: Type.Optional(Type.String()), effort: Type.Optional(Type.String()), profile: Type.Optional(Type.String()) }),
+    Type.Object({
+      model: Type.Optional(Type.String()),
+      effort: Type.Optional(Type.String()),
+      profile: Type.Optional(Type.String()),
+      preset: Type.Optional(Type.String()),
+    }),
   ),
+  /**
+   * The id of the run's input (feature `run.correlation`; default: one the daemon makes): 1-256
+   * letters, digits, `.`, `_`, `:`, `-`, starting with a letter or digit. One another input already
+   * has (a routing record) fails `input_id_taken`.
+   */
+  inputId: Type.Optional(Type.String()),
+  /**
+   * An opaque id of the host's (feature `run.correlation`), at most 256 characters: kept with the
+   * run's input (`InputRecord.correlation`), echoed in `run.ended` and shown by `explain`; never
+   * shown to the model.
+   */
+  correlation: Type.Optional(Type.String()),
 });
 export type RunStart = Static<typeof RunStart>;
 
@@ -389,10 +417,20 @@ export const RunEnded = Type.Object({
   /** 0 completed, 1 failed, 3 ambiguous, 124 timeout, 130 interrupted (cancelled). */
   exitCode: Type.Number(),
   error: Type.Optional(Type.Object({ code: Type.String(), message: Type.Optional(Type.String()) })),
-  /** Wall time from `run.start` to the end. */
+  /**
+   * Feature `run.ended.usage`: from the run's first log record (its input admitted) to its last
+   * (turn completed, input rejected or cancelled). Absent when the end is not known in time (a run
+   * a previous daemon left mid-turn).
+   */
   durationMs: Type.Optional(Type.Number()),
-  /** The harness's usage report for the turn, passed through (as `turn.completed.usage`). */
+  /** Feature `run.ended.usage`: the harness's usage report for the turn, passed through (`turn.completed.usage`); absent when it gave none. */
   usage: Type.Optional(Type.Unknown()),
+  /** Feature `run.ended.usage`: the run's turn (absent when none started), as in the session log. */
+  turnId: Type.Optional(Type.String()),
+  /** Feature `run.ended.usage`: the run's input. */
+  inputId: Type.Optional(Type.String()),
+  /** Feature `run.correlation`: `run.start.correlation`, as given. */
+  correlation: Type.Optional(Type.String()),
 });
 export type RunEnded = Static<typeof RunEnded>;
 
@@ -531,6 +569,10 @@ export const RunStartResult = Type.Object({
   state: Type.Union([Type.Literal('started'), Type.Literal('running'), Type.Literal('ended')]),
   /** How it ended, for `state: "ended"` (its `run.ended` frame is sent again too). */
   ended: Type.Optional(RunEnded),
+  /** The run's input (`started`, `running`; feature `run.correlation`). */
+  inputId: Type.Optional(Type.String()),
+  /** What the run's turn runs with: the agent's defaults with the overrides applied (`started`, `running`; feature `run.overrides`). */
+  run: Type.Optional(RunSpec),
 });
 export type RunStartResult = Static<typeof RunStartResult>;
 
@@ -634,6 +676,8 @@ export const ChainLink = Type.Object({
   basis: Type.Optional(InputCause.properties.basis),
   /** It was stopped by the loop guard. */
   loopGuard: Type.Optional(LoopGuardTrip),
+  /** The root is a task run's input: the run and the host's correlation id. */
+  run: Type.Optional(RunOfInput),
 });
 export type ChainLink = Static<typeof ChainLink>;
 

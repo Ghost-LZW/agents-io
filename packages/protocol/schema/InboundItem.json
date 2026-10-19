@@ -408,6 +408,9 @@
             }
           }
         },
+        "correlation": {
+          "type": "string"
+        },
         "channelContext": {
           "type": "object",
           "patternProperties": {

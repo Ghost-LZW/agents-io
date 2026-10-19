@@ -15,6 +15,7 @@ import {
   type ResultFrame,
   type ExplainResult,
   type RunEnded,
+  type RunStart,
   type SessionEvent,
   type Tier,
   type Topic,
@@ -232,7 +233,7 @@ export class LocalClient {
     return this.call('bindings.get');
   }
 
-  runStart(o: { runId: string; agent: string; input: ContentBlock[]; cwd?: string; env?: Record<string, string>; observe?: { routes: ReplyRoute[] }; timeoutMs?: number }): Promise<RunStartResult> {
+  runStart(o: Omit<RunStart, 'v' | 'type' | 'id'>): Promise<RunStartResult> {
     return this.call('run.start', o);
   }
 

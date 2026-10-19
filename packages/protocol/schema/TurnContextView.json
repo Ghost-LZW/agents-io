@@ -34,6 +34,18 @@
         "effort": {
           "type": "string"
         },
+        "mode": {
+          "anyOf": [
+            {
+              "const": "default",
+              "type": "string"
+            },
+            {
+              "const": "plan",
+              "type": "string"
+            }
+          ]
+        },
         "profile": {
           "type": "string"
         }
@@ -424,6 +436,9 @@
                 }
               }
             }
+          },
+          "correlation": {
+            "type": "string"
           },
           "channelContext": {
             "type": "object",

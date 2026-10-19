@@ -118,8 +118,8 @@
 | 帧 | 方向 | 用途 |
 |---|---|---|
 | `bindings.put` / `bindings.get` | 宿主 → 守护进程 | 原子替换 / 读取 Binding 表与身份映射 |
-| `run.start` / `run.cancel` | 宿主 → 守护进程 | 用 `mode: task` 的 agent 执行一轮：新的 session `run:<runId>`，结束即关闭；`env` 只进子进程环境 |
-| `run.ended` | 守护进程 → 宿主 | `{ runId, status, exitCode, durationMs?, usage? }`；`status` 含 `timeout`（`timeoutMs` 到期） |
+| `run.start` / `run.cancel` | 宿主 → 守护进程 | 用 `mode: task` 的 agent 执行一轮：新的 session `run:<runId>`，结束即关闭；`env` 只进子进程环境；可带 `overrides`、`inputId`、`correlation`（见下） |
+| `run.ended` | 守护进程 → 宿主 | `{ runId, status, exitCode, error?, durationMs?, usage?, turnId?, inputId?, correlation? }`；`status` 含 `timeout`（`timeoutMs` 到期） |
 | `deliver` | 宿主 → 守护进程 | 推送给人，按 `operationId` 幂等；按钮点击按 `actionPrefix` 规则回到宿主。由 `route` 的 `(channel, account)` 对应的通道发出；该账号没有通道时，只有当这个通道 id 恰好一个条目才用它发，否则 `unknown_channel`（多个飞书机器人时不会以别的机器人发出，决定 8） |
 | `inbound` | 守护进程 → 宿主 | §2.1 推送消费 |
 | `policy` | 守护进程 → 宿主 | §2.2 回调（`hook: "route"`），以及按 `hello.callouts` 开启的 `resolve`、`outbound`、`contact` 同步钩子（§4.1，超时 fail closed） |
@@ -128,7 +128,12 @@
 | `session.prepare` | 宿主 → 守护进程 | 为不经渠道路由打开的会话键预先登记 agent 和 launch（§2.2、§2.3） |
 | `inbound.redispatch` | 宿主 → 守护进程 | 把宿主入站队列里的一条输入按原始来源投递到指定会话（§2.1） |
 
-`run.start` 可带 `overrides: { model?, effort?, profile? }`，只覆盖本次运行的 agent 默认值。
+**任务运行的三个可选项**（方案见 `docs/design/run-overrides`，不变量 RN-2、RN-3、EX-7；旧守护进程接受这些字段然后忽略，宿主必须先看 `features`）：
+
+- **`overrides: { preset?, model?, effort?, profile? }`**（feature `run.overrides`）：只改这一次运行。`preset` 把 harness 实例、模型、力度换成那个 preset 的（运行仍以这个 agent 的身份：cwd、指令）；`model` / `effort` 再盖在上面，原样传给 harness；`profile` 缺省取 agent 的、再缺省 `restricted`。值不是一个普通记号、preset 没有配置，或（带 `profile` 或 `preset` 时）profile 既不是运行所在实例的 `profiles` 里有的、也不是内置的（`bypass`、`restricted`），整个请求答 `bad_override`，什么都不起。`run.start` 的答复带 `run`：实际用的 RunSpec（与日志里 `turn.started.run` 相同）。
+- **`run.ended` 的事实**（feature `run.ended.usage`）：`inputId`；`turnId`（开了轮才有）；`durationMs`（日志里从输入被接纳到结束的那条记录）；`usage`（这一轮 `turn.completed.usage` 原样转出，harness 没报就没有）。`timeoutMs` 到期的运行 `status: "timeout"`、退出码 124（`error.code` 仍为 `timeout`），会话日志里有一条 `notice { code: "run_timeout" }`。同一 runId 再发 `run.start` 得到的 `ended` 与第一次的 `run.ended` 相同（从日志重建，重启后也一样）；上一个进程留下的 `ambiguous` 运行没有 `durationMs`。
+- **`inputId`、`correlation`**（feature `run.correlation`）：`inputId` 是这次运行的输入 id（1–256 个字母、数字、`.`、`_`、`:`、`-`，以字母或数字开头，否则 `bad_input_id`），也是这次运行产生的 cause 链的 chain id；别的输入已有这个 id 的路由记录答 `input_id_taken`，所以宿主应在自己的命名空间里取。`correlation` 是不透明字符串（≤ 256 字、无控制字符，否则 `bad_correlation`），记在 `InputRecord.correlation` 上（日志里有，宿主回调的 `ctx.inputs` 里有，模型看不到），`run.ended` 带回。run 的输入有路由记录：`aio explain <inputId>` 答 `matched[0].bindingId: "host:run"` 与 `run: { runId, correlation? }`，`explain --chain` 的根那一级也带 `run`。`run.start` 的答复带 `inputId`。
+- **对严格校验的宿主可见的协议变化**（2026-10-19）：上面的字段都是新增的可选字段；`notice.code` 多了 `run_timeout`；超时的 `run.ended.status` 由 `interrupted` 改为协议里早有的 `timeout`。
 
 ### 4.1 回调钩子与代答
 
@@ -141,7 +146,7 @@
 - **`contact`**（agent 通信，`docs/design/agent-messaging/` §4.6）：`policy { hook: "contact", args: { from, to, op, turn } }`，`from` 是 `{ agent, sessionKey }`，`to` 是 `{ agent, sessionKey }` 或 `{ agent }`，`op` 为 `list` / `send` / `run` / `observe` / `control`；答复 `{ verdict: "allow" | "deny" }`。超时（2000 ms）、出错、答复不合 schema 时按本地策略：`policy.agentContacts: [{ from, to, ops? }]`（agent 名或 `*`），**不写就是全部拒绝**。钩子已定义，第一步还没有调用它的东西（`agents_list` / `agent_send` 等工具是第二步）。
 - **代答**：宿主连接（`origin.kind = "system"` 且 `origin.adapter = "host"`；网关与会话 lane 各查一次）发 `resolve` 时可带 `onBehalfOf: "<成员 id>"`。`human` 请求要求该成员在 `principals` 里；日志记 `request.resolved.by = { kind, id: <成员>, via: "host:<名字>" }`。非宿主连接带 `onBehalfOf` 答 `not_eligible`。**须部署方显式开启**（决定 13）：配置 `"policy": { "answerOnBehalf": true }`，缺省 `false`；未开启时宿主连接带 `onBehalfOf` 的 `resolve` 答 `on_behalf_not_allowed`（请求保持打开，宿主仍可不带 `onBehalfOf` 以自己的名义作答），`host.hello` 的 `features` 也不列 `"resolve.onBehalfOf"`。这是"以别人的名义作答"的唯一开关，决定 12 的 agent 代为审批以后也挂在它下面，不另设开关。**行为变化（2026-10-11）**：此前任何带 token 的宿主都能代答；依赖代答的部署升级后要加这一项。
 
-**能力协商**：`host.hello` 的结果带 `features: string[]`，按能力名协商而不是按版本号。目前有 `"session.launch"`：回调答复可带 `launch`、可用 `session.prepare`、规则可用 `callout.skipWhenPinned`；`"callouts.resolve"`、`"callouts.outbound"`、`"resolve.onBehalfOf"`（§4.1，只在 `policy.answerOnBehalf` 开启时列出）；`"inbound.redispatch"`（§2.1）；`"host.takeover"`：`host.hello` 支持 `takeover: true`（§2）；`"callouts.contact"`（§4.1）；`"explain.chain"`：`explain` 接受 operationId 与 `chain: true`（§5）。旧守护进程的 `callouts` 只接受布尔。推荐做法：直接发钩子列表，收到 `invalid_frame` 再用 `callouts: true` 重发（旧守护进程只有 `route`）。不要先用 `callouts: true` 握手探测 features：那次握手已让这条连接成为**唯一的**宿主、只开了 `route`，想换成列表必须断开重连，期间占着宿主位置。结果里没有某个 feature 时，宿主不得依赖它。
+**能力协商**：`host.hello` 的结果带 `features: string[]`，按能力名协商而不是按版本号。目前有 `"session.launch"`：回调答复可带 `launch`、可用 `session.prepare`、规则可用 `callout.skipWhenPinned`；`"callouts.resolve"`、`"callouts.outbound"`、`"resolve.onBehalfOf"`（§4.1，只在 `policy.answerOnBehalf` 开启时列出）；`"inbound.redispatch"`（§2.1）；`"host.takeover"`：`host.hello` 支持 `takeover: true`（§2）；`"callouts.contact"`（§4.1）；`"explain.chain"`：`explain` 接受 operationId 与 `chain: true`（§5）；`"run.overrides"`、`"run.ended.usage"`、`"run.correlation"`：任务运行的三个可选项（§4 表下）。旧守护进程的 `callouts` 只接受布尔。推荐做法：直接发钩子列表，收到 `invalid_frame` 再用 `callouts: true` 重发（旧守护进程只有 `route`）。不要先用 `callouts: true` 握手探测 features：那次握手已让这条连接成为**唯一的**宿主、只开了 `route`，想换成列表必须断开重连，期间占着宿主位置。结果里没有某个 feature 时，宿主不得依赖它。
 
 **`session.prepare { sessionKey, agent, launch }`**：用于不经渠道路由打开的会话（宿主连接发的客户端 `input` 帧、本地 `aio input` / `aio attach`、指向该键的 watch），也可以让宿主在键可预知时（如成员入驻时建群）提前登记，规则就不必开回调。它只登记（agent 行与 launch 行在同一事务里写入），不拉起 harness；第一条输入到达时按登记建 lane。结果 `{ sessionKey, agent, launch: { cwd?, envKeys }, created }`：同一键用相同的值再 prepare 幂等（`created: false`）。错误码：`unknown_agent`、`not_interactive_agent`、`launch_not_allowed`（agent 没有 `sessionParams`）、`bad_cwd`、`bad_env`、`launch_unsupported`（Codex `unix` 实例带 env）、`launch_conflict`（键已有不同的 launch，或已是无 launch 的会话）、`agent_conflict`（键已属于另一个 agent）、`invalid_frame`（含 `run:` 前缀的键，task run 用 `run.start`）。遇到 `launch_conflict` 换键，不要重试。每个请求的 `result.value` 都有 schema（`packages/protocol/src/host.ts` 末尾的 `HOST_RESULT_VALUES`，JSON Schema 见 `packages/protocol/schema/*Result.json`）。
 
@@ -153,7 +158,7 @@
 
 | 命令 | 等价于 |
 |---|---|
-| `aio run --agent <name> --run-id <id> --cwd <dir> [--env K=V…] -- <指令>` | `run.start`，阻塞到 `run.ended`，以 `exitCode` 退出 |
+| `aio run --agent <name> --run-id <id> --cwd <dir> [--env K=V…] [--preset/--model/--effort/--profile …] [--input-id <id>] [--correlation <id>] -- <指令>` | `run.start`，阻塞到 `run.ended`，以 `exitCode` 退出 |
 | `aio send --route <json> --operation-id <id> < message.json` | `deliver` |
 | `aio tail --consumer <name>` / `aio ack --consumer <name> <cursor>` | §2.1 拉取 |
 | `aio bindings put < table.json` | `bindings.put` |

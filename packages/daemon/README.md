@@ -147,12 +147,20 @@ before any host frame; after it, the connection's client frames carry the origin
   harness adapter (Codex: its own app-server over stdio) with the request `env`
   over the instance's env, in the child process only (never logged, never on
   argv; the daemon also sets `AGENTS_IO_RUN_ID`).
-  The input is the turn's content; the turn ends → `run.ended { status, exitCode }`
+  The input is the turn's content; the turn ends → `run.ended { status, exitCode,
+  turnId, inputId, durationMs, usage }` (usage: the turn's `turn.completed.usage`)
   and the session closes. `runId` is an idempotency key: starting an ended run
-  again answers `state: "ended"` with its outcome. `run.cancel` interrupts;
-  `timeoutMs` interrupts with `error.code: "timeout"`; `observe.routes` renders
-  the run on those routes through the compositors. A run left mid-turn by a
-  previous daemon is settled `ambiguous` at start.
+  again answers `state: "ended"` with the same frame, read from the log. `run.cancel`
+  interrupts; `timeoutMs` interrupts and ends the run `timeout` (a `run_timeout`
+  notice in its log); `observe.routes` renders the run on those routes through the
+  compositors. A run left mid-turn by a previous daemon is settled `ambiguous` at start.
+  `overrides { preset, model, effort, profile }` change this run's RunSpec only
+  (the answer's `run`), or fail `bad_override`: a preset must be configured, and a
+  `profile` / `preset` override needs a profile the run's instance defines or a
+  built-in one (`bypass`, `restricted`). `inputId` names the run's input (unique:
+  else `input_id_taken`); `correlation` is an opaque id kept on the input (never
+  shown to the model) and echoed in `run.ended`; `explain <inputId>` shows the run.
+  Features `run.overrides`, `run.ended.usage`, `run.correlation`.
   Exit codes: 0 completed, 1 failed, 3 ambiguous, 124 timed out, 130 interrupted.
 - `deliver`: through the outbox, idempotent per `operationId` (also across
   restarts: settled deliveries are in the database). Value: the delivery record
@@ -336,7 +344,8 @@ goes to its current topic, also from `per-thread` rules such as the default
 
 ```
 aio serve | e2e | attach | input | sessions | watch …           (as aio-dev; `aio-dev send` is `aio input`)
-aio run --agent <task agent> [--run-id <id>] [--cwd <dir>] [--env K=V …] [--timeout 10m] [--observe <route json> …] -- <instruction>
+aio run --agent <task agent> [--run-id <id>] [--cwd <dir>] [--env K=V …] [--timeout 10m] [--observe <route json> …]
+        [--preset <name>] [--model <m>] [--effort <e>] [--profile <p>] [--input-id <id>] [--correlation <id>] -- <instruction>
 aio send --route <route json> --operation-id <id> [--file message.json|-] [--text <text>]
 aio tail --consumer <name> [--from <cursor>] [--once]
 aio ack --consumer <name> <cursor>

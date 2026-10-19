@@ -592,10 +592,20 @@ export const SCENARIOS: Scenario[] = [
       const c = await w.client();
       await c.hello({ token: w.gw.token, name: 'e2e-host' });
       const t0 = Date.now();
-      const r = await c.runStart({ runId: 'e2e-r1', agent: 'exec', cwd: config.cwd, env: { E2E_PROBE: 'kiwi-42' }, input: [{ type: 'text', text: 'Run the shell command `echo $E2E_PROBE` and reply with exactly its output.' }] });
-      assert(r.state === 'started', `run.start answered ${r.state}`);
+      const r = await c.runStart({
+        runId: 'e2e-r1',
+        agent: 'exec',
+        cwd: config.cwd,
+        env: { E2E_PROBE: 'kiwi-42' },
+        inputId: 'e2e-in-1',
+        correlation: 'e2e-job',
+        input: [{ type: 'text', text: 'Run the shell command `echo $E2E_PROBE` and reply with exactly its output.' }],
+      });
+      assert(r.state === 'started' && r.inputId === 'e2e-in-1', `run.start answered ${r.state} (input ${r.inputId})`);
       const ended = await Promise.race([c.runEndedOf('e2e-r1'), new Promise<never>((_, rej) => setTimeout(() => rej(new Failure('no run.ended')), TURN_MS))]);
       assert(ended.exitCode === 0, `run ended ${ended.status} (exit ${ended.exitCode})${ended.error ? ` ${ended.error.code}` : ''}`);
+      // What a host reads off run.ended alone (RN-3): the turn, the input, how long, and the harness's usage when it reports one.
+      assert(ended.turnId !== undefined && ended.inputId === 'e2e-in-1' && ended.correlation === 'e2e-job' && typeof ended.durationMs === 'number', `run.ended lacks its facts: ${JSON.stringify({ ...ended, usage: undefined })}`);
       const log = w.gw.hub.log.read('run:e2e-r1', 0);
       const answer = log.filter((e) => e.body.t === 'text.snapshot' && e.body.final && e.audience === 'answer').map((e) => (e.body as BodyOf<'text.snapshot'>).text).join('\n');
       assert(/kiwi-42/.test(answer), `answer does not show the child env: ${JSON.stringify(answer.slice(0, 80))}`);
@@ -608,9 +618,10 @@ export const SCENARIOS: Scenario[] = [
       assert(!w.gw.sessions().find((s) => s.sessionKey === 'run:e2e-r1')?.live, 'run session still live after run.ended');
       const again = await c.runStart({ runId: 'e2e-r1', agent: 'exec', input: [{ type: 'text', text: 'x' }] });
       assert(again.state === 'ended' && again.ended?.exitCode === 0, 'the same runId ran again');
+      assert(JSON.stringify(again.ended) === JSON.stringify(ended), 'the re-sent run.start answered another frame than run.ended');
       const refused = await c.runStart({ runId: 'e2e-r2', agent: DEFAULT_AGENT, input: [{ type: 'text', text: 'x' }] }).then(() => 'started', (e: Error) => e.message);
       assert(/not_task_agent/.test(refused), `interactive agent: ${refused}`);
-      return `exit 0 in ${sec(Date.now() - t0)}; child saw its env; session closed; rerun reports the outcome; interactive agent refused`;
+      return `exit 0 in ${sec(Date.now() - t0)} (run.ended: ${sec(ended.durationMs!)}, usage ${ended.usage === undefined ? 'none' : 'reported'}); child saw its env; session closed; rerun reports the same outcome; interactive agent refused`;
     },
   },
   {

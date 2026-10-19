@@ -99,7 +99,53 @@
         "durationMs": {
           "type": "number"
         },
-        "usage": {}
+        "usage": {},
+        "turnId": {
+          "type": "string"
+        },
+        "inputId": {
+          "type": "string"
+        },
+        "correlation": {
+          "type": "string"
+        }
+      }
+    },
+    "inputId": {
+      "type": "string"
+    },
+    "run": {
+      "type": "object",
+      "required": [
+        "harness",
+        "model",
+        "profile"
+      ],
+      "properties": {
+        "harness": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "effort": {
+          "type": "string"
+        },
+        "mode": {
+          "anyOf": [
+            {
+              "const": "default",
+              "type": "string"
+            },
+            {
+              "const": "plan",
+              "type": "string"
+            }
+          ]
+        },
+        "profile": {
+          "type": "string"
+        }
       }
     }
   }

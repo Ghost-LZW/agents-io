@@ -108,7 +108,7 @@ import { privateDb, privateDir } from './private.js';
 import { blobResolvers, type MediaResolvers } from './media.js';
 import { DaemonRecords, type CauseRecord, type OutboundRecord } from './records.js';
 import { checkLaunch, launchView, sameLaunch, type LaunchCheck } from './launch.js';
-import { Runs } from './runs.js';
+import { RUN_RULE, Runs, type RunOverrides } from './runs.js';
 import { Strangers } from './strangers.js';
 import { runCommand, type CommandHost } from './commands.js';
 import { ClaudeTuiService } from './tui-claude.js';
@@ -467,8 +467,11 @@ export class Gateway {
     this.runs = new Runs({
       hub: this.hub,
       agents: () => c.agents,
-      agentCwd: (a) => a.cwd ?? c.harnesses[a.harness]?.cwd ?? c.cwd,
+      agentCwd: (a, instance) => a.cwd ?? c.harnesses[instance]?.cwd ?? c.cwd,
+      runSpec: (a, o) => this.runSpec(a, o),
       openRunLane: (r) => this.openRunLane(r),
+      explained: (id) => this.router.explain(id),
+      recordRunInput: (r) => this.recordRunInput(r),
       hostPeer: () => this.host.hostPeer(),
       log: (level, msg, data) => this.log(level, msg, data),
     });
@@ -1220,14 +1223,61 @@ export class Gateway {
   }
 
   /**
+   * A task run's RunSpec (feature `run.overrides`): the agent's instance, model and effort, or
+   * those of `overrides.preset`; `overrides.model` / `effort` over them (passed through); the
+   * profile `overrides.profile`, else the agent's, else `restricted`. `bad_override` when a preset
+   * is not configured, a value is not a plain token, or (with a `profile` or `preset` override) the
+   * profile is neither one the run's instance defines nor built in: never a silent fallback.
+   */
+  private runSpec(agent: AgentConfig, o: RunOverrides | undefined): { ok: true; spec: RunSpec } | { ok: false; code: string; message: string } {
+    const c = this.o.config;
+    const bad = (message: string) => ({ ok: false as const, code: 'bad_override', message });
+    for (const k of ['model', 'effort', 'profile', 'preset'] as const) {
+      const v = o?.[k];
+      if (v !== undefined && !OVERRIDE_VALUE.test(v)) return bad(`overrides.${k} must be 1-256 characters without whitespace`);
+    }
+    let inst = c.harnesses[agent.harness];
+    if (!inst) return { ok: false, code: 'harness_unavailable', message: `agent ${agent.name}: unknown harness instance ${agent.harness}` };
+    let base = agentRun(agent, inst);
+    if (o?.preset !== undefined) {
+      const preset = c.presets[o.preset];
+      if (!preset) return bad(`unknown preset ${JSON.stringify(o.preset)} (${Object.keys(c.presets).length ? `configured: ${Object.keys(c.presets).join(', ')}` : 'no `presets` configured'})`);
+      inst = c.harnesses[preset.harness]!;
+      base = agentRun(preset, inst);
+    }
+    const profile = o?.profile ?? agent.profile ?? 'restricted';
+    if ((o?.profile !== undefined || inst.name !== agent.harness) && !Object.hasOwn(inst.profiles, profile) && !BUILTIN_PROFILES.includes(profile)) {
+      const own = Object.keys(inst.profiles);
+      return bad(`profile ${JSON.stringify(profile)} is not defined on harness instance ${inst.name} (${own.length ? `its profiles: ${own.join(', ')}; ` : ''}built in: ${BUILTIN_PROFILES.join(', ')})`);
+    }
+    return { ok: true, spec: { ...base, ...(o?.model !== undefined ? { model: o.model } : {}), ...(o?.effort !== undefined ? { effort: o.effort } : {}), profile } };
+  }
+
+  /** A task run's input gets a routing record like a channel input's (EX-7): `explain` names its run and the host's correlation id. */
+  private recordRunInput(r: { input: InputRecord; runId: string; agent: string; sessionKey: string; rejected?: { code: string; message?: string } }): void {
+    const o = r.input.origin;
+    this.router.record({
+      inputId: r.input.inputId,
+      tableVersions: [],
+      matched: [{ bindingId: RUN_RULE, source: 'host', on: 'dispatch', agent: r.agent, sessionKey: r.sessionKey, ...(r.rejected ? { rejected: r.rejected } : {}) }],
+      principal: o.principal?.id ?? null,
+      evidence: o.evidence,
+      at: Date.now(),
+      run: { runId: r.runId, ...(r.input.correlation !== undefined ? { correlation: r.input.correlation } : {}) },
+    });
+  }
+
+  /**
    * The lane of one task run: its own harness adapter, built for this run with the
    * request env over the instance's (the child's environment only), the run's cwd,
-   * the agent's run config, and no retry of an unconsumed input.
+   * its RunSpec (the agent's with the request's overrides), and no retry of an
+   * unconsumed input.
    */
-  private openRunLane(r: { runId: string; sessionKey: string; agent: AgentConfig; cwd: string; env: Record<string, string>; turnId: string }): { lane: Lane; dispose(): Promise<void> } {
+  private openRunLane(r: { runId: string; sessionKey: string; agent: AgentConfig; spec: RunSpec; cwd: string; env: Record<string, string>; turnId: string }): { lane: Lane; dispose(): Promise<void> } {
     const c = this.o.config;
-    const inst = c.harnesses[r.agent.harness];
-    if (!inst) throw new Error(`agent ${r.agent.name}: unknown harness instance ${r.agent.harness}`);
+    // The spec's instance: the agent's, or the one an `overrides.preset` names (the run still runs as the agent).
+    const inst = c.harnesses[r.spec.harness];
+    if (!inst) throw new Error(`agent ${r.agent.name}: unknown harness instance ${r.spec.harness}`);
     // AGENTS_IO_RUN_ID lets a host command run in the workspace tie itself to this run. There is no
     // per-run provenance variable: it was a constant the host that started the run already knows (decision 13).
     const env = { ...r.env, AGENTS_IO_RUN_ID: r.runId };
@@ -1245,7 +1295,7 @@ export class Gateway {
       own = this.build(runInst);
       adapter = withAgent(own, r.agent, r.cwd);
     }
-    const spec: RunSpec = { ...agentRun(r.agent, inst), profile: r.agent.profile ?? 'restricted' };
+    const spec = r.spec;
     let firstTurn = true;
     const lane = new Lane({
       sessionKey: r.sessionKey,
@@ -1447,7 +1497,7 @@ export class Gateway {
         // No cause: a human, host or system input — the root — when we know of it at all.
         if (!ex && links.length === 0) return undefined;
         const turnId = sessionKey ? this.turnOfInput(sessionKey, cur) : undefined;
-        links.push({ inputId: cur, hop: 0, ...this.where(sessionKey), principal: ex?.principal ?? null, ...(turnId ? { turnId } : {}) });
+        links.push({ inputId: cur, hop: 0, ...this.where(sessionKey), principal: ex?.principal ?? null, ...(turnId ? { turnId } : {}), ...(ex?.run ? { run: ex.run } : {}) });
         end = 'root';
         break;
       }
@@ -2806,6 +2856,12 @@ function isHandedContext(id: string, context: Set<string>): boolean {
 function fail(code: string, message = code): Outcome {
   return { ok: false, code, message };
 }
+
+/** Profiles every harness maps without configuration (Claude Code and Codex alike): `run.overrides` may name them on any instance. */
+const BUILTIN_PROFILES = ['bypass', 'restricted'];
+
+/** A `run.start.overrides` value: one plain token (models and efforts are passed through, never interpreted). */
+const OVERRIDE_VALUE = /^[^\s\u0000-\u001f]{1,256}$/;
 
 /** An agent's (or a preset's) RunSpec over its instance's defaults (without the profile). */
 function agentRun(agent: Pick<AgentConfig, 'model' | 'effort'>, inst: HarnessInstance): Omit<RunSpec, 'profile'> {

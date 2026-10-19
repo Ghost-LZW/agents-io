@@ -107,6 +107,20 @@
                 "type": "string"
               }
             }
+          },
+          "run": {
+            "type": "object",
+            "required": [
+              "runId"
+            ],
+            "properties": {
+              "runId": {
+                "type": "string"
+              },
+              "correlation": {
+                "type": "string"
+              }
+            }
           }
         }
       }

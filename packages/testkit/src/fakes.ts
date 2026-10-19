@@ -154,6 +154,8 @@ export interface FakeTurnApi {
   emit(body: HarnessEvent['body'], extra?: Partial<Omit<HarnessEvent, 'body'>>): void;
   /** Resolves when the host answers `requestId`. */
   waitDecision(requestId: string): Promise<Decision>;
+  /** The usage report `turn.completed` carries (as a harness's own report, passed through). */
+  usage(report: unknown): void;
   signal: AbortSignal;
 }
 
@@ -228,6 +230,7 @@ export class FakeHarnessSession implements HarnessSession {
     this.push({ t: 'turn.started', turnId, inputIds: inputs.map((i) => i.inputId), replyRoute: inputs[0]?.replyRoute ?? null, run: run ?? this.args.run }, { turnId });
     void (async () => {
       let status: 'completed' | 'interrupted' | 'failed' = 'completed';
+      let usage: unknown;
       try {
         await this.script({
           turnId,
@@ -241,13 +244,16 @@ export class FakeHarnessSession implements HarnessSession {
               this.pending.set(requestId, resolve);
               ctl.signal.addEventListener('abort', () => reject(new Error('interrupted')), { once: true });
             }),
+          usage: (report) => {
+            usage = report;
+          },
         });
       } catch {
         status = ctl.signal.aborted ? 'interrupted' : 'failed';
       }
       if (ctl.signal.aborted) status = 'interrupted';
       this.push({ t: 'input.consumed', inputIds: inputs.map((i) => i.inputId), turnId }, { turnId });
-      this.push({ t: 'turn.completed', turnId, status }, { turnId });
+      this.push({ t: 'turn.completed', turnId, status, ...(usage !== undefined ? { usage } : {}) }, { turnId });
       this.active = undefined;
     })();
   }

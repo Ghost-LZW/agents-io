@@ -143,6 +143,11 @@ export const InputRecord = Type.Object({
    * handover, `inbound.redispatch`). Clients and adapters cannot set it.
    */
   cause: Type.Optional(InputCause),
+  /**
+   * Task-run inputs only: the opaque id the host gave in `run.start.correlation`, kept so the
+   * run's log and `run.ended` can name it. Never shown to the model; clients and adapters cannot set it.
+   */
+  correlation: Type.Optional(Type.String()),
   /** Small scalar facts a harness may surface to the model (chat name, sender name…). */
   channelContext: Type.Record(Type.String(), Type.Union([Type.String(), Type.Number(), Type.Boolean()])),
 });

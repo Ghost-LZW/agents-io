@@ -45,6 +45,12 @@ describe('cli arguments', () => {
       timeoutMs: 120_000,
     });
     expect(runRequest(parseCli(['run', '--agent', 'e', '--', 'x'])).runId).toMatch(/^run_/);
+    expect(runRequest(parseCli(['run', '--agent', 'e', '--preset', 'fast', '--model', 'm', '--effort', 'high', '--profile', 'bypass', '--input-id', 'in-1', '--correlation', 'job 7', '--', 'x']))).toMatchObject({
+      overrides: { preset: 'fast', model: 'm', effort: 'high', profile: 'bypass' },
+      inputId: 'in-1',
+      correlation: 'job 7',
+    });
+    expect(runRequest(parseCli(['run', '--agent', 'e', '--', 'x']))).not.toHaveProperty('overrides');
     expect(() => runRequest(parseCli(['run', '--', 'x']))).toThrow(/--agent is required/);
     expect(() => runRequest(parseCli(['run', '--agent', 'e']))).toThrow(/no instruction/);
     expect(() => parseEnvPairs(['NOEQ'])).toThrow(ConfigError);

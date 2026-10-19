@@ -635,6 +635,9 @@
                             }
                           }
                         },
+                        "correlation": {
+                          "type": "string"
+                        },
                         "channelContext": {
                           "type": "object",
                           "patternProperties": {
@@ -841,6 +844,18 @@
                         "effort": {
                           "type": "string"
                         },
+                        "mode": {
+                          "anyOf": [
+                            {
+                              "const": "default",
+                              "type": "string"
+                            },
+                            {
+                              "const": "plan",
+                              "type": "string"
+                            }
+                          ]
+                        },
                         "profile": {
                           "type": "string"
                         }
@@ -891,6 +906,18 @@
                         },
                         "effort": {
                           "type": "string"
+                        },
+                        "mode": {
+                          "anyOf": [
+                            {
+                              "const": "default",
+                              "type": "string"
+                            },
+                            {
+                              "const": "plan",
+                              "type": "string"
+                            }
+                          ]
                         },
                         "profile": {
                           "type": "string"
@@ -2000,6 +2027,10 @@
                         },
                         {
                           "const": "live_profile",
+                          "type": "string"
+                        },
+                        {
+                          "const": "run_timeout",
                           "type": "string"
                         },
                         {

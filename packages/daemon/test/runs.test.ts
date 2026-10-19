@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { HOST_RESULT_VALUES, errors } from '@agents-io/protocol';
+import type { InputRecord } from '@agents-io/protocol';
 import type { FakeTurnScript } from '@agents-io/testkit';
 import { daemon, tmp, until } from './helpers.js';
 
@@ -11,9 +12,10 @@ const AGENTS = {
   exec: { harness: 'claude-code', mode: 'task', profile: 'bypass', model: 'haiku' },
 };
 
-/** Fails the turn on `fail`, waits for an interrupt on `wait`, else echoes. */
+/** Fails the turn on `fail`, waits for an interrupt on `wait`, reports usage on `usage`, else echoes. */
 const script: FakeTurnScript = async (t) => {
   const text = t.inputs.flatMap((i) => i.content).map((c) => (c.type === 'text' ? c.text : '')).join(' ');
+  if (text.includes('usage')) t.usage({ totalCostUsd: 0.25, usage: { input_tokens: 12, output_tokens: 3 } });
   if (text.includes('fail')) throw new Error('boom');
   if (text.includes('wait')) await new Promise((_, reject) => t.signal.addEventListener('abort', () => reject(new Error('interrupted')), { once: true }));
   t.emit({ t: 'item.started', item: { itemId: 'i1', type: 'command', title: 'echo pong', status: 'running' } });
@@ -29,7 +31,7 @@ describe('run.start', () => {
     const w = await world();
     const h = await w.host();
     const r = await h.runStart({ runId: 'r1', agent: 'exec', cwd: w.dir, input: [{ type: 'text', text: 'pong please' }] });
-    expect(r).toEqual({ runId: 'r1', sessionKey: 'run:r1', state: 'started' });
+    expect(r).toEqual({ runId: 'r1', sessionKey: 'run:r1', state: 'started', inputId: expect.stringMatching(/^in_run_/), run: { harness: 'claude-code', model: 'haiku', profile: 'bypass' } });
     const ended = await h.runEndedOf('r1');
     expect(ended).toMatchObject({ type: 'run.ended', runId: 'r1', sessionKey: 'run:r1', status: 'completed', exitCode: 0 });
     const s = w.harness.sessions.at(-1)!;
@@ -57,8 +59,9 @@ describe('run.start', () => {
     await expect(h.runCancel('c')).rejects.toMatchObject({ code: 'run_ended' });
     await expect(h.runCancel('nope')).rejects.toMatchObject({ code: 'unknown_run' });
 
+    // `timeout` as the protocol has it (older daemons said `interrupted`); error.code stays for hosts that read it.
     await h.runStart({ runId: 't', agent: 'exec', input: [{ type: 'text', text: 'wait forever' }], timeoutMs: 50 });
-    expect(await h.runEndedOf('t')).toMatchObject({ status: 'interrupted', exitCode: 124, error: { code: 'timeout' } });
+    expect(await h.runEndedOf('t')).toMatchObject({ status: 'timeout', exitCode: 124, error: { code: 'timeout' } });
   });
 
   it('env goes into the run child only: the instance built for the run has it; the log, explain records and other instances do not #SE-1 #EX-3', async () => {
@@ -273,5 +276,166 @@ describe('interactive agents', () => {
     expect(w.gw.router.explain(r.inputId!)!.matched[0]).toMatchObject({ sessionKey: 'main', rejected: { code: 'agent_unavailable' } });
     // The input the watch would have given the session (its own id, inw_<watch>_…) is the one refused.
     expect(w.gw.hub.log.read('main', 0).some((e) => e.body.t === 'input.rejected' && e.body.inputIds.some((id) => id.startsWith('inw_w_')) && e.body.reason === 'agent_unavailable')).toBe(true);
+  });
+});
+
+describe('run.start overrides', () => {
+  /** Two instances (the agent's with its own profile `tight`, and a Codex one a preset names). */
+  const raw = {
+    harnesses: { 'claude-code': { use: 'claude-code', profiles: { tight: { permissionMode: 'default', disallowedTools: ['Bash'] } } }, cx: { use: 'codex' } },
+    presets: { fast: { harness: 'cx', model: 'gpt-x', effort: 'low' } },
+  };
+  const input = [{ type: 'text' as const, text: 'go' }];
+  const runOf = (w: Awaited<ReturnType<typeof world>>, runId: string) => w.gw.hub.log.read(`run:${runId}`, 0).find((e) => e.body.t === 'turn.started')!.body;
+
+  it('apply to that run only: model, effort, profile and preset reach the harness and turn.started.run; the answer says what runs; without them the agent defaults hold #RN-2', async () => {
+    const w = await world(raw);
+    const h = await w.host();
+    const probe = await w.client();
+    expect((await probe.hello({ token: w.gw.token, name: 'probe' })).features).toEqual(expect.arrayContaining(['run.overrides', 'run.ended.usage', 'run.correlation']));
+
+    const a = await h.runStart({ runId: 'a', agent: 'exec', input, overrides: { model: 'opus', effort: 'high' } });
+    expect(a).toMatchObject({ state: 'started', run: { harness: 'claude-code', model: 'opus', effort: 'high', profile: 'bypass' } });
+    await h.runEndedOf('a');
+    expect(w.harness.sessions.find((s) => s.args.sessionKey === 'run:a')!.args.run).toEqual(a.run);
+    expect(runOf(w, 'a')).toMatchObject({ run: a.run });
+
+    const b = await h.runStart({ runId: 'b', agent: 'exec', input, overrides: { profile: 'tight' } });
+    expect(b.run).toEqual({ harness: 'claude-code', model: 'haiku', profile: 'tight' });
+    await h.runEndedOf('b');
+    expect(runOf(w, 'b')).toMatchObject({ run: { profile: 'tight' } });
+
+    // A preset moves the run to its instance (still as the agent), its model and effort; model / effort go over those.
+    const c = await h.runStart({ runId: 'c', agent: 'exec', input, overrides: { preset: 'fast', effort: 'medium' } });
+    expect(c.run).toEqual({ harness: 'cx', model: 'gpt-x', effort: 'medium', profile: 'bypass' });
+    await h.runEndedOf('c');
+    expect(w.built.find((i) => i.env.AGENTS_IO_RUN_ID === 'c')!.name).toBe('cx');
+    expect(runOf(w, 'c')).toMatchObject({ run: c.run });
+
+    // Another run of the agent, and the agent itself, are unchanged.
+    const d = await h.runStart({ runId: 'd', agent: 'exec', input });
+    expect(d.run).toEqual({ harness: 'claude-code', model: 'haiku', profile: 'bypass' });
+    await h.runEndedOf('d');
+    expect(w.harness.sessions.find((s) => s.args.sessionKey === 'run:d')!.args.run).toEqual(d.run);
+    expect(w.config.agents.exec).toMatchObject({ harness: 'claude-code', model: 'haiku', profile: 'bypass' });
+  });
+
+  it('one that cannot apply fails the request with bad_override and nothing runs; never a silent fallback #RN-2', async () => {
+    const w = await world({ ...raw, agents: { ...AGENTS, own: { harness: 'claude-code', mode: 'task', profile: 'tight' } } });
+    const h = await w.host();
+    const refused = async (runId: string, agent: string, overrides: Record<string, string>, message: RegExp) => {
+      await expect(h.runStart({ runId, agent, input, overrides })).rejects.toMatchObject({ code: 'bad_override', message: expect.stringMatching(message) });
+      expect(w.gw.hub.log.head(`run:${runId}`)).toBe(0);
+    };
+    await refused('p', 'exec', { profile: 'nope' }, /profile "nope" is not defined on harness instance claude-code \(its profiles: tight; built in: bypass, restricted\)/);
+    await refused('q', 'exec', { preset: 'ghost' }, /unknown preset "ghost" \(configured: fast\)/);
+    await refused('m', 'exec', { model: 'two words' }, /overrides.model/);
+    await refused('e', 'exec', { effort: '' }, /overrides.effort/);
+    // The agent's own profile is defined only on its instance: a preset moving the run elsewhere would lose it.
+    await refused('o', 'own', { preset: 'fast' }, /profile "tight" is not defined on harness instance cx/);
+    expect(w.harness.sessions).toHaveLength(0);
+    // The same overrides on the agent's instance are fine; built-in profiles are on every instance.
+    expect((await h.runStart({ runId: 'ok', agent: 'own', input, overrides: { profile: 'tight' } })).run).toMatchObject({ profile: 'tight' });
+    expect((await h.runStart({ runId: 'ok2', agent: 'exec', input, overrides: { preset: 'fast', profile: 'restricted' } })).run).toMatchObject({ harness: 'cx', profile: 'restricted' });
+  });
+});
+
+describe('run.ended', () => {
+  it('carries the run\'s turn, input, duration and the harness\'s usage; a re-sent run.start answers the same frame from the log, also after a restart #RN-3', async () => {
+    const w = await world();
+    const h = await w.host();
+    await h.runStart({ runId: 'u', agent: 'exec', input: [{ type: 'text', text: 'usage please' }] });
+    const ended = await h.runEndedOf('u');
+    const log = w.gw.hub.log.read('run:u', 0);
+    const started = log.find((e) => e.body.t === 'turn.started')!;
+    const completed = log.find((e) => e.body.t === 'turn.completed')!;
+    expect(ended).toMatchObject({
+      status: 'completed',
+      exitCode: 0,
+      turnId: started.turnId,
+      inputId: expect.stringMatching(/^in_run_/),
+      usage: { totalCostUsd: 0.25, usage: { input_tokens: 12, output_tokens: 3 } },
+      durationMs: completed.ts - log[0]!.ts,
+    });
+    expect(ended).not.toHaveProperty('correlation');
+    expect((await h.runStart({ runId: 'u', agent: 'exec', input: [{ type: 'text', text: 'again' }] })).ended).toEqual(ended);
+
+    // A failing turn: no usage reported, still its turn and duration.
+    await h.runStart({ runId: 'f', agent: 'exec', input: [{ type: 'text', text: 'please fail' }] });
+    const failed = await h.runEndedOf('f');
+    expect(failed).toMatchObject({ status: 'failed', exitCode: 1, turnId: expect.any(String), durationMs: expect.any(Number) });
+    expect(failed).not.toHaveProperty('usage');
+
+    // A timeout is `timeout` in the log too, not a cancel.
+    await h.runStart({ runId: 't', agent: 'exec', input: [{ type: 'text', text: 'wait' }], timeoutMs: 30 });
+    const timedOut = await h.runEndedOf('t');
+    expect(timedOut).toMatchObject({ status: 'timeout', exitCode: 124, error: { code: 'timeout' } });
+    expect(w.gw.hub.log.read('run:t', 0).some((e) => e.body.t === 'notice' && e.body.code === 'run_timeout')).toBe(true);
+
+    await w.stop();
+    const w2 = await daemon({ dir: w.dir, raw: { agents: AGENTS }, script });
+    const h2 = await w2.host();
+    expect((await h2.runStart({ runId: 'u', agent: 'exec', input: [{ type: 'text', text: 'again' }] })).ended).toEqual(ended);
+    expect((await h2.runStart({ runId: 'f', agent: 'exec', input: [{ type: 'text', text: 'again' }] })).ended).toEqual(failed);
+    expect((await h2.runStart({ runId: 't', agent: 'exec', input: [{ type: 'text', text: 'again' }] })).ended).toEqual(timedOut);
+  });
+
+  it('a run a previous daemon left mid-turn has no duration (its end is not known) #RN-3 #RS-5', async () => {
+    const w = await world();
+    const draft = { ts: Date.now(), level: 'primary' as const, audience: 'status' as const, durability: 'durable' as const, harness: 'claude-code', generation: 1 };
+    w.gw.hub.append('run:d', { ...draft, turnId: 't-d', body: { t: 'turn.started', turnId: 't-d', inputIds: ['in-d'], replyRoute: null } });
+    await w.stop();
+    const w2 = await daemon({ dir: w.dir, raw: { agents: AGENTS }, script });
+    const h = await w2.host();
+    const r = await h.runStart({ runId: 'd', agent: 'exec', input: [{ type: 'text', text: 'again' }] });
+    expect(r.ended).toMatchObject({ status: 'ambiguous', turnId: 't-d' });
+    expect(r.ended).not.toHaveProperty('durationMs');
+  });
+});
+
+describe('run.start inputId and correlation', () => {
+  it('the input is the host\'s: its id and correlation id are kept (not in what the model is shown), echoed by run.ended, and explain names the run #EX-7 #RN-3', async () => {
+    const seen: InputRecord[] = [];
+    const w = await daemon({ raw: { agents: AGENTS }, script: async (t) => void seen.push(...t.inputs) });
+    const h = await w.host();
+    const r = await h.runStart({ runId: 'c1', agent: 'exec', input: [{ type: 'text', text: 'go' }], inputId: 'lbg_42', correlation: 'deleg:7 / turn 3' });
+    expect(r).toMatchObject({ state: 'started', inputId: 'lbg_42' });
+    const ended = await h.runEndedOf('c1');
+    expect(ended).toMatchObject({ status: 'completed', inputId: 'lbg_42', correlation: 'deleg:7 / turn 3' });
+    expect(seen[0]).toMatchObject({ inputId: 'lbg_42', correlation: 'deleg:7 / turn 3' });
+    expect(Object.values(seen[0]!.channelContext)).not.toContain('deleg:7 / turn 3');
+
+    const ex = await h.explain('lbg_42');
+    expect(errors(HOST_RESULT_VALUES.explain, ex)).toEqual([]);
+    expect(ex).toMatchObject({ inputId: 'lbg_42', principal: 'host:xwo', matched: [{ bindingId: 'host:run', source: 'host', on: 'dispatch', agent: 'exec', sessionKey: 'run:c1' }], run: { runId: 'c1', correlation: 'deleg:7 / turn 3' } });
+    // The root of its cause chain: what the run's turn produces chains back here.
+    const chain = await h.explain('lbg_42', { chain: true });
+    expect(chain).toMatchObject({ inputId: 'lbg_42', chain: 'lbg_42', end: 'root', links: [{ inputId: 'lbg_42', hop: 0, run: { runId: 'c1', correlation: 'deleg:7 / turn 3' } }] });
+
+    // Re-sent: the run's own record, not a taken id.
+    expect(await h.runStart({ runId: 'c1', agent: 'exec', input: [{ type: 'text', text: 'go' }], inputId: 'lbg_42', correlation: 'deleg:7 / turn 3' })).toMatchObject({ state: 'ended', ended });
+    // Without an inputId the daemon makes one; explain has it too.
+    const g = await h.runStart({ runId: 'c2', agent: 'exec', input: [{ type: 'text', text: 'go' }] });
+    expect(g.inputId).toMatch(/^in_run_/);
+    expect(await h.explain(g.inputId!)).toMatchObject({ run: { runId: 'c2' } });
+  });
+
+  it('refuses an inputId another input has, ids that are not plain tokens and bad correlation ids; nothing runs #EX-7', async () => {
+    const w = await world();
+    const h = await w.host();
+    const input = [{ type: 'text' as const, text: 'go' }];
+    await h.runStart({ runId: 'first', agent: 'exec', input, inputId: 'mine-1' });
+    await h.runEndedOf('first');
+    const before = w.harness.sessions.length;
+    await expect(h.runStart({ runId: 'second', agent: 'exec', input, inputId: 'mine-1' })).rejects.toMatchObject({ code: 'input_id_taken' });
+    // A channel input's id is taken the same way.
+    const ch = await w.chat.inject({ sender: { channelUserId: 'alice', evidence: 'platform_signed' }, text: 'hi' });
+    await expect(h.runStart({ runId: 'third', agent: 'exec', input, inputId: ch.inputId! })).rejects.toMatchObject({ code: 'input_id_taken' });
+    for (const id of ['has space', 'ctxo_turn', 'a@b', '-lead', 'x'.repeat(257), ''])
+      await expect(h.runStart({ runId: 'bad', agent: 'exec', input, inputId: id })).rejects.toMatchObject({ code: 'bad_input_id' });
+    for (const c of ['line\nbreak', 'y'.repeat(257), ''])
+      await expect(h.runStart({ runId: 'bad', agent: 'exec', input, correlation: c })).rejects.toMatchObject({ code: 'bad_correlation' });
+    expect(w.gw.hub.log.head('run:second') + w.gw.hub.log.head('run:third') + w.gw.hub.log.head('run:bad')).toBe(0);
+    expect(w.harness.sessions.filter((s) => s.args.sessionKey.startsWith('run:')).length).toBe(before);
   });
 });

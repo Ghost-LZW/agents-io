@@ -713,6 +713,15 @@ describe('helpers', () => {
     const [bare] = (await renderInputs([{ ...input('i1', 'x'), origin: agent, cause, channelContext: { loopGuard: 'hops' } }], { preface: false })) as { text: string }[];
     expect(bare!.text).toBe('[sender loopGuard="hops"]\nx');
   });
+
+  it("a task run's correlation id never reaches the model #EX-7", async () => {
+    const host = { kind: 'system' as const, principal: { id: 'host:h', labels: ['host'] }, evidence: 'device_only' as const, via: 'host:h', adapter: 'host' };
+    const run = { ...input('lbg_42', 'go'), origin: host, correlation: 'deleg-7', channelContext: { channel: 'host', runId: 'r1', agent: 'exec' } };
+    for (const preface of [true, false]) {
+      const [first] = (await renderInputs([run], { preface })) as { text: string }[];
+      expect(first!.text).not.toContain('deleg-7');
+    }
+  });
 });
 
 describe('live (realtime voice, decision 11)', () => {

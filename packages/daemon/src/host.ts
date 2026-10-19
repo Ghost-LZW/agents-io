@@ -280,8 +280,24 @@ export class HostService implements HostFrames {
   }
 }
 
-/** Capabilities `host.hello` advertises (a host must not rely on one this list lacks); `resolve.onBehalfOf` only with `policy.answerOnBehalf`. */
-export const FEATURES = ['session.launch', 'callouts.resolve', 'callouts.outbound', 'callouts.contact', 'resolve.onBehalfOf', 'inbound.redispatch', 'host.takeover', 'explain.chain'];
+/**
+ * Capabilities `host.hello` advertises (a host must not rely on one this list lacks); `resolve.onBehalfOf` only with `policy.answerOnBehalf`.
+ * `run.overrides`: `run.start.overrides` apply (or fail `bad_override`); `run.ended.usage`: `run.ended` carries `durationMs`,
+ * `usage`, `turnId`, `inputId` and says `timeout`; `run.correlation`: `run.start.inputId` / `correlation`.
+ */
+export const FEATURES = [
+  'session.launch',
+  'callouts.resolve',
+  'callouts.outbound',
+  'callouts.contact',
+  'resolve.onBehalfOf',
+  'inbound.redispatch',
+  'host.takeover',
+  'explain.chain',
+  'run.overrides',
+  'run.ended.usage',
+  'run.correlation',
+];
 
 /** `DaemonRecords` flag: the name of the host that declared the `outbound` hook. */
 const OUTBOUND_FLAG = 'host.outbound';

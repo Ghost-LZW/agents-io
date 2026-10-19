@@ -1,6 +1,18 @@
 import { statSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
-import { PROTOCOL_VERSION, type ContentBlock, type InputRecord, type Origin, type ReplyRoute, type RunEnded, type RunStart, type RunStartResult, type SessionEvent } from '@agents-io/protocol';
+import {
+  PROTOCOL_VERSION,
+  type ContentBlock,
+  type InputRecord,
+  type Origin,
+  type ReplyRoute,
+  type RouteExplanation,
+  type RunEnded,
+  type RunSpec,
+  type RunStart,
+  type RunStartResult,
+  type SessionEvent,
+} from '@agents-io/protocol';
 import type { Hub, Lane, Subscription } from '@agents-io/session';
 import type { AgentConfig } from './config.js';
 import type { LogFn, Outcome } from './gateway.js';
@@ -10,7 +22,9 @@ import type { Peer } from './local-server.js';
  * Task runs (docs/HOSTS.md §4 `run.start`): one headless turn of a `mode: task`
  * agent in a fresh session `run:<runId>`, closed when the turn ends. The request
  * env goes only into the harness child's environment (never the log, never
- * argv). The run's end is reported as `run.ended` with an exit code.
+ * argv). `overrides` change this run's RunSpec only, or the request fails
+ * (`bad_override`). The run's end is reported as `run.ended` with an exit code,
+ * its turn, duration and usage; a re-sent `run.start` reads the same from the log.
  */
 
 export type RunStatus = RunEnded['status'];
@@ -34,14 +48,26 @@ export function exitCodeOf(status: RunStatus, errorCode?: string): number {
 /** `run.start` answer (protocol `RunStartResult`). */
 export type { RunStartResult };
 
+/** `run.start.overrides`. */
+export type RunOverrides = NonNullable<RunStart['overrides']>;
+
+/** Binding id of a task run's input in `explain` (its routing record names the run, EX-7). */
+export const RUN_RULE = 'host:run';
+
 /** What a run needs from the daemon. */
 export interface RunDeps {
   readonly hub: Hub;
   agents(): Record<string, AgentConfig>;
-  /** Default working directory of an agent's runs. */
-  agentCwd(agent: AgentConfig): string;
-  /** Build the run's lane (its own harness adapter with `env` in the child's environment). */
-  openRunLane(o: { runId: string; sessionKey: string; agent: AgentConfig; cwd: string; env: Record<string, string>; turnId: string }): { lane: Lane; dispose(): Promise<void> };
+  /** Default working directory of an agent's runs on a harness instance (the agent's, unless a preset moves the run). */
+  agentCwd(agent: AgentConfig, instance: string): string;
+  /** The run's RunSpec: the agent's defaults with `overrides` applied, or why one cannot apply. */
+  runSpec(agent: AgentConfig, overrides: RunOverrides | undefined): { ok: true; spec: RunSpec } | { ok: false; code: string; message: string };
+  /** Build the run's lane (its own harness adapter with `env` in the child's environment) for `spec`. */
+  openRunLane(o: { runId: string; sessionKey: string; agent: AgentConfig; spec: RunSpec; cwd: string; env: Record<string, string>; turnId: string }): { lane: Lane; dispose(): Promise<void> };
+  /** The routing record of an input id, if any (a host-chosen `inputId` must not be one another input has). */
+  explained(inputId: string): RouteExplanation | undefined;
+  /** Write the run input's routing record (`explain`, EX-7). */
+  recordRunInput(r: { input: InputRecord; runId: string; agent: string; sessionKey: string; rejected?: { code: string; message?: string } }): void;
   /** Where run.ended goes when no connection that asked for the run is left. */
   hostPeer(): Peer | undefined;
   log: LogFn;
@@ -51,6 +77,8 @@ interface ActiveRun {
   runId: string;
   sessionKey: string;
   inputId: string;
+  correlation?: string;
+  spec: RunSpec;
   turnId: string;
   lane: Lane;
   dispose(): Promise<void>;
@@ -62,10 +90,23 @@ interface ActiveRun {
   started: boolean;
   ending: boolean;
   origin: Origin;
+  /** When run.start accepted it; the log's first and last records of the run (durationMs). */
+  acceptedAt: number;
+  firstTs?: number;
+  endTs?: number;
+  /** `turn.completed.usage` of the run's turn. */
+  usage?: unknown;
 }
 
 const RUN_ID = /^[^\s\u0000-\u001f]{1,256}$/;
 const VAR_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** A host-chosen input id: a plain token (no characters derived ids use: `@`, `>`, `~`, `/`). */
+const INPUT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
+/** Input ids the daemon makes itself (the lane's omitted-context record). */
+const RESERVED_INPUT_ID = /^ctxo_/;
+const CORRELATION = /^[^\u0000-\u001f\u007f]{1,256}$/;
+/** The error of a run that timed out (a fresh object per frame). */
+const timeoutError = () => ({ code: 'timeout', message: 'run.start timeoutMs elapsed' });
 
 export const runSessionKey = (runId: string) => `run:${runId}`;
 
@@ -90,8 +131,9 @@ export class Runs {
 
     const running = this.active.get(f.runId);
     if (running) {
+      // The runId is the idempotency key: the first request's input, overrides and correlation hold.
       running.listeners.add(peer);
-      return ok<RunStartResult>({ runId: f.runId, sessionKey, state: 'running' });
+      return ok<RunStartResult>({ runId: f.runId, sessionKey, state: 'running', inputId: running.inputId, run: running.spec });
     }
     if (this.d.hub.log.head(sessionKey) > 0) {
       // Ran before (runIds are idempotency keys): report how it ended instead of running it again.
@@ -100,7 +142,19 @@ export class Runs {
       return ok<RunStartResult>({ runId: f.runId, sessionKey, state: 'ended', ended });
     }
 
-    const cwd = f.cwd ?? this.d.agentCwd(agent);
+    if (f.inputId !== undefined && (!INPUT_ID.test(f.inputId) || RESERVED_INPUT_ID.test(f.inputId)))
+      return fail('bad_input_id', 'inputId must be 1-256 letters, digits, ".", "_", ":" or "-", starting with a letter or digit (and not ctxo_…)');
+    if (f.correlation !== undefined && !CORRELATION.test(f.correlation)) return fail('bad_correlation', 'correlation must be 1-256 characters without control characters');
+    if (f.inputId !== undefined) {
+      // Unique per deployment: explain and cause chains key on it. A record of this very run is one an earlier daemon wrote before it stopped.
+      const known = this.d.explained(f.inputId);
+      if (known && known.run?.runId !== f.runId) return fail('input_id_taken', `input ${f.inputId} is already on record (inputIds name one input)`);
+    }
+    const planned = this.d.runSpec(agent, f.overrides);
+    if (!planned.ok) return fail(planned.code, planned.message);
+    const spec = planned.spec;
+
+    const cwd = f.cwd ?? this.d.agentCwd(agent, spec.harness);
     if (!isAbsolute(cwd)) return fail('bad_cwd', `cwd must be absolute: ${cwd}`);
     try {
       if (!statSync(cwd).isDirectory()) return fail('bad_cwd', `cwd is not a directory: ${cwd}`);
@@ -111,38 +165,77 @@ export class Runs {
     for (const k of Object.keys(env)) if (!VAR_NAME.test(k)) return fail('bad_env', `${JSON.stringify(k)} is not an environment variable name`);
     if (!f.input.length) return fail('empty_input', 'run.start needs input');
 
+    const acceptedAt = Date.now();
     const turnId = `turn_run_${randomSuffix()}`;
     let built: { lane: Lane; dispose(): Promise<void> };
     try {
-      built = this.d.openRunLane({ runId: f.runId, sessionKey, agent, cwd, env, turnId });
+      built = this.d.openRunLane({ runId: f.runId, sessionKey, agent, spec, cwd, env, turnId });
     } catch (e) {
       return fail('harness_unavailable', (e as Error).message);
     }
     const observe = f.observe?.routes ?? [];
     const input: InputRecord = {
-      inputId: `in_run_${randomSuffix()}`,
+      inputId: f.inputId ?? `in_run_${randomSuffix()}`,
       origin,
       content: f.input as ContentBlock[],
       replyRoute: observe[0] ?? null,
+      // Out of channelContext: that is shown to the model, the correlation id never is.
+      ...(f.correlation !== undefined ? { correlation: f.correlation } : {}),
       channelContext: { channel: 'host', runId: f.runId, agent: agent.name },
     };
+    // Before the first await: a concurrent run.start with the same inputId finds this record.
+    const recorded = { input, runId: f.runId, agent: agent.name, sessionKey };
+    this.d.recordRunInput(recorded);
     const sub = this.d.hub.subscribe({ sessionKey, tier: 'full', fromSeq: this.d.hub.log.head(sessionKey), visibility: ['participants', 'operators', 'internal'] });
-    const run: ActiveRun = { runId: f.runId, sessionKey, inputId: input.inputId, turnId, lane: built.lane, dispose: built.dispose, sub, listeners: new Set([peer]), observe, timedOut: false, started: false, ending: false, origin };
+    const run: ActiveRun = {
+      runId: f.runId,
+      sessionKey,
+      inputId: input.inputId,
+      ...(f.correlation !== undefined ? { correlation: f.correlation } : {}),
+      spec,
+      turnId,
+      lane: built.lane,
+      dispose: built.dispose,
+      sub,
+      listeners: new Set([peer]),
+      observe,
+      timedOut: false,
+      started: false,
+      ending: false,
+      origin,
+      acceptedAt,
+    };
     this.active.set(f.runId, run);
     void this.watch(run);
     if (f.timeoutMs !== undefined && f.timeoutMs > 0) {
+      const ms = f.timeoutMs;
       run.timer = setTimeout(() => {
         run.timedOut = true;
+        // In the log, so a re-sent run.start reports `timeout` too (not a cancel).
+        if (!run.ending)
+          this.d.hub.append(run.sessionKey, {
+            ts: Date.now(),
+            ...(run.started ? { turnId: run.turnId } : {}),
+            level: 'detail',
+            audience: 'status',
+            durability: 'durable',
+            visibility: 'operators',
+            body: { t: 'notice', code: 'run_timeout', message: `run.start timeoutMs (${ms} ms) elapsed; interrupting the run` },
+          });
         void this.interrupt(run);
-      }, f.timeoutMs);
+      }, ms);
     }
     const r = await run.lane.command({ type: 'input', sessionKey, input, mode: 'queue' });
     if (!r.ok) {
+      this.d.recordRunInput({ ...recorded, rejected: { code: 'start_failed', message: r.reason } });
       await this.end(run, 'failed', { code: 'start_failed', message: r.reason });
       return fail('start_failed', r.reason);
     }
-    this.d.log('info', `run ${f.runId}: agent ${agent.name} in ${cwd}${Object.keys(env).length ? ` (env: ${Object.keys(env).join(', ')})` : ''}`);
-    return ok<RunStartResult>({ runId: f.runId, sessionKey, state: 'started' });
+    this.d.log(
+      'info',
+      `run ${f.runId}: agent ${agent.name} (${spec.harness}${spec.model ? `, ${spec.model}` : ''}${spec.effort ? `, ${spec.effort}` : ''}, ${spec.profile}) in ${cwd}${Object.keys(env).length ? ` (env: ${Object.keys(env).join(', ')})` : ''}`,
+    );
+    return ok<RunStartResult>({ runId: f.runId, sessionKey, state: 'started', inputId: input.inputId, run: spec });
   }
 
   async cancel(runId: string, reason?: string): Promise<Outcome> {
@@ -195,18 +288,45 @@ export class Runs {
     return this.outcome(runId) ?? ended(runId, sessionKey, 'ambiguous', { code: 'host_restarted' });
   }
 
-  /** How a run that is not running ended, from its session log. */
+  /**
+   * How a run that is not running ended, from its session log: the same frame the run's end
+   * sent (status, error, turn, input, correlation, usage, duration), so a re-sent `run.start`
+   * agrees with the first `run.ended`.
+   */
   outcome(runId: string): RunEnded | undefined {
     const sessionKey = runSessionKey(runId);
-    let out: RunEnded | undefined;
-    let turned = false;
+    let end: { status: RunStatus; error?: { code: string; message?: string }; at: number; usage?: unknown; restarted?: boolean } | undefined;
+    let first: number | undefined;
+    let inputId: string | undefined;
+    let correlation: string | undefined;
+    let turnId: string | undefined;
+    let timedOut = false;
     for (const e of this.d.hub.log.read(sessionKey, 0)) {
       const b = e.body;
-      if (b.t === 'turn.started') turned = true;
-      if (b.t === 'turn.completed') out = ended(runId, sessionKey, b.status, b.error ? { code: b.error.code, ...(b.error.message ? { message: b.error.message } : {}) } : undefined);
-      if (b.t === 'input.rejected' && !turned && !out) out = ended(runId, sessionKey, 'failed', { code: 'start_failed', message: b.reason });
+      first ??= e.ts;
+      if (b.t === 'input.admitted' && inputId === undefined) {
+        inputId = b.inputId;
+        correlation = b.input?.correlation;
+      }
+      if (b.t === 'turn.started' && turnId === undefined) turnId = b.turnId;
+      if (b.t === 'notice' && b.code === 'run_timeout') timedOut = true;
+      if (b.t === 'turn.completed') {
+        const timeout = timedOut && b.status === 'interrupted';
+        const error = timeout ? timeoutError() : b.error ? { code: b.error.code, ...(b.error.message ? { message: b.error.message } : {}) } : undefined;
+        end = { status: timeout ? 'timeout' : b.status, ...(error ? { error } : {}), at: e.ts, usage: b.usage, restarted: b.error?.code === 'host_restarted' };
+      }
+      if (b.t === 'input.rejected' && turnId === undefined && !end) end = { status: 'failed', error: { code: 'start_failed', message: b.reason }, at: e.ts };
+      if (b.t === 'input.cancelled' && turnId === undefined && !end) end = timedOut ? { status: 'timeout', error: timeoutError(), at: e.ts } : { status: 'interrupted', error: { code: 'cancelled' }, at: e.ts };
     }
-    return out;
+    if (!end) return undefined;
+    // A run settled at a later start (host_restarted) ended at an unknown time: no duration.
+    return ended(runId, sessionKey, end.status, end.error, {
+      ...(first !== undefined && !end.restarted ? { durationMs: end.at - first } : {}),
+      ...(end.usage !== undefined ? { usage: end.usage } : {}),
+      ...(turnId !== undefined ? { turnId } : {}),
+      ...(inputId !== undefined ? { inputId } : {}),
+      ...(correlation !== undefined ? { correlation } : {}),
+    });
   }
 
   private async interrupt(run: ActiveRun): Promise<void> {
@@ -223,6 +343,7 @@ export class Runs {
   /** True once the run has ended. */
   private onEvent(run: ActiveRun, e: SessionEvent): boolean {
     const b = e.body;
+    run.firstTs ??= e.ts;
     if (b.t === 'turn.started' && b.inputIds.includes(run.inputId)) {
       run.started = true;
       run.turnId = b.turnId;
@@ -233,16 +354,23 @@ export class Runs {
       return false;
     }
     if (b.t === 'turn.completed' && (b.turnId === run.turnId || run.started)) {
-      const err = run.timedOut ? { code: 'timeout', message: 'run.start timeoutMs elapsed' } : b.error ? { code: b.error.code, ...(b.error.message ? { message: b.error.message } : {}) } : undefined;
-      void this.end(run, b.status, err);
+      run.endTs = e.ts;
+      if (b.usage !== undefined) run.usage = b.usage;
+      // A turn that completed (or failed) as the timer fired keeps its own outcome.
+      const timeout = run.timedOut && b.status === 'interrupted';
+      const err = timeout ? timeoutError() : b.error ? { code: b.error.code, ...(b.error.message ? { message: b.error.message } : {}) } : undefined;
+      void this.end(run, timeout ? 'timeout' : b.status, err);
       return true;
     }
     if (b.t === 'input.rejected' && b.inputIds.includes(run.inputId) && !run.started) {
+      run.endTs = e.ts;
       void this.end(run, 'failed', { code: 'start_failed', message: b.reason });
       return true;
     }
     if (b.t === 'input.cancelled' && b.inputIds.includes(run.inputId) && !run.started) {
-      void this.end(run, 'interrupted', run.timedOut ? { code: 'timeout' } : { code: 'cancelled' });
+      run.endTs = e.ts;
+      if (run.timedOut) void this.end(run, 'timeout', timeoutError());
+      else void this.end(run, 'interrupted', { code: 'cancelled' });
       return true;
     }
     return false;
@@ -253,7 +381,13 @@ export class Runs {
     run.ending = true;
     if (run.timer) clearTimeout(run.timer);
     run.sub.close();
-    const frame = ended(run.runId, run.sessionKey, status, error);
+    const frame = ended(run.runId, run.sessionKey, status, error, {
+      durationMs: (run.endTs ?? Date.now()) - (run.firstTs ?? run.acceptedAt),
+      ...(run.usage !== undefined ? { usage: run.usage } : {}),
+      ...(run.started ? { turnId: run.turnId } : {}),
+      inputId: run.inputId,
+      ...(run.correlation !== undefined ? { correlation: run.correlation } : {}),
+    });
     this.d.log('info', `run ${run.runId}: ${status} (exit ${frame.exitCode})${error ? ` ${error.code}` : ''}`);
     try {
       await run.dispose();
@@ -267,8 +401,14 @@ export class Runs {
   }
 }
 
-function ended(runId: string, sessionKey: string, status: RunStatus, error?: { code: string; message?: string }): RunEnded {
-  return { v: PROTOCOL_VERSION, type: 'run.ended', runId, sessionKey, status, exitCode: exitCodeOf(status, error?.code), ...(error ? { error } : {}) };
+function ended(
+  runId: string,
+  sessionKey: string,
+  status: RunStatus,
+  error?: { code: string; message?: string },
+  facts: Pick<RunEnded, 'durationMs' | 'usage' | 'turnId' | 'inputId' | 'correlation'> = {},
+): RunEnded {
+  return { v: PROTOCOL_VERSION, type: 'run.ended', runId, sessionKey, status, exitCode: exitCodeOf(status, error?.code), ...(error ? { error } : {}), ...facts };
 }
 
 function randomSuffix(): string {

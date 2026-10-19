@@ -69,6 +69,15 @@
     "durationMs": {
       "type": "number"
     },
-    "usage": {}
+    "usage": {},
+    "turnId": {
+      "type": "string"
+    },
+    "inputId": {
+      "type": "string"
+    },
+    "correlation": {
+      "type": "string"
+    }
   }
 }

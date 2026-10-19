@@ -430,6 +430,9 @@
                     }
                   }
                 },
+                "correlation": {
+                  "type": "string"
+                },
                 "channelContext": {
                   "type": "object",
                   "patternProperties": {
@@ -1273,6 +1276,9 @@
                     }
                   }
                 },
+                "correlation": {
+                  "type": "string"
+                },
                 "channelContext": {
                   "type": "object",
                   "patternProperties": {
@@ -2054,6 +2060,18 @@
                     "effort": {
                       "type": "string"
                     },
+                    "mode": {
+                      "anyOf": [
+                        {
+                          "const": "default",
+                          "type": "string"
+                        },
+                        {
+                          "const": "plan",
+                          "type": "string"
+                        }
+                      ]
+                    },
                     "profile": {
                       "type": "string"
                     }
@@ -2445,6 +2463,9 @@
                           }
                         }
                       },
+                      "correlation": {
+                        "type": "string"
+                      },
                       "channelContext": {
                         "type": "object",
                         "patternProperties": {
@@ -2725,6 +2746,18 @@
                         },
                         "effort": {
                           "type": "string"
+                        },
+                        "mode": {
+                          "anyOf": [
+                            {
+                              "const": "default",
+                              "type": "string"
+                            },
+                            {
+                              "const": "plan",
+                              "type": "string"
+                            }
+                          ]
                         },
                         "profile": {
                           "type": "string"
@@ -3116,6 +3149,9 @@
                                 }
                               }
                             }
+                          },
+                          "correlation": {
+                            "type": "string"
                           },
                           "channelContext": {
                             "type": "object",
@@ -3499,6 +3535,18 @@
                         "effort": {
                           "type": "string"
                         },
+                        "mode": {
+                          "anyOf": [
+                            {
+                              "const": "default",
+                              "type": "string"
+                            },
+                            {
+                              "const": "plan",
+                              "type": "string"
+                            }
+                          ]
+                        },
                         "profile": {
                           "type": "string"
                         }
@@ -3890,6 +3938,9 @@
                               }
                             }
                           },
+                          "correlation": {
+                            "type": "string"
+                          },
                           "channelContext": {
                             "type": "object",
                             "patternProperties": {
@@ -4177,7 +4228,16 @@
         "durationMs": {
           "type": "number"
         },
-        "usage": {}
+        "usage": {},
+        "turnId": {
+          "type": "string"
+        },
+        "inputId": {
+          "type": "string"
+        },
+        "correlation": {
+          "type": "string"
+        }
       }
     },
     {
