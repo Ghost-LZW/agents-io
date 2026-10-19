@@ -3,8 +3,13 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { HOST_RESULT_VALUES, errors } from '@agents-io/protocol';
-import type { InputRecord } from '@agents-io/protocol';
+import type { InputRecord, RouteExplanation, RunEnded } from '@agents-io/protocol';
+import { Hub, MemorySessionLog } from '@agents-io/session';
+import type { Lane } from '@agents-io/session';
 import type { FakeTurnScript } from '@agents-io/testkit';
+import type { AgentConfig } from '../src/config.js';
+import type { Peer } from '../src/local-server.js';
+import { Runs, type RunDeps } from '../src/runs.js';
 import { daemon, tmp, until } from './helpers.js';
 
 const AGENTS = {
@@ -12,11 +17,12 @@ const AGENTS = {
   exec: { harness: 'claude-code', mode: 'task', profile: 'bypass', model: 'haiku' },
 };
 
-/** Fails the turn on `fail`, waits for an interrupt on `wait`, reports usage on `usage`, else echoes. */
+/** Fails the turn on `fail`, waits for an interrupt on `wait`, never ends on `hang`, reports usage on `usage`, else echoes. */
 const script: FakeTurnScript = async (t) => {
   const text = t.inputs.flatMap((i) => i.content).map((c) => (c.type === 'text' ? c.text : '')).join(' ');
   if (text.includes('usage')) t.usage({ totalCostUsd: 0.25, usage: { input_tokens: 12, output_tokens: 3 } });
   if (text.includes('fail')) throw new Error('boom');
+  if (text.includes('hang')) await new Promise(() => {});
   if (text.includes('wait')) await new Promise((_, reject) => t.signal.addEventListener('abort', () => reject(new Error('interrupted')), { once: true }));
   t.emit({ t: 'item.started', item: { itemId: 'i1', type: 'command', title: 'echo pong', status: 'running' } });
   t.emit({ t: 'text.snapshot', text: `echo: ${text}`, final: true }, { audience: 'answer' });
@@ -340,6 +346,19 @@ describe('run.start overrides', () => {
   });
 });
 
+describe('run.start overrides: cwd', () => {
+  it('a preset run keeps the agent\'s default cwd (its own instance\'s), not the one of the instance the preset names #RN-2', async () => {
+    const own = tmp();
+    const other = tmp();
+    const w = await world({ harnesses: { 'claude-code': { use: 'claude-code', cwd: own }, cx: { use: 'codex', cwd: other } }, presets: { fast: { harness: 'cx', model: 'gpt-x' } } });
+    const h = await w.host();
+    expect((await h.runStart({ runId: 'p', agent: 'exec', input: [{ type: 'text', text: 'go' }], overrides: { preset: 'fast' } })).run).toMatchObject({ harness: 'cx' });
+    await h.runEndedOf('p');
+    expect(w.harness.sessions.find((s) => s.args.sessionKey === 'run:p')!.args.cwd).toBe(own);
+    expect(w.built.find((i) => i.env.AGENTS_IO_RUN_ID === 'p')).toMatchObject({ name: 'cx', cwd: own });
+  });
+});
+
 describe('run.ended', () => {
   it('carries the run\'s turn, input, duration and the harness\'s usage; a re-sent run.start answers the same frame from the log, also after a restart #RN-3', async () => {
     const w = await world();
@@ -390,6 +409,130 @@ describe('run.ended', () => {
     const r = await h.runStart({ runId: 'd', agent: 'exec', input: [{ type: 'text', text: 'again' }] });
     expect(r.ended).toMatchObject({ status: 'ambiguous', turnId: 't-d' });
     expect(r.ended).not.toHaveProperty('durationMs');
+  });
+});
+
+describe('run.ended: every end is in the log', () => {
+  const draft = { level: 'primary' as const, audience: 'status' as const, durability: 'durable' as const };
+  const admitted = (inputId: string, correlation: string): InputRecord => ({
+    inputId,
+    origin: { kind: 'system', principal: null, evidence: 'daemon', via: 'host', adapter: 'host' },
+    content: [{ type: 'text', text: 'x' }],
+    replyRoute: null,
+    correlation,
+    channelContext: { channel: 'host', runId: 'x', agent: 'exec' },
+  });
+
+  it('a daemon stop ends a run interrupted with daemon_stopping (or as its harness recorded the turn); the frame is the log\'s, also after the restart #RN-3 #RN-1', async () => {
+    const w = await world();
+    const h = await w.host();
+    await h.runStart({ runId: 's', agent: 'exec', input: [{ type: 'text', text: 'wait' }], inputId: 'in-s', correlation: 'deleg:s' });
+    // A harness that does not end the turn when interrupted: closing the session settles it (ambiguous).
+    await h.runStart({ runId: 'h', agent: 'exec', input: [{ type: 'text', text: 'hang' }] });
+    await until(() => w.gw.hub.snapshot('run:s').turn && w.gw.hub.snapshot('run:h').turn);
+    const endedS = h.runEndedOf('s');
+    const endedH = h.runEndedOf('h');
+    await w.stop();
+    const s = await endedS;
+    const hung = await endedH;
+    const w2 = await daemon({ dir: w.dir, raw: { agents: AGENTS }, script });
+    const log = w2.gw.hub.log.read('run:s', 0);
+    expect(s).toEqual({
+      v: expect.any(Number),
+      type: 'run.ended',
+      runId: 's',
+      sessionKey: 'run:s',
+      status: 'interrupted',
+      exitCode: 130,
+      error: { code: 'daemon_stopping', message: expect.any(String) },
+      turnId: log.find((e) => e.body.t === 'turn.started')!.turnId,
+      inputId: 'in-s',
+      correlation: 'deleg:s',
+      durationMs: log.find((e) => e.body.t === 'turn.completed')!.ts - log[0]!.ts,
+    });
+    expect(log.some((e) => e.body.t === 'notice' && e.body.code === 'run_stopping')).toBe(true);
+    expect(hung).toMatchObject({ status: 'ambiguous', exitCode: 3, error: { code: 'harness_closed' }, durationMs: expect.any(Number) });
+
+    const h2 = await w2.host();
+    expect((await h2.runStart({ runId: 's', agent: 'exec', input: [{ type: 'text', text: 'again' }] })).ended).toEqual(s);
+    expect((await h2.runStart({ runId: 'h', agent: 'exec', input: [{ type: 'text', text: 'again' }] })).ended).toEqual(hung);
+  });
+
+  it('a run cancelled, timed out or left before its turn started answers from the log: interrupted / timeout with its input, correlation and duration; ambiguous without a duration #RN-3 #RS-5', async () => {
+    const w = await world();
+    const t0 = Date.now();
+    const at = (ms: number) => ({ ...draft, ts: t0 + ms });
+    w.gw.hub.append('run:c', { ...at(0), body: { t: 'input.admitted', inputId: 'in-c', disposition: 'new_turn', input: admitted('in-c', 'deleg:c') } });
+    w.gw.hub.append('run:c', { ...at(40), body: { t: 'input.cancelled', inputIds: ['in-c'], reason: 'interrupt' } });
+    w.gw.hub.append('run:t', { ...at(0), body: { t: 'input.admitted', inputId: 'in-t', disposition: 'new_turn', input: admitted('in-t', 'deleg:t') } });
+    w.gw.hub.append('run:t', { ...at(30), level: 'detail', visibility: 'operators', body: { t: 'notice', code: 'run_timeout', message: 'elapsed' } });
+    w.gw.hub.append('run:t', { ...at(35), body: { t: 'input.cancelled', inputIds: ['in-t'], reason: 'interrupt' } });
+    // The previous daemon stopped between admitting the input and starting its turn.
+    w.gw.hub.append('run:a', { ...at(0), body: { t: 'input.admitted', inputId: 'in-a', disposition: 'new_turn', input: admitted('in-a', 'deleg:a') } });
+    await w.stop();
+    const w2 = await daemon({ dir: w.dir, raw: { agents: AGENTS }, script });
+    const h = await w2.host();
+    const again = async (runId: string) => (await h.runStart({ runId, agent: 'exec', input: [{ type: 'text', text: 'again' }] })).ended!;
+    const c = await again('c');
+    expect(c).toEqual({ v: expect.any(Number), type: 'run.ended', runId: 'c', sessionKey: 'run:c', status: 'interrupted', exitCode: 130, error: { code: 'cancelled' }, inputId: 'in-c', correlation: 'deleg:c', durationMs: 40 });
+    expect(await again('c')).toEqual(c);
+    expect(await again('t')).toMatchObject({ status: 'timeout', exitCode: 124, error: { code: 'timeout' }, inputId: 'in-t', correlation: 'deleg:t', durationMs: 35 });
+    const a = await again('a');
+    expect(a).toMatchObject({ status: 'ambiguous', exitCode: 3, error: { code: 'host_restarted' }, inputId: 'in-a', correlation: 'deleg:a' });
+    expect(a).not.toHaveProperty('durationMs');
+    expect(a).not.toHaveProperty('turnId');
+    expect(w2.harness.sessions).toHaveLength(0);
+  });
+
+  it('an end the harness left out of the log is written by the daemon (a turn still open when the lane closed, an input the lane refused unrecorded): run.ended is the frame the log gives #RN-3 #RN-1', async () => {
+    const hub = new Hub(new MemorySessionLog());
+    const records = new Map<string, RouteExplanation>();
+    /** `admit`: the lane records the input and starts a turn, then never ends it; else it refuses the input without a record. */
+    let admit = true;
+    const agent = { name: 'exec', harness: 'fake', mode: 'task', tools: false, configured: true } as AgentConfig;
+    const deps: RunDeps = {
+      hub,
+      agents: () => ({ exec: agent }),
+      agentCwd: () => tmp(),
+      runSpec: () => ({ ok: true, spec: { harness: 'fake', model: 'm', profile: 'restricted' } }),
+      openRunLane: ({ sessionKey, turnId }) => ({
+        lane: {
+          command: async (cmd: { type: string; input?: InputRecord }) => {
+            if (cmd.type !== 'input') return { ok: true };
+            if (!admit) return { ok: false, reason: 'closed' };
+            const input = cmd.input!;
+            hub.append(sessionKey, { ...draft, ts: Date.now(), body: { t: 'input.admitted', inputId: input.inputId, disposition: 'new_turn', input } });
+            hub.append(sessionKey, { ...draft, ts: Date.now(), turnId, harness: 'fake', generation: 1, body: { t: 'turn.started', turnId, inputIds: [input.inputId], replyRoute: null } });
+            return { ok: true, disposition: 'new_turn' };
+          },
+        } as unknown as Lane,
+        dispose: async () => {},
+      }),
+      explained: (id) => records.get(id),
+      recordRunInput: (r) =>
+        void records.set(r.input.inputId, { inputId: r.input.inputId, tableVersions: [], matched: [], principal: null, evidence: 'daemon', at: 0, run: { runId: r.runId, ...(r.input.correlation ? { correlation: r.input.correlation } : {}) } } as RouteExplanation),
+      hostPeer: () => undefined,
+      log: () => {},
+    };
+    const runs = new Runs(deps);
+    const sent: RunEnded[] = [];
+    const peer = { id: 'p', signal: new AbortController().signal, send: (f: Record<string, unknown>) => sent.push(f as unknown as RunEnded) > 0 } as unknown as Peer;
+    const origin = { kind: 'system' as const, principal: null, evidence: 'daemon' as const, via: 'host', adapter: 'host' };
+
+    expect(await runs.start(peer, { v: 1, type: 'run.start', runId: 'open', agent: 'exec', input: [{ type: 'text', text: 'x' }], correlation: 'deleg:open' }, origin)).toMatchObject({ ok: true, value: { state: 'started' } });
+    await runs.stop();
+    const open = sent.find((f) => f.runId === 'open')!;
+    expect(open).toMatchObject({ status: 'interrupted', exitCode: 130, error: { code: 'daemon_stopping' }, turnId: expect.any(String), inputId: expect.stringMatching(/^in_run_/), correlation: 'deleg:open', durationMs: expect.any(Number) });
+    expect(hub.log.read('run:open', 0).filter((e) => e.body.t === 'turn.completed')).toMatchObject([{ body: { status: 'interrupted', error: { code: 'daemon_stopping', retryable: false } } }]);
+    expect(runs.outcome('open')).toEqual(open);
+
+    admit = false;
+    const fresh = new Runs(deps);
+    expect(await fresh.start(peer, { v: 1, type: 'run.start', runId: 'refused', agent: 'exec', input: [{ type: 'text', text: 'x' }], inputId: 'in-r', correlation: 'deleg:r' }, origin)).toMatchObject({ ok: false, code: 'start_failed' });
+    const refused = sent.find((f) => f.runId === 'refused')!;
+    expect(refused).toEqual({ v: expect.any(Number), type: 'run.ended', runId: 'refused', sessionKey: 'run:refused', status: 'failed', exitCode: 1, error: { code: 'start_failed', message: 'closed' }, inputId: 'in-r', correlation: 'deleg:r', durationMs: 0 });
+    expect(hub.log.read('run:refused', 0).map((e) => e.body)).toEqual([{ t: 'input.rejected', inputIds: ['in-r'], reason: 'closed' }]);
+    expect(fresh.outcome('refused')).toEqual(refused);
   });
 });
 

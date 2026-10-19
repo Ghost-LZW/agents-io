@@ -1972,6 +1972,10 @@
                   "type": "string"
                 },
                 {
+                  "const": "run_stopping",
+                  "type": "string"
+                },
+                {
                   "const": "other",
                   "type": "string"
                 }

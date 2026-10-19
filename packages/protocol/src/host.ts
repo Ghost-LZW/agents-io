@@ -149,10 +149,10 @@ export const LoopGuardTrip = Type.Object({
 });
 export type LoopGuardTrip = Static<typeof LoopGuardTrip>;
 
-/** Why an input went where it went (`aio explain`). */
 /** The task run an input started (`run.start`), and the correlation id its host gave. */
 export const RunOfInput = Type.Object({ runId: Type.String(), correlation: Type.Optional(Type.String()) });
 
+/** Why an input went where it went (`aio explain`). */
 export const RouteExplanation = Type.Object({
   inputId: Type.String(),
   tableVersions: Type.Array(Type.String()),
@@ -418,9 +418,9 @@ export const RunEnded = Type.Object({
   exitCode: Type.Number(),
   error: Type.Optional(Type.Object({ code: Type.String(), message: Type.Optional(Type.String()) })),
   /**
-   * Feature `run.ended.usage`: from the run's first log record (its input admitted) to its last
-   * (turn completed, input rejected or cancelled). Absent when the end is not known in time (a run
-   * a previous daemon left mid-turn).
+   * Feature `run.ended.usage`: from the run's first log record (its input admitted) to the record
+   * of its end (turn completed, input rejected or cancelled; the daemon writes one when the harness
+   * left none). Absent when the end is not known in time (a run a previous daemon left unfinished).
    */
   durationMs: Type.Optional(Type.Number()),
   /** Feature `run.ended.usage`: the harness's usage report for the turn, passed through (`turn.completed.usage`); absent when it gave none. */

@@ -149,15 +149,19 @@ before any host frame; after it, the connection's client frames carry the origin
   argv; the daemon also sets `AGENTS_IO_RUN_ID`).
   The input is the turn's content; the turn ends → `run.ended { status, exitCode,
   turnId, inputId, durationMs, usage }` (usage: the turn's `turn.completed.usage`)
-  and the session closes. `runId` is an idempotency key: starting an ended run
-  again answers `state: "ended"` with the same frame, read from the log. `run.cancel`
-  interrupts; `timeoutMs` interrupts and ends the run `timeout` (a `run_timeout`
-  notice in its log); `observe.routes` renders the run on those routes through the
-  compositors. A run left mid-turn by a previous daemon is settled `ambiguous` at start.
+  and the session closes. Every run's end is in its log (the daemon writes one when
+  the harness left none), and `run.ended` is built from the log: `runId` is an
+  idempotency key, and starting an ended run again answers `state: "ended"` with the
+  same frame, also after a restart. `run.cancel` interrupts; `timeoutMs` interrupts
+  and ends the run `timeout` (a `run_timeout` notice in its log); a stopping daemon
+  interrupts it and it ends `interrupted` with `daemon_stopping` (a `run_stopping`
+  notice); `observe.routes` renders the run on those routes through the compositors.
+  A run left mid-turn by a previous daemon is settled `ambiguous` at start.
   `overrides { preset, model, effort, profile }` change this run's RunSpec only
   (the answer's `run`), or fail `bad_override`: a preset must be configured, and a
   `profile` / `preset` override needs a profile the run's instance defines or a
-  built-in one (`bypass`, `restricted`). `inputId` names the run's input (unique:
+  built-in one (`bypass`, `restricted`). The default cwd stays the agent's (a preset
+  does not move it). `inputId` names the run's input (unique:
   else `input_id_taken`); `correlation` is an opaque id kept on the input (never
   shown to the model) and echoed in `run.ended`; `explain <inputId>` shows the run.
   Features `run.overrides`, `run.ended.usage`, `run.correlation`.

@@ -195,6 +195,8 @@ export const Body = Type.Union([
       Type.Literal('live_profile'),
       /** A task run's `run.start.timeoutMs` elapsed; the run is interrupted and ends `timeout`. */
       Type.Literal('run_timeout'),
+      /** The daemon is stopping while a task run goes; the run is interrupted and ends `interrupted` with `daemon_stopping`. */
+      Type.Literal('run_stopping'),
       Type.Literal('other'),
     ]),
     message: Type.String(),

@@ -23,8 +23,10 @@ import type { Peer } from './local-server.js';
  * agent in a fresh session `run:<runId>`, closed when the turn ends. The request
  * env goes only into the harness child's environment (never the log, never
  * argv). `overrides` change this run's RunSpec only, or the request fails
- * (`bad_override`). The run's end is reported as `run.ended` with an exit code,
- * its turn, duration and usage; a re-sent `run.start` reads the same from the log.
+ * (`bad_override`). Every run's end is in its session log (the harness's record, or
+ * the daemon's when the harness left none), and `run.ended` is built from the log:
+ * the first one and the answer to a re-sent `run.start` (also after a restart) are
+ * the same frame.
  */
 
 export type RunStatus = RunEnded['status'];
@@ -58,8 +60,8 @@ export const RUN_RULE = 'host:run';
 export interface RunDeps {
   readonly hub: Hub;
   agents(): Record<string, AgentConfig>;
-  /** Default working directory of an agent's runs on a harness instance (the agent's, unless a preset moves the run). */
-  agentCwd(agent: AgentConfig, instance: string): string;
+  /** Default working directory of an agent's runs (the agent's own, also when a preset moves the run to another instance). */
+  agentCwd(agent: AgentConfig): string;
   /** The run's RunSpec: the agent's defaults with `overrides` applied, or why one cannot apply. */
   runSpec(agent: AgentConfig, overrides: RunOverrides | undefined): { ok: true; spec: RunSpec } | { ok: false; code: string; message: string };
   /** Build the run's lane (its own harness adapter with `env` in the child's environment) for `spec`. */
@@ -77,7 +79,6 @@ interface ActiveRun {
   runId: string;
   sessionKey: string;
   inputId: string;
-  correlation?: string;
   spec: RunSpec;
   turnId: string;
   lane: Lane;
@@ -86,16 +87,22 @@ interface ActiveRun {
   listeners: Set<Peer>;
   observe: ReplyRoute[];
   timer?: ReturnType<typeof setTimeout>;
-  timedOut: boolean;
   started: boolean;
-  ending: boolean;
+  /** Set once the run ends: settles when its run.ended has been sent. */
+  done?: Promise<void>;
   origin: Origin;
-  /** When run.start accepted it; the log's first and last records of the run (durationMs). */
-  acceptedAt: number;
-  firstTs?: number;
-  endTs?: number;
-  /** `turn.completed.usage` of the run's turn. */
-  usage?: unknown;
+}
+
+/** An end the daemon writes when the harness left none in the log. */
+type Unlogged = { status: 'failed' | 'interrupted'; error: { code: string; message?: string } };
+
+/** What a run's session log says about it (`Runs.read`). */
+interface RunLog {
+  facts: Pick<RunEnded, 'turnId' | 'inputId' | 'correlation'>;
+  /** The first record's time. */
+  first?: number;
+  /** The run's end: its first `turn.completed`, or an `input.rejected` / `input.cancelled` before any turn. */
+  end?: { status: RunStatus; error?: { code: string; message?: string }; at: number; usage?: unknown; restarted: boolean };
 }
 
 const RUN_ID = /^[^\s\u0000-\u001f]{1,256}$/;
@@ -107,6 +114,10 @@ const RESERVED_INPUT_ID = /^ctxo_/;
 const CORRELATION = /^[^\u0000-\u001f\u007f]{1,256}$/;
 /** The error of a run that timed out (a fresh object per frame). */
 const timeoutError = () => ({ code: 'timeout', message: 'run.start timeoutMs elapsed' });
+/** The error of a run the daemon interrupted as it stopped. */
+const stoppingError = () => ({ code: 'daemon_stopping', message: 'the daemon stopped while the run was going' });
+/** Notices (in the run's log) that say why a run was interrupted; the first one holds. */
+const CAUSES = { run_timeout: { status: 'timeout', error: timeoutError }, run_stopping: { status: 'interrupted', error: stoppingError } } as const;
 
 export const runSessionKey = (runId: string) => `run:${runId}`;
 
@@ -154,7 +165,7 @@ export class Runs {
     if (!planned.ok) return fail(planned.code, planned.message);
     const spec = planned.spec;
 
-    const cwd = f.cwd ?? this.d.agentCwd(agent, spec.harness);
+    const cwd = f.cwd ?? this.d.agentCwd(agent);
     if (!isAbsolute(cwd)) return fail('bad_cwd', `cwd must be absolute: ${cwd}`);
     try {
       if (!statSync(cwd).isDirectory()) return fail('bad_cwd', `cwd is not a directory: ${cwd}`);
@@ -165,7 +176,6 @@ export class Runs {
     for (const k of Object.keys(env)) if (!VAR_NAME.test(k)) return fail('bad_env', `${JSON.stringify(k)} is not an environment variable name`);
     if (!f.input.length) return fail('empty_input', 'run.start needs input');
 
-    const acceptedAt = Date.now();
     const turnId = `turn_run_${randomSuffix()}`;
     let built: { lane: Lane; dispose(): Promise<void> };
     try {
@@ -191,7 +201,6 @@ export class Runs {
       runId: f.runId,
       sessionKey,
       inputId: input.inputId,
-      ...(f.correlation !== undefined ? { correlation: f.correlation } : {}),
       spec,
       turnId,
       lane: built.lane,
@@ -199,36 +208,23 @@ export class Runs {
       sub,
       listeners: new Set([peer]),
       observe,
-      timedOut: false,
       started: false,
-      ending: false,
       origin,
-      acceptedAt,
     };
     this.active.set(f.runId, run);
     void this.watch(run);
     if (f.timeoutMs !== undefined && f.timeoutMs > 0) {
       const ms = f.timeoutMs;
       run.timer = setTimeout(() => {
-        run.timedOut = true;
-        // In the log, so a re-sent run.start reports `timeout` too (not a cancel).
-        if (!run.ending)
-          this.d.hub.append(run.sessionKey, {
-            ts: Date.now(),
-            ...(run.started ? { turnId: run.turnId } : {}),
-            level: 'detail',
-            audience: 'status',
-            durability: 'durable',
-            visibility: 'operators',
-            body: { t: 'notice', code: 'run_timeout', message: `run.start timeoutMs (${ms} ms) elapsed; interrupting the run` },
-          });
+        // In the log: the run's end reads `timeout` (not a cancel), now and when re-sent.
+        if (!run.done) this.cause(run, 'run_timeout', `run.start timeoutMs (${ms} ms) elapsed; interrupting the run`);
         void this.interrupt(run);
       }, ms);
     }
-    const r = await run.lane.command({ type: 'input', sessionKey, input, mode: 'queue' });
+    const r = await run.lane.command({ type: 'input', sessionKey, input, mode: 'queue' }).catch((e: Error) => ({ ok: false as const, reason: e.message }));
     if (!r.ok) {
       this.d.recordRunInput({ ...recorded, rejected: { code: 'start_failed', message: r.reason } });
-      await this.end(run, 'failed', { code: 'start_failed', message: r.reason });
+      await this.end(run, { status: 'failed', error: { code: 'start_failed', message: r.reason } });
       return fail('start_failed', r.reason);
     }
     this.d.log(
@@ -251,12 +247,17 @@ export class Runs {
     for (const r of this.active.values()) r.listeners.delete(peer);
   }
 
-  /** Daemon shutdown: interrupt every run and wait (bounded by the caller) for them to end. */
+  /**
+   * Daemon shutdown: interrupt every run and wait (bounded by the caller) for its run.ended
+   * to go out. A run interrupted this way ends `interrupted` with `daemon_stopping`.
+   */
   async stop(): Promise<void> {
     this.stopped = true;
     await Promise.all([...this.active.values()].map(async (r) => {
+      if (!r.done) this.cause(r, 'run_stopping', 'the daemon is stopping; interrupting the run');
       await this.interrupt(r);
-      await this.end(r, 'interrupted', { code: 'daemon_stopping' });
+      // Closing the lane closes the harness session, which records how the turn ended.
+      await this.end(r, { status: 'interrupted', error: stoppingError() });
     }));
   }
 
@@ -285,22 +286,48 @@ export class Runs {
         body: { t: 'turn.completed', turnId: snap.turn.turnId, status: 'ambiguous', error: { code: 'host_restarted', retryable: false, message: 'the run was going when the previous daemon stopped' } },
       });
     }
-    return this.outcome(runId) ?? ended(runId, sessionKey, 'ambiguous', { code: 'host_restarted' });
+    // Still no end: the previous daemon stopped between admitting the input and starting the turn.
+    const log = this.read(runId);
+    return this.frame(runId, log) ?? ended(runId, sessionKey, 'ambiguous', { code: 'host_restarted' }, log.facts);
   }
 
   /**
-   * How a run that is not running ended, from its session log: the same frame the run's end
-   * sent (status, error, turn, input, correlation, usage, duration), so a re-sent `run.start`
-   * agrees with the first `run.ended`.
+   * How a run that is not running ended, from its session log: the frame its end sent
+   * (status, error, turn, input, correlation, usage, duration). `end` builds run.ended
+   * the same way, so a re-sent `run.start` agrees with the first `run.ended`.
    */
   outcome(runId: string): RunEnded | undefined {
+    return this.frame(runId, this.read(runId));
+  }
+
+  private frame(runId: string, log: RunLog): RunEnded | undefined {
+    const { end, first } = log;
+    if (!end) return undefined;
+    // A run settled at a later start (host_restarted) ended at an unknown time: no duration.
+    return ended(runId, runSessionKey(runId), end.status, end.error, {
+      ...(first !== undefined && !end.restarted ? { durationMs: end.at - first } : {}),
+      ...(end.usage !== undefined ? { usage: end.usage } : {}),
+      ...log.facts,
+    });
+  }
+
+  /**
+   * A run's session log: the input (`input.admitted` has the whole InputRecord; an input the
+   * lane refused before admitting it is named by its `input.rejected`, its correlation by its
+   * routing record), the turn, why it was interrupted (`run_timeout`, `run_stopping`), its end.
+   */
+  private read(runId: string): RunLog {
     const sessionKey = runSessionKey(runId);
-    let end: { status: RunStatus; error?: { code: string; message?: string }; at: number; usage?: unknown; restarted?: boolean } | undefined;
+    let end: RunLog['end'];
     let first: number | undefined;
     let inputId: string | undefined;
     let correlation: string | undefined;
     let turnId: string | undefined;
-    let timedOut = false;
+    let cause: keyof typeof CAUSES | undefined;
+    const interrupted = (at: number, error?: { code: string; message?: string }) => {
+      const c = cause && CAUSES[cause];
+      return c ? { status: c.status, error: c.error(), at, restarted: false } : { status: 'interrupted' as const, ...(error ? { error } : {}), at, restarted: false };
+    };
     for (const e of this.d.hub.log.read(sessionKey, 0)) {
       const b = e.body;
       first ??= e.ts;
@@ -309,23 +336,41 @@ export class Runs {
         correlation = b.input?.correlation;
       }
       if (b.t === 'turn.started' && turnId === undefined) turnId = b.turnId;
-      if (b.t === 'notice' && b.code === 'run_timeout') timedOut = true;
+      if (b.t === 'notice' && Object.hasOwn(CAUSES, b.code)) cause ??= b.code as keyof typeof CAUSES;
+      if (end) continue;
       if (b.t === 'turn.completed') {
-        const timeout = timedOut && b.status === 'interrupted';
-        const error = timeout ? timeoutError() : b.error ? { code: b.error.code, ...(b.error.message ? { message: b.error.message } : {}) } : undefined;
-        end = { status: timeout ? 'timeout' : b.status, ...(error ? { error } : {}), at: e.ts, usage: b.usage, restarted: b.error?.code === 'host_restarted' };
+        const error = b.error ? { code: b.error.code, ...(b.error.message ? { message: b.error.message } : {}) } : undefined;
+        end =
+          b.status === 'interrupted'
+            ? { ...interrupted(e.ts, error), usage: b.usage }
+            : { status: b.status, ...(error ? { error } : {}), at: e.ts, usage: b.usage, restarted: b.error?.code === 'host_restarted' };
       }
-      if (b.t === 'input.rejected' && turnId === undefined && !end) end = { status: 'failed', error: { code: 'start_failed', message: b.reason }, at: e.ts };
-      if (b.t === 'input.cancelled' && turnId === undefined && !end) end = timedOut ? { status: 'timeout', error: timeoutError(), at: e.ts } : { status: 'interrupted', error: { code: 'cancelled' }, at: e.ts };
+      if (turnId !== undefined) continue;
+      if (b.t === 'input.rejected' || b.t === 'input.cancelled') inputId ??= b.inputIds[0];
+      if (b.t === 'input.rejected') end = { status: 'failed', error: { code: 'start_failed', message: b.reason }, at: e.ts, restarted: false };
+      if (b.t === 'input.cancelled') end = interrupted(e.ts, { code: 'cancelled' });
     }
-    if (!end) return undefined;
-    // A run settled at a later start (host_restarted) ended at an unknown time: no duration.
-    return ended(runId, sessionKey, end.status, end.error, {
-      ...(first !== undefined && !end.restarted ? { durationMs: end.at - first } : {}),
-      ...(end.usage !== undefined ? { usage: end.usage } : {}),
-      ...(turnId !== undefined ? { turnId } : {}),
-      ...(inputId !== undefined ? { inputId } : {}),
-      ...(correlation !== undefined ? { correlation } : {}),
+    if (inputId !== undefined && correlation === undefined) {
+      const run = this.d.explained(inputId)?.run;
+      if (run?.runId === runId && run.correlation !== undefined) correlation = run.correlation;
+    }
+    return {
+      facts: { ...(turnId !== undefined ? { turnId } : {}), ...(inputId !== undefined ? { inputId } : {}), ...(correlation !== undefined ? { correlation } : {}) },
+      ...(first !== undefined ? { first } : {}),
+      ...(end ? { end } : {}),
+    };
+  }
+
+  /** Why the run is being interrupted, in its log (read by `read`). */
+  private cause(run: ActiveRun, code: keyof typeof CAUSES, message: string): void {
+    this.d.hub.append(run.sessionKey, {
+      ts: Date.now(),
+      ...(run.started ? { turnId: run.turnId } : {}),
+      level: 'detail',
+      audience: 'status',
+      durability: 'durable',
+      visibility: 'operators',
+      body: { t: 'notice', code, message },
     });
   }
 
@@ -340,10 +385,9 @@ export class Runs {
     }
   }
 
-  /** True once the run has ended. */
+  /** True once the run has ended (its end is in the log). */
   private onEvent(run: ActiveRun, e: SessionEvent): boolean {
     const b = e.body;
-    run.firstTs ??= e.ts;
     if (b.t === 'turn.started' && b.inputIds.includes(run.inputId)) {
       run.started = true;
       run.turnId = b.turnId;
@@ -353,51 +397,65 @@ export class Runs {
       }
       return false;
     }
-    if (b.t === 'turn.completed' && (b.turnId === run.turnId || run.started)) {
-      run.endTs = e.ts;
-      if (b.usage !== undefined) run.usage = b.usage;
-      // A turn that completed (or failed) as the timer fired keeps its own outcome.
-      const timeout = run.timedOut && b.status === 'interrupted';
-      const err = timeout ? timeoutError() : b.error ? { code: b.error.code, ...(b.error.message ? { message: b.error.message } : {}) } : undefined;
-      void this.end(run, timeout ? 'timeout' : b.status, err);
-      return true;
-    }
-    if (b.t === 'input.rejected' && b.inputIds.includes(run.inputId) && !run.started) {
-      run.endTs = e.ts;
-      void this.end(run, 'failed', { code: 'start_failed', message: b.reason });
-      return true;
-    }
-    if (b.t === 'input.cancelled' && b.inputIds.includes(run.inputId) && !run.started) {
-      run.endTs = e.ts;
-      if (run.timedOut) void this.end(run, 'timeout', timeoutError());
-      else void this.end(run, 'interrupted', { code: 'cancelled' });
-      return true;
-    }
-    return false;
+    const ends =
+      (b.t === 'turn.completed' && (b.turnId === run.turnId || run.started)) ||
+      ((b.t === 'input.rejected' || b.t === 'input.cancelled') && b.inputIds.includes(run.inputId) && !run.started);
+    if (ends) void this.end(run);
+    return ends;
   }
 
-  private async end(run: ActiveRun, status: RunStatus, error?: { code: string; message?: string }): Promise<void> {
-    if (run.ending) return;
-    run.ending = true;
+  /**
+   * End the run: close its lane, write `unlogged` if the log still has no end (a harness that
+   * never reported one, an input the lane refused without a record), then send run.ended as
+   * the log has it. Settles when it is sent; a second call waits for the first.
+   */
+  private end(run: ActiveRun, unlogged?: Unlogged): Promise<void> {
+    run.done ??= this.finish(run, unlogged);
+    return run.done;
+  }
+
+  private async finish(run: ActiveRun, unlogged: Unlogged = { status: 'interrupted', error: { code: 'cancelled' } }): Promise<void> {
     if (run.timer) clearTimeout(run.timer);
     run.sub.close();
-    const frame = ended(run.runId, run.sessionKey, status, error, {
-      durationMs: (run.endTs ?? Date.now()) - (run.firstTs ?? run.acceptedAt),
-      ...(run.usage !== undefined ? { usage: run.usage } : {}),
-      ...(run.started ? { turnId: run.turnId } : {}),
-      inputId: run.inputId,
-      ...(run.correlation !== undefined ? { correlation: run.correlation } : {}),
-    });
-    this.d.log('info', `run ${run.runId}: ${status} (exit ${frame.exitCode})${error ? ` ${error.code}` : ''}`);
     try {
       await run.dispose();
     } catch (e) {
       this.d.log('warn', `run ${run.runId}: close failed: ${(e as Error).message}`);
     }
+    let frame: RunEnded;
+    try {
+      let log = this.read(run.runId);
+      if (!log.end) {
+        this.record(run, unlogged, log.facts.turnId);
+        log = this.read(run.runId);
+      }
+      frame = this.frame(run.runId, log) ?? ended(run.runId, run.sessionKey, unlogged.status, unlogged.error, log.facts);
+    } catch (e) {
+      // The log closed first (a daemon stop that outwaited the bound on Runs.stop): what is known.
+      this.d.log('warn', `run ${run.runId}: its log is gone: ${(e as Error).message}`);
+      frame = ended(run.runId, run.sessionKey, unlogged.status, unlogged.error, { inputId: run.inputId, ...(run.started ? { turnId: run.turnId } : {}) });
+    }
+    this.d.log('info', `run ${run.runId}: ${frame.status} (exit ${frame.exitCode})${frame.error ? ` ${frame.error.code}` : ''}`);
     this.active.delete(run.runId);
     const live = [...run.listeners].filter((p) => !p.signal.aborted);
     const to = live.length ? live : [this.d.hostPeer()].filter((p): p is Peer => !!p);
     for (const p of to) p.send(frame as unknown as Record<string, unknown>);
+  }
+
+  /** The run's end, when its lane closed without one in the log: on its turn (`turnId`, open), or on its input. */
+  private record(run: ActiveRun, u: Unlogged, turnId: string | undefined): void {
+    const draft = { ts: Date.now(), level: 'primary', audience: 'status', durability: 'durable' } as const;
+    if (turnId !== undefined) {
+      const snap = this.d.hub.snapshot(run.sessionKey);
+      this.d.hub.append(run.sessionKey, {
+        ...draft,
+        turnId,
+        harness: snap.harness,
+        generation: snap.generation,
+        body: { t: 'turn.completed', turnId, status: u.status, error: { ...u.error, retryable: false } },
+      });
+    } else if (u.status === 'failed') this.d.hub.append(run.sessionKey, { ...draft, body: { t: 'input.rejected', inputIds: [run.inputId], reason: u.error.message ?? u.error.code } });
+    else this.d.hub.append(run.sessionKey, { ...draft, body: { t: 'input.cancelled', inputIds: [run.inputId], reason: u.error.code } });
   }
 }
 

@@ -467,7 +467,7 @@ export class Gateway {
     this.runs = new Runs({
       hub: this.hub,
       agents: () => c.agents,
-      agentCwd: (a, instance) => a.cwd ?? c.harnesses[instance]?.cwd ?? c.cwd,
+      agentCwd: (a) => a.cwd ?? c.harnesses[a.harness]?.cwd ?? c.cwd,
       runSpec: (a, o) => this.runSpec(a, o),
       openRunLane: (r) => this.openRunLane(r),
       explained: (id) => this.router.explain(id),
