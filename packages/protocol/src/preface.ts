@@ -12,7 +12,7 @@ import type { InputRecord } from './inbound.js';
 /** Keys shown once per conversation (`origin.via`) until their value changes. */
 const PER_CONVERSATION = new Set(['conversationKind', 'reply', 'topic', 'topicTitle', 'topicTools']);
 /** Keys shown once per sender until their value changes. */
-const PER_SENDER = new Set(['senderName', 'senderIsBot']);
+const PER_SENDER = new Set(['senderId', 'senderName', 'senderIsBot']);
 
 /**
  * What a harness session already showed the model. Reset it whenever the model

@@ -34,6 +34,13 @@ describe('Ingress', () => {
     expect(seen[0]!.channelContext).toMatchObject({ subject: 'Weekly report', channel: 'fake' });
   });
 
+  it('carries the sender channel user id as senderId, which an adapter can not claim', async () => {
+    const { ingress, lanes, seen } = world();
+    await ingress.accept(fakeEnvelope({ sender: alice, text: 'hi', context: { senderId: 'spoofed' } }));
+    await lanes.get('fake:default:c1')!.whenIdle();
+    expect(seen[0]!.channelContext.senderId).toBe('alice');
+  });
+
   it('adds a compact reply summary from the rendering adapter caps when configured', async () => {
     const caps: ChannelCaps = {
       text: { maxChars: 4000, markdown: 'basic' },

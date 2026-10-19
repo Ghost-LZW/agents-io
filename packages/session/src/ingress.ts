@@ -798,6 +798,10 @@ function channelContext(env: InboundEnvelope, reply: string | undefined): InputR
   delete ctx.loopGuard;
   // Set by the daemon only, for the owner's own harness command (passed to the harness as typed).
   delete ctx.nativeCommand;
+  // The sender's id on the channel. Tools that address people on the platform (mention)
+  // need it even when a host rewrote `origin.principal` into an id of its own, which is
+  // what `resolve.onBehalfOf` does: the principal is then no longer `<channel>:<user id>`.
+  if (env.sender.channelUserId) ctx.senderId = env.sender.channelUserId;
   if (env.sender.displayName !== undefined) ctx.senderName = env.sender.displayName;
   if (env.sender.isBot !== undefined) ctx.senderIsBot = env.sender.isBot;
   if (env.sentAt !== undefined) ctx.sentAt = env.sentAt;

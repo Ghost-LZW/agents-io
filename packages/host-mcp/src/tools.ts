@@ -541,7 +541,10 @@ export class HostTools {
     const targets = (ids as string[]).map((raw) => {
       const id = raw.startsWith(`${route.channel}:`) ? raw.slice(route.channel.length + 1) : raw;
       const p = people.find((x) => x.userId === id || x.principal === raw);
-      return { id, ...(p?.name ? { name: p.name } : {}) };
+      // The adapter turns `id` into a platform at-tag, so hand it the channel's own user id:
+      // a principal of a host that rewrote it (`lb:<uuid>`) would resolve to nothing and the
+      // mention would silently degrade to plain `@name` text.
+      return { id: p?.userId ?? id, ...(p?.name ? { name: p.name } : {}) };
     });
     const data: MentionsData = { targets, text };
     const fallback = `${targets.map((t) => `@${t.name ?? t.id}`).join(' ')} ${text}`;

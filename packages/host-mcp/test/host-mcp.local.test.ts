@@ -85,6 +85,17 @@ describe('HostTools', () => {
     expect((msg.channelData as Record<string, unknown>)[MENTIONS_KEY]).toEqual({ targets: [{ id: 'alice', name: 'Alice' }, { id: 'bob' }], text: 'please look' });
   });
 
+  it('mention of a principal a host rewrote still carries the channel user id', async () => {
+    // A host that resolves senders into ids of its own (`resolve.onBehalfOf`) leaves a
+    // principal that is not `<channel>:<user id>`; the at-tag needs the channel's id.
+    const r = route();
+    const i = { ...input(r, 'lb:u1'), channelContext: { channel: 'fake', conversationKind: 'dm', senderName: 'Alice', senderId: 'alice' } };
+    const w = world({ turn: { sessionKey: SK, turnId: 't1', run: { harness: 'fake', model: 'm', profile: 'bypass' }, inputs: [i], replyRoute: r, deliveries: [] } });
+    const out = await call(w, 'mention', { user_ids: ['lb:u1'], text: 'look' });
+    expect((w.fake.sent[0]!.msg.channelData as Record<string, unknown>)[MENTIONS_KEY]).toEqual({ targets: [{ id: 'alice', name: 'Alice' }], text: 'look' });
+    expect(out).toMatchObject({ mentioned: ['alice'] });
+  });
+
   it('get_channel_context summarises the route, caps, tier and participants', async () => {
     const w = world({ routes: ['fake:default:ops'] });
     const c = await call(w, 'get_channel_context', {});
