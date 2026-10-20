@@ -72,7 +72,7 @@ harness 事件 ──▶ SessionLog（seq）──▶ Compositor（读全量，�
 | image | `sha256:` 引用（已存进网关的 blob 存储）：Claude 收到真正的图片块（超过 3.75MB 的不内联，给出原因）；Codex 收到 `localImage`（本地文件路径）。平台引用（如下载失败时的 `lark-file:`）显示为一行"未显示"的说明 |
 | file / audio | `sha256:` 引用：Claude 收到 `[file 名称 类型 at 本地路径]`，Codex 收到 `[file 名称 (类型) at 本地路径]`（语音给 Codex 的是 `localAudio`），agent 可以用自己的工具读这个文件。平台引用只显示 `[file 名称 类型 引用]`，内容不读取 |
 | ref | `[ref "标题"] 链接` |
-| event（卡片点击、会议邀请等） | `[event 名称] JSON`，超过 4000 字符截断 |
+| event（卡片点击、表情回应、会议邀请等） | `[event 名称] JSON`，超过 4000 字符截断 |
 
 ## 1a. 路由：哪条消息进哪个 session
 
@@ -83,11 +83,12 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 | 规则 | 命中 | 动作 |
 |---|---|---|
 | `default:owner-dm` | 主人的私聊 | 开一轮。设了 `ownerSessionKey` 就进那个 session，否则进该会话的 session |
+| `default:observe-dm` | 主人在私聊里做的、适配器标了 `observe` 的事（飞书：对机器人消息点表情） | 只记录，不开轮，进 `default:owner-dm` 的同一个 session（INVARIANTS RT-2） |
 | `default:owner-<会话类型>` | 主人在私聊以外的会话里对本部署说话（`mentions: ["self"]`） | 在该会话的 session 开一轮 |
 | `default:observe-<会话类型>` | 私聊以外的其他消息 | 记成只观察的输入，不开轮；该 session 下一轮开始时交给 agent（§1b） |
 
-- "对本部署说话"指：消息 @ 了本部署自己的账号（`policy.selfAccounts`）；或适配器的提示是 `dispatch`（飞书：私聊、@ 机器人、卡片点击）；或适配器不给提示（邮件、私有通道：收到的默认就是发给本部署的）。飞书群里不 @ 机器人的消息提示是 `observe`，所以只记录。
-- 陌生人的私聊、本部署自己的回流（规则的 `includeSelf` 默认关）不命中任何规则，丢弃。**`policy.strangers: "ask"`**（决定 15，INVARIANTS ID-9）时，陌生人发给本部署的消息（私聊、群里 @，邮件除外）不丢，改为在主人的对话（`ownerSessionKey` 最近一轮的路由）里出一张卡片：允许这一次 / 以后都允许 / 忽略。放行后按原发送者投到该对话的会话（私聊按会话、群按话题串），`restricted`，审批找主人；"以后都允许"把此人记为 `guest`（存在日志库里），之后直接投递。即使某条规则包括回流，回流也只会被记录，不会开轮。适配器自己标了 drop 的（自动回复、退信、群发）在匹配之前就丢弃。
+- "对本部署说话"指：消息 @ 了本部署自己的账号（`policy.selfAccounts`）；或适配器的提示是 `dispatch`（飞书：私聊、@ 机器人、卡片点击）；或适配器不给提示（邮件、私有通道：收到的默认就是发给本部署的）。飞书群里不 @ 机器人的消息、对机器人消息点的表情提示是 `observe`，所以只记录；私聊里也一样（`default:owner-dm` 带 `mentions: ["self"]`）。
+- 陌生人的私聊、本部署自己的回流（规则的 `includeSelf` 默认关）不命中任何规则，丢弃。**`policy.strangers: "ask"`**（决定 15，INVARIANTS ID-9）时，陌生人发给本部署的消息（私聊、群里 @，邮件除外；提示 `observe` 的如表情回应不算）不丢，改为在主人的对话（`ownerSessionKey` 最近一轮的路由）里出一张卡片：允许这一次 / 以后都允许 / 忽略。放行后按原发送者投到该对话的会话（私聊按会话、群按话题串），`restricted`，审批找主人；"以后都允许"把此人记为 `guest`（存在日志库里），之后直接投递。即使某条规则包括回流，回流也只会被记录，不会开轮。适配器自己标了 drop 的（自动回复、退信、群发）在匹配之前就丢弃。
 - 审批、停止和原生问题的提交按钮（`req:…`、`turn:…`、`ask:…`）不走表，直接找到所属的 session，由那里再检查谁能点。其他按钮 id 作为普通输入走表（规则可用 `actionPrefix` 匹配）。
 - 身份：`policy.owners` 就是最简的身份映射（`通道:用户 id` → 主体，标签 `owner`），证据默认要求 `platform_signed` 或 `dkim_pass`。宿主推送的身份映射对同一个渠道身份优先；同一张表里一个渠道身份出现两次，整张表被拒绝。
 - 每条输入的路由解释（命中了哪些规则、表版本、回调结果、主体、证据，没投递时还有原因）写进日志所在的 SQLite，重启后仍能用 `Router.explain(inputId)` 查到。
@@ -180,6 +181,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 | 合并转发 | 用 `im.v1.message.get` 读取外层消息及子消息，按 `upper_message_id` 保留嵌套层级，用 `2.3` 这样的编号列出发送者 id 和内容；文字、富文本展开。前 4 个图片、文件、语音或视频用外层消息 ID 下载，并按相同层级编号附在文字之后。最多 100 条、16,000 字，超出会标注截断；查询或下载失败会明确写出原因。群内非 @ 消息仍只作 observe |
 | 回复某条消息 | 前面加一个引用块：用 `im.v1.message.get` 取回被回复的消息，拍平成文字（卡片取它显示的文字，图片文件变成 `[image]`、`[file 名称]`），最多 500 字（`quoteMaxChars`），按消息 id 缓存。被回复的是本机器人发出、且记录过发送身份的消息时，引用块带 `declared`。取不到时退回只有消息 id 的空引用块 |
 | 卡片按钮 | 审批按钮变成 resolve 命令，"停止"按钮变成 interrupt 命令，原生提问的表单提交变成 answer 命令，都不会作为文字发给 agent；其他按钮变成 `[event action] …` |
+| 对机器人消息点表情、取消表情 | 只记录（`observe`），不开轮，下一轮作为 context 交给 agent（§1b）：`[event reaction] {"emoji":"THUMBSUP","action":"added","messageId":"om_…","text":"那条消息的开头"}`，取消是 `"action":"removed"`；发送者是点表情的人，会话是那条消息所在的私聊、群或话题。应用点的表情（本机器人自己的确认表情在内）、对别人消息的表情不交。见下面"表情回应" |
 | 其他消息类型（表情包、分享卡片等） | `[unsupported 类型 message]` |
 
 **被 @ 时的历史**（§1c）：话题里被 @，用 `im.v1.message.list`（`container_id_type: thread`）取这个话题最近的消息；群里（session 还没开过轮时）用 `container_id_type: chat` 取群里最近的消息（只有主流消息和话题的首条，话题里的回复不在其中），时间截到这条 @。条数由通道条目的 `config.historyOnMention` 定：
@@ -191,6 +193,14 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 - 和事件一样拍平：文字、富文本、@ 变成 `@名字`（@ 机器人自己的去掉）、回复的引用（被引用的那条也在取来的消息里时才有引用块，不为它单独查）、卡片取显示的文字（事件里是 `[unsupported interactive message]`）、表情包是 `[sticker]`、合并转发只是占位。本机器人自己的消息只要回答和输出工具发的那几类（文字、富文本、卡片、图片、文件、语音、视频），本进程开过的思维链气泡不要（重启前开的认不出来）。图片、文件、语音、视频**不下载**，保留 `lark-file:` 引用（harness 显示为"未显示"的一行）；撤回的消息和系统消息（入群、退群）不要。
 - 发送者：飞书列表里用户是 open_id，适配器换成事件里用的 union_id（从收到过的事件里记下的对应，或 `contact.v3.user.get` 查名字时一起拿到的），这样身份映射和 `mention` 都对得上；名字照样查（缓存共用）。本机器人发的消息发送者是机器人自己的 open_id（由出站索引认出），别的机器人是它的 app_id，都标 `senderIsBot`。
 - 权限：读取要 `im:message`（或 `im:message:readonly`），群里还要 `im:message.group_msg`（`messaging` 预设都有）。缺权限（`230027`、`9999167x`）时这一次没有历史，只告警一次，之后 30 分钟（`degradeTtlMs`）不再请求，过后再试，授权后不用重启。其他错误每次记一行 warn。
+
+**表情回应**（通道条目的 `config.reactions`，默认 `true`；`false` 关掉）：适配器订阅 `im.message.reaction.created_v1` 与 `im.message.reaction.deleted_v1`。事件只带消息 id、表情类型（`emoji_type`，如 `THUMBSUP`、`ThumbsDown`、`OK`，见飞书"表情文案说明"）、操作者和时间，不带会话，所以：
+
+- `operator_type` 不是 `user` 的直接丢掉（不查任何东西）：本机器人自己的确认表情（`ack`）和别的机器人的表情都是应用点的。事件里的 `app_id` 不能用来判断：人点的表情事件里没有它，SDK 合并事件头后看到的是本应用自己的 id。
+- 用 `im.v1.message.get` 读那条消息：发送者是本应用、类型是回答或输出工具会发的那几类（文字、富文本、卡片、图片、文件、语音、视频），且不是本进程开的思维链气泡，才交；结果按消息 id 缓存。`text` 是那条消息拍平后的文字（同引用块，至多 `quoteMaxChars`），让 agent 知道是哪一条。
+- 会话类型：消息有 `thread_id` 是 `thread`；否则用启动以来这个会话收到的消息记下的类型，没收到过（例如刚重启）就问 `im.v1.chat.get` 的 `chat_mode`（`p2p` 是私聊）。问不到（缺 `im:chat:readonly`、不在群里）这条表情就不交，告警一次。
+- 信封 id 是 `reaction:<事件 id>`（加、取消、再加是三条输入），不用消息自己的 id（出站索引会把它当成本部署的回流）。同一条消息上的表情按到达顺序交给网关；确认时限、确认后重试与普通消息相同。发送者名字照样查。
+- 权限：订阅事件要 `im:message.reactions:read`（或 `im:message:readonly`），读消息要 `im:message`，问会话类型要 `im:chat:readonly`；在开放平台的"事件与回调"里加上这两个事件并发布新版本。没有订阅就收不到，不影响别的功能。
 
 飞书事件不带发送者名字，适配器用 `contact.v3.user.get` 按 union_id / open_id 查显示名（需要 `contact:user.base:readonly`，`messaging,contact` 预设已包含），缓存 6 小时，查不到的 10 分钟内不再查。查询失败时说明行里没有 `senderName`，agent 只知道身份 id。机器人发送者不查。
 
@@ -508,6 +518,7 @@ agent 自己以语音进一个会议或通话：听得到所有人，用自己�
 
 | 缺口 | 影响 |
 |---|---|
+| 表情回应未经真机验证 | 事件结构、`im.v1.chat.get` 对私聊的 `chat_mode` 都按开放平台文档实现，只用假客户端测过（`docs/E2E.md` Tier 2 有手工步骤）；一个人对同一条消息点了又取消，交出的是两条输入，agent 要自己看最后一条 |
 | 输出工具在飞书上未经真机验证 | 文件/图片上传、多选表单、at 标签都只用假客户端测过；多选表单的 `form_value` 结构按文档实现 |
 | 只能 @ 说过话的人 | 参与者是这个 session 在当前对话里见过的发送者（§7），群消息里只被 @ 到、自己没说过话的人只以名字出现。飞书的 at 标签要 open_id，没从事件或历史里见过的 union_id 只能写成 `@名字`；重启后参与者从日志重建，但 union_id → open_id 的对应要等这个人再说话（或再取一次历史）才回来 |
 | 历史里的附件不下载 | §1c 取来的图片、文件只是 `lark-file:` 引用，agent 看不到内容；回复的引用只在被引用的那条也在取来的消息里时才有 |

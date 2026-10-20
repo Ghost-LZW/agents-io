@@ -600,7 +600,8 @@ export class Gateway {
       ...(c.policy.strangers === 'ask'
         ? {
             onAction: (a) => this.strangers?.action(a),
-            onUndispatched: (a) => this.strangers?.undispatched(a, a.env.conversation.kind === 'dm' || addressesSelf(a.env, new Set(c.policy.selfAccounts))),
+            // Addressed: a DM or an @ of us, unless the adapter says it is not (`observe`: a reaction, RT-2).
+            onUndispatched: (a) => this.strangers?.undispatched(a, addressesSelf(a.env, new Set(c.policy.selfAccounts))),
           }
         : {}),
     });

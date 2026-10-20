@@ -205,6 +205,24 @@ export interface RawMessageEvent {
   };
 }
 
+/**
+ * Flattened `im.message.reaction.created_v1` / `deleted_v1` payload (header + event merged, the
+ * event's fields last). Neither event names the chat. `app_id` is unreliable as a sender: on a
+ * person's reaction the event has none, so the header's (this app's own id) shows through.
+ */
+export interface RawReactionEvent {
+  event_id?: string;
+  event_type?: string;
+  message_id?: string;
+  reaction_type?: { emoji_type?: string };
+  /** `user` (then `user_id` is set) or `app` (then the event's `app_id`). */
+  operator_type?: string;
+  user_id?: { union_id?: string; user_id?: string; open_id?: string };
+  app_id?: string;
+  /** Unix ms, as a string. */
+  action_time?: string;
+}
+
 /** Flattened `card.action.trigger` payload. */
 export interface RawCardActionEvent {
   event_id?: string;

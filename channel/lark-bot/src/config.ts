@@ -108,6 +108,16 @@ export interface LarkBotConfig {
    * there is no history (one warning).
    */
   historyOnMention?: boolean | { thread?: number | false; chat?: number | false };
+  /**
+   * People's emoji reactions on messages this bot sent reach the host as `observe` inputs: an
+   * `event` block `reaction` (`{ emoji, action: "added" | "removed", messageId, text }`) from the
+   * person, on the conversation the message is in (docs/CHANNELS.md §2). Reactions by apps (this
+   * bot's own acknowledgements among them) and on anyone else's messages are ignored. Needs the
+   * events `im.message.reaction.created_v1` / `deleted_v1` (im:message.reactions:read or
+   * im:message:readonly), `im.v1.message.get` (im:message) and, for a chat no message of which
+   * arrived since the start, `im.v1.chat.get` (im:chat:readonly). Default true.
+   */
+  reactions?: boolean;
 }
 
 /** `historyOnMention` defaults. */
@@ -134,6 +144,7 @@ export function resolveConfig(c: LarkBotConfig): ResolvedConfig {
   }
   if (c.look !== undefined && c.look !== 'console' && c.look !== 'chat') throw new Error('lark-bot: look must be console or chat');
   if (c.cotOn !== undefined && c.cotOn !== 'turn' && c.cotOn !== 'tool') throw new Error('lark-bot: cotOn must be turn or tool');
+  if (c.reactions !== undefined && typeof c.reactions !== 'boolean') throw new Error('lark-bot: reactions must be true or false');
   const historyOnMention = resolveHistory(c.historyOnMention);
   return {
     ...c,
@@ -167,6 +178,7 @@ export function resolveConfig(c: LarkBotConfig): ResolvedConfig {
     senderNameTtlMs: c.senderNameTtlMs ?? 21_600_000,
     lookupTimeoutMs: c.lookupTimeoutMs ?? 5000,
     historyOnMention,
+    reactions: c.reactions ?? true,
   };
 }
 

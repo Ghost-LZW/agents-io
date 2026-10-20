@@ -502,7 +502,15 @@ describe('explanations', () => {
     one.record(d.explanation);
     one.close();
     const two = router({ path });
-    expect(two.explain('in-42')).toMatchObject({ inputId: 'in-42', tableVersions: ['config'], principal: 'fake:alice', matched: [{ bindingId: 'default:owner-dm', on: 'dispatch', agent: 'assistant', sessionKey: 'assistant:fake:default:c1' }] });
+    expect(two.explain('in-42')).toMatchObject({
+      inputId: 'in-42',
+      tableVersions: ['config'],
+      principal: 'fake:alice',
+      matched: [
+        { bindingId: 'default:owner-dm', on: 'dispatch', agent: 'assistant', sessionKey: 'assistant:fake:default:c1' },
+        { bindingId: 'default:observe-dm', on: 'context', agent: 'assistant', sessionKey: 'assistant:fake:default:c1' },
+      ],
+    });
     expect(two.explain('nope')).toBeUndefined();
     two.close();
   });
@@ -529,6 +537,17 @@ describe('the default table (formerly defaultPolicy.admit)', () => {
     expect(await at(fakeEnvelope({ conversation: dm }), UNKNOWN)).toEqual([]);
     expect(await at(fakeEnvelope({ conversation: group }), { ...owner, self: true })).toEqual([]);
     expect(await at(fakeEnvelope({ conversation: dm, admission: 'drop' }), owner)).toEqual([]);
+  });
+
+  it('an owner DM the adapter marks observe (a reaction) is context in the DM\'s session, never a turn; a stranger\'s is dropped #RT-2', async () => {
+    expect(await at(fakeEnvelope({ conversation: dm, admission: 'observe' }), owner)).toEqual([['context', 'fake:default:c1']]);
+    expect(await at(fakeEnvelope({ conversation: dm, admission: 'observe' }), UNKNOWN)).toEqual([]);
+    // Addressed DMs still start turns: no hint (mail, bridges) and `dispatch` alike.
+    expect(await at(fakeEnvelope({ conversation: dm, admission: 'dispatch' }), owner)).toEqual([['dispatch', 'fake:default:c1']]);
+    // With ownerSessionKey the context goes where the owner's turns go.
+    const main = new Router({ agents, defaultAgent: 'default', config: ownersTable({ owners: ['fake:alice'], agent: 'default', ownerSessionKey: 'main' }) });
+    const d = await route(main, fakeEnvelope({ conversation: dm, admission: 'observe' }), owner);
+    expect(d.deliveries.map((x) => [x.on, x.sessionKey])).toEqual([['context', 'main']]);
   });
 });
 

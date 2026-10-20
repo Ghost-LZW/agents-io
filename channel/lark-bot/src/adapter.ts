@@ -21,7 +21,7 @@ import { resolveConfig, type LarkBotConfig, type ProcessMode, type ResolvedConfi
 import { CotBubble, closeOpenBubble, type OpenBubble } from './cot.js';
 import { InboundEnricher } from './enrich.js';
 import { HistoryFetcher } from './history.js';
-import { CHANNEL_ID, mapCardAction, mapMessageEvent } from './inbound.js';
+import { CHANNEL_ID, mapCardAction, mapMessageEvent, senderId } from './inbound.js';
 import {
   EL,
   PANEL_ORDER,
@@ -59,9 +59,10 @@ import {
   uuidFor,
   type OutMessage,
 } from './render.js';
+import { ReactionPlacer, mapReaction, type ReactionAction } from './reactions.js';
 import { defaultLarkDeps } from './sdk.js';
 import { DedupWindow, MemoryDeclaredSenderStore, type DeclaredSenderStore } from './store.js';
-import type { LarkClientLike, LarkConnectionParams, LarkDeps, RawCardActionEvent, RawMessageEvent } from './types.js';
+import type { LarkClientLike, LarkConnectionParams, LarkDeps, RawCardActionEvent, RawMessageEvent, RawReactionEvent } from './types.js';
 
 export { LarkApiError };
 
@@ -182,8 +183,11 @@ export class LarkBotAdapter implements ChannelAdapter {
   private readonly enricher: InboundEnricher;
   /** chat id → enrichment of its previous message, so messages reach the host in order. */
   private readonly inboundTails = new Map<string, Promise<void>>();
-  /** chat id → its kind, learnt from inbound messages (`processByChat`). */
+  /** chat id → its kind, learnt from inbound messages (`processByChat`, reactions). */
   private readonly chatKinds = new Map<string, 'dm' | 'group'>();
+  private readonly reactionPlacer: ReactionPlacer;
+  /** message id → the reaction on it being passed on, so reactions on one message reach the host in order. */
+  private readonly reactionTails = new Map<string, Promise<void>>();
   /** Inbound message id → the reaction this bot put on it as an acknowledgement. */
   private readonly ackReactions = new Map<string, string>();
   /** Reactions failed for want of the permission: acknowledgements stay off until a restart. */
@@ -214,6 +218,14 @@ export class LarkBotAdapter implements ChannelAdapter {
         bounded(this.unionIds, openId, unionId);
       },
       now: this.now,
+      log: (l, m) => this.log(l, m),
+    });
+    this.reactionPlacer = new ReactionPlacer({
+      client: () => this.client,
+      cfg: this.cfg,
+      chatKind: (chatId) => this.chatKinds.get(chatId),
+      learnChatKind: (chatId, kind) => bounded(this.chatKinds, chatId, kind),
+      isBubble: (messageId) => this.bubbleMessages.has(messageId),
       log: (l, m) => this.log(l, m),
     });
   }
@@ -267,6 +279,8 @@ export class LarkBotAdapter implements ChannelAdapter {
     dispatcher.register({
       'im.message.receive_v1': (data: RawMessageEvent) => this.onMessage(ctx, data),
       'card.action.trigger': (data: RawCardActionEvent) => this.onCardAction(ctx, data),
+      'im.message.reaction.created_v1': (data: RawReactionEvent) => this.onReaction(ctx, data, 'added'),
+      'im.message.reaction.deleted_v1': (data: RawReactionEvent) => this.onReaction(ctx, data, 'removed'),
     });
 
     while (!ctx.signal.aborted) {
@@ -381,6 +395,43 @@ export class LarkBotAdapter implements ChannelAdapter {
       if (this.inboundTails.get(chatId) === tail) this.inboundTails.delete(chatId);
     });
     return ready.then((e) => ctx.emit(e));
+  }
+
+  /**
+   * A person's emoji reaction on one of this bot's messages (`config.reactions`). Apps' reactions
+   * (this bot's own acknowledgements among them) are dropped before any lookup; the rest go
+   * through `deliver` like messages (acked by `ackTimeoutMs`, the emit retried after it). Per
+   * message one at a time, so an add and its removal reach the host in the order they came.
+   */
+  private async onReaction(ctx: ChannelContext, ev: RawReactionEvent, action: ReactionAction): Promise<void> {
+    const mid = ev?.message_id;
+    const emoji = ev?.reaction_type?.emoji_type;
+    if (!this.cfg.reactions || !mid || !emoji || ev.operator_type !== 'user') return;
+    const key = `reaction:${ev.event_id || `${mid}:${senderId(ev.user_id) ?? ''}:${emoji}:${action}:${ev.action_time ?? ''}`}`;
+    if (this.dedup.has(key)) {
+      ctx.log('debug', `dropping redelivered ${key}`);
+      return;
+    }
+    this.dedup.add(key);
+    await this.deliver(ctx, key, () => this.placeThenEmit(ctx, mid, ev, action));
+  }
+
+  /** Looks the message up (only this bot's go on), names the person, emits: chained per message. */
+  private placeThenEmit(ctx: ChannelContext, messageId: string, ev: RawReactionEvent, action: ReactionAction): Promise<unknown> {
+    const prev = this.reactionTails.get(messageId) ?? Promise.resolve();
+    const done = prev.then(async () => {
+      const at = await this.reactionPlacer.placement(messageId);
+      const env = at ? mapReaction(ev, action, at, { account: ctx.account }) : undefined;
+      if (!env) return undefined;
+      const name = await this.enricher.senderName(env.sender.channelUserId);
+      return ctx.emit(name ? { ...env, sender: { ...env.sender, displayName: name } } : env);
+    });
+    const tail = done.then(() => undefined, () => undefined);
+    this.reactionTails.set(messageId, tail);
+    void tail.then(() => {
+      if (this.reactionTails.get(messageId) === tail) this.reactionTails.delete(messageId);
+    });
+    return done;
   }
 
   /** Remember open_ids behind the union/user ids we hand out, for outbound at tags (and the reverse, for history). */

@@ -223,7 +223,7 @@ describe('console: explain, queue, sessions', () => {
     const e = await w.api(`/api/explain/${encodeURIComponent(dm.inputId!)}`);
     expect(e.status).toBe(200);
     expect(check(RouteExplanation, e.body)).toBe(true);
-    expect(e.body).toMatchObject({ inputId: dm.inputId, principal: 'fake:alice', matched: [expect.objectContaining({ on: 'dispatch' })] });
+    expect(e.body).toMatchObject({ inputId: dm.inputId, principal: 'fake:alice', matched: [expect.objectContaining({ on: 'dispatch' }), expect.objectContaining({ bindingId: 'default:observe-dm', on: 'context' })] });
     expect(await w.api('/api/explain/in_nope')).toMatchObject({ status: 404, body: { error: { code: 'unknown_input' } } });
 
     const q = await w.api('/api/queue');

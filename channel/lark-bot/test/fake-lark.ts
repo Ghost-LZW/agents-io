@@ -55,6 +55,10 @@ export class FakeLark {
   readonly lookups: string[] = [];
   /** Longest event content `message_cot` takes (UTF-8 bytes); Lark's real limit is not documented. */
   cotContentMax = Infinity;
+  /** Chat modes `im.v1.chat.get` answers (`p2p`, `group`, `topic`) by chat id; others fail (232011). */
+  readonly chats = new Map<string, string>();
+  /** Where inbound messages are (`message.get` of a reply of the bot's gives its parent's chat and topic). */
+  readonly placedAt = new Map<string, { chat_id: string; thread_id?: string }>();
   /** Reactions on messages, live ones only: `messageId:emoji` by reaction id. */
   readonly reactions = new Map<string, string>();
   wsStarts = 0;
@@ -149,6 +153,13 @@ export class FakeLark {
   /** Raw requests: bot info and the `message_cot` thinking bubble. */
   private async request(opts: { method: string; url: string; data?: any; params?: any }): Promise<unknown> {
     if (opts.url === '/open-apis/bot/v3/info') return { code: 0, bot: { open_id: this.botOpenId } };
+    const chat = /^\/open-apis\/im\/v1\/chats\/([^/]+)$/.exec(opts.url);
+    if (chat && opts.method === 'GET') {
+      const id = decodeURIComponent(chat[1]!);
+      this.lookups.push(`chat:${id}`);
+      const mode = this.chats.get(id);
+      return mode ? { code: 0, data: { chat_mode: mode } } : { code: 232011, msg: 'operator not in chat' };
+    }
     if (opts.url === '/open-apis/im/v1/message_cot' && opts.method === 'POST') {
       this.log.push('cot.create');
       const f = this.failing('cot.create');
@@ -236,6 +247,7 @@ export class FakeLark {
                     msg_type: m.msg_type,
                     body: { content: m.content },
                     sender: { id: 'cli_x', id_type: 'app_id', sender_type: 'app' },
+                    ...this.placeOf(m),
                   },
                 ],
               },
@@ -322,6 +334,14 @@ export class FakeLark {
     return this.messages.find((m) => m.id === id);
   }
 
+  /** A sent message's chat (and topic), as `message.get` gives them. */
+  private placeOf(m: PlatformMessage): { chat_id: string; thread_id?: string } {
+    if (m.receive.kind === 'create') return { chat_id: m.receive.chatId };
+    const to = m.receive.to;
+    const parent = this.placedAt.get(to) ?? (this.find(to) ? this.placeOf(this.find(to)!) : { chat_id: 'oc_chat' });
+    return m.receive.inThread ? { chat_id: parent.chat_id, thread_id: parent.thread_id ?? `omt_${to}` } : parent;
+  }
+
   private record(
     receive: PlatformMessage['receive'],
     data: { msg_type: string; content: string; uuid?: string },
@@ -404,6 +424,20 @@ export function messageEvent(over: {
       ...(over.thread ? { thread_id: over.thread } : {}),
       ...(over.mentions ? { mentions: over.mentions } : {}),
     },
+  };
+}
+
+/** A flattened `im.message.reaction.created_v1` / `deleted_v1` (header fields merged, as the SDK delivers it). */
+export function reactionEvent(over: { messageId: string; emoji?: string; user?: { union_id?: string; open_id?: string }; app?: string; eventId?: string; at?: string; removed?: boolean }) {
+  return {
+    event_id: over.eventId ?? `evr_${over.messageId}_${over.emoji ?? 'THUMBSUP'}_${over.removed ? 'del' : 'add'}`,
+    // The header's app_id: this app's own, also on a person's reaction.
+    app_id: over.app ?? 'cli_x',
+    message_id: over.messageId,
+    reaction_type: { emoji_type: over.emoji ?? 'THUMBSUP' },
+    operator_type: over.app ? 'app' : 'user',
+    ...(over.app ? {} : { user_id: over.user ?? { union_id: 'on_alice', open_id: 'ou_alice' } }),
+    action_time: over.at ?? '1700000100000',
   };
 }
 

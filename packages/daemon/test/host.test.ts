@@ -304,7 +304,14 @@ describe('deliver, input.verify, explain', () => {
     const r = await w.chat.inject({ sender: alice, text: 'hi' });
     const h = await w.host();
     const ex = await h.explain(r.inputId!);
-    expect(ex).toMatchObject({ inputId: r.inputId, principal: 'fake:alice', matched: [{ bindingId: 'default:owner-dm', source: 'config', on: 'dispatch' }] });
+    expect(ex).toMatchObject({
+      inputId: r.inputId,
+      principal: 'fake:alice',
+      matched: [
+        { bindingId: 'default:owner-dm', source: 'config', on: 'dispatch' },
+        { bindingId: 'default:observe-dm', source: 'config', on: 'context' },
+      ],
+    });
     await expect(h.explain('in_nope')).rejects.toBeInstanceOf(CommandError);
   });
 
