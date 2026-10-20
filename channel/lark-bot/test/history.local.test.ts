@@ -99,6 +99,31 @@ describe('history on mention: what the adapter returns', () => {
     await t.done;
   });
 
+  it('cards as their text, stickers as a placeholder; the bot’s own thinking bubbles and non-message types are left out', async () => {
+    const t = await setup();
+    await t.lark.fire('im.message.receive_v1', messageEvent({ id: 'om_at', chatType: 'group', thread: 'omt_1', root: 'om_1', parent: 'om_1', mentions: AT_BOT, content: { text: '@_user_1 hi' } }));
+    // A thinking bubble this bot opened in the thread is a message there too.
+    const p = { turnId: 't1', status: 'running' as const, steps: [{ kind: 'reasoning' as const, id: 'r0', text: 'Checking', done: false }], answer: '', answerFinal: false, startedAt: 1000 };
+    await t.adapter.previewProgress({ channel: 'lark-bot', account: 'acct', conversationId: 'oc_chat', threadId: 'omt_1', replyToMessageId: 'om_at' }, p, false);
+    expect(t.lark.cots.map((c) => c.messageId)).toEqual(['om_cot1']);
+    const card = { schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'Deploy **done**' }] } };
+    t.lark.histories.set('thread:omt_1', [
+      listed({ id: 'om_1', type: 'interactive', content: card, at: T - 5000, app: 'cli_ci' }),
+      listed({ id: 'om_2', type: 'sticker', content: { file_key: 'stk' }, at: T - 4000 }),
+      listed({ id: 'om_cot1', type: 'interactive', content: { elements: [{ tag: 'markdown', content: 'Checking' }] }, at: T - 3000, app: 'cli_x' }),
+      listed({ id: 'om_3', type: 'share_chat', content: { chat_id: 'oc_x' }, at: T - 2000, app: 'cli_x' }),
+      listed({ id: 'om_4', type: 'interactive', content: card, at: T - 1000, app: 'cli_x' }),
+    ]);
+    const got = await t.adapter.history(t.envs[0]!, 'thread');
+    expect(got.map((e) => [e.id, text(e)])).toEqual([
+      ['om_1', 'Deploy **done**'],
+      ['om_2', '[sticker]'],
+      ['om_4', 'Deploy **done**'],
+    ]);
+    t.ctl.abort();
+    await t.done;
+  });
+
   it('pages past 50; historyOnMention false or 0 makes no call', async () => {
     const t = await setup({ historyOnMention: { thread: 120 } });
     t.lark.histories.set('thread:omt_1', Array.from({ length: 130 }, (_, i) => listed({ id: `om_${i}`, text: `m${i}`, at: T - 200_000 + i })));

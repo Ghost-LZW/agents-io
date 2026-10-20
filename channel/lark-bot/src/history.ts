@@ -21,6 +21,8 @@ export interface HistoryDeps {
   enricher: InboundEnricher;
   /** union_id behind an open_id, learnt from inbound events. */
   unionOf: (openId: string) => string | undefined;
+  /** A thinking bubble this bot opened (a message of its own that is no part of the conversation). */
+  isBubble: (messageId: string) => boolean;
   /** Remember union_id → open_id (outbound at tags need the open_id). */
   learn: (unionId: string, openId: string) => void;
   now: () => number;
@@ -29,6 +31,10 @@ export interface HistoryDeps {
 
 /** One page of `message.list` holds at most 50. */
 const PAGE_MAX = 50;
+/** What this bot's own messages in a conversation are: answers and output tools. Anything else of its own (a thinking bubble) is left out. */
+const OWN_TYPES = new Set(['text', 'post', 'interactive', 'image', 'file', 'audio', 'media']);
+/** Types the receive-event mapping does not flatten; history gives their visible text instead (a card's strings, `[sticker]`). */
+const MAPPED_TYPES = new Set(['text', 'post', 'image', 'file', 'audio', 'media', 'merge_forward']);
 /** Codes that mean the app lacks a scope (`230027` no permission, `9999167x` scope not granted): no history for the app, not one chat. */
 const PERMISSION_CODES = new Set([230027, 99991672, 99991679, 99991663]);
 
@@ -137,6 +143,7 @@ export class HistoryFetcher {
       isBot = true;
       // This bot: the open_id its echoes carry (the outbound index recognises the message itself); another app: its app_id.
       const own = s.id === this.d.cfg.appId;
+      if (own && (!OWN_TYPES.has(i.msg_type ?? '') || this.d.isBubble(i.message_id!))) return undefined;
       channelUserId = own && bot ? bot : s.id;
       sender = { open_id: channelUserId };
     } else return undefined;
@@ -158,7 +165,8 @@ export class HistoryFetcher {
     };
     const env = mapMessageEvent(raw, { account: trigger.account, botOpenId: bot, declared: undefined });
     if (!env) return undefined;
-    const content = env.content.flatMap((b): ContentBlock[] => {
+    const flat = MAPPED_TYPES.has(i.msg_type ?? '') ? undefined : messageText(i.msg_type, i.body?.content, i.mentions).trim();
+    const content = (flat ? [{ type: 'text' as const, text: flat }] : env.content).flatMap((b): ContentBlock[] => {
       if (b.type !== 'quote' || b.text || !b.fromMessageId) return [b];
       // The replied-to message, when it is among the fetched ones; otherwise no quote (no lookup per message).
       const parent = byId.get(b.fromMessageId);

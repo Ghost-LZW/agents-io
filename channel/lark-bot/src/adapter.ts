@@ -175,6 +175,8 @@ export class LarkBotAdapter implements ChannelAdapter {
   /** open_id → union_id, learned from inbound events (history lists users by open_id; inbound ids are union_ids). */
   private readonly unionIds = new Map<string, string>();
   private readonly historyFetcher: HistoryFetcher;
+  /** Message ids of the thinking bubbles this process opened (left out of history). */
+  private readonly bubbleMessages = new Map<string, true>();
   /** blob ref → uploaded Lark key, so a retried send does not upload again. */
   private readonly uploads = new Map<string, { ref: string; mime: string }>();
   private readonly enricher: InboundEnricher;
@@ -206,6 +208,7 @@ export class LarkBotAdapter implements ChannelAdapter {
       botOpenId: () => this.botOpenId,
       enricher: this.enricher,
       unionOf: (openId) => this.unionIds.get(openId),
+      isBubble: (messageId) => this.bubbleMessages.has(messageId),
       learn: (unionId, openId) => {
         bounded(this.openIds, unionId, openId);
         bounded(this.unionIds, openId, unionId);
@@ -732,6 +735,8 @@ export class LarkBotAdapter implements ChannelAdapter {
   }
 
   private markBubble(b: OpenBubble): void {
+    // A thinking bubble is a message in the chat: never part of the conversation's history.
+    bounded(this.bubbleMessages, b.messageId, true);
     const dir = this.bubbleDir();
     if (!dir) return;
     try {
