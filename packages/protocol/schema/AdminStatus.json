@@ -229,6 +229,24 @@
           "type": "number"
         }
       }
+    },
+    "externalMcp": {
+      "type": "object",
+      "required": [
+        "url",
+        "clients"
+      ],
+      "properties": {
+        "url": {
+          "type": "string"
+        },
+        "clients": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
     }
   }
 }

@@ -291,6 +291,40 @@ against the protocol alone.
   write nothing; the credentials stay in the env file, unreferenced, and the
   message names them (remove them by hand).
 
+## External MCP endpoint (agents outside the daemon)
+
+Off unless configured. Agents that do not run in this daemon (a Claude Code or Codex
+on the operator's machine, a host's proxy for its users) read sessions and write
+through it, each as a configured client. Design: `docs/design/external-mcp/`;
+host side: `docs/HOSTS.md` §4.2.
+
+```jsonc
+"externalMcp": {
+  "listen": "127.0.0.1:7465",   // default; loopback only (127.0.0.1 or [::1]); port 0: any free port
+  "clients": {
+    "laptop": {
+      "token": "env:AIO_MCP_LAPTOP_TOKEN",          // env:NAME only; or "tokenFile": "mcp/laptop.token" (read, or generated 0600)
+      "scopes": ["read", "send:lark-bot:default:*", "input:assistant:*"],
+      "declare": false                              // true: may send X-Agents-IO-Declared: <whom it acts for>
+    }
+  },
+  "limits": { "maxBodyBytes": 262144, "maxTextChars": 16000, "requestsPerMinute": 120, "writesPerMinute": 20 }
+}
+```
+
+- Streamable HTTP, stateless, JSON answers; `Authorization: Bearer <client token>`.
+  Requests with an `Origin` header or a non-loopback `Host` are refused (403).
+- Deny by default: a client lists and may call only what its scopes allow:
+  `read` / `read:<session pattern>` → `sessions_list`, `session_events`, `explain`
+  (and, with plain `read`, `channels_status`); `send:<route pattern>` → `send_message`;
+  `input:<session pattern>` → `session_input`. `*` matches any run of characters.
+- What a client does is stamped by the daemon: `kind: "peer"`, principal
+  `external:<name>` (never a person), evidence `device_only`; inputs carry a cause
+  and pass the loop guard; sends go through the outbound check and the outbox
+  (operationId `external:<name>:<operation_id>`, sent at most once) and
+  `aio explain <operationId>` names the client.
+- A host whose hello lists the `external` callout decides every write (fail closed).
+
 ## Topics (decision 6)
 
 A flat conversation (no platform threads) can hold several **topics**, each its

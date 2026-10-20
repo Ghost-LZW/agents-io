@@ -4164,6 +4164,253 @@
       "required": [
         "v",
         "type",
+        "id",
+        "hook",
+        "args"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "policy",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "hook": {
+          "const": "external",
+          "type": "string"
+        },
+        "args": {
+          "type": "object",
+          "required": [
+            "client",
+            "principal",
+            "op",
+            "content",
+            "id"
+          ],
+          "properties": {
+            "client": {
+              "type": "string"
+            },
+            "principal": {
+              "type": "string"
+            },
+            "declared": {
+              "type": "string"
+            },
+            "op": {
+              "anyOf": [
+                {
+                  "const": "send",
+                  "type": "string"
+                },
+                {
+                  "const": "input",
+                  "type": "string"
+                }
+              ]
+            },
+            "route": {
+              "type": "object",
+              "required": [
+                "channel",
+                "account",
+                "conversationId"
+              ],
+              "properties": {
+                "channel": {
+                  "type": "string"
+                },
+                "account": {
+                  "type": "string"
+                },
+                "conversationId": {
+                  "type": "string"
+                },
+                "threadId": {
+                  "type": "string"
+                },
+                "replyToMessageId": {
+                  "type": "string"
+                }
+              }
+            },
+            "sessionKey": {
+              "type": "string"
+            },
+            "content": {
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "required": [
+                      "type",
+                      "text"
+                    ],
+                    "properties": {
+                      "type": {
+                        "const": "text",
+                        "type": "string"
+                      },
+                      "text": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "required": [
+                      "type",
+                      "ref",
+                      "mime"
+                    ],
+                    "properties": {
+                      "type": {
+                        "anyOf": [
+                          {
+                            "const": "image",
+                            "type": "string"
+                          },
+                          {
+                            "const": "file",
+                            "type": "string"
+                          },
+                          {
+                            "const": "audio",
+                            "type": "string"
+                          }
+                        ]
+                      },
+                      "ref": {
+                        "type": "string"
+                      },
+                      "mime": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "required": [
+                      "type",
+                      "text"
+                    ],
+                    "properties": {
+                      "type": {
+                        "const": "quote",
+                        "type": "string"
+                      },
+                      "text": {
+                        "type": "string"
+                      },
+                      "fromMessageId": {
+                        "type": "string"
+                      },
+                      "declared": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "required": [
+                      "type",
+                      "text",
+                      "startMs",
+                      "endMs",
+                      "stable"
+                    ],
+                    "properties": {
+                      "type": {
+                        "const": "transcript",
+                        "type": "string"
+                      },
+                      "speaker": {
+                        "type": "string"
+                      },
+                      "text": {
+                        "type": "string"
+                      },
+                      "startMs": {
+                        "type": "number"
+                      },
+                      "endMs": {
+                        "type": "number"
+                      },
+                      "stable": {
+                        "type": "boolean"
+                      }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "required": [
+                      "type",
+                      "name",
+                      "data"
+                    ],
+                    "properties": {
+                      "type": {
+                        "const": "event",
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "data": {
+                        "type": "object",
+                        "patternProperties": {
+                          "^(.*)$": {}
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "required": [
+                      "type",
+                      "uri"
+                    ],
+                    "properties": {
+                      "type": {
+                        "const": "ref",
+                        "type": "string"
+                      },
+                      "uri": {
+                        "type": "string"
+                      },
+                      "title": {
+                        "type": "string"
+                      },
+                      "mime": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "id": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
         "runId",
         "sessionKey",
         "status",

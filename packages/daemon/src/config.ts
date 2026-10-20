@@ -3,11 +3,11 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { Type, type Static } from '@sinclair/typebox';
 import { Binding, Evidence, IdentityEntry, Tier, WatchDraft, errors, type BindingTable, type Principal, type RunSpec, type WatchSource } from '@agents-io/protocol';
-import { DEFAULT_BLOB_MAX_BYTES, Router, RouterError, checkIdentities, ownerIdentities, ownersTable, type AgentContactRule, type AgentSpec, type LoopGuardOptions } from '@agents-io/session';
+import { DEFAULT_BLOB_MAX_BYTES, OWNER_LABEL, Router, RouterError, checkIdentities, ownerIdentities, ownersTable, type AgentContactRule, type AgentSpec, type LoopGuardOptions } from '@agents-io/session';
 import { resolveChannelModule } from './channel-module.js';
 import { loadEnvFile } from '@agents-io/testkit';
 import type { CodexTransportOption } from '@agents-io/harness-codex';
-import { TOOL_NAMES } from '@agents-io/host-mcp';
+import { TOOL_NAMES, parseScope, type ExternalScopes } from '@agents-io/host-mcp';
 
 /*
  * aio.config.json: what runs. Secrets never go in it: they come from the
@@ -359,15 +359,16 @@ export const ConfigFile = Type.Object(
      */
     topics: Type.Optional(Type.Object({ parkedIdleMs: Type.Optional(Type.Number({ minimum: 0 })) }, Closed)),
     /**
-     * Timeouts of the host's `resolve` / `outbound` callouts (a host opts in with
+     * Timeouts of the host's `resolve` / `outbound` / `external` callouts (a host opts in with
      * `host.hello { callouts: [...] }`; `route` callouts use the rule's own timeout).
-     * Defaults 3000 / 2000 ms.
+     * Defaults 3000 / 2000 / 2000 ms.
      */
     hostCallouts: Type.Optional(
       Type.Object(
         {
           resolve: Type.Optional(Type.Object({ timeoutMs: Type.Optional(Type.Number({ minimum: 1 })) }, Closed)),
           outbound: Type.Optional(Type.Object({ timeoutMs: Type.Optional(Type.Number({ minimum: 1 })) }, Closed)),
+          external: Type.Optional(Type.Object({ timeoutMs: Type.Optional(Type.Number({ minimum: 1 })) }, Closed)),
         },
         Closed,
       ),
@@ -506,6 +507,59 @@ export const ConfigFile = Type.Object(
      * The token is still copied to `<socket>.token` for the CLI.
      */
     host: Type.Optional(Type.Object({ tokenFile: Type.Optional(Type.String()) }, Closed)),
+    /**
+     * The external MCP endpoint (docs/design/external-mcp): agents outside this daemon (a
+     * Claude Code or Codex on the owner's machine, a host's proxy) read sessions and send
+     * through it, each as its own client. Off unless this section is present (and
+     * `enabled` is not false). Loopback only. Every client has its own token (`token:
+     * "env:NAME"`, or `tokenFile`: read, or generated 0600 like `host.tokenFile`) and the
+     * scopes it may use; nothing else is allowed (`read`, `read:<session pattern>`,
+     * `send:<route pattern>`, `input:<session pattern>`; `*` matches any run of characters).
+     */
+    externalMcp: Type.Optional(
+      Type.Object(
+        {
+          enabled: Type.Optional(Type.Boolean()),
+          /** `host:port` (default `127.0.0.1:7465`; port 0: any free port). Only loopback addresses. */
+          listen: Type.Optional(Type.String()),
+          clients: Type.Record(
+            Type.String(),
+            Type.Object(
+              {
+                /** `env:NAME`: the variable holding the token (never a literal). */
+                token: Type.Optional(Type.String()),
+                /** A token file (relative to the config file): read when it exists, else generated (0600). */
+                tokenFile: Type.Optional(Type.String()),
+                scopes: Type.Array(Type.String()),
+                /** The principal it acts as (default `external:<name>`); always `external:…`, never a person. */
+                principal: Type.Optional(Type.String()),
+                /** Extra principal labels (`external` is always there; `owner` is refused). */
+                labels: Type.Optional(Type.Array(Type.String())),
+                /** It may say whom it acts for (`X-Agents-IO-Declared` header), recorded as `origin.declared`. */
+                declare: Type.Optional(Type.Boolean()),
+              },
+              Closed,
+            ),
+          ),
+          limits: Type.Optional(
+            Type.Object(
+              {
+                /** Largest request body (default 256 KiB). */
+                maxBodyBytes: Type.Optional(Type.Integer({ minimum: 1024 })),
+                /** Longest `text` of a send or an input (default 16000 characters). */
+                maxTextChars: Type.Optional(Type.Integer({ minimum: 1 })),
+                /** Requests per client per minute (default 120); more answer 429. */
+                requestsPerMinute: Type.Optional(Type.Integer({ minimum: 1 })),
+                /** Sends and inputs per client per minute (default 20). */
+                writesPerMinute: Type.Optional(Type.Integer({ minimum: 1 })),
+              },
+              Closed,
+            ),
+          ),
+        },
+        Closed,
+      ),
+    ),
     /** Who local socket clients are. */
     local: Type.Optional(
       Type.Object(
@@ -668,12 +722,14 @@ export interface Config {
   /** How long a parked topic's lane stays open while idle (0: until the daemon stops). */
   topics: { parkedIdleMs: number };
   /** Host `resolve` / `outbound` callout timeouts (ms). */
-  hostCallouts: { resolveTimeoutMs: number; outboundTimeoutMs: number };
+  hostCallouts: { resolveTimeoutMs: number; outboundTimeoutMs: number; externalTimeoutMs: number };
   local: { principal: Principal; session: string };
   /** The console API server. */
   console: ConsoleConfig;
   /** The host connection: `tokenFile` is an absolute path when set. */
   host?: { tokenFile?: string };
+  /** The external MCP endpoint (`externalMcp`), when on. */
+  externalMcp?: ExternalMcpConfig;
   /** Where this config came from (loadConfig): the file (it may not exist) and the env file found for it. */
   source?: { path: string; envFile?: string };
 }
@@ -747,6 +803,81 @@ function resolveConsole(c: ConfigFile['console']): ConsoleConfig {
     larkBotCommand: c?.larkBotCommand ?? CREATE_LARK_BOT,
     heartbeat: { intervalMs: c?.heartbeat?.intervalMs ?? DEFAULT_WS_HEARTBEAT_MS, timeoutMs: c?.heartbeat?.timeoutMs ?? DEFAULT_WS_HEARTBEAT_TIMEOUT_MS },
     liveChannels: c?.liveChannels === true,
+  };
+}
+
+/** One client of the external MCP endpoint, resolved. */
+export interface ExternalMcpClient {
+  /** Its name in `externalMcp.clients` (`[A-Za-z0-9._-]`, at most 64). */
+  name: string;
+  /** From `token: "env:NAME"`. SECRET: never log it. */
+  token?: string;
+  /** Absolute; read or generated when the endpoint starts. */
+  tokenFile?: string;
+  /** `external:<name>` unless configured (always `external:…`); labels always include `external`, never `owner`. */
+  principal: Principal;
+  scopes: ExternalScopes;
+  /** May declare whom it acts for (`X-Agents-IO-Declared`). */
+  declare: boolean;
+}
+
+export interface ExternalMcpConfig {
+  host: string;
+  port: number;
+  clients: ExternalMcpClient[];
+  limits: { maxBodyBytes: number; maxTextChars: number; requestsPerMinute: number; writesPerMinute: number };
+}
+
+export const DEFAULT_EXTERNAL_MCP_PORT = 7465;
+const CLIENT_NAME = /^[A-Za-z0-9._-]{1,64}$/;
+const EXTERNAL_PRINCIPAL = /^external:[^\s]{1,128}$/;
+
+function resolveExternalMcp(c: NonNullable<ConfigFile['externalMcp']>, env: Record<string, string | undefined>, path: (p: string) => string, owners: string[]): ExternalMcpConfig {
+  const listen = c.listen ?? `127.0.0.1:${DEFAULT_EXTERNAL_MCP_PORT}`;
+  const m = /^(\[[^\]]+\]|[^:]+):(\d{1,5})$/.exec(listen);
+  if (!m || Number(m[2]) > 65535) fail(`externalMcp.listen ${JSON.stringify(listen)} is not host:port`);
+  const host = m![1]!.replace(/^\[|\]$/g, '');
+  // Tokens are bearer credentials in clear text: never reachable off this machine.
+  if (!isLoopbackHost(host) || host.toLowerCase() === 'localhost') fail(`externalMcp.listen ${JSON.stringify(listen)}: the external MCP endpoint listens on a loopback address only (127.0.0.1 or ::1)`);
+  const clients = Object.entries(c.clients).map(([name, e]): ExternalMcpClient => {
+    const at = `externalMcp.clients.${name}`;
+    if (!CLIENT_NAME.test(name)) fail(`externalMcp.clients: ${JSON.stringify(name)} is not a client name (letters, digits, . _ -, at most 64)`);
+    if ((e.token === undefined) === (e.tokenFile === undefined)) fail(`${at}: give exactly one of token ("env:NAME") or tokenFile`);
+    let token: string | undefined;
+    if (e.token !== undefined) {
+      if (!e.token.startsWith('env:')) fail(`${at}.token must be "env:NAME" (a literal token does not belong in the config; or use tokenFile)`);
+      token = substituteEnv(e.token, env, `${at}.token`) as string;
+      if (token.length < 16 || /\s/.test(token)) fail(`${at}.token: the variable ${e.token.slice(4)} must hold at least 16 characters and no whitespace`);
+    }
+    const scopes: ExternalScopes = { read: [], readAll: false, send: [], input: [] };
+    e.scopes.forEach((x, i) => {
+      const p = parseScope(x);
+      if (!p) fail(`${at}.scopes[${i}]: ${JSON.stringify(x)} is not a scope (read, read:<session pattern>, send:<route pattern>, input:<session pattern>)`);
+      scopes[p!.kind].push(p!.pattern);
+      if (x === 'read') scopes.readAll = true;
+    });
+    const id = e.principal ?? `external:${name}`;
+    if (!EXTERNAL_PRINCIPAL.test(id)) fail(`${at}.principal must be "external:<id>" (an external client is never a person, an agent or a host)`);
+    if (owners.includes(id)) fail(`${at}.principal is an owner: an external client is never a person`);
+    const labels = [...new Set(['external', ...(e.labels ?? [])])];
+    if (labels.includes(OWNER_LABEL)) fail(`${at}.labels: an external client never carries the ${OWNER_LABEL} label`);
+    return {
+      name,
+      ...(token !== undefined ? { token } : {}),
+      ...(e.tokenFile !== undefined ? { tokenFile: path(e.tokenFile) } : {}),
+      principal: { id, labels },
+      scopes,
+      declare: e.declare === true,
+    };
+  });
+  const files = clients.map((x) => x.tokenFile).filter((f): f is string => f !== undefined);
+  if (new Set(files).size !== files.length) fail('externalMcp.clients: two clients name the same tokenFile');
+  const l = c.limits ?? {};
+  return {
+    host,
+    port: Number(m![2]),
+    clients,
+    limits: { maxBodyBytes: l.maxBodyBytes ?? 256 * 1024, maxTextChars: l.maxTextChars ?? 16_000, requestsPerMinute: l.requestsPerMinute ?? 120, writesPerMinute: l.writesPerMinute ?? 20 },
   };
 }
 
@@ -883,7 +1014,11 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     channels: ctx.channels === false ? [] : resolveChannels(c.channels ?? [], env, path, warnings),
     outputTools,
     topics: { parkedIdleMs: c.topics?.parkedIdleMs ?? DEFAULT_PARKED_IDLE_MS },
-    hostCallouts: { resolveTimeoutMs: c.hostCallouts?.resolve?.timeoutMs ?? 3000, outboundTimeoutMs: c.hostCallouts?.outbound?.timeoutMs ?? 2000 },
+    hostCallouts: {
+      resolveTimeoutMs: c.hostCallouts?.resolve?.timeoutMs ?? 3000,
+      outboundTimeoutMs: c.hostCallouts?.outbound?.timeoutMs ?? 2000,
+      externalTimeoutMs: c.hostCallouts?.external?.timeoutMs ?? 2000,
+    },
     policy: {
       owners,
       selfAccounts: c.policy?.selfAccounts ?? [],
@@ -903,6 +1038,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     },
     console: resolveConsole(c.console),
     host: c.host?.tokenFile !== undefined ? { tokenFile: path(c.host.tokenFile) } : {},
+    ...(c.externalMcp && c.externalMcp.enabled !== false ? { externalMcp: resolveExternalMcp(c.externalMcp, env, path, c.policy?.owners ?? []) } : {}),
     ...(warnings.length ? { warnings } : {}),
   };
 }

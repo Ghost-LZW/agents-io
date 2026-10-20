@@ -72,6 +72,24 @@
     },
     "at": {
       "type": "number"
+    },
+    "external": {
+      "type": "object",
+      "required": [
+        "client",
+        "principal"
+      ],
+      "properties": {
+        "client": {
+          "type": "string"
+        },
+        "principal": {
+          "type": "string"
+        },
+        "declared": {
+          "type": "string"
+        }
+      }
     }
   }
 }

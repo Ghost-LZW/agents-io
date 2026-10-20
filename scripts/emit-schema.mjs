@@ -15,6 +15,8 @@ const names = [
   'ResolveCalloutAnswer', 'OutboundCalloutAnswer', 'TurnContextView', 'InboundRedispatchResult',
   // Agent messaging: cause chain and explain of side effects / chains
   'InputCause', 'EffectExplanation', 'ChainExplanation', 'ExplainResult', 'ContactCalloutAnswer',
+  // External MCP endpoint (docs/design/external-mcp)
+  'ExternalCalloutAnswer', 'ExternalSender',
   // Console / admin HTTP API
   'AdminError', 'AdminLoginRequest', 'AdminLoginResult', 'AdminStatus', 'AdminConfigDocument', 'AdminConfigPut', 'AdminConfigPutResult',
   'AdminChannelsApplied', 'AdminConfigValidateRequest', 'AdminConfigValidation', 'AdminQueue', 'AdminSessions', 'AdminLarkBotRequest', 'AdminLarkBotStarted', 'AdminLarkBotJob',

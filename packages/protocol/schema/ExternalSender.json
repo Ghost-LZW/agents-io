@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/ExternalSender",
+  "type": "object",
+  "required": [
+    "client",
+    "principal"
+  ],
+  "properties": {
+    "client": {
+      "type": "string"
+    },
+    "principal": {
+      "type": "string"
+    },
+    "declared": {
+      "type": "string"
+    }
+  }
+}

@@ -254,7 +254,8 @@ export const HostHello = Type.Object({
    * Which synchronous hooks this host answers (`policy` frames): `true` = `["route"]`;
    * a list names them: `route` (rule callouts), `resolve` (who answers a request),
    * `outbound` (may an agent send there), `contact` (may one agent contact another; nothing
-   * asks it yet). Unknown names are ignored; the result's
+   * asks it yet), `external` (may a client of the external MCP endpoint send or queue an
+   * input). Unknown names are ignored; the result's
    * `callouts` lists what was granted. Any hook (or `consumer`) makes this connection the host.
    */
   callouts: Type.Optional(Type.Union([Type.Boolean(), Type.Array(Type.String())])),
@@ -491,11 +492,41 @@ export const ContactCallout = Type.Object({
   }),
 });
 
+/**
+ * `external` asked of a host whose hello lists it (feature `callouts.external`): may this
+ * client of the external MCP endpoint do this write? `op`: `send` (a message to `route`)
+ * or `input` (an input queued into `sessionKey`); `content` is what would be sent or
+ * queued. `client` is the client's name in `externalMcp.clients`, `principal` the one its
+ * actions are stamped with, `declared` whom it says it acts for (clients allowed to
+ * declare). Answer `{ verdict }` (`reason` is shown to the client when it denies).
+ * Timeout, error, a bad answer — and, once a host declared the hook, that host being away —
+ * deny. Reads are not asked: the client's scopes decide them.
+ */
+export const ExternalCallout = Type.Object({
+  ...Req('policy'),
+  hook: Type.Literal('external'),
+  args: Type.Object({
+    client: Type.String(),
+    principal: Type.String(),
+    declared: Type.Optional(Type.String()),
+    op: Type.Union([Type.Literal('send'), Type.Literal('input')]),
+    route: Type.Optional(ReplyRoute),
+    sessionKey: Type.Optional(Type.String()),
+    content: Type.Array(ContentBlock),
+    /** The send's operationId (`op: send`) or the input's id (`op: input`), as the daemon will record it. */
+    id: Type.String(),
+  }),
+});
+
+/** The host's answer to an `external` callout. */
+export const ExternalCalloutAnswer = Type.Object({ verdict: Type.Union([Type.Literal('allow'), Type.Literal('deny')]), reason: Type.Optional(Type.String({ maxLength: 500 })) });
+export type ExternalCalloutAnswer = Static<typeof ExternalCalloutAnswer>;
+
 /** The host's answer to a `contact` callout. */
 export const ContactCalloutAnswer = Type.Object({ verdict: Type.Union([Type.Literal('allow'), Type.Literal('deny')]) });
 export type ContactCalloutAnswer = Static<typeof ContactCalloutAnswer>;
 
-export const HostEventFrame = Type.Union([InboundFrame, RouteCallout, ResolveCallout, OutboundCallout, ContactCallout, RunEnded, ResultFrame]);
+export const HostEventFrame = Type.Union([InboundFrame, RouteCallout, ResolveCallout, OutboundCallout, ContactCallout, ExternalCallout, RunEnded, ResultFrame]);
 export type HostEventFrame = Static<typeof HostEventFrame>;
 
 export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare', 'inbound.redispatch'] as const;
@@ -644,6 +675,10 @@ export type InboundReadResult = Static<typeof InboundReadResult>;
 export const InboundAckResult = Type.Object({ consumer: Type.String(), acked: Type.Number() });
 export type InboundAckResult = Static<typeof InboundAckResult>;
 
+/** Who sent through the external MCP endpoint (`EffectExplanation.external`). */
+export const ExternalSender = Type.Object({ client: Type.String(), principal: Type.String(), declared: Type.Optional(Type.String()) });
+export type ExternalSender = Static<typeof ExternalSender>;
+
 /**
  * `explain` of a side effect: a delivery's operationId (as its `delivery.settled` names it)
  * → the session and turn that made it → that turn's triggering inputs (`explain` each for
@@ -659,6 +694,8 @@ export const EffectExplanation = Type.Object({
   result: Type.Union([Type.Literal('delivered'), Type.Literal('rejected'), Type.Literal('unknown')]),
   providerMessageId: Type.Optional(Type.String()),
   at: Type.Number(),
+  /** A send by a client of the external MCP endpoint: which client, the principal it was stamped with, whom it declared it acts for. */
+  external: Type.Optional(ExternalSender),
 });
 export type EffectExplanation = Static<typeof EffectExplanation>;
 

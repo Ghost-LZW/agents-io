@@ -1,6 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import {
   ContactCalloutAnswer,
+  ExternalCalloutAnswer,
   OutboundCalloutAnswer,
   PROTOCOL_VERSION,
   Resolver,
@@ -8,6 +9,7 @@ import {
   errors,
   type BodyOf,
   type ContactArgs,
+  type ContentBlock,
   type HostHelloResult,
   type HostRequestFrame,
   type InboundReadResult,
@@ -53,8 +55,10 @@ export interface HostServiceDeps {
   redispatch(hostName: string, f: Extract<HostRequestFrame, { type: 'inbound.redispatch' }>): Promise<Outcome>;
   /** `policy.answerOnBehalf`: the `resolve.onBehalfOf` feature is advertised only when it is on. */
   answerOnBehalf?: boolean;
-  /** Per-hook timeouts of the `resolve` / `outbound` / `contact` callouts (config `hostCallouts`). */
-  calloutTimeouts?: { resolve?: number; outbound?: number; contact?: number };
+  /** Per-hook timeouts of the `resolve` / `outbound` / `contact` / `external` callouts (config `hostCallouts`). */
+  calloutTimeouts?: { resolve?: number; outbound?: number; contact?: number; external?: number };
+  /** The external MCP endpoint is on: `external.mcp` is advertised. */
+  externalMcp?: () => boolean;
   /** `explain`: a routing record, a side effect by operationId, or (`chain`) an agent input's chain. */
   explain(inputId: string, chain: boolean): Outcome;
   log: LogFn;
@@ -106,6 +110,14 @@ export class HostService implements HostFrames {
    */
   outboundHeldBy(): string | undefined {
     return this.answers('outbound') ? undefined : this.d.records.flag(OUTBOUND_FLAG);
+  }
+
+  /**
+   * The host that last connected with the `external` hook, while it is not answering: every
+   * write of an external MCP client is denied until it (or a host without the hook) connects.
+   */
+  externalHeldBy(): string | undefined {
+    return this.answers('external') ? undefined : this.d.records.flag(EXTERNAL_FLAG);
   }
 
   /** The connected host answers this `policy` hook. */
@@ -192,6 +204,7 @@ export class HostService implements HostFrames {
     if (role) {
       this.host = { peer, name, hooks, ...(f.consumer !== undefined ? { consumer: f.consumer } : {}) };
       this.d.records.setFlag(OUTBOUND_FLAG, hooks.has('outbound') ? name : undefined);
+      this.d.records.setFlag(EXTERNAL_FLAG, hooks.has('external') ? name : undefined);
       this.d.router.setHostConnected(true);
       if (f.consumer !== undefined) this.host.push = this.startPush(peer, f.consumer);
       this.d.log('info', `host ${name} connected${f.consumer !== undefined ? `, consuming as ${f.consumer}` : ''}${hooks.size ? `, answering callouts (${[...hooks].join(', ')})` : ''}`);
@@ -204,7 +217,7 @@ export class HostService implements HostFrames {
       bindings: { version: st?.table.version ?? null, active: st?.active ?? false, ...(st?.suspended ? { suspended: st.suspended } : {}) },
       ...(f.consumer !== undefined ? { inbound: { consumer: f.consumer, acked: this.d.queue.cursor(f.consumer), head: this.d.queue.head() } } : {}),
       ...(replaced !== undefined ? { replaced: { name: replaced } } : {}),
-      features: this.d.answerOnBehalf ? FEATURES : FEATURES.filter((x) => x !== 'resolve.onBehalfOf'),
+      features: FEATURES.filter((x) => (x !== 'resolve.onBehalfOf' || this.d.answerOnBehalf) && (x !== 'external.mcp' || this.d.externalMcp?.() === true)),
       ...(f.callouts !== undefined ? { callouts: role ? [...hooks] : [] } : {}),
     });
   }
@@ -266,6 +279,16 @@ export class HostService implements HostFrames {
     return v.verdict;
   }
 
+  /**
+   * The `external` hook: may an external MCP client do this write. Throws on no answer or a
+   * bad one: the caller denies.
+   */
+  async externalCallout(a: { client: string; principal: string; declared?: string; op: 'send' | 'input'; route?: ReplyRoute; sessionKey?: string; content: ContentBlock[]; id: string }): Promise<ExternalCalloutAnswer> {
+    const v = await this.callout('external', a, this.d.calloutTimeouts?.external ?? 2000);
+    if (!check(ExternalCalloutAnswer, v)) throw new Error(`bad external answer: ${errors(ExternalCalloutAnswer, v).slice(0, 2).join('; ')}`);
+    return v;
+  }
+
   private async callout(hook: CalloutHook, args: unknown, timeoutMs: number): Promise<unknown> {
     const h = this.host;
     if (!h || !h.hooks.has(hook)) throw new Error(`no host answers ${hook}`);
@@ -284,6 +307,7 @@ export class HostService implements HostFrames {
  * Capabilities `host.hello` advertises (a host must not rely on one this list lacks); `resolve.onBehalfOf` only with `policy.answerOnBehalf`.
  * `run.overrides`: `run.start.overrides` apply (or fail `bad_override`); `run.ended.usage`: `run.ended` carries `durationMs`,
  * `usage`, `turnId`, `inputId` and says `timeout`; `run.correlation`: `run.start.inputId` / `correlation`.
+ * `callouts.external`: the `external` hook; `external.mcp` (only while the endpoint runs): the external MCP endpoint.
  */
 export const FEATURES = [
   'session.launch',
@@ -297,14 +321,18 @@ export const FEATURES = [
   'run.overrides',
   'run.ended.usage',
   'run.correlation',
+  'callouts.external',
+  'external.mcp',
 ];
 
 /** `DaemonRecords` flag: the name of the host that declared the `outbound` hook. */
 const OUTBOUND_FLAG = 'host.outbound';
+/** `DaemonRecords` flag: the name of the host that declared the `external` hook. */
+const EXTERNAL_FLAG = 'host.external';
 
 /** The `policy` hooks a host may answer. */
-export type CalloutHook = 'route' | 'resolve' | 'outbound' | 'contact';
-const HOOKS: readonly CalloutHook[] = ['route', 'resolve', 'outbound', 'contact'];
+export type CalloutHook = 'route' | 'resolve' | 'outbound' | 'contact' | 'external';
+const HOOKS: readonly CalloutHook[] = ['route', 'resolve', 'outbound', 'contact', 'external'];
 
 /** `host.hello.callouts`: `true` = route only; a list names the hooks (unknown names ignored). */
 export function calloutHooks(c: boolean | string[] | undefined): Set<CalloutHook> {

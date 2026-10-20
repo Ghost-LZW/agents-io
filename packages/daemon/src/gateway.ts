@@ -37,6 +37,7 @@ import {
   type Policy,
   type NativeClient,
   type ReplyRoute,
+  type ExternalSender,
   type Resolver,
   type RunSpec,
   type SessionLaunch,
@@ -107,6 +108,7 @@ import { LocalServer } from './local-server.js';
 import { privateDb, privateDir } from './private.js';
 import { blobResolvers, type MediaResolvers } from './media.js';
 import { DaemonRecords, type CauseRecord, type OutboundRecord } from './records.js';
+import { ExternalMcp } from './external-mcp.js';
 import { checkLaunch, launchView, sameLaunch, type LaunchCheck } from './launch.js';
 import { RUN_RULE, Runs, type RunOverrides } from './runs.js';
 import { Strangers } from './strangers.js';
@@ -277,6 +279,10 @@ export class Gateway {
   /** Host output tools, when some agent has `tools` on; mounted over MCP into those agents' harness bindings only. */
   readonly tools: HostTools | undefined;
   private readonly mcp: HostMcpServer | undefined;
+  /** The external MCP endpoint (config `externalMcp`), once listening. */
+  private externalMcp: { endpoint: ExternalMcp; url: string } | undefined;
+  /** Sends of external clients in flight: who, for the outbound record when they settle. */
+  private readonly externalSends = new Map<string, ExternalSender>();
   /** The durable host inbound queue (`on: "host"` rules), in the log's database. */
   readonly hostQueue: HostQueue;
   /** `policy.strangers: "ask"`: messages from people the deployment does not know are asked about (decision 15). */
@@ -484,7 +490,8 @@ export class Gateway {
       deliver: (name, f) => this.deliver(name, f),
       prepareSession: (f) => this.prepareSession(f),
       redispatch: (name, f) => this.redispatch(name, f),
-      calloutTimeouts: { resolve: c.hostCallouts.resolveTimeoutMs, outbound: c.hostCallouts.outboundTimeoutMs },
+      calloutTimeouts: { resolve: c.hostCallouts.resolveTimeoutMs, outbound: c.hostCallouts.outboundTimeoutMs, external: c.hostCallouts.externalTimeoutMs },
+      externalMcp: () => this.externalMcp !== undefined,
       explain: (id, chain) => this.explain(id, chain),
       answerOnBehalf: c.policy.answerOnBehalf,
       log: (level, msg, data) => this.log(level, msg, data),
@@ -663,6 +670,7 @@ export class Gateway {
         writeTokenFile(gw.tokenFile, gw.token);
       }
       if (o.console) await gw.startConsole();
+      if (o.config.externalMcp) await gw.startExternalMcp();
     } catch (e) {
       await gw.stop().catch(() => undefined);
       throw e;
@@ -715,6 +723,71 @@ export class Gateway {
     }
   }
 
+  /**
+   * The external MCP endpoint (docs/design/external-mcp). A bad client token or token file
+   * fails the start; a port that is taken is logged, not fatal (as for the console).
+   */
+  private async startExternalMcp(): Promise<void> {
+    const c = this.o.config;
+    const cfg = c.externalMcp!;
+    const endpoint = new ExternalMcp({
+      config: cfg,
+      hostToken: this.token,
+      hub: this.hub,
+      outbox: this.outbox,
+      host: this.host,
+      outbound: (from, to) => this.externalOutbound(from, to),
+      sessions: () => this.adminSessions().sessions,
+      explain: (id, chain) => this.explain(id, chain),
+      status: () => {
+        const st = this.adminStatus();
+        return { channels: st.channels, host: st.host, agents: st.agents, sessions: st.sessions };
+      },
+      channelFor: (r) => this.channelFor(r),
+      noChannelMessage: (r) => this.noChannelMessage(r),
+      isSession: (key) => this.isOurSession(key),
+      lane: async (key) => this.lanes.get(key) ?? (await this.laneAfterClose(key)),
+      agentOf: (key) => this.agentOfSession(key),
+      record: (e) => this.router.record(e),
+      sending: (op, by) => (by ? this.externalSends.set(op, by) : this.externalSends.delete(op)),
+      stopped: () => this.stopped,
+      log: (level, msg) => this.log(level, msg),
+    });
+    let url: string;
+    try {
+      url = await endpoint.listen();
+    } catch (e) {
+      this.log('error', `external MCP endpoint not started: cannot listen on ${cfg.host}:${cfg.port}: ${(e as Error).message}`);
+      return;
+    }
+    this.externalMcp = { endpoint, url };
+    this.log('info', `external MCP endpoint on ${url} (clients: ${cfg.clients.map((x) => x.name).join(', ') || 'none'})`);
+  }
+
+  /**
+   * The outbound check of an external client's send (DL-6): a host that declared `outbound`
+   * decides, and while it is away nothing goes (an external send is never a turn's own reply
+   * route); an embedder's own `Policy.outbound` decides; otherwise the client's send scope,
+   * checked before, is the local allowance (what preregistered routes are for a turn).
+   */
+  private async externalOutbound(from: TurnContext, to: ReplyRoute): Promise<'allow' | 'deny'> {
+    const held = this.host.outboundHeldBy();
+    if (held !== undefined) {
+      this.log('warn', `host ${held} decides outbound and is not connected: external send to ${routeKey(to)} denied`);
+      return 'deny';
+    }
+    if (this.host.answers('outbound')) {
+      try {
+        return await this.host.outboundCallout(from, to);
+      } catch (e) {
+        this.log('warn', `host outbound callout to ${routeKey(to)} failed (${(e as Error).message}); denied`);
+        return 'deny';
+      }
+    }
+    if (this.o.policy?.outbound) return this.o.policy.outbound({ from, to });
+    return 'allow';
+  }
+
   /** Origin of a console connection's client frames: the local principal, via the console. */
   consoleOrigin(sessionKey: string): Origin {
     return { ...this.localOrigin(sessionKey), via: 'console', adapter: 'console' };
@@ -755,6 +828,7 @@ export class Gateway {
       sessions: { total: sessions.length, live: sessions.filter((s) => s.live).length, running: sessions.filter((s) => s.turnId !== undefined).length },
       runs: { running: this.runs.running() },
       queue: { head: this.hostQueue.head() },
+      ...(this.externalMcp ? { externalMcp: { url: this.externalMcp.url, clients: (c.externalMcp?.clients ?? []).map((x) => x.name) } } : {}),
     };
   }
 
@@ -1401,6 +1475,7 @@ export class Gateway {
       route: rec.route,
       result: rec.status,
       ...(p ? { provenance: p } : {}),
+      ...(this.externalSends.has(rec.operationId) ? { external: this.externalSends.get(rec.operationId)! } : {}),
       at: Date.now(),
     });
   }
@@ -1450,6 +1525,7 @@ export class Gateway {
       result: r.result,
       ...(r.providerMessageId !== undefined ? { providerMessageId: r.providerMessageId } : {}),
       at: r.at,
+      ...(r.external ? { external: r.external } : {}),
     };
   }
 
@@ -2771,6 +2847,8 @@ ${a.summary}` }],
     for (const t of this.parkedTimers.values()) clearTimeout(t);
     this.parkedTimers.clear();
     this.host.close();
+    // No new external writes while stopping (the tools also answer "stopping").
+    await within(this.externalMcp?.endpoint.close(), 2000);
     await this.claudeTui.close();
     // Lives end first: the voice runs in the harness and the media peer in a channel, both about to go.
     await within(Promise.all([...this.lives.keys()].map((k) => this.leaveLive(k, 'gateway stopping'))), 5000);

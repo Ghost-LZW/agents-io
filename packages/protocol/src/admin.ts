@@ -129,6 +129,8 @@ export const AdminStatus = Type.Object({
   sessions: Type.Object({ total: Type.Number(), live: Type.Number(), running: Type.Number() }),
   runs: Type.Object({ running: Type.Array(Type.String()) }),
   queue: Type.Object({ head: Type.Number() }),
+  /** The external MCP endpoint (config `externalMcp`), when it is listening: its URL and client names (never tokens). */
+  externalMcp: Type.Optional(Type.Object({ url: Type.String(), clients: Type.Array(Type.String()) })),
 });
 export type AdminStatus = Static<typeof AdminStatus>;
 

@@ -71,7 +71,8 @@ export class LoopGuard {
 
   /**
    * An input about to start (or join) a turn: the trip if it must not, else undefined
-   * (and it is counted). Counted: agent inputs, and live delegations (`delegation`: the
+   * (and it is counted). Counted: agent inputs, inputs of agents outside this daemon
+   * (`kind: "peer"`: clients of the external MCP endpoint), and live delegations (`delegation`: the
    * voice side's words, whose speaker nothing attests — the far side of a meeting may be
    * another agent), per peer. Only a person writing here clears the pair counts: a human
    * input with a principal (an identified person). Strangers, system inputs (digests,
@@ -79,7 +80,7 @@ export class LoopGuard {
    * the platform does not flag, and a loop must not be kept going by interleaving them.
    */
   check(input: InputRecord, o: { delegation?: boolean } = {}): LoopGuardTrip | undefined {
-    if (input.origin.kind !== 'agent' && !o.delegation) {
+    if (!countsAsAgent(input) && !o.delegation) {
       if (isPersonHere(input)) this.pairs.clear();
       return undefined;
     }
@@ -103,6 +104,11 @@ export class LoopGuard {
     e.times.push(t);
     return undefined;
   }
+}
+
+/** Inputs the loop guard counts as an agent's: this daemon's agents (`agent`) and agents outside it (`peer`). */
+export function countsAsAgent(input: InputRecord): boolean {
+  return input.origin.kind === 'agent' || input.origin.kind === 'peer';
 }
 
 /** What lifts the same-pair stop: an identified person (a human input with a principal), never an agent, system or unidentified sender. */

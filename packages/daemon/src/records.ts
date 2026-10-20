@@ -1,5 +1,5 @@
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
-import type { InboundEnvelope, InputCause, InputVerifyResult, LoopGuardTrip, Origin, ReplyRoute, SessionLaunch, TurnProvenance, VerifiedInput } from '@agents-io/protocol';
+import type { ExternalSender, InboundEnvelope, InputCause, InputVerifyResult, LoopGuardTrip, Origin, ReplyRoute, SessionLaunch, TurnProvenance, VerifiedInput } from '@agents-io/protocol';
 import { channelRefOf, type DeliveryRecord, type InFlightDelivery, type OutboxStore } from '@agents-io/session';
 
 /*
@@ -35,6 +35,8 @@ export interface OutboundRecord {
   inputIds?: string[];
   /** The turn's provenance when it settled: its chain and flags, carried into a recovered input's cause. */
   provenance?: Pick<TurnProvenance, 'external' | 'watched' | 'group' | 'cause'>;
+  /** A send by a client of the external MCP endpoint (no turn made it): who. */
+  external?: ExternalSender;
   at: number;
 }
 

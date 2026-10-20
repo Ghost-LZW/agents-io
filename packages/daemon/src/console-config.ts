@@ -14,7 +14,7 @@ import { ConfigError, ConfigFile, findEnvFile, resolveConfig, type Config } from
  * bridge channel, codex `mcp_servers.<id>.env`), every header (`headers`,
  * `http_headers`, anywhere), codex `bearer_token`s, mail `auth.pass` /
  * `auth.accessToken`, lark-bot `appSecret` / `encryptKey` /
- * `verificationToken`, a bridge argument after a secret-looking flag; and, in
+ * `verificationToken`, external MCP clients' `token`, a bridge argument after a secret-looking flag; and, in
  * the free-form parts the daemon passes through (channel `config`, `options`,
  * …), any string under a secret-looking key. GET shows a credential only as
  * its `env:NAME` reference or ADMIN_REDACTED; writing ADMIN_REDACTED back to a
@@ -54,6 +54,8 @@ export function isCredential(doc: Json, at: Path): boolean {
   const leaf = s.at(-1);
   // `host.tokenFile` is a path, not the token.
   if (s[0] === 'host' && s[1] === 'tokenFile') return false;
+  // So are the external MCP clients' `tokenFile`s; their `token` is an `env:` reference (a literal is refused at load).
+  if (s[0] === 'externalMcp' && s[1] === 'clients' && s.length === 4 && leaf === 'tokenFile') return false;
   // Header values, anywhere (claude mcpServers `headers`, codex `http_headers`, options passed through).
   if (s.slice(0, -1).some((x) => x === 'headers' || x === 'http_headers' || /(^|\.)http_headers$/.test(x))) return true;
   if (s[0] === 'harnesses' && s.length >= 4) {

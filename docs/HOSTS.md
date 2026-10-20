@@ -109,6 +109,7 @@
 - **cause 链**：agent 产生的输入带 `InputRecord.cause`（`peer`、`basis`、`hop`、`chain`、`from`、`rootPrincipal`、`carried`），只由守护进程得出，客户端与适配器都不能设置；同一条输入换地方（watch 转投、话题换手、`inbound.redispatch`）时不变。每轮的 `TurnProvenance` 多了可选的 `cause: { hop, chain, rootPrincipal }`，随宿主写请求与 `agents-io.output` 事件出去；`rootPrincipal` 只是来源标记，守护进程不用它决定权限，宿主要放行"主人开的链上的 agent 转话"时在自己的 `Policy.plan` 里决定。本部署发出的消息经通道回来（同部署的另一个飞书机器人、邮件回声）时由出站索引按平台消息 id 认出，标 `self`、主体为发出它的 agent，不需要再手写 `selfAccounts`。
 - **防循环**：要开轮的 agent 输入在会话 lane 入口受两道上限（`policy.loopGuard`）：跳数超过 `maxHops`（默认 8），或同一对 agent 自上次有人说话以来在 15 分钟内来回超过 10 轮（`pair: { maxTurns, windowMs }`）。截停的输入记成上下文（下一次有人触发的轮次会看到，带 `loopGuard=`），接收与发送会话的日志各有一条 `notice { code: "loop_guard" }`，`aio explain` 带 `loopGuard`；通道上什么都不发。宿主经已有途径看到：会话事件、`inbound.redispatch` 的 `disposition: "observe_only"`。
 - **对严格校验的宿主可见的协议变化**（2026-10-11）：`Origin.evidence` 多了 `daemon`；`InputRecord.cause`、`TurnProvenance.cause`、`RouteExplanation.cause` / `loopGuard` 是新的可选字段；`notice.code` 多了 `loop_guard`；`explain` 的结果可能是 `EffectExplanation` 或 `ChainExplanation`（JSON Schema 见 `packages/protocol/schema/ExplainResult.json`）；`policy` 帧多了 `hook: "contact"`（只发给 `callouts` 列了它的宿主）。
+- **外部客户端的身份**（对外 MCP 端点，§4.2）：本守护进程之外的 agent 经端点排进会话的输入由守护进程盖章：`kind: "peer"`、主体 `external:<客户端名>`（标签 `external`，永远不带 `owner`、不是任何成员）、证据 `device_only`、`via: "external:<客户端名>"`；配置允许时 `origin.declared` 记它说替谁做。它带 `cause: { peer: "external:<名>", basis: "none" }`，过 lane 的同一对来回上限。宿主不能用身份映射改写它（它不经过通道与路由）；要按人限定，在 `external` 钩子里看 `declared`（§4.1）。
 - `input.verify { channelRef }`：宿主可以查询某条渠道消息的平台作者与证据（例如 x-work-os 0010 §4.8 核验"确认消息的作者"）。记录的是**封顶后**的证据；宿主入站队列 `InboundItem.envelope` 同样。被拒收的信封查不到记录。
 
 ## 4. 宿主协议
@@ -122,7 +123,7 @@
 | `run.ended` | 守护进程 → 宿主 | `{ runId, status, exitCode, error?, durationMs?, usage?, turnId?, inputId?, correlation? }`；`status` 含 `timeout`（`timeoutMs` 到期） |
 | `deliver` | 宿主 → 守护进程 | 推送给人，按 `operationId` 幂等；按钮点击按 `actionPrefix` 规则回到宿主。由 `route` 的 `(channel, account)` 对应的通道发出；该账号没有通道时，只有当这个通道 id 恰好一个条目才用它发，否则 `unknown_channel`（多个飞书机器人时不会以别的机器人发出，决定 8） |
 | `inbound` | 守护进程 → 宿主 | §2.1 推送消费 |
-| `policy` | 守护进程 → 宿主 | §2.2 回调（`hook: "route"`），以及按 `hello.callouts` 开启的 `resolve`、`outbound`、`contact` 同步钩子（§4.1，超时 fail closed） |
+| `policy` | 守护进程 → 宿主 | §2.2 回调（`hook: "route"`），以及按 `hello.callouts` 开启的 `resolve`、`outbound`、`contact`、`external` 同步钩子（§4.1，超时 fail closed） |
 | `explain { inputId, chain? }` | 宿主 → 守护进程 | 一条输入的路由记录；`inputId` 不是输入而是某次投递的 operationId 时，答产生它的会话、轮次与该轮的触发输入；`chain: true` 时沿 cause 链走回根（§5 `aio explain`） |
 | `input.verify` | 宿主 → 守护进程 | §3 |
 | `session.prepare` | 宿主 → 守护进程 | 为不经渠道路由打开的会话键预先登记 agent 和 launch（§2.2、§2.3） |
@@ -137,22 +138,35 @@
 
 ### 4.1 回调钩子与代答
 
-`host.hello.callouts` 是 `boolean | string[]`：`true` 等于 `["route"]`；列表可含 `route`、`resolve`、`outbound`、`contact`，未知名字忽略，结果的 `callouts` 列出实际开启的钩子。方案见 `docs/design/host-callouts`。
+`host.hello.callouts` 是 `boolean | string[]`：`true` 等于 `["route"]`；列表可含 `route`、`resolve`、`outbound`、`contact`、`external`，未知名字忽略，结果的 `callouts` 列出实际开启的钩子。方案见 `docs/design/host-callouts`。
 
 **`resolve` 与 `outbound` 两个钩子已冻结**（决定 13）：行为不变、照常可用，但不再增加钩子种类或参数，没有使用者之前也不为它们做新设计；新宿主不应依赖它们去表达本可以随表推送的静态规则。
 
 - **`resolve`**：`policy { hook: "resolve", args: { request, ctx } }`（`request.opened` 的事件体与 `TurnContext`，与 `Policy.resolve` 参数相同），答复一个 `Resolver`。超时（配置 `hostCallouts.resolve.timeoutMs`，默认 3000 ms）、出错、答复不合 schema 或宿主不在线时，按守护进程本地策略决定。
 - **`outbound`**：`policy { hook: "outbound", args: { from, to } }`，答复 `{ verdict: "allow" | "deny" }`。开启后超时（`hostCallouts.outbound.timeoutMs`，默认 2000 ms）、出错、答复不合 schema 一律 `deny`；没有开启的宿主时按本地策略。**宿主离线时也 fail closed**（2026-10-11，INVARIANTS DL-5）：开启过 `outbound` 的宿主断开后（守护进程重启后也一样，名字记在本地库里），只放行本轮自己的回复路由，本地策略额外允许的去向（预注册的 `routes`）一律拒绝，守护进程记一条 warn；直到它重新连上，或另一个宿主以不含 `outbound` 的 `callouts` 连上（把外发交还本地策略）。
 - **`contact`**（agent 通信，`docs/design/agent-messaging/` §4.6）：`policy { hook: "contact", args: { from, to, op, turn } }`，`from` 是 `{ agent, sessionKey }`，`to` 是 `{ agent, sessionKey }` 或 `{ agent }`，`op` 为 `list` / `send` / `run` / `observe` / `control`；答复 `{ verdict: "allow" | "deny" }`。超时（2000 ms）、出错、答复不合 schema 时按本地策略：`policy.agentContacts: [{ from, to, ops? }]`（agent 名或 `*`），**不写就是全部拒绝**。钩子已定义，第一步还没有调用它的东西（`agents_list` / `agent_send` 等工具是第二步）。
+- **`external`**（对外 MCP 端点，§4.2，feature `callouts.external`）：端点的客户端每做一次写（`send_message` 发消息、`session_input` 排输入）都问一次：`policy { hook: "external", args: { client, principal, declared?, op: "send" | "input", route?, sessionKey?, content, id } }`，答复 `{ verdict: "allow" | "deny", reason? }`（`reason` 原样给客户端）。超时（`hostCallouts.external.timeoutMs`，默认 2000 ms）、出错、答复不合 schema 一律拒绝；声明过它的宿主断开后（名字记在本地库里，重启后也一样）所有外部写都拒绝，直到它重连或另一个宿主以不含 `external` 的 `callouts` 连上。读不问。发送另外还过外发检查：声明了 `outbound` 的宿主照样收到 `outbound` 回调，`from` 是只含这条请求的一轮（会话键 `external:<名>`、`replyRoute: null`、输入的来源是客户端），宿主不必区分新旧形状就能拒绝；没有这样的宿主时，客户端的 `send:` scope 就是本地放行。
 - **代答**：宿主连接（`origin.kind = "system"` 且 `origin.adapter = "host"`；网关与会话 lane 各查一次）发 `resolve` 时可带 `onBehalfOf: "<成员 id>"`。`human` 请求要求该成员在 `principals` 里；日志记 `request.resolved.by = { kind, id: <成员>, via: "host:<名字>" }`。非宿主连接带 `onBehalfOf` 答 `not_eligible`。**须部署方显式开启**（决定 13）：配置 `"policy": { "answerOnBehalf": true }`，缺省 `false`；未开启时宿主连接带 `onBehalfOf` 的 `resolve` 答 `on_behalf_not_allowed`（请求保持打开，宿主仍可不带 `onBehalfOf` 以自己的名义作答），`host.hello` 的 `features` 也不列 `"resolve.onBehalfOf"`。这是"以别人的名义作答"的唯一开关，决定 12 的 agent 代为审批以后也挂在它下面，不另设开关。**行为变化（2026-10-11）**：此前任何带 token 的宿主都能代答；依赖代答的部署升级后要加这一项。
 
-**能力协商**：`host.hello` 的结果带 `features: string[]`，按能力名协商而不是按版本号。目前有 `"session.launch"`：回调答复可带 `launch`、可用 `session.prepare`、规则可用 `callout.skipWhenPinned`；`"callouts.resolve"`、`"callouts.outbound"`、`"resolve.onBehalfOf"`（§4.1，只在 `policy.answerOnBehalf` 开启时列出）；`"inbound.redispatch"`（§2.1）；`"host.takeover"`：`host.hello` 支持 `takeover: true`（§2）；`"callouts.contact"`（§4.1）；`"explain.chain"`：`explain` 接受 operationId 与 `chain: true`（§5）；`"run.overrides"`、`"run.ended.usage"`、`"run.correlation"`：任务运行的三个可选项（§4 表下）。旧守护进程的 `callouts` 只接受布尔。推荐做法：直接发钩子列表，收到 `invalid_frame` 再用 `callouts: true` 重发（旧守护进程只有 `route`）。不要先用 `callouts: true` 握手探测 features：那次握手已让这条连接成为**唯一的**宿主、只开了 `route`，想换成列表必须断开重连，期间占着宿主位置。结果里没有某个 feature 时，宿主不得依赖它。
+**能力协商**：`host.hello` 的结果带 `features: string[]`，按能力名协商而不是按版本号。目前有 `"session.launch"`：回调答复可带 `launch`、可用 `session.prepare`、规则可用 `callout.skipWhenPinned`；`"callouts.resolve"`、`"callouts.outbound"`、`"resolve.onBehalfOf"`（§4.1，只在 `policy.answerOnBehalf` 开启时列出）；`"inbound.redispatch"`（§2.1）；`"host.takeover"`：`host.hello` 支持 `takeover: true`（§2）；`"callouts.contact"`（§4.1）；`"explain.chain"`：`explain` 接受 operationId 与 `chain: true`（§5）；`"run.overrides"`、`"run.ended.usage"`、`"run.correlation"`：任务运行的三个可选项（§4 表下）；`"callouts.external"`（§4.1）；`"external.mcp"`：对外 MCP 端点开着（§4.2，只在配置了 `externalMcp` 且在监听时列出）。旧守护进程的 `callouts` 只接受布尔。推荐做法：直接发钩子列表，收到 `invalid_frame` 再用 `callouts: true` 重发（旧守护进程只有 `route`）。不要先用 `callouts: true` 握手探测 features：那次握手已让这条连接成为**唯一的**宿主、只开了 `route`，想换成列表必须断开重连，期间占着宿主位置。结果里没有某个 feature 时，宿主不得依赖它。
 
 **`session.prepare { sessionKey, agent, launch }`**：用于不经渠道路由打开的会话（宿主连接发的客户端 `input` 帧、本地 `aio input` / `aio attach`、指向该键的 watch），也可以让宿主在键可预知时（如成员入驻时建群）提前登记，规则就不必开回调。它只登记（agent 行与 launch 行在同一事务里写入），不拉起 harness；第一条输入到达时按登记建 lane。结果 `{ sessionKey, agent, launch: { cwd?, envKeys }, created }`：同一键用相同的值再 prepare 幂等（`created: false`）。错误码：`unknown_agent`、`not_interactive_agent`、`launch_not_allowed`（agent 没有 `sessionParams`）、`bad_cwd`、`bad_env`、`launch_unsupported`（Codex `unix` 实例带 env）、`launch_conflict`（键已有不同的 launch，或已是无 launch 的会话）、`agent_conflict`（键已属于另一个 agent）、`invalid_frame`（含 `run:` 前缀的键，task run 用 `run.start`）。遇到 `launch_conflict` 换键，不要重试。每个请求的 `result.value` 都有 schema（`packages/protocol/src/host.ts` 末尾的 `HOST_RESULT_VALUES`，JSON Schema 见 `packages/protocol/schema/*Result.json`）。
 
 **宿主写命令的来源标记**：守护进程为每一轮算出来源摘要（是否含 context/digest/外部/群聊输入），附在输出工具的每次调用上（`agents-io.output` 记录的 `provenance` 字段；宿主 MCP `onCall` 事件的 `provenance` 只在进程内嵌入时可用，远程宿主收不到），交互 session 与任务运行都是如此（见 CHANNELS.md §1a 的来源标记）。来源不进 harness 子进程的环境变量：任务运行只带 `AGENTS_IO_RUN_ID`（让工作区里的宿主命令能把调用对到这次运行）；原有的 `AGENTS_IO_TURN_PROVENANCE` 值恒定（`triggeredBy: ["host:<名>"]`，其余为 `false`），发起运行的宿主本来就知道，已删除（决定 13）。不拦截任何调用（决定 4）。
 
 **交互 session 里的宿主写命令：带 `ref`，宿主自己核验**（决定 4 的兑现方式，决定 13）。按原则 7，agent 是在工作区里直接调宿主命令（如 `x`）写入的，这次调用不经过 agents-io，守护进程没法往上附来源。所以来源换成一个宿主能独立验证的事实：给模型的发送者说明行里，来自渠道消息的输入带 `ref=channel:<通道>/<消息 id>`（CHANNELS §1）；agent 调宿主写命令时把触发它的那条消息的 `ref` 当参数带上；宿主用 `aio verify <ref>`（`input.verify { channelRef }`）查到这条消息的平台作者、主体、标签与封顶后的证据，按自己的规则决定收不收（例如"确认"必须来自 `owner` 且证据为 `platform_signed`）。没有 `ref` 的写请求（agent 自发、本地输入、宿主自己发的 `input`）由宿主决定怎么对待。`ref` 证明的是"这个人确实发过这条消息"，不证明这条消息就是触发本次命令的那条：agent 可能拿会话里更早的一条消息的 `ref`。核验结果带 `conversation`、`receivedAt` 与 `inputId`，宿主可以据此再加约束（同一会话、足够新、一条消息只认一次确认）。
+
+### 4.2 对外 MCP 端点（`externalMcp`）
+
+方案见 `docs/design/external-mcp/`，不变量 SE-5、ID-10、CF-10、DL-6、EX-8。
+
+- 守护进程可以多开一个 MCP 端点（Streamable HTTP，无状态，只听回环，缺省 `127.0.0.1:7465`），给本守护进程之外的 agent 用：运维者机器上直接跑的 Claude Code / Codex，或宿主替自己用户做的代理。配置 `externalMcp: { listen?, clients: { <名>: { token: "env:NAME" | tokenFile, scopes, principal?, labels?, declare? } }, limits? }`；没有这一节就不监听。
+- **缺省拒绝**：客户端只看得到、只能调用 scope 允许的工具。`read`（全部会话与守护进程状态）或 `read:<会话模式>` → `sessions_list`、`session_events`（某会话从某个 seq 起、按层级）、`explain`、（只 `read`）`channels_status`；`send:<路由模式>` → `send_message`；`input:<会话模式>` → `session_input`（往已有会话排一条输入，答复留在日志里）。模式里 `*` 匹配任意一串字符。
+- **凭据**：每个客户端自己的令牌（`env:NAME` 或 `tokenFile`：存在则读、不存在则生成 0600，规则同 `host.tokenFile`），按摘要常量时间比较，不得是宿主令牌。请求要 `Authorization: Bearer <令牌>`；带 `Origin` 或非回环 `Host` 的请求 403；有请求体、请求频率与写频率上限（`limits`）。
+- **身份**：客户端做的事由守护进程盖章（§3"外部客户端的身份"），永远不是人；`declare: true` 的客户端可以用 `X-Agents-IO-Declared: <id>` 头说明替谁做，记为 `origin.declared`，并出现在 `external` 回调、发送记录与 explain 里。宿主做代理时这样传递自己的成员 id。
+- **记录**：发送记在客户端的日志 `external:<名>`（`native` 事件 `agents-io.external` 与 `delivery.settled`，同宿主 `deliver` 的 `host:<名>`），operationId 为 `external:<名>:<operation_id>`、同一个只发一次；`aio explain <operationId>` 的 `external` 说出客户端、主体与 `declared`。输入有路由记录，`aio explain <inputId>` 可查。
+- **宿主怎样再收紧**：`external` 钩子决定每一次写，`outbound` 钩子照样决定发送（§4.1）；读由 scope 决定，宿主的代理可以自己再过滤。
+- **对严格校验的宿主可见的协议变化**（2026-10-20）：`policy` 帧多了 `hook: "external"`；`features` 多了 `callouts.external`、`external.mcp`；`EffectExplanation.external`、`AdminStatus.externalMcp` 是新的可选字段；输入的 `origin.kind` 可能是 `peer`（schema 里早有）；会话列表里可能出现 `external:<名>`（与 `host:<名>` 一样是投递日志）。
 
 ## 5. 命令行（给不想写 socket 客户端的宿主）
 

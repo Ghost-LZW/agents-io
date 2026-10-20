@@ -7,6 +7,7 @@
 > 2026-10-11：agent-messaging 合并评审的修复：DL-5（默认外发按输入是否全来自主人）、IN-8（live 委托过检查点、只有有主体的人清零、邮件自动回复标 bot）、EX-5（上下文输入带过来的标记、发送时取来源）、ID-3（保留 `agent` id）、ID-2（Claude Code 说明行 JSON 引号）、ID-8（多条发送全部索引）、EX-6（cause 按 session 存）；未修的记在 §15 第 17 条。
 > 2026-10-12：决定 11 修订（会中委托按说话人定权限）加入 LN-7；LN-6、ID-6、DL-5、IN-8 随之更新（委托轮次不再沿用 thread 上一轮的设置）。
 > 2026-10-19：任务运行的覆盖项、用量与关联 id（`docs/design/run-overrides/`）加入 RN-2、RN-3、EX-7；RN-1 的超时改报协议里早就有的 `status: "timeout"`。同日复审：每次运行的结局都写进日志，`run.ended` 由日志构建（RN-3），守护进程停止的运行记 `run_stopping`（RN-1），preset 不改变运行的缺省 cwd（RN-2）。
+> 2026-10-20：对外 MCP 端点（`docs/design/external-mcp/`）加入 SE-5、ID-10、CF-10、DL-6、EX-8；IN-8 的检查点扩到外部客户端的输入（`kind: "peer"`）。
 > 用途：改动 agents-io 的人或 agent 用它判断"这个改动有没有打破某个承诺"。新增承诺先写进这里，再写测试；测试改名时同步改这里。
 
 ## 0. 怎么读
@@ -102,9 +103,9 @@
 
 ### IN-8 agent 之间不无限来回：lane 入口唯一检查点截停
 
-- **承诺**：每条要开轮或并入轮次的输入（`queue` / `steer` / `interrupt`，不论来自通道规则、watch trigger、宿主 `input` 帧、本地客户端还是 `inbound.redispatch`）都经过 `Lane.input` 的同一个检查（`LoopGuard.check`），live 委托（`live.handoff`，harness 自己开轮或并进正在跑的轮次，不经 `Lane.input`）也经过它：`origin.kind === "agent"` 且 `cause.hop > policy.loopGuard.maxHops`（默认 8）→ 截停；同一 peer（本部署 agent 按 agent 名，外部按渠道身份，live 委托按会议路由）在一个 session 里、自上次有人写（`kind: "human"` 且有主体的输入）以来、`pair.windowMs`（默认 15 分钟）内已开了 `pair.maxTurns`（默认 10）轮 → 截停，直到有人写或窗口过去（不知道跳数的 `basis: none` 输入同样计数；live 委托也计数：说话的是谁没有任何证据，会议另一端可能是 agent）。陌生人、系统输入（digest、宿主 `input` 帧、通知）与 live 委托都不清零。截停的输入不开轮，记成上下文（`input.admitted observe_only`，带记录，`channelContext.loopGuard: "hops" | "pair"`），交给下一轮；接收 session 记 `notice { code: "loop_guard" }`（`visibility: operators`），产生它的本部署 session（已知时）也记一条；explain 带 `loopGuard`；不往任何通道发东西。被截停的 live 委托 harness 已经拿到了：照样记成上下文，带着它的轮次（harness 为它开的、或它被并进的）立即打断，它的 `input.consumed` 不算这一轮的输入；不在 live 上说话（会说话的断路器可能喂给另一端的 agent），语音端从被打断的轮次得知委托结束。非 agent 输入不受影响。
-- **实现**：`packages/session/src/loop-guard.ts` `LoopGuard.check`（`delegation`）、`isPersonHere`、`peerKey`、`loopGuardMessage`；`packages/session/src/lane.ts` `input`（`known` 去重之后、`trySteer` / 打断 / `enqueue` 之前）、`guarded`、`onHarnessEvent` 的 `live.handoff` 与 `turn.started { initiator: "harness" }`（`stoppedHandoffs`、`interruptStopped`）；邮件的自动回复、退信、群发标 `isBot`（`channel/mail/src/inbound.ts` `parseInbound`，同时 `admission: drop`）；`packages/daemon/src/gateway.ts` `causeHooks`、`loopGuarded`（发送方 notice、cause 记录、explain）、`explain`（合并 cause 记录里的截停）；配置 `packages/daemon/src/config.ts` `policy.loopGuard`。
-- **测试**：标签 `#IN-8`；`packages/session/test/agent-messaging.test.ts` "hop = maxHops starts a turn; maxHops + 1 is kept as context labelled loopGuard, with a loop_guard notice, never a turn"、"the stopped input is handed to the next turn a person starts, still labelled"、"same pair: the peer is stopped after maxTurns; a person writing clears it; another peer is not affected; broken chains count too"、"the pair window passes: the peer may start turns again"、"every entry reaches the checkpoint: a channel dispatch and a watch trigger are stopped alike"、"only a person writing here lifts a pair stop: a system digest, a host input or a stranger does not; an identified person does"；`packages/session/test/live.test.ts` "delegations reach the loop checkpoint: past the pair limit one is context labelled loopGuard, and the turn the harness runs for it is interrupted"；`channel/mail/test/mail.test.ts` "auto-replies, bounces and bulk mail are marked as a bot sender (and dropped); ordinary mail is not"；`packages/daemon/test/agent-messaging.test.ts` "a trip leaves a loop_guard notice in the receiving and the sending session, explain shows it (also after a restart), nothing goes to a channel"、"inbound.redispatch goes through the same checkpoint: a queued over-hop agent message stays context"。
+- **承诺**：每条要开轮或并入轮次的输入（`queue` / `steer` / `interrupt`，不论来自通道规则、watch trigger、宿主 `input` 帧、本地客户端还是 `inbound.redispatch`）都经过 `Lane.input` 的同一个检查（`LoopGuard.check`），live 委托（`live.handoff`，harness 自己开轮或并进正在跑的轮次，不经 `Lane.input`）也经过它：`origin.kind` 是 `agent` 或 `peer`（对外 MCP 端点的客户端，ID-10）且 `cause.hop > policy.loopGuard.maxHops`（默认 8）→ 截停；同一 peer（本部署 agent 按 agent 名，外部按渠道身份，对外 MCP 端点的客户端按 `external:<名字>`，live 委托按会议路由）在一个 session 里、自上次有人写（`kind: "human"` 且有主体的输入）以来、`pair.windowMs`（默认 15 分钟）内已开了 `pair.maxTurns`（默认 10）轮 → 截停，直到有人写或窗口过去（不知道跳数的 `basis: none` 输入同样计数；live 委托也计数：说话的是谁没有任何证据，会议另一端可能是 agent）。陌生人、系统输入（digest、宿主 `input` 帧、通知）与 live 委托都不清零。截停的输入不开轮，记成上下文（`input.admitted observe_only`，带记录，`channelContext.loopGuard: "hops" | "pair"`），交给下一轮；接收 session 记 `notice { code: "loop_guard" }`（`visibility: operators`），产生它的本部署 session（已知时）也记一条；explain 带 `loopGuard`；不往任何通道发东西。被截停的 live 委托 harness 已经拿到了：照样记成上下文，带着它的轮次（harness 为它开的、或它被并进的）立即打断，它的 `input.consumed` 不算这一轮的输入；不在 live 上说话（会说话的断路器可能喂给另一端的 agent），语音端从被打断的轮次得知委托结束。非 agent 输入不受影响。
+- **实现**：`packages/session/src/loop-guard.ts` `LoopGuard.check`（`delegation`）、`countsAsAgent`、`isPersonHere`、`peerKey`、`loopGuardMessage`；`packages/session/src/lane.ts` `input`（`known` 去重之后、`trySteer` / 打断 / `enqueue` 之前）、`guarded`、`onHarnessEvent` 的 `live.handoff` 与 `turn.started { initiator: "harness" }`（`stoppedHandoffs`、`interruptStopped`）；邮件的自动回复、退信、群发标 `isBot`（`channel/mail/src/inbound.ts` `parseInbound`，同时 `admission: drop`）；`packages/daemon/src/gateway.ts` `causeHooks`、`loopGuarded`（发送方 notice、cause 记录、explain）、`explain`（合并 cause 记录里的截停）；配置 `packages/daemon/src/config.ts` `policy.loopGuard`。
+- **测试**：标签 `#IN-8`；`packages/session/test/agent-messaging.test.ts` "hop = maxHops starts a turn; maxHops + 1 is kept as context labelled loopGuard, with a loop_guard notice, never a turn"、"the stopped input is handed to the next turn a person starts, still labelled"、"same pair: the peer is stopped after maxTurns; a person writing clears it; another peer is not affected; broken chains count too"、"the pair window passes: the peer may start turns again"、"every entry reaches the checkpoint: a channel dispatch and a watch trigger are stopped alike"、"only a person writing here lifts a pair stop: a system digest, a host input or a stranger does not; an identified person does"；`packages/session/test/live.test.ts` "delegations reach the loop checkpoint: past the pair limit one is context labelled loopGuard, and the turn the harness runs for it is interrupted"；`channel/mail/test/mail.test.ts` "auto-replies, bounces and bulk mail are marked as a bot sender (and dropped); ordinary mail is not"；`packages/daemon/test/agent-messaging.test.ts` "a trip leaves a loop_guard notice in the receiving and the sending session, explain shows it (also after a restart), nothing goes to a channel"、"inbound.redispatch goes through the same checkpoint: a queued over-hop agent message stays context"；`packages/daemon/test/external-mcp.test.ts` "inputs from outside pass the lane checkpoint: past pair.maxTurns they are kept as context, with a loop_guard notice"（对外 MCP 端点的客户端）。
 - **状态**：有测试。
 - **注意**：成对计数在内存里，重启、lane 关闭再打开（话题停放、空闲回收）都清零（跳数上限随持久化的 cause 仍然有效）；成对上限之下的慢循环不被截停（§15 第 17 条）；合批按最大跳数算，一句人话也会开一条新链。第一步里本部署的 agent 输入只有"回流"一条来路，而回流是 `self`、永远不开轮（ID-5），所以跳数上限现在实际只拦受信 agent 账号声明了跳数的输入；`agent_send` / `agent_run`（ROADMAP §2 第 3、4 项）接上后直接适用。宿主 `input` 帧是 `kind: system`，不开链、不计数、也不清零；本地客户端的输入是有主体的 `human`，清零成对计数。
 - **决定（2026-10-11 合并评审，依原则 4 自决）**：
@@ -172,6 +173,14 @@
   2. `live_join` 的地点按普通外发目的地处理：机器人在那里说话。缺省策略下要把会议路由预登记进 `policy.routes`，或由宿主 `outbound` 放行；`ChannelAdapter.liveRoute(account, target)`（可选）让网关在打开之前检查。
 - **已修**：~~宿主断线时退回本地策略~~、~~`live_join` 的目标不过 outbound 检查~~（2026-10-11，见上）；~~默认策略按 `run.profile === 'bypass'` 放行任何目的地，live 委托轮次沿用主人的 `bypass` 也被放行~~（2026-10-11 合并评审，改为看本轮输入是否全部来自主人，DECISIONS 决定 13 补记的修订）。
 - **注意**：outbox 自带的 outbound 检查只在 `Delivery.from` 存在时生效（`outbox.ts:108`），守护进程里没有调用方传 `from`，实际只靠输出工具的 `allowed()`。
+
+### DL-6 外部客户端的发送过 scope、宿主与外发检查，按 operationId 只发一次，记下是谁发的
+
+- **承诺**：对外 MCP 端点的 `send_message` 只发往客户端 `send:<模式>` 匹配的路由键；路由的 `(channel, account)` 没有运行中的通道就拒绝（决定 8 的规则，同宿主 `deliver`）；声明了 `external` 钩子的宿主拒绝、超时、出错、答复不合 schema，或它断开期间（含重启后），都不发（CF-10）；再过外发检查：声明了 `outbound` 的宿主决定（回调的 `from` 是一个只有这条请求的轮次：会话键 `external:<名字>`、`replyRoute: null`、输入的来源为客户端、内容为正文），这个宿主断开期间一律拒绝（DL-5），嵌入方自带的 `Policy.outbound` 照样问，都没有时 scope 即本地放行。发出经 outbox，operationId `external:<名字>:<operation_id>`，同一个永远只发一次（DL-2），不带 `SendOp.as`；客户端的日志 `external:<名字>` 里有一条 `agents-io.external` 事件与 `delivery.settled`，出站记录带 `external: { client, principal, declared? }`（EX-8）。
+- **实现**：`packages/host-mcp/src/external.ts` `ExternalMcpServer.call`（`send_message`：`parseRouteKey`、`globMatch`、写次数）；`packages/daemon/src/external-mcp.ts` `ExternalMcp.send`、`hostAllows`；`packages/daemon/src/gateway.ts` `externalOutbound`、`indexOutbound`（`externalSends`）；`packages/daemon/src/host.ts` `externalHeldBy`、`externalCallout`。
+- **测试**：标签 `#DL-6`；`packages/daemon/test/external-mcp.test.ts` "a send goes through the outbox once per operation_id, is recorded in the client log and the outbound records"、"a send passes the outbound check: a host answering outbound decides with the request as a one-input turn; a host that declared it and is away denies"、"a host listing the external hook decides every write; deny, timeout, error, bad answers and the host being away deny"、"an MCP client lists its tools, reads status, sessions and events, queues an input and sends"。
+- **状态**：有测试。
+- **注意**：答复 `unknown` 的发送（平台可能收到了）报错给客户端，但 operationId 已结算，同一个 id 不会重发；要再发须换 id。
 
 ---
 
@@ -318,6 +327,13 @@
 - **测试**：标签 `#ID-9`；`packages/daemon/test/strangers.test.ts`。
 - **状态**：有测试（假通道）。决定 15。
 
+### ID-10 外部客户端做的事由守护进程盖章：`peer`、它自己的主体，永远不是人
+
+- **承诺**：对外 MCP 端点的客户端排进会话的输入由守护进程盖章：`kind: "peer"`、主体 `external:<名字>`（或配置的 `external:…`；标签总有 `external`）、证据 `device_only`、`via: "external:<名字>"`、`adapter: "external-mcp"`；只有配置了 `declare: true` 的客户端可以用 `X-Agents-IO-Declared` 头说明替谁做，记为 `origin.declared`（只记录，不授予任何东西），其他客户端带这个头答 403。输入带 `cause: { peer: "external:<名字>", basis: "none" }`（客户端不能设置 cause），有路由记录（`matched[0].bindingId = "external:<名字>"`），回复路由是会话的 `local` 路由。外部主体不能是人：配置的 `principal` 不以 `external:` 开头、是 owners 之一，或 `labels` 含 `owner`，加载时报错；所以它触发的轮次默认 `restricted`。不收的会话：没人用过的键、`run:`、`host:` / `external:` 投递日志。
+- **实现**：`packages/daemon/src/external-mcp.ts` `externalOrigin`、`ExternalMcp.input`；`packages/daemon/src/config.ts` `resolveExternalMcp`；`packages/host-mcp/src/external.ts` `ExternalMcpServer.authenticate`（`DECLARED_HEADER`）、`admit`。
+- **测试**：标签 `#ID-10`；`packages/daemon/test/external-mcp.test.ts` "an input is stamped by the daemon: kind peer, the client principal (never a person), evidence device_only, a cause, a routing record; the turn runs restricted"、"an external principal is never a person: owner labels, owner ids and non-external principals are config errors"、"only a client allowed to declare may say whom it acts for (X-Agents-IO-Declared)"、"inputs from outside pass the lane checkpoint: past pair.maxTurns they are kept as context, with a loop_guard notice"。
+- **状态**：有测试。
+
 ---
 
 ## 5. 可解释性（EX）
@@ -378,6 +394,13 @@
 - **测试**：标签 `#EX-7`；`packages/daemon/test/runs.test.ts` "the input is the host's: its id and correlation id are kept (not in what the model is shown), echoed by run.ended, and explain names the run"、"refuses an inputId another input has, ids that are not plain tokens and bad correlation ids; nothing runs"；`harness/claude-code/test/claude-code.test.ts` 与 `harness/codex/test/codex.test.ts` "a task run's correlation id never reaches the model"。
 - **状态**：有测试。
 - **注意**：`input_id_taken` 只看路由记录（保留 7 天，同 EX-1）；更早的输入、本地客户端输入（没有路由记录）的 id 查不到。宿主应在自己的命名空间里取 id。
+
+### EX-8 外部客户端的发送，explain 说出是哪个客户端、替谁
+
+- **承诺**：`aio explain <operationId>`（宿主 `explain`、对外端点的 `explain` 工具）对外部客户端的发送答 `EffectExplanation`：会话键 `external:<名字>`、没有轮次、`inputIds: []`、路由与结果，以及 `external: { client, principal, declared? }`；本部署轮次与宿主 `deliver` 的发送没有 `external`。外部客户端排进的输入，`aio explain <inputId>` 答它的路由记录（ID-10）。
+- **实现**：`packages/daemon/src/records.ts` `OutboundRecord.external`；`packages/daemon/src/gateway.ts` `indexOutbound`、`explainEffect`；协议 `ExternalSender`、`EffectExplanation.external`。
+- **测试**：标签 `#EX-8`；`packages/daemon/test/external-mcp.test.ts` "explain of an external send names the client, its principal and whom it declared"。
+- **状态**：有测试。
 
 ---
 
@@ -722,6 +745,13 @@
 - **测试**：标签 `#CF-9`；`packages/session/test/agent-messaging.test.ts` "denies by default; policy.agentContacts allows by agent name or *, per op"；`packages/daemon/test/agent-messaging.test.ts` "Policy.contact: denied without policy.agentContacts; a host listing the contact callout decides, a failing host falls back to the local answer"。
 - **状态**：有测试（钩子本身）。
 
+### CF-10 外部客户端缺省拒绝：没有 scope 就什么都不能做；宿主可再收紧
+
+- **承诺**：对外 MCP 端点只列出、只允许调用客户端 scope 允许的工具：`read` 给 `sessions_list` / `session_events` / `explain` / `channels_status`，`read:<会话模式>` 只给前三个、且只涉及匹配的会话（列表过滤；日志与 explain 涉及模式外的会话即拒绝），`send:<路由模式>` 给 `send_message`，`input:<会话模式>` 给 `session_input`；没有 scope 的客户端一个工具都没有；不认识的 scope 是配置错误。`*` 匹配任意一串字符，其余照字面。宿主的 hello `callouts` 列了 `external` 时，每次写（发送、输入）都问它（`policy { hook: "external" }`），拒绝、超时（`hostCallouts.external.timeoutMs`，缺省 2000 ms）、出错、答复不合 schema 都拒绝；这个宿主断开后（名字记在本地库里，跨重启）所有外部写都拒绝，直到它重连或一个不列 `external` 的宿主连上。读不问宿主。
+- **实现**：`packages/host-mcp/src/external.ts` `EXTERNAL_TOOL_DEFS`（`scope`）、`ExternalMcpServer.allowed` / `build` / `call`、`globMatch`、`parseScope`；`packages/daemon/src/config.ts` `resolveExternalMcp`；`packages/daemon/src/external-mcp.ts` `hostAllows`；`packages/daemon/src/host.ts` `externalHeldBy`、`externalCallout`、`EXTERNAL_FLAG`、`HOOKS`；协议 `ExternalCallout`、`ExternalCalloutAnswer`。
+- **测试**：标签 `#CF-10`；`packages/daemon/test/external-mcp.test.ts` "denies by default: a client lists and may call only the tools its scopes allow"、"read:<pattern> sees only matching sessions: list, events and explain; send:<pattern> and input:<pattern> bound the targets"、"a host listing the external hook decides every write; deny, timeout, error, bad answers and the host being away deny"。
+- **状态**：有测试。
+
 ---
 
 ## 12. 协议与一致性（PR、CN、HC）
@@ -799,6 +829,14 @@
 - **实现**：`packages/host-mcp/src/tools.ts` `sendFile`（先 `realpath` 文件与 cwd，再 `inside`；`bypass` 轮次不限）；嵌入方可经 `HostToolsOptions.fileAccess` 换掉默认判断。
 - **测试**：标签 `#SE-4`；例：`packages/host-mcp/test/host-mcp.test.ts` "send_file refuses missing files, both/neither args, outside cwd in a restricted turn, and channels without media #SE-4"、"send_file in a restricted turn: symlinks and .. cannot escape the working directory #SE-4"。
 - **状态**：有测试。
+
+### SE-5 对外 MCP 端点缺省关闭、只听回环、每个客户端自己的令牌，有大小与频率上限
+
+- **承诺**：没有 `externalMcp`（或 `enabled: false`）就不监听，`features` 不列 `external.mcp`；`listen` 只许回环地址（`127.0.0.1`、`::1`），其他地址加载配置时报错；每个请求要某个客户端的 bearer 令牌（按 SHA-256 摘要以 `timingSafeEqual` 与每个客户端比较，不提前退出），否则 401；带 `Origin` 头（浏览器）或 `Host` 不是回环名的请求 403；GET / DELETE 405；请求体超过 `limits.maxBodyBytes`（缺省 256 KiB）413；每个客户端每分钟请求超过 `limits.requestsPerMinute`（缺省 120）429 带 `Retry-After`，写超过 `limits.writesPerMinute`（缺省 20）工具报错，`text` 超过 `limits.maxTextChars`（缺省 16000）报错。令牌只来自 `env:NAME` 或 `tokenFile`（存在则读、不存在则生成 0600，检查同 HQ-7），字面量、过短（< 16）或含空白的令牌是配置错误且不回显值；客户端令牌不得是宿主令牌、两个客户端不得相同。
+- **实现**：`packages/host-mcp/src/http.ts` `McpHttpEndpoint`（`isLoopback`、`localOnly`、`readBody`、`admit`）；`packages/host-mcp/src/external.ts` `ExternalMcpServer`（`authenticate`、`Window`）；`packages/daemon/src/config.ts` `resolveExternalMcp`；`packages/daemon/src/external-mcp.ts` 构造函数（`tokenFromFile`、宿主令牌检查）；`packages/daemon/src/gateway.ts` `startExternalMcp`；`packages/daemon/src/console-config.ts` `isCredential`（`tokenFile` 是路径）。
+- **测试**：标签 `#SE-5`；`packages/daemon/test/external-mcp.test.ts` "is off without externalMcp (and with enabled: false): nothing listens, external.mcp is not advertised"、"listens on loopback only; a literal token, a short one, a missing variable are config errors that never echo the value"、"needs the bearer token of a configured client (401 otherwise), refuses browsers and foreign Host headers (403), bounds the body (413)"、"tokens: a token file is generated 0600 when missing; a client may not use the host token"、"rate-limits requests (429 with Retry-After) and writes per client"、"only a client allowed to declare may say whom it acts for (X-Agents-IO-Declared)"。
+- **状态**：有测试。
+- **注意**：没有 `allowRemote`：远处的客户端应经宿主自己的代理（认证、限定、审计都在宿主）。
 
 ---
 

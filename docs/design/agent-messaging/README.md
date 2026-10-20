@@ -235,7 +235,7 @@ type AgentAddress = { agent: string; sessionKey: string };
 | 3 消息（`agent_send`） | 目标地址 → lane；输入按 §4.2 盖章，`basis: internal`，`hop = 本轮 + 1`；回复路由是发送方的 `agent` 路由，对方的回复（compositor 对 `agent` 通道的投递）在守护进程内变成发送方 session 的新输入，同样加一跳；`Policy.contact(op: send)`；截停时工具返回错误 |
 | 4 任务（`agent_run`） | 复用 `run.start` 的 `Runs` 路径（`daemon/src/runs.ts`），内部调用多带 `cause`；run 的输入 `hop = 本轮 + 1`，`RunEnded` 结果作为调用方 session 的输入回来，再加一跳；宿主发起的 `run.start` 可带不透明的关联 id（只记录、explain 可见），本身是根 |
 | 5 观察与控制 | 状态通知是 `kind: system` 输入，不是 agent 输入，不加跳、不计成对次数；打断/插话走 `Policy.control`（agent 主体是本轮 owner 时可打断自己开的轮次）；代为审批是新的 Resolver 种类，`ResolvedBy.via = "agent:<agent>:<sessionKey>"`，须显式开启 |
-| 外部 MCP 端点 | 外部 agent 进来时 `kind: agent`、证据为端点的认证方式（不是 `daemon`），cause 由对方声明时 `basis: declared` |
+| 外部 MCP 端点 | 外部 agent 进来时 `kind: agent`、证据为端点的认证方式（不是 `daemon`），cause 由对方声明时 `basis: declared`（2026-10-20 实现时改为 `kind: "peer"`、证据 `device_only`、`basis: none`，见 `docs/design/external-mcp/` §8） |
 
 ## 6. 方案比较
 

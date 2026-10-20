@@ -1,10 +1,9 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import type { IncomingMessage } from 'node:http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import type { TurnProvenance } from '@agents-io/protocol';
+import { McpHttpEndpoint } from './http.js';
 import { ToolError, type CallMeta, type HostTools, type ToolBinding } from './tools.js';
 
 export const SERVER_NAME = 'agents_io';
@@ -148,12 +147,6 @@ export interface HostMcpServerOptions {
   onCall?: (e: { binding: ToolBinding; tool: string; meta: Record<string, unknown> | undefined; ok: boolean; error?: string; provenance?: TurnProvenance }) => void;
 }
 
-function isLoopback(host: string): boolean {
-  if (host === '::1') return true;
-  const v4 = /^(\d{1,3})\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.exec(host);
-  return v4 !== null && v4[1] === '127';
-}
-
 /** `_meta` keys harnesses put their own tool-call id under. */
 const CALL_ID_KEYS = ['claudecode/toolUseId', 'codex/callId', 'callId', 'call_id', 'toolCallId', 'tool_call_id'];
 
@@ -173,36 +166,36 @@ function callIdOf(meta: Record<string, unknown> | undefined): string | undefined
  * (sessionKey, generation). The current turn is resolved at call time.
  */
 export class HostMcpServer {
-  private http: Server | undefined;
   private readonly tokens = new Map<string, ToolBinding>();
   /** Tokens limited to some tools (the agent's `tools` list). */
   private readonly allowed = new Map<string, ReadonlySet<string>>();
-  private base: string | undefined;
+  private readonly endpoint: McpHttpEndpoint<{ b: ToolBinding; allow?: ReadonlySet<string> }>;
 
-  constructor(private readonly o: HostMcpServerOptions) {}
+  constructor(private readonly o: HostMcpServerOptions) {
+    // The tokens are bearer credentials sent in clear text: never reachable off this machine.
+    this.endpoint = new McpHttpEndpoint({
+      ...(o.host !== undefined ? { host: o.host } : {}),
+      ...(o.port !== undefined ? { port: o.port } : {}),
+      authenticate: (req) => this.binding(req),
+      build: (a) => this.build(a.b, a.allow),
+    });
+  }
 
   async listen(): Promise<string> {
-    if (this.base) return this.base;
-    // The tokens are bearer credentials sent in clear text: never reachable off this machine.
-    const bind = this.o.host ?? '127.0.0.1';
-    if (!isLoopback(bind)) throw new Error(`HostMcpServer: host ${JSON.stringify(bind)} is not a loopback address (use 127.0.0.1 or ::1)`);
-    const http = createServer((req, res) => void this.handle(req, res));
-    await new Promise<void>((resolve, reject) => {
-      http.once('error', reject);
-      http.listen(this.o.port ?? 0, bind, () => resolve());
-    });
-    http.unref();
-    this.http = http;
-    const a = http.address() as AddressInfo;
-    const host = a.family === 'IPv6' ? `[${a.address}]` : a.address;
-    this.base = `http://${host}:${a.port}/mcp`;
-    return this.base;
+    try {
+      return await this.endpoint.listen();
+    } catch (e) {
+      throw new Error(`HostMcpServer: ${(e as Error).message.replace(/^MCP endpoint: /, '')}`);
+    }
   }
 
   /** The endpoint URL (after `listen`). */
   get url(): string {
-    if (!this.base) throw new Error('HostMcpServer is not listening');
-    return this.base;
+    try {
+      return this.endpoint.url;
+    } catch {
+      throw new Error('HostMcpServer is not listening');
+    }
   }
 
   /** A new token for one harness binding. */
@@ -236,12 +229,7 @@ export class HostMcpServer {
   }
 
   async close(): Promise<void> {
-    const h = this.http;
-    this.http = undefined;
-    this.base = undefined;
-    if (!h) return;
-    h.closeAllConnections?.();
-    await new Promise<void>((r) => h.close(() => r()));
+    await this.endpoint.close();
   }
 
   private binding(req: IncomingMessage): { b: ToolBinding; allow?: ReadonlySet<string> } | undefined {
@@ -257,36 +245,6 @@ export class HostMcpServer {
       }
     }
     return undefined;
-  }
-
-  private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const path = (req.url ?? '').split('?')[0];
-    if (path !== '/mcp') {
-      res.writeHead(404).end();
-      return;
-    }
-    const found = this.binding(req);
-    if (!found) {
-      res.writeHead(401, { 'content-type': 'application/json', 'www-authenticate': 'Bearer' }).end(JSON.stringify({ error: 'invalid or missing bearer token' }));
-      return;
-    }
-    if (req.method !== 'POST') {
-      // Stateless: no standalone SSE stream and no sessions to delete.
-      res.writeHead(405, { allow: 'POST' }).end();
-      return;
-    }
-    const server = this.build(found.b, found.allow);
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
-    res.on('close', () => {
-      void transport.close();
-      void server.close();
-    });
-    try {
-      await server.connect(transport);
-      await transport.handleRequest(req, res);
-    } catch (e) {
-      if (!res.headersSent) res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: (e as Error).message }));
-    }
   }
 
   private build(b: ToolBinding, allow?: ReadonlySet<string>): McpServer {
