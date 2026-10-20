@@ -879,6 +879,14 @@
 - **测试**：标签 `#RT-1`；例：`packages/session/test/router.test.ts` `binding match fields` 组（"channel, account, conversation, conversationKind, senders #RT-1" 等 6 条）、"fans out to every matching rule; per session the strongest action wins #RT-1 #EX-1"、"on a tie the earlier rule wins (config before host before watches) #RT-1"、"host and drop are independent of the session deliveries #RT-1"、"rejects tables that target task agents or unknown agents, and other invalid tables #RT-1"。
 - **状态**：有测试。
 
+### RT-2 适配器说"不是对本部署说的"（`observe`），默认路由不开轮；表情回应永远是 `observe`
+
+- **承诺**：入站信封带 `admission: "observe"` 时，守护进程自己的路由不因它开轮：默认表（`policy.owners` 生成）里主人在私聊里的这类输入只记作该私聊会话的 context（`default:observe-dm`，与 `default:owner-dm` 同一个会话），陌生人与访客的不命中任何规则；`policy.strangers: "ask"` 不为它问主人、访客的也不开轮。私聊里没有提示或提示 `dispatch` 的照旧开轮。飞书适配器把人对本机器人消息的表情回应作为 `observe` 信封交出（`event` 块 `reaction`），应用的表情回应（本机器人自己的确认表情在内）与对别人消息的回应一律不交。宿主表与回调仍可让任何输入开轮（提示只是提示，RT-1）。
+- **实现**：`packages/session/src/router.ts` `defaultBindings`（`default:owner-dm` 带 `mentions: ["self"]`，新增 `default:observe-dm`）、`addressesSelf`；`packages/daemon/src/gateway.ts`（`onUndispatched` 按 `addressesSelf` 判定是否对本部署说话）；`channel/lark-bot/src/reactions.ts` `mapReaction`（`admission: "observe"`，`operator_type` 不是 `user` 就不交）、`ReactionPlacer.placement`（只认本应用发出的回答与输出工具消息）；`channel/lark-bot/src/adapter.ts` `onReaction`。
+- **测试**：标签 `#RT-2`；`packages/session/test/router.test.ts` "an owner DM the adapter marks observe (a reaction) is context in the DM's session, never a turn; a stranger's is dropped"；`packages/daemon/test/strangers.test.ts` "a stranger's DM activity the adapter marks observe (a reaction) is never asked about and runs nothing"；`channel/lark-bot/test/reactions.test.ts` "a person's reaction on the bot's answer is an observe input of the answer's conversation; apps' reactions and reactions on others' messages never pass"。
+- **状态**：有测试（假通道、假飞书）。飞书真机未核实（`docs/E2E.md` Tier 2 的手工步骤）。
+- **注意**：自己发 `observe` 私聊信封、却指望主人的这类消息开轮的私有适配器，在默认表下改为只记录。
+
 ### RN-1 任务运行的结局
 
 - **承诺**：`run.start` 在新的 `run:<id>` session 里跑一轮任务 agent；退出码含义固定：0 完成、1 失败、3 ambiguous（含上一个进程留下的）、124 超时（`status: "timeout"`）、130 取消；发起的连接离开后运行继续，`run.ended` 交给宿主；守护进程停止时运行被打断（先在日志里记 `notice { code: "run_stopping" }`），以 `interrupted`、`error.code: "daemon_stopping"` 结束（harness 关会话时把这一轮记成别的结局的，按它记的），告知仍连着的发起者；`aio run` 阻塞到 `run.ended` 并以它的退出码退出。

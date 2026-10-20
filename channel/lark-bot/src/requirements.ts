@@ -38,6 +38,16 @@ export const TENANT_SCOPES: readonly ScopeRequirement[] = [
     why: 'acknowledgement reactions on inbound messages (im.v1.messageReaction create/delete, channel entry `ack`); without it there are none',
   },
   {
+    name: 'im:message.reactions:read',
+    tier: 'optional',
+    why: 'receive people\'s reactions on the bot\'s messages (im.message.reaction.created_v1 / deleted_v1, config `reactions`; im:message:readonly also grants them); without it there are none',
+  },
+  {
+    name: 'im:chat:readonly',
+    tier: 'optional',
+    why: 'tell a DM from a group (im.v1.chat.get) for a reaction in a chat no message of which arrived since the start; without it such reactions are dropped',
+  },
+  {
     name: 'cardkit:card:write',
     tier: 'optional',
     why: 'process cards as CardKit entities (create, streaming typewriter answer, element updates, card.update); without it they fall back to message patch (no typewriter, whole-card updates every editMinIntervalMs)',
@@ -53,7 +63,7 @@ export const TENANT_SCOPES: readonly ScopeRequirement[] = [
 export const COT_SCOPE_NOTE = 'message_cot uses im:message:send_as_bot; no separate scope verified';
 
 /** Event subscriptions (app identity). The adapter's WS dispatcher registers exactly these. */
-export const APP_EVENTS: readonly string[] = ['im.message.receive_v1'];
+export const APP_EVENTS: readonly string[] = ['im.message.receive_v1', 'im.message.reaction.created_v1', 'im.message.reaction.deleted_v1'];
 
 /** Callbacks (card interactions). */
 export const APP_CALLBACKS: readonly string[] = ['card.action.trigger'];

@@ -100,6 +100,19 @@ describe('strangers: ask', () => {
     expect(askCard(w.chat)).toBeUndefined();
   });
 
+  it('a stranger\'s DM activity the adapter marks observe (a reaction) is never asked about and runs nothing #ID-9 #RT-2', async () => {
+    const w = await setup();
+    await w.chat.inject({
+      conversation: { id: 'c-eve', kind: 'dm' },
+      sender: eve,
+      admission: 'observe',
+      content: [{ type: 'event', name: 'reaction', data: { emoji: 'THUMBSUP', action: 'added', messageId: 'om_1' } }],
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(askCard(w.chat)).toBeUndefined();
+    expect(w.harness.sessions).toHaveLength(1);
+  });
+
   it('a guest\'s turn asks the owner, in the owner\'s chat, about what it wants to do #ID-9 #RQ-5', async () => {
     const w = await setup({
       script: async (t) => {

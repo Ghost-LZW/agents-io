@@ -185,6 +185,7 @@ attach 里直接输入文字就是 queue 输入；`/steer <text>`、`/interrupt 
 - [ ] Codex `requestUserInput` / Claude Code `AskUserQuestion`：提问时出现独立表单卡片；填写并提交后，同一轮继续运行。让非指定人员提交应无效；无表单通道用提示里的 `/answer <问题代码> <答案>`。
 - [ ] `/interrupt` 后卡片 finalize 为 `Interrupted`。
 - [ ] Ctrl-C 停 serve 再启动：之前的 session 用 `session.bound` 里的原生 id 续接（claude `--resume` / codex `thread/resume`）。
+- [ ] 表情回应（INVARIANTS RT-2；先在开放平台订阅 `im.message.reaction.created_v1` / `deleted_v1`，开 `im:message.reactions:read`、`im:chat:readonly` 并发布）：对机器人的一条回答点 👍 → 不开轮、卡片不动；`aio tail main` 里有一条 `input.admitted observe_only`，内容 `[event reaction] {"emoji":"THUMBSUP","action":"added",…}`；再私聊一句，这一轮的输入里它排在前面（context）。取消 👍 → 又一条 `"action":"removed"`。对自己发的消息点表情、机器人自己的确认表情（`ack`）都不出现。重启 serve 后对重启前的回答点表情：仍然交出（`im.v1.chat.get` 认出私聊）。群里对机器人在群里的回答点表情：进那个群的会话，同样只记录。
 - [ ] 两个机器人（同一守护进程，决定 8；`policy.selfAccounts` 里**不写**对方）进同一个群，主人 @ 机器人 a 说一句：先核实飞书是否把 a 的回复卡片推给 b（b 的 `lark-bot:b:<群>` 会话日志里有没有那条 `input.admitted`）。推的话，那条输入应是 `self`、主体 `agent:<agent>`、`aio explain <它的 inputId>` 里 `cause.basis: "recovered"`、`hop: 1`；`aio explain --chain <它>` 走回主人那条消息（`end: "root"`）；b 不开轮（agent-messaging，INVARIANTS ID-8）。不推的话，在 ROADMAP §4"被外部条件挡住"记下结论。
 
 ### 1.4 手动：每会话 launch（决定 7，多租户）

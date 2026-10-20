@@ -862,7 +862,8 @@ export interface DefaultBindingsOptions {
  * The single-owner defaults (POSITIONING §4) as rules, in place of the old
  * `defaultPolicy.admit`:
  *
- * - `default:owner-dm` — the owner's DM starts a turn in the DM's current topic (in `ownerSessionKey` when set);
+ * - `default:owner-dm` — the owner's DM starts a turn in the DM's current topic (in `ownerSessionKey` when set),
+ *   unless the adapter marks it not addressed (`observe`, e.g. a reaction): then `default:observe-dm` records it as context there;
  * - `default:owner-<kind>` — the owner addressing the deployment anywhere else
  *   (`mentions: ["self"]`: an @ of the bot, or an adapter that hints `dispatch` or nothing) starts a turn there;
  * - `default:observe-<kind>` — anything else outside DMs is recorded as context of that conversation's session.
@@ -876,12 +877,23 @@ export function defaultBindings(o: DefaultBindingsOptions): Binding[] {
   const out: Binding[] = [
     {
       id: 'default:owner-dm',
-      match: { conversationKind: 'dm', labels: [label] },
+      // `self`: everything in a DM unless the adapter says it is not addressed (`observe`: a reaction).
+      match: { conversationKind: 'dm', labels: [label], mentions: ['self'] },
       on: 'dispatch',
       agent: o.agent,
       // One topic at a time in a flat DM (decision 6); a DM thread stays its own session.
       session: o.ownerSessionKey ? { key: o.ownerSessionKey } : 'topic',
       note: 'the owner talking to the deployment directly',
+    },
+    {
+      id: 'default:observe-dm',
+      // What the owner does in the DM that is not addressed to the deployment (RT-2): context only.
+      match: { conversationKind: 'dm', labels: [label] },
+      on: 'context',
+      agent: o.agent,
+      // Context of a flat DM goes to its current topic (`scope`).
+      session: o.ownerSessionKey ? { key: o.ownerSessionKey } : 'per-conversation',
+      note: 'the owner\'s DM activity not addressed to the deployment (a reaction)',
     },
   ];
   for (const kind of NON_DM_KINDS) {
