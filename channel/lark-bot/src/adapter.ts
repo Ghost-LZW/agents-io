@@ -7,6 +7,7 @@ import type {
   ChannelCaps,
   ChannelContext,
   EmitResult,
+  HistoryScope,
   InboundEnvelope,
   ProgressView,
   RenderedMessage,
@@ -19,6 +20,7 @@ import { CardKitCard, LarkApiError, errCode } from './cardkit.js';
 import { resolveConfig, type LarkBotConfig, type ProcessMode, type ResolvedConfig } from './config.js';
 import { CotBubble, closeOpenBubble, type OpenBubble } from './cot.js';
 import { InboundEnricher } from './enrich.js';
+import { HistoryFetcher } from './history.js';
 import { CHANNEL_ID, mapCardAction, mapMessageEvent } from './inbound.js';
 import {
   EL,
@@ -170,6 +172,9 @@ export class LarkBotAdapter implements ChannelAdapter {
   private readonly stateDir: string | undefined;
   /** union_id / user_id → open_id, learned from inbound events (at tags need an open_id). */
   private readonly openIds = new Map<string, string>();
+  /** open_id → union_id, learned from inbound events (history lists users by open_id; inbound ids are union_ids). */
+  private readonly unionIds = new Map<string, string>();
+  private readonly historyFetcher: HistoryFetcher;
   /** blob ref → uploaded Lark key, so a retried send does not upload again. */
   private readonly uploads = new Map<string, { ref: string; mime: string }>();
   private readonly enricher: InboundEnricher;
@@ -194,6 +199,20 @@ export class LarkBotAdapter implements ChannelAdapter {
     this.blobs = opts.blobs;
     this.stateDir = opts.stateDir;
     this.enricher = new InboundEnricher({ client: () => this.client, store: this.store, cfg: this.cfg, now: this.now, log: (l, m) => this.log(l, m) });
+    this.historyFetcher = new HistoryFetcher({
+      client: () => this.client,
+      cfg: this.cfg,
+      account: () => this.account,
+      botOpenId: () => this.botOpenId,
+      enricher: this.enricher,
+      unionOf: (openId) => this.unionIds.get(openId),
+      learn: (unionId, openId) => {
+        bounded(this.openIds, unionId, openId);
+        bounded(this.unionIds, openId, unionId);
+      },
+      now: this.now,
+      log: (l, m) => this.log(l, m),
+    });
   }
 
   caps(_account?: string): ChannelCaps {
@@ -361,14 +380,29 @@ export class LarkBotAdapter implements ChannelAdapter {
     return ready.then((e) => ctx.emit(e));
   }
 
-  /** Remember open_ids behind the union/user ids we hand out, for outbound at tags. */
+  /** Remember open_ids behind the union/user ids we hand out, for outbound at tags (and the reverse, for history). */
   private learnIds(ev: RawMessageEvent): void {
     const ids = [ev.sender?.sender_id, ...(ev.message?.mentions ?? []).map((m) => m.id)];
     for (const id of ids) {
       if (!id?.open_id) continue;
-      if (id.union_id) bounded(this.openIds, id.union_id, id.open_id);
+      if (id.union_id) {
+        bounded(this.openIds, id.union_id, id.open_id);
+        bounded(this.unionIds, id.open_id, id.union_id);
+      }
       if (id.user_id) bounded(this.openIds, id.user_id, id.open_id);
     }
+  }
+
+  /**
+   * Earlier messages of the thread an @ is in, or of its chat (`ChannelAdapter.history`,
+   * `config.historyOnMention`): `im.v1.message.list`, mapped like inbound messages, nothing
+   * downloaded. Never rejects: without the permission there is one warning and no history.
+   */
+  history(env: InboundEnvelope, scope: HistoryScope): Promise<InboundEnvelope[]> {
+    return this.historyFetcher.fetch(env, scope).catch((e: unknown) => {
+      this.log('warn', `lark history failed: ${e instanceof Error ? e.message : String(e)}`);
+      return [];
+    });
   }
 
   private openIdOf(id: string): string | undefined {

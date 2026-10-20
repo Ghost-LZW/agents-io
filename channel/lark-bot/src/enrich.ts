@@ -132,7 +132,7 @@ const idType = (id: string): 'union_id' | 'open_id' | 'user_id' => (id.startsWit
 
 export class InboundEnricher {
   private readonly quotes = new Map<string, { text: string }>();
-  private readonly names = new Map<string, { name: string | undefined; until: number }>();
+  private readonly names = new Map<string, { name: string | undefined; unionId?: string; until: number }>();
 
   constructor(private readonly d: EnrichDeps) {}
 
@@ -357,23 +357,35 @@ export class InboundEnricher {
 
   /** Display name via `contact.v3.user.get` (contact:user.base:readonly), cached with a TTL; undefined on any failure. */
   async senderName(id: string): Promise<string | undefined> {
-    if (!this.d.cfg.resolveSenderNames) return undefined;
+    return (await this.contact(id)).name;
+  }
+
+  /**
+   * Display name and union_id of a user (`contact.v3.user.get`, contact:user.base:readonly),
+   * cached with a TTL (a failure for 10 minutes); empty on any failure or with names off.
+   */
+  async contact(id: string): Promise<{ name?: string; unionId?: string }> {
+    if (!this.d.cfg.resolveSenderNames) return {};
     const now = this.d.now();
     const hit = this.names.get(id);
-    if (hit && hit.until > now) return hit.name;
+    const view = (h: { name: string | undefined; unionId?: string }) => ({ ...(h.name ? { name: h.name } : {}), ...(h.unionId ? { unionId: h.unionId } : {}) });
+    if (hit && hit.until > now) return view(hit);
     const api = this.d.client().contact?.v3.user;
-    if (!api) return undefined;
+    if (!api) return {};
     try {
       const res = await withTimeout(api.get({ path: { user_id: id }, params: { user_id_type: idType(id) } }), this.d.cfg.lookupTimeoutMs, 'contact.user.get');
       if (res?.code) throw new Error(`contact.user.get ${res.code}: ${res.msg ?? ''}`);
       const u = res?.data?.user;
       const name = u?.name || u?.nickname || u?.en_name || undefined;
-      put(this.names, id, { name, until: now + (name ? this.d.cfg.senderNameTtlMs : NAME_FAIL_TTL_MS) });
-      return name;
+      const entry = { name, ...(u?.union_id ? { unionId: u.union_id } : {}), until: now + (name ? this.d.cfg.senderNameTtlMs : NAME_FAIL_TTL_MS) };
+      put(this.names, id, entry);
+      // The same person by the id inbound events carry: one lookup serves both.
+      if (entry.unionId && entry.unionId !== id) put(this.names, entry.unionId, entry);
+      return view(entry);
     } catch (e) {
       put(this.names, id, { name: undefined, until: now + NAME_FAIL_TTL_MS });
       this.d.log('debug', `sender name of ${id} not resolved: ${errText(e)}`);
-      return undefined;
+      return {};
     }
   }
 }

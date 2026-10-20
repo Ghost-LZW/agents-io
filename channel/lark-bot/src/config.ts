@@ -96,12 +96,28 @@ export interface LarkBotConfig {
   resolveSenderNames?: boolean;
   /** How long a resolved name is cached. Default 21600000 (6 h). */
   senderNameTtlMs?: number;
-  /** Timeout of each message.get / contact lookup. Default 5000. */
+  /** Timeout of each message.get / message.list / contact lookup. Default 5000. */
   lookupTimeoutMs?: number;
+  /**
+   * Earlier messages handed to the agent as context when the bot is @-ed (`ChannelAdapter.history`,
+   * docs/CHANNELS.md §1c): up to `thread` messages of the thread (topic) the @ is in, and, in a
+   * group chat whose session has had no turn yet, up to `chat` most recent messages of the chat.
+   * The gateway drops those the session already has. `false` (or 0) turns one or both off;
+   * `true` = the defaults. Default `{ thread: 50, chat: 20 }`, at most 200 each. Needs
+   * im:message (or im:message:readonly) and, in groups, im:message.group_msg; without them
+   * there is no history (one warning).
+   */
+  historyOnMention?: boolean | { thread?: number | false; chat?: number | false };
 }
 
-export interface ResolvedConfig extends Required<Omit<LarkBotConfig, 'encryptKey' | 'verificationToken' | 'botOpenId' | 'ackEmoji'>> {
+/** `historyOnMention` defaults. */
+export const HISTORY_DEFAULTS = { thread: 50, chat: 20 } as const;
+const HISTORY_MAX = 200;
+
+export interface ResolvedConfig extends Required<Omit<LarkBotConfig, 'encryptKey' | 'verificationToken' | 'botOpenId' | 'ackEmoji' | 'historyOnMention'>> {
   ackEmoji: { working: string; done: string; failed: string };
+  /** 0 = off. */
+  historyOnMention: { thread: number; chat: number };
   encryptKey?: string;
   verificationToken?: string;
   botOpenId?: string;
@@ -118,6 +134,7 @@ export function resolveConfig(c: LarkBotConfig): ResolvedConfig {
   }
   if (c.look !== undefined && c.look !== 'console' && c.look !== 'chat') throw new Error('lark-bot: look must be console or chat');
   if (c.cotOn !== undefined && c.cotOn !== 'turn' && c.cotOn !== 'tool') throw new Error('lark-bot: cotOn must be turn or tool');
+  const historyOnMention = resolveHistory(c.historyOnMention);
   return {
     ...c,
     maxChars: c.maxChars ?? 4000,
@@ -149,5 +166,21 @@ export function resolveConfig(c: LarkBotConfig): ResolvedConfig {
     resolveSenderNames: c.resolveSenderNames ?? true,
     senderNameTtlMs: c.senderNameTtlMs ?? 21_600_000,
     lookupTimeoutMs: c.lookupTimeoutMs ?? 5000,
+    historyOnMention,
   };
+}
+
+function resolveHistory(h: LarkBotConfig['historyOnMention']): ResolvedConfig['historyOnMention'] {
+  if (h === undefined || h === true) return { ...HISTORY_DEFAULTS };
+  if (h === false) return { thread: 0, chat: 0 };
+  if (!h || typeof h !== 'object' || Array.isArray(h)) throw new Error('lark-bot: historyOnMention must be true, false or { thread?, chat? }');
+  const out = { ...HISTORY_DEFAULTS } as { thread: number; chat: number };
+  for (const k of Object.keys(h)) {
+    if (k !== 'thread' && k !== 'chat') throw new Error(`lark-bot: historyOnMention has no ${JSON.stringify(k)} (thread, chat)`);
+    const v = (h as Record<string, unknown>)[k];
+    if (v === false) out[k] = 0;
+    else if (typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= HISTORY_MAX) out[k] = v;
+    else throw new Error(`lark-bot: historyOnMention.${k} must be an integer from 0 to ${HISTORY_MAX}, or false`);
+  }
+  return out;
 }

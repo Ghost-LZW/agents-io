@@ -7,7 +7,7 @@ agents-io channel adapter for the official Feishu/Lark bot platform: events arri
 Provision the app with [create-lark-bot](https://github.com/Ghost-LZW/create-lark-bot); this package does not create or configure apps. Pass it a custom name and avatar, and request at least what this adapter needs:
 
 - event `im.message.receive_v1`, callback `card.action.trigger`;
-- the tenant scopes in `src/requirements.ts` (`TENANT_SCOPES`, also exported). `runtime` scopes are required; `optional` ones enable reading non-@ group messages and attachment download.
+- the tenant scopes in `src/requirements.ts` (`TENANT_SCOPES`, also exported). `runtime` scopes are required; `optional` ones enable reading non-@ group messages (and a group's history when @-ed) and attachment download.
 
 `scopesJson()` returns the same list in the console's batch-import format. A test fails if the adapter starts registering an event or callback that is not listed in `requirements.ts`, so the list stays in step with the code.
 
@@ -23,6 +23,8 @@ npx github:Ghost-LZW/create-lark-bot#v0.2.3 verify --live
 `messaging` covers every scope, event and callback in `requirements.ts`; `contact` lets the tool resolve your union_id, which it writes as the owner key.
 
 Inbound `merge_forward` messages are expanded with `im.v1.message.get`: the agent receives the child messages in their original hierarchy (`upper_message_id`), with numbered paths such as `2.3`, sender IDs, text, and rich text. The first four images/files/audio/video resources (including those in rich text) are downloaded using the outer forwarded message ID and attached after the text, labeled by the same path. Text is capped at 100 messages and 16,000 characters. If the bot cannot read the forwarded content or download a resource, the input says so explicitly.
+
+When the bot is @-ed in a topic (thread), or in a group chat whose session has had no turn yet, the adapter lists the earlier messages with `im.v1.message.list` (`ChannelAdapter.history`) and the gateway hands those the session does not have yet to the agent as context before the @ (docs/CHANNELS.md §1c). `config.historyOnMention` sets how many: default `{ "thread": 50, "chat": 20 }`, `false` turns it off. Media in them stay `lark-file:` refs (nothing is downloaded). It needs `im:message` (or `im:message:readonly`) and, in groups, `im:message.group_msg`; without them there is one warning and no history.
 
 Then give the adapter the credentials (`appId`, `appSecret`, `domain` in its config; the aio daemon reads them per channel entry, or from `LARK_APP_ID` / `LARK_APP_SECRET` / `LARK_DOMAIN` for a single entry). An adapter sends only to routes of the account it was started with (several bots in one daemon each have their own account). The owner key that `defaultPolicy({ owners })` from `@agents-io/session` matches is `lark-bot:<union_id>`, because the adapter identifies senders by `union_id` first (falling back to `open_id`).
 

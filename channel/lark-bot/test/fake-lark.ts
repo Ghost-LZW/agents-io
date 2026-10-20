@@ -48,7 +48,9 @@ export class FakeLark {
   /** `im.v1.file.create` / `image.create` calls, in order. */
   readonly uploads: { kind: 'file' | 'image'; fileType?: string; name?: string; bytes: number; key: string }[] = [];
   /** Contact users by id (`contact.v3.user.get`). */
-  readonly users = new Map<string, { name: string }>();
+  readonly users = new Map<string, { name: string; union_id?: string }>();
+  /** Chat / thread histories (`message.list`) by `chat:<chat_id>` / `thread:<thread_id>`, oldest first. */
+  readonly histories = new Map<string, LarkMessageItem[]>();
   /** Calls of the inbound lookups, e.g. `resource:om_1/img_1:image`, `get:om_p`, `user:on_alice:union_id`. */
   readonly lookups: string[] = [];
   /** Longest event content `message_cot` takes (UTF-8 bytes); Lark's real limit is not documented. */
@@ -205,6 +207,19 @@ export class FakeLark {
             m.updates.push(data);
             return { code: 0, data: {} };
           },
+          list: async ({ params }) => {
+            this.lookups.push(`list:${params.container_id_type}:${params.container_id}:${params.page_size ?? ''}${params.page_token ? `:${params.page_token}` : ''}`);
+            const f = this.failing('message.list');
+            if (f) return f;
+            let all = [...(this.histories.get(`${params.container_id_type}:${params.container_id}`) ?? [])];
+            if (params.end_time !== undefined) all = all.filter((i) => Number(i.create_time) <= Number(params.end_time) * 1000);
+            if (params.sort_type === 'ByCreateTimeDesc') all.reverse();
+            const start = Number(params.page_token ?? 0);
+            const size = params.page_size ?? 20;
+            const items = all.slice(start, start + size);
+            const more = start + size < all.length;
+            return { code: 0, data: { items, has_more: more, ...(more ? { page_token: String(start + size) } : {}) } };
+          },
           get: async ({ path }): Promise<LarkApiResponse<{ items?: LarkMessageItem[] }>> => {
             this.lookups.push(`get:${path.message_id}`);
             const other = this.foreign.get(path.message_id);
@@ -274,7 +289,7 @@ export class FakeLark {
           get: async ({ path, params }) => {
             this.lookups.push(`user:${path.user_id}:${params?.user_id_type}`);
             const u = this.users.get(path.user_id);
-            return u ? { code: 0, data: { user: { name: u.name } } } : { code: 41050, msg: 'no user authority' };
+            return u ? { code: 0, data: { user: { name: u.name, ...(u.union_id ? { union_id: u.union_id } : {}) } } } : { code: 41050, msg: 'no user authority' };
           },
         },
       },
@@ -389,5 +404,35 @@ export function messageEvent(over: {
       ...(over.thread ? { thread_id: over.thread } : {}),
       ...(over.mentions ? { mentions: over.mentions } : {}),
     },
+  };
+}
+
+/** One `message.list` item from a user (open_id) or an app (app_id). */
+export function listed(over: {
+  id: string;
+  text?: string;
+  type?: string;
+  content?: unknown;
+  at: number;
+  user?: string;
+  app?: string;
+  parent?: string;
+  root?: string;
+  thread?: string;
+  deleted?: boolean;
+  mentions?: { key: string; id: string; name: string }[];
+}): LarkMessageItem {
+  return {
+    message_id: over.id,
+    msg_type: over.type ?? 'text',
+    create_time: String(over.at),
+    chat_id: 'oc_chat',
+    ...(over.parent ? { parent_id: over.parent } : {}),
+    ...(over.root ? { root_id: over.root } : {}),
+    ...(over.thread ? { thread_id: over.thread } : {}),
+    ...(over.deleted ? { deleted: true } : {}),
+    sender: over.app ? { id: over.app, id_type: 'app_id', sender_type: 'app' } : { id: over.user ?? 'ou_alice', id_type: 'open_id', sender_type: 'user' },
+    body: { content: JSON.stringify(over.content ?? { text: over.text ?? '' }) },
+    ...(over.mentions ? { mentions: over.mentions.map((m) => ({ ...m, id_type: 'open_id' })) } : {}),
   };
 }

@@ -97,7 +97,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 
 ## 1b. 只记录的输入怎样交给 agent
 
-规则或监听的动作是 `context` 的输入（群里没 @ 机器人的话、`context` 模式的监听、会议这类只观察的流）不开轮，但不会只停在日志里：这个 session **下一次开轮时**，自上一轮以来记下、还没交出去的这些输入，按到达顺序排在触发这一轮的输入**前面**，一起交给 harness。
+规则或监听的动作是 `context` 的输入（群里没 @ 机器人的话、`context` 模式的监听、会议这类只观察的流）不开轮，但不会只停在日志里：这个 session **下一次开轮时**，自上一轮以来记下、还没交出去的这些输入，按到达顺序排在触发这一轮的输入**前面**，一起交给 harness（被 @ 时取来的历史按发送时间插在其中，§1c）。
 
 - **每条保留自己的来源**：仍是原发送者的 `origin`（陌生人就是 `from=unknown`），所以照常有 §1 的发送者说明行，agent 知道是谁说的。
 - **明确标成"不是对你说的"**：`channelContext` 加 `context=true`（经监听来的还带 `watch=<id>`），渲染时在发送者说明行前多一行：
@@ -118,6 +118,28 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 - **重启后不丢**：只记录的输入在日志的 `input.admitted`（`observe_only`）里带着整条输入记录；网关重启后 session 从日志重建"已记录、未交出"的部分，下一轮照样交出；已经交过（或当时因上限被略去）的不会再交。
 
 所以群聊里陌生人说了两句话、主人随后 @ 机器人问"他们说了什么"，agent 在那一轮里能直接看到这两句话（e2e 场景 `context-listen`）。
+
+## 1c. 被 @ 时补上之前的讨论（历史）
+
+§1b 只交网关收到过的话。机器人入群之前的讨论、没有群消息权限时别人说的话、网关停着时说的话，它都没收到。所以话题或群聊里的一条通道消息被 **dispatch** 到某个 session 时（通常是被 @），网关先向发出它的通道实例要这段对话更早的消息（`ChannelAdapter.history(env, scope)`，可选；INVARIANTS IN-9）：
+
+| 这条消息在 | 要什么（`scope`） | 什么时候要 |
+|---|---|---|
+| 话题（`conversationKind: "thread"`） | 这个话题里更早的消息（`thread`） | 每次 |
+| 群聊（`group`） | 群里最近的消息（`chat`） | 只在这个 session 还没 dispatch 过任何输入时（入群后第一次被 @、或者是新 session） |
+| 私聊、邮件、会议等 | 不要 | — |
+
+按话题分会话的对话（决定 6，规则 `session: "topic"`），第二个及以后的话题（`/new`、`session_rotate`）是有意重新开始，不要历史。
+
+- **只补没有的**：取来的每条用它作为事件到达时的输入 id；接收 session 已经有的（开过轮的、记过上下文的、交过的）不再记。剩下的记成上下文（`input.admitted observe_only`），和 §1b 的上下文一样在这一轮交给 harness：同样的发送者说明行、`context=true`、"not addressed to you" 一行，多一个 `history="thread"` 或 `history="chat"`；按发送时间排进待交的上下文，都在触发消息之前；同样受每轮 50 条 / 20000 字符的上限（保留最新的）。之后同一条消息再作为事件到达，答 `duplicate`，不当修订、不再交一次。
+- **怎么盖章**：每条照入站消息处理：`Policy.identify` 认人；证据至多与触发消息相同；不带 `declared` 和跳数声明；本部署自己发过的消息由出站索引认出（`self=true`，来自哪个 agent），**接收它的 session 自己发的不交**（harness 本来就有），别的 session（另一个话题、宿主换过的会话键）发的作为 `self` 上下文交。只认同一通道、同一账号、早于触发消息、不是它本身的条目，别的丢掉。
+- **不经路由**：历史不走 Binding 表、不经宿主回调、不进监听，只跟着那条已经 dispatch 的消息进同一个 session；宿主的参与者记录不会因为历史里的人而变化。
+- **没有 `ref`**：网关没有收到过这些消息，`aio verify` 核不了，所以说明行里没有 `ref`。
+- **取不到就没有**：通道答不出（缺权限、超时、抛错）或交回不合格的条目，只是没有（那几条）历史，消息照常开轮；网关记一行 warn（`history (…) not handed`）。
+- **时间**：取历史在开轮之前、在通道交出这条消息的路径上（飞书超过 `ackTimeoutMs` 先确认事件，见 §2），一次列表请求，通常几百毫秒。
+- **重启**：已经记下的历史在日志里，重启后照样算"已有"。
+
+飞书的做法和配置见 §2"被 @ 时的历史"。其他通道没有实现 `history` 时没有这一步。
 
 ## 2. 飞书 / Lark 机器人（`channel/lark-bot`，档位 `card`）
 
@@ -151,6 +173,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 | 私聊机器人 | 主人：触发一轮。默认配置 `ownerSessionKey: "main"`，主人的私聊都进 session `main`。陌生人：丢弃 |
 | 群里 @ 机器人 | 主人：触发一轮。非主人：只记录，不开轮 |
 | 群里不 @ 机器人 | 只记录（observe），不开轮，下一轮作为 context 交给 agent（§1b）。需要 `im:message.group_msg` 权限才收得到 |
+| 话题里被 @；群里第一次被 @ | 先取这个话题（或群里最近）的历史，会话还没有的作为 context 排在这条前面（§1c，下面"被 @ 时的历史"） |
 | 文本 | 原文。@机器人 被去掉，@其他人 变成 `@名字` |
 | 富文本（post） | 拍平成文字，里面的图片、文件变成引用 |
 | 图片 / 文件 / 语音 / 视频（含富文本里的图片） | 用 `im.v1.messageResource.get` 下载进 blob 存储，变成带真实类型和文件名的 `sha256:` 引用（类型取响应头，没有就按文件头识别；语音默认 `audio/opus`，视频 `video/mp4`）。单个上限 20MB（`mediaMaxBytes`），30 秒超时（`mediaTimeoutMs`）。下载失败、超限或没有 blob 存储时保留 `lark-file:` 引用，并在后面加一行 `[image 键 not downloaded: 原因]` 说明 |
@@ -158,6 +181,16 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 | 回复某条消息 | 前面加一个引用块：用 `im.v1.message.get` 取回被回复的消息，拍平成文字（卡片取它显示的文字，图片文件变成 `[image]`、`[file 名称]`），最多 500 字（`quoteMaxChars`），按消息 id 缓存。被回复的是本机器人发出、且记录过发送身份的消息时，引用块带 `declared`。取不到时退回只有消息 id 的空引用块 |
 | 卡片按钮 | 审批按钮变成 resolve 命令，"停止"按钮变成 interrupt 命令，原生提问的表单提交变成 answer 命令，都不会作为文字发给 agent；其他按钮变成 `[event action] …` |
 | 其他消息类型（表情包、分享卡片等） | `[unsupported 类型 message]` |
+
+**被 @ 时的历史**（§1c）：话题里被 @，用 `im.v1.message.list`（`container_id_type: thread`）取这个话题最近的消息；群里（session 还没开过轮时）用 `container_id_type: chat` 取群里最近的消息（只有主流消息和话题的首条，话题里的回复不在其中），时间截到这条 @。条数由通道条目的 `config.historyOnMention` 定：
+
+```jsonc
+{ "type": "lark-bot", "config": { "historyOnMention": { "thread": 50, "chat": 20 } } }  // 默认值；false 关掉，单项写 0 或 false 关掉那一项，每项至多 200
+```
+
+- 和事件一样拍平：文字、富文本、@ 变成 `@名字`（@ 机器人自己的去掉）、回复的引用（被引用的那条也在取来的消息里时才有引用块，不为它单独查）、卡片取显示的文字、合并转发只是占位。图片、文件、语音、视频**不下载**，保留 `lark-file:` 引用（harness 显示为"未显示"的一行）；撤回的消息和系统消息（入群、退群）不要。
+- 发送者：飞书列表里用户是 open_id，适配器换成事件里用的 union_id（从收到过的事件里记下的对应，或 `contact.v3.user.get` 查名字时一起拿到的），这样身份映射和 `mention` 都对得上；名字照样查（缓存共用）。本机器人发的消息发送者是机器人自己的 open_id（由出站索引认出），别的机器人是它的 app_id，都标 `senderIsBot`。
+- 权限：读取要 `im:message`（或 `im:message:readonly`），群里还要 `im:message.group_msg`（`messaging` 预设都有）。缺权限（`230027`、`9999167x`）时这一次没有历史，只告警一次，之后 30 分钟（`degradeTtlMs`）不再请求，过后再试，授权后不用重启。其他错误每次记一行 warn。
 
 飞书事件不带发送者名字，适配器用 `contact.v3.user.get` 按 union_id / open_id 查显示名（需要 `contact:user.base:readonly`，`messaging,contact` 预设已包含），缓存 6 小时，查不到的 10 分钟内不再查。查询失败时说明行里没有 `senderName`，agent 只知道身份 id。机器人发送者不查。
 
@@ -405,7 +438,7 @@ aio-dev watch remove team-digest
 |---|---|---|---|
 | send_file | 用 `im.v1.image.create`（图片，≤10MB）或 `im.v1.file.create`（其他，`file_type` 按扩展名取 pdf/doc/xls/ppt/mp4/opus，其余 `stream`）上传，再发 image / file 消息；有 caption 时先发一条文字。同一个 blob 不会重复上传 | 作为这封回复邮件的附件 | 只写事件：attach 打印 `📎 名字 (类型, blob 引用)` |
 | ask_choice | 单选：卡片按钮，回调值 `choice:<choiceId>:<n>`。多选：卡片表单（多选下拉 + 提交按钮 `choice:<choiceId>:form`，回调里的 `form_value` 带回选中的序号） | 正文里列编号，"回复编号" | 打印编号列表和 `/choose <choiceId> <n>` |
-| mention | 文字消息里的 `<at user_id="ou_…">名字</at>`。适配器从收到的事件里记下 union_id → open_id 的对应，认不出的 id 写成 `@名字` | 写成 `@名字` 文字 | 写成 `@名字` 文字 |
+| mention | 文字消息里的 `<at user_id="ou_…">名字</at>`。适配器从收到的事件（和 §1c 取历史时查到的通讯录）里记下 union_id → open_id 的对应，认不出的 id 写成 `@名字` | 写成 `@名字` 文字 | 写成 `@名字` 文字 |
 | reply_to / send_message | 普通文字消息（reply_to 用回复接口） | 回复同一线程 / 新邮件 | 打印 `✉ 文字` |
 
 终端靠 `agents-io.output` 事件显示这些输出，它是 `native` 事件，只有 `full` 档 attach（默认就是）看得到。私有 JSONL 通道收到同样的 `RenderedMessage`，`channelData` 里带下面的中立键，能不能画由适配器自己决定，`text` 里总有可读的退化形式。
@@ -474,7 +507,9 @@ agent 自己以语音进一个会议或通话：听得到所有人，用自己�
 | 缺口 | 影响 |
 |---|---|
 | 输出工具在飞书上未经真机验证 | 文件/图片上传、多选表单、at 标签都只用假客户端测过；多选表单的 `form_value` 结构按文档实现 |
-| 只能 @ 认得出的人 | agent 只知道本轮输入里发送者的 id；群消息里 @ 到的其他人只以名字出现。飞书的 at 标签要 open_id，没从事件里见过的 union_id 只能写成 `@名字` |
+| 只能 @ 认得出的人 | agent 只知道本轮输入里发送者的 id；群消息里 @ 到的其他人只以名字出现。飞书的 at 标签要 open_id，没从事件或历史里见过的 union_id 只能写成 `@名字` |
+| 历史里的附件不下载 | §1c 取来的图片、文件只是 `lark-file:` 引用，agent 看不到内容；回复的引用只在被引用的那条也在取来的消息里时才有 |
+| 历史按 session 去重 | 宿主换了会话键（新 session），同一段话题历史会再交一次；新 session 在群里第一次被 @ 也会取群里最近的消息，与宿主自己交的回顾可能重复 |
 | 选择题卡片点完不变 | 点击后按钮仍可点，再点的结果带 `alreadyAnswered`；卡片不会改成"已选：蓝" |
 | 选择要等这一轮结束 | 点击是排队的输入，模型若不结束这一轮，就一直等不到答案 |
 | 输出工具 token 不过期 | token 按 harness 绑定发放，网关进程内一直有效（只在 loopback 上） |

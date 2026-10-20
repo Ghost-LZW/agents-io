@@ -11,6 +11,7 @@ import {
   type InputRecord,
   type ChannelCaps,
   type Evidence,
+  type HistoryScope,
   type Origin,
   type ReplyRoute,
   type Tier,
@@ -174,6 +175,19 @@ export interface IngressOptions {
    * account received it, so sibling bots need no `selfAccounts` entry.
    */
   recover?: (channel: string, messageId: string) => ProducingTurn | undefined;
+  /**
+   * Earlier messages of the conversation (`ChannelAdapter.history` of the channel that emitted
+   * `env`), for a channel message dispatched to a session (CHANNELS §1c): asked for `thread` when
+   * it is in a thread, for `chat` when it is in a group chat whose session has dispatched nothing
+   * yet. Each is stamped like an inbound message (identified, evidence at most the trigger's, no
+   * declared sender, this deployment's own messages recognised by `recover` and those of the
+   * receiving session left out) and recorded in that session as context ahead of the trigger;
+   * the session drops those it already has (`Lane.history`). A rejection or a bad envelope only
+   * costs the history (`onHistoryError`), never the message.
+   */
+  history?: (env: InboundEnvelope, scope: HistoryScope) => Promise<InboundEnvelope[]>;
+  /** Fetching or recording history for a dispatched message failed; the message went on without it. */
+  onHistoryError?: (err: unknown, a: { sessionKey: string; scope: HistoryScope; inputId: string }) => void;
 }
 
 /** Evidence an envelope needs before its message id is trusted to name our own message (a forged copy of a mail Message-ID is not). */
@@ -339,7 +353,11 @@ export class Ingress {
     }
   }
 
-  private async process(env: InboundEnvelope, claimedEvidence?: Evidence): Promise<IngressResult> {
+  /**
+   * Who sent `env`, as the gateway concludes it: `Policy.identify`, then the outbound index
+   * (this deployment's own message back is `self`, from the agent whose turn sent it).
+   */
+  private async stamp(env: InboundEnvelope): Promise<{ origin: Origin; cause?: InputCause; sent?: ProducingTurn }> {
     const identity = await this.policy.identify({
       channel: env.channel,
       account: env.account,
@@ -370,6 +388,11 @@ export class Ingress {
       const claim = identity.trustedAgent && RECOVERABLE.includes(env.sender.evidence) ? env.sender.cause : undefined;
       cause = claim ? { peer, basis: 'declared', hop: claim.hop, ...(claim.chain !== undefined ? { chain: claim.chain } : {}) } : { peer, basis: 'none' };
     }
+    return { origin, ...(cause ? { cause } : {}), ...(sent ? { sent } : {}) };
+  }
+
+  private async process(env: InboundEnvelope, claimedEvidence?: Evidence): Promise<IngressResult> {
+    const { origin, cause } = await this.stamp(env);
 
     // A click on an approval or stop button acts on a request or turn: it goes to the session that
     // owns it (Hub index), which re-checks who may act (resolver eligibility, Policy.control, still
@@ -613,12 +636,63 @@ export class Ingress {
       input = { ...input, channelContext: { ...input.channelContext, ...topicContext(d.topic, hint) } };
     }
     if (d.on === 'dispatch') {
+      await this.handHistory(lane, d, env, input);
       const result = await lane.command({ type: 'input', sessionKey: d.sessionKey, input, mode: d.mode ?? env.modeHint ?? 'queue' });
       return { ...base, result };
     }
     // context (or a digest without the watch machinery: recorded, never batched)
     const result = await lane.observe(input);
     return { ...base, result };
+  }
+
+  /**
+   * What the conversation said before a dispatched channel message (CHANNELS §1c), recorded
+   * as context in the session it goes to: the thread it is in, or the recent chat when that
+   * session has dispatched nothing yet. Not for a later topic of the conversation (`/new`,
+   * a rotation: a deliberate fresh start). Never fails the delivery.
+   */
+  private async handHistory(lane: Lane, d: RouteDelivery, env: InboundEnvelope, input: InputRecord): Promise<void> {
+    const fetch = this.o.history;
+    const sessionKey = d.sessionKey;
+    if (!fetch || !env.replyRoute) return;
+    const scope: HistoryScope | undefined =
+      env.conversation.kind === 'thread' && env.conversation.threadId ? 'thread' : env.conversation.kind === 'group' ? 'chat' : undefined;
+    if (!scope || (scope === 'chat' && lane.dispatched())) return;
+    if (d.topic && (this.router.topics?.list({ conversation: d.topic.conversation }).length ?? 0) > 1) return;
+    try {
+      const records: InputRecord[] = [];
+      for (const h of await fetch(env, scope)) {
+        const r = await this.historyRecord(h, env, sessionKey);
+        if (r) records.push(r);
+      }
+      if (records.length) await lane.history(records, scope);
+    } catch (err) {
+      this.o.onHistoryError?.(err, { sessionKey, scope, inputId: input.inputId });
+    }
+  }
+
+  /** One earlier message as a context input of `sessionKey`, stamped like an inbound one; undefined to leave it out. */
+  private async historyRecord(h: InboundEnvelope, env: InboundEnvelope, sessionKey: string): Promise<InputRecord | undefined> {
+    if (!h || errors(InboundEnvelope, h).length) return undefined;
+    // Only the same channel instance's own earlier messages, never the trigger itself or anything after it.
+    if (h.id === env.id || h.channel !== env.channel || h.account !== env.account) return undefined;
+    if (h.replyRoute && (h.replyRoute.channel !== env.channel || h.replyRoute.account !== env.account)) return undefined;
+    if (env.sentAt !== undefined && h.sentAt !== undefined && h.sentAt > env.sentAt) return undefined;
+    // At most what the trigger could claim, and no out-of-band sender claims (declared, hop).
+    const { declared: _d, cause: _c, ...sender } = h.sender;
+    const item: InboundEnvelope = { ...h, sender: { ...sender, evidence: sender.evidence === env.sender.evidence ? sender.evidence : 'none' }, admission: 'observe' };
+    const { origin, cause, sent } = await this.stamp(item);
+    // Written by the receiving session itself: its harness has it already.
+    if (sent?.from.sessionKey === sessionKey) return undefined;
+    return {
+      // The id the message has when it arrives as an event, so either copy is the other's duplicate.
+      inputId: this.inputIds.get(envKey(item.channel, item.account, item.id)) ?? this.inputIdOf(item),
+      origin,
+      content: item.content,
+      replyRoute: item.replyRoute,
+      ...(cause ? { cause } : {}),
+      channelContext: channelContext(item, undefined),
+    };
   }
 
   /** Answer a topic command, checked by `Policy.control` (as a `reset` of the session it was sent to). */

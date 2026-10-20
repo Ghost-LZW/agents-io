@@ -182,6 +182,9 @@ export interface ChannelContext {
 /** How an inbound message's handling stands (`ChannelAdapter.acknowledge`). */
 export type AckState = 'working' | 'done' | 'failed' | 'none';
 
+/** Which earlier messages `ChannelAdapter.history` is asked for: the thread an input is in, or the most recent of its chat. */
+export type HistoryScope = 'thread' | 'chat';
+
 export interface ChannelAdapter {
   readonly id: string;
   caps(account: string): ChannelCaps;
@@ -201,6 +204,17 @@ export interface ChannelAdapter {
    * Cosmetic: the adapter swallows its own failures.
    */
   acknowledge?(route: ReplyRoute, messageId: string, state: AckState): Promise<void>;
+  /**
+   * Earlier messages of the conversation `env` (an input addressed to the agent) came from
+   * (CHANNELS §1c): `thread` = the thread it is in, `chat` = the most recent of its chat. The
+   * gateway asks only when it will use them (a thread; a chat whose session has dispatched
+   * nothing yet), keeps those the session does not have yet, and records them as context
+   * ahead of `env`. Envelopes of this channel and account, oldest first, all sent before `env`
+   * and without it; content as `emit` would carry it, except that attachments may stay
+   * platform refs. Resolves [] when off or not possible; never rejects for platform errors
+   * (a missing permission, a timeout): the message goes on without history.
+   */
+  history?(env: InboundEnvelope, scope: HistoryScope): Promise<InboundEnvelope[]>;
   /** After restart: is a previously sent (streaming) message still editable? */
   reconcile?(route: ReplyRoute, providerMessageId: string): Promise<'alive' | 'gone'>;
   /**

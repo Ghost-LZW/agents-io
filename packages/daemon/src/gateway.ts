@@ -590,6 +590,9 @@ export class Gateway {
       onUnavailable: (a) => this.refuseUnavailable(a.sessionKey, a.code, a.message, a.input.inputId, a.on === 'dispatch' ? a.input.replyRoute : null),
       // Our own messages back through a channel (any bot account): found by platform message id, marked self.
       recover: (channel, id) => this.recoverSend(channel, id),
+      // A thread's (or a new session's chat's) earlier messages, from the channel that emitted the @ (CHANNELS §1c).
+      history: async (env, scope) => (await this.channelFor(env)?.adapter.history?.(env, scope)) ?? [],
+      onHistoryError: (err, a) => this.log('warn', `history (${a.scope}) for ${a.inputId} in ${a.sessionKey} not handed: ${(err as Error).message}`),
       // `/help`, `/status`, `/stop`, `/model`… from the owner, answered on the route they came from.
       onCommand: (a) => this.command$(a),
       ...(c.policy.strangers === 'ask'

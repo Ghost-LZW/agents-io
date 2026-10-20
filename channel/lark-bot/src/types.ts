@@ -21,6 +21,24 @@ export interface LarkMessageApi {
     /** `card_msg_content_type: 'user_card_content'` returns a card's real JSON (the default is an "upgrade your client" stub for CardKit cards). */
     params?: { user_id_type?: 'user_id' | 'union_id' | 'open_id'; card_msg_content_type?: string };
   }): Promise<LarkApiResponse<{ items?: LarkMessageItem[] }>>;
+  /**
+   * Chat or thread history (`GET /im/v1/messages`): needs im:message (or im:message:readonly),
+   * and im:message.group_msg in groups. `start_time` / `end_time` are seconds and not supported
+   * for threads; `page_size` is 1–50. Users come back as open_ids, bots as app_ids.
+   * Optional so narrow test clients need not provide it (no history then).
+   */
+  list?(payload: {
+    params: {
+      container_id_type: 'chat' | 'thread';
+      container_id: string;
+      start_time?: string;
+      end_time?: string;
+      sort_type?: 'ByCreateTimeAsc' | 'ByCreateTimeDesc';
+      page_size?: number;
+      page_token?: string;
+      card_msg_content_type?: string;
+    };
+  }): Promise<LarkApiResponse<{ has_more?: boolean; page_token?: string; items?: LarkMessageItem[] }>>;
 }
 
 /** One item of `im.v1.message.get` (fields the adapter reads). */
@@ -29,6 +47,11 @@ export interface LarkMessageItem {
   msg_type?: string;
   deleted?: boolean;
   upper_message_id?: string;
+  root_id?: string;
+  parent_id?: string;
+  thread_id?: string;
+  /** Unix ms, as a string. */
+  create_time?: string;
   chat_id?: string;
   sender?: { id: string; id_type: string; sender_type: string };
   body?: { content: string };
@@ -51,7 +74,7 @@ export interface LarkContactUserApi {
   get(payload: {
     path: { user_id: string };
     params?: { user_id_type?: 'user_id' | 'union_id' | 'open_id' };
-  }): Promise<LarkApiResponse<{ user?: { name?: string; en_name?: string; nickname?: string } }>>;
+  }): Promise<LarkApiResponse<{ user?: { name?: string; en_name?: string; nickname?: string; union_id?: string; open_id?: string } }>>;
 }
 
 export interface LarkApiResponse<T = unknown> {

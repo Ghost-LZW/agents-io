@@ -322,13 +322,39 @@ export class Lane {
    */
   observe(input: InputRecord): Promise<CommandResult> {
     return this.serial(async () => {
-      // The same message again (a redelivery, also after a restart): not a revision.
+      // The same message again (a redelivery, also after a restart): not a revision. A message this
+      // session first got from the conversation's history is the same message, whatever its rendering.
       const prior = this.observedInputs.get(input.inputId);
-      if (prior && sameContent(prior, input)) return { ok: true, disposition: 'duplicate' } as const;
+      if (prior && (sameContent(prior, input) || prior.channelContext.history !== undefined)) return { ok: true, disposition: 'duplicate' } as const;
       this.recordContext(input);
       this.indexCause(input);
       return { ok: true, disposition: 'observe_only' } as const;
     });
+  }
+
+  /**
+   * Earlier messages of the conversation a dispatched input came from (`ChannelAdapter.history`,
+   * CHANNELS §1c), marked `channelContext.history`: recorded as context like `observe`, in
+   * the order they were sent among the pending context, except those this session already has
+   * (admitted, recorded as context, handed) and, for `chat`, all of them once this session has
+   * dispatched anything. Never starts a turn. Resolves with the input ids recorded.
+   */
+  history(records: InputRecord[], scope: 'thread' | 'chat'): Promise<string[]> {
+    return this.serial(async () => {
+      if (this.closed || (scope === 'chat' && this.dispatched())) return [];
+      const out: string[] = [];
+      for (const r of records) {
+        if (this.known.has(r.inputId) || this.observedInputs.has(r.inputId)) continue;
+        this.recordContext({ ...r, channelContext: { ...r.channelContext, history: scope } });
+        out.push(r.inputId);
+      }
+      return out;
+    });
+  }
+
+  /** Whether this session ever admitted an input to start or join a turn (across restarts: from its log). */
+  dispatched(): boolean {
+    return this.known.size > 0;
   }
 
   private recordContext(input: InputRecord): void {
@@ -996,12 +1022,33 @@ export class Lane {
     // A revision of one an earlier turn already saw is handed again, under a fresh id
     // (harnesses key their messages by input id).
     const revised = this.handedCtx.has(id);
-    this.pendingCtx.set(id, { input, handId: revised ? `${id}@${seq}` : id, revised });
+    const entry: PendingContext = { input, handId: revised ? `${id}@${seq}` : id, revised };
+    const at = input.channelContext.history !== undefined ? this.sentBefore(input) : -1;
+    if (at < 0) this.pendingCtx.set(id, entry);
+    else {
+      // Fetched history is older than what arrived since: it goes where it was sent, so the turn reads the conversation in order.
+      const entries = [...this.pendingCtx];
+      entries.splice(at, 0, [id, entry]);
+      this.pendingCtx = new Map(entries);
+    }
     for (const k of this.pendingCtx.keys()) {
       if (this.pendingCtx.size <= this.ctxLimits.maxItems) break;
       this.pendingCtx.delete(k);
       this.ctxDropped++;
     }
+  }
+
+  /** Position of the first pending entry sent after `input` (both with `sentAt`), or -1. */
+  private sentBefore(input: InputRecord): number {
+    const t = input.channelContext.sentAt;
+    if (typeof t !== 'number') return -1;
+    let i = 0;
+    for (const p of this.pendingCtx.values()) {
+      const u = p.input.channelContext.sentAt;
+      if (typeof u === 'number' && u > t) return i;
+      i++;
+    }
+    return -1;
   }
 
   /**

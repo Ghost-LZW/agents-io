@@ -8,6 +8,7 @@
 > 2026-10-12：决定 11 修订（会中委托按说话人定权限）加入 LN-7；LN-6、ID-6、DL-5、IN-8 随之更新（委托轮次不再沿用 thread 上一轮的设置）。
 > 2026-10-19：任务运行的覆盖项、用量与关联 id（`docs/design/run-overrides/`）加入 RN-2、RN-3、EX-7；RN-1 的超时改报协议里早就有的 `status: "timeout"`。同日复审：每次运行的结局都写进日志，`run.ended` 由日志构建（RN-3），守护进程停止的运行记 `run_stopping`（RN-1），preset 不改变运行的缺省 cwd（RN-2）。
 > 2026-10-20：对外 MCP 端点（`docs/design/external-mcp/`）加入 SE-5、ID-10、CF-10、DL-6、EX-8；IN-8 的检查点扩到外部客户端的输入（`kind: "peer"`）。
+> 2026-10-20：被 @ 时取会话历史（CHANNELS §1c）加入 IN-9。
 > 用途：改动 agents-io 的人或 agent 用它判断"这个改动有没有打破某个承诺"。新增承诺先写进这里，再写测试；测试改名时同步改这里。
 
 ## 0. 怎么读
@@ -85,7 +86,7 @@
 
 ### IN-6 只记录的 context 输入在下一轮交出，跨重启不丢
 
-- **承诺**：`context` 动作的输入不开轮，在该 session 下一次开轮时按到达顺序排在触发输入前面；有条数与字符上限，超出时保留最新并加一行说明；重启后从日志重建"已记录、未交出"的部分；digest 条目不重复交出。
+- **承诺**：`context` 动作的输入不开轮，在该 session 下一次开轮时按到达顺序排在触发输入前面（被 @ 时取来的历史按发送时间插在其中，IN-9）；有条数与字符上限，超出时保留最新并加一行说明；重启后从日志重建"已记录、未交出"的部分；digest 条目不重复交出。
 - **实现**：`lane.ts:256-264`（记录时带完整输入）、`lane.ts:725-756`（`rebuildContext`）；上限见 `CONTEXT_DEFAULTS`。
 - **测试**：`packages/session/test/context.test.ts` "context recorded but not handed before the restart goes to the next turn; handed context does not #IN-6 #RS-1"、"provenance: flags come from the context actually handed, and stay for later turns #IN-6 #EX-3"。
 - **状态**：有测试。
@@ -111,6 +112,14 @@
 - **决定（2026-10-11 合并评审，依原则 4 自决）**：
   1. **谁能清零**：只有"有人在这里写"——`kind: "human"` 且有主体（主人或宿主映射的成员）。原来任何非 agent 输入都清零，系统 digest、宿主输入、陌生人插一句就能让一对 agent 无限来回；没有主体的发送者可能是平台没标出来的机器人，按 fail closed 不算。邮件自动回复本来就丢弃（CHANNELS 邮件一节），现在另标 `isBot`，即使哪天被放进来也是 agent 一侧。
   2. **live 委托**：决定 11 让委托轮次由 harness 自己开，绕过了 `Lane.input`。委托计入成对计数（peer = 会议路由），因为说话者没有证据、会议另一端可能是另一个语音 agent；截停时 harness 已经开工，只能打断。（委托轮次的权限后来按说话人定，见 LN-7。）代价：一场会里 15 分钟内超过 `pair.maxTurns` 次委托、其间没人在会话里写，会被截停；可调参数。
+
+### IN-9 被 @ 时取来的会话历史只补会话没有的，取不到不影响这条消息
+
+- **承诺**：一条通道消息被 dispatch 到某个 session 时（CHANNELS §1c），它在话题里（`thread`）、或在群里且这个 session 还没 dispatch 过任何输入（`chat`），网关向发出它的通道实例要更早的消息（`ChannelAdapter.history`）；对话的后来的话题（`/new`、轮换）是有意重新开始，不要。取来的每条：只认同一通道、同一账号、早于触发消息、不是它本身、通过 schema 的；像入站消息一样盖章（`Policy.identify`；证据至多与触发消息相同，不带 `declared` 与 hop 声明；出站索引认出的本部署消息是 `self`，而接收它的 session 自己发的那些不交）；输入 id 与这条消息作为事件到达时相同。接收 session 只记下它还没有的（没接纳过、没记过上下文、没交过），记成上下文（`channelContext.history`），按发送时间排进待交的上下文、在触发消息之前，受 §1b 的条数与字符上限；`chat` 在 session dispatch 过之后一条都不记。之后同一条消息作为事件到达是 `duplicate`，不当修订。通道取不到（缺权限、超时、抛错）或交回不合格的条目，只是没有（那几条）历史：触发消息照常开轮；飞书缺权限只告警一次。重启后从日志知道已经有了哪些。
+- **实现**：`packages/session/src/ingress.ts` `deliverOwn`（dispatch 之前 `handHistory`）、`handHistory`、`historyRecord`、`stamp`（与入站消息同一段盖章）；`packages/session/src/lane.ts` `history`、`dispatched`、`addContext`（带 `history` 的按 `sentAt` 插入）、`observe`（历史副本在先时答 `duplicate`）、`rebuildContext`；`packages/daemon/src/gateway.ts` 的 `history` / `onHistoryError`（`channelFor(env).adapter.history`）；`channel/lark-bot/src/history.ts` `HistoryFetcher`（`im.v1.message.list`，权限错误告警一次后停 `degradeTtlMs`）、`channel/lark-bot/src/adapter.ts` `history`；协议 `packages/protocol/src/channel.ts` `ChannelAdapter.history`、`HistoryScope`。
+- **测试**：标签 `#IN-9`；`packages/session/test/history.test.ts` "a thread @: what the session does not have is handed before the @, in the order it was sent; what it observed is not repeated"、"a group chat: the recent chat only for a session that has dispatched nothing yet; never for a DM"、"a later topic of the conversation (/new) is a fresh start: no history for it"、"fetching costs only the history: a failure, or envelopes that are not earlier messages of this channel, leave the @ as it was"、"stamped like inbound messages: identified, evidence at most the trigger’s, no declared sender; the session’s own sends left out, another session’s are self context"、"an event arriving after its history copy is a duplicate, not a revision; nothing is handed twice"、"after a restart the session still has what history brought: it is not recorded again"、"beyond the context bounds the newest are kept, with the usual omitted line"；`packages/daemon/test/history.test.ts` "a thread @ asks the channel that emitted it; the turn reads the thread first"；`channel/lark-bot/test/history.test.ts` "a missing permission costs only the history: no messages, one warning, and no more calls until degradeTtlMs"、"never rejects: a failing or hanging list call answers no messages"。
+- **状态**：有测试。
+- **注意**：历史不走路由表、不触发监听、不经宿主回调：它跟着已经 dispatch 的那条消息进同一个 session，所以宿主不会因为历史里的发送者改变参与者记录。去重以 session 为单位：新 session（例如宿主换了会话键）没有旧 session 的记录，同一段话题历史会再交一次。嵌入方自己给 `newId` 时，历史条目与事件的 id 对不上，只在内存窗口内去重。历史条目没有 `ref`（网关没有收到过这条消息，`aio verify` 核不了）。
 
 ---
 
@@ -306,7 +315,7 @@
 ### ID-7 agent 产生的输入由守护进程盖章；agent 主体永远不是主人
 
 - **承诺**：本部署 agent 产生的输入（`agentInput`，供 `agent_send` / `agent_run` 用）由守护进程盖章：`kind: "agent"`、主体默认 `agent:<agent>`（标签 `agent`；宿主身份映射可把 `{ channel: "agent", channelUserId: <agent> }` 映射成自己的成员）、证据 `daemon`、`via` = 发送 session 的地址 `agent:<agent>:<sessionKey>`，带 `cause`（`basis: internal`）。agent 主体不能带 `owner` 标签：本地配置的 `identities` / `owners` 里出现即启动失败，宿主表 `bindings.put` 被拒。`InputRecord.cause` 只由守护进程得出：本地客户端、宿主连接的 `input` 帧带的 `cause` 不生效，`channelContext.loopGuard` 被去掉（适配器的 `context` 与客户端的 `channelContext` 都是）；适配器只能经 `sender.cause` 声明跳数，只有 `agentAccounts` 里的账号、带 `platform_signed` / `dkim_pass` 证据、且通道允许声明发送者（`caps.declaresSender`）时才采信（`basis: declared`），否则外部 agent 是 `basis: none`；`daemon` 证据不在适配器可声明的 `Evidence` 里。
-- **实现**：`packages/protocol/src/address.ts` `agentInputOrigin`；`packages/protocol/src/common.ts` `OriginEvidence`；`packages/session/src/loop-guard.ts` `agentInput`、`causeFrom`；`packages/session/src/identity.ts` `checkIdentities`（agent 通道的条目不得带 `owner`）、`IdentityMap.agentPrincipal`、`identify`（`trustedAgent`）；`packages/session/src/ingress.ts` `process`（`cause` 判定）、`capEnvelope`、`channelContext`（去掉 `loopGuard`）；`packages/daemon/src/gateway.ts` `command`（本地 / 宿主输入逐字段构造，去掉 `loopGuard`）；`packages/host-mcp/src/tools.ts` `agentOrigin`（建监听时的来源：`via` 为 session 地址，证据 `daemon`，主体仍为空、`createdBy` 仍是 `session:<key>`）。
+- **实现**：`packages/protocol/src/address.ts` `agentInputOrigin`；`packages/protocol/src/common.ts` `OriginEvidence`；`packages/session/src/loop-guard.ts` `agentInput`、`causeFrom`；`packages/session/src/identity.ts` `checkIdentities`（agent 通道的条目不得带 `owner`）、`IdentityMap.agentPrincipal`、`identify`（`trustedAgent`）；`packages/session/src/ingress.ts` `stamp`（`cause` 判定，`process` 与 §1c 的历史条目共用）、`capEnvelope`、`channelContext`（去掉 `loopGuard`）；`packages/daemon/src/gateway.ts` `command`（本地 / 宿主输入逐字段构造，去掉 `loopGuard`）；`packages/host-mcp/src/tools.ts` `agentOrigin`（建监听时的来源：`via` 为 session 地址，证据 `daemon`，主体仍为空、`createdBy` 仍是 `session:<key>`）。
 - **测试**：标签 `#ID-7`；`packages/session/test/agent-messaging.test.ts` "agentInput: kind agent, principal agent:<agent>, evidence daemon, via = the sending session, one hop past its turn"、"agent principals can never carry the owner label: a config map fails, a host table is refused"、"a hit without platform evidence is not ours (a forged copy of a mail Message-ID); a miss from a bot is a broken chain"、"clients and adapters cannot set a cause: a declared hop counts only from a trusted agent account with platform evidence; channelContext.loopGuard is stripped"；`packages/daemon/test/agent-messaging.test.ts` "a local or host client cannot set a cause or the loopGuard label on its input"、"a config identity giving an agent the owner label fails the start"。
 - **状态**：有测试。第一步还没有调用 `agentInput` 的工具（`agent_send` 是第二步）。
 - **注意**：`SendOp.as` 仍是 `session:<sessionKey>`（DL-4b 现行），没有按提案 §4.2 改成 `agent:<agent>`，见 `docs/design/agent-messaging/` 状态行的偏差说明。
@@ -314,7 +323,7 @@
 ### ID-8 本部署的消息经通道回来，由出站索引认出
 
 - **承诺**：本部署某个 turn 投递成功、有平台消息 id 的消息，经任何通道账号回来时（同部署的兄弟机器人、邮件回声），只要信封带 `platform_signed` / `dkim_pass` 证据，就按 `(channel, 消息 id)` 在出站索引里认出：`self: true`、`kind: "agent"`、主体为发出它的 agent（同 ID-7 的主体规则）、证据保持通道的、`cause = { basis: "recovered", hop: 那一轮 + 1, chain, from: { sessionKey, turnId }, rootPrincipal, carried }`；不需要手写 `selfAccounts`。路由不变：`self` 永远不开轮（ID-5）。证据不够的同 id 信封（收件人伪造的邮件 Message-ID）不算。
-- **实现**：`packages/daemon/src/records.ts` `daemon_outbound`、`daemon_outbound_parts`（拆开发送的其余各条；`putOutbound`、`outboundByMessage`，保留 30 天）；`channel/lark-bot/src/adapter.ts` `doSend`（`providerMessageIds`）；`packages/session/src/outbox.ts` `onSettled`；`packages/daemon/src/gateway.ts` `indexOutbound`（每次结算都记，带 turn 发送时的来源与链：`provenanceAtSend`，见 EX-5）、`recoverSend`；`packages/session/src/ingress.ts` `process`（`recover`，在 `identify` 之后、路由之前）。
+- **实现**：`packages/daemon/src/records.ts` `daemon_outbound`、`daemon_outbound_parts`（拆开发送的其余各条；`putOutbound`、`outboundByMessage`，保留 30 天）；`channel/lark-bot/src/adapter.ts` `doSend`（`providerMessageIds`）；`packages/session/src/outbox.ts` `onSettled`；`packages/daemon/src/gateway.ts` `indexOutbound`（每次结算都记，带 turn 发送时的来源与链：`provenanceAtSend`，见 EX-5）、`recoverSend`；`packages/session/src/ingress.ts` `stamp`（`recover`，在 `identify` 之后、路由之前；被 @ 时取来的历史条目也经过它，IN-9）。
 - **测试**：标签 `#ID-8`；`packages/session/test/agent-messaging.test.ts` "a hit is self, from the agent that sent it, with a recovered cause one hop on — whatever account received it"、"a hit without platform evidence is not ours (a forged copy of a mail Message-ID); a miss from a bot is a broken chain"；`packages/daemon/test/agent-messaging.test.ts` "bot a's reply delivered into a group comes back through bot b: self, from the agent that wrote it, recovered — no selfAccounts needed"、"every part of a split send is indexed: an image sent after the text comes back as ours too"；`channel/lark-bot/test/output-tools.test.ts` "reports every platform message it produced (caption and file), so the outbound index knows each part as ours"。
 - **状态**：有测试（假通道）。飞书是否把机器人的群消息推给同群其他机器人仍待 live 核实（ROADMAP §4）；不推则飞书上这条路径不出现。
 - **边界**：适配器把一次发送拆成多条（长文本、图片、文件）时，每一条的 id 都要在 `SendResult.providerMessageIds` 里报出来才认得出（飞书适配器报；只报 `providerMessageId` 的适配器只认得主消息）；出站索引过了保留期、或另一台机器发的，都找不回，落回身份规则。
