@@ -142,6 +142,18 @@
 - **输出工具开关的层次**：顶层 `outputTools` 保留，含义收窄为各 agent `tools` 的缺省值，缺省 `false`；有任一 agent 开启时网关才起 MCP 服务。e2e 的场景 agent 跟随配置里默认 agent 的 `tools`（或顶层 `outputTools`），示例配置给 `assistant` 开启。
 - **代答开关名 `policy.answerOnBehalf`，错误码 `on_behalf_not_allowed`**：与 `launch_not_allowed`（部署方没有授权该能力）同一形式；非宿主连接仍先得到 `not_eligible`；未开启时 `features` 不列 `resolve.onBehalfOf`，宿主可按能力名判断。
 
+### 决定 13 补记：`resolve` 回调有了使用者（2026-10-21）
+
+冻结 `resolve` 的依据是「没有使用者」（原则 6、7）。蓝饼助手 2026-10-08 起用它把审批交给对话的主人，现在要「总是允许」的规则、无人值守的请求早过期、执行前的模型审查（它的 s5-approvals）。原则 7 把审批列在控制面，所以按决定 13 的规则由维护者解冻这几项，不改原则：
+
+| 事项 | 决定 | 依据 |
+|---|---|---|
+| `resolve` 回调带 harness 原始请求（`native`） | 加，feature `resolve.native`；`Policy.resolve` 第三个参数 `{ native }` | 宿主的规则要匹配命令与路径；事件体只有一行标题。`native` 本来就进 full 档的事件，宿主连接本来就读得到 |
+| 模型审查 | 接线 `modelReviewer` → 宿主钩子 `review`（feature `callouts.review`，超时 `hostCallouts.review.timeoutMs` 默认 15 s）；`model` resolver 加 `escalate` | `Resolver.model` 与 `ModelReviewer` 已在协议里（决定 9）；放在 `resolve` 里同步做会挡住 lane 的串行队列 |
+| `human` resolver 的 `timeoutMs`、`note`、`allowSessionAs` | 加，feature `resolver.human.extras` | 过期时长按回合不同（没人在场时短）；卡片上要说明为什么问、「总是允许」会记下什么；「总是允许」落在宿主（能撤销），不写进 harness 的权限文件 |
+
+`outbound` 仍冻结。
+
 ## 决定 14：测试集按不变量组织
 
 日期：2026-10-11。复查见 `docs/design/test-suite-review/`。按决定 13 的规则由维护者依原则决定。

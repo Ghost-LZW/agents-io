@@ -1,7 +1,7 @@
 import { Type, type Static, type TObject, type TSchema } from '@sinclair/typebox';
 import { ContentBlock, Evidence, OriginEvidence, ReplyRoute, V } from './common.js';
 import { Body } from './events.js';
-import { Resolver } from './requests.js';
+import { Decision, Resolver } from './requests.js';
 import { RunSpec } from './run.js';
 import { ConversationKind, InboundEnvelope, InputCause, InputRecord, OriginKind } from './inbound.js';
 import { RenderedMessage } from './channel.js';
@@ -459,7 +459,35 @@ export const TurnContextView = Type.Object({
 export const ResolveCallout = Type.Object({
   ...Req('policy'),
   hook: Type.Literal('resolve'),
-  args: Type.Object({ request: RequestOpenedBody, ctx: TurnContextView }),
+  args: Type.Object({
+    request: RequestOpenedBody,
+    ctx: TurnContextView,
+    /**
+     * The harness's own form of the request (feature `resolve.native`), as its `request.opened`
+     * event carries it at the full tier: for Claude Code `{ toolName, input, suggestions,
+     * decisionReason, blockedPath, mcpServer, … }`. What a host matches its own rules on.
+     */
+    native: Type.Optional(Type.Unknown()),
+  }),
+});
+
+/**
+ * The `model` resolver's review asked of a host whose hello lists `review` (feature
+ * `callouts.review`): the request a `resolve` answer gave `{ kind: "model" }`. The host runs
+ * its reviewer and answers a `ReviewCalloutAnswer`. The lane does not wait for it: the request
+ * stays pending (shown to nobody) until the answer, and a timeout, an error or a bad answer
+ * escalate (the model resolver's `escalate`, else `Policy.escalate`).
+ */
+export const ReviewCallout = Type.Object({
+  ...Req('policy'),
+  hook: Type.Literal('review'),
+  args: Type.Object({
+    request: RequestOpenedBody,
+    ctx: TurnContextView,
+    model: Type.String(),
+    prompt: Type.Optional(Type.String()),
+    native: Type.Optional(Type.Unknown()),
+  }),
 });
 
 /**
@@ -522,11 +550,26 @@ export const ExternalCallout = Type.Object({
 export const ExternalCalloutAnswer = Type.Object({ verdict: Type.Union([Type.Literal('allow'), Type.Literal('deny')]), reason: Type.Optional(Type.String({ maxLength: 500 })) });
 export type ExternalCalloutAnswer = Static<typeof ExternalCalloutAnswer>;
 
+/**
+ * The host's answer to a `review` callout: a decision (settled as `by: { kind: "model", id: model }`),
+ * or `escalate` — to `resolver` when given (e.g. a human resolver whose `note` says why), else
+ * to the model resolver's `escalate`, else to `Policy.escalate`.
+ */
+export const ReviewCalloutAnswer = Type.Union([
+  Decision,
+  Type.Object({
+    escalate: Type.Literal(true),
+    reason: Type.Optional(Type.String({ maxLength: 500 })),
+    resolver: Type.Optional(Resolver),
+  }),
+]);
+export type ReviewCalloutAnswer = Static<typeof ReviewCalloutAnswer>;
+
 /** The host's answer to a `contact` callout. */
 export const ContactCalloutAnswer = Type.Object({ verdict: Type.Union([Type.Literal('allow'), Type.Literal('deny')]) });
 export type ContactCalloutAnswer = Static<typeof ContactCalloutAnswer>;
 
-export const HostEventFrame = Type.Union([InboundFrame, RouteCallout, ResolveCallout, OutboundCallout, ContactCallout, ExternalCallout, RunEnded, ResultFrame]);
+export const HostEventFrame = Type.Union([InboundFrame, RouteCallout, ResolveCallout, ReviewCallout, OutboundCallout, ContactCallout, ExternalCallout, RunEnded, ResultFrame]);
 export type HostEventFrame = Static<typeof HostEventFrame>;
 
 export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare', 'inbound.redispatch'] as const;

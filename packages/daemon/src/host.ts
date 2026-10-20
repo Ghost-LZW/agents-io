@@ -5,11 +5,13 @@ import {
   OutboundCalloutAnswer,
   PROTOCOL_VERSION,
   Resolver,
+  ReviewCalloutAnswer,
   check,
   errors,
   type BodyOf,
   type ContactArgs,
   type ContentBlock,
+  type Decision,
   type HostHelloResult,
   type HostRequestFrame,
   type InboundReadResult,
@@ -55,8 +57,8 @@ export interface HostServiceDeps {
   redispatch(hostName: string, f: Extract<HostRequestFrame, { type: 'inbound.redispatch' }>): Promise<Outcome>;
   /** `policy.answerOnBehalf`: the `resolve.onBehalfOf` feature is advertised only when it is on. */
   answerOnBehalf?: boolean;
-  /** Per-hook timeouts of the `resolve` / `outbound` / `contact` / `external` callouts (config `hostCallouts`). */
-  calloutTimeouts?: { resolve?: number; outbound?: number; contact?: number; external?: number };
+  /** Per-hook timeouts of the `resolve` / `review` / `outbound` / `contact` / `external` callouts (config `hostCallouts`). */
+  calloutTimeouts?: { resolve?: number; review?: number; outbound?: number; contact?: number; external?: number };
   /** The external MCP endpoint is on: `external.mcp` is advertised. */
   externalMcp?: () => boolean;
   /** `explain`: a routing record, a side effect by operationId, or (`chain`) an agent input's chain. */
@@ -258,10 +260,36 @@ export class HostService implements HostFrames {
    * not answer it, times out, fails or answers something that is not a Resolver:
    * the caller falls back to its own policy.
    */
-  async resolveCallout(request: BodyOf<'request.opened'>, ctx: TurnContext): Promise<Resolver> {
+  async resolveCallout(request: BodyOf<'request.opened'>, ctx: TurnContext, native?: unknown): Promise<Resolver> {
     const { resolver: _r, ...req } = request;
-    const v = await this.callout('resolve', { request: req, ctx: ctxView(ctx) }, this.d.calloutTimeouts?.resolve ?? 3000);
+    const args = { request: req, ctx: ctxView(ctx), ...(native !== undefined ? { native } : {}) };
+    const v = await this.callout('resolve', args, this.d.calloutTimeouts?.resolve ?? 3000);
     if (!check(Resolver, v)) throw new Error(`bad resolve answer: ${errors(Resolver, v).slice(0, 2).join('; ')}`);
+    return v;
+  }
+
+  /**
+   * The `model` resolver's review asked of the host (hook `review`, the lanes' `modelReviewer`).
+   * Throws when no host answers it, it times out, fails or answers something else: the lane
+   * escalates.
+   */
+  async reviewCallout(a: {
+    request: BodyOf<'request.opened'>;
+    ctx: TurnContext;
+    model: string;
+    prompt?: string;
+    native?: unknown;
+  }): Promise<Decision | { escalate: true; reason?: string; resolver?: Resolver }> {
+    const { resolver: _r, ...req } = a.request;
+    const args = {
+      request: req,
+      ctx: ctxView(a.ctx),
+      model: a.model,
+      ...(a.prompt !== undefined ? { prompt: a.prompt } : {}),
+      ...(a.native !== undefined ? { native: a.native } : {}),
+    };
+    const v = await this.callout('review', args, this.d.calloutTimeouts?.review ?? 15_000);
+    if (!check(ReviewCalloutAnswer, v)) throw new Error(`bad review answer: ${errors(ReviewCalloutAnswer, v).slice(0, 2).join('; ')}`);
     return v;
   }
 
@@ -308,10 +336,16 @@ export class HostService implements HostFrames {
  * `run.overrides`: `run.start.overrides` apply (or fail `bad_override`); `run.ended.usage`: `run.ended` carries `durationMs`,
  * `usage`, `turnId`, `inputId` and says `timeout`; `run.correlation`: `run.start.inputId` / `correlation`.
  * `callouts.external`: the `external` hook; `external.mcp` (only while the endpoint runs): the external MCP endpoint.
+ * `callouts.review`: the `review` hook (a `model` resolver's review); `resolve.native`: `resolve` and `review` callouts carry
+ * the harness's `native` request; `resolver.human.extras`: a human resolver's `timeoutMs`, `note` and `allowSessionAs`, and
+ * a model resolver's `escalate`, apply.
  */
 export const FEATURES = [
   'session.launch',
   'callouts.resolve',
+  'callouts.review',
+  'resolve.native',
+  'resolver.human.extras',
   'callouts.outbound',
   'callouts.contact',
   'resolve.onBehalfOf',
@@ -331,8 +365,8 @@ const OUTBOUND_FLAG = 'host.outbound';
 const EXTERNAL_FLAG = 'host.external';
 
 /** The `policy` hooks a host may answer. */
-export type CalloutHook = 'route' | 'resolve' | 'outbound' | 'contact' | 'external';
-const HOOKS: readonly CalloutHook[] = ['route', 'resolve', 'outbound', 'contact', 'external'];
+export type CalloutHook = 'route' | 'resolve' | 'review' | 'outbound' | 'contact' | 'external';
+const HOOKS: readonly CalloutHook[] = ['route', 'resolve', 'review', 'outbound', 'contact', 'external'];
 
 /** `host.hello.callouts`: `true` = route only; a list names the hooks (unknown names ignored). */
 export function calloutHooks(c: boolean | string[] | undefined): Set<CalloutHook> {

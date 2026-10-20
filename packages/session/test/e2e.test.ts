@@ -112,6 +112,20 @@ describe('end to end: channel → ingress → lane → harness → compositor �
     expect(bodies(w.events(), 'request.resolved')).toEqual([{ t: 'request.resolved', requestId: 'r1', decision: { kind: 'allow_once' }, by: { kind: 'human', id: 'fake:alice' } }]);
   });
 
+  it('a human resolver\'s note shows under the ask on the card #RQ-5', async () => {
+    const w = world(
+      async (t) => {
+        t.emit({ t: 'request.opened', requestId: 'r1', kind: 'tool_approval', title: 'git push', risk: { network: true }, allowedDecisions: ['allow_once', 'deny'], allowAlways: false, defaultDeny: true });
+        await t.waitDecision('r1');
+        t.emit({ t: 'text.snapshot', text: 'done', final: true }, { audience: 'answer' });
+      },
+      { policy: { resolve: async () => ({ kind: 'human', principals: ['fake:alice'], routes: [], note: 'Review: pushes to a shared branch' }) } },
+    );
+    await w.channel.inject({ sender: alice, text: 'ship it' });
+    await until(() => !!w.channel.sent[0] && !!lastRender(w.channel.sent[0]).actions?.length);
+    expect(lastRender(w.channel.sent[0]!).sections).toContainEqual({ kind: 'status', text: 'Approval needed: git push\nReview: pushes to a shared branch' });
+  });
+
   it('final-tier channel without edit: one message per turn, plus one per human request #RQ-5', async () => {
     const caps: ChannelCaps = { ...defaultChannelCaps, edit: false, buttons: false, defaultTier: 'final' };
     const w = world(

@@ -121,6 +121,62 @@ describe('resolve callout', () => {
   });
 });
 
+describe('review callout', () => {
+  const native = { toolName: 'Bash', input: { command: 'rm -rf build' } };
+  const withNative: FakeTurnScript = async (t) => {
+    t.emit({ t: 'request.opened', requestId: 'r1', kind: 'tool_approval', title: 'rm -rf build', risk: { writes: true }, allowedDecisions: ['allow_once', 'deny'], allowAlways: false, defaultDeny: true }, { native });
+    const d = await t.waitDecision('r1');
+    t.emit({ t: 'text.snapshot', text: `got ${d.kind}`, final: true }, { audience: 'answer' });
+  };
+
+  it('resolve carries the native request; a model resolver is reviewed by the host; its decision is the model\'s #RQ-3', async () => {
+    const w = await daemon({ script: withNative });
+    const h = await w.host({ callouts: ['resolve', 'review'] });
+    const asked: Record<string, unknown>[] = [];
+    h.onRequest('policy', (f) => {
+      asked.push(f);
+      return f.hook === 'resolve'
+        ? { kind: 'model', model: 'lb-review', escalate: { kind: 'human', principals: ['member-7'], routes: [] } }
+        : { kind: 'allow_once' };
+    });
+    const probe = await w.client();
+    expect((await probe.hello({ token: w.gw.token, name: 'probe' })).features).toEqual(expect.arrayContaining(['callouts.review', 'resolve.native', 'resolver.human.extras']));
+    const c = await w.client();
+    await c.input('R1', 'go');
+    await until(() => events(w, 'R1', 'turn.completed').length === 1);
+    expect(asked.map((f) => f.hook)).toEqual(['resolve', 'review']);
+    expect(asked[0]).toMatchObject({ args: { native } });
+    expect(asked[1]).toMatchObject({ args: { model: 'lb-review', native, request: { requestId: 'r1' }, ctx: { sessionKey: 'R1' } } });
+    expect(events(w, 'R1', 'request.resolved')[0]).toMatchObject({ decision: { kind: 'allow_once' }, by: { kind: 'model', id: 'lb-review' } });
+    expect(events(w, 'R1', 'text.snapshot').at(-1)).toMatchObject({ text: 'got allow_once' });
+  });
+
+  it('a review that times out, fails, answers badly or is not declared escalates to the resolver\'s escalate #RQ-4', async () => {
+    for (const answer of ['timeout', 'error', 'bad', 'not-declared', 'escalate'] as const) {
+      const w = await daemon({ script: withNative, raw: { ...onBehalf, hostCallouts: { review: { timeoutMs: 50 } } } });
+      const h = await w.host({ callouts: answer === 'not-declared' ? ['resolve'] : ['resolve', 'review'] });
+      let reviews = 0;
+      h.onRequest('policy', async (f) => {
+        if (f.hook === 'resolve') return { kind: 'model', model: 'lb-review', escalate: { kind: 'human', principals: ['member-7'], routes: [], note: 'fallback' } };
+        reviews++;
+        if (answer === 'timeout') await new Promise((r) => setTimeout(r, 300));
+        if (answer === 'error') throw new Error('boom');
+        if (answer === 'escalate') return { escalate: true, reason: 'unsure', resolver: { kind: 'human', principals: ['member-7'], routes: [], note: 'reviewer: deletes files' } };
+        return { kind: 'nonsense' };
+      });
+      const c = await w.client();
+      await c.input('R2', 'go');
+      await until(() => events(w, 'R2', 'request.opened').length === 2);
+      const note = answer === 'escalate' ? 'reviewer: deletes files' : 'fallback';
+      expect(events(w, 'R2', 'request.opened')[1]).toMatchObject({ resolver: { kind: 'human', principals: ['member-7'], note } });
+      expect(reviews).toBe(answer === 'not-declared' ? 0 : 1);
+      await h.command({ type: 'resolve', sessionKey: 'R2', requestId: 'r1', decision: { kind: 'deny' }, onBehalfOf: 'member-7' });
+      await until(() => events(w, 'R2', 'turn.completed').length === 1);
+      expect(events(w, 'R2', 'request.resolved')[0]).toMatchObject({ by: { kind: 'human', id: 'member-7' } });
+    }
+  });
+});
+
 describe('outbound callout', () => {
   it('the host decides; timeout, error and bad answers deny; without the hook the local policy decides #DL-5', async () => {
     const w = await daemon({ raw: { hostCallouts: { outbound: { timeoutMs: 50 } } } });
