@@ -534,6 +534,8 @@ export class Gateway {
         watches: { add: (by, d) => this.addWatch(by, d), remove: (by, id) => this.removeWatch(by, id), list: (key) => this.listWatches(key) },
         // Decision 4: every write carries where the turn's inputs came from.
         provenance: (key, turnId) => this.lanes.get(key)?.provenance(turnId),
+        // People seen in the session's conversations: the agent can @ them, not only this turn's senders.
+        participants: (key) => this.lanes.get(key)?.participants() ?? [],
         // Decision 6: the agent decides when a conversation moves to another topic.
         topics: {
           list: (key) => (this.topics.bySession(key) ? this.topics.siblings(key).map(topicView) : undefined),

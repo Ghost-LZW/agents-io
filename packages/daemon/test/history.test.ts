@@ -8,7 +8,7 @@ const THREAD = { id: 'g1', kind: 'thread' as const, threadId: 't1' };
 const routeOf = (id: string) => ({ channel: 'fake', account: 'default', conversationId: 'g1', threadId: 't1', replyToMessageId: id });
 
 describe('history on mention through the gateway', () => {
-  it('a thread @ asks the channel that emitted it; the turn reads the thread first #IN-9', async () => {
+  it('a thread @ asks the channel that emitted it; the turn reads the thread first, and its senders can be @-ed #IN-9', async () => {
     const holder: { h?: FakeHarness } = {};
     const turns: InputRecord[][] = [];
     const contexts: { isError: boolean; text: string }[] = [];
@@ -35,6 +35,12 @@ describe('history on mention through the gateway', () => {
       ['the plan is in the doc', 'thread'],
       ['build green', 'thread'],
       ['@bot summarise', null],
+    ]);
+    const ctx = JSON.parse(contexts[0]!.text);
+    expect(ctx.participants).toEqual([
+      { principal: 'fake:alice', userId: 'alice', name: 'Alice', channel: 'fake' },
+      { userId: 'ci', name: 'CI', channel: 'fake', isBot: true },
+      { userId: 'carol', name: 'Carol', channel: 'fake' },
     ]);
   });
 });

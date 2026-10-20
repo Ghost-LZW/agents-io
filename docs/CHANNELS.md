@@ -421,7 +421,7 @@ aio-dev watch remove team-digest
 
 | 工具 | 做什么 | 目的地 |
 |---|---|---|
-| `get_channel_context()` | 返回当前路由、通道、会话类型、档位、通道能力摘要（markdown 程度、长度上限、按钮、能发哪些媒体）、本轮参与者（可用于 mention 的 id 和名字）、允许的目的地 | — |
+| `get_channel_context()` | 返回当前路由、通道、会话类型、档位、通道能力摘要（markdown 程度、长度上限、按钮、能发哪些媒体）、参与者（可用于 mention 的 id 和名字，见下）、允许的目的地 | — |
 | `send_file(path \| blob, name?, caption?)` | 读文件（相对路径按 session 的 cwd）存进 blob 存储，作为附件发出。上限 30MB；`restricted` 档的轮次只能发 cwd 里的文件 | 本轮回复路由 |
 | `ask_choice(question, options[], multi?)` | 发一个选择题，**立即返回** `choiceId`。用户的选择作为**下一条输入**回来（见下），工具说明里要求模型发完就结束这一轮 | 本轮回复路由 |
 | `mention(user_ids[], text)` | 发一条 @ 某些人的消息 | 本轮回复路由 |
@@ -429,6 +429,8 @@ aio-dev watch remove team-digest
 | `send_message(route, text)` | 另发一条独立消息（不是回复） | `"current"` 或允许的路由键 |
 | `watch_add / watch_remove / watch_list` | 见下面"agent 自己建监听" | 永远是自己的 session |
 | `live_join / live_say / live_leave` | 以语音进出会议或通话，见 §7a | 通道的媒体对端 |
+
+**参与者**（`participants`，`mention` 可以 @ 其中任何人）：先是本轮输入的发送者，再是这个 session 在**当前对话**（同一通道、同一会话 id）里见过的其他人，按最近说话排序，合计至多 50 个。"见过"指这个 session 收到过他们的消息：开轮的、只记录的上下文、§1c 取来的历史都算；本部署自己的回流不算。每项 `{ userId, name?, principal?, channel, isBot? }`，`userId` 是通道里的用户 id（飞书是 union_id 或 open_id），机器人标 `isBot: true`。session 记最近 50 个不同的发送者，重启后从日志里的输入记录重建。只在消息里被 @ 过、自己没说过话的人不在其中。`mention` 照旧接受任何 id（也接受 `lark-bot:on_x` 这样的主体），对参与者补上名字；适配器认不出的 id 写成 `@名字` 文字（下表）。
 
 目的地一律过 `Policy.outbound`。默认策略：触发本轮的输入全部来自主人的一轮可以发往任何地方（它的 harness 本来就能访问一切，拦住只减功能、不减风险，决定 4、5）；只沿用了 `bypass` 档、触发它的不是主人的一轮（live 委托）不算；其他轮只允许本轮的回复路由（以及本轮输入带来的路由）和主人在 `policy.routes` 里预登记的路由。被拒时工具返回错误，错误里写明被拒的路由、允许的是哪些，并让模型不要换个目的地重试；日志里记一条 `notice`。
 
@@ -480,7 +482,7 @@ aio-dev watch remove team-digest
 | `agents-io/mentions` | `{ targets: [{ id, name? }], text }`；`text` 是去掉 @ 之后的正文，`RenderedMessage.text` 是 `@名字 … 正文` 的退化形式 |
 | `agents-io/output` | `{ tool }`：这条消息出自哪个输出工具 |
 
-建议的协议改动：`RenderedMessage.mentions`、`RenderedMessage.choice`（或 `actions[].group` + `multi`）、一个 `output.sent` 事件类型代替 `native agents-io.output`、`InputRecord` 带发送者的通道 id（`senderId`）和消息里的 `mentions`，让 agent 能 @ 本轮之外的人。
+建议的协议改动：`RenderedMessage.mentions`、`RenderedMessage.choice`（或 `actions[].group` + `multi`）、一个 `output.sent` 事件类型代替 `native agents-io.output`、`InputRecord` 带消息里的 `mentions`，让 agent 也能 @ 只被别人 @ 过、自己没说过话的人（说过话的人已经在参与者里，靠 `channelContext.senderId`）。
 
 ## 7a. 实时语音会话（live，决定 11）
 
@@ -507,7 +509,7 @@ agent 自己以语音进一个会议或通话：听得到所有人，用自己�
 | 缺口 | 影响 |
 |---|---|
 | 输出工具在飞书上未经真机验证 | 文件/图片上传、多选表单、at 标签都只用假客户端测过；多选表单的 `form_value` 结构按文档实现 |
-| 只能 @ 认得出的人 | agent 只知道本轮输入里发送者的 id；群消息里 @ 到的其他人只以名字出现。飞书的 at 标签要 open_id，没从事件或历史里见过的 union_id 只能写成 `@名字` |
+| 只能 @ 说过话的人 | 参与者是这个 session 在当前对话里见过的发送者（§7），群消息里只被 @ 到、自己没说过话的人只以名字出现。飞书的 at 标签要 open_id，没从事件或历史里见过的 union_id 只能写成 `@名字`；重启后参与者从日志重建，但 union_id → open_id 的对应要等这个人再说话（或再取一次历史）才回来 |
 | 历史里的附件不下载 | §1c 取来的图片、文件只是 `lark-file:` 引用，agent 看不到内容；回复的引用只在被引用的那条也在取来的消息里时才有 |
 | 历史按 session 去重 | 宿主换了会话键（新 session），同一段话题历史会再交一次；新 session 在群里第一次被 @ 也会取群里最近的消息，与宿主自己交的回顾可能重复 |
 | 选择题卡片点完不变 | 点击后按钮仍可点，再点的结果带 `alreadyAnswered`；卡片不会改成"已选：蓝" |

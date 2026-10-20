@@ -20,7 +20,7 @@ import {
   type Watch,
   type WatchDraft,
 } from '@agents-io/protocol';
-import type { DeliveryRecord, Hub, InboundRewrite, Outbox } from '@agents-io/session';
+import type { DeliveryRecord, Hub, InboundRewrite, Outbox, Participant } from '@agents-io/session';
 import {
   CHOICE_KEY,
   MENTIONS_KEY,
@@ -35,6 +35,18 @@ import {
 
 /** Name of the `native` session event recording one output-tool message (see `OutputRecord`). */
 export const OUTPUT_EVENT = 'agents-io.output';
+
+/** One entry of get_channel_context `participants`: someone the agent can @ with `mention` (by `userId`). */
+export interface ParticipantView {
+  principal?: string;
+  userId?: string;
+  name?: string;
+  channel?: string;
+  isBot?: boolean;
+}
+
+/** Most entries get_channel_context lists as participants. */
+export const MAX_PARTICIPANTS = 50;
 
 /** What a token authenticates: one harness binding (run) of one session. */
 export interface ToolBinding {
@@ -104,6 +116,12 @@ export interface HostToolsOptions {
   watches?: WatchControl;
   /** Provenance of a session's turn (`Lane.provenance`), attached to every write the turn makes. */
   provenance?(sessionKey: string, turnId: string): TurnProvenance | undefined;
+  /**
+   * People who wrote in a session's conversations, most recent first (`Lane.participants`):
+   * get_channel_context lists those of the current conversation after this turn's senders, so
+   * the agent can @ anyone it has seen there, not only who spoke this turn. Absent: only this turn's.
+   */
+  participants?(sessionKey: string): Participant[];
   /** Topics of the caller's conversation (decision 6); absent = no session_* tools. */
   topics?: TopicControl;
   /** Live (realtime voice) control (decision 11); absent = no live_* tools. */
@@ -318,22 +336,38 @@ export class HostTools {
     return a.caps(route.account);
   }
 
-  private participants(turn: TurnContext): { principal?: string; userId?: string; name?: string; channel?: string }[] {
-    const out = new Map<string, { principal?: string; userId?: string; name?: string; channel?: string }>();
+  /**
+   * Who the agent can address with mention: this turn's senders first, then (with
+   * `participants`) the others seen in the current conversation, most recent first; at most
+   * `MAX_PARTICIPANTS`. Ids are channel user ids (what an adapter turns into a mention).
+   */
+  private participants(turn: TurnContext, sessionKey: string): ParticipantView[] {
+    const out = new Map<string, ParticipantView>();
+    const add = (k: string | undefined, p: ParticipantView) => {
+      if (!k || out.has(k) || out.size >= MAX_PARTICIPANTS) return;
+      out.set(k, p);
+    };
     for (const i of turn.inputs) {
       const ch = i.origin.adapter;
       const pid = i.origin.principal?.id;
       const ctxId = i.channelContext.senderId;
       const userId = typeof ctxId === 'string' ? ctxId : pid?.startsWith(`${ch}:`) ? pid.slice(ch.length + 1) : undefined;
       const name = typeof i.channelContext.senderName === 'string' ? i.channelContext.senderName : undefined;
-      const k = userId ?? pid ?? name;
-      if (!k || out.has(k)) continue;
-      out.set(k, { ...(pid ? { principal: pid } : {}), ...(userId ? { userId } : {}), ...(name ? { name } : {}), channel: ch });
+      const isBot = i.channelContext.senderIsBot === true;
+      add(userId ?? pid ?? name, { ...(pid ? { principal: pid } : {}), ...(userId ? { userId } : {}), ...(name ? { name } : {}), channel: ch, ...(isBot ? { isBot } : {}) });
+    }
+    const r = currentRoute(turn);
+    if (r) {
+      for (const p of this.o.participants?.(sessionKey) ?? []) {
+        // Only people of this conversation: an id from another chat would not reach anyone here.
+        if (p.channel !== r.channel || (p.conversationId !== undefined && p.conversationId !== r.conversationId)) continue;
+        add(p.userId, { ...(p.principal ? { principal: p.principal } : {}), userId: p.userId, ...(p.name ? { name: p.name } : {}), channel: p.channel, ...(p.isBot ? { isBot: true } : {}) });
+      }
     }
     return [...out.values()];
   }
 
-  private channelContext(_b: ToolBinding, turn: TurnContext) {
+  private channelContext(b: ToolBinding, turn: TurnContext) {
     const r = currentRoute(turn);
     const first = turn.inputs[0]?.channelContext ?? {};
     const pre = this.o.routes?.() ?? [];
@@ -354,7 +388,7 @@ export class HostTools {
         mediaOut: caps.media.out,
         approvals: caps.approvals,
       },
-      participants: this.participants(turn),
+      participants: this.participants(turn, b.sessionKey),
       allowedDestinations: {
         current: routeKey(r),
         alsoThisTurn: turn.deliveries.map(routeKey),
@@ -537,7 +571,7 @@ export class HostTools {
     if (!Array.isArray(ids) || !ids.length || ids.some((x) => typeof x !== 'string' || !x)) throw new ToolError('user_ids must be a non-empty array of user id strings');
     const route = this.parseRoute(turn, undefined);
     await this.allowed(b, turn, 'mention', route);
-    const people = this.participants(turn);
+    const people = this.participants(turn, b.sessionKey);
     const targets = (ids as string[]).map((raw) => {
       const id = raw.startsWith(`${route.channel}:`) ? raw.slice(route.channel.length + 1) : raw;
       const p = people.find((x) => x.userId === id || x.principal === raw);

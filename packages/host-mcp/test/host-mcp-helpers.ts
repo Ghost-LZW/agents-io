@@ -2,7 +2,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ChannelCaps, InputRecord, ReplyRoute, TurnContext } from '@agents-io/protocol';
-import { Hub, MemorySessionLog, Outbox, WatchDispatcher, WatchRegistry, defaultPolicy } from '@agents-io/session';
+import { Hub, MemorySessionLog, Outbox, WatchDispatcher, WatchRegistry, defaultPolicy, type Participant } from '@agents-io/session';
 import { FakeChannel, defaultChannelCaps } from '@agents-io/testkit';
 import { HostTools, MemoryBlobStore, OUTPUT_EVENT, type OutputRecord } from '../src/index.js';
 
@@ -28,7 +28,7 @@ export function turnOf(r: ReplyRoute | null, profile = 'bypass'): TurnContext {
 
 const NO_MEDIA: ChannelCaps = { ...defaultChannelCaps, buttons: false, media: { in: [], out: [] } };
 
-export function world(o: { turn?: TurnContext | undefined; routes?: string[]; cwd?: string } = {}) {
+export function world(o: { turn?: TurnContext | undefined; routes?: string[]; cwd?: string; participants?: Participant[] } = {}) {
   const hub = new Hub(new MemorySessionLog());
   const policy = defaultPolicy({ owners: ['fake:alice'], routes: o.routes ?? [] });
   const outbox = new Outbox({ hub, policy, sleep: async () => {} });
@@ -46,6 +46,7 @@ export function world(o: { turn?: TurnContext | undefined; routes?: string[]; cw
     blobs,
     cwd: () => cwd,
     routes: () => o.routes ?? [],
+    ...(o.participants ? { participants: () => o.participants! } : {}),
   });
   const events = () => hub.log.read(SK, 0);
   const outputs = () => events().filter((e) => e.body.t === 'native' && e.body.name === OUTPUT_EVENT).map((e) => e.native as OutputRecord);

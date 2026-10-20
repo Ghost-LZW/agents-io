@@ -149,6 +149,26 @@ interface Queued {
 /** Bounds of the context handed to one turn. */
 export const CONTEXT_DEFAULTS = { maxItems: 50, maxChars: 20_000 } as const;
 
+/** How many distinct senders a session remembers for `Lane.participants` (most recent kept). */
+export const PARTICIPANTS_MAX = 50;
+
+/**
+ * Someone who wrote in this session's conversations (a dispatched or context input from a
+ * channel message): what the output tools offer as people to @ (`get_channel_context`, `mention`).
+ */
+export interface Participant {
+  /** Channel id (`origin.adapter`). */
+  channel: string;
+  /** The sender's id on the channel (`channelContext.senderId`): what an adapter turns into a platform mention. */
+  userId: string;
+  name?: string;
+  /** Principal id the gateway stamped, when it recognised the sender. */
+  principal?: string;
+  isBot?: boolean;
+  /** Conversation the message was in (`channelContext.conversationId`). */
+  conversationId?: string;
+}
+
 /** A context-only input recorded but not yet handed to a turn. */
 interface PendingContext {
   /** Latest revision. */
@@ -269,6 +289,8 @@ export class Lane {
   private ctxDropped = 0;
   /** Original ids of context inputs already handed to a turn (bounded). */
   private handedCtx = new Set<string>();
+  /** Senders of this session's inputs, least recent first (bounded, `PARTICIPANTS_MAX`), keyed by channel and user id. */
+  private people = new Map<string, Participant>();
   private live: LiveInfo | undefined;
   /** The run delegated turns begin under while the live runs (`LiveStartArgs.delegationRun`): plan over no inputs. */
   private delegationRun: RunSpec | undefined;
@@ -357,8 +379,37 @@ export class Lane {
     return this.known.size > 0;
   }
 
+  /**
+   * Who wrote in this session, most recent first: the senders of its inputs (dispatched and
+   * context) that came from channel messages, at most `PARTICIPANTS_MAX`; never this
+   * deployment's own messages. Rebuilt from the log when the lane opens.
+   */
+  participants(): Participant[] {
+    return [...this.people.values()].reverse();
+  }
+
+  private notePerson(input: InputRecord): void {
+    const c = input.channelContext;
+    const userId = c.senderId;
+    if (typeof userId !== 'string' || !userId || input.origin.self) return;
+    const channel = input.origin.adapter;
+    const key = `${channel}\u0000${userId}`;
+    const prior = this.people.get(key);
+    const name = typeof c.senderName === 'string' && c.senderName ? c.senderName : prior?.name;
+    const principal = input.origin.principal?.id ?? prior?.principal;
+    const isBot = typeof c.senderIsBot === 'boolean' ? c.senderIsBot : prior?.isBot;
+    const conversationId = typeof c.conversationId === 'string' ? c.conversationId : prior?.conversationId;
+    this.people.delete(key);
+    this.people.set(key, { channel, userId, ...(name ? { name } : {}), ...(principal ? { principal } : {}), ...(isBot ? { isBot } : {}), ...(conversationId ? { conversationId } : {}) });
+    for (const k of this.people.keys()) {
+      if (this.people.size <= PARTICIPANTS_MAX) break;
+      this.people.delete(k);
+    }
+  }
+
   private recordContext(input: InputRecord): void {
     this.observedInputs.set(input.inputId, input);
+    this.notePerson(input);
     const e = this.emit({ body: { t: 'input.admitted', inputId: input.inputId, disposition: 'observe_only', ...pid(input), input } });
     this.addContext(input, e.seq);
   }
@@ -829,6 +880,7 @@ export class Lane {
   private async input(input: InputRecord, mode: InputMode, expectedTurnId?: string): Promise<CommandResult> {
     if (this.known.has(input.inputId)) return { ok: true, disposition: 'duplicate' };
     this.known.add(input.inputId);
+    this.notePerson(input);
     // The single loop checkpoint: every path that starts or joins a turn (queue, steer, interrupt) comes here.
     const trip = this.guard?.check(input);
     if (trip) return this.guarded(input, trip);
@@ -1135,6 +1187,7 @@ export class Lane {
       if (b.t === 'input.admitted' && b.disposition !== 'observe_only') this.known.add(b.inputId);
       if (b.t === 'input.admitted' && b.input) {
         records.set(b.inputId, b.input);
+        this.notePerson(b.input);
         if (b.disposition === 'observe_only') {
           this.observedInputs.set(b.inputId, b.input);
           this.addContext(b.input, e.seq);

@@ -18,7 +18,7 @@ const ROUTE =
 export const TOOL_DEFS = {
   get_channel_context: {
     description:
-      'Describe where your reply goes: the current route key, channel, conversation kind, rendering tier and what the channel can show (markdown level, max message length, buttons, which media it can send), the people in this turn (ids usable with mention) and the destinations you may send to. Call it before sending files, buttons or mentions if you are unsure what the channel supports. Your normal text answer is always delivered to the user automatically; you do not need these tools just to reply.',
+      'Describe where your reply goes: the current route key, channel, conversation kind, rendering tier and what the channel can show (markdown level, max message length, buttons, which media it can send), the people you can @ with mention (this turn\'s senders first, then others seen in this conversation, most recent first; bots marked isBot) and the destinations you may send to. Call it before sending files, buttons or mentions if you are unsure what the channel supports. Your normal text answer is always delivered to the user automatically; you do not need these tools just to reply.',
     input: {},
     readOnly: true,
   },
@@ -43,7 +43,7 @@ export const TOOL_DEFS = {
   },
   mention: {
     description:
-      'Send a message in the current conversation that @-mentions (notifies) specific people. `user_ids` are channel user ids, e.g. from get_channel_context participants (a principal like lark-bot:on_x also works). On channels without mentions (mail, terminal) the names are written as @name text. Use only when someone must be notified; ordinary answers need no mention.',
+      'Send a message in the current conversation that @-mentions (notifies) specific people. `user_ids` are channel user ids from get_channel_context participants: anyone seen in this conversation, not only this turn\'s senders (a principal like lark-bot:on_x also works). On channels without mentions (mail, terminal) the names are written as @name text. Use only when someone must be notified; ordinary answers need no mention.',
     input: {
       user_ids: z.array(z.string()).min(1).describe('Channel user ids to mention'),
       text: z.string().describe('Message text after the mentions'),

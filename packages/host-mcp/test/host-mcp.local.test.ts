@@ -111,6 +111,44 @@ describe('HostTools', () => {
   });
 });
 
+describe('participants: people seen in the conversation', () => {
+  const seen = [
+    { channel: 'fake', userId: 'carol', name: 'Carol', conversationId: 'c1' },
+    { channel: 'fake', userId: 'alice', name: 'Alice', principal: 'fake:alice', conversationId: 'c1' },
+    { channel: 'fake', userId: 'ci-bot', name: 'CI', isBot: true, conversationId: 'c1' },
+    { channel: 'fake', userId: 'dave', name: 'Dave', conversationId: 'c2' },
+    { channel: 'mail', userId: 'erin@example.com', name: 'Erin' },
+  ];
+
+  it('get_channel_context lists this turn’s senders first, then others of this conversation, most recent first, bots marked', async () => {
+    const w = world({ participants: seen });
+    const c = await call(w, 'get_channel_context', {});
+    expect(c.participants).toEqual([
+      { principal: 'fake:alice', userId: 'alice', name: 'Alice', channel: 'fake' },
+      { userId: 'carol', name: 'Carol', channel: 'fake' },
+      { userId: 'ci-bot', name: 'CI', channel: 'fake', isBot: true },
+    ]);
+  });
+
+  it('mention names anyone seen in the conversation; an id it has not seen is passed on as given', async () => {
+    const w = world({ participants: seen });
+    const out = await call(w, 'mention', { user_ids: ['carol', 'fake:ci-bot', 'zed'], text: 'standup?' });
+    expect((w.fake.sent[0]!.msg.channelData as Record<string, unknown>)[MENTIONS_KEY]).toEqual({
+      targets: [{ id: 'carol', name: 'Carol' }, { id: 'ci-bot', name: 'CI' }, { id: 'zed' }],
+      text: 'standup?',
+    });
+    expect(w.fake.sent[0]!.msg.text).toBe('@Carol @CI @zed standup?');
+    expect(out).toMatchObject({ mentioned: ['carol', 'ci-bot', 'zed'] });
+  });
+
+  it('at most 50', async () => {
+    const many = Array.from({ length: 80 }, (_, i) => ({ channel: 'fake', userId: `u${i}`, conversationId: 'c1' }));
+    const c = await call(world({ participants: many }), 'get_channel_context', {});
+    expect(c.participants).toHaveLength(50);
+    expect(c.participants[1]).toMatchObject({ userId: 'u0' });
+  });
+});
+
 describe('watch tools', () => {
   it('validates mode and digest period', async () => {
     const w = watchWorld();
