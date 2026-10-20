@@ -356,6 +356,109 @@ describe('Lane: requests', () => {
     await c.lane.close();
   });
 
+  it('the harness\'s native request reaches policy.resolve and the reviewer #RQ-1', async () => {
+    const native = { toolName: 'Bash', input: { command: 'git status' } };
+    const seen: unknown[] = [];
+    const got: Decision[] = [];
+    const { lane } = setup({
+      harness: new FakeHarness(async (t) => {
+        t.emit(req('r1'), { native });
+        got.push(await t.waitDecision('r1'));
+      }),
+      policy: policy({
+        resolve: async (_r, _c, extra) => {
+          seen.push(extra?.native);
+          return { kind: 'model', model: 'judge' };
+        },
+      }),
+      modelReviewer: async (a) => {
+        seen.push(a.native);
+        return { kind: 'allow_once' };
+      },
+    });
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('go'), mode: 'queue' });
+    await until(() => got.length === 1);
+    expect(seen).toEqual([native, native]);
+    await lane.close();
+  });
+
+  it('model: the resolver\'s escalate answers an escalation, a reviewer error and no reviewer; the reviewer\'s own resolver wins #RQ-1', async () => {
+    const fallback = { kind: 'human' as const, principals: ['fake:bob'], routes: [], note: 'asked because' };
+    const run = async (reviewer: ModelReviewer | undefined) => {
+      const got: Decision[] = [];
+      const ctx = setup({
+        harness: asking(got),
+        policy: policy({ resolve: async () => ({ kind: 'model', model: 'judge', escalate: fallback }) }),
+        ...(reviewer ? { modelReviewer: reviewer } : {}),
+      });
+      await ctx.lane.command({ type: 'input', sessionKey: 's1', input: input('go'), mode: 'queue' });
+      return { ...ctx, got };
+    };
+    const last = (evs: ReturnType<ReturnType<typeof setup>['events']>) =>
+      (bodies(evs, 'request.opened').at(-1) as BodyOf<'request.opened'>).resolver;
+
+    const a = await run(async () => ({ escalate: true }));
+    await until(() => bodies(a.events(), 'request.opened').length === 2);
+    expect(last(a.events())).toEqual(fallback);
+    expect(await a.lane.command({ type: 'resolve', sessionKey: 's1', requestId: 'r1', decision: { kind: 'allow_once' }, origin: origin('fake:bob') })).toEqual({ ok: true });
+    await until(() => a.got.length === 1);
+
+    const b = await run(async () => {
+      throw new Error('gateway down');
+    });
+    await until(() => bodies(b.events(), 'request.opened').length === 2);
+    expect(last(b.events())).toEqual(fallback);
+
+    const c = await run(undefined);
+    await until(() => bodies(c.events(), 'request.opened').length === 1);
+    expect(last(c.events())).toEqual(fallback);
+
+    const mine = { kind: 'human' as const, principals: ['fake:carol'], routes: [], note: 'the reviewer says why' };
+    const d = await run(async () => ({ escalate: true, reason: 'unsure', resolver: mine }));
+    await until(() => bodies(d.events(), 'request.opened').length === 2);
+    expect(last(d.events())).toEqual(mine);
+
+    // A reviewer naming a model resolver again is not taken: no review loop.
+    const e = await run(async () => ({ escalate: true, resolver: { kind: 'model', model: 'again' } }));
+    await until(() => bodies(e.events(), 'request.opened').length === 2);
+    expect(last(e.events())).toEqual(fallback);
+    for (const x of [a, b, c, d, e]) await x.lane.close();
+  });
+
+  it('a human resolver\'s timeoutMs denies the request unanswered after that long #RQ-2', async () => {
+    const got: Decision[] = [];
+    const { lane, events } = setup({
+      harness: asking(got),
+      policy: policy({ resolve: async () => ({ kind: 'human', principals: ['fake:alice'], routes: [], timeoutMs: 1000 }) }),
+      requestTimeoutMs: 60_000,
+    });
+    const t0 = Date.now();
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('go'), mode: 'queue' });
+    await until(() => got.length === 1, 5000);
+    expect(Date.now() - t0).toBeLessThan(10_000);
+    expect(got[0]).toMatchObject({ kind: 'deny' });
+    expect(bodies(events(), 'request.resolved')[0]).toMatchObject({ by: 'timeout' });
+    await lane.close();
+  });
+
+  it('allowSessionAs: a person\'s allow_session reaches the harness as allow_once; the log keeps allow_session #RQ-1', async () => {
+    const got: Decision[] = [];
+    const { lane, events } = setup({
+      harness: new FakeHarness(async (t) => {
+        t.emit(req('r1', { allowAlways: true, allowedDecisions: ['allow_once', 'allow_session', 'deny'] }));
+        got.push(await t.waitDecision('r1'));
+      }),
+      policy: policy({ resolve: async () => ({ kind: 'human', principals: ['fake:alice'], routes: [], allowSessionAs: 'allow_once' }) }),
+    });
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('go'), mode: 'queue' });
+    await until(() => bodies(events(), 'request.opened').length === 1);
+    expect(await lane.command({ type: 'resolve', sessionKey: 's1', requestId: 'r1', decision: { kind: 'allow_session' }, origin: origin('fake:alice') })).toEqual({ ok: true });
+    await until(() => got.length === 1);
+    expect(got[0]).toEqual({ kind: 'allow_once' });
+    expect(bodies(events(), 'request.resolved')[0]).toMatchObject({ decision: { kind: 'allow_session' }, by: { kind: 'human', id: 'fake:alice' } });
+    await lane.close();
+  });
+
   it('cancels open requests when the turn ends without answering them #RQ-2', async () => {
     const h = new ManualHarness({ ...fakeHarnessCaps });
     const { lane, events } = setup({ harness: h, policy: policy({ resolve: async () => ({ kind: 'human', principals: ['fake:alice'], routes: [] }) }) });

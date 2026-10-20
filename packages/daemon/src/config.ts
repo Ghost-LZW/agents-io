@@ -367,6 +367,7 @@ export const ConfigFile = Type.Object(
       Type.Object(
         {
           resolve: Type.Optional(Type.Object({ timeoutMs: Type.Optional(Type.Number({ minimum: 1 })) }, Closed)),
+          review: Type.Optional(Type.Object({ timeoutMs: Type.Optional(Type.Number({ minimum: 1 })) }, Closed)),
           outbound: Type.Optional(Type.Object({ timeoutMs: Type.Optional(Type.Number({ minimum: 1 })) }, Closed)),
           external: Type.Optional(Type.Object({ timeoutMs: Type.Optional(Type.Number({ minimum: 1 })) }, Closed)),
         },
@@ -722,7 +723,7 @@ export interface Config {
   /** How long a parked topic's lane stays open while idle (0: until the daemon stops). */
   topics: { parkedIdleMs: number };
   /** Host `resolve` / `outbound` callout timeouts (ms). */
-  hostCallouts: { resolveTimeoutMs: number; outboundTimeoutMs: number; externalTimeoutMs: number };
+  hostCallouts: { resolveTimeoutMs: number; reviewTimeoutMs: number; outboundTimeoutMs: number; externalTimeoutMs: number };
   local: { principal: Principal; session: string };
   /** The console API server. */
   console: ConsoleConfig;
@@ -1016,6 +1017,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     topics: { parkedIdleMs: c.topics?.parkedIdleMs ?? DEFAULT_PARKED_IDLE_MS },
     hostCallouts: {
       resolveTimeoutMs: c.hostCallouts?.resolve?.timeoutMs ?? 3000,
+      reviewTimeoutMs: c.hostCallouts?.review?.timeoutMs ?? 15_000,
       outboundTimeoutMs: c.hostCallouts?.outbound?.timeoutMs ?? 2000,
       externalTimeoutMs: c.hostCallouts?.external?.timeoutMs ?? 2000,
     },

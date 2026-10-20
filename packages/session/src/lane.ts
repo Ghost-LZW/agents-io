@@ -35,11 +35,16 @@ export interface ModelReviewArgs {
   ctx: TurnContext;
   model: string;
   prompt?: string;
+  /** The harness's own form of the request (its `request.opened` event's `native`). */
+  native?: unknown;
   signal: AbortSignal;
 }
 
-/** Host-provided model review. Return a decision, or `escalate` to hand the request to a human. */
-export type ModelReviewer = (args: ModelReviewArgs) => Promise<Decision | { escalate: true; reason?: string }>;
+/**
+ * Host-provided model review. Return a decision, or `escalate` to hand the request on: to
+ * `resolver` when given, else to the model resolver's `escalate`, else to `Policy.escalate`.
+ */
+export type ModelReviewer = (args: ModelReviewArgs) => Promise<Decision | { escalate: true; reason?: string; resolver?: Resolver }>;
 
 export interface LaneOptions {
   sessionKey: string;
@@ -70,7 +75,7 @@ export interface LaneOptions {
    * not in the turn's own conversation (e.g. the owner, about a guest's turn) gets its card there.
    */
   routeOf?: (routeKey: string) => ReplyRoute | undefined;
-  /** Human/host requests without `expiresAt` are denied after this long (default 10 min). */
+  /** Human/host requests without `expiresAt` (or a human resolver's `timeoutMs`) are denied after this long (default 10 min). */
   requestTimeoutMs?: number;
   /** How many times an admitted-but-unconsumed input is re-queued before it is rejected (default 1). */
   requeueLimit?: number;
@@ -1615,11 +1620,11 @@ export class Lane {
     const owner = this.turn?.owner ?? null;
     let resolver: Resolver;
     try {
-      resolver = await this.policy.resolve(b, ctx);
+      resolver = await this.policy.resolve(b, ctx, e.native !== undefined ? { native: e.native } : undefined);
     } catch (err) {
       resolver = { kind: 'auto', decision: { kind: 'deny', message: `policy error: ${errMsg(err)}` } };
     }
-    if (resolver.kind === 'model' && !this.o.modelReviewer) resolver = await this.escalate(b, ctx);
+    if (resolver.kind === 'model' && !this.o.modelReviewer) resolver = resolver.escalate ?? (await this.escalate(b, ctx));
     if (b.kind === 'question' && resolver.kind === 'auto' && !decisionAllowed(b, resolver.decision)) {
       resolver = { kind: 'auto', decision: { kind: 'deny', message: 'Question resolver returned no answer.' } };
     }
@@ -1648,7 +1653,7 @@ export class Lane {
         await this.settle(b.requestId, resolver.decision, { kind: 'auto' });
         return;
       case 'model':
-        this.startReview(b.requestId, p, resolver, ctx, owner, gen);
+        this.startReview(b.requestId, p, resolver, ctx, owner, gen, e.native);
         return;
       case 'human':
       case 'host':
@@ -1658,7 +1663,7 @@ export class Lane {
     }
   }
 
-  private startReview(id: string, p: PendingRequest, r: Resolver & { kind: 'model' }, ctx: TurnContext, owner: string | null, gen: number): void {
+  private startReview(id: string, p: PendingRequest, r: Resolver & { kind: 'model' }, ctx: TurnContext, owner: string | null, gen: number, native: unknown): void {
     const abort = new AbortController();
     p.abort = abort;
     this.arm(id, p);
@@ -1669,15 +1674,19 @@ export class Lane {
       ctx,
       model: r.model,
       ...(r.prompt !== undefined ? { prompt: r.prompt } : {}),
+      ...(native !== undefined ? { native } : {}),
       signal: abort.signal,
     })
-      .catch((err: unknown) => ({ escalate: true as const, reason: errMsg(err) }))
+      .catch((err: unknown): { escalate: true; reason?: string; resolver?: Resolver } => ({ escalate: true, reason: errMsg(err) }))
       .then((out) =>
         this.serial(async () => {
           if (this.requests.get(id) !== p) return; // already settled (timeout, harness, turn end)
           if ('escalate' in out) {
             if (p.timer) clearTimeout(p.timer);
-            const next = await this.escalate(p.body, ctx);
+            // The reviewer's own resolver (a model one would review again: not taken), else the one
+            // the resolve answer named for this case, else the policy's.
+            const given = out.resolver && out.resolver.kind !== 'model' ? out.resolver : undefined;
+            const next = given ?? r.escalate ?? (await this.escalate(p.body, ctx));
             const q: PendingRequest = { body: p.body, resolver: next, turnId: p.turnId, audience: audienceFor(next, 'approval') };
             this.requests.set(id, q);
             // Re-open with the escalated resolver; subscribers upsert by requestId.
@@ -1708,7 +1717,8 @@ export class Lane {
 
   private arm(id: string, p: PendingRequest): void {
     if (p.timer) clearTimeout(p.timer);
-    const ms = p.body.expiresAt !== undefined ? Math.max(0, p.body.expiresAt - Date.now()) : (this.o.requestTimeoutMs ?? 600_000);
+    const own = p.resolver.kind === 'human' ? p.resolver.timeoutMs : undefined;
+    const ms = p.body.expiresAt !== undefined ? Math.max(0, p.body.expiresAt - Date.now()) : (own ?? this.o.requestTimeoutMs ?? 600_000);
     p.timer = setTimeout(() => {
       void this.serial(() => this.settle(id, { kind: 'deny', message: 'request timed out' }, 'timeout'));
     }, ms);
@@ -1731,8 +1741,11 @@ export class Lane {
     // the durable session event log or another channel's event stream.
     const recorded = p.body.questions?.some((q) => q.secret) && decision.kind === 'answer' ? null : decision;
     this.emit({ turnId: p.turnId, audience: p.audience, body: { t: 'request.resolved', requestId: id, decision: recorded, by } });
+    // The host keeps "always" itself (human resolver `allowSessionAs`): the harness gets a plain allow.
+    const toHarness: Decision =
+      decision.kind === 'allow_session' && p.resolver.kind === 'human' && p.resolver.allowSessionAs === 'allow_once' ? { kind: 'allow_once' } : decision;
     try {
-      await this.session?.respond(id, decision);
+      await this.session?.respond(id, toHarness);
     } catch (err) {
       this.emit({ turnId: p.turnId, level: 'detail', body: { t: 'notice', code: 'other', message: `respond failed: ${errMsg(err)}` } });
     }

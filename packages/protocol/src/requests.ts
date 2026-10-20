@@ -19,18 +19,42 @@ export const Decision = Type.Union([
 export type Decision = Static<typeof Decision>;
 export type DecisionKind = Decision['kind'];
 
+const HumanResolver = Type.Object({
+  kind: Type.Literal('human'),
+  principals: Type.Array(Type.String()),
+  routes: Type.Array(Type.String()),
+  /**
+   * Deny the request unanswered after this long (instead of the session's default; a request
+   * whose harness set `expiresAt` keeps that). E.g. shorter for a turn nobody is present for.
+   */
+  timeoutMs: Type.Optional(Type.Integer({ minimum: 1000 })),
+  /** One line shown with the request wherever it renders (why it is asked, what "always" would keep). */
+  note: Type.Optional(Type.String({ maxLength: 500 })),
+  /**
+   * `allow_once`: a person's `allow_session` reaches the harness as `allow_once` (the host keeps
+   * the "always" itself, revocably, rather than the harness's own permission rules); the recorded
+   * decision stays `allow_session`.
+   */
+  allowSessionAs: Type.Optional(Type.Literal('allow_once')),
+});
+
 /**
  * Who answers a request. Chosen by the host's `Policy.resolve`. Only `human`
  * requests are ever pushed to people; the default is `auto`.
  */
 export const Resolver = Type.Union([
   Type.Object({ kind: Type.Literal('auto'), decision: Decision }),
-  Type.Object({ kind: Type.Literal('model'), model: Type.String(), prompt: Type.Optional(Type.String()) }),
   Type.Object({
-    kind: Type.Literal('human'),
-    principals: Type.Array(Type.String()),
-    routes: Type.Array(Type.String()),
+    kind: Type.Literal('model'),
+    model: Type.String(),
+    prompt: Type.Optional(Type.String()),
+    /**
+     * Who answers when the review escalates or cannot decide (no reviewer, an error, a timeout);
+     * without it `Policy.escalate` decides.
+     */
+    escalate: Type.Optional(Type.Union([Type.Object({ kind: Type.Literal('auto'), decision: Decision }), HumanResolver])),
   }),
+  HumanResolver,
   /** The host answers asynchronously via a `resolve` command. */
   Type.Object({ kind: Type.Literal('host') }),
 ]);

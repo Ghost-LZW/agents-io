@@ -88,6 +88,11 @@ export interface ControlArgs {
   turn?: TurnContext;
 }
 
+/** What `Policy.resolve` gets besides the request and the turn. */
+export interface ResolveExtra {
+  native?: unknown;
+}
+
 /**
  * Host policy. Every hook is optional; agents-io ships defaults that only cover a
  * single owner using it for themselves.
@@ -96,7 +101,8 @@ export interface Policy {
   identify?(args: IdentifyArgs): Promise<Identity>;
   admit?(env: InboundEnvelope, origin: Origin): Promise<Admission>;
   plan?(turn: TurnDraft): Promise<RunSpec>;
-  resolve?(req: BodyOf<'request.opened'>, ctx: TurnContext): Promise<Resolver>;
+  /** `extra.native`: the harness's own form of the request (its `request.opened` event's `native`). */
+  resolve?(req: BodyOf<'request.opened'>, ctx: TurnContext, extra?: ResolveExtra): Promise<Resolver>;
   outbound?(args: { from: TurnContext | null; to: ReplyRoute }): Promise<'allow' | 'deny'>;
   /** May this origin interrupt, clear the queue, or change the session? */
   control?(args: ControlArgs): Promise<'allow' | 'deny'>;

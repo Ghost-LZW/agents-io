@@ -285,7 +285,9 @@ export function renderTurn(v: TurnView, tier: Tier, o: RenderOptions = {}): Rend
   const actions: NonNullable<RenderedMessage['actions']> = [];
   const asks: string[] = [];
   for (const r of v.pending) {
-    asks.push(`${r.kind === 'question' ? 'Answer needed' : 'Approval needed'}: ${r.title}`);
+    // A human resolver's `note` (why it is asked; what "always" would keep) goes with the ask.
+    const note = r.resolver?.kind === 'human' ? r.resolver.note : undefined;
+    asks.push(`${r.kind === 'question' ? 'Answer needed' : 'Approval needed'}: ${r.title}${note ? `\n${note}` : ''}`);
     const routes = r.resolver?.kind === 'human' ? r.resolver.routes : [];
     // Buttons only where the resolver said people answer; elsewhere just say it is waiting.
     if (o.caps?.buttons === false || (routes.length && here && !routes.includes(here))) continue;

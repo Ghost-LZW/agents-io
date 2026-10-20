@@ -74,10 +74,20 @@ POSITIONING §2 的判据：某个请求交给谁答、某个目的地能不能�
 ### 4.5 配置
 
 ```jsonc
-"hostCallouts": { "resolve": { "timeoutMs": 3000 }, "outbound": { "timeoutMs": 2000 } }
+"hostCallouts": { "resolve": { "timeoutMs": 3000 }, "review": { "timeoutMs": 15000 }, "outbound": { "timeoutMs": 2000 } }
 ```
 
 可选；`route` 仍用规则自己的 `callout.timeoutMs`。
+
+### 4.6 审查与「总是允许」（2026-10-21，决定 13 补记）
+
+第一个宿主（蓝饼助手）要做三件事：人点过「总是允许」的同类请求以后自动放行（规则在宿主，能撤销）；没人在场的回合里的请求短一些过期；执行前由一个独立的审查模型先看一遍。为此加了：
+
+- `resolve` 回调带 `native`（harness 的原始请求，规则要匹配命令、路径、工具名；事件体只有一行标题）。
+- `review` 钩子：`Resolver { kind: "model" }` 与 lane 的 `modelReviewer` 早就在协议里，守护进程一直没有接线。现在接到宿主：审查不占 lane 的串行队列（`resolve` 是同步的，审查要几秒，期间停止按钮和新输入都会被挡住），审查期间请求不显示给人，升级时以宿主给的 `human` resolver 重新打开。
+- `human.timeoutMs`、`human.note`、`human.allowSessionAs`、`model.escalate`：都是可选字段，旧宿主不受影响。
+
+`ReviewCalloutAnswer` 是新的答复 schema；`HostEventFrame` 多了 `ReviewCallout`。
 
 ## 5. 协议 / Schema 影响
 

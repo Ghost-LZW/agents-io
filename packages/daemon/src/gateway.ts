@@ -79,6 +79,7 @@ import {
   type DeliveryRecord,
   type EmitSource,
   type LaneOptions,
+  type ModelReviewer,
   type ProducingTurn,
   type FullPolicy,
   type IngressResult,
@@ -268,6 +269,14 @@ async function within(p: Promise<unknown> | undefined, ms: number): Promise<void
 export class Gateway {
   readonly hub: Hub;
   readonly policy: FullPolicy;
+  /**
+   * A `model` resolver's review: the connected host's `review` hook. Without one (or when it
+   * fails, times out or answers something else) the lane escalates the request.
+   */
+  private readonly modelReviewer: ModelReviewer = async (a) => {
+    if (!this.host.answers('review')) throw new Error('no host answers review');
+    return this.host.reviewCallout(a);
+  };
   /** The binding tables: the owners config as the default table, plus watches as runtime rules. */
   readonly router: Router;
   readonly ingress: Ingress;
@@ -407,7 +416,7 @@ export class Gateway {
       // The router's identity maps (the owners config; a host's map once one is pushed).
       identify: async (a) => router.identify(a),
       // With `strangers: ask`, what a non-owner's turn asks for is asked of the owner, in their chat (decision 15).
-      resolve: async (req, ctx) => this.askOwner(ctx) ?? base.resolve(req, ctx),
+      resolve: async (req, ctx, extra) => this.askOwner(ctx) ?? base.resolve(req, ctx, extra),
       // The host (authenticated with the token) may interrupt and cancel what it started and what it watches.
       control: async (a) => (isHostOrigin(a.origin) ? 'allow' : base.control(a)),
       ...o.policy,
@@ -418,13 +427,13 @@ export class Gateway {
       // cannot (timeout, error, bad answer) the local policy does. This falls back (fails open to
       // the built-in resolvers), it does not deny: a host restricting who may answer is not
       // enforced while it is slow or down. (outbound below denies instead.)
-      resolve: async (req, ctx) => {
-        if (!this.host.answers('resolve')) return local.resolve(req, ctx);
+      resolve: async (req, ctx, extra) => {
+        if (!this.host.answers('resolve')) return local.resolve(req, ctx, extra);
         try {
-          return await this.host.resolveCallout(req, ctx);
+          return await this.host.resolveCallout(req, ctx, extra?.native);
         } catch (e) {
           this.log('warn', `${ctx.sessionKey}: host resolve callout for ${req.requestId} failed (${(e as Error).message}); the local policy decides`);
-          return local.resolve(req, ctx);
+          return local.resolve(req, ctx, extra);
         }
       },
       // A connected host whose hello lists `contact` decides which agent may contact which; when it
@@ -490,7 +499,7 @@ export class Gateway {
       deliver: (name, f) => this.deliver(name, f),
       prepareSession: (f) => this.prepareSession(f),
       redispatch: (name, f) => this.redispatch(name, f),
-      calloutTimeouts: { resolve: c.hostCallouts.resolveTimeoutMs, outbound: c.hostCallouts.outboundTimeoutMs, external: c.hostCallouts.externalTimeoutMs },
+      calloutTimeouts: { resolve: c.hostCallouts.resolveTimeoutMs, review: c.hostCallouts.reviewTimeoutMs, outbound: c.hostCallouts.outboundTimeoutMs, external: c.hostCallouts.externalTimeoutMs },
       externalMcp: () => this.externalMcp !== undefined,
       explain: (id, chain) => this.explain(id, chain),
       answerOnBehalf: c.policy.answerOnBehalf,
@@ -1014,6 +1023,7 @@ export class Gateway {
       resumeFor: (id) => this.nativeIdOf(sessionKey, id),
       hub: this.hub,
       policy: this.withRunOverride(this.agentPolicy(agent), sessionKey),
+      modelReviewer: this.modelReviewer,
       cwd,
       ...(this.mcp && agent.tools ? { mcp: (a: { sessionKey: string; generation: number; harnessId: string }) => this.mcp!.mcpFor(a, agent.toolNames) } : {}),
       onLiveEnded: (liveId, reason) => this.liveEnded(sessionKey, liveId, reason),
@@ -1381,6 +1391,7 @@ export class Gateway {
       harness: adapter,
       hub: this.hub,
       policy: { ...this.policy, plan: async () => spec },
+      modelReviewer: this.modelReviewer,
       cwd: r.cwd,
       requeueLimit: 0,
       newId: (p) => {
