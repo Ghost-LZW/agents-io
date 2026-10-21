@@ -246,6 +246,13 @@ function batchKey(i: InputRecord): string | null {
   return `${p}\u0000${i.replyRoute ? routeKey(i.replyRoute) : '-'}`;
 }
 
+/**
+ * The harness's own command (`/compact`), marked by the daemon only (CT-2, CT-3): it runs as a
+ * turn of its own, never batched with other inputs and handed no context (the context waits for
+ * the next turn), so the harness reads nothing but the command.
+ */
+const isNativeCommand = (i: InputRecord) => i.channelContext.nativeCommand === true;
+
 const sameRoute = (a: ReplyRoute | null, b: ReplyRoute | null) =>
   (a === null && b === null) || (a !== null && b !== null && routeKey(a) === routeKey(b));
 
@@ -704,6 +711,28 @@ export class Lane {
       this.emit({ level: 'detail', body: { t: 'notice', code: 'runtime_restart', message: `harness binding released: ${reason}` } });
       await s.close(reason).catch(() => undefined);
       return { ok: true } as const;
+    });
+  }
+
+  /**
+   * Compact the harness's context now (host `session.compact`, CT-3): `input`, the harness's own
+   * command (`nativeCommand`), starts a turn of its own, handed no context. Only when the session
+   * is quiet: a turn running or starting, queued inputs, open requests or a live answer `busy` and
+   * nothing is recorded. Inputs arriving while it runs queue behind it like behind any turn (only
+   * the turn owner may steer, and nobody owns this one but the host). Answers the turn it started.
+   */
+  compact(input: InputRecord): Promise<CommandResult & { turnId?: string }> {
+    return this.serial(async () => {
+      if (this.closed) return { ok: false, reason: 'closed' };
+      if (!isNativeCommand(input)) return { ok: false, reason: 'not_a_command' };
+      if (this.known.has(input.inputId)) return { ok: true, disposition: 'duplicate' };
+      if (this.turn || this.queue.length || this.requests.size || this.live || this.dangling) return { ok: false, reason: 'busy' };
+      this.known.add(input.inputId);
+      await this.enqueue(input);
+      // Its events are handled behind this call (serial): no turn here means it failed to start
+      // (`input.rejected start_failed` is in the log).
+      const t = this.turn as ActiveTurn | undefined; // set by the pump above (TS keeps the narrowing from the check)
+      return t?.inputs.some((i) => i.inputId === input.inputId) ? { ok: true, disposition: 'new_turn', turnId: t.turnId } : { ok: false, reason: 'start_failed' };
     });
   }
 
@@ -1226,10 +1255,10 @@ export class Lane {
     const head = this.queue.shift();
     if (!head) return [];
     const batch = [head];
-    const key = batchKey(head.input);
+    const key = isNativeCommand(head.input) ? null : batchKey(head.input);
     if (key !== null) {
       // Consecutive only: never let a later input jump ahead of someone else's.
-      while (this.queue[0] && batchKey(this.queue[0].input) === key) batch.push(this.queue.shift()!);
+      while (this.queue[0] && !isNativeCommand(this.queue[0].input) && batchKey(this.queue[0].input) === key) batch.push(this.queue.shift()!);
     }
     return batch;
   }
@@ -1320,7 +1349,8 @@ export class Lane {
         context: [],
       };
       // Context recorded since the previous turn goes first: the model reads it before what it is asked.
-      const ctx = this.takeContext(t.turnId, t.replyRoute);
+      // A harness command reads none: it stays pending for the next turn.
+      const ctx = isNativeCommand(inputs[0]!) ? { records: [], taken: [] } : this.takeContext(t.turnId, t.replyRoute);
       t.context = ctx.records;
       this.turn = t;
       this.track(t.turnId, inputs, ctx.records);

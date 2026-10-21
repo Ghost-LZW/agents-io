@@ -8,6 +8,7 @@ import {
   type ContentBlock,
   type InboundItem,
   type InboundRedispatchResult,
+  type SessionCompactResult,
   type SessionLaunch,
   type SessionScope,
   type RenderedMessage,
@@ -273,6 +274,11 @@ export class LocalClient {
   /** Deliver a queued host-inbound item to a session with its original origin (idempotent per cursor). */
   inboundRedispatch(o: { cursor: number; agent?: string; session?: SessionScope; launch?: SessionLaunch }): Promise<InboundRedispatchResult> {
     return this.call('inbound.redispatch', o);
+  }
+
+  /** Compact a quiet live session's harness context as a turn of its own (`session.compact`, CT-3). */
+  sessionCompact(o: { sessionKey: string; inputId?: string }): Promise<SessionCompactResult> {
+    return this.call('session.compact', o);
   }
 
   /**

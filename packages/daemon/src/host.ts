@@ -55,6 +55,8 @@ export interface HostServiceDeps {
   prepareSession(f: Extract<HostRequestFrame, { type: 'session.prepare' }>): Outcome;
   /** `inbound.redispatch`: deliver a queued host-inbound item to a session with its original origin. */
   redispatch(hostName: string, f: Extract<HostRequestFrame, { type: 'inbound.redispatch' }>): Promise<Outcome>;
+  /** `session.compact`: compact a quiet live session's harness context as a turn of its own (CT-3). */
+  compactSession(f: Extract<HostRequestFrame, { type: 'session.compact' }>, origin: Origin): Promise<Outcome>;
   /** `policy.answerOnBehalf`: the `resolve.onBehalfOf` feature is advertised only when it is on. */
   answerOnBehalf?: boolean;
   /** Per-hook timeouts of the `resolve` / `review` / `outbound` / `contact` / `external` callouts (config `hostCallouts`). */
@@ -170,6 +172,8 @@ export class HostService implements HostFrames {
         return this.d.prepareSession(f);
       case 'inbound.redispatch':
         return this.d.redispatch(peer.auth!.name, f);
+      case 'session.compact':
+        return this.d.compactSession(f, peer.auth!.origin(f.sessionKey));
     }
   }
 
@@ -338,7 +342,8 @@ export class HostService implements HostFrames {
  * `callouts.external`: the `external` hook; `external.mcp` (only while the endpoint runs): the external MCP endpoint.
  * `callouts.review`: the `review` hook (a `model` resolver's review); `resolve.native`: `resolve` and `review` callouts carry
  * the harness's `native` request; `resolver.human.extras`: a human resolver's `timeoutMs`, `note` and `allowSessionAs`, and
- * a model resolver's `escalate`, apply.
+ * a model resolver's `escalate`, apply. `session.compact`: the `session.compact` request (a quiet live session's harness
+ * compacts its context as a turn of its own, CT-3).
  */
 export const FEATURES = [
   'session.launch',
@@ -357,6 +362,7 @@ export const FEATURES = [
   'run.correlation',
   'callouts.external',
   'external.mcp',
+  'session.compact',
 ];
 
 /** `DaemonRecords` flag: the name of the host that declared the `outbound` hook. */

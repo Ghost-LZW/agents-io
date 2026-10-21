@@ -861,10 +861,17 @@
 
 ### CT-2 对话里的命令只有主人能用，命令本身不开轮
 
-- **承诺**：发给本部署、整条消息是 `/名字 参数` 的文字，若名字是守护进程的命令（`/help`、`/status`、`/stop`、`/steer`、`/preset`、`/model`、`/effort`、`/compact`、`/agent`、`/new @agent`、`/tui`），只在 `Policy.control` 放行（主人）时执行，在原路由回一条短文本，不进 lane、不开轮；别人发的同样文字是普通消息。`/preset`、`/model`、`/effort` 只改这个会话、从下一轮起生效（存在日志库里）；`/preset` 换掉 harness 实例、model 和 effort，并清掉本会话 `/model`、`/effort` 设过的值，换到的实例仍以该会话 agent 的 cwd、指令和工具运行，权限 profile 不变。`/agent`、`/new @agent` 让这个平铺对话之后交给所选 agent（存在路由表库里），固定会话（`ownerSessionKey`）下说明做不到。`/compact` 是唯一原样交给 harness 的文字：只能由守护进程标记（`channelContext.nativeCommand`），适配器的 `context`、本地与宿主客户端的输入都去掉这个键。
-- **实现**：`packages/daemon/src/commands.ts`；`packages/session/src/ingress.ts` `onCommand`、`slashCommand`、`channelContext`（去掉 `nativeCommand`）；`packages/session/src/router.ts` `conversationAgent`、`setConversationAgent`、`place`；`packages/daemon/src/gateway.ts` `commandHost`、`withRunOverride`；`harness/claude-code/src/content.ts` `toUserMessage`。
-- **测试**：标签 `#CT-2`；`packages/daemon/test/commands.test.ts`。
+- **承诺**：发给本部署、整条消息是 `/名字 参数` 的文字，若名字是守护进程的命令（`/help`、`/status`、`/stop`、`/steer`、`/preset`、`/model`、`/effort`、`/compact`、`/agent`、`/new @agent`、`/tui`），只在 `Policy.control` 放行（主人）时执行，在原路由回一条短文本，不进 lane、不开轮；别人发的同样文字是普通消息。`/preset`、`/model`、`/effort` 只改这个会话、从下一轮起生效（存在日志库里）；`/preset` 换掉 harness 实例、model 和 effort，并清掉本会话 `/model`、`/effort` 设过的值，换到的实例仍以该会话 agent 的 cwd、指令和工具运行，权限 profile 不变。`/agent`、`/new @agent` 让这个平铺对话之后交给所选 agent（存在路由表库里），固定会话（`ownerSessionKey`）下说明做不到。`/compact` 是唯一原样交给 harness 的文字：只能由守护进程标记（`channelContext.nativeCommand`），适配器的 `context`、本地与宿主客户端的输入都去掉这个键。带这个标记的输入自成一轮：不与前后同一发送者的输入合批，也不带上之前记下的 context（留给下一轮），harness 只读到这条命令（2026-10-22 起；之前会与同一人排在它前后的消息合成一轮）。
+- **实现**：`packages/daemon/src/commands.ts`；`packages/session/src/ingress.ts` `onCommand`、`slashCommand`、`channelContext`（去掉 `nativeCommand`）；`packages/session/src/router.ts` `conversationAgent`、`setConversationAgent`、`place`；`packages/daemon/src/gateway.ts` `commandHost`、`withRunOverride`；`packages/session/src/lane.ts` `isNativeCommand`、`takeBatch`、`pump`；`harness/claude-code/src/content.ts` `toUserMessage`。
+- **测试**：标签 `#CT-2`；`packages/daemon/test/commands.test.ts`；`packages/session/test/lane.test.ts` "a harness command is a turn of its own: never batched with the same sender's inputs around it, handed no context"。
 - **状态**：有测试（假通道）。Codex 没有 `/compact`（生成的协议类型里没有压缩请求）。
+
+### CT-3 宿主压缩会话：只在安静时，一轮只有压缩命令，不回任何渠道，期间来的输入排在后面
+
+- **承诺**：宿主的 `session.compact { sessionKey, inputId? }`（feature `session.compact`）让一个有打开的 lane 的会话的 harness 立刻压缩上下文：开一轮，唯一的输入是 harness 自己的命令（Claude Code `/compact`，`nativeCommand`），来源是宿主连接（`kind: "system"`、`adapter: "host"`），`replyRoute` 为空：没有回复、进度卡片或通知到任何渠道；之前记下的 context 不交给这一轮，留给下一轮。只在会话安静时做：有一轮在跑或正在开始、有排队的输入、有未答的请求、有 live 或有待结算的遗留轮时答 `busy`，什么都不记。没有打开的 lane 答 `not_live`（不为压缩拉起 harness）；harness 没有压缩命令（Codex）答 `unsupported`；`run:` 键答 `invalid_frame`；`inputId` 同 `run.start` 的规则（`bad_input_id`），同一个 id 再来答 `duplicate: true`、不开轮。这一轮在跑时到达的输入照常排队（只有本轮发起者能插话，这一轮的发起者是宿主），结束后开自己的一轮。不经 `Policy.control`：宿主连接凭 token。
+- **实现**：`packages/daemon/src/gateway.ts` `compactSession`；`packages/daemon/src/host.ts`（`session.compact`、`FEATURES`）；`packages/session/src/lane.ts` `compact`、`isNativeCommand`；`packages/protocol/src/host.ts` `SessionCompact`、`SessionCompactResult`。
+- **测试**：标签 `#CT-3`；`packages/daemon/test/compact.test.ts`；`packages/session/test/lane.test.ts` "compact: starts the command as a turn when the session is quiet; busy (nothing recorded) while a turn runs or inputs are queued"。
+- **状态**：有测试（假 harness）。真实 Claude Code 2.1.291 与 2.1.303 实测（2026-10-22）：`/compact` 作为用户消息时依次出 `system/status compacting`、`compact_boundary`（`trigger: "manual"`、`pre_tokens`、`post_tokens`）、两条 user 消息（摘要与 `<local-command-stdout>Compacted </local-command-stdout>`，适配器作 `native`）和 `result`（`local_command: "compact"`、`result` 为空、`num_turns: 0`），所以这一轮没有回答文字；适配器把前两者记成 `compacting` 通知。
 ### OB-1 "卡住了"可观察
 
 - **承诺**：有未答的人工请求时，lane 状态与进度视图报 `requires_action`，不是 `running`；没有文字就结束的轮次（失败、打断……）在 `final` 层级也说明它怎么结束的，不留空白。

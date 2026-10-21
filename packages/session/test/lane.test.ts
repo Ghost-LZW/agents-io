@@ -123,6 +123,82 @@ describe('Lane: turns and queue', () => {
   });
 });
 
+describe('Lane: harness commands and compaction', () => {
+  const command = (id: string): InputRecord => ({ ...input('/compact', { id }), channelContext: { nativeCommand: true } });
+
+  it('a harness command is a turn of its own: never batched with the same sender\'s inputs around it, handed no context #CT-2 #CT-3', async () => {
+    const g = gate();
+    let first = true;
+    const seen: InputRecord[][] = [];
+    const { lane, events } = setup({
+      harness: new FakeHarness(async (t) => {
+        seen.push(t.inputs);
+        if (first) {
+          first = false;
+          await g.promise;
+        }
+      }),
+    });
+    const send = (i: InputRecord) => lane.command({ type: 'input', sessionKey: 's1', input: i, mode: 'queue' });
+    await send(input('busy', { id: 'a0' }));
+    await lane.observe({ ...input('said in passing', { id: 'ctx1', principal: 'fake:eve' }), channelContext: { senderName: 'Eve' } });
+    await send(input('a1', { id: 'a1' }));
+    await send(command('cmd'));
+    await send(input('a2', { id: 'a2' }));
+    await send(input('a3', { id: 'a3' }));
+    g.open();
+    await until(() => bodies(events(), 'turn.completed').length === 4);
+    expect(turnsOf(events())).toEqual([['a0'], ['ctx1', 'a1'], ['cmd'], ['a2', 'a3']]);
+    expect(seen[2]!.map((i) => i.inputId)).toEqual(['cmd']);
+  });
+
+  it('compact: starts the command as a turn when the session is quiet; busy (nothing recorded) while a turn runs or inputs are queued #CT-3', async () => {
+    const g = gate();
+    const seen: InputRecord[][] = [];
+    const { lane, events } = setup({
+      harness: new FakeHarness(async (t) => {
+        seen.push(t.inputs);
+        if (t.inputs.some((i) => i.inputId === 'slow')) await g.promise;
+      }),
+    });
+    await lane.observe({ ...input('note', { id: 'ctx1', principal: 'fake:eve' }) });
+    const r = await lane.compact(command('c1'));
+    expect(r).toMatchObject({ ok: true, disposition: 'new_turn' });
+    await until(() => bodies(events(), 'turn.completed').length === 1);
+    const started = bodies(events(), 'turn.started')[0] as BodyOf<'turn.started'>;
+    expect(started.turnId).toBe((r as { turnId?: string }).turnId);
+    expect(started.inputIds).toEqual(['c1']);
+    expect(await lane.compact(command('c1'))).toEqual({ ok: true, disposition: 'duplicate' });
+    expect(await lane.compact(input('not a command', { id: 'x' }))).toEqual({ ok: false, reason: 'not_a_command' });
+
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('slow', { id: 'slow' }), mode: 'queue' });
+    expect(await lane.compact(command('c2'))).toEqual({ ok: false, reason: 'busy' });
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('later', { id: 'later', principal: 'fake:bob' }), mode: 'queue' });
+    g.open();
+    await until(() => bodies(events(), 'turn.completed').length === 3);
+    // The context waited for the first turn that was not a command; c2 left nothing behind.
+    expect(seen.map((ins) => ins.map((i) => i.inputId))).toEqual([['c1'], ['ctx1', 'slow'], ['later']]);
+    expect(bodies(events(), 'input.admitted').some((b) => (b as BodyOf<'input.admitted'>).inputId === 'c2')).toBe(false);
+    // Quiet again: it may run, and a later input waits behind it.
+    const g2 = gate();
+    let held = false;
+    const h2 = setup({
+      harness: new FakeHarness(async (t) => {
+        if (!held && t.inputs.some((i) => i.inputId === 'c3')) {
+          held = true;
+          await g2.promise;
+        }
+      }),
+    });
+    await h2.lane.compact(command('c3'));
+    expect((await h2.lane.command({ type: 'input', sessionKey: 's1', input: input('meanwhile', { id: 'm1' }), mode: 'steer' })).ok).toBe(true);
+    expect(h2.lane.queued()).toEqual(['m1']);
+    g2.open();
+    await until(() => bodies(h2.events(), 'turn.completed').length === 2);
+    expect(turnsOf(h2.events())).toEqual([['c3'], ['m1']]);
+  });
+});
+
 describe('Lane: steer', () => {
   it('degrades to queue when the harness cannot steer #IN-1', async () => {
     const g = gate();

@@ -12,7 +12,7 @@ const names = [
   // Host request result values
   'HostHelloResult', 'BindingsPutResult', 'BindingsGetResult', 'RunStartResult', 'RunCancelResult', 'RunEnded', 'DeliverResult',
   'InputVerifyResult', 'InboundReadResult', 'InboundAckResult', 'InboundAnswer', 'RouteCalloutAnswer', 'SessionPrepareResult',
-  'ResolveCalloutAnswer', 'ReviewCalloutAnswer', 'OutboundCalloutAnswer', 'TurnContextView', 'InboundRedispatchResult',
+  'ResolveCalloutAnswer', 'ReviewCalloutAnswer', 'OutboundCalloutAnswer', 'TurnContextView', 'InboundRedispatchResult', 'SessionCompactResult',
   // Agent messaging: cause chain and explain of side effects / chains
   'InputCause', 'EffectExplanation', 'ChainExplanation', 'ExplainResult', 'ContactCalloutAnswer',
   // External MCP endpoint (docs/design/external-mcp)

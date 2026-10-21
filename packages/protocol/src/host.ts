@@ -368,7 +368,20 @@ export const InboundRedispatch = Type.Object({
 });
 export type InboundRedispatch = Static<typeof InboundRedispatch>;
 
-export const HostRequestFrame = Type.Union([HostHello, BindingsPut, BindingsGet, RunStart, RunCancel, Deliver, InputVerify, InboundRead, InboundAck, Explain, SessionPrepare, InboundRedispatch]);
+/**
+ * Compact a session's harness context now (feature `session.compact`, CT-3): a turn of its own
+ * whose one input is the harness's command (Claude Code `/compact`), from the host, with no reply
+ * route (nothing reaches a channel) and no context handed (it waits for the next turn). Only a
+ * session with an open lane (`not_live`; it never opens a harness just to compact) whose harness
+ * can compact (`unsupported`), and only while it is quiet: a turn running or starting, queued
+ * inputs, open requests or a live answer `busy` and record nothing. Inputs arriving while it runs
+ * queue behind it. `inputId` as `run.start`'s (`bad_input_id`); the same id again answers
+ * `duplicate: true` and starts nothing.
+ */
+export const SessionCompact = Type.Object({ ...Req('session.compact'), sessionKey: Type.String(), inputId: Type.Optional(Type.String()) });
+export type SessionCompact = Static<typeof SessionCompact>;
+
+export const HostRequestFrame = Type.Union([HostHello, BindingsPut, BindingsGet, RunStart, RunCancel, Deliver, InputVerify, InboundRead, InboundAck, Explain, SessionPrepare, InboundRedispatch, SessionCompact]);
 export type HostRequestFrame = Static<typeof HostRequestFrame>;
 
 // ---- daemon → host --------------------------------------------------------
@@ -572,7 +585,7 @@ export type ContactCalloutAnswer = Static<typeof ContactCalloutAnswer>;
 export const HostEventFrame = Type.Union([InboundFrame, RouteCallout, ResolveCallout, ReviewCallout, OutboundCallout, ContactCallout, ExternalCallout, RunEnded, ResultFrame]);
 export type HostEventFrame = Static<typeof HostEventFrame>;
 
-export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare', 'inbound.redispatch'] as const;
+export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare', 'inbound.redispatch', 'session.compact'] as const;
 export const HOST_EVENT_FRAME_TYPES = ['inbound', 'policy', 'run.ended', 'result'] as const;
 
 // ---- result values --------------------------------------------------------
@@ -831,6 +844,15 @@ export const InboundRedispatchResult = Type.Object({
 });
 export type InboundRedispatchResult = Static<typeof InboundRedispatchResult>;
 
+/** `session.compact`: the turn it started (none with `duplicate`: that id was taken before). */
+export const SessionCompactResult = Type.Object({
+  sessionKey: Type.String(),
+  inputId: Type.String(),
+  turnId: Type.Optional(Type.String()),
+  duplicate: Type.Boolean(),
+});
+export type SessionCompactResult = Static<typeof SessionCompactResult>;
+
 /** Result value schema per host request type. */
 export const HOST_RESULT_VALUES = {
   'host.hello': HostHelloResult,
@@ -845,4 +867,5 @@ export const HOST_RESULT_VALUES = {
   explain: ExplainResult,
   'session.prepare': SessionPrepareResult,
   'inbound.redispatch': InboundRedispatchResult,
+  'session.compact': SessionCompactResult,
 } as const satisfies Record<(typeof HOST_REQUEST_FRAME_TYPES)[number], TSchema>;

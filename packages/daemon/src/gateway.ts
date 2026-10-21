@@ -43,6 +43,8 @@ import {
   type SessionLaunch,
   type SessionPrepare,
   type SessionPrepareResult,
+  type SessionCompact,
+  type SessionCompactResult,
   type InboundRedispatch,
   type InboundRedispatchResult,
   type Tier,
@@ -499,6 +501,7 @@ export class Gateway {
       deliver: (name, f) => this.deliver(name, f),
       prepareSession: (f) => this.prepareSession(f),
       redispatch: (name, f) => this.redispatch(name, f),
+      compactSession: (f, origin) => this.compactSession(f, origin),
       calloutTimeouts: { resolve: c.hostCallouts.resolveTimeoutMs, review: c.hostCallouts.reviewTimeoutMs, outbound: c.hostCallouts.outboundTimeoutMs, external: c.hostCallouts.externalTimeoutMs },
       externalMcp: () => this.externalMcp !== undefined,
       explain: (id, chain) => this.explain(id, chain),
@@ -1140,6 +1143,37 @@ export class Gateway {
       this.log('info', `${f.sessionKey}: prepared for agent ${f.agent}${v.cwd ? ` in ${v.cwd}` : ''}${v.envKeys.length ? ` (env: ${v.envKeys.join(', ')})` : ''}`);
     }
     return { ok: true, value: { sessionKey: f.sessionKey, agent: f.agent, launch: launchView(c.launch), created: c.outcome === 'applied' } satisfies SessionPrepareResult };
+  }
+
+  /**
+   * `session.compact` (CT-3): the harness compacts a quiet live session's context as a turn of its
+   * own, from the host (`origin`), with no reply route and no context handed. Never opens a lane or
+   * a harness to do it; only harnesses with a compaction command (Claude Code `/compact`).
+   */
+  async compactSession(f: SessionCompact, origin: Origin): Promise<Outcome> {
+    if (this.stopped) return fail('stopped', 'daemon is stopping');
+    if (!f.sessionKey) return fail('invalid_frame', 'sessionKey is empty');
+    if (f.sessionKey.startsWith('run:')) return fail('invalid_frame', `${f.sessionKey} is a task run session (it ends with its one turn)`);
+    if (f.inputId !== undefined && !HOST_INPUT_ID.test(f.inputId))
+      return fail('bad_input_id', 'inputId must be 1-256 letters, digits, ".", "_", ":" or "-", starting with a letter or digit (and not ctxo_…)');
+    const lane = this.lanes.get(f.sessionKey);
+    if (!lane) return fail('not_live', `${f.sessionKey} has no open lane (session.compact never opens a harness to compact)`);
+    // What its next turn runs on (the agent's instance, or one a preset set here moved it to).
+    const run = this.commandHost.run(f.sessionKey);
+    if (run.kind !== 'claude-code') return fail('unsupported', `${run.harness} (${run.kind}) has no compaction command`);
+    const inputId = f.inputId ?? `cmp_${randomUUID()}`;
+    const input: InputRecord = {
+      inputId,
+      origin,
+      content: [{ type: 'text', text: '/compact' }],
+      replyRoute: null,
+      channelContext: { channel: 'host', nativeCommand: true },
+    };
+    const r = await lane.compact(input);
+    if (!r.ok) return fail(r.reason, r.reason === 'busy' ? `${f.sessionKey} is not quiet (a turn, queued inputs, open requests or a live)` : `${f.sessionKey}: ${r.reason}`);
+    if (r.disposition === 'duplicate') return { ok: true, value: { sessionKey: f.sessionKey, inputId, duplicate: true } satisfies SessionCompactResult };
+    this.log('info', `${f.sessionKey}: compacting (${inputId}, turn ${r.turnId})`);
+    return { ok: true, value: { sessionKey: f.sessionKey, inputId, ...(r.turnId ? { turnId: r.turnId } : {}), duplicate: false } satisfies SessionCompactResult };
   }
 
   /** `inbound.redispatch` in flight, per cursor (a second request waits for the first). */
@@ -2957,6 +2991,8 @@ const BUILTIN_PROFILES = ['bypass', 'restricted'];
 
 /** A `run.start.overrides` value: one plain token (models and efforts are passed through, never interpreted). */
 const OVERRIDE_VALUE = /^[^\s\u0000-\u001f]{1,256}$/;
+/** A host-chosen input id (`session.compact`), as `run.start`'s: a plain token, not the lane's own `ctxo_…`. */
+const HOST_INPUT_ID = /^(?!ctxo_)[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
 
 /** An agent's (or a preset's) RunSpec over its instance's defaults (without the profile). */
 function agentRun(agent: Pick<AgentConfig, 'model' | 'effort'>, inst: HarnessInstance): Omit<RunSpec, 'profile'> {

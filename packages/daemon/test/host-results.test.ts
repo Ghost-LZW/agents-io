@@ -43,5 +43,10 @@ describe('host result values', () => {
     expect(errors(RunEnded, await t.runEndedOf('r2'))).toEqual([]);
     valid('explain', await t.explain('h-1'));
     valid('explain', await t.explain('h-1', { chain: true }));
+
+    // A live session (its turn has run): compacted, then the same id again.
+    const key = w.gw.sessions().find((s) => s.live && !s.sessionKey.startsWith('run:'))!.sessionKey;
+    valid('session.compact', await t.sessionCompact({ sessionKey: key, inputId: 'cmp-1' }));
+    valid('session.compact', await t.sessionCompact({ sessionKey: key, inputId: 'cmp-1' }));
   });
 });
