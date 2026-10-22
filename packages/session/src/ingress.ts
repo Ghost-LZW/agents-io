@@ -879,6 +879,9 @@ function channelContext(env: InboundEnvelope, reply: string | undefined): InputR
   if (env.sender.displayName !== undefined) ctx.senderName = env.sender.displayName;
   if (env.sender.isBot !== undefined) ctx.senderIsBot = env.sender.isBot;
   if (env.sentAt !== undefined) ctx.sentAt = env.sentAt;
+  // The reply chain, for hosts (e.g. which earlier message a reply answers); the preface does not show it.
+  if (env.rootMessageId !== undefined) ctx.rootMessageId = env.rootMessageId;
+  if (env.parentMessageId !== undefined) ctx.parentMessageId = env.parentMessageId;
   if (reply !== undefined) ctx.reply = reply;
   return ctx;
 }

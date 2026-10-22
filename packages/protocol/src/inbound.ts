@@ -53,6 +53,15 @@ export const InboundEnvelope = Type.Object({
   mentions: Type.Optional(
     Type.Array(Type.Object({ id: Type.String(), name: Type.Optional(Type.String()), isBot: Type.Optional(Type.Boolean()) })),
   ),
+  /**
+   * The reply chain as the platform gives it, in the adapter's message id namespace: the first
+   * message of the chain or topic (`rootMessageId`) and the message this one replies to
+   * (`parentMessageId`), e.g. Lark `root_id` / `parent_id`. Only when the platform sets them.
+   * Copied into `InputRecord.channelContext` under the same names, for hosts; not shown to the
+   * model (a replied-to message reaches it as a `quote` block).
+   */
+  rootMessageId: Type.Optional(Type.String()),
+  parentMessageId: Type.Optional(Type.String()),
   /** Small scalar facts (subject, chat name…); becomes InputRecord.channelContext. */
   context: Type.Optional(Type.Record(Type.String(), Type.Union([Type.String(), Type.Number(), Type.Boolean()]))),
   /** null = do not reply (e.g. observe-only meeting transcript). */

@@ -758,6 +758,12 @@
                     }
                   }
                 },
+                "rootMessageId": {
+                  "type": "string"
+                },
+                "parentMessageId": {
+                  "type": "string"
+                },
                 "context": {
                   "type": "object",
                   "patternProperties": {
@@ -1603,6 +1609,12 @@
                       }
                     }
                   }
+                },
+                "rootMessageId": {
+                  "type": "string"
+                },
+                "parentMessageId": {
+                  "type": "string"
                 },
                 "context": {
                   "type": "object",

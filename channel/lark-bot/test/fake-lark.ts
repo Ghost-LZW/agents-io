@@ -345,10 +345,10 @@ export class FakeLark {
   private record(
     receive: PlatformMessage['receive'],
     data: { msg_type: string; content: string; uuid?: string },
-  ): LarkApiResponse<{ message_id?: string }> {
+  ): LarkApiResponse<{ message_id?: string; thread_id?: string }> {
     if (data.uuid) {
       const prior = this.byUuid.get(data.uuid);
-      if (prior) return { code: 0, data: { message_id: prior.id } };
+      if (prior) return { code: 0, data: this.sent(prior) };
     }
     const m: PlatformMessage = {
       id: `om_${++this.seq}`,
@@ -361,7 +361,13 @@ export class FakeLark {
     };
     this.messages.push(m);
     if (data.uuid) this.byUuid.set(data.uuid, m);
-    return { code: 0, data: { message_id: m.id } };
+    return { code: 0, data: this.sent(m) };
+  }
+
+  /** What create / reply answer: the message id, and the topic like Lark when the message is in one. */
+  private sent(m: PlatformMessage): { message_id: string; thread_id?: string } {
+    const thread = this.placeOf(m).thread_id;
+    return { message_id: m.id, ...(thread ? { thread_id: thread } : {}) };
   }
 
   /** Deliver a flattened event the way `EventDispatcher` would. */

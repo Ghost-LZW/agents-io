@@ -544,7 +544,8 @@ export class LarkBotAdapter implements ChannelAdapter {
     return res;
   }
 
-  private async sendOne(route: ReplyRoute, out: OutMessage, uuid: string): Promise<string | undefined> {
+  /** One platform message: its id, and the topic it is in when Lark says (`thread_id`). */
+  private async sendOne(route: ReplyRoute, out: OutMessage, uuid: string): Promise<{ id?: string; threadId?: string }> {
     const msg = this.client.im.v1.message;
     const res = route.replyToMessageId
       ? await this.api('message.reply', () =>
@@ -559,7 +560,8 @@ export class LarkBotAdapter implements ChannelAdapter {
             params: { receive_id_type: 'chat_id' },
           }),
         );
-    return res.data?.message_id;
+    const threadId = res.data?.thread_id || undefined;
+    return { id: res.data?.message_id, ...(threadId ? { threadId } : {}) };
   }
 
   private attachmentParts(msg: RenderedMessage): { out: OutMessage; kind: MsgKind }[] {
@@ -660,10 +662,12 @@ export class LarkBotAdapter implements ChannelAdapter {
     const msg = await this.uploadAttachments(input);
     const { parts, primary } = this.plan(msg);
     let providerMessageId: string | undefined;
+    let providerThreadId: string | undefined;
     const all: string[] = [];
     for (const [i, p] of parts.entries()) {
       // Same operationId -> same uuid per part, so Lark itself drops a duplicate within its dedup window.
-      const id = await this.sendOne(route, p.out, uuidFor(this.account, op.operationId, i));
+      const { id, threadId } = await this.sendOne(route, p.out, uuidFor(this.account, op.operationId, i));
+      providerThreadId ??= threadId;
       if (id) all.push(id);
       if (id && op.as) await this.store.set(id, op.as);
       if (i === primary) {
@@ -672,7 +676,11 @@ export class LarkBotAdapter implements ChannelAdapter {
       }
     }
     // Every part (split text, images, files) is ours: the outbound index recognises each one coming back (ID-8).
-    return { ...(providerMessageId ? { providerMessageId } : {}), ...(all.length > 1 ? { providerMessageIds: all } : {}) };
+    return {
+      ...(providerMessageId ? { providerMessageId } : {}),
+      ...(all.length > 1 ? { providerMessageIds: all } : {}),
+      ...(providerThreadId ? { providerThreadId } : {}),
+    };
   }
 
   /** Serialise edits per message and keep `gap` ms between two of them. */
@@ -1033,13 +1041,14 @@ export class LarkBotAdapter implements ChannelAdapter {
     }
     this.feedCot(st, p, false);
     let id: string | undefined;
+    let threadId: string | undefined;
     while (id === undefined) {
       if (level === 'patch') {
         st.level = 'patch';
         pending.level = 'patch';
         const card = fitProcessCard(this.model(msg, p, st), this.cfg.maxCardBytes);
         st.lastCard = JSON.stringify(card);
-        id = await this.sendOne(route, cardMessage(card), uuid);
+        ({ id, threadId } = await this.sendOne(route, cardMessage(card), uuid));
         if (id) bounded(this.kinds, id, 'card');
         break;
       }
@@ -1062,7 +1071,7 @@ export class LarkBotAdapter implements ChannelAdapter {
         continue;
       }
       try {
-        id = await this.sendOne(route, { msg_type: 'interactive', content: JSON.stringify({ type: 'card', data: { card_id: card.cardId } }) }, uuid);
+        ({ id, threadId } = await this.sendOne(route, { msg_type: 'interactive', content: JSON.stringify({ type: 'card', data: { card_id: card.cardId } }) }, uuid));
       } catch (err) {
         // Only an explicit rejection is safe to retry as another message under the same uuid.
         if (!(err instanceof LarkApiError) || err.code === undefined) throw err;
@@ -1084,7 +1093,7 @@ export class LarkBotAdapter implements ChannelAdapter {
     this.initSent(st, (st.card && st.card === pending.card && pending.shown) || this.model(msg, p, st));
     for (const [i, part] of this.attachmentParts(msg).entries()) await this.sendOne(route, part.out, uuidFor(this.account, op.operationId, i + 1));
     this.pendingProcs.delete(op.operationId);
-    return { providerMessageId: id };
+    return { providerMessageId: id, ...(threadId ? { providerThreadId: threadId } : {}) };
   }
 
   /** What a freshly created card already shows, so the first edit only sends differences. */

@@ -53,6 +53,8 @@
 - **推送**：宿主连接守护进程并 `host.hello { inbound: true, consumer }`；守护进程推 `inbound` 帧，宿主回 `result { accepted }` 后前移；断线期间留在队列，重连后补推。
 - **拉取**：`aio tail --consumer <name> [--from <cursor>]` 逐行输出 JSON（含 `cursor`）；宿主处理后 `aio ack --consumer <name> <cursor>`。
 
+条目里的 `input.channelContext` 与 `envelope`（路由回调的 `args.input` / `args.envelope` 也一样）在通道给得出时带回复链：`rootMessageId`（链或话题的第一条）、`parentMessageId`（这条回复的那一条），都是通道自己的消息 id（飞书 `root_id` / `parent_id`，私聊、群、话题都有）。宿主可据此判断一条回复是在回哪条消息（例如自己 `deliver` 过的通知）。模型的发送者说明行不显示这两项。
+
 **补投（`inbound.redispatch { cursor, agent?, session?, launch? }`，feature `inbound.redispatch`）**：宿主可把队列里仍在的一条输入（已 ack 与否均可）投递到它指定的会话，作为这条输入到达时的样子：原始 origin（发送者、主体、证据、来路）、内容、回复路由与渠道上下文不变，只在 `channelContext.redispatchedBy` 记上宿主。会话按一条指向 `agent`（缺省默认 agent）、`session`（缺省 `per-conversation`，或 `{ key }`）的 `dispatch` 规则来定；`launch` 与回调答复同样校验。新输入 id 为 `<原 id>~r<cursor>`。按 cursor **至多一次**：投递前先记一条待定记录、投递后补全；再次请求答复第一次的结果并带 `duplicate: true`；若上一次投递被守护进程停止截断（记录仍是待定），答复带 `interrupted: true`，输入可能已到也可能未到会话，不会再发。失败的投递不记，可换会话重试。`session: { key: "run:…" }`（task run 会话）答 `invalid_frame`；指定的 `agent` 与该会话已有的 agent 不符答 `agent_conflict`，不指定时结果里的 `agent` 是会话自己的 agent。补投直接进会话，不经话题命令处理：条目文本是 `/new`、`/topics`、`/switch` 时作为普通输入送达。不 ack 原条目。`aio explain` 在新输入上显示 `redispatchOf`，在原输入上显示 `redispatched`。典型用途：宿主离线或回调超时期间进入队列的输入，事后补投给会话，不必请人重发。命令行：`aio redispatch <cursor> [--agent] [--session] [--cwd] [--env]`。方案见 `docs/design/inbound-redispatch`。
 
 ### 2.2 规则级同步回调（`callout`）
@@ -121,7 +123,7 @@
 | `bindings.put` / `bindings.get` | 宿主 → 守护进程 | 原子替换 / 读取 Binding 表与身份映射 |
 | `run.start` / `run.cancel` | 宿主 → 守护进程 | 用 `mode: task` 的 agent 执行一轮：新的 session `run:<runId>`，结束即关闭；`env` 只进子进程环境；可带 `overrides`、`inputId`、`correlation`（见下） |
 | `run.ended` | 守护进程 → 宿主 | `{ runId, status, exitCode, error?, durationMs?, usage?, turnId?, inputId?, correlation? }`；`status` 含 `timeout`（`timeoutMs` 到期） |
-| `deliver` | 宿主 → 守护进程 | 推送给人，按 `operationId` 幂等；按钮点击按 `actionPrefix` 规则回到宿主。由 `route` 的 `(channel, account)` 对应的通道发出；该账号没有通道时，只有当这个通道 id 恰好一个条目才用它发，否则 `unknown_channel`（多个飞书机器人时不会以别的机器人发出，决定 8） |
+| `deliver` | 宿主 → 守护进程 | 推送给人，按 `operationId` 幂等；按钮点击按 `actionPrefix` 规则回到宿主。由 `route` 的 `(channel, account)` 对应的通道发出；该账号没有通道时，只有当这个通道 id 恰好一个条目才用它发，否则 `unknown_channel`（多个飞书机器人时不会以别的机器人发出，决定 8）。结果（`DeliverResult`）带平台消息 id `providerMessageId`；通道报告消息落在哪个话题时还带 `providerThreadId`（飞书：发送接口返回的 `thread_id`，例如 `reply_in_thread` 开出的新话题），重复的 `deliver` 照样带回 |
 | `inbound` | 守护进程 → 宿主 | §2.1 推送消费 |
 | `policy` | 守护进程 → 宿主 | §2.2 回调（`hook: "route"`），以及按 `hello.callouts` 开启的 `resolve`、`review`、`outbound`、`contact`、`external` 钩子（§4.1，超时 fail closed） |
 | `explain { inputId, chain? }` | 宿主 → 守护进程 | 一条输入的路由记录；`inputId` 不是输入而是某次投递的 operationId 时，答产生它的会话、轮次与该轮的触发输入；`chain: true` 时沿 cause 链走回根（§5 `aio explain`） |

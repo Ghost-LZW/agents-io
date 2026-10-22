@@ -161,6 +161,17 @@ describe('process card: degradation', () => {
     expect(lark.messages.find((x) => x.id === id)!.patches.length).toBeGreaterThan(0);
   });
 
+  it("a process card sent into a topic returns Lark's thread_id as providerThreadId (CardKit and patched card)", async () => {
+    const topic = { ...route, threadId: 'omt_om_in1' };
+    const { adapter } = make({ process: 'panels' });
+    expect(await adapter.send(topic, turn().msg(), { operationId: 'c1' })).toEqual({ providerMessageId: 'om_1', providerThreadId: 'omt_om_in1' });
+    const lark = new FakeLark();
+    delete (lark.client as { cardkit?: unknown }).cardkit;
+    expect(await make({ process: 'panels' }, lark).adapter.send(topic, turn().msg(), { operationId: 'c2' })).toEqual({ providerMessageId: 'om_1', providerThreadId: 'omt_om_in1' });
+    // Not in a topic: none.
+    expect(await make({ process: 'panels' }).adapter.send(route, turn().msg(), { operationId: 'c3' })).toEqual({ providerMessageId: 'om_1' });
+  });
+
   it("process: 'off' keeps the flat card and advertises no native stream", async () => {
     const { lark, adapter } = make({ process: 'off' });
     expect(adapter.caps().nativeStream).toBeUndefined();

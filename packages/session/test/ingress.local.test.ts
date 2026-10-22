@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { FakeHarness, fakeEnvelope } from '@agents-io/testkit';
 import { Hub, Ingress, Lane, MemorySessionLog, defaultPolicy, replySummary } from '../src/index.js';
-import type { ChannelCaps, InputRecord } from '@agents-io/protocol';
+import { prefaceContext, type ChannelCaps, type InputRecord } from '@agents-io/protocol';
 import { RUN } from './helpers.js';
 
 const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };
@@ -39,6 +39,20 @@ describe('Ingress', () => {
     await ingress.accept(fakeEnvelope({ sender: alice, text: 'hi', context: { senderId: 'spoofed' } }));
     await lanes.get('fake:default:c1')!.whenIdle();
     expect(seen[0]!.channelContext.senderId).toBe('alice');
+  });
+
+  it('copies the envelope reply chain into channelContext (rootMessageId, parentMessageId) for hosts; the preface leaves it out', async () => {
+    const { ingress, lanes, seen } = world();
+    await ingress.accept(fakeEnvelope({ sender: alice, text: 'a reply', rootMessageId: 'om_root', parentMessageId: 'om_parent' }));
+    await ingress.accept(fakeEnvelope({ sender: alice, text: 'plain' }));
+    await lanes.get('fake:default:c1')!.whenIdle();
+    expect(seen[0]!.channelContext).toMatchObject({ rootMessageId: 'om_root', parentMessageId: 'om_parent' });
+    expect(seen[1]!.channelContext).not.toHaveProperty('rootMessageId');
+    expect(seen[1]!.channelContext).not.toHaveProperty('parentMessageId');
+    const keys = prefaceContext(seen[0]!).map(([k]) => k);
+    expect(keys).toContain('senderId');
+    expect(keys).not.toContain('rootMessageId');
+    expect(keys).not.toContain('parentMessageId');
   });
 
   it('adds a compact reply summary from the rendering adapter caps when configured', async () => {

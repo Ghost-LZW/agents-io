@@ -253,6 +253,9 @@ export function mapMessageEvent(ev: RawMessageEvent, ctx: MapContext): InboundEn
       ...(declared ? { declared } : {}),
     },
     content,
+    // The reply chain as Lark gives it (DMs, groups and topics alike), for hosts.
+    ...(msg.root_id ? { rootMessageId: msg.root_id } : {}),
+    ...(msg.parent_id ? { parentMessageId: msg.parent_id } : {}),
     replyRoute: {
       channel: CHANNEL_ID,
       account: ctx.account,

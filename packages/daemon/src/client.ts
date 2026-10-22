@@ -255,7 +255,7 @@ export class LocalClient {
     });
   }
 
-  deliver(o: { operationId: string; route: ReplyRoute; message: RenderedMessage }): Promise<{ operationId: string; status: string; attempts: number; providerMessageId?: string; error?: string; duplicate: boolean }> {
+  deliver(o: { operationId: string; route: ReplyRoute; message: RenderedMessage }): Promise<{ operationId: string; status: string; attempts: number; providerMessageId?: string; providerThreadId?: string; error?: string; duplicate: boolean }> {
     return this.call('deliver', o);
   }
 

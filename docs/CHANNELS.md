@@ -53,7 +53,7 @@ harness 事件 ──▶ SessionLog（seq）──▶ Compositor（读全量，�
 - `hop`：agent 发来的输入在 agent 之间转了几跳（只在跳数已知时出现）；链 id、轮次 id 不给模型。被防循环截停、作为上下文交出的输入另有 `loopGuard=hops|pair`。
 - `declared`：只有发送账号可信、且通过适配器控制的元数据表明身份时才出现，消息正文里的自称不算。
 - `ref`：这条输入对应的渠道消息引用 `channel:<通道>/<消息 id>`（决定 13），与宿主入站队列的幂等键、`input.verify` / `aio verify` 的参数同一格式。网关按核对过的信封盖章（`InputRecord.channelRef`），适配器和客户端都不能设置；不截断，含空白或引号时整体加 JSON 引号。只有来自渠道消息的输入才有：本地（`aio input` / `attach`）、宿主 `input` 帧、任务运行、系统输入（汇总、话题摘要、live 委托）都没有。agent 调宿主命令做敏感写操作（确认、作答）时把它原样带上，宿主用 `aio verify <ref>` 自己核验作者与证据（HOSTS §4.1）。
-- 后面的 `key=value` 来自适配器提供的上下文（如邮件主题、发送者名字），网关自己的字段同名时以网关为准。
+- 后面的 `key=value` 来自适配器提供的上下文（如邮件主题、发送者名字），网关自己的字段同名时以网关为准。回复链的消息 id（`channelContext.rootMessageId`、`parentMessageId`，来自信封的同名字段）只给宿主，说明行不显示：被回复的消息以引用块交给 agent。
 - `senderName`：适配器给出的发送者显示名（飞书经通讯录解析，邮件取 From 里的名字），拿不到就没有这一项。
 - `reply`：这一轮的回复会怎么显示，由网关按渲染该路由的通道能力和档位生成，适配器不能伪造。格式固定为
   `reply=<档位> markdown=<none|basic|full> maxChars=<数字> buttons=<yes|no> media=<可发送的媒体类型，逗号分隔|none>`，
@@ -179,7 +179,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 | 富文本（post） | 拍平成文字，里面的图片、文件变成引用 |
 | 图片 / 文件 / 语音 / 视频（含富文本里的图片） | 用 `im.v1.messageResource.get` 下载进 blob 存储，变成带真实类型和文件名的 `sha256:` 引用（类型取响应头，没有就按文件头识别；语音默认 `audio/opus`，视频 `video/mp4`）。单个上限 20MB（`mediaMaxBytes`），30 秒超时（`mediaTimeoutMs`）。下载失败、超限或没有 blob 存储时保留 `lark-file:` 引用，并在后面加一行 `[image 键 not downloaded: 原因]` 说明 |
 | 合并转发 | 用 `im.v1.message.get` 读取外层消息及子消息，按 `upper_message_id` 保留嵌套层级，用 `2.3` 这样的编号列出发送者 id 和内容；文字、富文本展开。前 4 个图片、文件、语音或视频用外层消息 ID 下载，并按相同层级编号附在文字之后。最多 100 条、16,000 字，超出会标注截断；查询或下载失败会明确写出原因。群内非 @ 消息仍只作 observe |
-| 回复某条消息 | 前面加一个引用块：用 `im.v1.message.get` 取回被回复的消息，拍平成文字（卡片取它显示的文字，图片文件变成 `[image]`、`[file 名称]`），最多 500 字（`quoteMaxChars`），按消息 id 缓存。被回复的是本机器人发出、且记录过发送身份的消息时，引用块带 `declared`。取不到时退回只有消息 id 的空引用块 |
+| 回复某条消息 | 前面加一个引用块：用 `im.v1.message.get` 取回被回复的消息，拍平成文字（卡片取它显示的文字，图片文件变成 `[image]`、`[file 名称]`），最多 500 字（`quoteMaxChars`），按消息 id 缓存。被回复的是本机器人发出、且记录过发送身份的消息时，引用块带 `declared`。取不到时退回只有消息 id 的空引用块。消息的 `root_id`、`parent_id`（私聊、群、话题里都有，话题里的每条都有 `root_id`）原样放进信封的 `rootMessageId`、`parentMessageId`，再进 `channelContext`，给宿主用（HOSTS §2.1），agent 看不到 |
 | 卡片按钮 | 审批按钮变成 resolve 命令，"停止"按钮变成 interrupt 命令，原生提问的表单提交变成 answer 命令，都不会作为文字发给 agent；其他按钮变成 `[event action] …` |
 | 对机器人消息点表情、取消表情 | 只记录（`observe`），不开轮，下一轮作为 context 交给 agent（§1b）：`[event reaction] {"emoji":"THUMBSUP","action":"added","messageId":"om_…","text":"那条消息的开头"}`，取消是 `"action":"removed"`；发送者是点表情的人，会话是那条消息所在的私聊、群或话题。应用点的表情（本机器人自己的确认表情在内）、对别人消息的表情不交。见下面"表情回应" |
 | 其他消息类型（表情包、分享卡片等） | `[unsupported 类型 message]` |
@@ -230,6 +230,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
   - 通道条目上的 `ack`：收到的消息上点一个表情（默认 `OnIt`），这一轮及时回复了就撤掉；回复晚于 `doneAfterMs`（默认 60 秒）或消息作为 steer 并入正在运行的一轮时换成 `DONE`；没完成或被拒换成 `CrossMark`。启用了 `ack` 且支持消息表情的通道，成功的 `/steer` 不另发确认消息；其他通道仍用文字确认。表情类型可用 `config.ackEmoji` 改，需要 `im:message.reactions:write_only` 权限。
   - `look: "chat"` 时，第一次发送就已完成、没有按钮，且答案不超过一条消息的上限（默认 4000 字符）、不含代码围栏或表格的回复发普通文本，有 Markdown 时发富文本（post）；其他回复使用卡片。
 - **降级**：流式更新失败时退到整卡替换，再失败退到普通消息编辑。失败记录按会话保留 30 分钟，权限类错误对整个应用生效。
+- **发送结果**：飞书的发送、回复接口返回 `thread_id`（消息在话题里，包括 `reply_in_thread` 刚开出的话题）时，`SendResult` 带 `providerThreadId`，宿主 `deliver` 的结果里也有（HOSTS §4）。
 
 ### 对话里的命令（主人）
 

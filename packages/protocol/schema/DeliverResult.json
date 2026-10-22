@@ -64,6 +64,9 @@
     "providerMessageId": {
       "type": "string"
     },
+    "providerThreadId": {
+      "type": "string"
+    },
     "error": {
       "type": "string"
     },

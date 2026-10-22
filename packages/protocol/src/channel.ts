@@ -137,6 +137,8 @@ export const SendResult = Type.Object({
   providerMessageId: Type.Optional(Type.String()),
   /** All platform messages produced, in order, when split. */
   providerMessageIds: Type.Optional(Type.Array(Type.String())),
+  /** The platform thread (topic) the message is in, when the platform says (Lark `thread_id`). */
+  providerThreadId: Type.Optional(Type.String()),
 });
 export type SendResult = Static<typeof SendResult>;
 

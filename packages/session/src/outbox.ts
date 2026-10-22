@@ -21,6 +21,8 @@ export interface DeliveryRecord {
   providerMessageId?: string;
   /** Every platform message the send produced, in order, when the adapter split it (`SendResult.providerMessageIds`). */
   providerMessageIds?: string[];
+  /** The platform thread (topic) the message is in, when the adapter reports one (`SendResult.providerThreadId`). */
+  providerThreadId?: string;
   error?: string;
 }
 
@@ -261,6 +263,7 @@ export class Outbox {
           status: 'delivered',
           ...(r && r.providerMessageId !== undefined ? { providerMessageId: r.providerMessageId } : {}),
           ...(r && r.providerMessageIds?.length ? { providerMessageIds: [...r.providerMessageIds] } : {}),
+          ...(r && r.providerThreadId !== undefined ? { providerThreadId: r.providerThreadId } : {}),
         });
       } catch (err) {
         rec.error = err instanceof Error ? err.message : String(err);

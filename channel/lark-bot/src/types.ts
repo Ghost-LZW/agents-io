@@ -4,11 +4,11 @@ export interface LarkMessageApi {
   create(payload: {
     data: { receive_id: string; msg_type: string; content: string; uuid?: string };
     params: { receive_id_type: 'chat_id' | 'open_id' | 'union_id' | 'user_id' | 'email' };
-  }): Promise<LarkApiResponse<{ message_id?: string }>>;
+  }): Promise<LarkApiResponse<SentMessage>>;
   reply(payload: {
     data: { content: string; msg_type: string; reply_in_thread?: boolean; uuid?: string };
     path: { message_id: string };
-  }): Promise<LarkApiResponse<{ message_id?: string }>>;
+  }): Promise<LarkApiResponse<SentMessage>>;
   /** Patch an interactive card (`PATCH /im/v1/messages/:id`). Cards only. */
   patch(payload: { data: { content: string }; path: { message_id: string } }): Promise<LarkApiResponse>;
   /** Replace a text/post message (`PUT /im/v1/messages/:id`). */
@@ -39,6 +39,12 @@ export interface LarkMessageApi {
       card_msg_content_type?: string;
     };
   }): Promise<LarkApiResponse<{ has_more?: boolean; page_token?: string; items?: LarkMessageItem[] }>>;
+}
+
+/** What `message.create` / `message.reply` answer (fields the adapter reads): `thread_id` when the message is in a topic. */
+export interface SentMessage {
+  message_id?: string;
+  thread_id?: string;
 }
 
 /** One item of `im.v1.message.get` (fields the adapter reads). */

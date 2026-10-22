@@ -4,7 +4,8 @@ import type { InputRecord } from './inbound.js';
  * The channelContext part of a harness's sender preface (INVARIANTS ID-2). Keys
  * that stay the same across a conversation (how replies render, the topic and its
  * hint) or a sender (display name) are shown when they change, not on every
- * input; keys `via` already names (`channel`, `conversationId`) are not repeated.
+ * input; keys `via` already names (`channel`, `conversationId`) are not repeated;
+ * the reply chain's message ids (`rootMessageId`, `parentMessageId`) are for hosts.
  * The sender fields themselves (from, kind, evidence, via, ref…) are not here:
  * every input carries them.
  */
@@ -13,6 +14,8 @@ import type { InputRecord } from './inbound.js';
 const PER_CONVERSATION = new Set(['conversationKind', 'reply', 'topic', 'topicTitle', 'topicTools']);
 /** Keys shown once per sender until their value changes. */
 const PER_SENDER = new Set(['senderId', 'senderName', 'senderIsBot']);
+/** Keys for hosts, never shown: the reply chain's platform message ids (a replied-to message reaches the model as a quote block). */
+const NOT_SHOWN = new Set(['rootMessageId', 'parentMessageId']);
 
 /**
  * What a harness session already showed the model. Reset it whenever the model
@@ -44,6 +47,7 @@ export function prefaceContext(input: InputRecord, memo?: PrefaceMemo, value: (v
   const conversation = rest.join(':');
   const out: [string, string][] = [];
   for (const [k, v] of Object.entries(input.channelContext)) {
+    if (NOT_SHOWN.has(k)) continue;
     if (k === 'channel' && v === channel) continue;
     if (k === 'conversationId' && typeof v === 'string' && v && (conversation === v || conversation.startsWith(`${v}:`))) continue;
     const s = value(v);

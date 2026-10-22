@@ -152,4 +152,27 @@ describe('inbound mapping', () => {
     ctl.abort();
     await done;
   });
+
+  it('carries root_id / parent_id as rootMessageId / parentMessageId, in DMs and topics; a plain message has neither', async () => {
+    const { lark, envs, ctl, done } = await setup();
+    // A DM reply to an earlier message (e.g. a notice the bot sent).
+    await lark.fire('im.message.receive_v1', messageEvent({ id: 'om_d1', root: 'om_notice', parent: 'om_notice', content: { text: 'go on' } }));
+    // A message in a topic, and a reply to a specific message inside it.
+    await lark.fire('im.message.receive_v1', messageEvent({ id: 'om_t1', chatType: 'group', root: 'om_root', parent: 'om_root', thread: 'omt_1', content: { text: 'in topic' } }));
+    await lark.fire('im.message.receive_v1', messageEvent({ id: 'om_t2', chatType: 'group', root: 'om_root', parent: 'om_t1', thread: 'omt_1', content: { text: 'to t1' } }));
+    // Plain messages: no reply chain.
+    await lark.fire('im.message.receive_v1', messageEvent({ id: 'om_d2', content: { text: 'new' } }));
+    await lark.fire('im.message.receive_v1', messageEvent({ id: 'om_g1', chatType: 'group', content: { text: 'chatter' } }));
+    expect(envs[0]).toMatchObject({ conversation: { kind: 'dm' }, rootMessageId: 'om_notice', parentMessageId: 'om_notice' });
+    expect(envs[0]!.content).toEqual([{ type: 'quote', text: '', fromMessageId: 'om_notice' }, { type: 'text', text: 'go on' }]);
+    expect(envs[1]).toMatchObject({ conversation: { kind: 'thread', threadId: 'omt_1' }, rootMessageId: 'om_root', parentMessageId: 'om_root' });
+    expect(envs[1]!.content).toEqual([{ type: 'text', text: 'in topic' }]);
+    expect(envs[2]).toMatchObject({ rootMessageId: 'om_root', parentMessageId: 'om_t1' });
+    for (const e of envs.slice(3)) {
+      expect(e).not.toHaveProperty('rootMessageId');
+      expect(e).not.toHaveProperty('parentMessageId');
+    }
+    ctl.abort();
+    await done;
+  });
 });

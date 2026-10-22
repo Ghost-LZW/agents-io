@@ -746,6 +746,12 @@
                   }
                 }
               },
+              "rootMessageId": {
+                "type": "string"
+              },
+              "parentMessageId": {
+                "type": "string"
+              },
               "context": {
                 "type": "object",
                 "patternProperties": {

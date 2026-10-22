@@ -676,6 +676,8 @@ export const DeliverResult = Type.Object({
   status: Type.Union([Type.Literal('delivered'), Type.Literal('rejected'), Type.Literal('unknown')]),
   attempts: Type.Number(),
   providerMessageId: Type.Optional(Type.String()),
+  /** The platform thread (topic) the message is in, when the channel reports one (`SendResult.providerThreadId`; Lark `thread_id`). */
+  providerThreadId: Type.Optional(Type.String()),
   error: Type.Optional(Type.String()),
   /** An earlier `deliver` with this operationId settled it; nothing was sent now. */
   duplicate: Type.Boolean(),

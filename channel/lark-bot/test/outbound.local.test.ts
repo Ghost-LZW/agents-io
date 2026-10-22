@@ -34,6 +34,27 @@ describe('send', () => {
     expect(JSON.parse(lark.messages[0]!.content).zh_cn.content[0][0]).toEqual({ tag: 'md', text: '**bold** and `code`' });
   });
 
+  it("returns Lark's thread_id as providerThreadId when the message is in a topic, also for a repeated send", async () => {
+    const { lark, adapter } = make();
+    // A notice that starts a topic: reply_in_thread to it; Lark answers the new topic's id.
+    const root = await adapter.send(route, { text: 'first notice' }, { operationId: 'n1' });
+    expect(root).toEqual({ providerMessageId: 'om_1' });
+    const inTopic = { ...route, threadId: 'omt_om_1', replyToMessageId: 'om_1' };
+    const r = await adapter.send(inTopic, { text: 'second notice' }, { operationId: 'n2' });
+    expect(r).toEqual({ providerMessageId: 'om_2', providerThreadId: 'omt_om_1' });
+    // A fresh adapter (restart) sending the same operation again gets the same answer from Lark's uuid dedup.
+    const fresh = new LarkBotAdapter(cfg, { deps: lark.deps });
+    expect(await fresh.send(inTopic, { text: 'second notice' }, { operationId: 'n2' })).toEqual(r);
+    // Split text and cards report it too.
+    const split = await adapter.send(inTopic, { text: `${'a fairly long line '.repeat(300)}\n\n${'and another one '.repeat(300)}` }, { operationId: 'n3' });
+    expect(split.providerMessageIds!.length).toBeGreaterThan(1);
+    expect(split.providerThreadId).toBe('omt_om_1');
+    const card = await adapter.send(inTopic, { text: 'pick', actions: [{ id: 'a1', label: 'A' }] }, { operationId: 'n4' });
+    expect(card).toMatchObject({ providerThreadId: 'omt_om_1' });
+    // A quote-reply in the chat (not in a topic) has none.
+    expect(await adapter.send({ ...route, replyToMessageId: 'om_1' }, { text: 'quoted' }, { operationId: 'n5' })).not.toHaveProperty('providerThreadId');
+  });
+
   it('renders sections, actions and link as a schema 2.0 card', async () => {
     const { lark, adapter } = make();
     await adapter.send(
