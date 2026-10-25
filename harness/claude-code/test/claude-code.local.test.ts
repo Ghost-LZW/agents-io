@@ -15,6 +15,12 @@ describe('open → SDK options', () => {
     });
   });
 
+  it('mcpAlwaysLoad: false leaves the host tools to tool search (no alwaysLoad on the host server)', async () => {
+    const { q } = await setup({ run, mcp: { url: 'http://h/mcp', token: 't' } }, { mcpAlwaysLoad: false });
+    expect(q.options.mcpServers?.agents_io).toEqual({ type: 'http', url: 'http://h/mcp', headers: { Authorization: 'Bearer ${AGENTS_IO_MCP_TOKEN}' } });
+    expect(q.options.allowedTools).toEqual(['mcp__agents_io']);
+  });
+
   it('instance launch config: env over process.env, configDir, settings, sources, plugins, skills, flags, dirs, MCP', async () => {
     process.env.AGENTS_IO_TEST_INHERITED = 'from-process';
     process.env.AGENTS_IO_TEST_REMOVED = 'from-process';

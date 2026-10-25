@@ -93,6 +93,27 @@
       "items": {
         "type": "string"
       }
+    },
+    "outboundScope": {
+      "type": "object",
+      "required": [
+        "revision",
+        "routes"
+      ],
+      "properties": {
+        "revision": {
+          "type": "number"
+        },
+        "routes": {
+          "type": "number"
+        }
+      }
+    },
+    "optIn": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     }
   }
 }

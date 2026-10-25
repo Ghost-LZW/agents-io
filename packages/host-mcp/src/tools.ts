@@ -20,7 +20,7 @@ import {
   type Watch,
   type WatchDraft,
 } from '@agents-io/protocol';
-import type { DeliveryRecord, Hub, InboundRewrite, Outbox, Participant } from '@agents-io/session';
+import type { Delivery, DeliveryRecord, ExitVerdict, Hub, InboundRewrite, Outbox, Participant } from '@agents-io/session';
 import {
   CHOICE_KEY,
   MENTIONS_KEY,
@@ -90,6 +90,12 @@ export interface HostToolsOptions {
   hub: Hub;
   outbox: Outbox;
   policy: Required<Pick<Policy, 'outbound'>>;
+  /**
+   * U20: the exit check of an output tool's message (`kind: tool`, with its content), before it is recorded
+   * as `agents-io.output`: `hold` = the host took it (settled `held`, nothing recorded, the agent is told
+   * not to send it again), `deny` = refused like the outbound policy. `undefined`: no check applies.
+   */
+  exit?: (d: Delivery) => Promise<ExitVerdict | undefined> | undefined;
   /** The running turn of a session (`Lane.currentTurn()`), undefined when idle. */
   turn(sessionKey: string): TurnContext | undefined;
   /** The adapter that sends to a route: its channel and account (several Lark bots share the channel id). */
@@ -443,6 +449,18 @@ export class HostTools {
   private async deliver(b: ToolBinding, turn: TurnContext, tool: string, route: ReplyRoute, msg: RenderedMessage, operationId: string, choice?: ChoiceData): Promise<DeliveryRecord> {
     const prior = this.o.outbox.get(operationId);
     const body: RenderedMessage = { ...msg, channelData: { ...(msg.channelData as object | undefined), [OUTPUT_KEY]: { tool } } };
+    if (!prior && this.o.exit) {
+      // U20: asked before anything is recorded; the same operationId again (a retried call) is not asked again.
+      const d = { operationId, sessionKey: b.sessionKey, turnId: turn.turnId, route, from: turn, kind: 'tool' as const, content: body };
+      const p = this.o.exit(d);
+      const v = p === undefined ? undefined : await p;
+      if (v?.verdict === 'hold') {
+        this.o.outbox.hold(d, v.reason);
+        throw new ToolError(`宿主拿走了这条，没有发出${v.reason ? `（${v.reason}）` : ''}。不要再发。`);
+      }
+      if (v && v.verdict !== 'allow') throw new ToolError(`destination ${routeKey(route)} is not allowed by the host's outbound policy${v.reason ? ` (${v.reason})` : ''}. Do not retry with another destination unless the user asks for it.`);
+    }
+    if (prior?.status === 'held') throw new ToolError(`the host took this message; it was not sent${prior.reason ? ` (${prior.reason})` : ''}. Do not send it again.`);
     if (!prior) {
       const provenance = this.o.provenance?.(b.sessionKey, turn.turnId);
       const rec: OutputRecord = { tool, operationId, route, msg: body, ...(choice ? { choice } : {}), ...(provenance ? { provenance } : {}) };
@@ -458,7 +476,7 @@ export class HostTools {
       });
     }
     let rec: DeliveryRecord;
-    const d = { operationId, sessionKey: b.sessionKey, turnId: turn.turnId, route };
+    const d = { operationId, sessionKey: b.sessionKey, turnId: turn.turnId, route, kind: 'tool' as const, exitChecked: true };
     if (this.eventOnly.has(route.channel)) {
       // The terminal and other stream ends render the output event themselves.
       rec = await this.o.outbox.deliver(d, async () => ({ providerMessageId: operationId }));

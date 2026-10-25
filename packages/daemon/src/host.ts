@@ -3,6 +3,7 @@ import {
   ContactCalloutAnswer,
   ExternalCalloutAnswer,
   OutboundCalloutAnswer,
+  OutboundContentCalloutAnswer,
   PROTOCOL_VERSION,
   Resolver,
   ReviewCalloutAnswer,
@@ -18,6 +19,9 @@ import {
   type InboundEnvelope,
   type InputRecord,
   type Origin,
+  type OutboundKind,
+  type OutboundScopeRoute,
+  type RenderedMessage,
   type ReplyRoute,
   type TurnContext,
 } from '@agents-io/protocol';
@@ -57,6 +61,8 @@ export interface HostServiceDeps {
   redispatch(hostName: string, f: Extract<HostRequestFrame, { type: 'inbound.redispatch' }>): Promise<Outcome>;
   /** `session.compact`: compact a quiet live session's harness context as a turn of its own (CT-3). */
   compactSession(f: Extract<HostRequestFrame, { type: 'session.compact' }>, origin: Origin): Promise<Outcome>;
+  /** `session.prewarm`: open a known session's harness without a turn. */
+  prewarmSession(f: Extract<HostRequestFrame, { type: 'session.prewarm' }>): Promise<Outcome>;
   /** `policy.answerOnBehalf`: the `resolve.onBehalfOf` feature is advertised only when it is on. */
   answerOnBehalf?: boolean;
   /** Per-hook timeouts of the `resolve` / `review` / `outbound` / `contact` / `external` callouts (config `hostCallouts`). */
@@ -65,11 +71,19 @@ export interface HostServiceDeps {
   externalMcp?: () => boolean;
   /** `explain`: a routing record, a side effect by operationId, or (`chain`) an agent input's chain. */
   explain(inputId: string, chain: boolean): Outcome;
+  /** Test hooks are on (`test.hooks` is advertised; HOSTS §4.3, SE-6). */
+  testHooks?: () => boolean;
+  /** `test.replay`: a channel message accepted earlier, to the gateway again (answers `test_hooks_off` when off). */
+  testReplay?(hostName: string, f: Extract<HostRequestFrame, { type: 'test.replay' }>): Promise<Outcome>;
+  /** `test.fault`: drop the responses of a channel's next sends; clear; list (answers `test_hooks_off` when off). */
+  testFault?(hostName: string, f: Extract<HostRequestFrame, { type: 'test.fault' }>): Outcome;
   log: LogFn;
   /** How long a pushed `inbound` waits for the host's result before it is retried (default 30 s). */
   pushTimeoutMs?: number;
   /** Delay before a refused push is retried (default 1 s). */
   pushRetryMs?: number;
+  /** U20: an `outbound.scoped` host declared or replaced its scope (lives in scope now are left). */
+  onScope?: () => void;
 }
 
 /** Origin of what a host connection sends (client frames, run inputs). */
@@ -84,6 +98,7 @@ const TAKEOVER_FLAP_MS = 60_000;
 
 export class HostService implements HostFrames {
   private host: { peer: Peer; name: string; consumer?: string; hooks: Set<CalloutHook>; push?: PushSubscription } | undefined;
+  private scopeCache: { raw: string; scope: StoredScope } | undefined;
   /** When the last host takeover happened (repeated ones within TAKEOVER_FLAP_MS are logged as errors). */
   private lastTakeover: number | undefined;
   private readonly token: Buffer;
@@ -122,6 +137,72 @@ export class HostService implements HostFrames {
    */
   externalHeldBy(): string | undefined {
     return this.answers('external') ? undefined : this.d.records.flag(EXTERNAL_FLAG);
+  }
+
+  /**
+   * The last host to take the role declared `outbound` with `outbound.content` (U20 item 1, feature
+   * `callouts.outbound.content`): its `outbound` callouts carry the content and may answer `hold`, and
+   * every settlement says what it was (`kind`). Kept while it is away, like `host.outbound`.
+   */
+  outboundContentDeclared(): boolean {
+    return this.d.records.flag(CONTENT_FLAG) !== undefined;
+  }
+
+  /**
+   * HC-7: the last host to take the role asked for `optIn: ["item.tool"]` (MCP tool items keep
+   * `tool { server, name }`, nothing else changes). Kept while it is away, like `host.outbound.content`.
+   */
+  itemToolDeclared(): boolean {
+    return this.d.records.flag(ITEM_TOOL_FLAG) !== undefined;
+  }
+
+  /** The connected host answers `outbound` with the content (`outbound` + `outbound.content`). */
+  answersContent(): boolean {
+    return this.answers('outbound') && this.answers('outbound.content');
+  }
+
+  /**
+   * The scope an `outbound.scoped` host declared (U20), kept across restarts and while that host is
+   * away; cleared only by a hello that takes the host role without `outbound.scoped`.
+   */
+  outboundScope(): StoredScope | undefined {
+    const raw = this.d.records.flag(SCOPE_FLAG);
+    if (raw === undefined) return undefined;
+    if (this.scopeCache?.raw === raw) return this.scopeCache.scope;
+    let scope: StoredScope | undefined;
+    try {
+      const v = JSON.parse(raw) as StoredScope;
+      if (typeof v?.host === 'string' && typeof v.revision === 'number' && Array.isArray(v.routes)) scope = v;
+    } catch {
+      scope = undefined;
+    }
+    // A record that does not parse still says a scope was declared: fail closed, every route is in it
+    // (checked, held while no host answers) until a scoped host declares or replaces its scope.
+    if (!scope) {
+      scope = { host: '?', revision: 0, routes: [], all: true };
+      this.d.log('error', `the outbound scope record does not parse: every route is checked until the scoped host declares its scope again`);
+    }
+    this.scopeCache = { raw, scope };
+    return scope;
+  }
+
+  /** The route is in the declared scope (its conversation, any thread). */
+  inScope(route: { channel: string; account: string; conversationId: string }): boolean {
+    const s = this.outboundScope();
+    if (s?.all) return true;
+    return !!s && s.routes.some((r) => r.channel === route.channel && r.account === route.account && r.conversationId === route.conversationId);
+  }
+
+  private putScope(host: string, routes: OutboundScopeRoute[]): number {
+    const revision = (this.outboundScope()?.revision ?? 0) + 1;
+    const clean = routes.map((r) => ({ channel: r.channel, account: r.account, conversationId: r.conversationId }));
+    this.d.records.setFlag(SCOPE_FLAG, JSON.stringify({ host, revision, routes: clean } satisfies StoredScope));
+    try {
+      this.d.onScope?.();
+    } catch {
+      // best effort: a live in scope is also refused at live_say
+    }
+    return revision;
   }
 
   /** The connected host answers this `policy` hook. */
@@ -174,6 +255,20 @@ export class HostService implements HostFrames {
         return this.d.redispatch(peer.auth!.name, f);
       case 'session.compact':
         return this.d.compactSession(f, peer.auth!.origin(f.sessionKey));
+      case 'session.prewarm':
+        return this.d.prewarmSession(f);
+      // Test hooks: the host token (checked by hello) and AIO_TEST_HOOKS=1 at daemon start.
+      case 'test.replay':
+        return this.d.testReplay ? this.d.testReplay(peer.auth!.name, f) : fail('test_hooks_off', 'test hooks are off');
+      case 'test.fault':
+        return this.d.testFault ? this.d.testFault(peer.auth!.name, f) : fail('test_hooks_off', 'test hooks are off');
+      case 'host.outboundScope': {
+        const h = this.host;
+        if (!h || h.peer !== peer || !h.hooks.has('outbound.scoped')) return fail('not_scoped', 'only the connected host that declared outbound.scoped may replace its scope');
+        const revision = this.putScope(h.name, f.routes);
+        this.d.log('info', `host ${h.name} replaced its outbound scope (revision ${revision}, ${f.routes.length} conversation(s))`);
+        return ok({ revision });
+      }
     }
   }
 
@@ -187,8 +282,13 @@ export class HostService implements HostFrames {
     const name = f.name.trim();
     if (!name) return fail('invalid_frame', 'name is empty');
     const hooks = calloutHooks(f.callouts);
+    const optIn = new Set(OPT_INS.filter((x) => Array.isArray(f.optIn) && f.optIn.includes(x)));
+    // `outbound.content` adds to `outbound` (`outbound.scoped` has the content anyway): alone it names nothing.
+    if (hooks.has('outbound.content') && !hooks.has('outbound') && !hooks.has('outbound.scoped')) hooks.delete('outbound.content');
     const role = f.consumer !== undefined || hooks.size > 0;
     if (f.consumer !== undefined && !f.consumer) return fail('invalid_frame', 'consumer is empty');
+    if (hooks.has('outbound') && hooks.has('outbound.scoped')) return fail('invalid_frame', 'callouts name both outbound and outbound.scoped: one or the other');
+    if (hooks.has('outbound.scoped') && !f.outboundScope) return fail('invalid_frame', 'outbound.scoped needs outboundScope { routes }');
     let replaced: string | undefined;
     if (role && this.host && !this.host.peer.signal.aborted) {
       if (f.takeover !== true || !this.host.peer.end) return fail('host_connected', `host ${this.host.name} is connected; at most one host (consumer / callouts) at a time (host.hello takeover: true replaces it)`);
@@ -210,7 +310,12 @@ export class HostService implements HostFrames {
     if (role) {
       this.host = { peer, name, hooks, ...(f.consumer !== undefined ? { consumer: f.consumer } : {}) };
       this.d.records.setFlag(OUTBOUND_FLAG, hooks.has('outbound') ? name : undefined);
+      this.d.records.setFlag(CONTENT_FLAG, hooks.has('outbound') && hooks.has('outbound.content') ? name : undefined);
       this.d.records.setFlag(EXTERNAL_FLAG, hooks.has('external') ? name : undefined);
+      this.d.records.setFlag(ITEM_TOOL_FLAG, optIn.has('item.tool') ? name : undefined);
+      // U20: a scope stays across restarts and while its host is away; a host taking the role without it ends it.
+      if (hooks.has('outbound.scoped')) this.putScope(name, f.outboundScope!.routes);
+      else this.d.records.setFlag(SCOPE_FLAG, undefined);
       this.d.router.setHostConnected(true);
       if (f.consumer !== undefined) this.host.push = this.startPush(peer, f.consumer);
       this.d.log('info', `host ${name} connected${f.consumer !== undefined ? `, consuming as ${f.consumer}` : ''}${hooks.size ? `, answering callouts (${[...hooks].join(', ')})` : ''}`);
@@ -223,8 +328,10 @@ export class HostService implements HostFrames {
       bindings: { version: st?.table.version ?? null, active: st?.active ?? false, ...(st?.suspended ? { suspended: st.suspended } : {}) },
       ...(f.consumer !== undefined ? { inbound: { consumer: f.consumer, acked: this.d.queue.cursor(f.consumer), head: this.d.queue.head() } } : {}),
       ...(replaced !== undefined ? { replaced: { name: replaced } } : {}),
-      features: FEATURES.filter((x) => (x !== 'resolve.onBehalfOf' || this.d.answerOnBehalf) && (x !== 'external.mcp' || this.d.externalMcp?.() === true)),
+      features: FEATURES.filter((x) => (x !== 'resolve.onBehalfOf' || this.d.answerOnBehalf) && (x !== 'external.mcp' || this.d.externalMcp?.() === true) && (x !== 'test.hooks' || this.d.testHooks?.() === true)),
       ...(f.callouts !== undefined ? { callouts: role ? [...hooks] : [] } : {}),
+      ...(role && hooks.has('outbound.scoped') ? { outboundScope: { revision: this.outboundScope()!.revision, routes: this.outboundScope()!.routes.length } } : {}),
+      ...(f.optIn !== undefined ? { optIn: role ? [...optIn] : [] } : {}),
     });
   }
 
@@ -300,8 +407,31 @@ export class HostService implements HostFrames {
   /** `Policy.outbound` asked of the host (hook `outbound`). Throws on no answer or a bad one: the caller denies. */
   async outboundCallout(from: TurnContext | null, to: ReplyRoute): Promise<'allow' | 'deny'> {
     const v = await this.callout('outbound', { from: from ? ctxView(from) : null, to }, this.d.calloutTimeouts?.outbound ?? 2000);
+    // An `outbound.content` host may answer `hold` here too (a check with no content, e.g. where a live opens): not sent.
+    if (this.answersContent() && check(OutboundContentCalloutAnswer, v)) return v.verdict === 'allow' ? 'allow' : 'deny';
     if (!check(OutboundCalloutAnswer, v)) throw new Error(`bad outbound answer: ${errors(OutboundCalloutAnswer, v).slice(0, 2).join('; ')}`);
     return v.verdict;
+  }
+
+  /**
+   * The `outbound` callout with the content and what it is (U20), asked of an `outbound.scoped` host or
+   * an `outbound` + `outbound.content` one. Throws on no answer or a bad one: the caller holds
+   * (`host_unavailable`, scoped) or denies (DL-5, unscoped).
+   */
+  async outboundContentCallout(a: { from: TurnContext | null; to: ReplyRoute; content?: RenderedMessage; attachmentText?: Record<string, string>; turnId?: string; kind: OutboundKind; requestId?: string }): Promise<OutboundContentCalloutAnswer> {
+    const args = {
+      from: a.from ? ctxView(a.from) : null,
+      to: a.to,
+      kind: a.kind,
+      ...(a.content !== undefined ? { content: a.content } : {}),
+      ...(a.attachmentText && Object.keys(a.attachmentText).length ? { attachmentText: a.attachmentText } : {}),
+      ...(a.turnId !== undefined ? { turnId: a.turnId } : {}),
+      ...(a.requestId !== undefined ? { requestId: a.requestId } : {}),
+    };
+    const hook: CalloutHook = this.host?.hooks.has('outbound.scoped') ? 'outbound.scoped' : 'outbound.content';
+    const v = await this.callout(hook, args, this.d.calloutTimeouts?.outbound ?? 2000, 'outbound');
+    if (!check(OutboundContentCalloutAnswer, v)) throw new Error(`bad outbound answer: ${errors(OutboundContentCalloutAnswer, v).slice(0, 2).join('; ')}`);
+    return v;
   }
 
   /** `Policy.contact` asked of the host (hook `contact`). Throws on no answer or a bad one: the caller's own policy decides. */
@@ -321,10 +451,11 @@ export class HostService implements HostFrames {
     return v;
   }
 
-  private async callout(hook: CalloutHook, args: unknown, timeoutMs: number): Promise<unknown> {
+  /** `wire`: the hook name on the `policy` frame when it differs (`outbound.scoped` asks `outbound`). */
+  private async callout(hook: CalloutHook, args: unknown, timeoutMs: number, wire: string = hook): Promise<unknown> {
     const h = this.host;
     if (!h || !h.hooks.has(hook)) throw new Error(`no host answers ${hook}`);
-    const r = await h.peer.request({ type: 'policy', hook, args }, timeoutMs);
+    const r = await h.peer.request({ type: 'policy', hook: wire, args } as never, timeoutMs);
     if (!r.ok) throw new Error(`${r.error?.code ?? 'error'}: ${r.error?.message ?? ''}`);
     return r.value;
   }
@@ -343,7 +474,11 @@ export class HostService implements HostFrames {
  * `callouts.review`: the `review` hook (a `model` resolver's review); `resolve.native`: `resolve` and `review` callouts carry
  * the harness's `native` request; `resolver.human.extras`: a human resolver's `timeoutMs`, `note` and `allowSessionAs`, and
  * a model resolver's `escalate`, apply. `session.compact`: the `session.compact` request (a quiet live session's harness
- * compacts its context as a turn of its own, CT-3).
+ * compacts its context as a turn of its own, CT-3). `session.prewarm`: the `session.prewarm` request (a known session's
+ * harness opens without a turn, ahead of input the host expects). `test.hooks` (only when the daemon was started with
+ * AIO_TEST_HOOKS=1): the `test.replay` and `test.fault` requests (fault injection, HOSTS §4.3, SE-6). `item.tool` (HC-7):
+ * MCP tool items carry `tool { server, name }` while the host declared `outbound.scoped`, `outbound` + `outbound.content`,
+ * or asked `optIn: ["item.tool"]` (granted in the result's `optIn`).
  */
 export const FEATURES = [
   'session.launch',
@@ -363,16 +498,44 @@ export const FEATURES = [
   'callouts.external',
   'external.mcp',
   'session.compact',
+  'session.prewarm',
+  'test.hooks',
+  'callouts.outbound.content',
+  'callouts.outbound.scope',
+  'reply.check',
+  'callout.history',
+  'item.tool',
 ];
 
 /** `DaemonRecords` flag: the name of the host that declared the `outbound` hook. */
 const OUTBOUND_FLAG = 'host.outbound';
 /** `DaemonRecords` flag: the name of the host that declared the `external` hook. */
 const EXTERNAL_FLAG = 'host.external';
+/**
+ * `DaemonRecords` flag (U20): the `outbound.scoped` host's scope as JSON `{ host, revision, routes }`.
+ * A new name, so a daemon downgraded to one without scopes never reads it (and holds nothing back).
+ */
+const SCOPE_FLAG = 'host.outbound.scope';
+/** `DaemonRecords` flag (U20): the name of the host that declared `outbound` with `outbound.content`. */
+const CONTENT_FLAG = 'host.outbound.content';
+/** `DaemonRecords` flag (HC-7): the name of the host whose hello had `optIn: ["item.tool"]`. */
+const ITEM_TOOL_FLAG = 'host.item.tool';
+
+/** `host.hello.optIn` names a host may ask for. */
+const OPT_INS = ['item.tool'] as const;
+
+/** The stored scope of an `outbound.scoped` host. */
+export interface StoredScope {
+  host: string;
+  revision: number;
+  routes: OutboundScopeRoute[];
+  /** The record did not parse: every route is in scope (fail closed), never written. */
+  all?: true;
+}
 
 /** The `policy` hooks a host may answer. */
-export type CalloutHook = 'route' | 'resolve' | 'review' | 'outbound' | 'contact' | 'external';
-const HOOKS: readonly CalloutHook[] = ['route', 'resolve', 'review', 'outbound', 'contact', 'external'];
+export type CalloutHook = 'route' | 'resolve' | 'review' | 'outbound' | 'outbound.content' | 'outbound.scoped' | 'contact' | 'external';
+const HOOKS: readonly CalloutHook[] = ['route', 'resolve', 'review', 'outbound', 'outbound.content', 'outbound.scoped', 'contact', 'external'];
 
 /** `host.hello.callouts`: `true` = route only; a list names the hooks (unknown names ignored). */
 export function calloutHooks(c: boolean | string[] | undefined): Set<CalloutHook> {

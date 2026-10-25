@@ -50,11 +50,17 @@ export function inputSummary(tool: string, input: unknown, max = 120): string | 
   return json && json !== '{}' ? oneLine(json, max) : undefined;
 }
 
+/** `mcp__server__tool` → `{ server, name }` (docs/HOSTS.md §4.4); built-ins: undefined. */
+export function mcpTool(tool: string): { server: string; name: string } | undefined {
+  if (!tool.startsWith('mcp__')) return undefined;
+  const [, server, ...rest] = tool.split('__');
+  return { server: server!, name: rest.join('__') };
+}
+
 /** `mcp__server__tool` → `server.tool`; built-ins unchanged. */
 export function toolLabel(tool: string): string {
-  if (!tool.startsWith('mcp__')) return tool;
-  const [, server, ...rest] = tool.split('__');
-  return `${server}.${rest.join('__')}`;
+  const m = mcpTool(tool);
+  return m ? `${m.server}.${m.name}` : tool;
 }
 
 export function itemTitle(tool: string, input: unknown): string {

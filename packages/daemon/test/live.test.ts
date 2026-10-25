@@ -216,6 +216,32 @@ describe('live tools (decision 11)', () => {
     expect(settled.turnId).toBe(turnId);
   });
 
+  it('live_say settles with kind live and its turn while settlements say what they were (an outbound.scoped host declared); before, as it was #DL-7 #EX-2', async () => {
+    const holder: { h?: LiveFakeHarness } = {};
+    const said: string[] = [];
+    const w = await setup(async (t) => {
+      const mcp = holder.h!.sessions.at(-1)!.args.mcp;
+      const text = t.inputs.flatMap((i) => i.content).map((c) => (c.type === 'text' ? c.text : '')).join(' ');
+      if (text === 'join') await mcpCall(mcp, 'live_join', { target: '42' }, 'join1');
+      await mcpCall(mcp, 'live_say', { text: 'hello room' }, `say:${text}`);
+      said.push(text);
+    });
+    holder.h = w.harness;
+    const op = (text: string) => w.events.find((e) => e.body.t === 'delivery.settled' && e.body.operationId === `tool:fake:default:c1:say:${text}`);
+    await w.chat.inject({ sender: { channelUserId: 'alice', evidence: 'platform_signed' }, text: 'join' });
+    const before = await until(() => op('join'));
+    expect(before.body).toMatchObject({ result: 'delivered' });
+    expect(before.body).not.toHaveProperty('kind');
+    // A scoped host whose scope is elsewhere: the live stays, and what it says now says what it was.
+    const h = await LocalClient.connect(join(w.dir, 'run', 'aio.sock'));
+    cleanups.push(() => h.close());
+    await h.hello({ token: w.gw.token, name: 'lb', callouts: ['outbound.scoped'], outboundScope: { routes: [{ channel: 'fake', account: 'default', conversationId: 'elsewhere' }] } } as never);
+    await w.chat.inject({ sender: { channelUserId: 'alice', evidence: 'platform_signed' }, text: 'again' });
+    const after = await until(() => op('again'));
+    expect(after.body).toMatchObject({ result: 'delivered', kind: 'live', turnId: after.turnId });
+    expect(w.harness.said).toEqual(['hello room', 'hello room']);
+  });
+
   it('two concurrent live_join: one wins, the other is refused without touching the running live or opening an endpoint #LN-3', async () => {
     const holder: { h?: LiveFakeHarness } = {};
     const results: { isError: boolean; text: string }[] = [];

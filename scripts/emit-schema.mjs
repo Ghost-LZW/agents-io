@@ -13,6 +13,10 @@ const names = [
   'HostHelloResult', 'BindingsPutResult', 'BindingsGetResult', 'RunStartResult', 'RunCancelResult', 'RunEnded', 'DeliverResult',
   'InputVerifyResult', 'InboundReadResult', 'InboundAckResult', 'InboundAnswer', 'RouteCalloutAnswer', 'SessionPrepareResult',
   'ResolveCalloutAnswer', 'ReviewCalloutAnswer', 'OutboundCalloutAnswer', 'TurnContextView', 'InboundRedispatchResult', 'SessionCompactResult',
+  // Test hooks (AIO_TEST_HOOKS=1 only; HOSTS §4.3)
+  'TestReplayResult', 'TestFaultResult',
+  // U20: the exit check of an outbound.scoped host
+  'OutboundContentCalloutAnswer', 'OutboundKind', 'OutboundScopeRoute', 'HostOutboundScopeResult',
   // Agent messaging: cause chain and explain of side effects / chains
   'InputCause', 'EffectExplanation', 'ChainExplanation', 'ExplainResult', 'ContactCalloutAnswer',
   // External MCP endpoint (docs/design/external-mcp)

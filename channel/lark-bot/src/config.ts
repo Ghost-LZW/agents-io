@@ -4,7 +4,9 @@
  * - `cot`: Feishu's native thinking bubble (`message_cot`) for thinking and tool calls; the
  *   reply card carries only status, plan and answer. When the bubble fails, the process is not shown.
  * - `auto`: like `cot` while the bubble API works for the chat, otherwise `panels`.
- * - `off`: ignore `progress`; render the flat text/sections card as before.
+ * - `off`: no process; the flat text/sections card, which says only 「处理中…」 while the turn runs
+ *   (`progress` tells running from ended) and carries the final answer when it ends; a turn with
+ *   none (`progress.finalAnswer` unset: failed, interrupted…) ends saying only how it ended.
  */
 export type ProcessMode = 'auto' | 'cot' | 'panels' | 'off';
 
@@ -46,8 +48,24 @@ export interface LarkBotConfig {
 
   /** Native process rendering. Default `auto`. */
   process?: ProcessMode;
-  /** `process` per kind of chat (a chat's kind is learnt from its messages; unknown chats use `process`). */
+  /**
+   * `process` per kind of chat. A chat's kind is learnt from its messages; a chat not heard from yet
+   * (a send before any message from it, a restart) could be either, so it gets the strictest mode
+   * configured (`unknownChatProcess`): `off` when any of `process`, `processByChat.dm` and
+   * `processByChat.group` is `off` — `{ group: "off" }` never shows a process in a group whose kind
+   * is not learnt yet, whatever `process` says.
+   */
   processByChat?: { dm?: ProcessMode; group?: ProcessMode };
+  /**
+   * Who sees a process in a DM (fail closed): when set, a DM shows its process (by `processByChat.dm`
+   * / `process`) only when the person in it is listed — by any of the ids Lark gives them (union_id,
+   * open_id or user_id, as their messages carry). Everyone else's DM, a DM whose person is not
+   * known (not heard from since the start), and a chat whose kind is not known yet get `off` (a flat
+   * card that says only that it is working while the turn runs: no text so far, no plan). Groups
+   * are not affected. `[]`: no DM shows a process. Unset: as before (every DM by its mode).
+   * The process shows the agent's thinking, its tools' titles and inputs and their result previews.
+   */
+  processDmUsers?: string[];
   /** Default `console`. */
   look?: ReplyLook;
   /**
@@ -124,8 +142,10 @@ export interface LarkBotConfig {
 export const HISTORY_DEFAULTS = { thread: 50, chat: 20 } as const;
 const HISTORY_MAX = 200;
 
-export interface ResolvedConfig extends Required<Omit<LarkBotConfig, 'encryptKey' | 'verificationToken' | 'botOpenId' | 'ackEmoji' | 'historyOnMention'>> {
+export interface ResolvedConfig extends Required<Omit<LarkBotConfig, 'encryptKey' | 'verificationToken' | 'botOpenId' | 'ackEmoji' | 'historyOnMention' | 'processDmUsers'>> {
   ackEmoji: { working: string; done: string; failed: string };
+  /** Unset: every DM by its mode. */
+  processDmUsers?: ReadonlySet<string>;
   /** 0 = off. */
   historyOnMention: { thread: number; chat: number };
   encryptKey?: string;
@@ -134,6 +154,22 @@ export interface ResolvedConfig extends Required<Omit<LarkBotConfig, 'encryptKey
 }
 
 const PROCESS_MODES: readonly ProcessMode[] = ['auto', 'cot', 'panels', 'off'];
+
+/**
+ * The process modes, strictest first: `off` shows none; `panels` folds it into the reply card and
+ * `cot` shows only the bubble (nothing when it fails), no extra message for `panels`; `auto` may
+ * show either.
+ */
+export const PROCESS_STRICTEST_FIRST: readonly ProcessMode[] = ['off', 'panels', 'cot', 'auto'];
+
+/**
+ * The mode of a chat whose kind is not known yet: the strictest of `process` and the modes of
+ * `processByChat` (each kind's falling back to `process`) — `off` when any of them is.
+ */
+export function unknownChatProcess(c: Pick<ResolvedConfig, 'process' | 'processByChat'>): ProcessMode {
+  const modes = [c.process, c.processByChat.dm ?? c.process, c.processByChat.group ?? c.process];
+  return PROCESS_STRICTEST_FIRST.find((m) => modes.includes(m)) ?? c.process;
+}
 
 export function resolveConfig(c: LarkBotConfig): ResolvedConfig {
   if (!c.appId || !c.appSecret) throw new Error('lark-bot: appId and appSecret are required');
@@ -145,9 +181,13 @@ export function resolveConfig(c: LarkBotConfig): ResolvedConfig {
   if (c.look !== undefined && c.look !== 'console' && c.look !== 'chat') throw new Error('lark-bot: look must be console or chat');
   if (c.cotOn !== undefined && c.cotOn !== 'turn' && c.cotOn !== 'tool') throw new Error('lark-bot: cotOn must be turn or tool');
   if (c.reactions !== undefined && typeof c.reactions !== 'boolean') throw new Error('lark-bot: reactions must be true or false');
+  if (c.processDmUsers !== undefined && (!Array.isArray(c.processDmUsers) || c.processDmUsers.some((id) => typeof id !== 'string' || !id.trim())))
+    throw new Error('lark-bot: processDmUsers must be a list of Lark user ids (union_id, open_id or user_id)');
   const historyOnMention = resolveHistory(c.historyOnMention);
+  const { processDmUsers, ...rest } = c;
   return {
-    ...c,
+    ...rest,
+    ...(processDmUsers !== undefined ? { processDmUsers: new Set(processDmUsers.map((id) => id.trim())) } : {}),
     maxChars: c.maxChars ?? 4000,
     editMinIntervalMs: c.editMinIntervalMs ?? 1200,
     maxCardBytes: c.maxCardBytes ?? 28_000,

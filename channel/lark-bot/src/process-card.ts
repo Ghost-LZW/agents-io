@@ -28,6 +28,8 @@ const L = {
     status: { running: '处理中', requires_action: '等待确认', completed: '已完成', interrupted: '已中断', failed: '失败', ambiguous: '结果未知' },
     panel: { thinking: '思考过程', tools: '工具调用', plan: '计划' },
     working: '处理中…',
+    /** How a turn ended, said alone where only its final answer may show (process `off`) and it has none. */
+    ended: { completed: '已完成', interrupted: '被打断了', failed: '没答完', ambiguous: '不确定答完没有' },
     toolsCount: (n: number, shown: number) => (n > shown ? `共 ${n} 次，显示最近 ${shown} 次` : `共 ${n} 次`),
     thinkingCount: (n: number, shown: number) => (n > shown ? `共 ${n} 段，显示最近 ${shown} 段` : ''),
     elapsed: '用时',
@@ -45,6 +47,7 @@ const L = {
     status: { running: 'Working', requires_action: 'Waiting for approval', completed: 'Done', interrupted: 'Interrupted', failed: 'Failed', ambiguous: 'Outcome unknown' },
     panel: { thinking: 'Thinking', tools: 'Tool calls', plan: 'Plan' },
     working: 'Working…',
+    ended: { completed: 'Done', interrupted: 'Interrupted', failed: 'Did not finish', ambiguous: 'Outcome unknown' },
     toolsCount: (n: number, shown: number) => (n > shown ? `${n} calls, last ${shown} shown` : `${n} calls`),
     thinkingCount: (n: number, shown: number) => (n > shown ? `${n} blocks, last ${shown} shown` : ''),
     elapsed: 'took',
@@ -155,6 +158,18 @@ function toolsBody(steps: ProgressStep[], o: ModelOptions): string {
   return clipTail(body, o.panelMaxChars);
 }
 
+/** Steps shown in the answer's place until it starts: the last few tool calls, else thinking. */
+const STEPS_SHOWN = 5;
+function stepsSoFar(steps: ProgressStep[], o: ModelOptions): string {
+  const tools = steps.filter((s): s is Extract<ProgressStep, { kind: 'tool' }> => s.kind === 'tool' && !s.parentItemId);
+  if (!tools.length) return steps.some((s) => s.kind !== 'tool' && !!s.text.trim()) ? `_${labels(o.locale).cotThinking}_` : '';
+  const lines = tools.slice(-STEPS_SHOWN).map((t) => {
+    const title = code(clip(oneLine(t.title), 60));
+    return o.style === 'plain' ? `${title}${labels(o.locale).toolStatus[t.status] ? ` ${labels(o.locale).toolStatus[t.status]}` : ''}` : `${TOOL_MARK[t.status]} ${title}`;
+  });
+  return (tools.length > STEPS_SHOWN ? [`…`, ...lines] : lines).join('\n');
+}
+
 function planBody(p: ProgressView): string {
   if (!p.plan?.length) return '';
   return p.plan.map((s) => `${PLAN_MARK[s.status]} ${oneLine(s.text)}`).join('\n');
@@ -241,8 +256,9 @@ export function buildModel(msg: RenderedMessage, p: ProgressView, o: ModelOption
   let answer = pages[0] ?? '';
   const overflow = done ? pages.slice(1) : [];
   if (pages.length > 1) answer += `\n\n${done ? t.continued : t.continuing}`;
-  // No answer yet while running: an empty body (the bubble or the status shows the work), not a placeholder.
-  if (!answer) answer = done ? `_${t.status[status]}_` : '';
+  // No answer yet while running: the steps so far, one short line per tool call, so the card
+  // shows the work even when the bubble is folded (b0); empty before anything happened.
+  if (!answer) answer = done ? `_${t.status[status]}_` : stepsSoFar(p.steps, o);
 
   const toolCount = p.steps.filter((s) => s.kind === 'tool').length;
   const started = p.startedAt;

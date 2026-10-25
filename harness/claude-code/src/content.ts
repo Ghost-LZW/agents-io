@@ -180,3 +180,46 @@ export async function toUserMessage(
   if (opts.clientComposed) message.client_composed = true;
   return { message, notices };
 }
+
+/**
+ * One SDKUserMessage for several inputs of one turn (the context records handed with it and the
+ * addressed inputs), in their order, each behind its own preface, so every record keeps its source.
+ * Claude Code runs every queued user message as a model request of its own: a turn of six records
+ * made six requests one after another (b0, 2026-10-23: 2 min 26 s for a one-line answer, one of them
+ * waiting 125.8 s for its first byte). One message is one request.
+ *
+ * The uuid is derived from all the inputIds (`inputUuid`), so the CLI's `user_message_uuids` echo
+ * consumes them together. The `human` origin is stamped only when every input of the message, its
+ * context included, is a person's: the stamp covers the whole message, so a bot's or the host's
+ * record merged beside a person's words must not pass the CLI's isHuman() gates as theirs (fails
+ * closed, as each of them alone would). A harness command (`/compact`) is never merged (the session
+ * layer hands it alone); one input is `toUserMessage` unchanged.
+ */
+export async function toTurnMessage(
+  inputs: InputRecord[],
+  opts: UserMessageOpts,
+): Promise<{ message: SDKUserMessage; notices: string[] }> {
+  if (inputs.length === 1 || inputs.some((i) => i.channelContext.nativeCommand === true)) {
+    if (inputs.length !== 1) throw new Error('a harness command runs alone, never merged with other inputs');
+    return toUserMessage(inputs[0]!, opts);
+  }
+  if (!inputs.length) throw new Error('toTurnMessage needs at least one input');
+  const blocks: UserBlock[] = [];
+  const notices: string[] = [];
+  for (const input of inputs) {
+    const r = await toUserMessage(input, { ...opts, clientComposed: false });
+    blocks.push(...(r.message.message.content as UserBlock[]));
+    notices.push(...r.notices);
+  }
+  const message: SDKUserMessage = {
+    type: 'user',
+    message: { role: 'user', content: blocks },
+    parent_tool_use_id: null,
+    priority: opts.priority,
+    uuid: inputUuid(`batch:${inputs.map((i) => i.inputId).join('\u0000')}`) as SDKUserMessage['uuid'],
+    timestamp: new Date().toISOString(),
+  };
+  if (inputs.every((i) => i.origin.kind === 'human')) message.origin = { kind: 'human' };
+  if (opts.clientComposed) message.client_composed = true;
+  return { message, notices };
+}

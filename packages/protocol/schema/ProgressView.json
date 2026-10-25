@@ -238,6 +238,9 @@
     "answerFinal": {
       "type": "boolean"
     },
+    "finalAnswer": {
+      "type": "boolean"
+    },
     "startedAt": {
       "type": "number"
     },

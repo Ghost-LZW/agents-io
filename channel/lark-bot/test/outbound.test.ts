@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ReplyRoute } from '@agents-io/protocol';
-import { LarkApiError, LarkBotAdapter, MemoryDeclaredSenderStore, uuidFor, type DeclaredSenderStore } from '../src/index.js';
+import { LarkApiError, LarkBotAdapter, MemoryDeclaredSenderStore, receiveIdType, uuidFor, type DeclaredSenderStore } from '../src/index.js';
 import { FakeLark, messageEvent, startAdapter, tick } from './fake-lark.js';
 
 const cfg = { appId: 'cli_x', appSecret: 's', domain: 'lark' as const, editMinIntervalMs: 0 };
@@ -51,6 +51,24 @@ describe('send', () => {
     expect(lark.messages.map((m) => JSON.parse(m.content).text).join('\n\n')).toBe(text);
     expect(new Set(lark.messages.map((m) => m.uuid)).size).toBe(lark.messages.length);
     expect(r.providerMessageId).toBe(lark.messages.at(-1)!.id);
+  });
+});
+
+describe('a DM the bot opens (the host sends to a person, not a chat)', () => {
+  it('sends to an open_id or union_id as that id type, a chat id as chat_id #DL-1', async () => {
+    expect(receiveIdType('oc_chat')).toBe('chat_id');
+    expect(receiveIdType('ou_person')).toBe('open_id');
+    expect(receiveIdType('on_person')).toBe('union_id');
+    expect(receiveIdType('7000000000000000001')).toBe('chat_id');
+    const { lark, adapter } = make();
+    await adapter.send({ ...route, conversationId: 'on_friend' }, { text: 'hi' }, { operationId: 'open-1' });
+    await adapter.send({ ...route, conversationId: 'ou_friend' }, { text: 'hi' }, { operationId: 'open-2' });
+    await adapter.send(route, { text: 'hi' }, { operationId: 'chat-1' });
+    expect(lark.messages.map((m) => m.receive)).toEqual([
+      { kind: 'create', chatId: 'on_friend', idType: 'union_id' },
+      { kind: 'create', chatId: 'ou_friend', idType: 'open_id' },
+      { kind: 'create', chatId: 'oc_chat' },
+    ]);
   });
 });
 

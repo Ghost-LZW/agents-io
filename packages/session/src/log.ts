@@ -47,6 +47,8 @@ export interface SessionSnapshot {
     run?: RunSpec;
     owner?: string;
     deliveries: ReplyRoute[];
+    /** U20: the turn is checked (`turn.started` / `turn.adopted` / `turn.delivery_added` said so); absent: no scope was declared. */
+    checked?: boolean;
   } | null;
   /** Cumulative answer text of the current turn. */
   partialText: string;
@@ -110,6 +112,7 @@ export function foldSnapshot(s: SessionSnapshot, e: SessionEvent): void {
         ...(b.run ? { run: b.run } : {}),
         ...(b.owner !== undefined ? { owner: b.owner } : {}),
         deliveries: [],
+        ...(b.checked !== undefined ? { checked: b.checked } : {}),
       };
       drop(b.inputIds);
       s.state = 'running';
@@ -126,11 +129,18 @@ export function foldSnapshot(s: SessionSnapshot, e: SessionEvent): void {
         s.activeItems = [];
         s.plan = null;
       }
+      if (b.checked !== undefined && s.turn) s.turn.checked = s.turn.checked === true || b.checked;
       drop(b.inputIds); // the harness runs them: they are not waiting any more
       s.state = 'running';
       break;
     case 'turn.delivery_added':
-      if (s.turn?.turnId === b.turnId) s.turn.deliveries.push(b.route);
+      if (s.turn?.turnId === b.turnId) {
+        s.turn.deliveries.push(b.route);
+        if (b.checked === true) {
+          s.turn.checked = true;
+          s.partialText = '';
+        } else if (b.checked === false && s.turn.checked === undefined) s.turn.checked = false;
+      }
       break;
     case 'turn.completed':
       if (s.turn?.turnId === b.turnId || !s.turn) {
@@ -140,11 +150,12 @@ export function foldSnapshot(s: SessionSnapshot, e: SessionEvent): void {
         if (s.state !== 'error') s.state = 'idle';
       }
       break;
+    // U20: a checked turn's text is not shown to late joiners before it is checked (the host reads `text.snapshot`).
     case 'text.delta':
-      if (b.stream === 'answer') s.partialText += b.delta;
+      if (b.stream === 'answer' && !s.turn?.checked) s.partialText += b.delta;
       break;
     case 'text.snapshot':
-      if (e.audience === 'answer' || e.audience === 'commentary') s.partialText = b.text;
+      if ((e.audience === 'answer' || e.audience === 'commentary') && !s.turn?.checked) s.partialText = b.text;
       break;
     case 'item.started':
       s.activeItems = [...s.activeItems.filter((i) => i.itemId !== b.item.itemId), b.item];

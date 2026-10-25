@@ -186,6 +186,13 @@ describe('config', () => {
     expect(resolve({ channels: [{ type: 'lark-bot' }] }, {}, { channels: false }).channels).toEqual([]);
   });
 
+  it('a channel entry may open its first message at the first tool call (openOnProcess, c-progress-edit)', () => {
+    const env = { LARK_APP_ID: 'id', LARK_APP_SECRET: 'secret' };
+    const c = resolve({ channels: [{ type: 'lark-bot', account: 'helper', tier: 'card', openDelayMs: 3000, openOnProcess: false }] }, env);
+    expect(c.channels[0]).toMatchObject({ type: 'lark-bot', account: 'helper', tier: 'card', openDelayMs: 3000, openOnProcess: false });
+    expect(() => resolve({ channels: [{ type: 'lark-bot', openOnProcess: 'yes' }] }, env)).toThrow(/invalid config: \/channels\/0/);
+  });
+
   it('substitutes env:NAME in mail and bridge config', () => {
     const c = resolve(
       { channels: [{ type: 'mail', config: { imap: { auth: { user: 'me', pass: 'env:MAIL_PASS' } } } }, { type: 'bridge', command: 'python3', args: ['x.py'], env: { TOKEN: 'env:TOK' }, cwd: 'ch' }] },

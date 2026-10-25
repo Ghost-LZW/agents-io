@@ -64,6 +64,52 @@ describe('compositor openDelayMs', () => {
   });
 });
 
+describe('openOnProcess (b0: the card opens with the steps, not only when the answer starts)', () => {
+  function rig2(openDelayMs: number) {
+    const hub = new Hub(new MemorySessionLog());
+    const channel = new FakeChannel('fake', defaultChannelCaps);
+    const c = new Compositor({
+      hub, sessionKey: SESSION, adapter: channel, outbox: new Outbox({ hub, sleep: async () => {} }),
+      throttleMs: 1, previewDelayMs: 10, openDelayMs, holdAnswerUntilOpen: true, requireAnswerToOpen: true, openOnProcess: true,
+    });
+    c.start();
+    cleanups.push(() => c.stop());
+    const append = (body: Parameters<Hub['append']>[1]['body']) => hub.append(SESSION, { ts: Date.now(), ...ev, body });
+    append({ t: 'turn.started', turnId: 't1', inputIds: [], replyRoute: R });
+    return { channel, append };
+  }
+
+  it('the first tool call opens the card before the delay, showing the step; the answer then streams into it', async () => {
+    const { channel, append } = rig2(10_000);
+    await settle();
+    expect(channel.sent).toEqual([]);
+    append({ t: 'item.started', item: { itemId: 'i1', type: 'command', title: 'Bash: ls', status: 'running' } });
+    await until(() => channel.sent.length === 1);
+    expect(channel.sent[0]!.msg.progress?.steps.map((s) => s.kind)).toEqual(['tool']);
+    append({ t: 'text.delta', stream: 'answer', delta: 'Found it.' });
+    await until(() => channel.sent[0]!.edits.some((m) => m.text.includes('Found it.')));
+    expect(channel.sent).toHaveLength(1);
+  });
+
+  it('a short reply without tools still comes as one final message (answer text alone does not open the card early)', async () => {
+    const { channel, append } = rig2(10_000);
+    append({ t: 'text.delta', stream: 'answer', delta: 'Hi.' });
+    await settle();
+    expect(channel.sent).toEqual([]);
+    append({ t: 'turn.completed', turnId: 't1', status: 'completed' });
+    await until(() => channel.sent.length === 1);
+    expect(channel.sent[0]!.edits).toEqual([]);
+  });
+
+  it('after the delay: opens once there is thinking to show, never as an empty card', async () => {
+    const { channel, append } = rig2(30);
+    await new Promise((r) => setTimeout(r, 55));
+    expect(channel.sent).toEqual([]);
+    append({ t: 'text.delta', stream: 'reasoning', delta: 'Let me think.' });
+    await until(() => channel.sent.length === 1);
+  });
+});
+
 describe('delayed process preview', () => {
   it('waits past the deadline for actual answer text instead of sending an empty card', async () => {
     const hub = new Hub(new MemorySessionLog());

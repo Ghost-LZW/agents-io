@@ -8,13 +8,14 @@ import {
   type ExternalSender,
   type InputRecord,
   type Origin,
+  type RenderedMessage,
   type ReplyRoute,
   type RouteExplanation,
   type SessionEvent,
   type Tier,
   type TurnContext,
 } from '@agents-io/protocol';
-import { LaneUnavailableError, passes, project, type DeliveryRecord, type Hub, type Lane, type Outbox } from '@agents-io/session';
+import { LaneUnavailableError, passes, project, withholding, type DeliveryRecord, type Hub, type Lane, type Outbox } from '@agents-io/session';
 import { ExternalMcpServer, ToolError, type ExternalBackend, type ExternalCaller, type ExternalClient } from '@agents-io/host-mcp';
 import type { ExternalMcpConfig } from './config.js';
 import type { LogFn, Outcome } from './gateway.js';
@@ -66,8 +67,11 @@ export interface ExternalMcpDeps {
   hub: Hub;
   outbox: Outbox;
   host: Pick<HostService, 'externalHeldBy' | 'answers' | 'externalCallout'>;
-  /** The outbound check of an external send (gateway: a host answering `outbound` decides; else the client's scope is the local allowance). */
-  outbound(from: TurnContext, to: ReplyRoute): Promise<'allow' | 'deny'>;
+  /**
+   * The outbound check of an external send (gateway: a host answering `outbound` decides, an
+   * `outbound.content` one with `content` and maybe `hold`; else the client's scope is the local allowance).
+   */
+  outbound(from: TurnContext, to: ReplyRoute, content?: RenderedMessage): Promise<'allow' | 'deny' | { hold: true; reason?: string }>;
   sessions(): AdminSession[];
   explain(id: string, chain: boolean): Outcome;
   status(): unknown;
@@ -129,7 +133,9 @@ export class ExternalMcp implements ExternalBackend {
     if (head === 0 && !this.d.isSession(sessionKey)) return undefined;
     const all = log.read(sessionKey, a.fromSeq ?? 0).filter((e) => passes(e, a.tier));
     const picked = a.fromSeq === undefined ? all.slice(-a.limit) : all.slice(0, a.limit);
-    const events = picked.map((e) => view(project(e, a.tier)));
+    // U20: a checked turn's answer, cards and native payloads are not read here before they are past the exit check.
+    const w = withholding(log.read(sessionKey, 0));
+    const events = picked.map((e) => (w.none ? view(project(e, a.tier)) : w.apply(e, view(project(e, a.tier)))));
     // Paging forward: the next call passes the last seq seen (or the same from_seq when nothing new came).
     const next = picked.at(-1)?.seq ?? a.fromSeq;
     return { head, events, ...(next !== undefined ? { nextFromSeq: next } : {}) };
@@ -190,11 +196,17 @@ export class ExternalMcp implements ExternalBackend {
         replyRoute: null,
         deliveries: [],
       };
-      let verdict: 'allow' | 'deny';
+      let verdict: 'allow' | 'deny' | { hold: true; reason?: string };
       try {
-        verdict = await this.d.outbound(from, route);
+        verdict = await this.d.outbound(from, route, { text: a.text });
       } catch {
         verdict = 'deny';
+      }
+      if (typeof verdict === 'object') {
+        // U20: an outbound.content host took it: settled held, never sent, not recorded as sent.
+        this.d.outbox.hold({ operationId, sessionKey: externalLog(name), route, kind: 'tool' }, verdict.reason);
+        this.d.log('info', `external MCP: ${name} send to ${routeKey(route)} held by the host`);
+        throw new ToolError(`the host took this message; it was not sent${verdict.reason ? ` (${verdict.reason})` : ''}. Do not send it again (operationId ${operationId})`);
       }
       if (verdict !== 'allow') {
         this.d.log('warn', `external MCP: ${name} send to ${routeKey(route)} denied by the outbound policy`);
@@ -214,7 +226,8 @@ export class ExternalMcp implements ExternalBackend {
       this.d.sending(operationId, by);
       let d: DeliveryRecord;
       try {
-        d = await this.d.outbox.send(ch.adapter, { operationId, sessionKey: externalLog(name), route, msg: { text: a.text } });
+        // U20: `kind` lets an outbound.scoped host check it when the route is in its scope (nothing changes otherwise).
+        d = await this.d.outbox.send(ch.adapter, { operationId, sessionKey: externalLog(name), route, msg: { text: a.text }, kind: 'tool' });
       } finally {
         this.d.sending(operationId, undefined);
       }
@@ -292,6 +305,6 @@ function sent(r: DeliveryRecord, duplicate: boolean) {
 }
 
 /** An event as session_events shows it. */
-function view(e: SessionEvent): unknown {
+function view(e: SessionEvent): { body: unknown; native?: unknown; [k: string]: unknown } {
   return { seq: e.seq, ts: e.ts, ...(e.turnId !== undefined ? { turnId: e.turnId } : {}), level: e.level, audience: e.audience, body: e.body, ...(e.native !== undefined ? { native: e.native } : {}) };
 }

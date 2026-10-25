@@ -155,3 +155,37 @@ describe('session.compact', () => {
     expect(hello.features).toContain('session.compact');
   });
 });
+
+/*
+ * `session.prewarm` (c2 A3): a host opens a known session's harness ahead of input it expects (a
+ * reminder or a routine coming due), so that input's turn does not wait for the harness to boot.
+ */
+describe('session.prewarm', () => {
+  it('opens a known session\'s harness without a turn; open already: opened false; unknown keys and task runs refused #CT-4', async () => {
+    const s = scripted();
+    const raw = { harnesses: { claude: { use: 'claude-code' } }, defaultHarness: 'claude' };
+    const w = await daemon({ raw, script: s.script });
+    const key = await liveSession(w);
+    const h = await w.host({ name: 'lb' });
+    expect(await h.sessionPrewarm({ sessionKey: key })).toEqual({ sessionKey: key, opened: false });
+    expect(w.harness.sessions).toHaveLength(1);
+    await expect(h.sessionPrewarm({ sessionKey: 'nobody' })).rejects.toMatchObject({ code: 'not_found' });
+    await expect(h.sessionPrewarm({ sessionKey: 'run:x' })).rejects.toMatchObject({ code: 'invalid_frame' });
+    expect(HOST_RESULT_VALUES['session.prewarm']).toBeDefined();
+    await w.stop();
+
+    // After a restart nothing is open: the prewarm opens it, once, and no turn runs.
+    const w2 = await daemon({ dir: w.dir, raw, script: s.script });
+    const h2 = await w2.host({ name: 'lb' });
+    const before = w2.harness.sessions.length;
+    expect(await h2.sessionPrewarm({ sessionKey: key })).toEqual({ sessionKey: key, opened: true });
+    expect(w2.harness.sessions).toHaveLength(before + 1);
+    expect(await h2.sessionPrewarm({ sessionKey: key })).toEqual({ sessionKey: key, opened: false });
+    expect(w2.harness.sessions).toHaveLength(before + 1);
+    expect(s.seen).toHaveLength(1);
+    expect(completed(w2, key)).toBe(1);
+    const c = await w2.client();
+    expect((await c.hello({ token: w2.gw.token, name: 'probe' })).features).toContain('session.prewarm');
+    await w2.stop();
+  });
+});

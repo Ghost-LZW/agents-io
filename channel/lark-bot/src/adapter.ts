@@ -17,7 +17,7 @@ import type {
 } from '@agents-io/protocol';
 import { routeKey } from '@agents-io/protocol';
 import { CardKitCard, LarkApiError, errCode } from './cardkit.js';
-import { resolveConfig, type LarkBotConfig, type ProcessMode, type ResolvedConfig } from './config.js';
+import { resolveConfig, unknownChatProcess, type LarkBotConfig, type ProcessMode, type ResolvedConfig } from './config.js';
 import { CotBubble, closeOpenBubble, type OpenBubble } from './cot.js';
 import { InboundEnricher } from './enrich.js';
 import { HistoryFetcher } from './history.js';
@@ -30,6 +30,7 @@ import {
   buildModel,
   fitProcessCard,
   footerElement,
+  labels,
   panelElement,
   processCard,
   splitMarkdown,
@@ -117,6 +118,16 @@ const EMIT_RETRIES = 5;
 /** Lark codes for a missing scope / app permission: remembered for the whole app, not one chat. */
 const PERMISSION_CODES = new Set([99991672, 99991679, 99991663]);
 
+/**
+ * How Lark reads a route's conversation id when the bot starts a message: a chat (`oc_…`), or a
+ * person, for a DM the bot opens itself (the host sends to someone who has not written to the bot
+ * yet): `ou_…` is their open_id, `on_…` their union_id. Lark creates the p2p chat on that first
+ * message, and only for people in the app's visible range (others: an API error, not a message).
+ */
+export function receiveIdType(id: string): 'chat_id' | 'open_id' | 'union_id' {
+  return id.startsWith('ou_') ? 'open_id' : id.startsWith('on_') ? 'union_id' : 'chat_id';
+}
+
 function bounded<K, V>(m: Map<K, V>, k: K, v: V): void {
   m.delete(k);
   m.set(k, v);
@@ -185,6 +196,8 @@ export class LarkBotAdapter implements ChannelAdapter {
   private readonly inboundTails = new Map<string, Promise<void>>();
   /** chat id → its kind, learnt from inbound messages (`processByChat`, reactions). */
   private readonly chatKinds = new Map<string, 'dm' | 'group'>();
+  /** DM chat id → the ids of the person in it, learnt from their messages (`processDmUsers`). */
+  private readonly dmPeople = new Map<string, string[]>();
   private readonly reactionPlacer: ReactionPlacer;
   /** message id → the reaction on it being passed on, so reactions on one message reach the host in order. */
   private readonly reactionTails = new Map<string, Promise<void>>();
@@ -378,6 +391,11 @@ export class LarkBotAdapter implements ChannelAdapter {
       return;
     }
     bounded(this.chatKinds, env.conversation.id, env.conversation.kind === 'dm' ? 'dm' : 'group');
+    if (env.conversation.kind === 'dm' && !fromBot) {
+      const sid = ev.sender?.sender_id;
+      const people = [sid?.union_id, sid?.open_id, sid?.user_id].filter((id): id is string => !!id);
+      if (people.length) bounded(this.dmPeople, env.conversation.id, people);
+    }
     await this.deliver(ctx, key, () => this.enrichThenEmit(ctx, ev.message.chat_id, env));
   }
 
@@ -557,7 +575,7 @@ export class LarkBotAdapter implements ChannelAdapter {
       : await this.api('message.create', () =>
           msg.create({
             data: { receive_id: route.conversationId, msg_type: out.msg_type, content: out.content, uuid },
-            params: { receive_id_type: 'chat_id' },
+            params: { receive_id_type: receiveIdType(route.conversationId) },
           }),
         );
     const threadId = res.data?.thread_id || undefined;
@@ -636,8 +654,10 @@ export class LarkBotAdapter implements ChannelAdapter {
     }
     const prior = this.sends.get(op.operationId);
     if (prior) return prior;
-    const plain = this.plainReply(msg) && !isLarkCard(msg.channelData);
     const process = this.useProcess(route, msg);
+    // Process `off`: what the turn may show (only 「处理中…」 while it runs; its final answer or how it ended).
+    const shown = process ? msg : this.flat(route, msg);
+    const plain = this.plainReply(shown) && !isLarkCard(msg.channelData);
     const run = (async () => {
       // The turn can finish while its delayed card is queued. A plain final reply must settle
       // the earlier bubble because there will be no process card to finalize it.
@@ -647,7 +667,7 @@ export class LarkBotAdapter implements ChannelAdapter {
       }
       return process
         ? this.sendProcess(route, msg, op)
-        : this.doSend(route, plain ? { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) } : msg, op);
+        : this.doSend(route, plain ? { text: shown.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) } : shown, op);
     })();
     this.sends.set(op.operationId, run);
     if (this.sends.size > BOUND) {
@@ -727,7 +747,7 @@ export class LarkBotAdapter implements ChannelAdapter {
         if (last !== undefined && op.sequence <= last) return; // stale or duplicate edit
         bounded(this.lastSeq, providerMessageId, op.sequence);
         if (proc) await this.editProcess(route, providerMessageId, msg, false);
-        else await this.patch(providerMessageId, msg);
+        else await this.patch(providerMessageId, this.flat(route, msg));
       },
       gap,
     );
@@ -736,7 +756,7 @@ export class LarkBotAdapter implements ChannelAdapter {
   async finalize(route: ReplyRoute, providerMessageId: string, msg: RenderedMessage): Promise<void> {
     this.ownRoute('finalize', route);
     const proc = this.isProcessMessage(route, providerMessageId, msg);
-    await this.serial(providerMessageId, () => (proc ? this.editProcess(route, providerMessageId, msg, true) : this.patch(providerMessageId, msg)));
+    await this.serial(providerMessageId, () => (proc ? this.editProcess(route, providerMessageId, msg, true) : this.patch(providerMessageId, this.flat(route, msg))));
     this.forget(providerMessageId);
   }
 
@@ -876,9 +896,65 @@ export class LarkBotAdapter implements ChannelAdapter {
     return [process, processByChat.dm ?? process, processByChat.group ?? process].some((m) => m !== 'off');
   }
 
+  /**
+   * A chat's process mode: its kind's; a chat whose kind is not learnt yet gets the strictest
+   * configured (fail closed); with `processDmUsers`, `off` unless it is a group or the DM of someone listed.
+   */
   private processFor(route: ReplyRoute): ProcessMode {
+    if (this.processWithheld(route)) return 'off';
     const kind = this.chatKinds.get(route.conversationId);
-    return (kind && this.cfg.processByChat[kind]) ?? this.cfg.process;
+    return kind ? (this.cfg.processByChat[kind] ?? this.cfg.process) : unknownChatProcess(this.cfg);
+  }
+
+  /**
+   * `processDmUsers`: whether this chat shows no process because it may be a DM of someone not
+   * listed — a DM whose person is not listed or not known, or a chat whose kind is not known yet.
+   */
+  private processWithheld(route: ReplyRoute): boolean {
+    const listed = this.cfg.processDmUsers;
+    if (!listed) return false;
+    const kind = this.chatKinds.get(route.conversationId);
+    if (kind === 'group') return false;
+    const people = kind === 'dm' ? this.dmPeople.get(route.conversationId) : undefined;
+    return !people?.some((id) => listed.has(id));
+  }
+
+  /**
+   * A flat card in a chat that shows no process (`processFor` is `off`: a group with `group: off`,
+   * the DM of someone not listed in `processDmUsers`, a chat not learnt yet).
+   *
+   * While its turn runs (`progress` `running` / `requires_action`) the card says only 「处理中…」:
+   * not the text so far (`text` is everything the model said, also what it says before a tool
+   * call, e.g. 「我先翻一下小红和小明的私聊。」, until the final answer replaces it), not the status
+   * line the compositor wrote (`▶ <tool title>`, the headline: a harness's narration, a tool
+   * summary), no plan (`details`). The answer comes when the turn ends. An ask (approval:
+   * `requires_action`, its status line and buttons) shows under it; a question is its own message.
+   * It stays a card (a `body`), so the buttons and the end can come on it.
+   *
+   * When the turn ended: its final answer (`progress.finalAnswer`), how it ended and the buttons;
+   * no plan. Without a final answer — it failed or was interrupted (also with a final snapshot: an
+   * idle-deadline stop's is what it said so far and a notice, HC-3b), its outcome is unknown, or it
+   * completed saying nothing a harness took as its answer — `text` is what was said along the way:
+   * the card says only how it ended (「没答完」, 「被打断了」…), as its body and summary.
+   *
+   * A card without `progress` cannot tell an ask from a running line: its status line says
+   * 「处理中…」 too.
+   */
+  private flat(route: ReplyRoute, msg: RenderedMessage): RenderedMessage {
+    if (this.processFor(route) !== 'off') return msg;
+    const status = msg.progress?.status;
+    const working = labels(this.cfg.locale).working;
+    if (status === 'running' || status === 'requires_action') {
+      const asks = status === 'requires_action' ? (msg.sections ?? []).filter((s) => s.kind === 'status') : [];
+      return { ...msg, text: working, sections: [{ kind: 'body', text: working }, ...asks] };
+    }
+    if (status !== undefined && !msg.progress!.finalAnswer) {
+      const ended = labels(this.cfg.locale).ended[status];
+      return { ...msg, text: ended, sections: [{ kind: 'body', text: ended }] };
+    }
+    if (!msg.sections?.length) return msg;
+    const sections = msg.sections.flatMap((s) => (s.kind === 'details' ? [] : s.kind === 'status' && status === undefined ? [{ ...s, text: working }] : [s]));
+    return { ...msg, sections };
   }
 
   private useProcess(route: ReplyRoute, msg: RenderedMessage): boolean {

@@ -5,8 +5,15 @@ import { createRequire } from 'node:module';
 import { delimiter, dirname, join } from 'node:path';
 import type { HarnessAdapter, HarnessCaps, HarnessOpenArgs, HarnessSession } from '@agents-io/protocol';
 import { AsyncQueue } from './queue.js';
-import { ClaudeCodeSession, defaultProfile, isEffort } from './session.js';
+import { ClaudeCodeSession, defaultProfile, isEffort, permissionModeFor } from './session.js';
 import type { ClaudeCodeOptions, ClaudeProfile, Options, QueryFn, SDKUserMessage } from './types.js';
+import {
+  DEFAULT_FIRST_BYTE_TIMEOUT_MS,
+  DEFAULT_IDLE_TIMEOUT_MS,
+  DEFAULT_STALL_NOTICE,
+  type FallbackSources,
+  fallbackChain,
+} from './watchdog.js';
 
 /** SDK 0.x: the minor is the breaking component. */
 export const SUPPORTED_SDK = /^0\.3\./;
@@ -155,18 +162,37 @@ export class ClaudeCodeHarness implements HarnessAdapter {
     const given = (args.options ?? {}) as ClaudeCodeOptions;
     const options: ClaudeCodeOptions = { ...given, profiles: { ...c.profiles, ...given.profiles } };
     const profile = options.profiles?.[args.run.profile] ?? defaultProfile(args.run.profile);
-    const permissionMode = profile.permissionMode ?? 'default'; // never omit: the CLI default may be 'auto'
+    // Never omit: the CLI default may be 'auto'. With `bypassModels` it is the run model's (HC-5).
+    const permissionMode = permissionModeFor(profile, args.run.model);
+    // HC-5: a profile whose mode follows the model may enter bypass later (setPermissionMode needs the
+    // launch flag) and may leave it (prompts then need canUseTool).
+    const byModel = (profile.bypassModels?.length ?? 0) > 0;
     const sessionId = args.resume ?? randomUUID();
     const prompt = new AsyncQueue<SDKUserMessage>();
     const stderr: string[] = [];
+    // Filled in below from the options the CLI is given; read when the watchdog fires.
+    let fallbackSources: FallbackSources | undefined;
+    const firstByteMs = options.firstByteTimeoutMs ?? DEFAULT_FIRST_BYTE_TIMEOUT_MS;
+    const idleMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+    const fallbackModels = () =>
+      options.firstByteFallbackModel
+        ? [options.firstByteFallbackModel]
+        : fallbackSources
+          ? fallbackChain(fallbackSources)
+          : [];
 
     const session: ClaudeCodeSession = new ClaudeCodeSession({
       args,
       options,
       profile,
+      permissionMode,
       sessionId,
       prompt,
       stderrTail: () => stderr.slice(-20).join('').trim(),
+      ...(firstByteMs > 0 ? { watchdog: { timeoutMs: firstByteMs, fallbackModels } } : {}),
+      ...(idleMs > 0
+        ? { stall: { timeoutMs: idleMs, notice: options.idleStallNotice ?? DEFAULT_STALL_NOTICE, fallbackModels } }
+        : {}),
     });
 
     const env = this.childEnv({ ...options.env, ...args.env });
@@ -182,8 +208,9 @@ export class ClaudeCodeHarness implements HarnessAdapter {
         type: transport,
         url: args.mcp.url,
         headers: { Authorization: `Bearer \${${MCP_TOKEN_ENV}}` },
-        // Host output tools are always in the prompt, never deferred behind tool search.
-        ...(transport === 'http' ? { alwaysLoad: true } : {}),
+        // Host output tools are in every prompt, not deferred behind tool search, unless the
+        // deployment trades that for a shorter fixed prefix (`mcpAlwaysLoad: false`).
+        ...(transport === 'http' && options.mcpAlwaysLoad !== false ? { alwaysLoad: true } : {}),
       } as NonNullable<Options['mcpServers']>[string];
     }
     // Host tools check their own destinations (Policy.outbound): never ask a person to approve them.
@@ -204,13 +231,14 @@ export class ClaudeCodeHarness implements HarnessAdapter {
       model: args.run.model,
       ...(isEffort(args.run.effort) ? { effort: args.run.effort } : {}),
       permissionMode,
-      ...(permissionMode === 'bypassPermissions' ? { allowDangerouslySkipPermissions: true } : {}),
+      ...(permissionMode === 'bypassPermissions' || byModel ? { allowDangerouslySkipPermissions: true } : {}),
       ...(allowedTools ? { allowedTools } : {}),
       ...(profile.disallowedTools ? { disallowedTools: profile.disallowedTools } : {}),
       ...(additionalDirectories.length ? { additionalDirectories } : {}),
       permissionPrompts: profile.permissionPrompts ?? 'host',
-      // bypassPermissions never consults canUseTool (the SDK warns when both are set).
-      ...(permissionMode === 'bypassPermissions' ? {} : { canUseTool: session.canUseTool }),
+      // bypassPermissions never consults canUseTool (the SDK warns when both are set); a profile
+      // whose mode follows the model needs it for the turns it does not bypass in.
+      ...(permissionMode === 'bypassPermissions' && !byModel ? {} : { canUseTool: session.canUseTool }),
       includePartialMessages: true,
       forwardSubagentText: options.forwardSubagentText ?? false,
       agentProgressSummaries: options.agentProgressSummaries ?? false,
@@ -223,6 +251,16 @@ export class ClaudeCodeHarness implements HarnessAdapter {
         if (stderr.length > 200) stderr.splice(0, stderr.length - 200);
         options.sdk?.stderr?.(d);
       },
+    };
+
+    fallbackSources = {
+      sdkFallbackModel: sdkOptions.fallbackModel,
+      extraArgFallbackModel: sdkOptions.extraArgs?.['fallback-model'],
+      settings: sdkOptions.settings,
+      settingSources: sdkOptions.settingSources,
+      cwd: args.cwd,
+      configDir: env.CLAUDE_CONFIG_DIR,
+      home: env.HOME,
     };
 
     const query = this.config.query ?? (await loadQuery());

@@ -38,6 +38,13 @@ export const ItemSummary = Type.Object({
   result: Type.Optional(
     Type.Object({ preview: Type.String(), truncated: Type.Union([Type.Boolean(), Type.Null()]), isError: Type.Boolean() }),
   ),
+  /**
+   * An MCP tool call (`type: "mcp_tool"`, docs/HOSTS.md §4.4, INVARIANTS HC-7): the server and the tool
+   * as the harness names them; `title` starts with `<server>.<name>`. Every harness adapter sets it;
+   * the session log keeps it only while an `outbound.scoped` or `outbound.content` host is declared
+   * (feature `item.tool`), so the events of other hosts read as before.
+   */
+  tool: Type.Optional(Type.Object({ server: Type.String(), name: Type.String() })),
 });
 export type ItemSummary = Static<typeof ItemSummary>;
 
@@ -98,6 +105,12 @@ export const Body = Type.Union([
     nativeTurnId: Type.Optional(Type.String()),
     run: Type.Optional(RunSpec),
     owner: Type.Optional(Type.String()),
+    /**
+     * Only while an `outbound.scoped` host's scope is declared (feature `reply.check`): `true` when the
+     * reply route is in scope as the turn starts. The answer is then sent once, after the turn, past the
+     * host's check; no streaming, no process. `false`: not checked.
+     */
+    checked: Type.Optional(Type.Boolean()),
   }),
   /**
    * A freshly opened harness session took over a turn that was already running
@@ -109,12 +122,16 @@ export const Body = Type.Union([
     nativeTurnId: Type.Optional(Type.String()),
     inputIds: Type.Array(Type.String()),
     run: Type.Optional(RunSpec),
+    /** As `turn.started.checked`. */
+    checked: Type.Optional(Type.Boolean()),
   }),
   T('turn.delivery_added', {
     turnId: Type.String(),
     route: ReplyRoute,
     /** approval: a human request of a delegated turn is shown where its resolver's people are (the live's control route). */
     reason: Type.Union([Type.Literal('steer'), Type.Literal('handoff'), Type.Literal('mirror'), Type.Literal('approval')]),
+    /** As `turn.started.checked`, for this route (scope as it is added); `true` makes the turn checked from here on. */
+    checked: Type.Optional(Type.Boolean()),
   }),
   T('turn.completed', {
     turnId: Type.String(),
@@ -144,6 +161,26 @@ export const Body = Type.Union([
   }),
   /** The harness's own session/thread id became known (persist it for resume). */
   T('session.bound', { nativeId: Type.String() }),
+  /**
+   * The harness is up and took the turn's input (Claude Code: its `system/init`, at the start of each
+   * CLI run; a session opened for the turn has booted by then). With the turn's id when one runs.
+   * Hosts time a turn's start by it; the native event stays for operators (HC-6).
+   */
+  T('session.ready', { nativeId: Type.Optional(Type.String()), model: Type.Optional(Type.String()) }),
+  /**
+   * The turn's model was switched within the turn: by the harness itself (Claude Code's
+   * `model_fallback`, a refusal fallback) or by agents-io's own deadlines (`first_byte_timeout`,
+   * `idle_timeout`). `trigger` is the harness's reason (HC-6).
+   */
+  T('model.fallback', {
+    from: Type.String(),
+    to: Type.String(),
+    trigger: Type.String(),
+    scope: Type.Optional(Type.String()),
+    timeoutMs: Type.Optional(Type.Number()),
+  }),
+  /** The permission mode the turn runs in (HC-5): at its start, and each tightening within it (HC-6). */
+  T('permission.mode', { mode: Type.String(), previous: Type.String(), model: Type.String(), trigger: Type.String() }),
   /**
    * Folded state for late joiners; sent before live events when the requested
    * fromSeq is no longer retained. `seq` on this event is the last folded seq.
@@ -204,8 +241,20 @@ export const Body = Type.Union([
   T('delivery.settled', {
     operationId: Type.String(),
     route: ReplyRoute,
-    result: Type.Union([Type.Literal('delivered'), Type.Literal('rejected'), Type.Literal('unknown')]),
+    /** `held`: an `outbound.content` / `outbound.scoped` host took it (or could not answer for a scoped route); never sent. */
+    result: Type.Union([Type.Literal('delivered'), Type.Literal('rejected'), Type.Literal('unknown'), Type.Literal('held')]),
     providerMessageId: Type.Optional(Type.String()),
+    /** While an `outbound.content` / `outbound.scoped` host is declared: what was sent (`OutboundKind`), its turn, the card's request. */
+    kind: Type.Optional(Type.String()),
+    turnId: Type.Optional(Type.String()),
+    requestId: Type.Optional(Type.String()),
+    /** `held` (and a denied check): why, as given to the agent. */
+    reason: Type.Optional(Type.String()),
+    /**
+     * `rejected` because the exit check answered `deny` (U20; only with `kind`): never sent. Like `held`,
+     * a checked turn's text it carried stays withheld from external readers, and the agent is told.
+     */
+    denied: Type.Optional(Type.Boolean()),
   }),
   T('render.anchor', {
     route: ReplyRoute,
@@ -226,6 +275,11 @@ export const Body = Type.Union([
     to: Type.String(),
     title: Type.Optional(Type.String()),
     reason: TopicChangeReason,
+    /**
+     * U20: the agent's `session_rotate` was asked of the `outbound.scoped` host (its title, with the
+     * summary of the topic left): `allowed` kept both, `held` kept neither. Absent when nothing was asked.
+     */
+    check: Type.Optional(Type.Union([Type.Literal('allowed'), Type.Literal('held')])),
   }),
   /** A realtime voice session opened on this session (decision 11). Recorded by the session layer. */
   T('live.started', {

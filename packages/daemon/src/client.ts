@@ -9,6 +9,9 @@ import {
   type InboundItem,
   type InboundRedispatchResult,
   type SessionCompactResult,
+  type SessionPrewarmResult,
+  type TestFaultResult,
+  type TestReplayResult,
   type SessionLaunch,
   type SessionScope,
   type RenderedMessage,
@@ -279,6 +282,21 @@ export class LocalClient {
   /** Compact a quiet live session's harness context as a turn of its own (`session.compact`, CT-3). */
   sessionCompact(o: { sessionKey: string; inputId?: string }): Promise<SessionCompactResult> {
     return this.call('session.compact', o);
+  }
+
+  /** Open a known session's harness without a turn, ahead of input (`session.prewarm`). */
+  sessionPrewarm(o: { sessionKey: string }): Promise<SessionPrewarmResult> {
+    return this.call('session.prewarm', o);
+  }
+
+  /** Test hook (feature `test.hooks`): hand a channel message accepted earlier to the gateway again, `times` times. */
+  testReplay(o: { inputId: string; times?: number }): Promise<TestReplayResult> {
+    return this.call('test.replay', o);
+  }
+
+  /** Test hook (feature `test.hooks`): drop the responses of a channel's next sends; clear; list. */
+  testFault(o: { action: 'drop-response' | 'clear' | 'list'; channel?: string; account?: string; conversation?: string; next?: number }): Promise<TestFaultResult> {
+    return this.call('test.fault', o);
   }
 
   /**
