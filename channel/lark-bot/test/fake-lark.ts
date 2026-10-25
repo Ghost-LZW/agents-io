@@ -7,7 +7,7 @@ export interface PlatformMessage {
   uuid?: string;
   msg_type: string;
   content: string;
-  receive: { kind: 'create'; chatId: string } | { kind: 'reply'; to: string; inThread: boolean };
+  receive: { kind: 'create'; chatId: string; idType?: string } | { kind: 'reply'; to: string; inThread: boolean };
   patches: string[];
   updates: { msg_type: string; content: string }[];
   deleted?: boolean;
@@ -200,7 +200,8 @@ export class FakeLark {
     im: {
       v1: {
         message: {
-          create: async ({ data }) => this.record({ kind: 'create', chatId: data.receive_id }, data),
+          create: async ({ data, params }) =>
+            this.record({ kind: 'create', chatId: data.receive_id, ...(params?.receive_id_type && params.receive_id_type !== 'chat_id' ? { idType: params.receive_id_type } : {}) }, data),
           reply: async ({ data, path }) =>
             this.record({ kind: 'reply', to: path.message_id, inThread: !!data.reply_in_thread }, data),
           patch: async ({ data, path }) => {

@@ -63,6 +63,8 @@ export async function daemon(
     channelAdapter?: GatewayOptions['channelAdapter'];
     /** GatewayOptions.channelStartGraceMs. */
     channelStartGraceMs?: number;
+    /** GatewayOptions.testHooks, outboxAttemptTimeoutMs and logger. */
+    gateway?: Pick<GatewayOptions, 'testHooks' | 'outboxAttemptTimeoutMs' | 'logger'>;
   } = {},
 ): Promise<World> {
   const dir = o.dir ?? tmp();
@@ -94,6 +96,7 @@ export async function daemon(
     ...(o.console ? { console: true, consoleEnv: o.consoleEnv ?? {} } : {}),
     ...(o.channelAdapter ? { channelAdapter: o.channelAdapter } : {}),
     ...(o.channelStartGraceMs !== undefined ? { channelStartGraceMs: o.channelStartGraceMs } : {}),
+    ...o.gateway,
   });
   let stopped = false;
   const stop = async () => {

@@ -30,7 +30,7 @@ export interface OutboundRecord {
   /** The agent of the session (when it has one). */
   agent?: string;
   route: ReplyRoute;
-  result: 'delivered' | 'rejected' | 'unknown';
+  result: 'delivered' | 'rejected' | 'unknown' | 'held';
   /** A delivery no turn made that answers inputs (a system reply): which. */
   inputIds?: string[];
   /** The turn's provenance when it settled: its chain and flags, carried into a recovered input's cause. */

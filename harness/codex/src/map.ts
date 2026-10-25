@@ -201,6 +201,7 @@ export function summarizeItem(item: ThreadItem, cwd?: string): MappedItem | unde
     case 'mcpToolCall': {
       const s = base('mcp_tool', `${item.server}.${item.tool}`, itemStatus(item.status));
       s.inputSummary = clip(JSON.stringify(item.arguments ?? null));
+      s.tool = { server: item.server, name: item.tool };
       if (item.error) s.result = preview(item.error.message, true);
       else if (item.result) s.result = preview(contentText(item.result.content), false);
       return { summary: s, audience: 'status', level: 'primary' };

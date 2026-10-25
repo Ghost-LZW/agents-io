@@ -36,7 +36,9 @@ import {
   type Origin,
   type Policy,
   type NativeClient,
+  type RenderedMessage,
   type ReplyRoute,
+  type SessionEvent,
   type ExternalSender,
   type Resolver,
   type RunSpec,
@@ -45,8 +47,13 @@ import {
   type SessionPrepareResult,
   type SessionCompact,
   type SessionCompactResult,
+  type SessionPrewarm,
+  type SessionPrewarmResult,
   type InboundRedispatch,
   type InboundRedispatchResult,
+  type TestFault,
+  type TestReplay,
+  type TestReplayResult,
   type Tier,
   type TopicSwitchFrame,
   type TurnContext,
@@ -78,7 +85,9 @@ import {
   parseQuestionActionId,
   questionTextAnswer,
   type AddWatchResult,
+  type Delivery,
   type DeliveryRecord,
+  type ExitVerdict,
   type EmitSource,
   type LaneOptions,
   type ModelReviewer,
@@ -87,12 +96,14 @@ import {
   type IngressResult,
   type RemoveWatchResult,
   addressesSelf,
+  channelRefOf,
   type SessionLog,
   type TopicChange,
   type TopicRecord,
   topicContext,
   topicView,
   settleLeftoverInputs,
+  withholding,
 } from '@agents-io/session';
 import { HostMcpServer, HostTools, ToolError, agentIdentity, type TopicHandover } from '@agents-io/host-mcp';
 import { ClaudeCodeHarness, findOnPath, type ClaudeCodeHarnessConfig } from '@agents-io/harness-claude-code';
@@ -117,6 +128,7 @@ import { RUN_RULE, Runs, type RunOverrides } from './runs.js';
 import { Strangers } from './strangers.js';
 import { runCommand, type CommandHost } from './commands.js';
 import { ClaudeTuiService } from './tui-claude.js';
+import { MAX_REPLAY_TIMES, TEST_HOOKS_ENV, TestHooks } from './test-hooks.js';
 import { consoleUrlPath, loadOrCreateTokenFile, removeTokenFile, TokenError, tokenPath, writeTokenFile } from './token.js';
 
 export type LogFn = (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
@@ -173,6 +185,13 @@ export interface GatewayOptions {
    * connect at once and are not waited for.
    */
   channelStartGraceMs?: number;
+  /**
+   * Test hooks (`test.replay`, `test.fault`; HOSTS §4.3, SE-6): `aio serve` turns them on only
+   * with AIO_TEST_HOOKS=1 in its environment. Default off: the frames answer `test_hooks_off`.
+   */
+  testHooks?: boolean;
+  /** One outbox attempt's upper bound (default 60 s; tests). */
+  outboxAttemptTimeoutMs?: number;
 }
 
 /** Outcome of a local command, mapped 1:1 onto a `result` frame. */
@@ -252,8 +271,25 @@ const hasTopicTools = (a: AgentConfig | undefined): boolean => !!a?.tools && (!a
 
 /** `Gateway.accept`'s refusal while stopping: "not now", never `permanent` (IN-7). */
 const GATEWAY_STOPPING = 'gateway stopping';
+/** U20: why a scoped send was held when the host could not answer. */
+const HOST_UNAVAILABLE = 'host_unavailable';
+/** U20: the largest text-like attachment whose text the exit check gets. */
+const MAX_ATTACHMENT_TEXT = 64 * 1024;
+/** U20: attachments whose text the exit check gets (`text/*`, JSON, Markdown, CSV). */
+const isTextLike = (mime: string, name?: string) =>
+  /^text\//i.test(mime) || /^application\/(json|[\w.+-]*\+json|x-ndjson|csv|markdown)\b/i.test(mime) || /\.(md|markdown|csv|json|txt)$/i.test(name ?? '');
+
+/** U20: what the agent is told of a held send: `what` and why (the host away: a fixed line), never the content. */
+export const heldText = (reason: string | undefined, what: string): string =>
+  `${what}。${reason === HOST_UNAVAILABLE ? '宿主不在，没有发出。' : reason !== undefined ? `原因：${reason}` : ''}`;
 
 export const localRoute = (sessionKey: string): ReplyRoute => ({ channel: 'local', account: 'local', conversationId: sessionKey });
+
+/** A topic's conversation (`routeKey` of channel, account and conversation id) as a route. */
+const conversationRoute = (conversation: string): ReplyRoute | undefined => {
+  const [channel, account, ...id] = conversation.split(':');
+  return channel && account && id.length ? { channel, account, conversationId: id.join(':') } : undefined;
+};
 
 /** Wait for `p`, at most `ms`; the timer holds the event loop and is cleared when `p` wins. */
 async function within(p: Promise<unknown> | undefined, ms: number): Promise<void> {
@@ -304,6 +340,8 @@ export class Gateway {
   readonly records: DaemonRecords;
   /** The host protocol on the local socket. */
   readonly host: HostService;
+  /** Test hooks (`GatewayOptions.testHooks`), when on. */
+  readonly testHooks: TestHooks | undefined;
   /** Task runs (`run.start`). */
   readonly runs: Runs;
   /** Topics of flat conversations (decision 6), in the log's database. */
@@ -454,6 +492,9 @@ export class Gateway {
       // connects) only the turn's own routes stay open: the local policy's wider allowances
       // (preregistered routes) are what the host may have tightened, so they fail closed.
       outbound: async (a) => {
+        // U20: with an `outbound.scoped` host's scope declared, this check is the local policy only; what the
+        // host decides for its routes is asked with the content, as the send goes out (`exitCheck`).
+        if (this.host.outboundScope() !== undefined) return local.outbound(a);
         const held = this.host.outboundHeldBy();
         if (held !== undefined) {
           const k = routeKey(a.to);
@@ -477,10 +518,26 @@ export class Gateway {
       store: this.records,
       // Which turn sent which platform message (the outbound index), and explain of a side effect by operationId.
       atSend: (d) => this.provenanceAtSend(d),
-      onSettled: (d, rec, atSend) => this.indexOutbound(d, rec, atSend as OutboundRecord['provenance']),
+      onSettled: (d, rec, atSend) => {
+        // U20: taken by the exit check, held or denied (never sent): the same for the agent.
+        const taken = rec.status === 'held' || rec.denied === true;
+        // U20: a held answer is told to the agent before its next turn.
+        if (taken && d.kind === 'reply') this.heldNotice(d.sessionKey, rec.operationId, rec.reason);
+        // U20: a held card settles its request as cancelled: the turn does not wait for an answer nobody can give.
+        if (taken && (d.kind === 'question' || d.kind === 'request') && d.requestId !== undefined) {
+          this.lanes.get(d.sessionKey)?.cancelRequest(d.requestId, heldText(rec.reason, '宿主拿走了这张卡，没有发出'));
+        }
+        this.indexOutbound(d, rec, atSend as OutboundRecord['provenance']);
+      },
       // Agent-authored sends carry their hop out-of-band where the channel can (mail X-Agents-IO-Hop).
       causeOf: (d) => this.sendCause(d.sessionKey, d.turnId),
+      ...(o.outboxAttemptTimeoutMs !== undefined ? { attemptTimeoutMs: o.outboxAttemptTimeoutMs } : {}),
+      // U20: what an `outbound.scoped` host checks, and settlements that say what they were.
+      exit: (d) => this.exitCheck(d),
+      detailed: () => this.settlementsDetailed(),
     });
+    this.testHooks = o.testHooks ? new TestHooks({ log: (level, msg) => this.log(level, msg) }) : undefined;
+    if (this.testHooks) this.log('warn', `test hooks are on (${TEST_HOOKS_ENV}=1): test.replay and test.fault answer the host token; never in production`);
     this.runs = new Runs({
       hub: this.hub,
       agents: () => c.agents,
@@ -502,11 +559,16 @@ export class Gateway {
       prepareSession: (f) => this.prepareSession(f),
       redispatch: (name, f) => this.redispatch(name, f),
       compactSession: (f, origin) => this.compactSession(f, origin),
+      prewarmSession: (f) => this.prewarmSession(f),
       calloutTimeouts: { resolve: c.hostCallouts.resolveTimeoutMs, review: c.hostCallouts.reviewTimeoutMs, outbound: c.hostCallouts.outboundTimeoutMs, external: c.hostCallouts.externalTimeoutMs },
       externalMcp: () => this.externalMcp !== undefined,
       explain: (id, chain) => this.explain(id, chain),
+      testHooks: () => this.testHooks !== undefined,
+      testReplay: (name, f) => this.testReplay(name, f),
+      testFault: (name, f) => this.testFault(name, f),
       answerOnBehalf: c.policy.answerOnBehalf,
       log: (level, msg, data) => this.log(level, msg, data),
+      onScope: () => this.leaveScopedLives(),
       ...(o.hostPush?.timeoutMs !== undefined ? { pushTimeoutMs: o.hostPush.timeoutMs } : {}),
       ...(o.hostPush?.retryMs !== undefined ? { pushRetryMs: o.hostPush.retryMs } : {}),
     });
@@ -532,13 +594,17 @@ export class Gateway {
       this.tools = new HostTools({
         hub: this.hub,
         outbox: this.outbox,
-        policy: this.policy,
+        // U20: an `outbound` + `outbound.content` host is asked once, with the content, as the message
+        // goes out (`exit`); here only while it is away (DL-5). Everything else as `policy`.
+        policy: { ...this.policy, outbound: (a) => (this.host.outboundScope() === undefined && this.host.answersContent() ? Promise.resolve('allow' as const) : this.policy.outbound(a)) },
         // Only lanes that exist: a tool call always comes from a running harness session.
         turn: (key) => this.lanes.get(key)?.currentTurn(),
         adapter: (r) => this.channelFor(r)?.adapter,
         as: (key) => agentIdentity(key),
         agentOf: (key) => this.agentOfSession(key),
         blobs: this.blobs,
+        // U20: an output tool's message to a route an outbound.scoped host checks is asked with its content first.
+        exit: (d) => this.exitCheck(d),
         cwd: (key) => this.laneInfo.get(key)?.cwd ?? this.instanceOf(this.lanes.get(key)?.harnessId)?.cwd ?? c.cwd,
         tier: (r) => this.channelFor(r)?.tier,
         routes: () => c.policy.routes,
@@ -564,8 +630,14 @@ export class Gateway {
             if (this.records.outboundByOperation(a.operationId)) return;
             let result: 'delivered' | 'unknown' = 'unknown';
             const route = lane.liveInfo()!.route;
+            // U20: what a live says cannot be checked before it is heard: never where an outbound.scoped host checks.
+            if (this.host.outboundScope() !== undefined && this.host.inScope(route)) {
+              void this.leaveLive(key, 'the route is checked by the host (outbound.scoped)');
+              throw new ToolError(`live_say: ${routeKey(route)} is checked by the host before anything is said there; a live cannot be, so it was left`);
+            }
             try {
-              result = (await lane.liveSay(text, a)).result;
+              // U20: while settlements say what they were, what a live said says so too (never asked).
+              result = (await lane.liveSay(text, { ...a, ...(this.settlementsDetailed() ? { kind: 'live' as const } : {}) })).result;
             } finally {
               this.indexOutbound({ sessionKey: key, turnId: a.turnId }, { operationId: a.operationId, sessionKey: key, route, status: result, attempts: 1 });
             }
@@ -624,7 +696,8 @@ export class Gateway {
         send: async (route, msg, operationId) => {
           const ch = this.channelFor(route);
           if (!ch) return undefined;
-          const rec = await this.outbox.send(ch.adapter, { operationId, sessionKey: c.policy.ownerSessionKey ?? 'strangers', route, msg });
+          // A notice of the daemon's own (no agent wrote it): says what it is, not an exit check (U20).
+          const rec = await this.outbox.send(ch.adapter, { operationId, sessionKey: c.policy.ownerSessionKey ?? 'strangers', route, msg, kind: 'notice', exitChecked: true });
           return rec.status === 'delivered' ? rec.providerMessageId : undefined;
         },
         edit: async (route, id, msg) => {
@@ -754,7 +827,7 @@ export class Gateway {
       hub: this.hub,
       outbox: this.outbox,
       host: this.host,
-      outbound: (from, to) => this.externalOutbound(from, to),
+      outbound: (from, to, content) => this.externalOutbound(from, to, content),
       sessions: () => this.adminSessions().sessions,
       explain: (id, chain) => this.explain(id, chain),
       status: () => {
@@ -788,11 +861,21 @@ export class Gateway {
    * route); an embedder's own `Policy.outbound` decides; otherwise the client's send scope,
    * checked before, is the local allowance (what preregistered routes are for a turn).
    */
-  private async externalOutbound(from: TurnContext, to: ReplyRoute): Promise<'allow' | 'deny'> {
+  private async externalOutbound(from: TurnContext, to: ReplyRoute, content?: RenderedMessage): Promise<'allow' | 'deny' | { hold: true; reason?: string }> {
     const held = this.host.outboundHeldBy();
     if (held !== undefined) {
       this.log('warn', `host ${held} decides outbound and is not connected: external send to ${routeKey(to)} denied`);
       return 'deny';
+    }
+    // U20: an `outbound` + `outbound.content` host sees what the client sends (`kind: tool`) and may hold it.
+    if (this.host.answersContent() && content !== undefined) {
+      try {
+        const v = await this.host.outboundContentCallout({ from, to, kind: 'tool', content });
+        return v.verdict === 'hold' ? { hold: true, ...(v.reason !== undefined ? { reason: v.reason } : {}) } : v.verdict;
+      } catch (e) {
+        this.log('warn', `host outbound callout to ${routeKey(to)} failed (${(e as Error).message}); denied`);
+        return 'deny';
+      }
     }
     if (this.host.answers('outbound')) {
       try {
@@ -1041,6 +1124,7 @@ export class Gateway {
       onTurnCompleted: (turnId, status) => {
         if (status === 'completed') void this.updateTopicTitle(sessionKey, turnId).catch((e) => this.log('warn', `${sessionKey}: title update failed: ${(e as Error).message}`));
       },
+      ...this.checkHooks(sessionKey),
     });
     this.lanes.set(sessionKey, lane);
     this.laneInfo.set(sessionKey, { agent, ...(agent.configured ? { cwd } : {}) });
@@ -1176,6 +1260,69 @@ export class Gateway {
     return { ok: true, value: { sessionKey: f.sessionKey, inputId, ...(r.turnId ? { turnId: r.turnId } : {}), duplicate: false } satisfies SessionCompactResult };
   }
 
+  /**
+   * `session.prewarm`: open a known session's harness without a turn, so the input the host expects
+   * soon (a reminder, a routine) does not wait for the harness to boot. Opens the lane of a session
+   * the daemon has run or registered (`isOurSession`); never a task run, never an unknown key (`not_found`).
+   */
+  async prewarmSession(f: SessionPrewarm): Promise<Outcome> {
+    if (this.stopped) return fail('stopped', 'daemon is stopping');
+    if (!f.sessionKey) return fail('invalid_frame', 'sessionKey is empty');
+    if (f.sessionKey.startsWith('run:')) return fail('invalid_frame', `${f.sessionKey} is a task run session (it ends with its one turn)`);
+    if (!this.isOurSession(f.sessionKey))
+      return fail('not_found', `${f.sessionKey} is not a session this daemon knows`);
+    let lane: Lane;
+    try {
+      lane = await this.laneAfterClose(f.sessionKey);
+    } catch (e) {
+      return fail(e instanceof LaneUnavailableError ? e.code : 'unavailable', (e as Error).message);
+    }
+    const opened = await lane.prewarm();
+    if (opened) this.log('info', `${f.sessionKey}: harness opened ahead of input (prewarm)`);
+    return { ok: true, value: { sessionKey: f.sessionKey, opened } satisfies SessionPrewarmResult };
+  }
+
+  /**
+   * `test.replay` (test hooks, SE-6): hand a channel message this process accepted to the
+   * gateway again, as its channel redelivering it would (the envelope as emitted, stamped
+   * against the running channel instance of its (channel, account)). Nothing else changes.
+   */
+  async testReplay(hostName: string, f: TestReplay): Promise<Outcome> {
+    if (!this.testHooks) return fail('test_hooks_off', `test hooks are off (start the daemon with ${TEST_HOOKS_ENV}=1)`);
+    const times = f.times ?? 1;
+    if (!Number.isInteger(times) || times < 1 || times > MAX_REPLAY_TIMES) return fail('invalid_frame', `times must be an integer from 1 to ${MAX_REPLAY_TIMES}`);
+    const kept = this.testHooks.find(f.inputId);
+    if (!kept) return fail('not_found', `no channel message kept for ${f.inputId} (only ones this process accepted with test hooks on, for 2 h)`);
+    const env = kept.env;
+    const entry = this.channels.find((c) => c.adapter.id === env.channel && c.account === env.account && c.state === 'running');
+    if (!entry) return fail('channel_not_running', `channel ${env.channel} (${env.account}) is not running`);
+    const channelRef = channelRefOf(env);
+    this.log('warn', `test hook: ${hostName} replays ${f.inputId} (${channelRef}) ${times} time(s)`);
+    const results: TestReplayResult['results'] = [];
+    for (let i = 0; i < times; i++) {
+      const r = await this.accept(env, this.emitSource(entry));
+      this.stamped(entry, env, r);
+      results.push({
+        action: !r.accepted ? 'refused' : r.action === 'duplicate' ? 'duplicate' : 'accepted',
+        ...(r.inputId !== undefined ? { inputId: r.inputId } : {}),
+        ...(!r.accepted && r.error !== undefined ? { error: r.error } : {}),
+      });
+    }
+    return { ok: true, value: { inputId: f.inputId, channelRef, channel: env.channel, account: env.account, results } satisfies TestReplayResult };
+  }
+
+  /** `test.fault` (test hooks, SE-6): drop the responses of the next sends of a channel; clear; list. */
+  testFault(hostName: string, f: TestFault): Outcome {
+    if (!this.testHooks) return fail('test_hooks_off', `test hooks are off (start the daemon with ${TEST_HOOKS_ENV}=1)`);
+    if (f.action === 'drop-response' && f.channel && !this.channels.some((c) => c.adapter.id === f.channel && (f.account === undefined || c.account === f.account))) {
+      return fail('unknown_channel', `no channel ${f.channel}${f.account ? ` (${f.account})` : ''}`);
+    }
+    const r = this.testHooks.fault(f);
+    if (!r.ok) return fail('invalid_frame', r.message);
+    if (f.action !== 'list') this.log('warn', `test hook: ${hostName} asked test.fault ${f.action}`);
+    return { ok: true, value: r.value };
+  }
+
   /** `inbound.redispatch` in flight, per cursor (a second request waits for the first). */
   private readonly redispatching = new Map<number, Promise<Outcome>>();
 
@@ -1213,6 +1360,7 @@ export class Gateway {
         ...(f.agent !== undefined ? { agent: f.agent } : {}),
         ...(f.session !== undefined ? { session: f.session } : {}),
         ...(f.launch !== undefined ? { launch: f.launch } : {}),
+        ...(f.history === false ? { history: false } : {}),
         beforeDeliver: (d, inputId, launch) => {
           // The session's own agent: a named agent must match it (as session.prepare checks).
           const had = this.laneInfo.get(d.sessionKey)?.agent.name ?? this.records.agentOf(d.sessionKey);
@@ -1429,6 +1577,7 @@ export class Gateway {
       modelReviewer: this.modelReviewer,
       cwd: r.cwd,
       requeueLimit: 0,
+      ...this.checkHooks(r.sessionKey),
       newId: (p) => {
         if (p === 'turn' && firstTurn) {
           firstTurn = false;
@@ -1692,7 +1841,8 @@ export class Gateway {
     if (!ch) return fail('unknown_channel', this.noChannelMessage(f.route));
     // A single-entry fallback sends as that entry's account (the adapter refuses routes of other accounts).
     // Not agent-authored (the host speaks): no `as`.
-    const rec = await this.outbox.send(ch.adapter, { operationId, sessionKey: `host:${hostName}`, route: { ...f.route, account: ch.account }, msg: f.message });
+    // The host's own message: it checked it itself; the settlement says what it is (U20).
+    const rec = await this.outbox.send(ch.adapter, { operationId, sessionKey: `host:${hostName}`, route: { ...f.route, account: ch.account }, msg: f.message, kind: 'host', exitChecked: true });
     return { ok: true, value: { ...rec, operationId: f.operationId, duplicate: false } };
   }
 
@@ -1726,7 +1876,7 @@ export class Gateway {
       return;
     }
     const { replyToMessageId: _r, ...route } = { ...a.route, account: ch.account };
-    await this.outbox.send(ch.adapter, { operationId: a.operationId, sessionKey: a.sessionKey, route, msg: { text: a.text } });
+    await this.outbox.send(ch.adapter, { operationId: a.operationId, sessionKey: a.sessionKey, route, msg: { text: a.text }, kind: 'notice', exitChecked: true });
     // No turn wrote it: explain of its operationId names the input it answers (EX-2).
     const ob = a.inputId !== undefined ? this.records.outboundByOperation(a.operationId) : undefined;
     if (ob && !ob.inputIds) this.records.putOutbound({ ...ob, inputIds: [a.inputId!] });
@@ -1867,6 +2017,10 @@ export class Gateway {
 
   /** `Policy.outbound` for a live destination; a deny or a failing check refuses (fail closed). */
   private async liveAllowed(turn: TurnContext, to: ReplyRoute): Promise<void> {
+    // U20: a route an outbound.scoped host checks gets nothing unchecked: a live (voice, said as it is made) never opens there.
+    if (this.host.outboundScope() !== undefined && this.host.inScope(to)) {
+      throw new ToolError(`live_join: ${routeKey(to)} is checked by the host before anything is said there (outbound.scoped); a live cannot be checked, so it does not open there`);
+    }
     const v = await this.policy.outbound({ from: turn, to }).catch(() => 'deny' as const);
     if (v !== 'allow') throw new ToolError(`live_join: ${routeKey(to)} is not an allowed destination (Policy.outbound; preregister it in policy.routes)`);
   }
@@ -1942,8 +2096,18 @@ export class Gateway {
 
   private async rotateTopic(sessionKey: string, turn: TurnContext, a: { title: string; summary: string }): Promise<TopicHandover> {
     const from = this.topicOfSession(sessionKey);
+    // U20: the agent's title and summary, where an outbound.scoped host checks, are asked first (one
+    // ask, kind title: the title, the summary as a details section); not allowed: neither is kept, the
+    // new topic starts untitled (named later from what passed the check) and `topic.changed` says
+    // `check: "held"` (external readers keep the rotate's tool item and the handed summary withheld).
+    const checked = this.titleChecked(from.conversation, this.hub.log.read(sessionKey, 0));
+    const allowed = !checked || (await this.titleAllowed(sessionKey, from.conversation, a.title, turn.turnId, a.summary));
     // The summary describes the topic being left: it is saved on it (and handed to the new one as context).
-    const r = this.router.newTopic(from.agent, from.conversation, { title: a.title }, 'agent', { turn: turnRef(turn), summaryOfPrevious: a.summary });
+    const r = this.router.newTopic(from.agent, from.conversation, allowed ? { title: a.title } : {}, 'agent', {
+      turn: turnRef(turn),
+      ...(allowed ? { summaryOfPrevious: a.summary } : {}),
+      ...(checked ? { check: allowed ? ('allowed' as const) : ('held' as const) } : {}),
+    });
     const summary: InputRecord = {
       inputId: `sum_${turn.turnId}`,
       origin: { kind: 'system', principal: null, evidence: 'none', via: `topic:${from.id}`, adapter: 'session' },
@@ -2003,13 +2167,26 @@ ${a.summary}` }],
     const eligible = new Set(events.filter((e) => e.body.t === 'turn.started' && e.body.inputIds.length > 0).map((e) => e.body.t === 'turn.started' ? e.body.turnId : ''));
     const completed = events.filter((e) => e.body.t === 'turn.completed' && e.body.status === 'completed' && eligible.has(e.body.turnId)).length;
     if (completed !== 1 && completed % 3 !== 1) return;
-    const expected = topic.title;
-    const prompt = topicTitlePrompt(events, expected);
-    if (!prompt) return;
-    const run = started.body.run ?? { ...agentRun(info.agent, this.o.config.harnesses[name]!), profile: 'restricted' };
+    // U20: a topic an outbound.scoped host checks gets a title from what passed the check only, and the
+    // title itself is asked before it is kept (it is said in the group: /topics, /status, the card).
+    const checked = this.titleChecked(topic.conversation, events);
     this.titleJobs.add(topic.id);
     try {
+      let read = events;
+      if (checked) {
+        // This turn's checked answer settles first: once it is past the check, the title may use it.
+        await this.checkedSettled(sessionKey, turnId);
+        if (this.stopped) return;
+        read = this.hub.log.read(sessionKey, 0);
+      }
+      const expected = topic.title;
+      const withheld = checked ? withholding(read) : undefined;
+      // An answer an external reader would read withheld (not past the check, held, denied) is left out.
+      const prompt = topicTitlePrompt(read, expected, withheld && !withheld.none ? (e) => e.body.t === 'text.snapshot' && withheld.of(e) !== undefined : undefined);
+      if (!prompt) return;
+      const run = started.body.run ?? { ...agentRun(info.agent, this.o.config.harnesses[name]!), profile: 'restricted' };
       const title = await generateTopicTitle(adapter, { cwd: info.cwd ?? this.o.config.cwd, run, prompt });
+      if (!this.stopped && title && checked && !(await this.titleAllowed(sessionKey, topic.conversation, title, turnId))) return;
       if (!this.stopped && title && this.topics.setAutoTitle(topic.id, expected, title)) {
         for (const c of this.sessionCompositors.get(sessionKey) ?? []) void c.refreshLatestTitle().catch((e) => this.log('warn', `${sessionKey}: title card refresh failed: ${(e as Error).message}`));
       }
@@ -2110,6 +2287,161 @@ ${a.summary}` }],
     return id;
   }
 
+  // ---- U20: the exit check of an `outbound.scoped` host (docs/HOSTS.md §4.1) ----
+
+  /**
+   * A lane's checked turns: only while a scope is declared. HC-7: an MCP tool item keeps its
+   * `tool { server, name }` while an `outbound.scoped` or `outbound.content` host is declared, or the
+   * host asked for it alone (`host.hello.optIn: ["item.tool"]`, which changes nothing else).
+   */
+  private checkHooks(sessionKey: string): Pick<LaneOptions, 'replyCheck' | 'settleGate' | 'itemTool'> {
+    return {
+      replyCheck: (route) => (this.host.outboundScope() === undefined ? undefined : !!route && this.host.inScope(route)),
+      settleGate: (turnId) => this.checkedSettled(sessionKey, turnId),
+      itemTool: () => this.settlementsDetailed() || this.host.itemToolDeclared(),
+    };
+  }
+
+  /** Every compositor of the session has settled the checked answer of `turnId` (at most a hook timeout and the send later). */
+  private async checkedSettled(sessionKey: string, turnId: string): Promise<void> {
+    const comps = this.sessionCompositors.get(sessionKey) ?? [];
+    const bound = this.o.config.hostCallouts.outboundTimeoutMs + 5000;
+    let t: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([Promise.all(comps.map((c) => c.checkedSettled(turnId))), new Promise<void>((r) => (t = setTimeout(r, bound)))]);
+    clearTimeout(t);
+  }
+
+  /**
+   * `Outbox.exit`: with a scope declared, a checked turn's answer (`kind: reply`, checked as the turn
+   * started) and anything else sent to a route in scope now are asked of the scoped host with their
+   * content. The host away, slow, failing or answering badly: held (`host_unavailable`), the turn's own
+   * reply route too. No scope: nothing applies.
+   */
+  private exitCheck(d: Delivery): Promise<ExitVerdict | undefined> | undefined {
+    if (d.kind === undefined) return undefined;
+    // A send of a turn checked as it started, on a route it is checked on: checked whatever the scope is
+    // now. A scope cleared meanwhile does not let it out unchecked (fail closed: no scoped host, held).
+    if (d.checked === true) return this.askExit(d, d.kind);
+    // U20 item 1 without a scope: an agent's send to wherever (`from` set: what the `outbound` hook
+    // decides) is asked of an `outbound` + `outbound.content` host with its content. Nothing else changes.
+    if (this.host.outboundScope() === undefined) return d.from !== undefined && this.host.outboundContentDeclared() ? this.askContent(d, d.from) : undefined;
+    // An answer is checked by its turn (above), never by where its route is now.
+    return d.kind !== 'reply' && this.host.inScope(d.route) ? this.askExit(d, d.kind) : undefined;
+  }
+
+  /**
+   * U20: a topic's title is said in its conversation (`/topics`, `/status`, the card) and read outside
+   * (`topic.changed`, `sessions_list`): checked where the scoped host checks the conversation, or where the
+   * session has had a checked turn (a scope cleared meanwhile: still checked, fail closed).
+   */
+  private titleChecked(conversation: string, events: readonly SessionEvent[]): boolean {
+    const route = conversationRoute(conversation);
+    if (this.host.outboundScope() !== undefined && route && this.host.inScope(route)) return true;
+    return events.some((e) => (e.body.t === 'turn.started' || e.body.t === 'turn.adopted' || e.body.t === 'turn.delivery_added') && e.body.checked === true);
+  }
+
+  /**
+   * U20: a topic title asked of the scoped host before it is kept (`kind: title`, the title as content;
+   * session_rotate's summary of the topic left as a `details` section); only `allow` keeps it.
+   */
+  private async titleAllowed(sessionKey: string, conversation: string, title: string, turnId: string, summary?: string): Promise<boolean> {
+    const route = conversationRoute(conversation) ?? localRoute(sessionKey);
+    const content = { text: title, ...(summary !== undefined ? { sections: [{ kind: 'details' as const, text: summary }] } : {}) };
+    const v = await this.askExit({ operationId: `title:${sessionKey}:${turnId}`, sessionKey, turnId, route, kind: 'title', content, checked: true }, 'title');
+    if (v.verdict === 'allow') return true;
+    this.log('info', `${sessionKey}: topic title not kept: the outbound check answered ${v.verdict}${v.reason !== undefined ? ` (${v.reason})` : ''}`);
+    return false;
+  }
+
+  /** U20: settlements say what they were (`kind`, `turnId`): an `outbound.scoped` or `outbound.content` host was declared. */
+  private settlementsDetailed(): boolean {
+    return this.host.outboundScope() !== undefined || this.host.outboundContentDeclared();
+  }
+
+  private async askExit(d: Delivery, kind: NonNullable<Delivery["kind"]>): Promise<ExitVerdict> {
+    if (!this.host.answers('outbound.scoped')) {
+      this.log('warn', `${d.sessionKey}: the outbound.scoped host is not connected: ${kind} to ${routeKey(d.route)} held`);
+      return { verdict: 'hold', reason: HOST_UNAVAILABLE };
+    }
+    try {
+      const attachmentText = await this.attachmentText(d.content);
+      return await this.host.outboundContentCallout({
+        from: d.from ?? (d.turnId !== undefined && this.lanes.get(d.sessionKey)?.currentTurn()?.turnId === d.turnId ? this.lanes.get(d.sessionKey)!.currentTurn()! : null),
+        to: d.route,
+        kind,
+        ...(d.content !== undefined ? { content: d.content } : {}),
+        ...(attachmentText ? { attachmentText } : {}),
+        ...(d.turnId !== undefined ? { turnId: d.turnId } : {}),
+        ...(d.requestId !== undefined ? { requestId: d.requestId } : {}),
+      });
+    } catch (e) {
+      this.log('warn', `${d.sessionKey}: outbound check of ${kind} to ${routeKey(d.route)} failed (${(e as Error).message}); held`);
+      return { verdict: 'hold', reason: HOST_UNAVAILABLE };
+    }
+  }
+
+  /**
+   * The `outbound` check of an `outbound` + `outbound.content` host with the content (DL-5 as before:
+   * no answer denies; the host away, only the turn's own routes stay open).
+   */
+  private async askContent(d: Delivery, from: TurnContext | null): Promise<ExitVerdict> {
+    if (!this.host.answersContent()) return { verdict: await this.policy.outbound({ from, to: d.route }).catch(() => 'deny' as const) };
+    try {
+      const attachmentText = await this.attachmentText(d.content);
+      return await this.host.outboundContentCallout({
+        from,
+        to: d.route,
+        kind: d.kind!,
+        ...(d.content !== undefined ? { content: d.content } : {}),
+        ...(attachmentText ? { attachmentText } : {}),
+        ...(d.turnId !== undefined ? { turnId: d.turnId } : {}),
+        ...(d.requestId !== undefined ? { requestId: d.requestId } : {}),
+      });
+    } catch (e) {
+      this.log('warn', `host outbound callout to ${routeKey(d.route)} failed (${(e as Error).message}); denied`);
+      return { verdict: 'deny' };
+    }
+  }
+
+  /** U20: a scope came or changed: a live where the scoped host now checks is left (nothing unchecked is said there). */
+  private leaveScopedLives(): void {
+    for (const [key, live] of this.lives) {
+      if (this.host.inScope(live.endpoint.route)) void this.leaveLive(key, 'the route is checked by the host (outbound.scoped)').catch(() => undefined);
+    }
+  }
+
+  /** The text of a message's text-like attachments (at most 64 KiB each), by ref: the host cannot read blobs. */
+  private async attachmentText(msg: Delivery['content']): Promise<Record<string, string> | undefined> {
+    const out: Record<string, string> = {};
+    for (const a of msg?.attachments ?? []) {
+      if (!isTextLike(a.mime, a.name)) continue;
+      try {
+        const st = await this.blobs.stat(a.ref);
+        if (!st || st.size > MAX_ATTACHMENT_TEXT) continue;
+        out[a.ref] = new TextDecoder().decode((await this.blobs.get(a.ref)).bytes);
+      } catch {
+        // unreadable: the host sees the reference only
+      }
+    }
+    return Object.keys(out).length ? out : undefined;
+  }
+
+  /**
+   * U20: a checked answer was held. The agent is told before its next turn's inputs (context of the
+   * session, from the system): that it was not sent and why, never the answer itself.
+   */
+  private heldNotice(sessionKey: string, operationId: string, reason: string | undefined): void {
+    const lane = this.lanes.get(sessionKey);
+    if (!lane) return;
+    lane.heldNotice({
+      inputId: `held:${operationId}`,
+      origin: { kind: 'system', principal: null, evidence: 'device_only', via: 'agents-io', adapter: 'agents-io' },
+      content: [{ type: 'text', text: heldText(reason, '上一条回答没有发出') }],
+      replyRoute: null,
+      channelContext: { held: true },
+    });
+  }
+
   private compose(sessionKey: string, ch: RunningChannel): void {
     const { adapter, tier, account } = ch;
     const isLark = adapter instanceof LarkBotAdapter;
@@ -2123,13 +2455,17 @@ ${a.summary}` }],
       // Each bot renders its own routes only: two Lark bots must not race for one reply.
       account,
       outbox: this.outbox,
+      inScope: (route) => this.host.outboundScope() !== undefined && this.host.inScope(route),
       // Every message the session's agent produces says who wrote it (POSITIONING §2 identity declaration).
       as: agentIdentity(sessionKey),
       ...(tier ? { tier } : {}),
       ...(openDelayMs !== undefined ? { openDelayMs } : {}),
       ...(previewDelayMs !== undefined ? { previewDelayMs } : {}),
       ...(isLark ? { holdAnswerUntilOpen: true } : {}),
-      ...(isLark && (openDelayMs ?? 0) > 0 ? { requireAnswerToOpen: true } : {}),
+      // The card opens at the first tool call (or once the delay passed with something to show) and
+      // lists the steps until the answer streams in (b0: 19 s of only the thinking bubble). Other
+      // channels when their entry says so (`openOnProcess`: open-lark's progress line, c-progress-edit).
+      ...((ch.source?.openOnProcess ?? isLark) && (openDelayMs ?? 0) > 0 ? { openOnProcess: true } : {}),
       ...(ack ? { ack: { doneAfterMs: (typeof ack === 'object' ? ack.doneAfterMs : undefined) ?? 60_000 } } : {}),
       // In Lark, the early process bubble carries progress; keep the reply card free of Stop controls.
       interruptButton: !isLark,
@@ -2396,6 +2732,8 @@ ${a.summary}` }],
     const ac = new AbortController();
     // Built before start(): an adapter may emit synchronously, before its first await.
     const entry: RunningChannel = { adapter: ch.adapter, account: ch.account, ...(ch.tier ? { tier: ch.tier } : {}), ac, running: Promise.resolve(), state: 'running', owner: ch.owner, rejected: 0, evidenceCapped: 0, ...(ch.close ? { close: ch.close } : {}) };
+    // Test hooks on: `test.fault drop-response` applies to this adapter's sends (no change without an injection).
+    this.testHooks?.wrap(ch.adapter);
     entry.running = ch.adapter
       .start({
         account: ch.account,
@@ -2406,6 +2744,8 @@ ${a.summary}` }],
         emit: async (env) => {
           const r = await this.accept(env, this.emitSource(entry));
           this.stamped(entry, env, r);
+          // Test hooks on: keep the message as emitted for `test.replay` (memory only, bounded).
+          if (this.testHooks && r.accepted && r.action !== 'duplicate' && r.inputId !== undefined) this.testHooks.keep(r.inputId, env);
           if (r.accepted) return {
             accepted: true,
             ...(r.inputId !== undefined ? { inputId: r.inputId } : {}),

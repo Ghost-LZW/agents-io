@@ -89,6 +89,8 @@ export interface RouteDelivery {
   topic?: { id: string; conversation: string; title?: string };
   /** A callout answer's launch for this session, as checked (`RouterOptions.launches`). */
   launch?: SessionLaunch;
+  /** U21 (feature `callout.history`): the host said this dispatch hands no channel history (IN-9). */
+  noHistory?: true;
 }
 
 /** The daemon's view of session launches (decision 7). */
@@ -125,6 +127,8 @@ export interface CalloutAnswer {
   session?: SessionScope;
   /** Feature `session.launch`: how the session the input lands in is launched. */
   launch?: SessionLaunch;
+  /** Feature `callout.history`: `false` = this dispatch hands no channel history (IN-9). */
+  history?: boolean;
 }
 
 export type RouteCallout = (bindingId: string, input: InputRecord, envelope: InboundEnvelope) => Promise<CalloutAnswer>;
@@ -474,6 +478,8 @@ export class Router {
         // A launch rides along whichever delivery wins.
         if (!prior || STRENGTH[on as Effective] > STRENGTH[prior.on]) best.set(d.sessionKey, prior?.launch && !d.launch ? { ...d, launch: prior.launch } : d);
         else if (d.launch && !prior.launch) prior.launch = d.launch;
+        // U21: the host's `history: false` rides along to whichever delivery wins, like a launch (only callout answers set it).
+        if (d.noHistory) best.get(d.sessionKey)!.noHistory = true;
       } else if (on === 'host') host ??= { bindingId: r.binding.id, source: r.source };
       explanation.matched.push(entry);
     }
@@ -555,6 +561,7 @@ export class Router {
       ...(r.source !== 'watch' ? { match: r.binding.match } : {}),
       ...(r.mode ? { mode: r.mode } : {}),
       ...(scope.topic ? { topic: { id: scope.topic.id, conversation: scope.topic.conversation, ...(scope.topic.title !== undefined ? { title: scope.topic.title } : {}) } } : {}),
+      ...(r.noHistory ? { noHistory: true as const } : {}),
     };
     return { on, entry, delivery };
   }
@@ -592,6 +599,7 @@ export class Router {
       ...(answer.session !== undefined ? { session: answer.session } : {}),
       callout: { outcome: 'answered', on: answer.on },
       ...(answer.launch !== undefined ? { launch: answer.launch, failed: (reason: string) => fail('error', reason) } : {}),
+      ...(answer.history === false ? { noHistory: true as const } : {}),
     };
   }
 
@@ -730,6 +738,8 @@ interface Resolved extends Rule {
   /** A callout answer's launch, and the rule's failure mode should it be refused. */
   launch?: SessionLaunch;
   failed?: (reason: string) => Resolved;
+  /** U21: the callout answer said `history: false`. */
+  noHistory?: true;
   /** Legacy admit: the session it named. */
   legacyKey?: string;
   mode?: InputMode;

@@ -4,10 +4,15 @@ import type { HarnessAdapter, InputRecord, RunSpec, SessionEvent } from '@agents
 const MAX_CONTEXT = 4000;
 const MAX_TITLE = 36;
 
-/** Only human messages and final answers enter the title prompt; no tool output or request answers. */
-export function topicTitlePrompt(events: SessionEvent[], current?: string): string | undefined {
+/**
+ * Only human messages and final answers enter the title prompt; no tool output or request answers.
+ * `skip` (U20, a session an `outbound.scoped` host checks): events left out, e.g. the answers of
+ * checked turns not past the exit check (what `withholding` withholds: checking, held or denied).
+ */
+export function topicTitlePrompt(events: SessionEvent[], current?: string, skip?: (e: SessionEvent) => boolean): string | undefined {
   const lines: string[] = [];
   for (const e of events) {
+    if (skip?.(e)) continue;
     if (e.body.t === 'input.admitted' && e.body.input?.origin.kind === 'human') {
       const value = e.body.input.content.filter((c): c is Extract<typeof c, { type: 'text' }> => c.type === 'text').map((c) => c.text).join(' ').trim();
       if (value) lines.push(`User: ${value}`);

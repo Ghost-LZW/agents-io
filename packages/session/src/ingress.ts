@@ -564,6 +564,8 @@ export class Ingress {
       agent?: string;
       session?: SessionScope;
       launch?: SessionLaunch;
+      /** U21: `false` = this dispatch hands no channel history. */
+      history?: boolean;
       by: string;
       /** Called with the placed delivery before it is made: a refusal stops it (nothing delivered or recorded). */
       beforeDeliver?: (d: RouteDelivery, inputId: string, launch?: { cwd?: string; envKeys: string[]; outcome: string }) => { ok: true } | { ok: false; code: string; message: string };
@@ -586,7 +588,8 @@ export class Ingress {
       throw e;
     }
     if (!r.ok) return r;
-    const { delivery, explanation } = r;
+    const { explanation } = r;
+    const delivery: RouteDelivery = o.history === false ? { ...r.delivery, noHistory: true } : r.delivery;
     const before = o.beforeDeliver?.(delivery, inputId, explanation.matched[0]!.launch);
     if (before && !before.ok) return before;
     const input: InputRecord = { ...item.input, inputId, channelContext: { ...item.input.channelContext, redispatchedBy: o.by } };
@@ -654,7 +657,8 @@ export class Ingress {
   private async handHistory(lane: Lane, d: RouteDelivery, env: InboundEnvelope, input: InputRecord): Promise<void> {
     const fetch = this.o.history;
     const sessionKey = d.sessionKey;
-    if (!fetch || !env.replyRoute) return;
+    // U21: the host said this dispatch goes without history (it has its own recap, or the same messages under other ids).
+    if (!fetch || !env.replyRoute || d.noHistory) return;
     const scope: HistoryScope | undefined =
       env.conversation.kind === 'thread' && env.conversation.threadId ? 'thread' : env.conversation.kind === 'group' ? 'chat' : undefined;
     if (!scope || (scope === 'chat' && lane.dispatched())) return;

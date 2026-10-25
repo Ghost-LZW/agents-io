@@ -159,6 +159,14 @@ const ChannelCommon = {
    * default to 0 and answer text opens early.
    */
   openDelayMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 60_000 })),
+  /**
+   * With `openDelayMs`: the first message opens at the turn's first tool call, or once the delay
+   * passed with something to show (a tool, thinking, answer text), instead of with the first
+   * answer text. Default: on for Lark bots (their card lists the steps), off elsewhere. A module
+   * channel that edits its message (open-lark's personal account on the `card` tier) sets it to
+   * show one progress line early and edit it into the answer.
+   */
+  openOnProcess: Type.Optional(Type.Boolean()),
   /** Lark native process preview delay (ms), before the reply card. Default 2000. */
   previewDelayMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 60_000 })),
   /**

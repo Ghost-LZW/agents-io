@@ -45,6 +45,42 @@
             }
           ]
         },
+        "outboundScope": {
+          "type": "object",
+          "required": [
+            "routes"
+          ],
+          "properties": {
+            "routes": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "channel",
+                  "account",
+                  "conversationId"
+                ],
+                "properties": {
+                  "channel": {
+                    "type": "string"
+                  },
+                  "account": {
+                    "type": "string"
+                  },
+                  "conversationId": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "optIn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "takeover": {
           "type": "boolean"
         }
@@ -1072,6 +1108,9 @@
                 "answerFinal": {
                   "type": "boolean"
                 },
+                "finalAnswer": {
+                  "type": "boolean"
+                },
                 "startedAt": {
                   "type": "number"
                 },
@@ -1319,6 +1358,9 @@
               }
             }
           }
+        },
+        "history": {
+          "type": "boolean"
         }
       }
     },
@@ -1347,6 +1389,153 @@
         },
         "inputId": {
           "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "sessionKey"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "session.prewarm",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "sessionKey": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "inputId"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "test.replay",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "inputId": {
+          "type": "string"
+        },
+        "times": {
+          "type": "number"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "action"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "test.fault",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "action": {
+          "anyOf": [
+            {
+              "const": "drop-response",
+              "type": "string"
+            },
+            {
+              "const": "clear",
+              "type": "string"
+            },
+            {
+              "const": "list",
+              "type": "string"
+            }
+          ]
+        },
+        "channel": {
+          "type": "string"
+        },
+        "account": {
+          "type": "string"
+        },
+        "conversation": {
+          "type": "string"
+        },
+        "next": {
+          "type": "number"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "routes"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "host.outboundScope",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "routes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "channel",
+              "account",
+              "conversationId"
+            ],
+            "properties": {
+              "channel": {
+                "type": "string"
+              },
+              "account": {
+                "type": "string"
+              },
+              "conversationId": {
+                "type": "string"
+              }
+            }
+          }
         }
       }
     }

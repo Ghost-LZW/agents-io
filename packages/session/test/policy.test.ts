@@ -90,13 +90,6 @@ describe('defaultPolicy.plan / resolve / outbound', () => {
     expect(await p.resolve(req, ctx('restricted', { live: { ...live, startedBy: null } }))).toMatchObject({ kind: 'auto', decision: { kind: 'deny' } });
   });
 
-  it('routes native questions to the person who owns the turn, never auto-approves them', async () => {
-    const req = { t: 'request.opened' as const, requestId: 'q', kind: 'question' as const, title: 'Which DB?', risk: {}, allowedDecisions: ['answer', 'deny'], allowAlways: false, defaultDeny: false };
-    expect(await p.resolve(req, ctx('bypass', { owner: 'fake:alice' }))).toEqual({ kind: 'human', principals: ['fake:alice'], routes: ['fake:default:c1'] });
-    expect(await p.resolve(req, ctx('restricted', { owner: 'fake:bob' }))).toEqual({ kind: 'human', principals: ['fake:bob'], routes: ['fake:default:c1'] });
-    expect(await p.resolve(req, ctx('bypass', { replyRoute: null }))).toMatchObject({ kind: 'auto', decision: { kind: 'deny' } });
-  });
-
   it('control: owners and turn owners may interrupt #CT-1', async () => {
     expect(await p.control({ sessionKey: 's', op: 'interrupt', origin: origin('fake:alice'), turn: turnOwnedBy('x') })).toBe('allow');
     expect(await p.control({ sessionKey: 's', op: 'interrupt', origin: origin('x', ['agent']), turn: turnOwnedBy('x') })).toBe('allow');

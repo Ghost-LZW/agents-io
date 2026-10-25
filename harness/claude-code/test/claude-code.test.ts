@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { runHarnessEnvConformance } from '@agents-io/testkit';
 import type { HarnessSession } from '@agents-io/protocol';
-import { ClaudeCodeHarness, convertBlock, inputUuid, preface } from '../src/index.js';
+import { CONTEXT_LABEL, ClaudeCodeHarness, convertBlock, inputUuid, preface, toTurnMessage } from '../src/index.js';
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 import type { PermissionResult } from '../src/types.js';
 import { bodies, collectUntil, fakeQueryFn, input, isTurnCompleted, sdk, type FakeQuery } from './fake-query.js';
 import { run, setup, uuidOf } from './claude-code-helpers.js';
@@ -48,14 +49,6 @@ describe('open → SDK options', () => {
     } finally {
       delete process.env.CLAUDE_CODE_RESUME_INTERRUPTED_TURN;
     }
-  });
-
-  it("runs on Claude Code's own system prompt unless options.sdk sets one", async () => {
-    // The SDK turns an absent systemPrompt into an empty one (no tool guidance, no sub-agents).
-    const { q } = await setup();
-    expect(q.options.systemPrompt).toEqual({ type: 'preset', preset: 'claude_code' });
-    const custom = await setup({}, { sdk: { systemPrompt: { type: 'preset', preset: 'claude_code', append: 'Be brief.' } } });
-    expect(custom.q.options.systemPrompt).toEqual({ type: 'preset', preset: 'claude_code', append: 'Be brief.' });
   });
 
   it('host MCP token is passed through the env, never in mcpServers (the SDK puts those on the CLI argv) #SE-1', async () => {
@@ -132,16 +125,64 @@ describe('input writing', () => {
   it('one SDKUserMessage per input, uuid bound to inputId, explicit priority, preface #ID-2', async () => {
     const { s, q } = await setup();
     const id = '1b4e28ba-2fa1-41d2-883f-0016d3cca427';
-    await s.startTurn('t1', [input(id, 'hello', { channelContext: { chat: 'Team' } }), input('plain-id', 'second')]);
-    await q.waitWritten(2);
+    await s.startTurn('t1', [input(id, 'hello', { channelContext: { chat: 'Team' } })]);
+    await q.waitWritten(1);
     expect(q.written[0]!.uuid).toBe(id);
-    expect(q.written[1]!.uuid).toBe(inputUuid('plain-id'));
-    expect(q.written[1]!.uuid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
-    expect(q.written.map((m) => m.priority)).toEqual(['later', 'later']);
+    expect(inputUuid('plain-id')).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(q.written[0]!.priority).toBe('later');
     expect(q.written[0]!.origin).toEqual({ kind: 'human' });
     const content = q.written[0]!.message.content as { type: string; text: string }[];
     expect(content[0]!.text).toBe('[agents-io input from=owner kind=human evidence=platform_signed via=fake:a:c1 chat="Team"]');
     expect(content[1]).toEqual({ type: 'text', text: 'hello' });
+  });
+
+  it("a turn's inputs reach the CLI as one message: each behind its own preface, in order, so the model runs once, not once per record #HC-4 #ID-2", async () => {
+    const { s, q, it, give, conform } = await setup();
+    const host = { kind: 'system' as const, principal: { id: 'host:lb', labels: ['host'] }, evidence: 'device_only' as const, via: 'host:lb', adapter: 'host' };
+    const bot = { kind: 'agent' as const, principal: null, evidence: 'platform_signed' as const, via: 'lark:a:g1', adapter: 'lark' };
+    const rules = { ...input('r1', 'rules changed'), origin: host, channelContext: { context: true } };
+    const said = { ...input('c1', '1 + 1 = 2'), origin: bot, channelContext: { context: true, senderName: 'Helper' } };
+    give('t1', 'r1', 'c1', 'a');
+    await s.startTurn('t1', [rules, said, input('a', 'and 2 + 2?')]);
+    await q.waitWritten(1);
+    await wait(10);
+    expect(q.written).toHaveLength(1);
+    const m = q.written[0]!;
+    expect(m.priority).toBe('later');
+    expect(m.uuid).toBe(inputUuid('batch:r1\u0000c1\u0000a'));
+    // The host's record and a bot's message ride in the same message: not stamped human (HC-4).
+    expect(m.origin).toBeUndefined();
+    const texts = (m.message.content as { type: string; text: string }[]).map((b) => b.text);
+    expect(texts).toEqual([
+      `[agents-io ${CONTEXT_LABEL}]\n[agents-io input from=host:lb kind=system evidence=device_only via=host:lb context=true]`,
+      'rules changed',
+      `[agents-io ${CONTEXT_LABEL}]\n[agents-io input from=unknown kind=agent evidence=platform_signed via=lark:a:g1 context=true senderName="Helper"]`,
+      '1 + 1 = 2',
+      '[agents-io input from=owner kind=human evidence=platform_signed via=fake:a:c1]',
+      'and 2 + 2?',
+    ]);
+    q.push(sdk.init(), sdk.text('m', '4'), sdk.result({ uuids: [m.uuid!], result: '4' }));
+    const evs = await collectUntil(it, isTurnCompleted);
+    expect(bodies(evs, 'input.consumed')).toEqual([{ t: 'input.consumed', inputIds: ['r1', 'c1', 'a'], turnId: 't1' }]);
+    expect(bodies(evs, 'turn.completed')).toEqual([expect.objectContaining({ turnId: 't1', status: 'completed' })]);
+    conform(evs);
+  });
+
+  it('a merged message is stamped human only when every input of it, context included, is a person: a bot\'s or the host\'s record never passes as human beside a person #HC-4', async () => {
+    const peer = { kind: 'peer' as const, principal: { id: 'agent:x', labels: [] }, evidence: 'daemon' as const, via: 'agent:x', adapter: 'agent' };
+    const bot = { kind: 'agent' as const, principal: null, evidence: 'platform_signed' as const, via: 'lark:a:g1', adapter: 'lark' };
+    const host = { kind: 'system' as const, principal: { id: 'host:lb', labels: [] }, evidence: 'device_only' as const, via: 'host:lb', adapter: 'host' };
+    const ctx = (id: string, origin: ReturnType<typeof input>['origin']) => ({ ...input(id, 'note'), origin, channelContext: { context: true } });
+    const msg = async (inputs: ReturnType<typeof input>[]) =>
+      (await toTurnMessage(inputs, { priority: 'later' })).message;
+    for (const o of [peer, bot, host]) expect((await msg([ctx('c1', o), input('a', 'hi')])).origin).toBeUndefined();
+    expect((await msg([input('a', 'hi'), { ...input('b', 'go'), origin: peer }])).origin).toBeUndefined();
+    expect((await msg([ctx('c1', peer), ctx('c2', peer)])).origin).toBeUndefined();
+    // People only (a group member's message kept as context, then the owner's): human, as each alone.
+    const guest = { ...input('g1', 'see you'), origin: { ...input('g1', '').origin, principal: null }, channelContext: { context: true } };
+    expect((await msg([guest, input('a', 'hi')])).origin).toEqual({ kind: 'human' });
+    expect((await msg([input('a', 'hi'), input('b', 'go')])).origin).toEqual({ kind: 'human' });
+    await expect(toTurnMessage([input('a', 'x'), { ...input('b', '/compact'), channelContext: { nativeCommand: true } }], { priority: 'later' })).rejects.toThrow(/alone/);
   });
 
   it('converts every content block kind #MD-1', async () => {
@@ -188,15 +229,15 @@ describe('input writing', () => {
     const stranger = { kind: 'human' as const, principal: null, evidence: 'platform_signed' as const, via: 'lark:a:g1', adapter: 'lark' };
     const ctx = { ...input('c1', 'the launch moved to Thursday'), origin: stranger, channelContext: { senderName: 'Eve', context: true, watch: 'wg' } };
     await s.startTurn('t1', [ctx, input('i1', 'what did they say?')]);
-    await q.waitWritten(2);
+    await q.waitWritten(1);
     const first = q.written[0]!.message.content as { type: string; text: string }[];
     expect(first[0]!.text).toBe(
       '[agents-io context, not addressed to you: recorded in the conversation; read it, do not reply to it unless the addressed input asks]\n' +
         '[agents-io input from=unknown kind=human evidence=platform_signed via=lark:a:g1 senderName="Eve" context=true watch="wg"]',
     );
     expect(first[1]).toEqual({ type: 'text', text: 'the launch moved to Thursday' });
-    const second = q.written[1]!.message.content as { type: string; text: string }[];
-    expect(second[0]!.text).toBe('[agents-io input from=owner kind=human evidence=platform_signed via=fake:a:c1]');
+    // The addressed input follows in the same message (HC-4), behind its own preface.
+    expect(first[2]!.text).toBe('[agents-io input from=owner kind=human evidence=platform_signed via=fake:a:c1]');
   });
 
   it('a watched input reaches the model with the watch= marker in its sender preface #ID-2', async () => {
@@ -346,6 +387,76 @@ describe('event mapping', () => {
     expect(evs.filter((e) => e.turnId === 't1').length).toBeGreaterThan(20);
   });
 
+  it('an MCP tool item: type mcp_tool, title starting <server>.<tool> (then ": <input>"), and tool { server, name }; a built-in has no tool #HC-7', async () => {
+    const { s, q, it, give, conform } = await setup();
+    give('t1', 'i1');
+    await s.startTurn('t1', [input('i1', 'read it')]);
+    await q.waitWritten(1);
+    q.push(
+      sdk.init(),
+      sdk.toolUse('m1', 'mcp__chatlog__sessions_get', { session: 'friendDm' }),
+      sdk.toolResult('m1', 'ok'),
+      sdk.toolUse('m2', 'mcp__agents_io__session_rotate', {}),
+      sdk.toolResult('m2', 'ok'),
+      sdk.toolUse('b1', 'Bash', { command: 'ls' }),
+      sdk.toolResult('b1', 'x'),
+      sdk.text('a1', 'Done.'),
+      sdk.result({ uuids: [uuidOf(q, 0)], result: 'Done.' }),
+    );
+    const evs = await collectUntil(it, isTurnCompleted);
+    conform(evs);
+    for (const t of ['item.started', 'item.completed'] as const) {
+      const items = bodies(evs, t).map((b) => b.item);
+      const get = items.find((i) => i.itemId === 'm1')!;
+      expect(get).toMatchObject({ type: 'mcp_tool', tool: { server: 'chatlog', name: 'sessions_get' } });
+      expect(get.title).toBe('chatlog.sessions_get: {"session":"friendDm"}');
+      expect(get.title.startsWith(`${get.tool!.server}.${get.tool!.name}`)).toBe(true);
+      expect(items.find((i) => i.itemId === 'm2')).toMatchObject({ type: 'mcp_tool', title: 'agents_io.session_rotate', tool: { server: 'agents_io', name: 'session_rotate' } });
+      expect(items.find((i) => i.itemId === 'b1')!.tool).toBeUndefined();
+    }
+  });
+
+  it('a turn that ends on a tool call has no final snapshot: what it said before the call is not its answer #HC-1', async () => {
+    const { s, q, it, give, conform } = await setup();
+    give('t1', 'i1');
+    await s.startTurn('t1', [input('i1', '帮我问问小明')]);
+    await q.waitWritten(1);
+    q.push(
+      sdk.init(),
+      sdk.assistant('a1', [
+        { type: 'text', text: '我先翻一下小红和小明的私聊。' },
+        { type: 'tool_use', id: 'r1', name: 'mcp__chatlog__sessions_get', input: { session: 'friendDm' } },
+      ]),
+      sdk.toolResult('r1', '小明：周六去看牙'),
+      sdk.toolUse('s1', 'mcp__agents_io__send_message', { text: '小明，周六有空吗？' }),
+      sdk.toolResult('s1', 'sent'),
+      sdk.assistant('a2', []),
+      sdk.result({ uuids: [uuidOf(q, 0)], result: '' }),
+    );
+    let evs = await collectUntil(it, isTurnCompleted);
+    expect(bodies(evs, 'turn.completed')[0]).toMatchObject({ turnId: 't1', status: 'completed' });
+    expect(bodies(evs, 'text.snapshot').filter((x) => x.final)).toEqual([]);
+    // Along the way it still says what it is doing.
+    expect(bodies(evs, 'text.snapshot')).toEqual([{ t: 'text.snapshot', text: '我先翻一下小红和小明的私聊。', final: false }]);
+
+    // What it says after its last tool call is its answer, also when the result carries no text.
+    give('t2', 'i2');
+    await s.startTurn('t2', [input('i2', '问到了吗')]);
+    await q.waitWritten(2);
+    q.push(
+      sdk.init(),
+      sdk.text('b1', '我看一下。'),
+      sdk.toolUse('r2', 'mcp__chatlog__sessions_get', { session: 'friendDm' }),
+      sdk.toolResult('r2', '小明：有空'),
+      sdk.text('b2', '她说周六有空。'),
+      sdk.result({ uuids: [uuidOf(q, 1)], result: '' }),
+    );
+    const evs2 = await collectUntil(it, isTurnCompleted);
+    expect(bodies(evs2, 'text.snapshot').filter((x) => x.final)).toEqual([{ t: 'text.snapshot', text: '她说周六有空。', final: true }]);
+    evs = [...evs, ...evs2];
+    conform(evs);
+  });
+
   it('error results fail the turn; is_error success too #HC-1', async () => {
     const { s, q, it, give, conform } = await setup();
     give('t1', 'i1');
@@ -376,12 +487,12 @@ describe('event mapping', () => {
 });
 
 describe('consumed reconciliation', () => {
-  it('a CLI batch of several inputs → one turn, one input.consumed #IN-1 #HC-1', async () => {
+  it('a CLI batch of several inputs → one turn, one input.consumed #IN-1 #HC-1 #HC-4', async () => {
     const { s, q, it, give, conform } = await setup();
     give('t1', 'a', 'b');
     await s.startTurn('t1', [input('a', '1'), input('b', '2')]);
-    await q.waitWritten(2);
-    q.push(sdk.init(), sdk.text('m', 'ok'), sdk.result({ uuids: [uuidOf(q, 0), uuidOf(q, 1)], result: 'ok' }));
+    await q.waitWritten(1);
+    q.push(sdk.init(), sdk.text('m', 'ok'), sdk.result({ uuids: [uuidOf(q, 0)], result: 'ok' }));
     const evs = await collectUntil(it, isTurnCompleted);
     expect(bodies(evs, 'input.consumed')).toEqual([{ t: 'input.consumed', inputIds: ['a', 'b'], turnId: 't1' }]);
     conform(evs);
@@ -390,7 +501,9 @@ describe('consumed reconciliation', () => {
   it('CLI splits our inputs over two native turns → still one canonical turn #IN-1 #HC-1', async () => {
     const { s, q, it, give, conform } = await setup();
     give('t1', 'a', 'b');
-    await s.startTurn('t1', [input('a', '1'), input('b', '2')]);
+    await s.startTurn('t1', [input('a', '1')]);
+    await q.waitWritten(1);
+    expect(await s.steer([input('b', '2')], 't1')).toBe('steered');
     await q.waitWritten(2);
     q.push(sdk.init(), sdk.text('m1', 'first'), sdk.result({ uuids: [uuidOf(q, 0)], result: 'first', queued_turn_count: 1 }));
     q.push(sdk.init(), sdk.text('m2', 'second'), sdk.result({ uuids: [uuidOf(q, 1)], result: 'second' }));

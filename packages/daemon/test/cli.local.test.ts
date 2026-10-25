@@ -1,7 +1,7 @@
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { parseCli, parseEnvPairs, runRequest, socketOf } from '../src/cli.js';
+import { faultRequest, parseCli, parseEnvPairs, replayRequest, runRequest, socketOf } from '../src/cli.js';
 import { ConfigError, configTable, resolveConfig } from '../src/config.js';
 import { tmp } from './helpers.js';
 
@@ -62,5 +62,26 @@ describe('cli arguments', () => {
   it('--socket / $AIO_SOCKET pick the daemon without loading a config', () => {
     expect(socketOf(parseCli(['tail', '--socket', '/x/aio.sock']))).toBe('/x/aio.sock');
     expect(socketOf(parseCli(['tail']), { AIO_SOCKET: '/y/aio.sock' })).toBe('/y/aio.sock');
+  });
+});
+
+describe('aio replay / aio fault (test hooks)', () => {
+  it('replay: --input (or the first argument) and an optional positive --times', () => {
+    expect(replayRequest(parseCli(['replay', '--input', 'in_abc']))).toEqual({ inputId: 'in_abc' });
+    expect(replayRequest(parseCli(['replay', 'in_abc', '--times', '2']))).toEqual({ inputId: 'in_abc', times: 2 });
+    expect(() => replayRequest(parseCli(['replay']))).toThrow(ConfigError);
+    expect(() => parseCli(['replay', '--input', 'x', '--times', '0'])).toThrow(ConfigError);
+  });
+
+  it('fault: list by default; drop-response needs --channel and --next; clear', () => {
+    expect(faultRequest(parseCli(['fault']))).toEqual({ action: 'list' });
+    expect(faultRequest(parseCli(['fault', 'clear']))).toEqual({ action: 'clear' });
+    expect(faultRequest(parseCli(['fault', 'drop-response', '--channel', 'lark-bot', '--next', '1']))).toEqual({ action: 'drop-response', channel: 'lark-bot', next: 1 });
+    expect(faultRequest(parseCli(['fault', 'drop-response', '--channel', 'lark-bot', '--account', 'helper', '--next', '3']))).toEqual({ action: 'drop-response', channel: 'lark-bot', account: 'helper', next: 3 });
+    expect(faultRequest(parseCli(['fault', 'drop-response', '--channel', 'lark-bot', '--conversation', 'oc_x', '--next', '1']))).toEqual({ action: 'drop-response', channel: 'lark-bot', conversation: 'oc_x', next: 1 });
+    expect(() => faultRequest(parseCli(['fault', 'drop-response', '--next', '1']))).toThrow(ConfigError);
+    expect(() => faultRequest(parseCli(['fault', 'drop-response', '--channel', 'lark-bot']))).toThrow(ConfigError);
+    expect(() => faultRequest(parseCli(['fault', 'nope']))).toThrow(ConfigError);
+    expect(() => parseCli(['fault', 'drop-response', '--channel', 'x', '--next', '-1'])).toThrow(ConfigError);
   });
 });

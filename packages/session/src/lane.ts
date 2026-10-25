@@ -15,6 +15,7 @@ import {
   type LiveTurnContext,
   type LoopGuardTrip,
   type Origin,
+  type OutboundKind,
   type ReplyRoute,
   type ResolvedBy,
   type Resolver,
@@ -50,6 +51,22 @@ export interface LaneOptions {
   sessionKey: string;
   harness: HarnessAdapter;
   hub: Hub;
+  /**
+   * U20 (`reply.check`): is this route checked by an `outbound.scoped` host's scope right now.
+   * `undefined`: no scope is declared, and turn events carry no `checked`.
+   */
+  replyCheck?: (route: ReplyRoute | null) => boolean | undefined;
+  /**
+   * U20: wait (bounded by the caller) until the checked answer of `turnId` has settled, before the next
+   * turn of this session starts: the order in a checked conversation stays, and a `held` notice
+   * (`heldNotice`) reaches the next turn first.
+   */
+  settleGate?: (turnId: string) => Promise<void>;
+  /**
+   * HC-7 (feature `item.tool`): keep an MCP tool item's `tool { server, name }` in the log. Off (or
+   * absent): it is left out, and the item reads as it did before the field existed.
+   */
+  itemTool?: () => boolean;
   policy?: SessionPolicy;
   cwd?: string;
   /** Native session/thread id to resume on first open. */
@@ -220,6 +237,8 @@ interface ActiveTurn {
    * them consumed or not: neither requeues them nor makes the turn ambiguous.
    */
   context: InputRecord[];
+  /** U20: the turn is checked (its reply route was in scope as it started, or a checked route was added). */
+  checked?: boolean;
 }
 
 /** A turn the log shows open from a previous host process. */
@@ -285,6 +304,8 @@ export class Lane {
   private closeReason = 'lane closed';
   private detached = false;
   private dangling: Dangling | undefined;
+  /** U20: the last checked turn, whose answer must settle before the next turn starts. */
+  private checkedPending: string | undefined;
   /** The harness was opened (once) to give it a chance to adopt `dangling` before a new turn settles it. */
   private adoptionChecked = false;
   /** Provenance of recent turns, by turn id (bounded). */
@@ -364,6 +385,37 @@ export class Lane {
       this.indexCause(input);
       return { ok: true, disposition: 'observe_only' } as const;
     });
+  }
+
+  /**
+   * U20: a checked answer was held. Recorded as context at once (not behind `serial`: the next turn
+   * may be waiting in `settleGate` for exactly this), so the next turn reads it before its inputs.
+   * The same input id again is ignored.
+   */
+  heldNotice(input: InputRecord): void {
+    if (this.closed || this.observedInputs.has(input.inputId)) return;
+    this.recordContext(input);
+  }
+
+  /**
+   * U20: the card of a request was held by the exit check: the request settles as cancelled (the
+   * harness gets a deny with `message`), so the turn does not wait for an answer nobody can give.
+   */
+  cancelRequest(requestId: string, message: string): void {
+    if (!this.requests.has(requestId)) return;
+    void this.serial(() => this.settle(requestId, { kind: 'deny', message }, 'runtime_cancelled')).catch(() => undefined);
+  }
+
+  /**
+   * The running turn is also rendered on `route` (`run.start` with more `observe` routes than its
+   * reply route): `turn.delivery_added { reason: 'mirror' }`, with `checked` while a scope is declared
+   * (U20: a mirror in scope is checked like any added route, and makes the turn checked).
+   */
+  mirror(turnId: string, route: ReplyRoute): void {
+    const t = this.turn;
+    const at = t && t.turnId === turnId ? t : undefined;
+    const checked = at ? this.addedChecked(at, route) : this.routeChecked(route);
+    this.o.hub.append(this.sessionKey, { ts: Date.now(), turnId, level: 'detail', audience: 'status', durability: 'durable', body: { t: 'turn.delivery_added', turnId, route, reason: 'mirror', ...checked } });
   }
 
   /**
@@ -622,18 +674,20 @@ export class Lane {
    * Speak `text` in the running live. With an `operationId` (a tool call) it leaves the
    * record every side effect leaves (EX-2): a `delivery.settled` on the live's route in
    * this session's log, `delivered`, or `unknown` when the harness failed (it may have
-   * spoken part of it). Returns that outcome.
+   * spoken part of it). Returns that outcome. `kind` (U20, while settlements say what they were): the
+   * settlement carries it and its `turnId`, as the outbox's do.
    */
-  async liveSay(text: string, o: { operationId?: string; turnId?: string } = {}): Promise<{ route: ReplyRoute; result: 'delivered' | 'unknown' }> {
+  async liveSay(text: string, o: { operationId?: string; turnId?: string; kind?: OutboundKind } = {}): Promise<{ route: ReplyRoute; result: 'delivered' | 'unknown' }> {
     const live = this.live;
     if (!live || !this.session?.live) throw new Error('no live is running in this session');
     const record = (result: 'delivered' | 'unknown') => {
       if (o.operationId === undefined) return;
+      const detail = o.kind !== undefined ? { kind: o.kind, ...(o.turnId !== undefined ? { turnId: o.turnId } : {}) } : {};
       this.emit({
         ...(o.turnId !== undefined ? { turnId: o.turnId } : {}),
         level: 'detail',
         visibility: 'operators',
-        body: { t: 'delivery.settled', operationId: o.operationId, route: live.route, result },
+        body: { t: 'delivery.settled', operationId: o.operationId, route: live.route, result, ...detail },
       });
     };
     try {
@@ -667,6 +721,19 @@ export class Lane {
         this.adoptionChecked = true;
         setTimeout(() => void this.settleLeftover().catch(() => undefined), 0);
       }
+    });
+  }
+
+  /**
+   * Open the harness ahead of input the host expects soon (`session.prewarm`): the first turn does
+   * not wait for it to boot. No turn, nothing admitted. True when this call opened it; false when it
+   * was open already or the lane is closed.
+   */
+  prewarm(): Promise<boolean> {
+    return this.serial(async () => {
+      if (this.closed || this.session) return false;
+      await this.ensureSession(this.lastRun ?? (await this.policy.plan({ sessionKey: this.sessionKey, inputs: [] })));
+      return true;
     });
   }
 
@@ -762,7 +829,7 @@ export class Lane {
     if (t?.starting) {
       this.emit({
         turnId: t.turnId,
-        body: { t: 'turn.started', turnId: t.turnId, inputIds: t.inputs.map((i) => i.inputId), replyRoute: t.replyRoute, initiator: 'host', ...(t.run ? { run: t.run } : {}), ...(t.owner !== null ? { owner: t.owner } : {}) },
+        body: { t: 'turn.started', turnId: t.turnId, inputIds: t.inputs.map((i) => i.inputId), replyRoute: t.replyRoute, initiator: 'host', ...(t.run ? { run: t.run } : {}), ...(t.owner !== null ? { owner: t.owner } : {}), ...this.checkedField(t, t.replyRoute) },
       });
     }
     this.stopTimers(reason);
@@ -839,6 +906,32 @@ export class Lane {
 
   // ---- event helpers ------------------------------------------------------
 
+  /**
+   * U20: `{ checked }` for a turn event while a scope is declared (nothing otherwise). Decided once per
+   * turn, as it starts (`t.checked` keeps it); a route that leaves the scope later keeps the turn checked.
+   */
+  private checkedField(t: ActiveTurn | undefined, route: ReplyRoute | null): { checked?: boolean } {
+    if (t?.checked !== undefined) return { checked: t.checked };
+    const c = this.o.replyCheck?.(route);
+    if (c === undefined) return {};
+    if (t) t.checked = c;
+    return { checked: c };
+  }
+
+  /** U20: `{ checked }` of a route by the scope now (nothing without one). */
+  private routeChecked(route: ReplyRoute): { checked?: boolean } {
+    const c = this.o.replyCheck?.(route);
+    return c === undefined ? {} : { checked: c };
+  }
+
+  /** U20: `{ checked }` of a route added to a running turn; a checked one makes the turn checked from here on. */
+  private addedChecked(t: ActiveTurn, route: ReplyRoute): { checked?: boolean } {
+    const c = this.o.replyCheck?.(route);
+    if (c === undefined) return {};
+    if (c) t.checked = true;
+    return { checked: c };
+  }
+
   private emit(d: Partial<EventDraft> & Pick<EventDraft, 'body'>): SessionEvent {
     return this.o.hub.append(this.sessionKey, {
       ts: Date.now(),
@@ -852,7 +945,7 @@ export class Lane {
   }
 
   private emitHarness(e: HarnessEvent, gen: number, override: Partial<HarnessEvent> = {}): SessionEvent {
-    const merged = { ...e, ...override };
+    const merged = withoutTool({ ...e, ...override }, this.o.itemTool?.() === true);
     return this.o.hub.append(this.sessionKey, {
       ...merged,
       harness: this.adapter.id,
@@ -996,7 +1089,7 @@ export class Lane {
     const extra = input.replyRoute;
     if (extra && !sameRoute(extra, t.replyRoute) && !t.deliveries.some((d) => sameRoute(d, extra))) {
       t.deliveries.push(extra);
-      this.emit({ turnId: t.turnId, body: { t: 'turn.delivery_added', turnId: t.turnId, route: extra, reason: 'steer' } });
+      this.emit({ turnId: t.turnId, body: { t: 'turn.delivery_added', turnId: t.turnId, route: extra, reason: 'steer', ...this.addedChecked(t, extra) } });
     }
     return { ok: true, disposition: 'steer' };
   }
@@ -1331,6 +1424,12 @@ export class Lane {
     if (this.closed) this.rejectQueue();
     if (!this.turn && this.queue.length && !this.closed && (await this.awaitAdoption())) return;
     if (!this.turn && this.queue.length && !this.closed) this.settleDangling();
+    // U20: the next turn waits for the checked answer of the last one to settle (bounded by the gate).
+    if (!this.turn && this.queue.length && !this.closed && this.checkedPending !== undefined) {
+      const turnId = this.checkedPending;
+      this.checkedPending = undefined;
+      await this.o.settleGate?.(turnId).catch(() => undefined);
+    }
     while (!this.turn && this.queue.length && !this.closed) {
       const batch = this.takeBatch();
       const inputs = batch.map((q) => q.input);
@@ -1518,7 +1617,7 @@ export class Lane {
           };
           this.track(b.turnId, inputs);
           // The log records the run the lane planned; the harness's own (what it began under) is in the notice below when it differs.
-          this.emitHarness(e, gen, { body: { ...b, run } });
+          this.emitHarness(e, gen, { body: { ...b, run, ...this.checkedField(this.turn, null) } });
           this.refreshState();
           const stopped = b.inputIds.filter((id) => this.stoppedHandoffs.has(id));
           if (stopped.length) await this.interruptStopped(b.turnId, stopped);
@@ -1526,7 +1625,9 @@ export class Lane {
           return;
         }
         const ours = t && t.turnId === b.turnId;
-        const body = ours && b.owner === undefined && t.owner !== null ? { ...b, owner: t.owner } : b;
+        const owned = ours && b.owner === undefined && t.owner !== null ? { ...b, owner: t.owner } : b;
+        // U20: checked is decided here, as the turn starts (a turn not ours: by its own reply route).
+        const body = { ...owned, ...this.checkedField(ours ? t : undefined, ours ? t.replyRoute : b.replyRoute) };
         this.emitHarness(e, gen, { body });
         this.refreshState();
         if (ours && this.o.thinkingHeadline !== null) {
@@ -1553,10 +1654,13 @@ export class Lane {
             consumed: new Set(),
             foreignConsumed: false,
             context: [],
+            // U20: what the log said when the turn started survives the restart (replay keeps it).
+            ...(d?.checked !== undefined ? { checked: d.checked } : {}),
           };
           this.track(b.turnId, []);
         }
-        this.emitHarness(e, gen);
+        const at = this.turn && this.turn.turnId === b.turnId ? this.turn : undefined;
+        this.emitHarness(e, gen, { body: { ...b, ...this.checkedField(at, at?.replyRoute ?? null) } });
         this.refreshState();
         return;
       }
@@ -1583,6 +1687,7 @@ export class Lane {
         return;
       }
       case 'turn.completed':
+        if (t && t.turnId === b.turnId && t.checked) this.checkedPending = t.turnId;
         if (t && t.turnId === b.turnId) return this.finishTurn(t, b, e, gen);
         this.emitHarness(e, gen);
         return;
@@ -1613,7 +1718,10 @@ export class Lane {
     this.o.onTurnCompleted?.(t.turnId, status);
 
     const unconsumed = t.inputs.filter((i) => !t.consumed.has(i.inputId));
-    const retry = status === 'completed' || (status === 'failed' && b.error?.retryable === true);
+    // A turn the idle deadline ended (HC-3b) ran its own inputs; follow-ups it never started go on
+    // as the next turn instead of being rejected with it.
+    const retry =
+      status === 'completed' || (status === 'failed' && (b.error?.retryable === true || b.error?.code === STALL_REQUEUE_CODE));
     const limit = this.o.requeueLimit ?? 1;
     const requeue: Queued[] = [];
     const rejected: string[] = [];
@@ -1669,7 +1777,7 @@ export class Lane {
         const at = control && routeKey(control) === key ? control : this.o.routeOf?.(key);
         if (!at || sameRoute(t.replyRoute, at) || t.deliveries.some((d) => sameRoute(d, at))) continue;
         t.deliveries.push(at);
-        this.emit({ turnId: t.turnId, body: { t: 'turn.delivery_added', turnId: t.turnId, route: at, reason: 'approval' } });
+        this.emit({ turnId: t.turnId, body: { t: 'turn.delivery_added', turnId: t.turnId, route: at, reason: 'approval', ...this.addedChecked(t, at) } });
       }
     }
     // A request without a turn id opened during a turn belongs to it; one opened while idle to no turn.
@@ -1816,6 +1924,14 @@ function decisionAllowed(b: BodyOf<'request.opened'>, d: Decision): boolean {
   return b.allowedDecisions.length === 0 || b.allowedDecisions.includes(d.kind);
 }
 
+/** HC-7: an item's `tool` stays only where it is asked for (`LaneOptions.itemTool`). */
+function withoutTool(e: HarnessEvent, keep: boolean): HarnessEvent {
+  const b = e.body;
+  if (keep || (b.t !== 'item.started' && b.t !== 'item.completed') || b.item.tool === undefined) return e;
+  const { tool: _tool, ...item } = b.item;
+  return { ...e, body: { ...b, item } };
+}
+
 function audienceFor(r: Resolver, fallback: SessionEvent['audience']): SessionEvent['audience'] {
   return r.kind === 'human' || r.kind === 'host' ? 'approval' : fallback === 'approval' ? 'status' : fallback;
 }
@@ -1830,6 +1946,8 @@ function visibilityOf(e: HarnessEvent): Visibility {
  * Principal of an admitted input; inputs that arrived via a watch also carry the
  * record itself, so the target session's log shows what arrived and from where.
  */
+/** `turn.completed` error code of a turn the harness's idle deadline ended (HC-3b): its unconsumed inputs are re-queued. */
+export const STALL_REQUEUE_CODE = 'idle_timeout';
 /** `input.rejected` reason prefix: the lane closed (stop, restart, detach) with the input still queued. */
 export const LANE_CLOSED = 'lane_closed';
 /** `input.rejected` reason: an earlier host process left the input unsettled (a crash, or its turn was never adopted). */

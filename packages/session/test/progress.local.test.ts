@@ -65,6 +65,49 @@ describe('ProgressView folding', () => {
     ]);
   });
 
+  it('finalAnswer: only a final snapshot of a turn that runs or completed; the end does not make text so far one', () => {
+    const turnOf = (...bodies: [Body, Partial<HarnessEvent>?][]) => {
+      const v = newTurnView('t1');
+      for (const [b, x] of bodies) foldTurn(v, ev(b, x ?? {}));
+      return v;
+    };
+    const said: [Body, Partial<HarnessEvent>][] = [
+      [{ t: 'text.delta', delta: 'Reading the DM.', stream: 'answer' }, { audience: 'answer' }],
+      [{ t: 'item.started', item: tool('i1', 'chatlog read', 'running') }, {}],
+      [{ t: 'item.completed', item: tool('i1', 'chatlog read', 'completed') }, {}],
+      [{ t: 'text.delta', delta: 'Found: they', stream: 'answer' }, { audience: 'answer' }],
+    ];
+    const snapshot = (text: string): [Body, Partial<HarnessEvent>] => [{ t: 'text.snapshot', text, final: true }, { audience: 'answer' }];
+    const end = (status: 'completed' | 'failed' | 'interrupted' | 'ambiguous'): [Body] => [{ t: 'turn.completed', turnId: 't1', status }];
+
+    const answered = turnOf(...said, snapshot('They plan a hike.'));
+    expect(progressOf(answered).finalAnswer).toBe(true); // while it runs
+    foldTurn(answered, ev(...end('completed')));
+    expect(progressOf(answered)).toMatchObject({ status: 'completed', answer: 'They plan a hike.', finalAnswer: true });
+    expect(renderTurn(answered, 'card').text).toBe('They plan a hike.');
+
+    for (const status of ['failed', 'interrupted', 'ambiguous'] as const) {
+      const cut = turnOf(...said, end(status));
+      // Ends that show text so far still get it: the flat text, the answer of the process view.
+      expect(renderTurn(cut, 'card').text, status).toBe('Reading the DM.Found: they');
+      expect(renderTurn(cut, 'final').text, status).toBe('Reading the DM.Found: they');
+      expect(progressOf(cut), status).toMatchObject({ status, answer: 'Found: they', answerFinal: true });
+      expect(progressOf(cut).finalAnswer, status).toBeUndefined();
+      expect(cut.finalText, status).toBeNull();
+      // A final snapshot of a turn that did not complete is not its answer (HC-3b: what it said so far and a notice).
+      const stalled = turnOf(...said, snapshot('Found: they\n\n(This turn stopped.)'), end(status));
+      expect(renderTurn(stalled, 'card').text, status).toBe('Found: they\n\n(This turn stopped.)');
+      expect(progressOf(stalled).finalAnswer, status).toBeUndefined();
+    }
+    // Completed with no final snapshot: text so far, not an answer.
+    const silent = turnOf(...said, end('completed'));
+    expect(renderTurn(silent, 'card').text).toBe('Reading the DM.Found: they');
+    expect(progressOf(silent).finalAnswer).toBeUndefined();
+    // A turn that moved to another topic: its line is the compositor's own.
+    const moved = turnOf(...said, [{ t: 'topic.changed', conversation: 'c1', from: 'a', to: 'b', reason: 'agent', title: 'Hike' }], end('completed'));
+    expect(renderTurn(moved, 'card').progress).toMatchObject({ answer: '→ Moved to topic "Hike"', finalAnswer: true });
+  });
+
   it('attaches progress on card/full tiers only, and a stop action when asked', () => {
     const v = newTurnView('t1');
     foldTurn(v, ev({ t: 'text.delta', delta: 'hi', stream: 'answer' }, { audience: 'answer' }));

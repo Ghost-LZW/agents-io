@@ -146,6 +146,21 @@ describe('end to end: channel → ingress → lane → harness → compositor �
     expect(w.channel.sent[1]!.msg).toEqual({ text: 'answer' });
     expect(w.channel.sent.every((s) => s.edits.length === 0)).toBe(true);
   });
+
+  it("the host's heading starts the ask in its people's language #RQ-5", async () => {
+    const caps: ChannelCaps = { ...defaultChannelCaps, edit: false, buttons: false, defaultTier: 'final' };
+    const w = world(
+      async (t) => {
+        t.emit({ t: 'request.opened', requestId: 'r1', kind: 'tool_approval', title: 'rm', risk: {}, allowedDecisions: ['allow_once', 'deny'], allowAlways: false, defaultDeny: true });
+        await t.waitDecision('r1');
+        t.emit({ t: 'text.snapshot', text: 'answer', final: true }, { audience: 'answer' });
+      },
+      { caps, policy: { resolve: async () => ({ kind: 'human', principals: ['fake:alice'], routes: [], heading: '需要批准：', note: '删除文件' }) } },
+    );
+    await w.channel.inject({ sender: alice, text: 'go' });
+    await until(() => w.channel.sent.length === 1);
+    expect(w.channel.sent[0]!.msg).toEqual({ text: '需要批准：rm\n删除文件' });
+  });
 });
 
 describe('end to end: rejected inputs reach the sender', () => {

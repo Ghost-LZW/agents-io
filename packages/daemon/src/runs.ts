@@ -393,7 +393,8 @@ export class Runs {
       run.turnId = b.turnId;
       // More observers than the input's reply route: the compositors render the turn there too.
       for (const route of run.observe.slice(1)) {
-        this.d.hub.append(run.sessionKey, { ts: Date.now(), turnId: b.turnId, level: 'detail', audience: 'status', durability: 'durable', body: { t: 'turn.delivery_added', turnId: b.turnId, route, reason: 'mirror' } });
+        // The lane writes it: a mirror in an outbound.scoped host's scope is checked (U20).
+        run.lane.mirror(b.turnId, route);
       }
       return false;
     }
