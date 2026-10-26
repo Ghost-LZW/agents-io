@@ -362,6 +362,8 @@ export class Gateway {
   /** Running lives (decision 11), by session: the channel's media peer of each. */
   /** Sessions with a live_join still opening its endpoint (the claim that keeps it to one live). */
   private readonly joining = new Set<string>();
+  /** `conversation.create` in flight or done, by channel, account and operationId (one conversation each). */
+  private readonly creating = new Map<string, Promise<{ conversationId: string }>>();
   private readonly lives = new Map<string, { liveId: string; endpoint: LiveEndpoint; channel: RunningChannel }>();
   /** Agent and working directory of each live lane. */
   private readonly laneInfo = new Map<string, { agent: AgentConfig; cwd?: string }>();
@@ -556,6 +558,8 @@ export class Gateway {
       records: this.records,
       runs: this.runs,
       deliver: (name, f) => this.deliver(name, f),
+      deliverUpdate: (name, f) => this.deliverUpdate(name, f),
+      createConversation: (f) => this.createConversation(f),
       prepareSession: (f) => this.prepareSession(f),
       redispatch: (name, f) => this.redispatch(name, f),
       compactSession: (f, origin) => this.compactSession(f, origin),
@@ -1844,6 +1848,73 @@ export class Gateway {
     // The host's own message: it checked it itself; the settlement says what it is (U20).
     const rec = await this.outbox.send(ch.adapter, { operationId, sessionKey: `host:${hostName}`, route: { ...f.route, account: ch.account }, msg: f.message, kind: 'host', exitChecked: true });
     return { ok: true, value: { ...rec, operationId: f.operationId, duplicate: false } };
+  }
+
+  /**
+   * `deliver.update`: edit a message a host `deliver` sent, through the channel's own edit (and
+   * finalize, with `final`). A final update goes through the outbox (once per operationId);
+   * the others are cosmetic and not recorded.
+   */
+  async deliverUpdate(hostName: string, f: Extract<HostRequestFrame, { type: 'deliver.update' }>): Promise<Outcome> {
+    if (this.stopped) return fail('stopped', 'daemon is stopping');
+    if (!f.operationId) return fail('invalid_frame', 'operationId is empty');
+    if (!f.providerMessageId) return fail('invalid_frame', 'providerMessageId is empty');
+    const ch = this.channelFor(f.route);
+    if (!ch) return fail('unknown_channel', this.noChannelMessage(f.route));
+    const adapter = ch.adapter;
+    if (!adapter.edit) return fail('unsupported', `channel ${adapter.id} cannot edit a sent message`);
+    const route = { ...f.route, account: ch.account };
+    const id = f.providerMessageId;
+    const answer = (rec: { status: string; error?: string }, duplicate: boolean) =>
+      ({ ok: true as const, value: { operationId: f.operationId, providerMessageId: id, status: rec.status, ...(rec.error !== undefined ? { error: rec.error } : {}), duplicate } });
+    if (f.final) {
+      const operationId = `host:${f.operationId}`;
+      const settled = this.outbox.get(operationId);
+      if (settled) return answer(settled, true);
+      const rec = await this.outbox.deliver({ operationId, sessionKey: `host:${hostName}`, route, kind: 'host', exitChecked: true }, async () => {
+        if (adapter.finalize) await adapter.finalize(route, id, f.message);
+        else await adapter.edit!(route, id, f.message, { operationId, sequence: f.sequence });
+        return { providerMessageId: id };
+      });
+      return answer(rec, false);
+    }
+    try {
+      await adapter.edit(route, id, f.message, { operationId: `host:${f.operationId}`, sequence: f.sequence });
+      return answer({ status: 'delivered' }, false);
+    } catch (e) {
+      return answer({ status: 'rejected', error: (e as Error).message }, false);
+    }
+  }
+
+  /** `conversation.create`: a conversation made by the channel (a Lark group), once per operationId. */
+  async createConversation(f: Extract<HostRequestFrame, { type: 'conversation.create' }>): Promise<Outcome> {
+    if (this.stopped) return fail('stopped', 'daemon is stopping');
+    if (!f.operationId) return fail('invalid_frame', 'operationId is empty');
+    if (!f.name.trim()) return fail('invalid_frame', 'name is empty');
+    const ch = this.channelFor(f);
+    if (!ch) return fail('unknown_channel', this.noChannelMessage(f));
+    if (!ch.adapter.createConversation) return fail('unsupported', `channel ${ch.adapter.id} cannot create a conversation`);
+    const key = `${ch.adapter.id}\u0000${ch.account}\u0000${f.operationId}`;
+    const prior = this.creating.get(key);
+    const duplicate = prior !== undefined;
+    const run = prior ?? ch.adapter.createConversation(ch.account, {
+      operationId: f.operationId,
+      name: f.name,
+      ...(f.description !== undefined ? { description: f.description } : {}),
+      ...(f.owner !== undefined ? { owner: f.owner } : {}),
+      members: f.members ?? [],
+    });
+    if (!prior) {
+      this.creating.set(key, run);
+      if (this.creating.size > 256) this.creating.delete(this.creating.keys().next().value!);
+      run.catch(() => this.creating.delete(key));
+    }
+    try {
+      const { conversationId } = await run;
+      return { ok: true, value: { operationId: f.operationId, channel: ch.adapter.id, account: ch.account, conversationId, duplicate } };
+    } catch (e) {
+      return fail('channel_error', (e as Error).message);
+    }
   }
 
   // ---- topics (decision 6) -------------------------------------------------

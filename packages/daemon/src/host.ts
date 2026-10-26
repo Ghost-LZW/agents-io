@@ -55,6 +55,10 @@ export interface HostServiceDeps {
   records: DaemonRecords;
   runs: Runs;
   deliver(hostName: string, f: Extract<HostRequestFrame, { type: 'deliver' }>): Promise<Outcome>;
+  /** `deliver.update`: edit (or, `final`, finalize) a message a `deliver` sent. */
+  deliverUpdate(hostName: string, f: Extract<HostRequestFrame, { type: 'deliver.update' }>): Promise<Outcome>;
+  /** `conversation.create`: a conversation the channel makes (a Lark group). */
+  createConversation(f: Extract<HostRequestFrame, { type: 'conversation.create' }>): Promise<Outcome>;
   /** `session.prepare`: pin an agent and a launch to a session key (decision 7). */
   prepareSession(f: Extract<HostRequestFrame, { type: 'session.prepare' }>): Outcome;
   /** `inbound.redispatch`: deliver a queued host-inbound item to a session with its original origin. */
@@ -232,6 +236,10 @@ export class HostService implements HostFrames {
         return this.d.runs.cancel(f.runId, f.reason);
       case 'deliver':
         return this.d.deliver(peer.auth!.name, f);
+      case 'deliver.update':
+        return this.d.deliverUpdate(peer.auth!.name, f);
+      case 'conversation.create':
+        return this.d.createConversation(f);
       case 'input.verify':
         return ok(this.d.records.verify(f.channelRef));
       case 'inbound.read': {
@@ -505,6 +513,8 @@ export const FEATURES = [
   'reply.check',
   'callout.history',
   'item.tool',
+  'deliver.update',
+  'conversation.create',
 ];
 
 /** `DaemonRecords` flag: the name of the host that declared the `outbound` hook. */

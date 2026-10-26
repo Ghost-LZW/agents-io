@@ -12,6 +12,8 @@ import {
   type SessionPrewarmResult,
   type TestFaultResult,
   type TestReplayResult,
+  type DeliverUpdateResult,
+  type ConversationCreateResult,
   type SessionLaunch,
   type SessionScope,
   type RenderedMessage,
@@ -260,6 +262,16 @@ export class LocalClient {
 
   deliver(o: { operationId: string; route: ReplyRoute; message: RenderedMessage }): Promise<{ operationId: string; status: string; attempts: number; providerMessageId?: string; providerThreadId?: string; error?: string; duplicate: boolean }> {
     return this.call('deliver', o);
+  }
+
+  /** Edit (with `final`, finalize) a message a `deliver` sent (`deliver.update`). */
+  deliverUpdate(o: { operationId: string; route: ReplyRoute; providerMessageId: string; message: RenderedMessage; sequence: number; final?: boolean }): Promise<DeliverUpdateResult> {
+    return this.call('deliver.update', o);
+  }
+
+  /** A conversation made by a channel, e.g. a Lark group (`conversation.create`). */
+  conversationCreate(o: { operationId: string; channel: string; account: string; name: string; description?: string; owner?: string; members?: string[] }): Promise<ConversationCreateResult> {
+    return this.call('conversation.create', o);
   }
 
   verify(channelRef: string): Promise<VerifyResult> {

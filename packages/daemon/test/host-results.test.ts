@@ -33,7 +33,13 @@ describe('host result values', () => {
     valid('explain', await t.explain(r.inputId!));
     valid('input.verify', await t.verify('channel:fake/m1'));
     valid('input.verify', await t.verify('channel:fake/never'));
-    valid('deliver', await t.deliver({ operationId: 'op', route: { channel: 'fake', account: 'default', conversationId: 'dm-alice' }, message: { text: 'x' } }));
+    const route = { channel: 'fake', account: 'default', conversationId: 'dm-alice' };
+    const sent = await t.deliver({ operationId: 'op', route, message: { text: 'x' } });
+    valid('deliver', sent);
+    const id = sent.providerMessageId!;
+    valid('deliver.update', await t.deliverUpdate({ operationId: 'op:1', route, providerMessageId: id, message: { text: 'y' }, sequence: 1 }));
+    valid('deliver.update', await t.deliverUpdate({ operationId: 'op:2', route, providerMessageId: id, message: { text: 'z' }, sequence: 2, final: true }));
+    valid('conversation.create', await t.conversationCreate({ operationId: 'g1', channel: 'fake', account: 'default', name: 'bench', members: ['alice'] }));
 
     valid('run.start', await t.runStart({ runId: 'r1', agent: 'exec', cwd: w.dir, input: [{ type: 'text', text: 'go' }] }));
     expect(errors(RunEnded, await t.runEndedOf('r1'))).toEqual([]);

@@ -151,6 +151,15 @@ export const SendResult = Type.Object({
 });
 export type SendResult = Static<typeof SendResult>;
 
+/** What `ChannelAdapter.createConversation` makes. */
+export interface ConversationSpec {
+  operationId: string;
+  name: string;
+  description?: string;
+  owner?: string;
+  members: string[];
+}
+
 /** Host-provided blob storage, so adapters never inline large payloads. */
 export interface BlobStore {
   put(bytes: Uint8Array, meta: { mime: string; name?: string }): Promise<string>;
@@ -226,6 +235,12 @@ export interface ChannelAdapter {
    * (a missing permission, a timeout): the message goes on without history.
    */
   history?(env: InboundEnvelope, scope: HistoryScope): Promise<InboundEnvelope[]>;
+  /**
+   * Create a conversation with the bot in it (a Lark group): `members` and `owner` are channel
+   * user ids of this channel. Resolves with its id. `operationId` must never make two (the
+   * platform's dedup where it has one). Rejects for platform errors (a missing permission).
+   */
+  createConversation?(account: string, spec: ConversationSpec): Promise<{ conversationId: string }>;
   /** After restart: is a previously sent (streaming) message still editable? */
   reconcile?(route: ReplyRoute, providerMessageId: string): Promise<'alive' | 'gone'>;
   /**

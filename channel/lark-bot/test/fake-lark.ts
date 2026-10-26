@@ -36,6 +36,8 @@ export class FakeLark {
   readonly byUuid = new Map<string, PlatformMessage>();
   readonly cards = new Map<string, FakeCard>();
   readonly cots: CotRecord[] = [];
+  /** `POST /im/v1/chats` requests, in order. */
+  readonly createdChats: { params: any; data: any }[] = [];
   /** Codes to answer the next calls of an op with (`card.create`, `cardElement.content`, `cot.create`, `cot.put`, `message.patch`…). */
   readonly fail = new Map<string, number[]>();
   /** Every CardKit / CoT call in order, for asserting sequences. */
@@ -184,6 +186,13 @@ export class FakeLark {
         if (e.event_type === 'RUN_FINISHED') rec.completed = 'finished';
       }
       return { code: 0, data: {} };
+    }
+    if (opts.url === '/open-apis/im/v1/chats' && opts.method === 'POST') {
+      this.log.push('chat.create');
+      const f = this.failing('chat.create');
+      if (f) return f;
+      this.createdChats.push({ params: opts.params, data: opts.data });
+      return { code: 0, data: { chat_id: `oc_made${this.createdChats.length}` } };
     }
     const done = /^\/open-apis\/im\/v1\/message_cot\/complete\/(.+)$/.exec(opts.url);
     if (done && opts.method === 'POST') {
