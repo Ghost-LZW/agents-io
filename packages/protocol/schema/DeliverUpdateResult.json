@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/DeliverUpdateResult",
+  "type": "object",
+  "required": [
+    "operationId",
+    "providerMessageId",
+    "status",
+    "duplicate"
+  ],
+  "properties": {
+    "operationId": {
+      "type": "string"
+    },
+    "providerMessageId": {
+      "type": "string"
+    },
+    "status": {
+      "anyOf": [
+        {
+          "const": "delivered",
+          "type": "string"
+        },
+        {
+          "const": "rejected",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "type": "string"
+        }
+      ]
+    },
+    "error": {
+      "type": "string"
+    },
+    "duplicate": {
+      "type": "boolean"
+    }
+  }
+}

@@ -6,6 +6,7 @@ import type {
   ChannelAdapter,
   ChannelCaps,
   ChannelContext,
+  ConversationSpec,
   EmitResult,
   HistoryScope,
   InboundEnvelope,
@@ -786,6 +787,41 @@ export class LarkBotAdapter implements ChannelAdapter {
     this.procs.delete(id);
   }
 
+  /**
+   * A group with the bot in it (`POST /im/v1/chats`, the bot made a manager): needs
+   * `im:chat:create` (or `im:chat`). `uuid` from the operationId: Lark makes at most one group
+   * per uuid within an hour. Members by union_id / open_id / user_id, as the ids look.
+   */
+  async createConversation(account: string, spec: ConversationSpec): Promise<{ conversationId: string }> {
+    if (this.started && account !== this.account) {
+      throw Object.assign(new LarkApiError('chat.create', undefined, `account ${JSON.stringify(account)} given to the bot of account ${JSON.stringify(this.account)}`), { retryable: false });
+    }
+    const ids = [...new Set([...(spec.owner ? [spec.owner] : []), ...spec.members])];
+    const kinds = new Set(ids.map(userIdType));
+    if (kinds.size > 1) throw new LarkApiError('chat.create', undefined, 'members must all be union_ids, open_ids or user_ids');
+    const type = [...kinds][0] ?? 'open_id';
+    const uuid = uuidFor(this.account, `chat:${spec.operationId}`, 0);
+    const res = await this.api('chat.create', async () =>
+      (await this.client.request({
+        method: 'POST',
+        url: '/open-apis/im/v1/chats',
+        params: { user_id_type: type, set_bot_manager: true, uuid },
+        data: {
+          name: spec.name,
+          ...(spec.description ? { description: spec.description } : {}),
+          ...(spec.owner ? { owner_id: spec.owner } : {}),
+          ...(ids.length ? { user_id_list: ids } : {}),
+          chat_mode: 'group',
+          chat_type: 'private',
+        },
+      })) as { code?: number; msg?: string; data?: { chat_id?: string } },
+    );
+    const conversationId = res.data?.chat_id;
+    if (!conversationId) throw new LarkApiError('chat.create', undefined, 'no chat_id returned');
+    bounded(this.chatKinds, conversationId, 'group');
+    return { conversationId };
+  }
+
   async reconcile(_route: ReplyRoute, providerMessageId: string): Promise<'alive' | 'gone'> {
     try {
       const res = await this.api('message.get', () => this.client.im.v1.message.get({ path: { message_id: providerMessageId } }));
@@ -1165,8 +1201,14 @@ export class LarkBotAdapter implements ChannelAdapter {
     if (op.as) await this.store.set(id, op.as);
     bounded(this.procs, id, st);
     this.previews.delete(previewKey);
+    // Sent already done (no edit or finalize will follow): the bubble settles now, and an answer too long for the card goes on in more messages.
+    const first = (st.card && st.card === pending.card && pending.shown) || this.model(msg, p, st);
+    if (first.done) {
+      this.feedCot(st, p, true);
+      await this.sendOverflow(route, id, first);
+    }
     // A reused card shows what it was created with, so the first edit sends the differences from that.
-    this.initSent(st, (st.card && st.card === pending.card && pending.shown) || this.model(msg, p, st));
+    this.initSent(st, first);
     for (const [i, part] of this.attachmentParts(msg).entries()) await this.sendOne(route, part.out, uuidFor(this.account, op.operationId, i + 1));
     this.pendingProcs.delete(op.operationId);
     return { providerMessageId: id, ...(threadId ? { providerThreadId: threadId } : {}) };
@@ -1219,12 +1261,15 @@ export class LarkBotAdapter implements ChannelAdapter {
     }
     if (st.level === 'update') await this.applyFull(id, st, m, final);
     else if (st.level === 'patch') await this.patchProcess(id, st, m);
-    if (final && m.overflow.length) {
-      // The answer did not fit the card: the rest follows as plain cards, each within the message limit.
-      const pages = m.overflow.flatMap((page) => splitMarkdown(page, this.cfg.maxCardBytes - 2000));
-      for (const [i, page] of pages.entries()) {
-        await this.sendOne(route, cardMessage({ schema: '2.0', config: { width_mode: 'fill' }, body: { elements: [{ tag: 'markdown', content: page }] } }), uuidFor(this.account, `${id}:more`, i));
-      }
+    if (final) await this.sendOverflow(route, id, m);
+  }
+
+  /** The answer did not fit the card: the rest follows as plain cards, each within the message limit. */
+  private async sendOverflow(route: ReplyRoute, id: string, m: ProcessModel): Promise<void> {
+    if (!m.overflow.length) return;
+    const pages = m.overflow.flatMap((page) => splitMarkdown(page, this.cfg.maxCardBytes - 2000));
+    for (const [i, page] of pages.entries()) {
+      await this.sendOne(route, cardMessage({ schema: '2.0', config: { width_mode: 'fill' }, body: { elements: [{ tag: 'markdown', content: page }] } }), uuidFor(this.account, `${id}:more`, i));
     }
   }
 
@@ -1306,6 +1351,11 @@ export class LarkBotAdapter implements ChannelAdapter {
     await this.api('message.patch', () => this.client.im.v1.message.patch({ data: { content: json }, path: { message_id: id } }));
     st.lastCard = json;
   }
+}
+
+/** The Lark id type of a user id, by its prefix: union_id `on_`, open_id `ou_`, else user_id. */
+export function userIdType(id: string): 'union_id' | 'open_id' | 'user_id' {
+  return id.startsWith('on_') ? 'union_id' : id.startsWith('ou_') ? 'open_id' : 'user_id';
 }
 
 /**

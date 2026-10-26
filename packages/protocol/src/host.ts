@@ -349,6 +349,43 @@ export const RunCancel = Type.Object({ ...Req('run.cancel'), runId: Type.String(
 export const Deliver = Type.Object({ ...Req('deliver'), operationId: Type.String(), route: ReplyRoute, message: RenderedMessage });
 export type Deliver = Static<typeof Deliver>;
 
+/**
+ * Edit a message the host delivered (feature `deliver.update`): `providerMessageId` as its
+ * `deliver` answered. `sequence` grows with each update of that message (a lower or equal one
+ * is stale and skipped). `final` settles it (a channel's finalize: a process card's last layout,
+ * its thinking bubble closed, an answer too long for the card continued in more messages); a
+ * final update is idempotent per operationId, others are not recorded. A channel that cannot
+ * edit answers `unsupported`.
+ */
+export const DeliverUpdate = Type.Object({
+  ...Req('deliver.update'),
+  operationId: Type.String(),
+  route: ReplyRoute,
+  providerMessageId: Type.String(),
+  message: RenderedMessage,
+  sequence: Type.Integer({ minimum: 1 }),
+  final: Type.Optional(Type.Boolean()),
+});
+export type DeliverUpdate = Static<typeof DeliverUpdate>;
+
+/**
+ * Create a conversation on a channel (feature `conversation.create`), e.g. a Lark group with
+ * the bot in it: `members` are channel user ids (the namespace of `sender.channelUserId`),
+ * `owner` one of them. At most one conversation per operationId (the channel's own dedup,
+ * where it has one, and the daemon's while it runs). A channel that cannot answers `unsupported`.
+ */
+export const ConversationCreate = Type.Object({
+  ...Req('conversation.create'),
+  operationId: Type.String(),
+  channel: Type.String(),
+  account: Type.String(),
+  name: Type.String(),
+  description: Type.Optional(Type.String()),
+  owner: Type.Optional(Type.String()),
+  members: Type.Optional(Type.Array(Type.String())),
+});
+export type ConversationCreate = Static<typeof ConversationCreate>;
+
 /** Platform author and evidence of a channel message, e.g. to verify who confirmed something. */
 export const InputVerify = Type.Object({ ...Req('input.verify'), channelRef: Type.String() });
 
@@ -460,7 +497,7 @@ export type TestFault = Static<typeof TestFault>;
 export const HostOutboundScope = Type.Object({ ...Req('host.outboundScope'), routes: Type.Array(OutboundScopeRoute) });
 export type HostOutboundScope = Static<typeof HostOutboundScope>;
 
-export const HostRequestFrame = Type.Union([HostHello, BindingsPut, BindingsGet, RunStart, RunCancel, Deliver, InputVerify, InboundRead, InboundAck, Explain, SessionPrepare, InboundRedispatch, SessionCompact, SessionPrewarm, TestReplay, TestFault, HostOutboundScope]);
+export const HostRequestFrame = Type.Union([HostHello, BindingsPut, BindingsGet, RunStart, RunCancel, Deliver, DeliverUpdate, ConversationCreate, InputVerify, InboundRead, InboundAck, Explain, SessionPrepare, InboundRedispatch, SessionCompact, SessionPrewarm, TestReplay, TestFault, HostOutboundScope]);
 export type HostRequestFrame = Static<typeof HostRequestFrame>;
 
 // ---- daemon → host --------------------------------------------------------
@@ -677,7 +714,7 @@ export type ContactCalloutAnswer = Static<typeof ContactCalloutAnswer>;
 export const HostEventFrame = Type.Union([InboundFrame, RouteCallout, ResolveCallout, ReviewCallout, OutboundCallout, ContactCallout, ExternalCallout, RunEnded, ResultFrame]);
 export type HostEventFrame = Static<typeof HostEventFrame>;
 
-export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare', 'inbound.redispatch', 'session.compact', 'session.prewarm', 'test.replay', 'test.fault', 'host.outboundScope'] as const;
+export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'deliver.update', 'conversation.create', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare', 'inbound.redispatch', 'session.compact', 'session.prewarm', 'test.replay', 'test.fault', 'host.outboundScope'] as const;
 export const HOST_EVENT_FRAME_TYPES = ['inbound', 'policy', 'run.ended', 'result'] as const;
 
 // ---- result values --------------------------------------------------------
@@ -783,6 +820,26 @@ export const DeliverResult = Type.Object({
   duplicate: Type.Boolean(),
 });
 export type DeliverResult = Static<typeof DeliverResult>;
+
+/** `deliver.update`. `duplicate`: a final update with this operationId was applied before. */
+export const DeliverUpdateResult = Type.Object({
+  operationId: Type.String(),
+  providerMessageId: Type.String(),
+  status: Type.Union([Type.Literal('delivered'), Type.Literal('rejected'), Type.Literal('unknown')]),
+  error: Type.Optional(Type.String()),
+  duplicate: Type.Boolean(),
+});
+export type DeliverUpdateResult = Static<typeof DeliverUpdateResult>;
+
+/** `conversation.create`: the new conversation's id (a route's `conversationId`). */
+export const ConversationCreateResult = Type.Object({
+  operationId: Type.String(),
+  channel: Type.String(),
+  account: Type.String(),
+  conversationId: Type.String(),
+  duplicate: Type.Boolean(),
+});
+export type ConversationCreateResult = Static<typeof ConversationCreateResult>;
 
 /** What the daemon recorded about one channel message for one receiving account. Never a guess. */
 export const VerifiedInput = Type.Object({
@@ -1018,6 +1075,8 @@ export const HOST_RESULT_VALUES = {
   'run.start': RunStartResult,
   'run.cancel': RunCancelResult,
   deliver: DeliverResult,
+  'deliver.update': DeliverUpdateResult,
+  'conversation.create': ConversationCreateResult,
   'input.verify': InputVerifyResult,
   'inbound.read': InboundReadResult,
   'inbound.ack': InboundAckResult,

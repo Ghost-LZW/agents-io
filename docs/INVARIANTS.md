@@ -204,6 +204,16 @@
 - **测试**：标签 `#DL-7`；`packages/daemon/test/u20-exit.test.ts`（含真重启、`inbound.redispatch`、`attachmentText`、`outbound.content`、宿主 `deliver` 与陌生人提示的 `kind`）、`packages/session/test/withhold.test.ts`（含中途受检的卡片按路由结算）、`packages/session/test/exit-kinds.test.ts`（话题标题 `kind: "title"`、拒收提示 `kind: "notice"`）；`u20-exit.test.ts` 的 "review of 3653cb0"（`deny` 和 `hold` 一致、范围清掉后失败关闭、`steer` 中途加进来的路由受检、宿主 `input` 的 `checked: false`、`session_rotate` 标题和摘要先问、不放行时摘要不记、交给新话题的摘要对外遮住）；`withhold.test.ts` 的 "withholding the agent's session_rotate"（受检的一轮里工具条目等 `check`、`held` 一直遮、没问到也遮、只有标题没有 `tool` 也认得、新话题里的摘要、同一轮两次调用各按自己的 `check`、并行调用）；`u20-exit.test.ts` 的 "session_rotate called three times in one checked turn"（真守护进程：问之前报错的、放行后被拒的都遮，只放开被放行的那次）；`packages/daemon/test/topic-title.local.test.ts`（提示词不含没过检的回答）；`packages/daemon/test/live.test.ts`（`live_say` 的 `kind: "live"`）。
 - **状态**：有测试。后台起标题整条路径（Codex 起标题）只有提示词的单元测试和 `session_rotate` 的守护进程级测试，没有守护进程级的 Codex 测试。
 
+### DL-8 宿主改它发过的消息：最后一次按 operationId 只做一次；建会话按 operationId 只建一个
+
+- **承诺**：宿主的 `deliver.update { operationId, route, providerMessageId, message, sequence, final? }`（feature `deliver.update`）经 `(channel, account)` 选中的通道（DL-4 的规则，找不到答 `unknown_channel`）改一条它 `deliver` 过的消息；通道不能改答 `unsupported`。`final: true` 经 outbox（`host:` 命名空间，DL-1、DL-2）调用通道的 `finalize`（没有时 `edit`），同一个 operationId 只做一次，再来答 `duplicate: true`；中间的更新不经 outbox、不记录（同卡片流式编辑），通道拒绝时答 `status: "rejected"` 而不是报错，`sequence` 不大于上一次的被通道当作过期丢掉。`conversation.create { operationId, channel, account, name, … }`（feature `conversation.create`）由通道建一个会话（飞书：私有群，机器人为管理员），守护进程运行期间同一个 `(channel, account, operationId)` 只建一个、再来答同一个 id 与 `duplicate: true`；跨重启靠通道自己的去重（飞书 `uuid`：一小时内同一个 uuid 只建一个群）。
+- **实现**：`packages/daemon/src/gateway.ts` `deliverUpdate`、`createConversation`（`creating`）；`packages/daemon/src/host.ts`（`deliver.update`、`conversation.create`、`FEATURES`）；`packages/protocol/src/host.ts` `DeliverUpdate`、`ConversationCreate` 与结果；`packages/protocol/src/channel.ts` `ChannelAdapter.createConversation`；`channel/lark-bot/src/adapter.ts` `createConversation`。
+- **测试**：标签 `#DL-8`；`packages/daemon/test/host-deliver-update.test.ts` "edits a delivered message, finalizes it once per operationId, and refuses what it cannot #DL-8"、"has the channel make one conversation per operationId #DL-8"。
+- **状态**：有测试。
+- **细节（按原则自决，决定 13）**：
+  1. 中间的更新不记录：它们是进度，丢一帧无妨（RECOMMENDATION §3.1）；最后一次决定消息停在什么样子，所以要恰好一次。
+  2. 不检查 `providerMessageId` 是否真是这个宿主发的：宿主凭 token 说话（HQ-6），通道只能改本机器人发的消息。
+
 ---
 
 ## 3. 宿主入站队列与补投（HQ）

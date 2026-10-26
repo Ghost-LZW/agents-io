@@ -231,6 +231,8 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
   - 通道条目上的 `ack`：收到的消息上点一个表情（默认 `OnIt`），这一轮及时回复了就撤掉；回复晚于 `doneAfterMs`（默认 60 秒）或消息作为 steer 并入正在运行的一轮时换成 `DONE`；没完成或被拒换成 `CrossMark`。启用了 `ack` 且支持消息表情的通道，成功的 `/steer` 不另发确认消息；其他通道仍用文字确认。表情类型可用 `config.ackEmoji` 改，需要 `im:message.reactions:write_only` 权限。
   - `look: "chat"` 时，第一次发送就已完成、没有按钮，且答案不超过一条消息的上限（默认 4000 字符）、不含代码围栏或表格的回复发普通文本，有 Markdown 时发富文本（post）；其他回复使用卡片。
 - **降级**：流式更新失败时退到整卡替换，再失败退到普通消息编辑。失败记录按会话保留 30 分钟，权限类错误对整个应用生效。
+- **宿主的进度消息**：宿主 `deliver` 一条带 `progress` 的消息时和一轮的回复卡片一样渲染。`status` 还在 `running` / `requires_action` 时开思考气泡，之后用 `deliver.update` 更新、`final: true` 收尾（气泡结束，回答太长时余下的接着发成几条卡片）。发出时已经是完成状态的，不开气泡（之后不会再有人收尾），过程放在卡片的折叠面板里，回答太长的部分同样接着发出。
+- **建群**（`createConversation`，宿主的 `conversation.create`）：`POST /im/v1/chats` 建私有群，机器人为管理员，`owner`、`members` 按 id 前缀认作 union_id（`on_`）、open_id（`ou_`）或 user_id，混用时拒绝。请求带由 operationId 算出的 `uuid`，一小时内同一个只建一个群。需要 `im:chat:create`（或 `im:chat`）权限，缺权限时把飞书的错误码原样报给宿主。
 - **发送结果**：飞书的发送、回复接口返回 `thread_id`（消息在话题里，包括 `reply_in_thread` 刚开出的话题）时，`SendResult` 带 `providerThreadId`，宿主 `deliver` 的结果里也有（HOSTS §4）。
 
 ### 对话里的命令（主人）
