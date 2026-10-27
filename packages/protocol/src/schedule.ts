@@ -31,6 +31,8 @@ export const ScheduleDraft = Type.Object(
     until: Type.Optional(Type.Number()),
     /** Why it exists; shown with the input. */
     note: Type.Optional(Type.String()),
+    /** Opaque to the daemon: carried into each firing's `channelContext` (`schedule.<key>`), e.g. how a host wakes an agent. */
+    meta: Type.Optional(Type.Record(Type.String(), Type.String())),
   },
   { additionalProperties: false },
 );

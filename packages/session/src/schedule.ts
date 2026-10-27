@@ -25,6 +25,7 @@ export interface Schedule extends Required<Pick<ScheduleDraft, 'when' | 'text'>>
   missed: 'once' | 'skip';
   until?: number;
   note?: string;
+  meta?: Record<string, string>;
   /** `creatorOf(origin)`: a principal id, `session:<key>` for an agent, `host:<name>`, `config`. */
   createdBy: string;
   createdAt: number;
@@ -263,6 +264,7 @@ export class ScheduleRegistry {
       missed: d.missed ?? 'once',
       ...(d.until !== undefined ? { until: d.until } : {}),
       ...(d.note ? { note: d.note } : {}),
+      ...(d.meta ? { meta: d.meta } : {}),
       createdBy,
       createdAt: now,
       nextAt: null,
@@ -462,6 +464,8 @@ export class ScheduleDispatcher {
       scheduledAt: new Date(scheduledAt).toISOString(),
       firedAt: new Date(this.now()).toISOString(),
       ...(missed ? { missed: true } : {}),
+      createdBy: s.createdBy,
+      ...Object.fromEntries(Object.entries(s.meta ?? {}).map(([k, v]) => [`schedule.${k}`, v])),
     };
     if (s.action === 'message') {
       if (!this.o.send) throw new Error('this host cannot send scheduled messages');
