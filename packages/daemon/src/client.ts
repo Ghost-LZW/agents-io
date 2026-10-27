@@ -14,6 +14,7 @@ import {
   type TestReplayResult,
   type DeliverUpdateResult,
   type ConversationCreateResult,
+  type MessageAckResult,
   type SessionLaunch,
   type SessionScope,
   type RenderedMessage,
@@ -267,6 +268,11 @@ export class LocalClient {
   /** Edit (with `final`, finalize) a message a `deliver` sent (`deliver.update`). */
   deliverUpdate(o: { operationId: string; route: ReplyRoute; providerMessageId: string; message: RenderedMessage; sequence: number; final?: boolean }): Promise<DeliverUpdateResult> {
     return this.call('deliver.update', o);
+  }
+
+  /** The channel's mark on a message, e.g. a reaction (`message.ack`). */
+  messageAck(o: { route: ReplyRoute; messageId: string; state: 'working' | 'done' | 'failed' | 'none' }): Promise<MessageAckResult> {
+    return this.call('message.ack', o);
   }
 
   /** A conversation made by a channel, e.g. a Lark group (`conversation.create`). */

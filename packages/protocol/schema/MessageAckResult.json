@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/MessageAckResult",
+  "type": "object",
+  "required": [
+    "messageId",
+    "state"
+  ],
+  "properties": {
+    "messageId": {
+      "type": "string"
+    },
+    "state": {
+      "type": "string"
+    }
+  }
+}

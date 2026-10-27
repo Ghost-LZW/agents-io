@@ -559,6 +559,7 @@ export class Gateway {
       runs: this.runs,
       deliver: (name, f) => this.deliver(name, f),
       deliverUpdate: (name, f) => this.deliverUpdate(name, f),
+      ackMessage: (f) => this.ackMessage(f),
       createConversation: (f) => this.createConversation(f),
       prepareSession: (f) => this.prepareSession(f),
       redispatch: (name, f) => this.redispatch(name, f),
@@ -1884,6 +1885,21 @@ export class Gateway {
     } catch (e) {
       return answer({ status: 'rejected', error: (e as Error).message }, false);
     }
+  }
+
+  /** `message.ack`: the channel's mark on a message (a reaction), for the host's own handling. */
+  async ackMessage(f: Extract<HostRequestFrame, { type: 'message.ack' }>): Promise<Outcome> {
+    if (this.stopped) return fail('stopped', 'daemon is stopping');
+    if (!f.messageId) return fail('invalid_frame', 'messageId is empty');
+    const ch = this.channelFor(f.route);
+    if (!ch) return fail('unknown_channel', this.noChannelMessage(f.route));
+    if (!ch.adapter.acknowledge) return fail('unsupported', `channel ${ch.adapter.id} cannot mark a message`);
+    try {
+      await ch.adapter.acknowledge({ ...f.route, account: ch.account }, f.messageId, f.state);
+    } catch (e) {
+      return fail('channel_error', (e as Error).message);
+    }
+    return { ok: true, value: { messageId: f.messageId, state: f.state } };
   }
 
   /** `conversation.create`: a conversation made by the channel (a Lark group), once per operationId. */

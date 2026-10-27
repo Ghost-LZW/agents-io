@@ -1562,6 +1562,78 @@
         "v",
         "type",
         "id",
+        "route",
+        "messageId",
+        "state"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "message.ack",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "route": {
+          "type": "object",
+          "required": [
+            "channel",
+            "account",
+            "conversationId"
+          ],
+          "properties": {
+            "channel": {
+              "type": "string"
+            },
+            "account": {
+              "type": "string"
+            },
+            "conversationId": {
+              "type": "string"
+            },
+            "threadId": {
+              "type": "string"
+            },
+            "replyToMessageId": {
+              "type": "string"
+            }
+          }
+        },
+        "messageId": {
+          "type": "string"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "const": "working",
+              "type": "string"
+            },
+            {
+              "const": "done",
+              "type": "string"
+            },
+            {
+              "const": "failed",
+              "type": "string"
+            },
+            {
+              "const": "none",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
         "operationId",
         "channel",
         "account",
