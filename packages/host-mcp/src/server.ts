@@ -113,11 +113,11 @@ export const TOOL_DEFS = {
     },
   },
   schedule_remove: {
-    description: 'Remove a schedule you created (by id, from schedule_add or schedule_list).',
+    description: 'Remove a schedule you created (by id, from schedule_add or schedule_list). You cannot remove schedules the owner, the host or another session set.',
     input: { id: z.string().describe('Schedule id') },
   },
   schedule_list: {
-    description: 'List the schedules of your session (mine=true for the ones you created), with when they fire next.',
+    description: 'List the schedules of your session (mine=true for the ones you created and may remove), with what they do and when each fires next.',
     input: {},
     readOnly: true,
   },
@@ -278,6 +278,7 @@ export class HostMcpServer {
       // Per-agent tool list (CF-6): a tool not listed is neither offered nor callable.
       if (allow && !allow.has(name)) continue;
       if (name.startsWith('watch_') && !this.o.tools.hasWatches) continue;
+      if (name.startsWith('schedule_') && !this.o.tools.hasSchedules) continue;
       if (name.startsWith('session_') && !this.o.tools.hasTopics) continue;
       if (name.startsWith('live_') && !this.o.tools.hasLive) continue;
       const def = TOOL_DEFS[name];

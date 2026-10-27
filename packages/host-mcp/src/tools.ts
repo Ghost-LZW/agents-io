@@ -266,6 +266,11 @@ export class HostTools {
   get hasWatches(): boolean {
     return !!this.o.watches;
   }
+  /** Whether the schedule tools are offered (the host passed `schedules`). */
+  get hasSchedules(): boolean {
+    return !!this.o.schedules;
+  }
+
 
   /** Whether the live_* tools are offered (the host passed `live`). */
   get hasLive(): boolean {

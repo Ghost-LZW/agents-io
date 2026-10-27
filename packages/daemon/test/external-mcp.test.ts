@@ -185,7 +185,7 @@ describe('external MCP endpoint: scopes', () => {
     const r = await call(reader, 'send_message', { route: 'fake:default:c1', text: 'x' });
     expect(r.isError).toBe(true);
     const none = resolveConfig({ externalMcp: { clients: { a: { token: 'env:T', scopes: [] } } } }, { env: { T: 'x'.repeat(20) }, baseDir: tmp(), cwd: tmp() });
-    expect(none.externalMcp!.clients[0]!.scopes).toEqual({ read: [], readAll: false, send: [], input: [] });
+    expect(none.externalMcp!.clients[0]!.scopes).toEqual({ read: [], readAll: false, send: [], input: [], schedule: [] });
     expect(() => resolveConfig({ externalMcp: { clients: { a: { token: 'env:T', scopes: ['write:*'] } } } }, { env: { T: 'x'.repeat(20) }, baseDir: tmp(), cwd: tmp() })).toThrow(/not a scope/);
   });
 
