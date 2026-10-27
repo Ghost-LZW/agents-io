@@ -15,6 +15,8 @@ import {
   type DeliverUpdateResult,
   type ConversationCreateResult,
   type MessageAckResult,
+  type ScheduleDraft,
+  type ScheduleView,
   type SessionLaunch,
   type SessionScope,
   type RenderedMessage,
@@ -268,6 +270,19 @@ export class LocalClient {
   /** Edit (with `final`, finalize) a message a `deliver` sent (`deliver.update`). */
   deliverUpdate(o: { operationId: string; route: ReplyRoute; providerMessageId: string; message: RenderedMessage; sequence: number; final?: boolean }): Promise<DeliverUpdateResult> {
     return this.call('deliver.update', o);
+  }
+
+  /** Set (or replace) a schedule (`schedule.put`). */
+  schedulePut(schedule: ScheduleDraft & { id: string }): Promise<{ schedule: ScheduleView }> {
+    return this.call('schedule.put', { schedule });
+  }
+
+  scheduleRemove(scheduleId: string): Promise<{ scheduleId: string; removed: boolean }> {
+    return this.call('schedule.remove', { scheduleId });
+  }
+
+  scheduleList(sessionKey?: string): Promise<{ schedules: ScheduleView[] }> {
+    return this.call('schedule.list', sessionKey !== undefined ? { sessionKey } : {});
   }
 
   /** The channel's mark on a message, e.g. a reaction (`message.ack`). */

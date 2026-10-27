@@ -41,6 +41,9 @@ host commands (authenticate with the token file next to the socket; docs/HOSTS.m
   aio ack       --consumer <name> <cursor>
   aio redispatch <cursor> [--agent <name>] [--session main|per-conversation|per-thread|topic|<key json>]
                 [--cwd <dir>] [--env K=V …]                           (a queued item to a session, original sender kept)
+  aio schedule  add --id <id> (--cron "<m h dom mon dow>" [--tz <zone>] | --at <time> | --every <minutes>)
+                [--session <key> | --route <route json> | --to-host] --text <text>  | list [--session <key>] | remove <id>
+                                                                      (docs/design/schedules)
   aio bindings  put [--file table.json|-] | get
   aio explain   <inputId | operationId> [--chain]                    (routing record; a delivery's turn and inputs;
                                                                        --chain: an agent input back to the root of its chain)
@@ -92,6 +95,13 @@ export function parseCli(argv: string[]): CliArgs {
         only: { type: 'string' },
         'data-dir': { type: 'string' },
         wait: { type: 'boolean' },
+        id: { type: 'string' },
+        cron: { type: 'string' },
+        tz: { type: 'string' },
+        at: { type: 'string' },
+        every: { type: 'string' },
+        missed: { type: 'string' },
+        'to-host': { type: 'boolean' },
         verbose: { type: 'boolean', short: 'v' },
         'no-color': { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
@@ -471,6 +481,54 @@ async function send(a: CliArgs): Promise<number> {
   }
 }
 
+async function schedule(a: CliArgs): Promise<number> {
+  const [sub = 'list', ...tokens] = a.rest;
+  const client = await hostClient(a);
+  try {
+    switch (sub) {
+      case 'add': {
+        const cron = str(a, 'cron');
+        const at = str(a, 'at');
+        const every = str(a, 'every');
+        const when = cron !== undefined ? { cron, ...(str(a, 'tz') ? { tz: str(a, 'tz')! } : {}) } : at !== undefined ? { at } : every !== undefined ? { everyMinutes: Number(every) } : undefined;
+        if (!when) throw new ConfigError('aio schedule add needs --cron, --at or --every');
+        const route = str(a, 'route');
+        const session = str(a, 'session');
+        const action = a.values['to-host'] === true ? 'host' : route !== undefined && session === undefined ? 'message' : 'turn';
+        const r = await client.schedulePut({
+          id: need(a, 'id'),
+          when,
+          action,
+          ...(action === 'turn' ? { target: { sessionKey: session ?? 'main' } } : {}),
+          ...(route !== undefined ? { route: JSON.parse(route) } : {}),
+          text: need(a, 'text'),
+          ...(str(a, 'missed') ? { missed: str(a, 'missed') as 'once' | 'skip' } : {}),
+        });
+        console.log(JSON.stringify(r.schedule));
+        return 0;
+      }
+      case 'list':
+      case 'ls': {
+        const r = await client.scheduleList(str(a, 'session'));
+        for (const x of r.schedules) console.log(`${x.id}\t${x.action}\t${x.nextAt === null ? 'never' : new Date(x.nextAt).toISOString()}\t${x.createdBy}\t${x.text}`);
+        if (!r.schedules.length) console.error('no schedules');
+        return 0;
+      }
+      case 'remove':
+      case 'rm': {
+        if (!tokens[0]) throw new ConfigError('usage: aio schedule remove <id>');
+        const r = await client.scheduleRemove(tokens[0]);
+        console.log(r.removed ? `removed ${tokens[0]}` : `no schedule ${tokens[0]}`);
+        return r.removed ? 0 : 1;
+      }
+      default:
+        throw new ConfigError(`unknown schedule command ${sub} (add, list, remove)`);
+    }
+  } finally {
+    client.close();
+  }
+}
+
 async function tail(a: CliArgs): Promise<number> {
   const consumer = need(a, 'consumer');
   const once = a.values.once === true;
@@ -696,7 +754,7 @@ async function e2e(a: CliArgs): Promise<number> {
   return n('FAIL') ? 1 : 0;
 }
 
-const COMMANDS: Record<string, (a: CliArgs) => Promise<number>> = { serve, attach, tui, 'tui-bridge': () => tuiBridge(), input, sessions, watch, e2e, run: runCmd, send, tail, ack, redispatch, bindings, explain, verify, replay, fault, 'console-link': consoleLink, console: consoleLink };
+const COMMANDS: Record<string, (a: CliArgs) => Promise<number>> = { serve, attach, tui, 'tui-bridge': () => tuiBridge(), input, sessions, watch, e2e, run: runCmd, send, tail, ack, redispatch, schedule, bindings, explain, verify, replay, fault, 'console-link': consoleLink, console: consoleLink };
 
 export async function main(argv: string[]): Promise<number> {
   const a = parseCli(argv);

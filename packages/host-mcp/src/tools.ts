@@ -18,9 +18,10 @@ import {
   type TurnContext,
   type TurnProvenance,
   type Watch,
+  type ScheduleDraft,
   type WatchDraft,
 } from '@agents-io/protocol';
-import type { Delivery, DeliveryRecord, ExitVerdict, Hub, InboundRewrite, Outbox, Participant } from '@agents-io/session';
+import type { Delivery, DeliveryRecord, ExitVerdict, Hub, InboundRewrite, Outbox, Participant, Schedule } from '@agents-io/session';
 import {
   CHOICE_KEY,
   MENTIONS_KEY,
@@ -120,6 +121,10 @@ export interface HostToolsOptions {
   agentOf?(sessionKey: string): string | undefined;
   /** Watch control (dev-gateway `addWatch`/`removeWatch`/`listWatches`); absent = no watch tools. */
   watches?: WatchControl;
+  /** Schedule control; absent = no schedule tools. */
+  schedules?: ScheduleControl;
+  /** The tools a session's agent has (its `tools` setting), for get_channel_context. */
+  toolNames?(sessionKey: string): readonly string[] | undefined;
   /** Provenance of a session's turn (`Lane.provenance`), attached to every write the turn makes. */
   provenance?(sessionKey: string, turnId: string): TurnProvenance | undefined;
   /**
@@ -169,6 +174,13 @@ export interface WatchControl {
   add(by: Origin, draft: WatchDraft): Promise<{ ok: true; watch: Watch } | { ok: false; code: string; message: string }>;
   remove(by: Origin, id: string): Promise<{ ok: true; removed: boolean } | { ok: false; code: string; message: string }>;
   list(sessionKey: string): Watch[];
+}
+
+/** What the schedule tools need from the host; `Policy.schedule` (limits) is applied behind `put`. */
+export interface ScheduleControl {
+  put(by: Origin, draft: ScheduleDraft): Promise<{ ok: true; schedule: Schedule } | { ok: false; code: string; message: string }>;
+  remove(by: Origin, id: string): Promise<{ ok: true; removed: boolean } | { ok: false; code: string; message: string }>;
+  list(sessionKey: string): Schedule[];
 }
 
 /** Declared identity of a session's agent: what its watches are created by. */
@@ -271,6 +283,8 @@ export class HostTools {
   /** Run one tool. Returns the JSON text result; throws ToolError for anything the model should fix. */
   async call(b: ToolBinding, name: string, args: Record<string, unknown>, meta: CallMeta = {}): Promise<string> {
     if (name === 'watch_add' || name === 'watch_remove' || name === 'watch_list') return json(await this.watchTool(b, name, args));
+    if (name === 'schedule_remove' || name === 'schedule_list') return json(await this.scheduleTool(b, name, args, undefined));
+    if (name === 'schedule_add') return json(await this.scheduleTool(b, name, args, this.o.turn(b.sessionKey)));
     if (name === 'session_list') return json(this.sessionList(b));
     const turn = this.o.turn(b.sessionKey);
     if (!turn) throw new ToolError('no turn is running in this session: output tools only work while you are answering a message');
@@ -395,6 +409,12 @@ export class HostTools {
         approvals: caps.approvals,
       },
       participants: this.participants(turn, b.sessionKey),
+      // What you can do besides answering: the tools you have (send_message, schedule_add, watch_add, …).
+      abilities: {
+        tools: this.o.toolNames?.(b.sessionKey) ?? null,
+        schedules: this.o.schedules ? { mine: this.o.schedules.list(b.sessionKey).filter((x) => x.createdBy === agentIdentity(b.sessionKey)).length } : null,
+        watches: this.o.watches ? { mine: this.o.watches.list(b.sessionKey).filter((x) => x.createdBy === agentIdentity(b.sessionKey)).length } : null,
+      },
       allowedDestinations: {
         current: routeKey(r),
         alsoThisTurn: turn.deliveries.map(routeKey),
@@ -676,6 +696,60 @@ export class HostTools {
       throw new ToolError(r.message);
     }
     return { ok: true, watch: view(r.watch) };
+  }
+
+  private async scheduleTool(b: ToolBinding, name: 'schedule_add' | 'schedule_remove' | 'schedule_list', args: Record<string, unknown>, turn: TurnContext | undefined) {
+    const c = this.o.schedules;
+    if (!c) throw new ToolError('schedules are not available on this host');
+    const by = agentOrigin(b.sessionKey, this.o.agentOf?.(b.sessionKey));
+    const me = agentIdentity(b.sessionKey);
+    const view = (x: Schedule) => ({ ...x, nextAt: x.nextAt === null ? null : new Date(x.nextAt).toISOString(), mine: x.createdBy === me });
+    if (name === 'schedule_list') return { ok: true, session: b.sessionKey, schedules: c.list(b.sessionKey).map(view) };
+    if (name === 'schedule_remove') {
+      const id = str(args.id, 'id')!;
+      const r = await c.remove(by, id);
+      if (!r.ok) throw new ToolError(r.message);
+      return { ok: true, removed: r.removed, id };
+    }
+    // schedule_add: a turn goes to the caller's own session; a route is "current" or one this turn may use.
+    if (args.target !== undefined || args.sessionKey !== undefined) throw new ToolError('schedule_add has no target: a schedule always belongs to your own session; remove the target argument');
+    const w = (args.when ?? {}) as Record<string, unknown>;
+    const when =
+      w.cron !== undefined
+        ? { cron: str(w.cron, 'when.cron')!, ...(w.tz !== undefined ? { tz: str(w.tz, 'when.tz')! } : {}) }
+        : w.every_minutes !== undefined
+          ? { everyMinutes: Number(w.every_minutes) }
+          : w.at !== undefined
+            ? { at: typeof w.at === 'number' ? w.at : str(w.at, 'when.at')! }
+            : undefined;
+    if (!when) throw new ToolError('when is { at } (once), { cron, tz? } or { every_minutes }');
+    const action = str(args.action, 'action', true) ?? 'turn';
+    if (action !== 'turn' && action !== 'message') throw new ToolError('action is turn or message');
+    const spec = str(args.route, 'route', true);
+    let route: ReplyRoute | undefined;
+    if (spec !== undefined || action === 'message') {
+      if (!turn) throw new ToolError('a route can only be given while you are answering a message ("current" is that conversation)');
+      route = this.parseRoute(turn, spec);
+      const verdict = await this.o.policy.outbound({ from: turn, to: route });
+      if (verdict !== 'allow') throw new ToolError(`the host policy does not let you send to ${routeKey(route)}; use "current" or a preregistered route`);
+    }
+    const until = str(args.until, 'until', true);
+    const untilMs = until !== undefined ? Date.parse(until) : undefined;
+    if (untilMs !== undefined && !Number.isFinite(untilMs)) throw new ToolError('until is an ISO 8601 time');
+    const draft: ScheduleDraft = {
+      ...(args.id !== undefined ? { id: str(args.id, 'id')! } : {}),
+      when,
+      action,
+      ...(action === 'turn' ? { target: { sessionKey: b.sessionKey } } : {}),
+      ...(route ? { route } : {}),
+      text: str(args.text, 'text')!,
+      ...(args.missed !== undefined ? { missed: str(args.missed, 'missed') as 'once' | 'skip' } : {}),
+      ...(untilMs !== undefined ? { until: untilMs } : {}),
+      ...(args.note !== undefined ? { note: str(args.note, 'note')! } : {}),
+    };
+    const r = await c.put(by, draft);
+    if (!r.ok) throw new ToolError(r.message);
+    return { ok: true, schedule: view(r.schedule) };
   }
 
   // ---- topics -----------------------------------------------------------------------------

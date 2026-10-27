@@ -28,6 +28,7 @@ import {
   type HostRequestFrame,
   type InboundEnvelope,
   type InputRecord,
+  type ScheduleDraft,
   type LiveEndpoint,
   type LiveSpeaker,
   type LiveStartArgs,
@@ -78,6 +79,12 @@ import {
   TOPIC_TOOLS_HINT,
   TopicError,
   TopicRegistry,
+  ScheduleDispatcher,
+  ScheduleError,
+  ScheduleRegistry,
+  creatorOf,
+  shortestMinutes,
+  type Schedule,
   WatchDispatcher,
   WatchRegistry,
   defaultPolicy,
@@ -105,7 +112,7 @@ import {
   settleLeftoverInputs,
   withholding,
 } from '@agents-io/session';
-import { HostMcpServer, HostTools, ToolError, agentIdentity, type TopicHandover } from '@agents-io/host-mcp';
+import { HostMcpServer, HostTools, TOOL_NAMES, ToolError, agentIdentity, type TopicHandover } from '@agents-io/host-mcp';
 import { ClaudeCodeHarness, findOnPath, type ClaudeCodeHarnessConfig } from '@agents-io/harness-claude-code';
 import { CodexHarness, type CodexProfile } from '@agents-io/harness-codex';
 import { loadChannelModule } from './channel-module.js';
@@ -321,6 +328,7 @@ export class Gateway {
   readonly outbox: Outbox;
   /** Watches: sessions subscribed to inputs not addressed to them. */
   readonly watches: WatchDispatcher;
+  readonly schedules: ScheduleDispatcher;
   /** Inbound media (channels put, harnesses read). */
   readonly blobs: FsBlobStore;
   /** Host output tools, when some agent has `tools` on; mounted over MCP into those agents' harness bindings only. */
@@ -560,6 +568,7 @@ export class Gateway {
       deliver: (name, f) => this.deliver(name, f),
       deliverUpdate: (name, f) => this.deliverUpdate(name, f),
       ackMessage: (f) => this.ackMessage(f),
+      schedule: (name, f) => this.hostSchedule(name, f),
       createConversation: (f) => this.createConversation(f),
       prepareSession: (f) => this.prepareSession(f),
       redispatch: (name, f) => this.redispatch(name, f),
@@ -594,6 +603,15 @@ export class Gateway {
       replyRoute: (w) => this.homeRoute(w.target.sessionKey),
       onError: (err, id) => this.log('warn', `watch ${id}: ${(err as Error).message}`),
     });
+    // Schedules live next to the log too: their next times and in-flight firings survive a restart (SC-1).
+    this.schedules = new ScheduleDispatcher({
+      registry: new ScheduleRegistry({ ...(log instanceof SqliteSessionLog ? { db: log.db } : {}), timeZone: c.timeZone }),
+      lanes: (key) => this.laneAfterClose(key),
+      replyRoute: (key) => this.homeRoute(key),
+      send: (s, operationId) => this.sendScheduled(s, operationId),
+      toHost: (s, input) => this.scheduledToHost(s, input),
+      onError: (err, id) => this.log('warn', `schedule ${id}: ${(err as Error).message}`),
+    });
     // Built when some agent has tools (agents.<name>.tools, default `outputTools`, off); only those agents' harnesses mount them.
     if (Object.values(c.agents).some((a) => a.tools)) {
       this.tools = new HostTools({
@@ -615,6 +633,12 @@ export class Gateway {
         routes: () => c.policy.routes,
         // Agents add watches as themselves (kind agent); Policy.watch decides, the target is pinned to their session.
         watches: { add: (by, d) => this.addWatch(by, d), remove: (by, id) => this.removeWatch(by, id), list: (key) => this.listWatches(key) },
+        // Agents keep schedules for their own session, within the owner's limits (SC-3).
+        schedules: { put: (by, d) => this.putSchedule(by, d), remove: (by, id) => this.removeSchedule(by, id), list: (key) => this.listSchedules(key) },
+        toolNames: (key) => {
+          const a = c.agents[this.agentOfSession(key) ?? ''];
+          return a?.tools ? (a.toolNames ?? TOOL_NAMES) : undefined;
+        },
         // Decision 4: every write carries where the turn's inputs came from.
         provenance: (key, turnId) => this.lanes.get(key)?.provenance(turnId),
         // People seen in the session's conversations: the agent can @ them, not only this turn's senders.
@@ -756,6 +780,8 @@ export class Gateway {
       for (const r of gw.outbox.recover()) gw.log('warn', `delivery ${r.operationId} was in flight when the previous daemon stopped; settled unknown, not resent`);
       gw.settleLeftoverInputs();
       await gw.loadConfigWatches();
+      gw.loadConfigSchedules();
+      gw.schedules.start();
       await gw.startChannels();
       await gw.adoptRunningTurns();
       if (o.listen !== false) {
@@ -847,6 +873,7 @@ export class Gateway {
       record: (e) => this.router.record(e),
       sending: (op, by) => (by ? this.externalSends.set(op, by) : this.externalSends.delete(op)),
       stopped: () => this.stopped,
+      schedules: { put: (by, d) => this.putSchedule(by, d), remove: (by, id) => this.removeSchedule(by, id), list: () => this.listSchedules() },
       log: (level, msg) => this.log(level, msg),
     });
     let url: string;
@@ -2950,6 +2977,65 @@ ${a.summary}` }],
     }
   }
 
+  /** Config schedules, as the owner (`config`); a bad one is logged and skipped. */
+  private loadConfigSchedules(): void {
+    for (const d of this.o.config.schedules) {
+      try {
+        const s = this.schedules.registry.put(d, 'config');
+        this.log('info', `schedule ${s.id}: ${s.action}${s.target ? ` → ${s.target.sessionKey}` : ''}, next ${s.nextAt === null ? 'never' : new Date(s.nextAt).toISOString()}`);
+      } catch (e) {
+        this.log('warn', `config schedule ${d.id}: ${(e as Error).message}`);
+      }
+    }
+  }
+
+  /** A `message` schedule: one message through the outbox (once per firing, DL-2), checked like an output tool's. */
+  private async sendScheduled(s: Schedule, operationId: string): Promise<void> {
+    const route = s.route!;
+    // An external client's schedule sends as that client, through the same checks as its send_message (DL-6).
+    const client = this.o.config.externalMcp?.clients.find((x) => x.principal.id === s.createdBy);
+    if (client) {
+      if (!this.externalMcp) throw new Error(`the external endpoint is not running, so ${client.name}'s schedule cannot send as it`);
+      await this.externalMcp.endpoint.sendAs(client.name, { route, text: s.text, operationId });
+      return;
+    }
+    const ch = this.channelFor(route);
+    if (!ch) throw new Error(this.noChannelMessage(route));
+    const rec = await this.outbox.send(ch.adapter, {
+      operationId,
+      sessionKey: `schedule:${s.id}`,
+      route: { ...route, account: ch.account },
+      msg: { text: s.text },
+    });
+    if (rec.status === 'rejected') throw new Error(`not sent: ${rec.error ?? 'rejected'}`);
+  }
+
+  /** A `host` schedule: one item into the host inbound queue (the host decides what to do). */
+  private async scheduledToHost(s: Schedule, input: InputRecord): Promise<void> {
+    const route = input.replyRoute;
+    const at = Date.parse(String(input.channelContext.firedAt)) || Date.now();
+    // The queue keeps it until the host reads it (HQ-1); the firing's input id is its reference, so a redo is one item (HQ-2).
+    this.hostQueue.append({
+      channelRef: `schedule:${input.inputId}`,
+      account: route?.account ?? 'schedule',
+      bindingId: `schedule:${s.id}`,
+      input,
+      envelope: {
+        v: PROTOCOL_VERSION,
+        id: input.inputId,
+        channel: 'schedule',
+        account: route?.account ?? 'schedule',
+        conversation: { id: route?.conversationId ?? s.id, kind: 'other' },
+        sender: { channelUserId: `schedule:${s.id}`, displayName: `schedule ${s.id}`, evidence: 'none' },
+        content: input.content,
+        replyRoute: route,
+        context: input.channelContext,
+        sentAt: at,
+      },
+      receivedAt: at,
+    });
+  }
+
   /**
    * `tui.attach` (decision 15): open the session's harness and say how to start the harness's own
    * terminal UI on it. Codex: the TUI is another client of the same thread (`--remote`); a thread
@@ -3203,6 +3289,73 @@ ${a.summary}` }],
   }
 
   /** Create or replace a watch as `by` (checked by `Policy.watch`). Host MCP tools call this for agents. */
+  /**
+   * A schedule from someone (Policy for schedules, SC-3): the owner, the local principal and the host
+   * may set any; an agent only for its own session (a turn there, or a message it may send anyway),
+   * at most `policy.scheduleLimit` of them, none firing more often than `policy.scheduleMinMinutes`.
+   */
+  async putSchedule(by: Origin, d: ScheduleDraft): Promise<{ ok: true; schedule: Schedule } | { ok: false; code: string; message: string }> {
+    const reg = this.schedules.registry;
+    const who = creatorOf(by);
+    if (by.kind === 'peer') {
+      if (d.action !== 'message') return { ok: false, code: 'forbidden', message: 'an external client sets message schedules only' };
+      const existing = d.id !== undefined ? reg.get(d.id) : undefined;
+      if (existing && existing.createdBy !== who) return { ok: false, code: 'forbidden', message: `schedule ${d.id} was set by ${existing.createdBy}` };
+    }
+    if (by.kind === 'agent') {
+      const own = by.declared?.startsWith('session:') ? by.declared.slice('session:'.length) : undefined;
+      if (!own) return { ok: false, code: 'forbidden', message: 'only a session agent may set schedules' };
+      if (d.action === 'host') return { ok: false, code: 'forbidden', message: 'an agent cannot hand schedules to the host' };
+      if ((d.action ?? 'turn') === 'turn' && d.target?.sessionKey !== own) return { ok: false, code: 'forbidden', message: 'a schedule of yours starts turns in your own session only' };
+      const existing = d.id !== undefined ? reg.get(d.id) : undefined;
+      if (existing && existing.createdBy !== who) return { ok: false, code: 'forbidden', message: `schedule ${d.id} was set by ${existing.createdBy}; pick another id` };
+      const mine = reg.list().filter((s) => s.createdBy === who && s.id !== d.id).length;
+      const p = this.o.config.policy;
+      if (mine >= p.scheduleLimit) return { ok: false, code: 'forbidden', message: `you already keep ${mine} schedules (the owner's limit is ${p.scheduleLimit}); remove one first` };
+      try {
+        const gap = shortestMinutes(d.when, reg.timeZone, Date.now());
+        if (gap < p.scheduleMinMinutes) return { ok: false, code: 'forbidden', message: `it would fire every ${gap} minutes; the owner's minimum is ${p.scheduleMinMinutes}` };
+      } catch (e) {
+        return { ok: false, code: 'invalid', message: (e as Error).message };
+      }
+    }
+    try {
+      const s = reg.put(d, who);
+      this.schedules.changed();
+      return { ok: true, schedule: s };
+    } catch (e) {
+      return { ok: false, code: e instanceof ScheduleError ? e.code : 'invalid', message: (e as Error).message };
+    }
+  }
+
+  /** The host's schedule requests: set as `host:<name>`, any session or route, or back to itself. */
+  private async hostSchedule(hostName: string, f: Extract<HostRequestFrame, { type: 'schedule.put' | 'schedule.remove' | 'schedule.list' }>): Promise<Outcome> {
+    const by: Origin = { kind: 'system', principal: { id: `host:${hostName}`, labels: ['host'] }, evidence: 'device_only', via: `host:${hostName}`, adapter: 'host' };
+    if (f.type === 'schedule.list') return { ok: true, value: { schedules: this.listSchedules(f.sessionKey) } };
+    if (f.type === 'schedule.remove') {
+      const r = await this.removeSchedule(by, f.scheduleId);
+      return r.ok ? { ok: true, value: { scheduleId: f.scheduleId, removed: r.removed } } : fail(r.code, r.message);
+    }
+    const r = await this.putSchedule(by, f.schedule);
+    return r.ok ? { ok: true, value: { schedule: r.schedule } } : fail(r.code === 'invalid' ? 'invalid_frame' : r.code, r.message);
+  }
+
+  /** Removed by whoever set it; the owner, the local principal and the host may remove any. */
+  async removeSchedule(by: Origin, id: string): Promise<{ ok: true; removed: boolean } | { ok: false; code: string; message: string }> {
+    const s = this.schedules.registry.get(id);
+    if (!s) return { ok: true, removed: false };
+    if ((by.kind === 'agent' || by.kind === 'peer') && s.createdBy !== creatorOf(by)) return { ok: false, code: 'forbidden', message: `schedule ${id} was set by ${s.createdBy}; you may only remove your own` };
+    const removed = this.schedules.registry.remove(id);
+    this.schedules.changed();
+    return { ok: true, removed };
+  }
+
+  /** Schedules of a session (turns into it), or all. */
+  listSchedules(sessionKey?: string): Schedule[] {
+    const all = this.schedules.registry.list();
+    return sessionKey === undefined ? all : all.filter((s) => s.target?.sessionKey === sessionKey || s.createdBy === `session:${sessionKey}`);
+  }
+
   addWatch(by: Origin, watch: WatchDraft): Promise<AddWatchResult> {
     return this.watches.add(by, watch);
   }
@@ -3338,6 +3491,7 @@ ${a.summary}` }],
     if (this.tokenFile) removeTokenFile(this.tokenFile, this.token);
     if (this.consoleFile && this.console) removeTokenFile(this.consoleFile, this.console.url);
     this.watches.stop();
+    this.schedules.stop();
     // A live channel apply in progress finishes (it sees `stopped` and launches nothing more)
     // before the channels are aborted, so none starts after the snapshot below.
     await within(this.applying, 5000);

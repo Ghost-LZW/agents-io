@@ -12,6 +12,7 @@ export * from './wire.js';
 export * from './client.js';
 export * from './host.js';
 export * from './watch.js';
+export * from './schedule.js';
 export * from './topic.js';
 export * from './admin.js';
 export * from './validate.js';

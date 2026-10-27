@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/ScheduleDraft",
+  "additionalProperties": false,
+  "type": "object",
+  "required": [
+    "when",
+    "text"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "when": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "cron"
+          ],
+          "properties": {
+            "cron": {
+              "type": "string"
+            },
+            "tz": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "at"
+          ],
+          "properties": {
+            "at": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "number"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "everyMinutes"
+          ],
+          "properties": {
+            "everyMinutes": {
+              "minimum": 1,
+              "type": "number"
+            }
+          }
+        }
+      ]
+    },
+    "action": {
+      "anyOf": [
+        {
+          "const": "turn",
+          "type": "string"
+        },
+        {
+          "const": "message",
+          "type": "string"
+        },
+        {
+          "const": "host",
+          "type": "string"
+        }
+      ]
+    },
+    "target": {
+      "type": "object",
+      "required": [
+        "sessionKey"
+      ],
+      "properties": {
+        "sessionKey": {
+          "type": "string"
+        }
+      }
+    },
+    "route": {
+      "type": "object",
+      "required": [
+        "channel",
+        "account",
+        "conversationId"
+      ],
+      "properties": {
+        "channel": {
+          "type": "string"
+        },
+        "account": {
+          "type": "string"
+        },
+        "conversationId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "replyToMessageId": {
+          "type": "string"
+        }
+      }
+    },
+    "text": {
+      "type": "string"
+    },
+    "missed": {
+      "anyOf": [
+        {
+          "const": "once",
+          "type": "string"
+        },
+        {
+          "const": "skip",
+          "type": "string"
+        }
+      ]
+    },
+    "until": {
+      "type": "number"
+    },
+    "note": {
+      "type": "string"
+    }
+  }
+}

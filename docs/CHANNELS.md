@@ -435,13 +435,14 @@ aio-dev watch remove team-digest
 
 | 工具 | 做什么 | 目的地 |
 |---|---|---|
-| `get_channel_context()` | 返回当前路由、通道、会话类型、档位、通道能力摘要（markdown 程度、长度上限、按钮、能发哪些媒体）、参与者（可用于 mention 的 id 和名字，见下）、允许的目的地 | — |
+| `get_channel_context()` | 返回当前路由、通道、会话类型、档位、通道能力摘要（markdown 程度、长度上限、按钮、能发哪些媒体）、参与者（可用于 mention 的 id 和名字，见下）、允许的目的地，以及 `abilities`（这个 agent 有哪些工具、自己设了几条定时任务和监听） | — |
 | `send_file(path \| blob, name?, caption?)` | 读文件（相对路径按 session 的 cwd）存进 blob 存储，作为附件发出。上限 30MB；`restricted` 档的轮次只能发 cwd 里的文件 | 本轮回复路由 |
 | `ask_choice(question, options[], multi?)` | 发一个选择题，**立即返回** `choiceId`。用户的选择作为**下一条输入**回来（见下），工具说明里要求模型发完就结束这一轮 | 本轮回复路由 |
 | `mention(user_ids[], text)` | 发一条 @ 某些人的消息 | 本轮回复路由 |
 | `reply_to(route, text, message_id?)` | 另发一条回复（默认回复发起本轮的那条消息） | `"current"` 或允许的路由键 |
 | `send_message(route, text)` | 另发一条独立消息（不是回复） | `"current"` 或允许的路由键 |
 | `watch_add / watch_remove / watch_list` | 见下面"agent 自己建监听" | 永远是自己的 session |
+| `schedule_add / schedule_remove / schedule_list` | 给自己约时间：到点收到一条 `[schedule <id>] <text>` 输入、开一轮（或只往允许的路由发一条消息）；`when` 写 `{ at }`、`{ cron, tz? }` 或 `{ every_minutes }`。每个会话至多 `policy.scheduleLimit` 条、间隔不短于 `policy.scheduleMinMinutes` 分钟（`docs/design/schedules`，SC-3） | 永远是自己的 session |
 | `live_join / live_say / live_leave` | 以语音进出会议或通话，见 §7a | 通道的媒体对端 |
 
 **参与者**（`participants`，`mention` 可以 @ 其中任何人）：先是本轮输入的发送者，再是这个 session 在**当前对话**（同一通道、同一会话 id）里见过的其他人，按最近说话排序，合计至多 50 个。"见过"指这个 session 收到过他们的消息：开轮的、只记录的上下文、§1c 取来的历史都算；本部署自己的回流不算。每项 `{ userId, name?, principal?, channel, isBot? }`，`userId` 是通道里的用户 id（飞书是 union_id 或 open_id），机器人标 `isBot: true`。session 记最近 50 个不同的发送者，重启后从日志里的输入记录重建。只在消息里被 @ 过、自己没说过话的人不在其中。`mention` 照旧接受任何 id（也接受 `lark-bot:on_x` 这样的主体），对参与者补上名字；适配器认不出的 id 写成 `@名字` 文字（下表）。

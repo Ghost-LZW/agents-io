@@ -2,7 +2,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { Type, type Static } from '@sinclair/typebox';
-import { Binding, Evidence, IdentityEntry, Tier, WatchDraft, errors, type BindingTable, type Principal, type RunSpec, type WatchSource } from '@agents-io/protocol';
+import { Binding, Evidence, IdentityEntry, ScheduleDraft, Tier, WatchDraft, errors, type BindingTable, type Principal, type RunSpec, type WatchSource } from '@agents-io/protocol';
 import { DEFAULT_BLOB_MAX_BYTES, OWNER_LABEL, Router, RouterError, checkIdentities, ownerIdentities, ownersTable, type AgentContactRule, type AgentSpec, type LoopGuardOptions } from '@agents-io/session';
 import { resolveChannelModule } from './channel-module.js';
 import { loadEnvFile } from '@agents-io/testkit';
@@ -405,6 +405,10 @@ export const ConfigFile = Type.Object(
            * approval (decision 12) will sit behind it too.
            */
           answerOnBehalf: Type.Optional(Type.Boolean()),
+          /** Schedules an agent may keep for its session (schedule_add), default 20. */
+          scheduleLimit: Type.Optional(Type.Integer({ minimum: 0 })),
+          /** The shortest period of an agent's schedule, in minutes, default 5. */
+          scheduleMinMinutes: Type.Optional(Type.Number({ minimum: 1 })),
           /**
            * Sources an agent may watch without asking (defaultPolicy `watchAllowlist`):
            * each entry matches when every field it sets equals the watch source's.
@@ -463,6 +467,13 @@ export const ConfigFile = Type.Object(
      * the config takes effect on restart.
      */
     watches: Type.Optional(Type.Array(Type.Intersect([WatchDraft, Type.Object({ id: Type.String() })]))),
+    /**
+     * Schedules the owner sets up (docs/design/schedules): each needs an `id`; loaded at start
+     * (an existing one with that id is replaced, its next time recomputed). `timeZone` is the
+     * default for cron schedules without `tz` (default the system's).
+     */
+    schedules: Type.Optional(Type.Array(Type.Object({ ...ScheduleDraft.properties, id: Type.String() }, { additionalProperties: false }))),
+    timeZone: Type.Optional(Type.String()),
     /**
      * The console API (HTTP + WebSocket for web UIs; protocol admin.ts). Default on for
      * `aio serve`, on 127.0.0.1:7464. A non-loopback `host` is refused unless
@@ -717,6 +728,10 @@ export interface Config {
     strangers: 'drop' | 'ask';
     routes: string[];
     watchAllowlist: Partial<Pick<WatchSource, 'channel' | 'account' | 'conversation' | 'conversationKind'>>[];
+    /** Schedules an agent may keep for its session. */
+    scheduleLimit: number;
+    /** The shortest period of an agent's schedule, in minutes. */
+    scheduleMinMinutes: number;
     /** `policy.answerOnBehalf` (default false): `resolve { onBehalfOf }` is allowed. */
     answerOnBehalf: boolean;
     /** `policy.loopGuard` (defaults in `LOOP_GUARD_DEFAULTS`). */
@@ -726,6 +741,10 @@ export interface Config {
   };
   /** Owner watches from the config file. */
   watches: (WatchDraft & { id: string })[];
+  /** Owner schedules from the config file. */
+  schedules: (ScheduleDraft & { id: string })[];
+  /** Default time zone of cron schedules. */
+  timeZone: string;
   /** The config's `outputTools` (default false): the default of every agent's `tools`. */
   outputTools: boolean;
   /** How long a parked topic's lane stays open while idle (0: until the daemon stops). */
@@ -858,10 +877,10 @@ function resolveExternalMcp(c: NonNullable<ConfigFile['externalMcp']>, env: Reco
       token = substituteEnv(e.token, env, `${at}.token`) as string;
       if (token.length < 16 || /\s/.test(token)) fail(`${at}.token: the variable ${e.token.slice(4)} must hold at least 16 characters and no whitespace`);
     }
-    const scopes: ExternalScopes = { read: [], readAll: false, send: [], input: [] };
+    const scopes: ExternalScopes = { read: [], readAll: false, send: [], input: [], schedule: [] };
     e.scopes.forEach((x, i) => {
       const p = parseScope(x);
-      if (!p) fail(`${at}.scopes[${i}]: ${JSON.stringify(x)} is not a scope (read, read:<session pattern>, send:<route pattern>, input:<session pattern>)`);
+      if (!p) fail(`${at}.scopes[${i}]: ${JSON.stringify(x)} is not a scope (read, read:<session pattern>, send:<route pattern>, input:<session pattern>, schedule:<route pattern>)`);
       scopes[p!.kind].push(p!.pattern);
       if (x === 'read') scopes.readAll = true;
     });
@@ -1037,11 +1056,15 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
       strangers: c.policy?.strangers ?? 'drop',
       routes: c.policy?.routes ?? [],
       watchAllowlist: c.policy?.watchAllowlist ?? [],
+      scheduleLimit: c.policy?.scheduleLimit ?? 20,
+      scheduleMinMinutes: c.policy?.scheduleMinMinutes ?? 5,
       answerOnBehalf: c.policy?.answerOnBehalf ?? false,
       loopGuard: c.policy?.loopGuard ?? {},
       agentContacts: (c.policy?.agentContacts ?? []) as AgentContactRule[],
     },
     watches: c.watches ?? [],
+    schedules: c.schedules ?? [],
+    timeZone: c.timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
     local: {
       principal: { id: c.local?.principal ?? owners[0] ?? 'local:owner', labels: c.local?.labels ?? ['owner'] },
       session: localSession,
