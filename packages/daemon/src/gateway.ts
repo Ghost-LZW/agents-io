@@ -3299,7 +3299,8 @@ ${a.summary}` }],
     const reg = this.schedules.registry;
     const who = creatorOf(by);
     if (by.kind === 'peer') {
-      if (d.action !== 'message') return { ok: false, code: 'forbidden', message: 'an external client sets message schedules only' };
+      // Messages it may send anyway, or wakes handed to the host that runs it (never a turn here).
+      if (d.action !== 'message' && !(d.action === 'host' && d.meta?.wake)) return { ok: false, code: 'forbidden', message: 'an external client sets message or wake schedules only' };
       const existing = d.id !== undefined ? reg.get(d.id) : undefined;
       if (existing && existing.createdBy !== who) return { ok: false, code: 'forbidden', message: `schedule ${d.id} was set by ${existing.createdBy}` };
     }

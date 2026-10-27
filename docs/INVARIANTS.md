@@ -1039,9 +1039,9 @@
 
 ### SC-3 谁能设定时任务：agent 只给自己的会话，有上限；外部客户端只发它的 scope 允许的路由
 
-- **承诺**：主人（配置 `schedules`）、宿主（`schedule.put`）可以设任何定时任务。agent 经输出工具设的定时任务只开它自己会话的轮次（不能给别的会话、不能交给宿主），`message` 的路由过 `Policy.outbound`；每个会话至多 `policy.scheduleLimit`（缺省 20）条，触发间隔不短于 `policy.scheduleMinMinutes`（缺省 5）分钟；只能删、替换自己设的。外部客户端要有 `schedule:<路由模式>` scope，只能设 `message` 定时任务、只发往 scope 内的路由；每次触发以这个客户端的身份发出，过它 `send_message` 的同一套检查（DL-6），触发时 scope 已不含该路由就不发。
+- **承诺**：主人（配置 `schedules`）、宿主（`schedule.put`）可以设任何定时任务。agent 经输出工具设的定时任务只开它自己会话的轮次（不能给别的会话、不能交给宿主），`message` 的路由过 `Policy.outbound`；每个会话至多 `policy.scheduleLimit`（缺省 20）条，触发间隔不短于 `policy.scheduleMinMinutes`（缺省 5）分钟；只能删、替换自己设的。外部客户端要有 `schedule:<路由模式>` scope，只能设 `message` 定时任务（只发往 scope 内的路由）和 `wake` 定时任务（到点作为宿主入站条目交给宿主，带 `schedule.wake`、`schedule.declared`，不在这里开轮）；每次触发以这个客户端的身份发出，过它 `send_message` 的同一套检查（DL-6），触发时 scope 已不含该路由就不发。
 - **实现**：`packages/daemon/src/gateway.ts` `putSchedule`、`removeSchedule`、`hostSchedule`；`packages/host-mcp/src/tools.ts` `scheduleTool`；`packages/host-mcp/src/external.ts`（`schedule` scope、`schedule_*` 工具）；`packages/daemon/src/external-mcp.ts` `schedulePut`、`sendAs`。
-- **测试**：标签 `#SC-3`；`packages/daemon/test/schedules.test.ts` "an agent sets a reminder for its own session, which comes back to it as a turn; it lists and removes only its own #SC-3"；`packages/daemon/test/external-mcp.test.ts` "a client with a schedule scope sets message schedules to routes its scope allows; each firing is its send #SC-3 #DL-6"。
+- **测试**：标签 `#SC-3`；`packages/daemon/test/schedules.test.ts` "an agent sets a reminder for its own session, which comes back to it as a turn; it lists and removes only its own #SC-3"；`packages/daemon/test/external-mcp.test.ts` "a client with a schedule scope sets message schedules to routes its scope allows; each firing is its send #SC-3 #DL-6"、"a wake schedule hands the firing to the host with who asked and how; a turn here is never allowed #SC-3"。
 - **状态**：有测试。
 
 ---

@@ -1832,6 +1832,14 @@
             },
             "note": {
               "type": "string"
+            },
+            "meta": {
+              "type": "object",
+              "patternProperties": {
+                "^(.*)$": {
+                  "type": "string"
+                }
+              }
             }
           }
         }

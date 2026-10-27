@@ -79,7 +79,7 @@ export interface ExternalBackend {
   send(caller: ExternalCaller, a: { route: ReplyRoute; text: string; operationId?: string }): Promise<unknown>;
   input(caller: ExternalCaller, a: { sessionKey: string; text: string }): Promise<unknown>;
   /** A schedule of the client's: it sends `text` to `route` at its times (docs/design/schedules). */
-  schedulePut(caller: ExternalCaller, a: { id?: string; when: ScheduleWhen; route: ReplyRoute; text: string; missed?: 'once' | 'skip'; until?: number; note?: string }): Promise<unknown>;
+  schedulePut(caller: ExternalCaller, a: { id?: string; when: ScheduleWhen; route: ReplyRoute; text: string; action?: 'message' | 'wake'; mode?: 'resume' | 'fresh'; missed?: 'once' | 'skip'; until?: number; note?: string }): Promise<unknown>;
   scheduleRemove(caller: ExternalCaller, id: string): Promise<unknown>;
   scheduleList(caller: ExternalCaller): unknown;
 }
@@ -168,13 +168,15 @@ export const EXTERNAL_TOOL_DEFS = {
     scope: 'schedule',
     readOnly: false,
     description:
-      'Send a message at set times: `when` is { at } (once: ISO 8601 with offset, or Unix ms), { cron, tz? } (five fields: minute hour day month weekday; tz like Asia/Shanghai) or { every_minutes }. At each time the daemon sends `text` to `route` (a route key your schedule scope allows), recorded as sent by your client. Missed while the daemon was down: sent once when it is back (missed "skip" drops it). Reuse an id of yours to replace it.',
+      'Do something at set times: `when` is { at } (once: ISO 8601 with offset, or Unix ms), { cron, tz? } (five fields: minute hour day month weekday; tz like Asia/Shanghai) or { every_minutes }. action "message" (default): the daemon sends `text` to `route` (a route key your schedule scope allows), recorded as sent by your client. action "wake": at each time `text` is handed to the host that runs you (with `mode`: "resume" = you, the same session, are woken with it; "fresh" = a new agent starts on it), and the answer goes to `route`. Missed while the daemon was down: once when it is back (missed "skip" drops it). Reuse an id of yours to replace it.',
     input: {
       when: z
         .object({ at: z.union([z.string(), z.number()]).optional(), cron: z.string().optional(), tz: z.string().optional(), every_minutes: z.number().optional() })
         .describe('{ at } | { cron, tz? } | { every_minutes }'),
       route: ROUTE_KEY,
-      text: z.string().min(1).describe('The message to send at those times'),
+      text: z.string().min(1).describe('message: what is sent; wake: what you (or the new agent) are told at that time'),
+      action: z.enum(['message', 'wake']).optional().describe('message (default): send text to route; wake: have the host wake an agent with text'),
+      mode: z.enum(['resume', 'fresh']).optional().describe('wake: resume = you (the same session); fresh = a new agent each time (default resume)'),
       missed: z.enum(['once', 'skip']).optional(),
       until: z.string().optional().describe('ISO 8601: remove it after this time'),
       note: z.string().optional(),
@@ -469,6 +471,8 @@ export class ExternalMcpServer {
           when,
           route,
           text: this.text(args.text),
+          ...(args.action === 'wake' ? { action: 'wake' as const } : {}),
+          ...(args.mode === 'resume' || args.mode === 'fresh' ? { mode: args.mode } : {}),
           ...(args.missed === 'once' || args.missed === 'skip' ? { missed: args.missed } : {}),
           ...(until !== undefined ? { until } : {}),
           ...(typeof args.note === 'string' ? { note: args.note } : {}),

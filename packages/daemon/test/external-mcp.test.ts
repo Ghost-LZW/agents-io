@@ -409,3 +409,20 @@ describe('external schedules', () => {
     expect(w.gw.schedules.registry.get('timer:hello')).toBeUndefined();
   });
 });
+
+describe('external wake schedules', () => {
+  it('a wake schedule hands the firing to the host with who asked and how; a turn here is never allowed #SC-3', async () => {
+    const dir = tmp();
+    const f = tokenFiles(dir);
+    const { w, url } = await world({ clients: { timer: { tokenFile: f.ops, scopes: ['schedule:fake:default:*'], declare: true } } });
+    const timer = await mcp(url, TOKENS.ops, { 'x-agents-io-declared': 'spawn:abc123' });
+    const added = await call(timer, 'schedule_add', { id: 'nudge', action: 'wake', mode: 'resume', when: { at: Date.now() + 300 }, route: 'fake:default:dm-alice', text: 'check the build again' });
+    expect(added.isError).toBe(false);
+    expect(added.value.schedule).toMatchObject({ id: 'timer:nudge', action: 'host', meta: { wake: 'resume', client: 'timer', declared: 'spawn:abc123' } });
+    const pull = await w.host({ name: 'tail' });
+    const { items } = await pull.inboundRead({ consumer: 'pull', waitMs: 5000 });
+    expect(items).toHaveLength(1);
+    expect(items[0]!.input.channelContext).toMatchObject({ schedule: 'timer:nudge', 'schedule.wake': 'resume', 'schedule.declared': 'spawn:abc123', createdBy: 'external:timer' });
+    expect(items[0]!.input.replyRoute).toMatchObject({ conversationId: 'dm-alice' });
+  });
+});

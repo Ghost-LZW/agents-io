@@ -255,7 +255,7 @@ export class ExternalMcp implements ExternalBackend {
     await this.send(caller, { route: a.route, text: a.text, operationId: a.operationId });
   }
 
-  async schedulePut(caller: ExternalCaller, a: { id?: string; when: ScheduleDraft['when']; route: ReplyRoute; text: string; missed?: 'once' | 'skip'; until?: number; note?: string }): Promise<unknown> {
+  async schedulePut(caller: ExternalCaller, a: { id?: string; when: ScheduleDraft['when']; route: ReplyRoute; text: string; action?: 'message' | 'wake'; mode?: 'resume' | 'fresh'; missed?: 'once' | 'skip'; until?: number; note?: string }): Promise<unknown> {
     const c = this.d.schedules;
     if (!c) throw new ToolError('schedules are not available on this daemon');
     if (!this.d.channelFor(a.route)) throw new ToolError(this.d.noChannelMessage(a.route));
@@ -263,12 +263,15 @@ export class ExternalMcp implements ExternalBackend {
     const content: ContentBlock[] = [{ type: 'text', text: a.text }];
     // Setting it is a write the host may decide; each firing then goes out as the client's send.
     await this.hostAllows(caller, { op: 'send', route: a.route, content, id: `schedule:${id}` });
+    // A wake goes to the host (it runs the agent): who asked (`declared`) and how travel with it.
+    const wake = a.action === 'wake';
     const r = await c.put(externalOrigin(caller.client, caller.declared), {
       id: `${caller.client.name}:${id}`,
       when: a.when,
-      action: 'message',
+      action: wake ? 'host' : 'message',
       route: a.route,
       text: a.text,
+      ...(wake ? { meta: { wake: a.mode ?? 'resume', client: caller.client.name, ...(caller.declared ? { declared: caller.declared } : {}) } } : {}),
       ...(a.missed ? { missed: a.missed } : {}),
       ...(a.until !== undefined ? { until: a.until } : {}),
       ...(a.note ? { note: a.note } : {}),
