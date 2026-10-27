@@ -119,6 +119,13 @@ export class FakeChannel implements ChannelAdapter {
     rec.finalized = true;
   }
 
+  /** Marks put by `acknowledge`, in order. */
+  readonly acks: { messageId: string; state: string }[] = [];
+
+  async acknowledge(_route: ReplyRoute, messageId: string, state: string) {
+    this.acks.push({ messageId, state });
+  }
+
   /** Conversations made by `createConversation`, in order. */
   readonly created: ConversationSpec[] = [];
 

@@ -40,3 +40,18 @@ describe('conversation.create', () => {
     await expect(t.conversationCreate({ ...spec, operationId: 'wb-2', name: ' ' })).rejects.toMatchObject({ code: 'invalid_frame' });
   });
 });
+
+describe('message.ack', () => {
+  it("puts the channel's mark on a message and takes it away; a channel without marks is unsupported #DL-8", async () => {
+    const w = await daemon({});
+    const t = await w.host({ name: 'herdr' });
+    const route = { channel: 'fake', account: 'default', conversationId: 'dm-alice' };
+    expect(await t.messageAck({ route, messageId: 'm1', state: 'working' })).toEqual({ messageId: 'm1', state: 'working' });
+    await t.messageAck({ route, messageId: 'm1', state: 'none' });
+    expect(w.chat.acks).toEqual([
+      { messageId: 'm1', state: 'working' },
+      { messageId: 'm1', state: 'none' },
+    ]);
+    await expect(t.messageAck({ route: { ...route, channel: 'none' }, messageId: 'm1', state: 'done' })).rejects.toMatchObject({ code: 'unknown_channel' });
+  });
+});

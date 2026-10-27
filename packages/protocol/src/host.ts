@@ -369,6 +369,20 @@ export const DeliverUpdate = Type.Object({
 export type DeliverUpdate = Static<typeof DeliverUpdate>;
 
 /**
+ * Mark a channel message with how the host's handling of it stands (feature `message.ack`): the
+ * channel's `acknowledge` (Lark: a reaction on it). `working` once taken, then `done` or
+ * `failed`, or `none` to take the mark away. Cosmetic: a channel without marks answers
+ * `unsupported`, a platform error `channel_error`; nothing is recorded.
+ */
+export const MessageAck = Type.Object({
+  ...Req('message.ack'),
+  route: ReplyRoute,
+  messageId: Type.String(),
+  state: Type.Union([Type.Literal('working'), Type.Literal('done'), Type.Literal('failed'), Type.Literal('none')]),
+});
+export type MessageAck = Static<typeof MessageAck>;
+
+/**
  * Create a conversation on a channel (feature `conversation.create`), e.g. a Lark group with
  * the bot in it: `members` are channel user ids (the namespace of `sender.channelUserId`),
  * `owner` one of them. At most one conversation per operationId (the channel's own dedup,
@@ -497,7 +511,7 @@ export type TestFault = Static<typeof TestFault>;
 export const HostOutboundScope = Type.Object({ ...Req('host.outboundScope'), routes: Type.Array(OutboundScopeRoute) });
 export type HostOutboundScope = Static<typeof HostOutboundScope>;
 
-export const HostRequestFrame = Type.Union([HostHello, BindingsPut, BindingsGet, RunStart, RunCancel, Deliver, DeliverUpdate, ConversationCreate, InputVerify, InboundRead, InboundAck, Explain, SessionPrepare, InboundRedispatch, SessionCompact, SessionPrewarm, TestReplay, TestFault, HostOutboundScope]);
+export const HostRequestFrame = Type.Union([HostHello, BindingsPut, BindingsGet, RunStart, RunCancel, Deliver, DeliverUpdate, MessageAck, ConversationCreate, InputVerify, InboundRead, InboundAck, Explain, SessionPrepare, InboundRedispatch, SessionCompact, SessionPrewarm, TestReplay, TestFault, HostOutboundScope]);
 export type HostRequestFrame = Static<typeof HostRequestFrame>;
 
 // ---- daemon → host --------------------------------------------------------
@@ -714,7 +728,7 @@ export type ContactCalloutAnswer = Static<typeof ContactCalloutAnswer>;
 export const HostEventFrame = Type.Union([InboundFrame, RouteCallout, ResolveCallout, ReviewCallout, OutboundCallout, ContactCallout, ExternalCallout, RunEnded, ResultFrame]);
 export type HostEventFrame = Static<typeof HostEventFrame>;
 
-export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'deliver.update', 'conversation.create', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare', 'inbound.redispatch', 'session.compact', 'session.prewarm', 'test.replay', 'test.fault', 'host.outboundScope'] as const;
+export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'deliver.update', 'message.ack', 'conversation.create', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare', 'inbound.redispatch', 'session.compact', 'session.prewarm', 'test.replay', 'test.fault', 'host.outboundScope'] as const;
 export const HOST_EVENT_FRAME_TYPES = ['inbound', 'policy', 'run.ended', 'result'] as const;
 
 // ---- result values --------------------------------------------------------
@@ -830,6 +844,10 @@ export const DeliverUpdateResult = Type.Object({
   duplicate: Type.Boolean(),
 });
 export type DeliverUpdateResult = Static<typeof DeliverUpdateResult>;
+
+/** `message.ack`. */
+export const MessageAckResult = Type.Object({ messageId: Type.String(), state: Type.String() });
+export type MessageAckResult = Static<typeof MessageAckResult>;
 
 /** `conversation.create`: the new conversation's id (a route's `conversationId`). */
 export const ConversationCreateResult = Type.Object({
@@ -1076,6 +1094,7 @@ export const HOST_RESULT_VALUES = {
   'run.cancel': RunCancelResult,
   deliver: DeliverResult,
   'deliver.update': DeliverUpdateResult,
+  'message.ack': MessageAckResult,
   'conversation.create': ConversationCreateResult,
   'input.verify': InputVerifyResult,
   'inbound.read': InboundReadResult,
