@@ -119,6 +119,15 @@ export class FakeChannel implements ChannelAdapter {
     rec.finalized = true;
   }
 
+  /** What `history` answers (set by tests); calls are recorded. */
+  historyAnswer: InboundEnvelope[] = [];
+  readonly historyCalls: { id: string; scope: string }[] = [];
+
+  async history(env: InboundEnvelope, scope: string): Promise<InboundEnvelope[]> {
+    this.historyCalls.push({ id: env.id, scope });
+    return this.historyAnswer;
+  }
+
   /** Marks put by `acknowledge`, in order. */
   readonly acks: { messageId: string; state: string }[] = [];
 

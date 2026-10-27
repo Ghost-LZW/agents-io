@@ -15,6 +15,7 @@ import {
   type DeliverUpdateResult,
   type ConversationCreateResult,
   type MessageAckResult,
+  type InboundEnvelope,
   type ScheduleDraft,
   type ScheduleView,
   type SessionLaunch,
@@ -270,6 +271,11 @@ export class LocalClient {
   /** Edit (with `final`, finalize) a message a `deliver` sent (`deliver.update`). */
   deliverUpdate(o: { operationId: string; route: ReplyRoute; providerMessageId: string; message: RenderedMessage; sequence: number; final?: boolean }): Promise<DeliverUpdateResult> {
     return this.call('deliver.update', o);
+  }
+
+  /** Earlier messages of the conversation a queued item is in (`history.read`). */
+  historyRead(o: { cursor: number; scope: 'thread' | 'chat'; limit?: number }): Promise<{ messages: InboundEnvelope[] }> {
+    return this.call('history.read', o);
   }
 
   /** Set (or replace) a schedule (`schedule.put`). */
