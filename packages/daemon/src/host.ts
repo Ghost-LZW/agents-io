@@ -57,6 +57,8 @@ export interface HostServiceDeps {
   deliver(hostName: string, f: Extract<HostRequestFrame, { type: 'deliver' }>): Promise<Outcome>;
   /** `deliver.update`: edit (or, `final`, finalize) a message a `deliver` sent. */
   deliverUpdate(hostName: string, f: Extract<HostRequestFrame, { type: 'deliver.update' }>): Promise<Outcome>;
+  /** `history.read`: the channel's earlier messages around a queued item (CHANNELS §1c). */
+  history(f: Extract<HostRequestFrame, { type: 'history.read' }>): Promise<Outcome>;
   /** `schedule.put` / `remove` / `list` (docs/design/schedules). */
   schedule(hostName: string, f: Extract<HostRequestFrame, { type: 'schedule.put' | 'schedule.remove' | 'schedule.list' }>): Promise<Outcome>;
   /** `message.ack`: the channel's mark on a message (a reaction). */
@@ -244,6 +246,8 @@ export class HostService implements HostFrames {
         return this.d.deliverUpdate(peer.auth!.name, f);
       case 'message.ack':
         return this.d.ackMessage(f);
+      case 'history.read':
+        return this.d.history(f);
       case 'schedule.put':
       case 'schedule.remove':
       case 'schedule.list':
@@ -527,6 +531,7 @@ export const FEATURES = [
   'conversation.create',
   'message.ack',
   'schedules',
+  'history',
 ];
 
 /** `DaemonRecords` flag: the name of the host that declared the `outbound` hook. */

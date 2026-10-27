@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { fakeEnvelope } from '@agents-io/testkit';
 import { daemon } from './helpers.js';
 
 // A host edits what it delivered (`deliver.update`) and has a channel make a conversation (`conversation.create`).
@@ -53,5 +54,27 @@ describe('message.ack', () => {
       { messageId: 'm1', state: 'none' },
     ]);
     await expect(t.messageAck({ route: { ...route, channel: 'none' }, messageId: 'm1', state: 'done' })).rejects.toMatchObject({ code: 'unknown_channel' });
+  });
+});
+
+describe('history.read', () => {
+  it("answers the channel's earlier messages of a queued item's conversation, oldest first, only its own and earlier #DL-8", async () => {
+    const w = await daemon({ raw: { bindings: [{ id: 'to-host', match: { channel: 'fake', keywords: ['xwo'] }, on: 'host' }] } });
+    const t = await w.host({ name: 'herdr', consumer: 'herdr' });
+    t.onRequest('inbound', () => ({ accepted: true }));
+    const base = Date.now();
+    await w.chat.inject({ id: 'trig', sender: { channelUserId: 'alice', evidence: 'platform_signed' }, text: 'xwo what happened?', sentAt: base });
+    const pull = await w.host({ name: 'tail' });
+    const [item] = (await pull.inboundRead({ consumer: 'pull', waitMs: 2000 })).items;
+    w.chat.historyAnswer = [
+      fakeEnvelope({ id: 'h1', channel: 'fake', account: 'default', text: 'first', sentAt: base - 2000 }),
+      fakeEnvelope({ id: 'h2', channel: 'fake', account: 'default', text: 'second', sentAt: base - 1000 }),
+      fakeEnvelope({ id: 'later', channel: 'fake', account: 'default', text: 'after', sentAt: base + 1000 }),
+      fakeEnvelope({ id: 'other', channel: 'elsewhere', account: 'default', text: 'no', sentAt: base - 500 }),
+    ];
+    const r = await t.historyRead({ cursor: item!.cursor, scope: 'chat' });
+    expect(r.messages.map((m) => m.id)).toEqual(['h1', 'h2']);
+    expect(w.chat.historyCalls).toEqual([{ id: 'trig', scope: 'chat' }]);
+    await expect(t.historyRead({ cursor: 99_999, scope: 'thread' })).rejects.toMatchObject({ code: 'unknown_cursor' });
   });
 });

@@ -1892,6 +1892,49 @@
         "v",
         "type",
         "id",
+        "cursor",
+        "scope"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "history.read",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "cursor": {
+          "type": "number"
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "const": "thread",
+              "type": "string"
+            },
+            {
+              "const": "chat",
+              "type": "string"
+            }
+          ]
+        },
+        "limit": {
+          "minimum": 1,
+          "maximum": 200,
+          "type": "integer"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
         "channelRef"
       ],
       "properties": {

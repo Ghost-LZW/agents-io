@@ -381,6 +381,21 @@ export const ScheduleRemove = Type.Object({ ...Req('schedule.remove'), scheduleI
 export const ScheduleList = Type.Object({ ...Req('schedule.list'), sessionKey: Type.Optional(Type.String()) });
 
 /**
+ * Earlier messages of the conversation a channel message is in (feature `history`): the channel's
+ * own `history` (CHANNELS §1c) for a host that hands context to an agent of its own. `scope`
+ * `thread`: the topic it is in; `chat`: the recent messages of its chat. Answers envelopes of
+ * that channel and account sent before it, oldest first (at most `limit`, default 50); [] when
+ * the channel cannot. `item` is an inbound item's cursor (the message the host received).
+ */
+export const HistoryRead = Type.Object({
+  ...Req('history.read'),
+  cursor: Type.Number(),
+  scope: Type.Union([Type.Literal('thread'), Type.Literal('chat')]),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+});
+export type HistoryRead = Static<typeof HistoryRead>;
+
+/**
  * Mark a channel message with how the host's handling of it stands (feature `message.ack`): the
  * channel's `acknowledge` (Lark: a reaction on it). `working` once taken, then `done` or
  * `failed`, or `none` to take the mark away. Cosmetic: a channel without marks answers
@@ -523,7 +538,7 @@ export type TestFault = Static<typeof TestFault>;
 export const HostOutboundScope = Type.Object({ ...Req('host.outboundScope'), routes: Type.Array(OutboundScopeRoute) });
 export type HostOutboundScope = Static<typeof HostOutboundScope>;
 
-export const HostRequestFrame = Type.Union([HostHello, BindingsPut, BindingsGet, RunStart, RunCancel, Deliver, DeliverUpdate, MessageAck, ConversationCreate, SchedulePut, ScheduleRemove, ScheduleList, InputVerify, InboundRead, InboundAck, Explain, SessionPrepare, InboundRedispatch, SessionCompact, SessionPrewarm, TestReplay, TestFault, HostOutboundScope]);
+export const HostRequestFrame = Type.Union([HostHello, BindingsPut, BindingsGet, RunStart, RunCancel, Deliver, DeliverUpdate, MessageAck, ConversationCreate, SchedulePut, ScheduleRemove, ScheduleList, HistoryRead, InputVerify, InboundRead, InboundAck, Explain, SessionPrepare, InboundRedispatch, SessionCompact, SessionPrewarm, TestReplay, TestFault, HostOutboundScope]);
 export type HostRequestFrame = Static<typeof HostRequestFrame>;
 
 // ---- daemon → host --------------------------------------------------------
@@ -740,7 +755,7 @@ export type ContactCalloutAnswer = Static<typeof ContactCalloutAnswer>;
 export const HostEventFrame = Type.Union([InboundFrame, RouteCallout, ResolveCallout, ReviewCallout, OutboundCallout, ContactCallout, ExternalCallout, RunEnded, ResultFrame]);
 export type HostEventFrame = Static<typeof HostEventFrame>;
 
-export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'deliver.update', 'message.ack', 'conversation.create', 'schedule.put', 'schedule.remove', 'schedule.list', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare', 'inbound.redispatch', 'session.compact', 'session.prewarm', 'test.replay', 'test.fault', 'host.outboundScope'] as const;
+export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'deliver.update', 'message.ack', 'conversation.create', 'schedule.put', 'schedule.remove', 'schedule.list', 'history.read', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare', 'inbound.redispatch', 'session.compact', 'session.prewarm', 'test.replay', 'test.fault', 'host.outboundScope'] as const;
 export const HOST_EVENT_FRAME_TYPES = ['inbound', 'policy', 'run.ended', 'result'] as const;
 
 // ---- result values --------------------------------------------------------
@@ -874,6 +889,9 @@ export const SchedulePutResult = Type.Object({ schedule: ScheduleView });
 export const ScheduleRemoveResult = Type.Object({ scheduleId: Type.String(), removed: Type.Boolean() });
 /** `schedule.list`. */
 export const ScheduleListResult = Type.Object({ schedules: Type.Array(ScheduleView) });
+
+/** `history.read`: earlier messages, oldest first. */
+export const HistoryReadResult = Type.Object({ messages: Type.Array(InboundEnvelope) });
 
 /** `message.ack`. */
 export const MessageAckResult = Type.Object({ messageId: Type.String(), state: Type.String() });
@@ -1128,6 +1146,7 @@ export const HOST_RESULT_VALUES = {
   'schedule.put': SchedulePutResult,
   'schedule.remove': ScheduleRemoveResult,
   'schedule.list': ScheduleListResult,
+  'history.read': HistoryReadResult,
   'conversation.create': ConversationCreateResult,
   'input.verify': InputVerifyResult,
   'inbound.read': InboundReadResult,

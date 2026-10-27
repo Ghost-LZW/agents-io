@@ -569,6 +569,7 @@ export class Gateway {
       deliverUpdate: (name, f) => this.deliverUpdate(name, f),
       ackMessage: (f) => this.ackMessage(f),
       schedule: (name, f) => this.hostSchedule(name, f),
+      history: (f) => this.hostHistory(f),
       createConversation: (f) => this.createConversation(f),
       prepareSession: (f) => this.prepareSession(f),
       redispatch: (name, f) => this.redispatch(name, f),
@@ -3326,6 +3327,24 @@ ${a.summary}` }],
     } catch (e) {
       return { ok: false, code: e instanceof ScheduleError ? e.code : 'invalid', message: (e as Error).message };
     }
+  }
+
+  /** `history.read`: what the channel can tell of the conversation before a queued item (never throws for platform errors). */
+  private async hostHistory(f: Extract<HostRequestFrame, { type: 'history.read' }>): Promise<Outcome> {
+    const item = this.hostQueue.get(f.cursor);
+    if (!item) return fail('unknown_cursor', `no queued item ${f.cursor}`);
+    const env = item.envelope;
+    const ch = this.channelFor(env);
+    if (!ch?.adapter.history) return { ok: true, value: { messages: [] } };
+    let got: InboundEnvelope[] = [];
+    try {
+      got = await ch.adapter.history(env, f.scope);
+    } catch (e) {
+      this.log('warn', `history for host (${env.channel}): ${(e as Error).message}`);
+    }
+    // Only this channel instance's own, earlier messages, oldest first (as the gateway's own history, IN-9).
+    const before = got.filter((h) => h.id !== env.id && h.channel === env.channel && h.account === env.account && (env.sentAt === undefined || h.sentAt === undefined || h.sentAt <= env.sentAt));
+    return { ok: true, value: { messages: before.slice(-(f.limit ?? 50)) } };
   }
 
   /** The host's schedule requests: set as `host:<name>`, any session or route, or back to itself. */
