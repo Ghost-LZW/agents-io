@@ -1683,6 +1683,215 @@
         "v",
         "type",
         "id",
+        "schedule"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "schedule.put",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "schedule": {
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "id",
+            "when",
+            "text"
+          ],
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "when": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "required": [
+                    "cron"
+                  ],
+                  "properties": {
+                    "cron": {
+                      "type": "string"
+                    },
+                    "tz": {
+                      "type": "string"
+                    }
+                  }
+                },
+                {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "required": [
+                    "at"
+                  ],
+                  "properties": {
+                    "at": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "number"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "required": [
+                    "everyMinutes"
+                  ],
+                  "properties": {
+                    "everyMinutes": {
+                      "minimum": 1,
+                      "type": "number"
+                    }
+                  }
+                }
+              ]
+            },
+            "action": {
+              "anyOf": [
+                {
+                  "const": "turn",
+                  "type": "string"
+                },
+                {
+                  "const": "message",
+                  "type": "string"
+                },
+                {
+                  "const": "host",
+                  "type": "string"
+                }
+              ]
+            },
+            "target": {
+              "type": "object",
+              "required": [
+                "sessionKey"
+              ],
+              "properties": {
+                "sessionKey": {
+                  "type": "string"
+                }
+              }
+            },
+            "route": {
+              "type": "object",
+              "required": [
+                "channel",
+                "account",
+                "conversationId"
+              ],
+              "properties": {
+                "channel": {
+                  "type": "string"
+                },
+                "account": {
+                  "type": "string"
+                },
+                "conversationId": {
+                  "type": "string"
+                },
+                "threadId": {
+                  "type": "string"
+                },
+                "replyToMessageId": {
+                  "type": "string"
+                }
+              }
+            },
+            "text": {
+              "type": "string"
+            },
+            "missed": {
+              "anyOf": [
+                {
+                  "const": "once",
+                  "type": "string"
+                },
+                {
+                  "const": "skip",
+                  "type": "string"
+                }
+              ]
+            },
+            "until": {
+              "type": "number"
+            },
+            "note": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "scheduleId"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "schedule.remove",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "scheduleId": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "schedule.list",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "sessionKey": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
         "channelRef"
       ],
       "properties": {

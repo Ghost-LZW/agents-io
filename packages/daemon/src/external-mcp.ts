@@ -11,12 +11,13 @@ import {
   type RenderedMessage,
   type ReplyRoute,
   type RouteExplanation,
+  type ScheduleDraft,
   type SessionEvent,
   type Tier,
   type TurnContext,
 } from '@agents-io/protocol';
-import { LaneUnavailableError, passes, project, withholding, type DeliveryRecord, type Hub, type Lane, type Outbox } from '@agents-io/session';
-import { ExternalMcpServer, ToolError, type ExternalBackend, type ExternalCaller, type ExternalClient } from '@agents-io/host-mcp';
+import { LaneUnavailableError, passes, project, withholding, type DeliveryRecord, type Hub, type Lane, type Outbox, type Schedule } from '@agents-io/session';
+import { ExternalMcpServer, ToolError, globMatch, type ExternalBackend, type ExternalCaller, type ExternalClient } from '@agents-io/host-mcp';
 import type { ExternalMcpConfig } from './config.js';
 import type { LogFn, Outcome } from './gateway.js';
 import type { HostService } from './host.js';
@@ -87,6 +88,12 @@ export interface ExternalMcpDeps {
   /** Remember who sends `operationId` until its delivery settles (the outbound record names them). */
   sending(operationId: string, by: ExternalSender | undefined): void;
   stopped(): boolean;
+  /** Schedules (docs/design/schedules): the client's own, sending to routes its scope allows. */
+  schedules?: {
+    put(by: Origin, d: ScheduleDraft): Promise<{ ok: true; schedule: Schedule } | { ok: false; code: string; message: string }>;
+    remove(by: Origin, id: string): Promise<{ ok: true; removed: boolean } | { ok: false; code: string; message: string }>;
+    list(): Schedule[];
+  };
   log: LogFn;
   /** Tests: an ephemeral port. */
   port?: number;
@@ -236,6 +243,54 @@ export class ExternalMcp implements ExternalBackend {
     } finally {
       this.inFlight.delete(operationId);
     }
+  }
+
+  /** A firing of a client's schedule: sent as that client, through the checks of its send_message. */
+  async sendAs(client: string, a: { route: ReplyRoute; text: string; operationId: string }): Promise<void> {
+    const c = this.d.config.clients.find((x) => x.name === client);
+    if (!c) throw new Error(`no external client ${client}`);
+    const caller: ExternalCaller = { client: { name: c.name, principal: c.principal, scopes: c.scopes, declare: c.declare } };
+    // Its scope may have changed since it was set: a route it may no longer use is not sent to.
+    if (!c.scopes.schedule.some((p) => globMatch(p, routeKey(a.route)))) throw new Error(`route ${routeKey(a.route)} is no longer in ${client}'s schedule scope`);
+    await this.send(caller, { route: a.route, text: a.text, operationId: a.operationId });
+  }
+
+  async schedulePut(caller: ExternalCaller, a: { id?: string; when: ScheduleDraft['when']; route: ReplyRoute; text: string; missed?: 'once' | 'skip'; until?: number; note?: string }): Promise<unknown> {
+    const c = this.d.schedules;
+    if (!c) throw new ToolError('schedules are not available on this daemon');
+    if (!this.d.channelFor(a.route)) throw new ToolError(this.d.noChannelMessage(a.route));
+    const id = a.id ?? `ext_${randomUUID().slice(0, 8)}`;
+    const content: ContentBlock[] = [{ type: 'text', text: a.text }];
+    // Setting it is a write the host may decide; each firing then goes out as the client's send.
+    await this.hostAllows(caller, { op: 'send', route: a.route, content, id: `schedule:${id}` });
+    const r = await c.put(externalOrigin(caller.client, caller.declared), {
+      id: `${caller.client.name}:${id}`,
+      when: a.when,
+      action: 'message',
+      route: a.route,
+      text: a.text,
+      ...(a.missed ? { missed: a.missed } : {}),
+      ...(a.until !== undefined ? { until: a.until } : {}),
+      ...(a.note ? { note: a.note } : {}),
+    });
+    if (!r.ok) throw new ToolError(r.message);
+    return { ok: true, schedule: { ...r.schedule, nextAt: r.schedule.nextAt === null ? null : new Date(r.schedule.nextAt).toISOString() } };
+  }
+
+  async scheduleRemove(caller: ExternalCaller, id: string): Promise<unknown> {
+    const c = this.d.schedules;
+    if (!c) throw new ToolError('schedules are not available on this daemon');
+    const full = id.startsWith(`${caller.client.name}:`) ? id : `${caller.client.name}:${id}`;
+    const r = await c.remove(externalOrigin(caller.client, caller.declared), full);
+    if (!r.ok) throw new ToolError(r.message);
+    return { ok: true, removed: r.removed, id: full };
+  }
+
+  scheduleList(caller: ExternalCaller): unknown {
+    const by = externalOrigin(caller.client, caller.declared);
+    const who = by.principal?.id;
+    const mine = (this.d.schedules?.list() ?? []).filter((s) => s.createdBy === who);
+    return { schedules: mine.map((s) => ({ ...s, nextAt: s.nextAt === null ? null : new Date(s.nextAt).toISOString() })) };
   }
 
   async input(caller: ExternalCaller, a: { sessionKey: string; text: string }): Promise<unknown> {

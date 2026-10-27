@@ -5,6 +5,7 @@ import { Decision, Resolver } from './requests.js';
 import { RunSpec } from './run.js';
 import { ConversationKind, InboundEnvelope, InputCause, InputRecord, OriginKind } from './inbound.js';
 import { RenderedMessage } from './channel.js';
+import { ScheduleDraft } from './schedule.js';
 import { ResultFrame } from './wire.js';
 
 /*
@@ -369,6 +370,17 @@ export const DeliverUpdate = Type.Object({
 export type DeliverUpdate = Static<typeof DeliverUpdate>;
 
 /**
+ * Schedules (feature `schedules`, docs/design/schedules): the host sets, removes and lists them.
+ * A host may point a turn at any session, send to any route (still past the outbound check) or
+ * have the item handed back to itself (`action: "host"`, through its inbound queue). The same id
+ * again replaces it. Set by `host:<name>`.
+ */
+export const SchedulePut = Type.Object({ ...Req('schedule.put'), schedule: Type.Object({ ...ScheduleDraft.properties, id: Type.String() }, { additionalProperties: false }) });
+export type SchedulePut = Static<typeof SchedulePut>;
+export const ScheduleRemove = Type.Object({ ...Req('schedule.remove'), scheduleId: Type.String() });
+export const ScheduleList = Type.Object({ ...Req('schedule.list'), sessionKey: Type.Optional(Type.String()) });
+
+/**
  * Mark a channel message with how the host's handling of it stands (feature `message.ack`): the
  * channel's `acknowledge` (Lark: a reaction on it). `working` once taken, then `done` or
  * `failed`, or `none` to take the mark away. Cosmetic: a channel without marks answers
@@ -511,7 +523,7 @@ export type TestFault = Static<typeof TestFault>;
 export const HostOutboundScope = Type.Object({ ...Req('host.outboundScope'), routes: Type.Array(OutboundScopeRoute) });
 export type HostOutboundScope = Static<typeof HostOutboundScope>;
 
-export const HostRequestFrame = Type.Union([HostHello, BindingsPut, BindingsGet, RunStart, RunCancel, Deliver, DeliverUpdate, MessageAck, ConversationCreate, InputVerify, InboundRead, InboundAck, Explain, SessionPrepare, InboundRedispatch, SessionCompact, SessionPrewarm, TestReplay, TestFault, HostOutboundScope]);
+export const HostRequestFrame = Type.Union([HostHello, BindingsPut, BindingsGet, RunStart, RunCancel, Deliver, DeliverUpdate, MessageAck, ConversationCreate, SchedulePut, ScheduleRemove, ScheduleList, InputVerify, InboundRead, InboundAck, Explain, SessionPrepare, InboundRedispatch, SessionCompact, SessionPrewarm, TestReplay, TestFault, HostOutboundScope]);
 export type HostRequestFrame = Static<typeof HostRequestFrame>;
 
 // ---- daemon → host --------------------------------------------------------
@@ -728,7 +740,7 @@ export type ContactCalloutAnswer = Static<typeof ContactCalloutAnswer>;
 export const HostEventFrame = Type.Union([InboundFrame, RouteCallout, ResolveCallout, ReviewCallout, OutboundCallout, ContactCallout, ExternalCallout, RunEnded, ResultFrame]);
 export type HostEventFrame = Static<typeof HostEventFrame>;
 
-export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'deliver.update', 'message.ack', 'conversation.create', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare', 'inbound.redispatch', 'session.compact', 'session.prewarm', 'test.replay', 'test.fault', 'host.outboundScope'] as const;
+export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'deliver.update', 'message.ack', 'conversation.create', 'schedule.put', 'schedule.remove', 'schedule.list', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare', 'inbound.redispatch', 'session.compact', 'session.prewarm', 'test.replay', 'test.fault', 'host.outboundScope'] as const;
 export const HOST_EVENT_FRAME_TYPES = ['inbound', 'policy', 'run.ended', 'result'] as const;
 
 // ---- result values --------------------------------------------------------
@@ -844,6 +856,24 @@ export const DeliverUpdateResult = Type.Object({
   duplicate: Type.Boolean(),
 });
 export type DeliverUpdateResult = Static<typeof DeliverUpdateResult>;
+
+/** A schedule as the daemon keeps it: the draft, who set it, and when it fires next (Unix ms; null: never again). */
+export const ScheduleView = Type.Object({
+  ...ScheduleDraft.properties,
+  id: Type.String(),
+  action: Type.String(),
+  createdBy: Type.String(),
+  createdAt: Type.Number(),
+  nextAt: Type.Union([Type.Number(), Type.Null()]),
+  lastFiredAt: Type.Optional(Type.Number()),
+});
+export type ScheduleView = Static<typeof ScheduleView>;
+/** `schedule.put`. */
+export const SchedulePutResult = Type.Object({ schedule: ScheduleView });
+/** `schedule.remove`. */
+export const ScheduleRemoveResult = Type.Object({ scheduleId: Type.String(), removed: Type.Boolean() });
+/** `schedule.list`. */
+export const ScheduleListResult = Type.Object({ schedules: Type.Array(ScheduleView) });
 
 /** `message.ack`. */
 export const MessageAckResult = Type.Object({ messageId: Type.String(), state: Type.String() });
@@ -1095,6 +1125,9 @@ export const HOST_RESULT_VALUES = {
   deliver: DeliverResult,
   'deliver.update': DeliverUpdateResult,
   'message.ack': MessageAckResult,
+  'schedule.put': SchedulePutResult,
+  'schedule.remove': ScheduleRemoveResult,
+  'schedule.list': ScheduleListResult,
   'conversation.create': ConversationCreateResult,
   'input.verify': InputVerifyResult,
   'inbound.read': InboundReadResult,

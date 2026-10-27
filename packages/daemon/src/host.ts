@@ -57,6 +57,8 @@ export interface HostServiceDeps {
   deliver(hostName: string, f: Extract<HostRequestFrame, { type: 'deliver' }>): Promise<Outcome>;
   /** `deliver.update`: edit (or, `final`, finalize) a message a `deliver` sent. */
   deliverUpdate(hostName: string, f: Extract<HostRequestFrame, { type: 'deliver.update' }>): Promise<Outcome>;
+  /** `schedule.put` / `remove` / `list` (docs/design/schedules). */
+  schedule(hostName: string, f: Extract<HostRequestFrame, { type: 'schedule.put' | 'schedule.remove' | 'schedule.list' }>): Promise<Outcome>;
   /** `message.ack`: the channel's mark on a message (a reaction). */
   ackMessage(f: Extract<HostRequestFrame, { type: 'message.ack' }>): Promise<Outcome>;
   /** `conversation.create`: a conversation the channel makes (a Lark group). */
@@ -242,6 +244,10 @@ export class HostService implements HostFrames {
         return this.d.deliverUpdate(peer.auth!.name, f);
       case 'message.ack':
         return this.d.ackMessage(f);
+      case 'schedule.put':
+      case 'schedule.remove':
+      case 'schedule.list':
+        return this.d.schedule(peer.auth!.name, f);
       case 'conversation.create':
         return this.d.createConversation(f);
       case 'input.verify':
@@ -520,6 +526,7 @@ export const FEATURES = [
   'deliver.update',
   'conversation.create',
   'message.ack',
+  'schedules',
 ];
 
 /** `DaemonRecords` flag: the name of the host that declared the `outbound` hook. */

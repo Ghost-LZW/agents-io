@@ -1018,6 +1018,33 @@
 
 ---
 
+## 14a. 定时任务（SC）
+
+方案见 `docs/design/schedules/`。
+
+### SC-1 每个到点只触发一次，跨重启
+
+- **承诺**：一条定时任务的每个到点 `(id, scheduledAt)` 至多产生一次投递：`turn` 是一条输入 id 为 `schedule:<id>:<scheduledAt>` 的输入，`message` 是一次 operationId 相同的发送（DL-2），`host` 是宿主入站队列里一条 `channelRef` 相同的条目（HQ-2）。投递前先记待定标记，投递后在同一个 savepoint 里删标记、推进下次时刻；进程死在中间，下次启动按标记以同一个 id 重做，会话（`duplicate`）、outbox、队列各自去重。一次性的（`at`）触发后删除，过了 `until` 的不再触发。
+- **实现**：`packages/session/src/schedule.ts` `ScheduleRegistry`（`schedules`、`schedule_firing` 两张表，与会话日志同一个 SQLite 文件）`begin` / `end` / `pending`，`ScheduleDispatcher` `fireOnce` / `deliver` / `start`；`packages/daemon/src/gateway.ts` `sendScheduled`、`scheduledToHost`。
+- **测试**：标签 `#SC-1`；`packages/session/test/schedule.test.ts` "fires a turn into the session at its time, once, then moves to the next time #SC-1"、"a firing cut off before it was settled is redone with the same input id, and the session keeps one #SC-1"；`packages/daemon/test/schedules.test.ts` "fire a turn in their session at their time; their next time survives a restart #SC-1"。
+- **状态**：有测试。
+
+### SC-2 停机期间错过的按 `missed` 处理，至多补一次
+
+- **承诺**：启动时下次时刻已过一分钟以上的定时任务，`missed: "once"`（缺省）以错过的最近那个到点补一次（`channelContext.missed=true`），`skip` 不触发、直接排到下一个；错过几次都至多补一次。
+- **实现**：`packages/session/src/schedule.ts` `ScheduleDispatcher.start`、`latestMissed`、`ScheduleRegistry.skip`。
+- **测试**：标签 `#SC-2`；`packages/session/test/schedule.test.ts` "missed while stopped: \"once\" fires the latest missed time once, \"skip\" moves on without firing #SC-2"。
+- **状态**：有测试。
+
+### SC-3 谁能设定时任务：agent 只给自己的会话，有上限；外部客户端只发它的 scope 允许的路由
+
+- **承诺**：主人（配置 `schedules`）、宿主（`schedule.put`）可以设任何定时任务。agent 经输出工具设的定时任务只开它自己会话的轮次（不能给别的会话、不能交给宿主），`message` 的路由过 `Policy.outbound`；每个会话至多 `policy.scheduleLimit`（缺省 20）条，触发间隔不短于 `policy.scheduleMinMinutes`（缺省 5）分钟；只能删、替换自己设的。外部客户端要有 `schedule:<路由模式>` scope，只能设 `message` 定时任务、只发往 scope 内的路由；每次触发以这个客户端的身份发出，过它 `send_message` 的同一套检查（DL-6），触发时 scope 已不含该路由就不发。
+- **实现**：`packages/daemon/src/gateway.ts` `putSchedule`、`removeSchedule`、`hostSchedule`；`packages/host-mcp/src/tools.ts` `scheduleTool`；`packages/host-mcp/src/external.ts`（`schedule` scope、`schedule_*` 工具）；`packages/daemon/src/external-mcp.ts` `schedulePut`、`sendAs`。
+- **测试**：标签 `#SC-3`；`packages/daemon/test/schedules.test.ts` "an agent sets a reminder for its own session, which comes back to it as a turn; it lists and removes only its own #SC-3"；`packages/daemon/test/external-mcp.test.ts` "a client with a schedule scope sets message schedules to routes its scope allows; each firing is its send #SC-3 #DL-6"。
+- **状态**：有测试。
+
+---
+
 ## 15. 缺口
 
 按风险从高到低。"不成立"指读代码确认、与文档承诺相反；"未测"指承诺可能成立但没有测试守着。

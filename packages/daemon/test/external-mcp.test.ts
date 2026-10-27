@@ -185,7 +185,7 @@ describe('external MCP endpoint: scopes', () => {
     const r = await call(reader, 'send_message', { route: 'fake:default:c1', text: 'x' });
     expect(r.isError).toBe(true);
     const none = resolveConfig({ externalMcp: { clients: { a: { token: 'env:T', scopes: [] } } } }, { env: { T: 'x'.repeat(20) }, baseDir: tmp(), cwd: tmp() });
-    expect(none.externalMcp!.clients[0]!.scopes).toEqual({ read: [], readAll: false, send: [], input: [] });
+    expect(none.externalMcp!.clients[0]!.scopes).toEqual({ read: [], readAll: false, send: [], input: [], schedule: [] });
     expect(() => resolveConfig({ externalMcp: { clients: { a: { token: 'env:T', scopes: ['write:*'] } } } }, { env: { T: 'x'.repeat(20) }, baseDir: tmp(), cwd: tmp() })).toThrow(/not a scope/);
   });
 
@@ -378,5 +378,34 @@ describe('external MCP endpoint end to end', () => {
     const s = await call(c, 'send_message', { route: 'fake:default:c7', text: 'done', operation_id: 'e2e-1' });
     expect(s.value).toMatchObject({ ok: true, operationId: 'external:ops:e2e-1' });
     expect(w.chat.sent.map((x) => x.msg.text)).toEqual(['done']);
+  });
+});
+
+describe('external schedules', () => {
+  it('a client with a schedule scope sets message schedules to routes its scope allows; each firing is its send #SC-3 #DL-6', async () => {
+    const dir = tmp();
+    const f = tokenFiles(dir);
+    const { w, url } = await world({
+      clients: {
+        timer: { tokenFile: f.ops, scopes: ['schedule:fake:default:*'] },
+        reader: { tokenFile: f.reader, scopes: ['read'] },
+      },
+    });
+    const timer = await mcp(url, TOKENS.ops);
+    const names = (await timer.listTools()).tools.map((t) => t.name);
+    expect(names.sort()).toEqual(['schedule_add', 'schedule_list', 'schedule_remove']);
+    // Nobody without the scope sees the tools.
+    expect((await (await mcp(url, TOKENS.reader)).listTools()).tools.map((t) => t.name)).not.toContain('schedule_add');
+    const refused = await call(timer, 'schedule_add', { when: { at: Date.now() + 300 }, route: 'other:default:x', text: 'no' });
+    expect(refused).toMatchObject({ isError: true, text: expect.stringMatching(/not in your schedule scope/) });
+    const added = await call(timer, 'schedule_add', { id: 'hello', when: { at: Date.now() + 300 }, route: 'fake:default:dm-alice', text: 'good morning' });
+    expect(added.isError).toBe(false);
+    expect(added.value.schedule).toMatchObject({ id: 'timer:hello', action: 'message', createdBy: 'external:timer' });
+    expect((await call(timer, 'schedule_list')).value.schedules.map((s: { id: string }) => s.id)).toEqual(['timer:hello']);
+    // At its time it goes out as the client's send (recorded in its log, like send_message).
+    await until(() => w.chat.sent.some((s) => s.msg.text === 'good morning'), 5000);
+    const sent = w.chat.sent.find((s) => s.msg.text === 'good morning')!;
+    expect(sent.route.conversationId).toBe('dm-alice');
+    expect(w.gw.schedules.registry.get('timer:hello')).toBeUndefined();
   });
 });
