@@ -62,7 +62,7 @@ export class DaemonRecords implements OutboxStore {
   private q: Record<
     | 'inPut' | 'inGet' | 'inPrune' | 'outGet' | 'outPut' | 'outPrune' | 'flyPut' | 'flyGet' | 'flyAll' | 'flyDel' | 'agentGet' | 'agentPut' | 'launchGet' | 'launchPut' | 'launchKeys'
     | 'flagGet' | 'flagPut' | 'flagDel'
-    | 'obPut' | 'obByOp' | 'obByMsg' | 'obPrune' | 'obPartPut' | 'obByPart' | 'obPartPrune' | 'causePut' | 'causeGet' | 'causeAll' | 'causePrune',
+    | 'obPut' | 'obByOp' | 'obByMsg' | 'obAnyMsg' | 'obAnyPart' | 'obPrune' | 'obPartPut' | 'obByPart' | 'obPartPrune' | 'causePut' | 'causeGet' | 'causeAll' | 'causePrune',
     StatementSync
   >;
   /** Tests: called between the agent row and the launch row of `pin` (a throw rolls both back). */
@@ -79,10 +79,18 @@ export class DaemonRecords implements OutboxStore {
       CREATE TABLE IF NOT EXISTS daemon_session_agents (session_key TEXT PRIMARY KEY, agent TEXT NOT NULL) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS daemon_session_launch (session_key TEXT PRIMARY KEY, cwd TEXT, env_json TEXT NOT NULL, at INTEGER NOT NULL) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS daemon_flags (name TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
-      CREATE TABLE IF NOT EXISTS daemon_outbound (operation_id TEXT PRIMARY KEY, channel TEXT NOT NULL, provider_message_id TEXT, at INTEGER NOT NULL, json TEXT NOT NULL) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS daemon_outbound (operation_id TEXT PRIMARY KEY, channel TEXT NOT NULL, provider_message_id TEXT, sent_message_id TEXT, at INTEGER NOT NULL, json TEXT NOT NULL) WITHOUT ROWID;
       CREATE INDEX IF NOT EXISTS daemon_outbound_msg ON daemon_outbound (channel, provider_message_id);
       CREATE TABLE IF NOT EXISTS daemon_outbound_parts (channel TEXT NOT NULL, provider_message_id TEXT NOT NULL, operation_id TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (channel, provider_message_id, operation_id)) WITHOUT ROWID;
     `);
+    // `sent_message_id` (any delivered message, `sentByUs`) came later: added to an older table and filled
+    // from what it already records.
+    const obCols = (this.db.prepare('PRAGMA table_info(daemon_outbound)').all() as { name: string }[]).map((c) => c.name);
+    if (!obCols.includes('sent_message_id')) {
+      this.db.exec(`ALTER TABLE daemon_outbound ADD COLUMN sent_message_id TEXT;
+        UPDATE daemon_outbound SET sent_message_id = json_extract(json, '$.providerMessageId') WHERE json_extract(json, '$.result') = 'delivered';`);
+    }
+    this.db.exec('CREATE INDEX IF NOT EXISTS daemon_outbound_sent ON daemon_outbound(channel, sent_message_id)');
     // One envelope may reach several sessions (a dispatch and a watch): a cause record per (input, session).
     // A table from before keyed by input_id alone is moved over.
     const pk = (this.db.prepare('PRAGMA table_info(daemon_causes)').all() as { name: string; pk: number }[]).filter((c) => c.pk > 0).map((c) => c.name);
@@ -120,14 +128,16 @@ export class DaemonRecords implements OutboxStore {
       flagGet: p('SELECT value FROM daemon_flags WHERE name = ?'),
       flagPut: p('INSERT INTO daemon_flags (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value'),
       flagDel: p('DELETE FROM daemon_flags WHERE name = ?'),
-      obPut: p('INSERT INTO daemon_outbound (operation_id, channel, provider_message_id, at, json) VALUES (?, ?, ?, ?, ?) ON CONFLICT(operation_id) DO UPDATE SET channel = excluded.channel, provider_message_id = excluded.provider_message_id, at = excluded.at, json = excluded.json'),
+      obPut: p('INSERT INTO daemon_outbound (operation_id, channel, provider_message_id, sent_message_id, at, json) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(operation_id) DO UPDATE SET channel = excluded.channel, provider_message_id = excluded.provider_message_id, sent_message_id = excluded.sent_message_id, at = excluded.at, json = excluded.json'),
       obByOp: p('SELECT json FROM daemon_outbound WHERE operation_id = ?'),
       // Only messages a turn delivered name a turn; the newest wins if a platform id was ever reused.
       obByMsg: p('SELECT json FROM daemon_outbound WHERE channel = ? AND provider_message_id = ? ORDER BY at DESC LIMIT 1'),
+      obAnyMsg: p('SELECT 1 FROM daemon_outbound WHERE channel = ? AND sent_message_id = ? LIMIT 1'),
       obPrune: p('DELETE FROM daemon_outbound WHERE at < ?'),
       // The other parts of a split send (the main row keys the primary one).
       obPartPut: p('INSERT INTO daemon_outbound_parts (channel, provider_message_id, operation_id, at) VALUES (?, ?, ?, ?) ON CONFLICT(channel, provider_message_id, operation_id) DO UPDATE SET at = excluded.at'),
-      obByPart: p('SELECT o.json FROM daemon_outbound_parts p JOIN daemon_outbound o ON o.operation_id = p.operation_id WHERE p.channel = ? AND p.provider_message_id = ? ORDER BY p.at DESC LIMIT 1'),
+      obByPart: p('SELECT o.json FROM daemon_outbound_parts p JOIN daemon_outbound o ON o.operation_id = p.operation_id WHERE p.channel = ? AND p.provider_message_id = ? AND o.provider_message_id IS NOT NULL ORDER BY p.at DESC LIMIT 1'),
+      obAnyPart: p('SELECT 1 FROM daemon_outbound_parts WHERE channel = ? AND provider_message_id = ? LIMIT 1'),
       obPartPrune: p('DELETE FROM daemon_outbound_parts WHERE at < ?'),
       causePut: p('INSERT INTO daemon_causes (input_id, chain, hop, session_key, at, json) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(input_id, session_key) DO UPDATE SET chain = excluded.chain, hop = excluded.hop, json = excluded.json'),
       causeGet: p('SELECT json FROM daemon_causes WHERE input_id = ? AND session_key = ?'),
@@ -148,15 +158,26 @@ export class DaemonRecords implements OutboxStore {
   putOutbound(r: OutboundRecord): void {
     // Only a delivered message a turn made is a key the index answers by.
     const msg = r.result === 'delivered' && r.turnId !== undefined && r.providerMessageId !== undefined ? r.providerMessageId : null;
-    this.q.obPut.run(r.operationId, r.channel, msg, r.at, JSON.stringify(r));
-    if (msg === null) return;
-    for (const id of r.providerMessageIds ?? []) if (id !== msg) this.q.obPartPut.run(r.channel, id, r.operationId, r.at);
+    // Any delivered message is ours (`sentByUs`), whoever made it.
+    const sent = r.result === 'delivered' && r.providerMessageId !== undefined ? r.providerMessageId : null;
+    this.q.obPut.run(r.operationId, r.channel, msg, sent, r.at, JSON.stringify(r));
+    if (sent === null) return;
+    for (const id of r.providerMessageIds ?? []) if (id !== sent) this.q.obPartPut.run(r.channel, id, r.operationId, r.at);
   }
 
   /** The delivery an operationId names, if it settled. */
   outboundByOperation(operationId: string): OutboundRecord | undefined {
     const r = this.q.obByOp.get(operationId) as { json: string } | undefined;
     return r ? (JSON.parse(r.json) as OutboundRecord) : undefined;
+  }
+
+  /**
+   * Whether this daemon delivered platform message `id` on `channel` at all: a turn's send, a host
+   * `deliver`, an output tool, a system reply (all settled deliveries are kept, DL-2). Unlike
+   * `outboundByMessage` (turn-made sends only, ID-8) it does not say who; it survives restarts.
+   */
+  sentByUs(channel: string, providerMessageId: string): boolean {
+    return !!(this.q.obAnyMsg.get(channel, providerMessageId) ?? this.q.obAnyPart.get(channel, providerMessageId));
   }
 
   /** The turn that delivered platform message `id` on `channel` (any account of it), if this daemon did. */
