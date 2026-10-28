@@ -426,3 +426,16 @@ describe('external wake schedules', () => {
     expect(items[0]!.input.replyRoute).toMatchObject({ conversationId: 'dm-alice' });
   });
 });
+
+describe('external send_message into a thread', () => {
+  it('a route key with a thread part sends into that thread, anchored on its root #DL-6', async () => {
+    const { w, url } = await world();
+    const ops = await mcp(url, TOKENS.ops);
+    const r = await call(ops, 'send_message', { route: 'fake:default:grp:root1', text: 'into the topic', operation_id: 'tt1' });
+    expect(r.isError).toBe(false);
+    const sent = w.chat.sent.find((s) => s.msg.text === 'into the topic')!;
+    expect(sent.route).toMatchObject({ conversationId: 'grp', threadId: 'root1', replyToMessageId: 'root1' });
+    const bad = await call(ops, 'send_message', { route: 'fake:default:a:b:c', text: 'x', operation_id: 'tt2' });
+    expect(bad).toMatchObject({ isError: true, text: expect.stringMatching(/route must be a route key/) });
+  });
+});

@@ -154,7 +154,7 @@ export const EXTERNAL_TOOL_DEFS = {
       route: ROUTE_KEY,
       text: z.string().min(1).describe('Message text'),
       operation_id: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/).optional().describe('Idempotency key: the same one never sends twice'),
-      reply_to_message_id: z.string().optional().describe('Platform message id to reply to'),
+      reply_to_message_id: z.string().optional().describe('Platform message id to reply to (in a thread route: the message it answers there; default the thread root)'),
     },
   },
   session_input: {
@@ -255,9 +255,10 @@ function clip(v: unknown): unknown {
 /** `channel:account:conversation[:thread]` → a route (the rest after the third part is the conversation id, as host tools read it). */
 export function parseRouteKey(spec: string): ReplyRoute | undefined {
   const parts = spec.split(':');
-  if (parts.length < 3 || parts.some((p) => !p)) return undefined;
-  const [channel, account, ...rest] = parts;
-  return { channel: channel!, account: account!, conversationId: rest.join(':') };
+  if (parts.length < 3 || parts.length > 4 || parts.some((p) => !p)) return undefined;
+  // `channel:account:conversation[:thread]`, as `routeKey` writes it: a fourth part is the thread (topic).
+  const [channel, account, conversationId, threadId] = parts;
+  return { channel: channel!, account: account!, conversationId: conversationId!, ...(threadId ? { threadId } : {}) };
 }
 
 /**
@@ -438,7 +439,8 @@ export class ExternalMcpServer {
         if (!matchesAny(s.send, key)) throw new ToolError(`route ${key} is not in your send scope`);
         const text = this.text(args.text);
         this.write(caller);
-        const mid = typeof args.reply_to_message_id === 'string' && args.reply_to_message_id ? args.reply_to_message_id : undefined;
+        // In a thread, a reply anchors there (its root by default) so channels that need an anchor place it in the thread.
+        const mid = typeof args.reply_to_message_id === 'string' && args.reply_to_message_id ? args.reply_to_message_id : route.threadId;
         return b.send(caller, { route: mid ? { ...route, replyToMessageId: mid } : route, text, ...(typeof args.operation_id === 'string' ? { operationId: args.operation_id } : {}) });
       }
       case 'session_input': {
