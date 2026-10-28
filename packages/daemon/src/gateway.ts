@@ -3343,8 +3343,17 @@ ${a.summary}` }],
     } catch (e) {
       this.log('warn', `history for host (${env.channel}): ${(e as Error).message}`);
     }
-    // Only this channel instance's own, earlier messages, oldest first (as the gateway's own history, IN-9).
-    const before = got.filter((h) => h.id !== env.id && h.channel === env.channel && h.account === env.account && (env.sentAt === undefined || h.sentAt === undefined || h.sentAt <= env.sentAt));
+    // Only this channel instance's own, earlier messages, oldest first (as the gateway's own history, IN-9),
+    // and none this deployment sent itself (the outbound index, ID-8: kept across restarts): the host's
+    // agents wrote those, they are not the conversation it is asking about.
+    const before = got.filter(
+      (h) =>
+        h.id !== env.id &&
+        h.channel === env.channel &&
+        h.account === env.account &&
+        (env.sentAt === undefined || h.sentAt === undefined || h.sentAt <= env.sentAt) &&
+        !this.records.sentByUs(h.channel, h.id),
+    );
     return { ok: true, value: { messages: before.slice(-(f.limit ?? 50)) } };
   }
 
