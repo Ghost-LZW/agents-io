@@ -500,7 +500,9 @@ export class HostService implements HostFrames {
  * harness opens without a turn, ahead of input the host expects). `test.hooks` (only when the daemon was started with
  * AIO_TEST_HOOKS=1): the `test.replay` and `test.fault` requests (fault injection, HOSTS §4.3, SE-6). `item.tool` (HC-7):
  * MCP tool items carry `tool { server, name }` while the host declared `outbound.scoped`, `outbound` + `outbound.content`,
- * or asked `optIn: ["item.tool"]` (granted in the result's `optIn`).
+ * or asked `optIn: ["item.tool"]` (granted in the result's `optIn`). `host-mcp.send_file.blob_scoped` (SE-7): `send_file`
+ * sends a `blob` ref only when it appeared in the calling session (an input's content block, an attachment it sent);
+ * any other ref is refused like a missing one.
  */
 export const FEATURES = [
   'session.launch',
@@ -532,6 +534,7 @@ export const FEATURES = [
   'message.ack',
   'schedules',
   'history',
+  'host-mcp.send_file.blob_scoped',
 ];
 
 /** `DaemonRecords` flag: the name of the host that declared the `outbound` hook. */
