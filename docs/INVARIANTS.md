@@ -14,6 +14,7 @@
 > 2026-10-24：Claude Code 一轮中途的空闲期限加入 HC-3b。
 > 2026-10-24：Claude Code 自己的系统事件给宿主一份公开事件加入 HC-6。
 > 2026-10-25：c6 合入 U20、U21（`wf/u20-u21`）：出口检查加入 DL-7；MCP 工具条目的 `tool` 加入 HC-7（那个分支上编号是 HC-6，与上一条撞号，合入时改成 HC-7）。
+> 2026-10-27：`send_file` 的 `blob` 只发本会话见过的引用，文件名用本会话见过的，加入 SE-7（`host.hello` 的 `features` 多了 `host-mcp.send_file.blob_scoped`）。
 > 用途：改动 agents-io 的人或 agent 用它判断"这个改动有没有打破某个承诺"。新增承诺先写进这里，再写测试；测试改名时同步改这里。
 
 ## 0. 怎么读
@@ -926,6 +927,14 @@
 - **测试**：`packages/daemon/test/test-hooks.test.ts` "are off by default: both frames answer test_hooks_off, test.hooks is not advertised, sends are not wrapped; only AIO_TEST_HOOKS=1 turns them on"、"need the host token: before host.hello (or with a wrong token) they are refused"、"replay hands an accepted channel message to the gateway again: every copy is a duplicate, the session admits it once and one turn runs; gone after a restart"、"drop-response: the next send goes out to the platform, its response is dropped and it settles unknown without a retry; the one after is normal; clear removes injections; conversation narrows it to one chat"。
 - **状态**：有测试。
 - **注意**：只给测试环境（staging）用，部署方的线上配置不设这个环境变量。`drop-response` 按 (通道[, 账号][, 会话 conversationId]) 计数，只数 `send`（`edit`、`finalize`、`previewProgress` 不扔也不占次数）：不给 `conversation` 时该通道下一次发送（可能是别的会话的）就是被扔掉的那次；过程显示开着的会话里，一轮的第一次发送是过程卡片。
+
+### SE-7 `send_file` 的 `blob` 只发本会话见过的引用
+
+- **承诺**（2026-10-27）：`send_file` 给 `blob` 时，这个引用必须在调用它的 session 里出现过：本轮的输入、或日志里任何一条 `input.admitted` 记下的输入（含只记录的 context 输入、话题交接过来的输入）里 `image` / `file` / `audio` 块的 `ref`（别的块上多出来的 `ref` 字段不算，schema 不禁止多带字段），或这个 session 自己发过的附件（`agents-io.output` 的 `msg.attachments`，按 `path` 发的也算；只认输出工具自己记下的那条，它是 `visibility: participants`，harness 自己的 `native` 事件哪怕也叫 `agents-io.output`，lane 也只记成 `operators` 或 `internal`，不算）。别的引用，哪怕 blob 存储里有（别的会话收到或发出的文件），都答 `unknown blob <ref>`，和不存在的引用一字不差，不发、不记 `agents-io.output`。没给 `name` 时，显示的文件名用这个 session 最近一次见到它时带的名字，没带名字就是 `file`，不用存储里的名字（存储按内容寻址，记的是这份字节第一次进来时的名字，可能是别的会话的）。`path` 那条路不变，仍按 SE-4。`host.hello` 的 `features` 有 `host-mcp.send_file.blob_scoped`。
+- **实现**：`packages/host-mcp/src/tools.ts` `sendFile`（先 `seenBlob` 再读 blob）、`seenBlob`（先看本轮 `turn.inputs`，再查 `seenRefs`，答出那里带的名字）、`seenRefs`（每个 session 一份见过的引用及其最新的名字，放在内存里：第一次从 `hub.log` 的 floor 一页一页读到 head，之后只读日志新增的事件；floor 变了就重读）；`packages/daemon/src/host.ts` `FEATURES`；工具说明 `packages/host-mcp/src/server.ts` `TOOL_DEFS.send_file`。
+- **测试**：标签 `#SE-7`；`packages/host-mcp/test/host-mcp.test.ts` "send_file blob: a ref this session saw (an input, a file it sent) goes out; another session's reads as unknown, like a missing one"、"send_file blob: the name shown is the one this session saw, not the store's (the same bytes came first under another session's name)"、"send_file blob: pages past the first count, the newest name wins, trimmed history does not"、"send_file blob: a session's log is read once, then only what it gained; a ref it never saw does not read it all again"、"send_file blob: only image, file and audio blocks and the outputs host-mcp recorded count; a stray ref on another block or a harness event under the output's name does not"、"send_file path is not scoped to refs: the bytes of another session's blob go out from the cwd"；`packages/daemon/test/output-tools.test.ts` "send_file blob: a file sent in one conversation goes back there by ref, not into another; hello advertises host-mcp.send_file.blob_scoped"、"send_file blob: a harness event under the output's name listing another conversation's file does not make it this session's to send"。
+- **状态**：有测试。
+- **注意**：只认日志里还留着的历史，修剪掉的（`MemorySessionLog` 的 `retain`、`SqliteSessionLog.compact`）按没见过处理（守护进程目前不修剪）。代价：守护进程起来以后，一个 session 第一次按 `blob` 发文件时同步读完它的整份日志（长寿的私聊、群聊会久一些），之后每次只读新增的；引用表跟着守护进程进程走，重启后重新读。话题按各自的 session 算：别的话题里的文件，要用户在这个话题里再发一次。只认日志真正记下的块：交给 session 的通道历史（IN-9）、宿主改写过的输入（`InboundRewrite`），都按记进 `input.admitted` 的那些块算，宿主改写时拿掉的引用不算。反过来，记进来的引用不问出处：watch 投递的输入带着原消息的 content（引用原样带过去），宿主或桥（如 jsonl-bridge）的输入帧也可以声明任意引用，这些都算本会话见过；所以 watch 的来源、宿主和桥，都要按"可以把这些附件发进目标会话"的级别来信任。挡的只是按引用外发：agent 能读到的文件（例如 harness 给的本地路径）抄进 cwd 后仍可按 `path` 发出去，那由沙箱与 SE-4 管。
 
 ---
 

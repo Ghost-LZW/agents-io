@@ -436,7 +436,7 @@ aio-dev watch remove team-digest
 | 工具 | 做什么 | 目的地 |
 |---|---|---|
 | `get_channel_context()` | 返回当前路由、通道、会话类型、档位、通道能力摘要（markdown 程度、长度上限、按钮、能发哪些媒体）、参与者（可用于 mention 的 id 和名字，见下）、允许的目的地，以及 `abilities`（这个 agent 有哪些工具、自己设了几条定时任务和监听） | — |
-| `send_file(path \| blob, name?, caption?)` | 读文件（相对路径按 session 的 cwd）存进 blob 存储，作为附件发出。上限 30MB；`restricted` 档的轮次只能发 cwd 里的文件 | 本轮回复路由 |
+| `send_file(path \| blob, name?, caption?)` | 读文件（相对路径按 session 的 cwd）存进 blob 存储，作为附件发出。上限 30MB；`restricted` 档的轮次只能发 cwd 里的文件。`blob` 只认本 session 见过的引用（它的输入里的附件，或它自己发过的），别的引用和不存在的一样答 `unknown blob`；不给 `name` 时用本 session 见到它时的文件名（INVARIANTS SE-7） | 本轮回复路由 |
 | `ask_choice(question, options[], multi?)` | 发一个选择题，**立即返回** `choiceId`。用户的选择作为**下一条输入**回来（见下），工具说明里要求模型发完就结束这一轮 | 本轮回复路由 |
 | `mention(user_ids[], text)` | 发一条 @ 某些人的消息 | 本轮回复路由 |
 | `reply_to(route, text, message_id?)` | 另发一条回复（默认回复发起本轮的那条消息） | `"current"` 或允许的路由键 |

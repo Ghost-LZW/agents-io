@@ -24,10 +24,10 @@ export const TOOL_DEFS = {
   },
   send_file: {
     description:
-      'Send a file or image to the user in the current conversation, as a real attachment (on Lark an uploaded file/image message, on mail an attachment, in the terminal a file notice). Give `path` (absolute, or relative to your working directory) OR `blob` (a blob ref such as sha256:… from an earlier input), not both. `name` overrides the file name shown; `caption` is an optional short text sent with it. Use this instead of pasting a file\'s contents when the user asks you to send/share/attach a file. Returns once delivered.',
+      'Send a file or image to the user in the current conversation, as a real attachment (on Lark an uploaded file/image message, on mail an attachment, in the terminal a file notice). Give `path` (absolute, or relative to your working directory) OR `blob` (a blob ref such as sha256:… of a file you were sent, or sent yourself, in this session), not both. `name` overrides the file name shown; `caption` is an optional short text sent with it. Use this instead of pasting a file\'s contents when the user asks you to send/share/attach a file. Returns once delivered.',
     input: {
       path: z.string().optional().describe('File on disk: absolute, or relative to your working directory'),
-      blob: z.string().optional().describe('Blob ref (e.g. sha256:…) of a file the host already holds'),
+      blob: z.string().optional().describe('Blob ref (e.g. sha256:…) of a file you were sent, or sent yourself, in this session'),
       name: z.string().optional().describe('File name to show (default: the file\'s own name)'),
       caption: z.string().optional().describe('Short text sent with the file'),
     },

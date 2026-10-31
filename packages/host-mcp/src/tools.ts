@@ -49,6 +49,21 @@ export interface ParticipantView {
 /** Most entries get_channel_context lists as participants. */
 export const MAX_PARTICIPANTS = 50;
 
+/** Session log events send_file reads at a time while it catches up on the blob refs a session saw (SE-7). */
+const SEEN_PAGE = 256;
+
+/** SE-7: the blob refs one session's log shows it saw, each with the name it carried last; read up to `head`. */
+interface SeenRefs {
+  floor: number;
+  head: number;
+  refs: Map<string, string | undefined>;
+}
+
+/** The blocks that carry a blob: another block with a stray top-level `ref` (the schema does not forbid one) does not count. */
+function blobBlocks(content: ContentBlock[] | undefined): Extract<ContentBlock, { ref: string }>[] {
+  return (content ?? []).filter((c): c is Extract<ContentBlock, { ref: string }> => c.type === 'image' || c.type === 'file' || c.type === 'audio');
+}
+
 /** What a token authenticates: one harness binding (run) of one session. */
 export interface ToolBinding {
   sessionKey: string;
@@ -246,6 +261,8 @@ function currentRoute(turn: TurnContext): ReplyRoute | null {
  */
 export class HostTools {
   private readonly choices = new Map<string, ChoiceRecord>();
+  /** SE-7: per session, the refs its log showed so far, so a send by blob reads only what the log gained since. */
+  private readonly seen = new Map<string, SeenRefs>();
   private readonly eventOnly: Set<string>;
 
   constructor(private readonly o: HostToolsOptions) {
@@ -555,6 +572,10 @@ export class HostTools {
       size = bytes.byteLength;
       ref = await this.o.blobs.put(bytes, { mime, name });
     } else {
+      // SE-7: the store is shared by every session, so a ref is only this session's to send when it saw it.
+      // One it did not reads like a missing one: the answer does not say whether the store has it.
+      const seen = this.seenBlob(b.sessionKey, turn, blob!);
+      if (!seen) throw new ToolError(`unknown blob ${blob}`);
       let got;
       try {
         got = await this.o.blobs.get(blob!);
@@ -563,7 +584,9 @@ export class HostTools {
       }
       ref = blob!;
       mime = got.mime;
-      name ??= got.name ?? 'file';
+      // The name this session saw, not the store's: the store keeps the name the bytes first came
+      // with, which may be another session's (the same statement under its private name).
+      name ??= seen.name ?? 'file';
       size = got.bytes.byteLength;
     }
     const caps = this.caps(route);
@@ -575,6 +598,55 @@ export class HostTools {
     const msg: RenderedMessage = { text: caption ?? '', attachments: [{ ref, mime: sendMime, name }] };
     const rec = await this.deliver(b, turn, 'send_file', route, msg, operationId);
     return this.sent(rec, { name, mime: sendMime, bytes: size, ref });
+  }
+
+  /**
+   * SE-7: where a blob ref appeared in this session, newest first: a content block of one of its
+   * inputs (this turn's, or any its log admitted, context and handed-over inputs included) or an
+   * attachment it sent (`agents-io.output`, a send_file by path too). Answers the name it carried
+   * there, undefined when the session never saw the ref. Log history trimmed away no longer counts.
+   */
+  private seenBlob(sessionKey: string, turn: TurnContext, ref: string): { name?: string } | undefined {
+    const named = (name: string | undefined) => (name ? { name } : {});
+    for (const i of [...turn.inputs].reverse()) {
+      const hit = blobBlocks(i.content).find((c) => c.ref === ref);
+      if (hit) return named(hit.name);
+    }
+    const refs = this.seenRefs(sessionKey);
+    return refs.has(ref) ? named(refs.get(ref)) : undefined;
+  }
+
+  /**
+   * SE-7: the refs this session's log shows it saw, read once and from then on only the events the
+   * log gained since, a page at a time: a long-lived session's log is long, and a ref it never saw
+   * would otherwise read all of it on every call. A later event's name replaces an earlier one's (the
+   * newest wins); a floor that moved means trimmed history, so what is left is read again.
+   */
+  private seenRefs(sessionKey: string): Map<string, string | undefined> {
+    const log = this.o.hub.log;
+    const floor = log.floor(sessionKey);
+    let s = this.seen.get(sessionKey);
+    if (!s || s.floor !== floor) this.seen.set(sessionKey, (s = { floor, head: floor, refs: new Map() }));
+    const head = log.head(sessionKey);
+    while (s.head < head) {
+      const page = log.read(sessionKey, s.head, SEEN_PAGE);
+      if (!page.length) break;
+      for (const e of page) {
+        const body = e.body;
+        // An output only as deliver wrote it (participants): the lane writes a harness's own native events as
+        // operators or internal (visibilityOf), so one a harness happens to name agents-io.output does not count.
+        const found =
+          body.t === 'input.admitted'
+            ? blobBlocks(body.input?.content)
+            : body.t === 'native' && body.name === OUTPUT_EVENT && e.visibility === 'participants'
+              ? ((e.native as OutputRecord | undefined)?.msg.attachments ?? [])
+              : [];
+        // Backwards, so that within one event the first block's name stands, as for this turn's inputs.
+        for (const a of [...found].reverse()) s.refs.set(a.ref, a.name);
+      }
+      s.head = page[page.length - 1]!.seq;
+    }
+    return s.refs;
   }
 
   private async askChoice(b: ToolBinding, turn: TurnContext, args: Record<string, unknown>, operationId: string) {
