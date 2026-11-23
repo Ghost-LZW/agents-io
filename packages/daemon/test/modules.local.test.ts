@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { Type } from '@sinclair/typebox';
-import type { KernelContext, ModuleInstance, ModuleManifest, ModuleResolveContext, ModuleToolCall } from '@agents-io/protocol';
+import type { HarnessAdapter, InputRecord, KernelContext, ModuleInstance, ModuleManifest, ModuleResolveContext, ModuleToolCall } from '@agents-io/protocol';
 import { MemorySessionLog, TOPIC_KEY } from '@agents-io/session';
 import { FakeChannel, FakeHarness, type FakeTurnScript } from '@agents-io/testkit';
 import { TOOL_NAMES } from '@agents-io/host-mcp';
@@ -98,7 +98,10 @@ describe('the module registry', () => {
     expect(resolve({}).externalMcp).toBeUndefined();
     // On: its settings are the module's, and (deprecated) Config.externalMcp is the same object.
     const on = resolve({ externalMcp: { clients: {} } });
-    expect(on.modules![1]).toEqual({ id: 'external-mcp', enabled: true, config: { host: '127.0.0.1', port: 7465, clients: [], limits: { maxBodyBytes: 262144, maxTextChars: 16000, requestsPerMinute: 120, writesPerMinute: 20 } } });
+    expect(on.modules).toEqual([
+      { id: 'topic-title', enabled: true, config: {} },
+      { id: 'external-mcp', enabled: true, config: { host: '127.0.0.1', port: 7465, clients: [], limits: { maxBodyBytes: 262144, maxTextChars: 16000, requestsPerMinute: 120, writesPerMinute: 20 } } },
+    ]);
     expect(on.externalMcp).toBe(on.modules![1]!.config);
     // Without the module, the section is an unknown key (as any other); an empty registry gives no modules.
     const none = new ModuleRegistry([]);
@@ -243,12 +246,13 @@ async function daemon(
   dir = mkdtempSync(join(tmpdir(), 'aio-mod-')),
   logger: (level: string, msg: string) => void = () => {},
   edit: (c: Config) => Config = (c) => c,
+  declares: Partial<HarnessAdapter> = {},
 ) {
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   const base = resolveConfig({ policy: { owners: ['fake:alice'] }, local: { principal: 'me' }, outputTools: true, ...raw }, { env: {}, baseDir: dir, cwd: dir, moduleRegistry: registry });
   const config = edit({ ...base, socketPath: join(dir, 'run', 'aio.sock') });
   const chat = new FakeChannel('fake');
-  const harness = new FakeHarness(script);
+  const harness = Object.assign(new FakeHarness(script), declares);
   const gw = await Gateway.start({ config, harness, log: new MemorySessionLog(), channels: [{ adapter: chat }], moduleRegistry: registry, logger });
   cleanups.push(() => gw.stop());
   return { gw, chat, harness, socketPath: config.socketPath };
@@ -455,15 +459,16 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     expect(logs).toContain('warn: module first: onTurnCompleted failed: boom');
     await until(() => logs.includes('warn: module second: onTurnCompleted failed: later'));
 
-    // What a hook reaches of the kernel: the lane's harness (a configured agent's), the topic and its generated title.
+    // What a hook reaches of the kernel: what it may run beside the lane (a configured agent's), the topic and its generated title.
     const k = kernels[0]!;
     const lane = k.lanes.harness(sessionKey)!;
-    const inst = w.gw.config.agents.helper!.harness;
-    expect(lane).toMatchObject({ agent: 'helper', instance: inst, cwd: w.gw.config.cwd });
-    expect(lane.run(inst)).toEqual({ harness: inst, model: w.gw.config.harnesses[inst]!.run.model });
-    // (An embedder's single harness, as here, runs every instance.)
-    expect(typeof lane.adapter(inst).open).toBe('function');
-    expect(() => lane.run('nope')).toThrow('unknown harness instance "nope"');
+    // An ephemeral turn, never the adapter; this harness (an embedder's single one, for every instance) declares no ephemeralOpen.
+    expect(Object.keys(lane).sort()).toEqual(['ephemeral', 'ephemeralTurn']);
+    const turnId = ended[0]!.split(' ')[2]!;
+    expect(lane.ephemeral(turnId)).toBe(false);
+    expect(lane.ephemeral('t_nope')).toBe(false);
+    await expect(lane.ephemeralTurn({ turnId, prompt: 'x', instructions: 'y' })).rejects.toThrow(`${sessionKey}: turn ${turnId} ran on no harness that runs ephemeral turns (ephemeralOpen)`);
+    expect(w.harness.sessions).toHaveLength(1);
     expect(k.lanes.harness('fake:default:nobody')).toBeUndefined();
     const topic = k.topics.bySession(sessionKey)!;
     expect(k.topics.titleSource(topic.id)).toBe('auto');
@@ -486,6 +491,68 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     await v.chat.inject({ sender: alice, text: 'hi' });
     await until(() => v.harness.sessions.length === 1);
     expect(kernels2[0]!.lanes.harness(v.harness.sessions[0]!.args.sessionKey)).toBeUndefined();
+  });
+
+  it("lanes.harness: an ephemeral turn on the harness a turn ran on, set by the kernel (a throwaway session in the session's cwd, that turn's run at low effort under a read-only profile named after the module, no tools, the kernel's input); nothing else the module passes reaches the harness", async () => {
+    const kernels: KernelContext[] = [];
+    const turns: string[] = [];
+    const asked: InputRecord[][] = [];
+    const registry = new ModuleRegistry([probe('probe', [], { instance: (k) => (kernels.push(k), { hooks: { onTurnCompleted: (a) => void turns.push(a.turnId) } }) })]);
+    const w = await daemon(registry, { agents: { helper: { harness: 'claude-code' } } }, async (t) => {
+      if (t.inputs[0]!.origin.via !== 'probe') return t.emit({ t: 'text.snapshot', text: 'ok', final: true }, { audience: 'answer' });
+      asked.push(t.inputs);
+      if (t.inputs[0]!.content.some((c) => c.type === 'text' && c.text === 'fail')) throw new Error('the ephemeral turn fails');
+      t.emit({ t: 'text.delta', stream: 'answer', delta: 'A ' }, { audience: 'answer' });
+      t.emit({ t: 'text.delta', stream: 'answer', delta: 'title' }, { audience: 'answer' });
+    }, undefined, undefined, undefined, { ephemeralOpen: true });
+    await w.chat.inject({ sender: alice, text: 'hi' });
+    await until(() => turns.length === 1);
+    const sessionKey = w.harness.sessions[0]!.args.sessionKey;
+    const lane = kernels[0]!.lanes.harness(sessionKey)!;
+    expect(lane.ephemeral(turns[0]!)).toBe(true);
+    // A module's untyped code may pass more (a run, options, tools): none of it is passed on.
+    const more = { turnId: turns[0]!, prompt: 'Name it', instructions: 'Only a title.', run: { profile: 'bypass' }, options: { sandbox: 'danger-full-access' }, mcp: { url: 'http://x' } };
+    expect(await lane.ephemeralTurn(more as never)).toBe('A title');
+    const started = w.gw.hub.log.read(sessionKey, 0).find((e) => e.body.t === 'turn.started')!.body;
+    if (started.t !== 'turn.started') throw new Error('no turn.started');
+    expect(started.run).toMatchObject({ harness: 'claude-code' });
+    const opened = w.harness.sessions.filter((s) => s.args.sessionKey !== sessionKey);
+    expect(opened.map((s) => s.args)).toEqual([{
+      sessionKey: expect.stringMatching(/^probe:/), generation: 1, cwd: w.gw.config.cwd,
+      run: { ...started.run, profile: 'probe', effort: 'low', mode: 'default' },
+      instructions: 'Only a title.',
+      options: { ephemeral: true, preface: false, profiles: { probe: { approvalPolicy: 'never', sandbox: 'read-only' } } },
+    }]);
+    expect(asked).toEqual([[{ inputId: expect.stringMatching(/^probe:/), origin: { kind: 'system', principal: null, evidence: 'daemon', via: 'probe', adapter: 'session' }, content: [{ type: 'text', text: 'Name it' }], replyRoute: null, channelContext: {} }]]);
+    // Kept out of the daemon's sessions and logs.
+    expect(w.gw.sessions().map((s) => s.sessionKey)).toEqual([sessionKey]);
+    expect(w.gw.hub.log.read(opened[0]!.args.sessionKey, 0)).toEqual([]);
+    // A turn that does not complete answers nothing; what the module gives is text, or it is refused.
+    expect(await lane.ephemeralTurn({ turnId: turns[0]!, prompt: 'fail', instructions: 'x' })).toBeUndefined();
+    await expect(lane.ephemeralTurn({ turnId: turns[0]!, prompt: 1, instructions: 'x' } as never)).rejects.toThrow('module probe: lanes.harness(…).ephemeralTurn: prompt must be a string');
+    expect(w.harness.sessions).toHaveLength(3);
+  });
+
+  it("a task run's turns never reach onTurnCompleted, and lanes.harness has nothing for its lane while it runs", async () => {
+    const kernels: KernelContext[] = [];
+    const heard: string[] = [];
+    const during: unknown[] = [];
+    const registry = new ModuleRegistry([probe('probe', [], { instance: (k) => (kernels.push(k), { hooks: { onTurnCompleted: (a) => void heard.push(a.sessionKey) } }) })]);
+    const w = await daemon(registry, { agents: { helper: { harness: 'claude-code' }, exec: { harness: 'claude-code', mode: 'task' } } }, async (t) => {
+      if (t.inputs[0]!.content.some((c) => c.type === 'text' && c.text === 'go')) during.push({ open: kernels[0]!.lanes.has('run:r1'), harness: kernels[0]!.lanes.harness('run:r1') });
+      t.emit({ t: 'text.snapshot', text: 'ok', final: true }, { audience: 'answer' });
+    }, undefined, undefined, undefined, { ephemeralOpen: true });
+    const h = await LocalClient.connect(w.socketPath);
+    cleanups.push(() => h.close());
+    await h.hello({ token: readTokenFile(tokenPath(w.socketPath)), name: 'host' });
+    await h.runStart({ runId: 'r1', agent: 'exec', input: [{ type: 'text', text: 'go' }] });
+    expect(await h.runEndedOf('r1')).toMatchObject({ status: 'completed' });
+    expect(during).toEqual([{ open: true, harness: undefined }]);
+    expect(w.gw.hub.log.read('run:r1', 0).some((e) => e.body.t === 'turn.completed' && e.body.status === 'completed')).toBe(true);
+    // A session's turn after it is heard; the run's never was.
+    await w.chat.inject({ sender: alice, text: 'hi' });
+    await until(() => heard.length === 1);
+    expect(heard).toEqual([w.harness.sessions.find((s) => !s.args.sessionKey.startsWith('run:'))!.args.sessionKey]);
   });
 
   it('setup and start failures fail the start naming the module; a hook not served yet, a missing handler, a config resolved without the registry too', async () => {

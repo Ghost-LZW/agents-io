@@ -388,7 +388,7 @@ export const CODEX_DECLARATIONS = Object.freeze({
   modes: Object.freeze(['plan'] as const),
   /** `bypass` and `restricted` map to Codex approval policies and sandboxes per turn. */
   ownerProfileSwitch: true,
-  /** `thread/start { ephemeral }` (topic titles until G4). */
+  /** `thread/start { ephemeral }` (a module's ephemeral turns: topic titles). */
   ephemeralOpen: true,
 }) satisfies HarnessDeclarations;
 

@@ -29,7 +29,8 @@ type Entry = { type: string } & Record<string, unknown>;
  * A channel type's name: ASCII letters, digits, `-` and `_`, starting with a letter or digit. The
  * type names its entries' owners (`<type>:<owner>`) and state directories (`<type>.<account>`):
  * with a `:` one type could say another's owner (`a:b` + `c` is `a` + `b:c`), with a `.` or `/`
- * share or leave a directory.
+ * share or leave a directory. Two names that differ only in letter case (`Chat`, `chat`) are one
+ * directory on a case-insensitive file system (macOS's default), so a registry has at most one of them.
  */
 const TYPE_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
@@ -120,6 +121,8 @@ export class ChannelRegistry {
       if (typeof m.type !== 'string' || !m.type) throw new Error('a channel module needs a non-empty type');
       if (!TYPE_NAME.test(m.type)) throw new Error(`channel type ${JSON.stringify(m.type)}: a type name is ASCII letters, digits, "-" and "_", starting with a letter or digit (it names owners "<type>:<owner>" and state directories "<type>.<account>")`);
       if (this.byType.has(m.type)) throw new Error(`channel type ${JSON.stringify(m.type)} is registered twice`);
+      const same = [...this.byType.keys()].find((t) => t.toLowerCase() === m.type.toLowerCase());
+      if (same !== undefined) throw new Error(`channel type ${JSON.stringify(m.type)}: differs from the registered type ${JSON.stringify(same)} only in letter case (their state directories "<type>.<account>" are one on a case-insensitive file system)`);
       const bad = badChannelModule(m as unknown as Partial<Record<string, unknown>>);
       if (bad) throw new Error(`channel type ${JSON.stringify(m.type)}: bad ${bad}`);
       for (const id of m.ids ?? []) {

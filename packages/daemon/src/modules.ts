@@ -509,6 +509,9 @@ export class ModuleHost {
 /**
  * What the gateway gives every module's kernel context (`kernelContext` namespaces it per module):
  * existing capabilities of the gateway, late-bound (`ready` is false until setup returned).
+ * Exported for an embedder that builds `KernelContext`s over a kernel of its own; it grows with
+ * what the modules need (every member is required, so each G6 step that adds one is a breaking
+ * change for such an embedder: packages/daemon/README.md lists them). `Gateway` implements it.
  */
 export interface KernelBackend {
   ready(): boolean;
@@ -541,7 +544,8 @@ export interface KernelBackend {
   command(cmd: ClientCommand, origin: Origin): Promise<KernelOutcome>;
   /** The lane's answer to the input (the lane opened when it is not). */
   laneInput(sessionKey: string, input: InputRecord, mode: 'queue' | 'steer' | 'interrupt'): Promise<KernelInputResult>;
-  laneHarness(sessionKey: string): KernelLaneHarness | undefined;
+  /** What a module (`module`: its id, which names the ephemeral turn's session, profile and input) may run beside the lane (`KernelContext.lanes.harness`). */
+  laneHarness(sessionKey: string, module: string): KernelLaneHarness | undefined;
   channelFor(route: { channel: string; account: string }): ChannelAdapter | undefined;
   resolveRoute(route: ReplyRoute): { ok: true; route: ReplyRoute } | { ok: false; message: string };
   send(route: ReplyRoute, msg: RenderedMessage, a: { operationId: string; sessionKey: string; turnId?: string; external?: ExternalSender }): Promise<KernelSendResult | undefined>;
@@ -609,7 +613,20 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
         if (input?.origin?.kind !== 'peer') throw new Error(`module ${id}: lanes.input takes a peer's input (origin.kind "peer", not ${JSON.stringify(input?.origin?.kind)})`);
         return live().laneInput(sessionKey, input, mode ?? 'queue');
       },
-      harness: (sessionKey) => live().laneHarness(sessionKey),
+      harness: (sessionKey) => {
+        const lane = live().laneHarness(sessionKey, id);
+        if (!lane) return undefined;
+        // Only what the module may say (a turn and text): its untyped code passes nothing else on.
+        return {
+          ephemeral: (turnId) => lane.ephemeral(turnId),
+          ephemeralTurn: async (a) => {
+            for (const k of ['turnId', 'prompt', 'instructions'] as const) {
+              if (typeof a?.[k] !== 'string') throw new Error(`module ${id}: lanes.harness(…).ephemeralTurn: ${k} must be a string`);
+            }
+            return lane.ephemeralTurn({ turnId: a.turnId, prompt: a.prompt, instructions: a.instructions });
+          },
+        };
+      },
     },
     channelFor: (route) => live().channelFor(route),
     resolveRoute: (route) => live().resolveRoute(route),

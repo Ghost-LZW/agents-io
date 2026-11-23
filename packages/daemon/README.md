@@ -126,8 +126,9 @@ see `docs/E2E.md` §0). New:
   unavailable; when no configured instance declares `modes` / `ownerProfileSwitch`, the reply
   names the registered kinds that do (`HarnessModule.declares`), so a deployment with only Claude
   Code configured still hears "/plan is available only on Codex". `ephemeralOpen: true` (Codex): the
-  topic titles module (`topic-title`, below) generates titles in an ephemeral session of a harness
-  that declares it; the open options it sends are still Codex's shape.
+  daemon runs a module's ephemeral turns on it (`KernelLaneHarness.ephemeralTurn`, "Feature
+  modules" below; the topic titles module `topic-title` is one); the open options it sends are
+  Codex's shape.
   A launched session's env (decision 7) reaches the harness as its adapter declares
   (`sessionEnv`): `'open'` (the default; Claude Code) puts it in the open args;
   `'own-process'` (Codex over stdio) runs the session on the adapter `ownProcess({ env, cwd })`
@@ -486,11 +487,11 @@ goes to its current topic, also from `per-thread` rules such as the default
   Lark adapter shows it as the card header title (the status moves to the subtitle).
 - A topic's first title is made from its opening message. The built-in module `topic-title`
   (on unless `topicTitles: { enabled: false }`) then asks the model for a short one: after the
-  1st completed turn of a configured agent's topic and every 3rd after, in an ephemeral session
-  of the instance the turn ran on, when that instance declares `ephemeralOpen` (Codex). A title
+  1st completed turn of a configured agent's topic and every 3rd after, in an ephemeral turn
+  on the instance the turn ran on, when that instance declares `ephemeralOpen` (Codex). A title
   given explicitly (`/new <title>`, `topic.switch` with `new.title`, `session_rotate`) is never
   replaced, nor one given while a title was being made; the latest card is edited to carry a
-  new title.
+  new title. There is no frame that renames an existing topic.
 
 ## CLI
 
@@ -598,9 +599,16 @@ capabilities: `log` (prefixed `module <id>: `), `events` and `head` (a session's
 while the topic's title is still generated and still the one the module read, then the latest
 card edited to carry it), `router` (`identify`, its own `setExtraIdentities`, `newTopic`,
 `conversationAgent`, `record`: an input's routing record), `lanes` (`has`, `open`, `command`,
-`input`: a peer's input the module stamped, any other origin kind is refused; `harness`: what a
-configured agent's open lane runs on, `{ agent, instance, cwd, adapter(instance), run(instance) }`,
-undefined for a task run's or the unconfigured default agent's), `channelFor`, `resolveRoute`, `send`
+`input`: a peer's input the module stamped, any other origin kind is refused; `harness`: what the
+module may run beside a configured agent's open lane, `{ ephemeral(turnId), ephemeralTurn({ turnId,
+prompt, instructions }) }`, undefined for a task run's or the unconfigured default agent's: one
+ephemeral turn on the instance a turn of the session ran on, when it declares `ephemeralOpen`,
+answering the text of its answer (undefined when it does not complete within 30 s). A module never
+gets the harness adapter: the kernel sets the turn's session (a throwaway one, in the session's
+working directory, none of the host's tools), its run (that turn's, at low effort in the default
+mode, under a read-only profile named after the module that never asks) and its one input (the
+kernel's, `via` the module's id); the module gives only the prompt and the instructions, and
+anything else it passes is dropped), `channelFor`, `resolveRoute`, `send`
 (through the outbox; `external` names the client outside the daemon it sends for, kept in the
 in-flight mark, EX-8), `settled`, `outbound` (the outbound check of a send that is no turn's
 reply, DL-6), `ownerRoute`, `redispatch`, `explain` and `host` (`connected`, `answers`, `heldBy`,
@@ -672,7 +680,10 @@ What changed for embedders with core-slimming G2 (channel types):
   build fails `Gateway.start` with a `ConfigError` (exit 2) naming the entry and its type: a type
   the gateway's registry lacks (the config was resolved with another one), or a `create` that
   returns no `BuiltChannel` (no `adapter` with `id`, `caps`, `start` and `send`; a `close` or
-  `idKnown` that is not a function). A `create` that throws fails it with its own error.
+  `idKnown` that is not a function). A `create` that throws fails it with its own error. Only the
+  shape of what `create` returns is checked: what its adapter does once started is not (a `start`
+  that returns no promise, a `caps` that throws or returns no caps fail as their own error, such
+  as a `TypeError`, not as a `ConfigError`).
 - `new ChannelRegistry(modules)` checks each module: its type name is ASCII letters, digits, `-`
   and `_`, starting with a letter or digit (owners are `<type>:<owner>` and state directories
   `<type>.<account>`, so no `:`, `.` or `/`), `entry` is an object, `resolve` and `create` are
@@ -784,3 +795,31 @@ What changed for embedders with core-slimming G6 step 2 (topic titles are a modu
 - The topic titles, their trigger, the card edit and every error text are as before. Its log line
   `title update failed` carries the `module topic-title: ` prefix; a turn that completes after the
   daemon began stopping its modules no longer starts a title (its result was dropped before).
+
+What changed for embedders with the follow-ups to core-slimming G4 / G6:
+
+- `KernelContext.lanes.harness(sessionKey)` (`KernelLaneHarness`) no longer hands a module the
+  harness adapter: `agent`, `instance`, `cwd`, `adapter(instance)` and `run(instance)` are gone,
+  `ephemeral(turnId)` and `ephemeralTurn({ turnId, prompt, instructions })` are new. A module could
+  open a session on that adapter with any `run.profile` and `options.profiles`, past the policy's
+  plan and the deployment's profiles; now the kernel runs one ephemeral turn for it and sets
+  everything but the text ("Feature modules" above). The topic titles are as before (the same
+  session options, profile, run, prompt and instructions); only the title turn's input id is
+  `topic-title:<uuid>` now (it was `title:<uuid>`; it stays inside the throwaway session).
+- `KernelBackend` (the gateway's side of `kernelContext`, exported for an embedder that builds
+  `KernelContext`s over a kernel of its own) has only required members, so each step that adds
+  one breaks such an embedder: G6 step 1 added `head`, `appendNative`, `sessions`,
+  `knownSession`, `agentOf`, `status`, `stopping`, `record`, `laneInput`, `resolveRoute`,
+  `settled`, `outbound`, `hostHeldBy`, `hostExternal` and `isHostToken`; step 2 added
+  `titleSource`, `setAutoTitle` and `laneHarness`; now `laneHarness(sessionKey, module)` takes the
+  module's id and returns the narrow `KernelLaneHarness`. An embedder that only uses `Gateway`
+  changes nothing.
+- `new ChannelRegistry(modules)` refuses a type whose name differs from a registered one's only in
+  letter case (`Chat` next to `chat`): their state directories (`<dataDir>/channels/<type>.<account>`)
+  are one on a case-insensitive file system (macOS's default). The built-in types are unaffected.
+- A bridge (`@agents-io/channel-jsonl-bridge`) handles an inbound frame once the hello of its
+  connection is applied, so a frame the peer sends right after answering hello is stamped with
+  that hello's channel id and caps even when both arrive in one chunk (it went out with the ones
+  before that hello: the offline caps after a failed first connect, so a granted owner was taken
+  as a stranger); an inbound frame of a connection whose hello failed or was refused is never
+  emitted (the peer is killed and redelivers to the next one). Frames are unchanged.

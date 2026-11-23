@@ -119,6 +119,7 @@ import { RUN_RULE, Runs, type RunOverrides } from './runs.js';
 import { Strangers } from './strangers.js';
 import { runCommand, type CommandHost, type CommandTable } from './commands.js';
 import { ModuleHost, ModuleRegistry, kernelContext, type KernelBackend, type ResolvedModule } from './modules.js';
+import { ephemeralTurn } from './ephemeral-turn.js';
 import { ClaudeTuiService } from './tui-claude.js';
 import { consoleUrlPath, loadOrCreateTokenFile, removeTokenFile, TokenError, tokenPath, writeTokenFile } from './token.js';
 
@@ -740,7 +741,7 @@ export class Gateway {
         const lane = gw().lanes.get(key) ?? (await gw().laneAfterClose(key));
         return lane.command({ type: 'input', sessionKey: key, input, mode });
       },
-      laneHarness: (key) => gw().laneHarness(key),
+      laneHarness: (key, module) => gw().laneHarness(key, module),
       channelFor: (route) => gw().channelFor(route)?.adapter,
       resolveRoute: (route) => {
         const ch = gw().channelFor(route);
@@ -2217,20 +2218,31 @@ ${a.summary}` }],
     return true;
   }
 
-  /** What a configured agent's open lane runs on (`KernelContext.lanes.harness`); not a task run's. */
-  private laneHarness(sessionKey: string): KernelLaneHarness | undefined {
+  /**
+   * What a module may run beside a configured agent's open lane (`KernelContext.lanes.harness`): an
+   * ephemeral turn on the adapter the session's turns open on the instance a turn ran on (the
+   * session's launch's, else the agent's), never that adapter itself; not a task run's lane.
+   */
+  private laneHarness(sessionKey: string, module: string): KernelLaneHarness | undefined {
     const info = this.laneInfo.get(sessionKey);
     if (!info?.agent.configured || sessionKey.startsWith('run:')) return undefined;
     const agent = info.agent;
+    // The turn's own instance (a session's preset may have moved it off the agent's), the run it ran with, and the adapter.
+    const turn = (turnId: string) => {
+      const started = this.hub.log.read(sessionKey, 0).find((e) => e.body.t === 'turn.started' && e.body.turnId === turnId);
+      if (started?.body.t !== 'turn.started') return undefined;
+      const name = started.body.run?.harness ?? agent.harness;
+      return { name, run: started.body.run, adapter: this.launched.get(sessionKey)?.adapter(name) ?? this.agentHarness(agent, name) };
+    };
     return {
-      agent: agent.name,
-      instance: agent.harness,
-      cwd: info.cwd ?? this.o.config.cwd,
-      adapter: (name) => this.launched.get(sessionKey)?.adapter(name) ?? this.agentHarness(agent, name),
-      run: (name) => {
-        const inst = this.o.config.harnesses[name];
-        if (!inst) throw new Error(`unknown harness instance ${JSON.stringify(name)} (configured: ${Object.keys(this.o.config.harnesses).join(', ')})`);
-        return agentRun(agent, inst);
+      ephemeral: (turnId) => turn(turnId)?.adapter.ephemeralOpen === true,
+      ephemeralTurn: async ({ turnId, prompt, instructions }) => {
+        const t = turn(turnId);
+        if (t?.adapter.ephemeralOpen !== true) throw new Error(`${sessionKey}: turn ${turnId} ran on no harness that runs ephemeral turns (ephemeralOpen)`);
+        const inst = this.o.config.harnesses[t.name];
+        if (!t.run && !inst) throw new Error(`unknown harness instance ${JSON.stringify(t.name)} (configured: ${Object.keys(this.o.config.harnesses).join(', ')})`);
+        const run = t.run ?? { ...agentRun(agent, inst!), profile: 'restricted' };
+        return ephemeralTurn(t.adapter, { module, cwd: info.cwd ?? this.o.config.cwd, run, prompt, instructions });
       },
     };
   }
@@ -2392,8 +2404,10 @@ ${a.summary}` }],
    * daemon: once launched it is listed `failed` with the reason and keeps being retried
    * with the bridge's restart backoff; it turns `running` once a peer answers
    * (`ChannelInit.onState`). An entry the gateway cannot build (its type is not in the
-   * gateway's registry, or `create` returned no channel) is a `ConfigError` naming the
-   * entry and the type; a `create` that throws fails the start with its own error.
+   * gateway's registry, or `create` returned no channel: `badBuiltChannel` checks the shape) is a
+   * `ConfigError` naming the entry and the type; a `create` that throws fails the start with its
+   * own error. Only the shape is checked: what the adapter does once started is not (a `start`
+   * that returns no promise, a `caps` that throws fail as their own error, e.g. a `TypeError`).
    */
   private async buildConfigChannel(cfg: ResolvedChannel, index: number): Promise<BuiltChannel> {
     let entry: RunningChannel | undefined;
@@ -2423,7 +2437,7 @@ ${a.summary}` }],
         acceptId,
         onState,
       });
-      // A third party's module is untyped code: what it built is checked here, not met as a TypeError later.
+      // A third party's module is untyped code: the shape of what it built is checked here (not what its adapter does once started).
       const bad = badBuiltChannel(built);
       if (bad) {
         const close = (built as { close?: unknown } | null)?.close;

@@ -295,22 +295,33 @@ export type KernelInputResult =
   | { ok: true; disposition?: 'new_turn' | 'steer' | 'queued' | 'observe_only' | 'duplicate' }
   | { ok: false; reason: string };
 
-/** What the lane of a configured agent's session runs on (`KernelContext.lanes.harness`). */
+/**
+ * What a module may run beside the open lane of a configured agent's session
+ * (`KernelContext.lanes.harness`): an ephemeral turn on the harness a turn of the session ran on.
+ * Never the adapter itself: what that turn may do (its session, profile, options, tools) is the
+ * kernel's to set, so a module cannot open a session with a profile or options of its own.
+ */
 export interface KernelLaneHarness {
-  /** The session's agent. */
-  agent: string;
-  /** The agent's harness instance; a turn's `run.harness` may name another (a preset moved the session). */
-  instance: string;
-  /** The session's working directory. */
-  cwd: string;
   /**
-   * The adapter the session's turns open on an instance: the session's launch's, else the agent's
-   * (its working directory and instructions over the instance's). Read what it declares
-   * (`ephemeralOpen`) before opening on it. Throws for an instance that is not configured.
+   * Whether `ephemeralTurn` runs for this turn of the session: the turn is in the session's log
+   * and the harness instance it ran on (its `run.harness`, which a preset may have moved off the
+   * agent's; else the agent's) declares `ephemeralOpen` (Codex). Throws for an instance that is
+   * not configured.
    */
-  adapter(instance: string): HarnessAdapter;
-  /** The agent's run on an instance, without a profile (its model and effort over the instance's). Throws for an instance that is not configured. */
-  run(instance: string): Omit<RunSpec, 'profile'>;
+  ephemeral(turnId: string): boolean;
+  /**
+   * One ephemeral turn beside the session, on the instance that ran `turnId`, and the text of its
+   * answer: undefined when that turn did not complete or no answer came within 30 s. The module
+   * gives only text. The kernel sets the rest: a throwaway session (`options.ephemeral`, kept out
+   * of the harness's history; no preface) in the session's working directory, with none of the
+   * host's tools (no MCP); the run that turn ran with (what the policy planned for it; the agent's
+   * when the log has none) at low effort in the default mode, under a profile named after the
+   * module that is read-only and never asks (`approvalPolicy: "never"`, `sandbox: "read-only"`);
+   * `instructions` in place of the agent's; one input of the kernel's (`origin.kind: "system"`,
+   * `via` the module's id) holding `prompt`. The session is closed afterwards. Throws when
+   * `ephemeral(turnId)` is false.
+   */
+  ephemeralTurn(a: { turnId: string; prompt: string; instructions: string }): Promise<string | undefined>;
 }
 
 /** What the host's `external` hook is asked (`ExternalCallout.args`). */
@@ -425,9 +436,9 @@ export interface KernelContext {
      */
     input(sessionKey: string, input: InputRecord, mode?: 'queue' | 'steer' | 'interrupt'): Promise<KernelInputResult>;
     /**
-     * What the open lane of a configured agent's session runs on, to open a session of the
-     * module's own beside it (an ephemeral one: topic titles). Undefined when no lane is open for
-     * the session, for a task run's session, and when its agent is not a configured one (the
+     * What the module may run beside the open lane of a configured agent's session: an ephemeral
+     * turn on the harness one of its turns ran on (topic titles). Undefined when no lane is open
+     * for the session, for a task run's session, and when its agent is not a configured one (the
      * default agent of a deployment without `agents`).
      */
     harness(sessionKey: string): KernelLaneHarness | undefined;

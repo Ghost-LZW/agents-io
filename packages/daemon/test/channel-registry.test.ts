@@ -131,6 +131,16 @@ describe('an entry\'s channel id belongs to its type (channel-stamping F4)', () 
     const r = new ChannelRegistry([fakeType('a', { owner: 'b:c' }).m, fakeType('a-b', { owner: 'c' }).m]);
     expect([r.owner({ type: 'a' }), r.owner({ type: 'a-b' })]).toEqual(['a:b:c', 'a-b:c']);
   });
+
+  it('two type names that differ only in letter case would share a state directory on a case-insensitive file system: the second is refused at registration #ID-3', () => {
+    // `channels/Chat.default` and `channels/chat.default` are one directory on macOS's default file system.
+    for (const [first, second] of [['chat', 'Chat'], ['Web-Hook', 'web-hook'], ['a_B', 'A_b']]) {
+      expect(() => new ChannelRegistry([fakeType(first!).m, fakeType(second!).m]), second).toThrow(`channel type ${JSON.stringify(second)}: differs from the registered type ${JSON.stringify(first)} only in letter case (their state directories "<type>.<account>" are one on a case-insensitive file system)`);
+    }
+    // Against the built-in types too; names that differ otherwise are fine.
+    expect(() => new ChannelRegistry([...builtinChannels.types.map((t) => builtinChannels.get(t)!), fakeType('Bridge').m])).toThrow('channel type "Bridge": differs from the registered type "bridge" only in letter case');
+    expect(new ChannelRegistry([fakeType('chat').m, fakeType('chat2').m, fakeType('chat_').m]).types).toEqual(['chat', 'chat2', 'chat_']);
+  });
 });
 
 describe('credentials in a channel entry are the ones its type marks', () => {

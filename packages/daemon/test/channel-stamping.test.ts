@@ -160,7 +160,8 @@ describe('channel-stamping: evidence is capped to grant ∩ caps', () => {
 
   it('a granted bridge whose first connect fails has its grant checked once it connects, against its peer\'s caps; then the grant gives it #ID-3 #CF-1', async () => {
     const gate = join(tmp(), 'gate');
-    const gated = (account: string, evidence: string[]) => bridge(account, { MODE: 'gated', GATE_FILE: gate, INBOUND: owner(account) }, { id: 'raw', evidence });
+    // The peer's inbound comes in one chunk with its hello's answer: it is stamped with that hello's caps all the same.
+    const gated = (account: string, evidence: string[]) => bridge(account, { MODE: 'gated', GATE_FILE: gate, INBOUND: owner(account), ONE_WRITE: '1' }, { id: 'raw', evidence });
     const w = await start({ owners: ['raw:alice'], channels: [gated('a', ['platform_signed']), gated('b', ['dkim_pass'])] });
     expect(w.status('raw', 'a')).toMatchObject({ state: 'failed', error: expect.stringMatching(/retrying/) });
     expect(w.status('raw', 'b')).toMatchObject({ state: 'failed', error: expect.stringMatching(/retrying/) });
@@ -175,7 +176,8 @@ describe('channel-stamping: evidence is capped to grant ∩ caps', () => {
     // Checked at the connect, against the hello's caps: only the grant beyond them.
     expect(warned().length).toBeGreaterThan(0);
     expect(new Set(warned())).toEqual(new Set(['warn: channel raw (b): evidence dkim_pass granted in the config, but the adapter cannot give it (caps.evidence: platform_signed); ignored']));
-  });
+    // Four peer launches at least, and up to 8 s waiting for the connect: more than the default 5 s on a loaded machine.
+  }, 20_000);
 
   it('an in-process adapter is capped by its caps #ID-3', async () => {
     const lark = new FakeChannel('lark-bot');
