@@ -3,7 +3,7 @@ import { chmodSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, re
 import { dirname, join } from 'node:path';
 import type { TSchema } from '@sinclair/typebox';
 import { Value } from '@sinclair/typebox/value';
-import { ADMIN_REDACTED, type AdminConfigDocument, type AdminConfigPutResult, type AdminConfigValidation, type ConfigIssue } from '@agents-io/protocol';
+import { ADMIN_REDACTED, type AdminConfigDocument, type AdminConfigPutResult, type AdminConfigValidation, type ChannelModule, type ConfigIssue } from '@agents-io/protocol';
 import { builtinChannels, builtinHarnesses } from './bundle.js';
 import type { ChannelRegistry } from './channel-registry.js';
 import { ConfigError, configFileSchema, findEnvFile, resolveConfig, type Config } from './config.js';
@@ -25,10 +25,12 @@ import type { HarnessRegistry } from './harness-registry.js';
  * (channel `config`, `options`, …), any string under a secret-looking key. GET
  * shows a credential only as its `env:NAME` reference or ADMIN_REDACTED;
  * writing ADMIN_REDACTED back to a credential field keeps the stored value,
- * and any new literal in a credential field is refused (`inline_secret`).
- * Validation is the startup one (`resolveConfig` over the daemon's registries,
- * with the env file read afresh). Writes are atomic (temp file + fsync +
- * rename) and 0600. The daemon does not reload its config: a changed file
+ * and any new literal in a credential field is refused (`inline_secret`; in a
+ * channel entry with its type's advice when it has one, `credentialHint`: a
+ * bridge argument is visible to other local users). Validation is the startup
+ * one (`resolveConfig` over the daemon's registries, with the env file read
+ * afresh). Writes are atomic (temp file + fsync + rename) and 0600. The
+ * daemon does not reload its config: a changed file
  * takes effect at the next start (`applied: "restart"`), except `channels`
  * with `console.liveChannels` (the gateway applies them and calls
  * `channelsApplied`).
@@ -76,6 +78,18 @@ function credentialMark(s: TSchema | undefined, path: readonly string[]): boolea
 }
 
 /**
+ * The channel entry `at` is in (below `channels[<i>]`), when its type is registered in `channels`:
+ * the type's module, the entry as the document has it, and `at` from the entry (`['args', '3']`).
+ */
+function channelAt(doc: Json, at: Path, channels: ChannelRegistry): { module: ChannelModule; entry: Record<string, unknown>; path: [string, ...string[]] } | undefined {
+  if (at[0] !== 'channels' || at.length < 3) return undefined;
+  const entry = get(doc, at.slice(0, 2));
+  const type = entry && typeof entry === 'object' ? (entry as { type?: unknown }).type : undefined;
+  const module = typeof type === 'string' ? channels.get(type) : undefined;
+  return module ? { module, entry: entry as Record<string, unknown>, path: at.slice(2).map(String) as [string, ...string[]] } : undefined;
+}
+
+/**
  * Whether the string at `at` in `doc` is a credential, by where the config
  * schema (config.ts) puts it. A channel entry's type says for its own keys
  * (`channels`: the registry the document's types come from, default the
@@ -102,13 +116,11 @@ export function isCredential(doc: Json, at: Path, channels: ChannelRegistry = bu
       if (parent === 'env' || last === 'bearer_token' || last === 'experimental_bearer_token') return true;
     }
   }
-  if (s[0] === 'channels' && s.length >= 3) {
-    const ch = get(doc, at.slice(0, 2));
-    const type = ch && typeof ch === 'object' ? (ch as { type?: unknown }).type : undefined;
-    const m = typeof type === 'string' ? channels.get(type) : undefined;
-    const [key, ...below] = s.slice(2) as [string, ...string[]];
-    const own = m && Object.hasOwn(m.entry, key) ? m.entry[key] : undefined;
-    if (m && (credentialMark(own, below) || m.isCredential?.([key, ...below], ch as Record<string, unknown>) === true)) return true;
+  const ch = channelAt(doc, at, channels);
+  if (ch) {
+    const [key, ...below] = ch.path;
+    const own = Object.hasOwn(ch.module.entry, key) ? ch.module.entry[key] : undefined;
+    if (credentialMark(own, below) || ch.module.isCredential?.(ch.path, ch.entry) === true) return true;
   }
   // Free-form parts: a secret-looking key.
   const key = [...at].reverse().find((x): x is string => typeof x === 'string');
@@ -174,23 +186,28 @@ export function unredact(next: Json, stored: Json, channels: ChannelRegistry = b
   return { doc, kept, issues };
 }
 
-/** Literal secrets: errors, except at `kept` paths (already in the file), which are warnings. */
+/**
+ * Literal secrets: errors, except at `kept` paths (already in the file), which are warnings. In a
+ * channel entry its type may say what to do instead (`ChannelModule.credentialHint`).
+ */
 function secretIssues(raw: Json, kept: Set<string> | 'all', channels: ChannelRegistry): ConfigIssue[] {
   const issues: ConfigIssue[] = [];
   walk(raw, [], (value, at) => {
     if (!literalCredential(raw, value, at, channels)) return undefined;
     const path = pointer(at);
     const old = kept === 'all' || kept.has(path);
-    const arg = at[0] === 'channels' && at[2] === 'args';
+    const ch = channelAt(raw, at, channels);
+    const hint = ch?.module.credentialHint?.(ch.path, ch.entry);
     issues.push({
       path,
       code: 'inline_secret',
       severity: old ? 'warning' : 'error',
-      message: arg
-        ? 'a secret on the bridge command line is visible to other local users (ps); pass it in the bridge env ("env": { "NAME": "env:NAME" })'
-        : old
-          ? 'a literal secret is stored in the config file; move it to the env file and reference it as "env:NAME"'
-          : 'secrets do not go into the config file: put the value in the env file (or the environment) and write "env:NAME"',
+      message:
+        typeof hint === 'string' && hint
+          ? hint
+          : old
+            ? 'a literal secret is stored in the config file; move it to the env file and reference it as "env:NAME"'
+            : 'secrets do not go into the config file: put the value in the env file (or the environment) and write "env:NAME"',
     });
     return undefined;
   });

@@ -100,7 +100,7 @@ import {
 } from '@agents-io/session';
 import { HostMcpServer, HostTools, ToolError, agentIdentity, type TopicHandover } from '@agents-io/host-mcp';
 import { builtinChannels, builtinConsoleParts, builtinHarnesses, type ConsoleParts } from './bundle.js';
-import { loadHarnessModule } from './module-loader.js';
+import { badChannelAdapter, loadHarnessModule } from './module-loader.js';
 import { ConfigError, UNGRANTED_EVIDENCE, agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type PresetConfig, type ResolvedChannel } from './config.js';
 import { ConsoleServer } from './console.js';
 import type { ChannelRegistry, DefaultEvidence } from './channel-registry.js';
@@ -2269,7 +2269,9 @@ ${a.summary}` }],
    * embedder's `channelAdapter`). A bridge whose first `hello` fails does not stop the
    * daemon: once launched it is listed `failed` with the reason and keeps being retried
    * with the bridge's restart backoff; it turns `running` once a peer answers
-   * (`ChannelInit.onState`).
+   * (`ChannelInit.onState`). An entry the gateway cannot build (its type is not in the
+   * gateway's registry, or `create` returned no channel) is a `ConfigError` naming the
+   * entry and the type; a `create` that throws fails the start with its own error.
    */
   private async buildConfigChannel(cfg: ResolvedChannel, index: number): Promise<BuiltChannel> {
     let entry: RunningChannel | undefined;
@@ -2299,6 +2301,13 @@ ${a.summary}` }],
         acceptId,
         onState,
       });
+      // A third party's module is untyped code: what it built is checked here, not met as a TypeError later.
+      const bad = badBuiltChannel(built);
+      if (bad) {
+        const close = (built as { close?: unknown } | null)?.close;
+        if (typeof close === 'function') await (async () => close.call(built))().catch(() => undefined);
+        throw new ConfigError(`channels[${index}]: channel type ${JSON.stringify(cfg.type)}: create did not return a channel (bad ${bad})`);
+      }
     }
     const { adapter, config, close, idKnown: settled } = built;
     return {
@@ -3397,3 +3406,13 @@ type BuiltChannel = {
 
 /** Its channel id is settled: anything but a bridge without `id` whose peer has not said hello yet (`BuiltChannel.idKnown`). */
 const idKnown = (b: { idKnown?: () => boolean }): boolean => b.idKnown?.() ?? true;
+
+/** What is wrong with a value `ChannelModule.create` returned, described: not a `BuiltChannel` with a `ChannelAdapter`; none when it is one. */
+function badBuiltChannel(v: unknown): string | undefined {
+  if (typeof v !== 'object' || v === null) return 'value (an object with an adapter)';
+  const b = v as Partial<Record<string, unknown>>;
+  const adapter = badChannelAdapter(b.adapter);
+  if (adapter) return `adapter.${adapter}`;
+  const method = (['close', 'idKnown'] as const).find((k) => b[k] !== undefined && typeof b[k] !== 'function');
+  return method ? `${method} (a function when present)` : undefined;
+}

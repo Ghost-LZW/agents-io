@@ -141,6 +141,7 @@ describe('module harness (use: "module")', () => {
       [{ detach: true }, 'detach (a function when present)'],
       [{ dispose: {} }, 'dispose (a function when present)'],
       [{ ownProcess: 'own' }, 'ownProcess (a function when present)'],
+      [{ nativeClient: { command: 'tui' } }, 'nativeClient (a function when present)'],
     ];
     for (const [members, what] of cases) {
       const start = declares(members);

@@ -45,6 +45,8 @@ export const bridgeChannelModule: ChannelModule<BridgeChannelEntry> = {
     if (typeof prev === 'string' && SECRET_FLAG.test(prev)) return true;
     return typeof self === 'string' && self.includes('=') && SECRET_FLAG.test(self.slice(0, self.indexOf('=')));
   },
+  // Not the env file: the peer's own env, which the command line does not show.
+  credentialHint: (path) => (path[0] === 'args' ? 'a secret on the bridge command line is visible to other local users (ps); pass it in the bridge env ("env": { "NAME": "env:NAME" })' : undefined),
 
   resolve: (entry, ctx) => ({
     ...entry,

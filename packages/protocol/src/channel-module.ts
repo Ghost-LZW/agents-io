@@ -106,7 +106,11 @@ export interface ChannelAdminContribution {}
  * In progress (core-slimming G2): the daemon reads all of it except `implicitEnv` and `admin`.
  */
 export interface ChannelModule<E = Record<string, unknown>, R = E> {
-  /** The `type` that selects it. */
+  /**
+   * The `type` that selects it: ASCII letters, digits, `-` and `_`, starting with a letter or digit
+   * (a host names owners `<type>:<owner>` and state directories `<type>.<account>` with it, so no
+   * `:`, `.`, `/` or spaces).
+   */
   readonly type: string;
   /**
    * The channel ids (`ChannelAdapter.id`) its adapters use, when fixed (`lark-bot`, `mail`):
@@ -128,6 +132,13 @@ export interface ChannelModule<E = Record<string, unknown>, R = E> {
    * is the entry as the document has it (the console asks about documents that may not validate).
    */
   isCredential?(path: readonly string[], entry: E): boolean;
+  /**
+   * What the console tells the author of a literal credential at `path` (an `inline_secret`
+   * issue), when the host's general advice (move it to the env file, write `"env:NAME"`) does not
+   * fit there: a bridge's argument is on its command line, visible to other local users. Undefined
+   * leaves the host's advice. Asked like `isCredential`, about documents that may not validate.
+   */
+  credentialHint?(path: readonly string[], entry: E): string | undefined;
   /** Variables the entry reads without naming them as `"env:NAME"` (a lark-bot entry without its own app: `LARK_APP_*`). */
   implicitEnv?(entry: E): string[];
   /**

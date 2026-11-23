@@ -118,10 +118,16 @@ export async function loadChannelModule(o: LoadedChannelOptions): Promise<Channe
   } catch (e) {
     throw new Error(`${where}: factory failed: ${(e as Error).message}`);
   }
-  const a = adapter as unknown as Partial<Record<string, unknown>> | null;
-  const bad = !a || typeof a.id !== 'string' || !a.id ? 'id (a non-empty string)' : (['caps', 'start', 'send'] as const).find((k) => typeof a[k] !== 'function');
+  const bad = badChannelAdapter(adapter);
   if (bad) throw new Error(`${where}: the factory did not return a ChannelAdapter (bad ${bad})`);
   return adapter;
+}
+
+/** The first member of a value that a `ChannelAdapter` must have and it lacks (`id`, `caps`, `start`, `send`); none when it has them. */
+export function badChannelAdapter(v: unknown): string | undefined {
+  const a = typeof v === 'object' && v !== null ? (v as Partial<Record<string, unknown>>) : undefined;
+  if (!a || typeof a.id !== 'string' || !a.id) return 'id (a non-empty string)';
+  return (['caps', 'start', 'send'] as const).find((k) => typeof a[k] !== 'function');
 }
 
 /**
@@ -183,14 +189,14 @@ function harnessDescriptor(v: unknown): Pick<HarnessModule, 'create'> & { schema
 /**
  * The first member of a module's adapter that is not what `HarnessAdapter` says, described; none when
  * all are. A module is untyped code: what the host reads later (the static declarations, the
- * lifecycle calls) is checked once here, so a wrong shape fails the start (CF-4) instead of a
- * command or a stop.
+ * lifecycle calls, `nativeClient` for a terminal joining a session) is checked once here, so a
+ * wrong shape fails the start (CF-4) instead of a command, an attach or a stop.
  */
 function badHarnessAdapter(a: Partial<Record<string, unknown>> | null): string | undefined {
   if (!a || typeof a.id !== 'string' || !a.id) return 'id (a non-empty string)';
   const required = (['probe', 'open'] as const).find((k) => typeof a[k] !== 'function');
   if (required) return required;
-  const method = (['detach', 'dispose', 'ownProcess'] as const).find((k) => a[k] !== undefined && typeof a[k] !== 'function');
+  const method = (['detach', 'dispose', 'ownProcess', 'nativeClient'] as const).find((k) => a[k] !== undefined && typeof a[k] !== 'function');
   if (method) return `${method} (a function when present)`;
   const flag = (['adopts', 'ownerProfileSwitch', 'ephemeralOpen'] as const).find((k) => a[k] !== undefined && typeof a[k] !== 'boolean');
   if (flag) return `${flag} (true or false when present)`;

@@ -120,6 +120,17 @@ describe('an entry\'s channel id belongs to its type (channel-stamping F4)', () 
     await expect(start([{ type: 'thief' }], { registry: new ChannelRegistry([chat.m, fakeType('thief', { id: 'agent' }).m]) })).rejects.toThrow('channel id "agent" is a built-in channel id; thief cannot use it');
     expect((await start([{ type: 'chat' }], { registry: new ChannelRegistry([fakeType('chat', { ids: ['chat'] }).m]) })).adminStatus().channels).toEqual([expect.objectContaining({ id: 'chat', state: 'running' })]);
   });
+
+  it('a type name cannot say another type\'s owner or share its state directory: one with ":", ".", "/" or a space is refused at registration #ID-3', () => {
+    // `a:b` with owner `c` would name the owner `a:b:c`, as `a` with owner `b:c` does; `a.b` with account `c` would share `channels/a.b.c` with `a`'s account `b.c`.
+    for (const type of ['a:b', 'a.b', 'a/b', '..', 'a b', '-a', 'ä']) {
+      expect(() => new ChannelRegistry([fakeType(type).m]), type).toThrow(`channel type ${JSON.stringify(type)}: a type name is ASCII letters, digits, "-" and "_", starting with a letter or digit (it names owners "<type>:<owner>" and state directories "<type>.<account>")`);
+    }
+    for (const type of ['chat', 'Chat_2', 'web-hook', '0x']) expect(new ChannelRegistry([fakeType(type).m]).types).toEqual([type]);
+    // So an owner's type is the part before its first ":".
+    const r = new ChannelRegistry([fakeType('a', { owner: 'b:c' }).m, fakeType('a-b', { owner: 'c' }).m]);
+    expect([r.owner({ type: 'a' }), r.owner({ type: 'a-b' })]).toEqual(['a:b:c', 'a-b:c']);
+  });
 });
 
 describe('credentials in a channel entry are the ones its type marks', () => {

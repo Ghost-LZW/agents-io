@@ -26,11 +26,35 @@ export interface ChannelRegistryOptions {
 type Entry = { type: string } & Record<string, unknown>;
 
 /**
+ * A channel type's name: ASCII letters, digits, `-` and `_`, starting with a letter or digit. The
+ * type names its entries' owners (`<type>:<owner>`) and state directories (`<type>.<account>`):
+ * with a `:` one type could say another's owner (`a:b` + `c` is `a` + `b:c`), with a `.` or `/`
+ * share or leave a directory.
+ */
+const TYPE_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+
+/**
+ * The first member of a channel module that is not what `ChannelModule` says, described; none when
+ * all are. A module may be untyped code: one without `create` would pass the config and fail the
+ * gateway's start with a TypeError.
+ */
+function badChannelModule(m: Partial<Record<string, unknown>>): string | undefined {
+  if (typeof m.entry !== 'object' || m.entry === null || Array.isArray(m.entry)) return 'entry (an object of schemas)';
+  const required = (['resolve', 'create'] as const).find((k) => typeof m[k] !== 'function');
+  if (required) return `${required} (a function)`;
+  const optional = (['isCredential', 'credentialHint', 'implicitEnv', 'validateAll', 'owner', 'idOf'] as const).find((k) => m[k] !== undefined && typeof m[k] !== 'function');
+  if (optional) return `${optional} (a function when present)`;
+  if (m.ids !== undefined && !(Array.isArray(m.ids) && m.ids.every((id) => typeof id === 'string' && id.length > 0))) return 'ids (an array of non-empty strings when present)';
+  return undefined;
+}
+
+/**
  * The channel types a deployment's config may name (`channels[].type`), each a `ChannelModule`, in
- * registration order (the order of the config file schema's union). `bundle.ts` builds the
- * built-in one (lark-bot, mail, bridge, module); an embedder may build its own and hand it to
- * `loadConfig` / `resolveConfig` (`channelRegistry`) and to `Gateway.start`, which builds every
- * configured channel through it.
+ * registration order (the order of the config file schema's union). Registration checks each
+ * module's type name (`TYPE_NAME`) and members (`badChannelModule`), so a type that passes the
+ * config has a `create` to build with. `bundle.ts` builds the built-in one (lark-bot, mail,
+ * bridge, module); an embedder may build its own and hand it to `loadConfig` / `resolveConfig`
+ * (`channelRegistry`) and to `Gateway.start`, which builds every configured channel through it.
  */
 export class ChannelRegistry {
   private readonly byType = new Map<string, ChannelModule>();
@@ -45,7 +69,10 @@ export class ChannelRegistry {
     const ids = new Map<string, string>();
     for (const m of modules) {
       if (typeof m.type !== 'string' || !m.type) throw new Error('a channel module needs a non-empty type');
+      if (!TYPE_NAME.test(m.type)) throw new Error(`channel type ${JSON.stringify(m.type)}: a type name is ASCII letters, digits, "-" and "_", starting with a letter or digit (it names owners "<type>:<owner>" and state directories "<type>.<account>")`);
       if (this.byType.has(m.type)) throw new Error(`channel type ${JSON.stringify(m.type)} is registered twice`);
+      const bad = badChannelModule(m as unknown as Partial<Record<string, unknown>>);
+      if (bad) throw new Error(`channel type ${JSON.stringify(m.type)}: bad ${bad}`);
       for (const id of m.ids ?? []) {
         if (CORE_CHANNEL_IDS.includes(id)) throw new Error(`channel type ${JSON.stringify(m.type)}: channel id ${JSON.stringify(id)} is the daemon's own`);
         const other = ids.get(id);
@@ -82,7 +109,8 @@ export class ChannelRegistry {
 
   /**
    * Who an entry's channel id belongs to (channel-stamping F4): `<type>:<ChannelModule.owner>`, or
-   * the type when its module does not say (`bridge:["node",["peer.js"]]`, `lark-bot`).
+   * the type when its module does not say (`bridge:["node",["peer.js"]]`, `lark-bot`). A type name
+   * has no `:` (`TYPE_NAME`), so the prefix ends at the first one: no type can say another's owner.
    */
   owner(entry: Entry): string {
     const m = this.byType.get(entry.type);

@@ -1,4 +1,4 @@
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Type } from '@sinclair/typebox';
 import { describe, expect, it } from 'vitest';
@@ -9,7 +9,8 @@ import { FakeChannel, FakeHarness } from '@agents-io/testkit';
 import { builtinChannels, builtinHarnesses } from '../src/bundle.js';
 import { ChannelRegistry, CORE_CHANNEL_IDS } from '../src/channel-registry.js';
 import { ConfigError, ConfigFile, configFileSchema, RESERVED_CHANNEL_IDS, resolveConfig, type HarnessInstance } from '../src/config.js';
-import { isCredential } from '../src/console-config.js';
+import { exitCodeFor } from '../src/cli.js';
+import { ConfigStore, isCredential } from '../src/console-config.js';
 import { Gateway, InstanceHarness } from '../src/gateway.js';
 import { cleanups, tmp } from './helpers.js';
 
@@ -118,6 +119,19 @@ describe('channel registry', () => {
     const taken = new ChannelRegistry([{ ...chat, entry: { ...chat.entry, account: Type.String() } }]);
     expect(() => configFileSchema(builtinHarnesses, taken)).toThrow('channel type "chat": every channel entry has "account"; its module cannot declare it');
   });
+
+  it('refuses a module whose members are not a ChannelModule\'s, so what passes the config can be built', () => {
+    const cases: [Record<string, unknown>, string][] = [
+      [{ create: undefined }, 'create (a function)'],
+      [{ resolve: 'entry' }, 'resolve (a function)'],
+      [{ entry: undefined }, 'entry (an object of schemas)'],
+      [{ owner: 'me' }, 'owner (a function when present)'],
+      [{ credentialHint: 'use env' }, 'credentialHint (a function when present)'],
+      [{ ids: 'chat' }, 'ids (an array of non-empty strings when present)'],
+      [{ ids: [''] }, 'ids (an array of non-empty strings when present)'],
+    ];
+    for (const [members, what] of cases) expect(() => new ChannelRegistry([{ ...chat, ...members } as unknown as ChannelModule]), what).toThrow(`channel type "chat": bad ${what}`);
+  });
 });
 
 describe('the gateway builds configured channels through the registry', () => {
@@ -166,6 +180,49 @@ describe('the gateway builds configured channels through the registry', () => {
     expect(gw.adminStatus().channels.filter((c) => c.id === 'probe').map((c) => c.account)).toEqual(['default', 'a b']);
     await gw.stop();
     expect(made.map((m) => m.closed)).toEqual([true, true]);
+  });
+
+  it('an entry the gateway cannot build fails the start as a config error (exit 2), naming the entry and its type', async () => {
+    const start = async (create: ChannelModule['create'], o: { gatewayRegistry?: boolean } = {}) => {
+      const dir = tmp('aio-creg-');
+      const registry = new ChannelRegistry([bridgeChannelModule, { type: 'probe', entry: {}, resolve: (e) => e, create }]);
+      const base = resolveConfig({ dataDir: dir, local: { principal: 'me' }, channels: [{ type: 'bridge', command: 'peer', id: 'peer' }, { type: 'probe' }] }, { env: {}, baseDir: dir, cwd: dir, channelRegistry: registry });
+      const gw = await Gateway.start({
+        config: { ...base, socketPath: join(dir, 'run', 'aio.sock') },
+        buildHarness: (i: HarnessInstance) => new InstanceHarness(i, new FakeHarness()),
+        ...(o.gatewayRegistry === false ? {} : { channelRegistry: registry }),
+        // The bridge is the embedder's here: only the probe entry is built by its type.
+        channelAdapter: (ch) => (ch.type === 'bridge' ? new FakeChannel('peer') : undefined),
+        logger: () => {},
+        listen: false,
+      });
+      await gw.stop();
+    };
+    const configError = async (p: Promise<unknown>) => {
+      try {
+        await p;
+      } catch (e) {
+        expect(e).toBeInstanceOf(ConfigError);
+        expect(exitCodeFor(e)).toBe(2);
+        return (e as Error).message;
+      }
+      throw new Error('started');
+    };
+    const ok = () => ({ adapter: new FakeChannel('probe') });
+    await start(ok);
+    // Resolved with a registry that has the type, started with one that lacks it (the built-in one).
+    expect(await configError(start(ok, { gatewayRegistry: false }))).toBe('channels[1]: channel type "probe" is not registered with the gateway; give Gateway.start the channel registry the config was resolved with');
+    const bad = (what: string) => `channels[1]: channel type "probe": create did not return a channel (bad ${what})`;
+    expect(await configError(start((() => undefined) as never))).toBe(bad('value (an object with an adapter)'));
+    expect(await configError(start((() => ({})) as never))).toBe(bad('adapter.id (a non-empty string)'));
+    expect(await configError(start((() => ({ adapter: { id: 'probe', caps: () => ({}), start: async () => {} } })) as never))).toBe(bad('adapter.send'));
+    let closed = 0;
+    expect(await configError(start((() => ({ adapter: new FakeChannel('probe'), close: async () => void closed++, idKnown: true })) as never))).toBe(bad('idKnown (a function when present)'));
+    // What it built is closed when it can be.
+    expect(closed).toBe(1);
+    expect(await configError(start((() => ({ adapter: new FakeChannel('probe'), close: 'later' })) as never))).toBe(bad('close (a function when present)'));
+    // A create that throws fails the start with its own error.
+    await expect(start(() => Promise.reject(new TypeError('no probe here')))).rejects.toThrow(new TypeError('no probe here'));
   });
 
   it('an entry of a type the gateway\'s registry lacks fails the start, naming the entry', async () => {
@@ -220,5 +277,37 @@ describe('what the registry says of an entry', () => {
     const other = new ChannelRegistry([bridgeChannelModule]);
     expect([isCredential(doc, ['channels', 0, 'env', 'X'], other), isCredential(doc, ['channels', 2, 'config', 'encryptKey'], other)]).toEqual([true, false]);
     expect(isCredential(doc, ['channels', 2, 'config', 'encryptKey'], new ChannelRegistry([larkBotChannelModule]))).toBe(true);
+  });
+
+  it('a literal credential is answered with its type\'s advice where it has one (credentialHint: a bridge argument), else the host\'s', () => {
+    const vault: ChannelModule = {
+      type: 'vault',
+      entry: { code: Type.String({ 'x-credential': true }), pin: Type.Optional(Type.String({ 'x-credential': true })) },
+      credentialHint: (path) => (path[0] === 'code' ? 'vault codes come from the vault agent' : undefined),
+      resolve: (e) => e,
+      create: () => ({ adapter: new FakeChannel('vault') }),
+    };
+    const dir = tmp('aio-creg-');
+    const path = join(dir, 'aio.config.json');
+    const channels = [
+      { type: 'bridge', command: 'p', args: ['--token', 'a'] },
+      { type: 'vault', code: 'c-1', pin: 'p-2' },
+    ];
+    writeFileSync(path, JSON.stringify({ channels }), { mode: 0o600 });
+    const s = new ConfigStore({ path, env: {}, channelRegistry: new ChannelRegistry([bridgeChannelModule, vault]) });
+    const inline = (issues: { code: string; path: string; message: string; severity: string }[]) => issues.filter((i) => i.code === 'inline_secret').map((i) => [i.path, i.severity, i.message]);
+    const bridgeArg = 'a secret on the bridge command line is visible to other local users (ps); pass it in the bridge env ("env": { "NAME": "env:NAME" })';
+    // Stored in the file: warnings.
+    expect(inline(s.document().issues)).toEqual([
+      ['/channels/0/args/1', 'warning', bridgeArg],
+      ['/channels/1/code', 'warning', 'vault codes come from the vault agent'],
+      ['/channels/1/pin', 'warning', 'a literal secret is stored in the config file; move it to the env file and reference it as "env:NAME"'],
+    ]);
+    // New ones: errors, the same advice.
+    expect(inline(s.validate({ channels }).issues)).toEqual([
+      ['/channels/0/args/1', 'error', bridgeArg],
+      ['/channels/1/code', 'error', 'vault codes come from the vault agent'],
+      ['/channels/1/pin', 'error', 'secrets do not go into the config file: put the value in the env file (or the environment) and write "env:NAME"'],
+    ]);
   });
 });

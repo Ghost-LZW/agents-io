@@ -86,7 +86,8 @@ see `docs/E2E.md` §0). New:
   (`@agents-io/protocol`, `channel-module.ts`) that owns its keys, how they resolve
   (`env:` substitution, paths, Lark's `LARK_APP_*` fallback), the rules across its
   entries (several Lark bots, one bridge program per channel id), which of its strings
-  are credentials (`x-credential`, `isCredential`), who owns its channel ids and how its
+  are credentials (`x-credential`, `isCredential`; the console's advice about a literal one,
+  `credentialHint`), who owns its channel ids and how its
   adapter is built. `lark-bot`, `mail` and `bridge` are in their packages
   (`channel/*/src/module.ts`); `module` is the daemon's own (`src/module-channel.ts`).
   The bundle also says which types' adapters are trusted with their caps' evidence
@@ -147,8 +148,8 @@ see `docs/E2E.md` §0). New:
   (Claude Code's 3.75 MB inline image limit lives in its package); resolvers given in the open
   options win. What the factory returns is checked before the daemon starts: a static
   declaration or lifecycle member of the wrong type (`modes` that is not an array of `'plan'`,
-  `sessionEnv` that is `null` or an unknown string, `compact` without a `command`, a `detach` that
-  is not a function, …) fails the start, naming the instance and the member.
+  `sessionEnv` that is `null` or an unknown string, `compact` without a `command`, a `detach` or
+  `nativeClient` that is not a function, …) fails the start, naming the instance and the member.
 - **Live (realtime voice, decision 11)**: a Codex instance with `"live": true` opts
   its app-server connection into Codex's experimental realtime API. Agents on it
   (with `tools`) get `live_join { target, channel?, instructions?, voice? }`,
@@ -530,7 +531,11 @@ What changed for embedders with core-slimming G3:
   env on a Codex instance: the daemon reads the `sessionEnv` of the adapter `buildHarness`
   returned for the instance and calls its `ownProcess({ env, cwd })` (`CodexHarness` does the
   rewrite itself). An adapter that declares nothing (a test fake) takes the session's env in its
-  open args (`'open'`).
+  open args (`'open'`). It is also called, for a launch with env on an instance that is
+  unavailable for now, with that instance and `unavailable` cleared: only to read the returned
+  adapter's `sessionEnv` (nothing is opened on it). Both copies (this one and a task run's) are
+  spreads of the instance, so they carry `launch` but not the deprecated `claude` / `codex`
+  alias.
 - A `use: "module"` instance whose adapter cannot be built because it is unavailable for now (an
   `env:` reference in its config is not set, so its factory never ran) refuses a launch with env
   (`launch_unsupported`, saying why it is unavailable); before, such a launch was accepted and
@@ -548,7 +553,17 @@ What changed for embedders with core-slimming G2 (channel types):
 - The gateway builds every configured channel through its type's `ChannelModule.create`
   (`GatewayOptions.channelAdapter` still wins when it returns an adapter); `init.stateDir` is
   `<dataDir>/channels/<type>.<account, URI-encoded>`, so a Lark bot's stays
-  `channels/lark-bot.<account>`. The gateway imports no channel package.
+  `channels/lark-bot.<account>`. The gateway imports no channel package. An entry it cannot
+  build fails `Gateway.start` with a `ConfigError` (exit 2) naming the entry and its type: a type
+  the gateway's registry lacks (the config was resolved with another one), or a `create` that
+  returns no `BuiltChannel` (no `adapter` with `id`, `caps`, `start` and `send`; a `close` or
+  `idKnown` that is not a function). A `create` that throws fails it with its own error.
+- `new ChannelRegistry(modules)` checks each module: its type name is ASCII letters, digits, `-`
+  and `_`, starting with a letter or digit (owners are `<type>:<owner>` and state directories
+  `<type>.<account>`, so no `:`, `.` or `/`), `entry` is an object, `resolve` and `create` are
+  functions, the optional hooks are functions when present and `ids` is an array of non-empty
+  strings. A wrong one throws, naming the type and the member, so a type an entry passes
+  `resolveConfig` with has a `create` to build it. The built-in types pass.
 - The evidence an entry gives without an `evidence` grant is the registration's, never the
   module's: `new ChannelRegistry(modules, { defaultEvidence: { <type>: 'caps' | 'ungranted' } })`,
   default `ungranted` (`device_only` only). `builtinChannels` gives lark-bot and mail `caps`,
@@ -559,7 +574,10 @@ What changed for embedders with core-slimming G2 (channel types):
 - The console's credentials in a channel entry are what its type marks: strings at or under a
   schema marked `x-credential` (a bridge's `env`) and `ChannelModule.isCredential` (a bridge
   argument after a secret-looking flag, mail `auth.pass` / `auth.accessToken`, a Lark app's
-  `appSecret` / `encryptKey` / `verificationToken`): the same fields as before. `isCredential`,
+  `appSecret` / `encryptKey` / `verificationToken`): the same fields as before. What the
+  console says of a literal one there is the type's too when it has advice of its own
+  (`ChannelModule.credentialHint`: a bridge argument is visible to other local users, the same
+  text as before), else the general one. `isCredential`,
   `redact` and `unredact` take an optional channel registry; `ConfigStoreOptions` takes
   `harnessRegistry` and `channelRegistry` (the gateway gives its own).
 - `Gateway.larkBots` is gone: the console's Lark bot provisioning is built by `bundle.ts`
