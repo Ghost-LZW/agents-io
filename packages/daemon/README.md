@@ -160,7 +160,10 @@ see `docs/E2E.md` §0). New:
   The harness's own terminal UI comes onto a session (`aio tui`, `tui.attach`, decision 15) as
   the adapter declares (`attach`, static): `'join'` (the default; Codex) answers how its TUI
   joins the open session as one more client (`nativeClient`); `'takeover'` (Claude Code) hands
-  the session to it (`takeover`, which it then needs). For a takeover the daemon refuses a second
+  the session to it (`takeover`, which it then needs). An instance that is unavailable for now
+  (an `env:` reference that is not set) declares as it will once it is available: its adapter is
+  built from the config as it stands only for that (never opened, not kept), so a Claude Code
+  terminal still takes the session over. For a takeover the daemon refuses a second
   attach while one is connected (`conflict`), releases the session's binding once its lane is
   idle (`busy` if a turn still runs), picks the session's native id on the instance (resumed) or
   a new one, opens the session on the takeover's `harness`, which stands in for the instance

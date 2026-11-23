@@ -1142,25 +1142,34 @@ export class Gateway {
 
   /**
    * Why a launched session's env cannot reach the instance `name`, if it cannot: what its adapter
-   * declares (`HarnessAdapter.sessionEnv`; built when asked, nothing started). An instance that is
-   * unavailable for now (an `env:` reference is not set) answers as it will once it is available:
-   * its kind's adapter is built from the config as it stands, only to read the declaration (never
-   * opened, not kept). One whose adapter cannot be built even so (a module whose factory never ran)
-   * cannot say, so it takes no session env: pinned, the launch might never run there.
+   * declares (`HarnessAdapter.sessionEnv`; built when asked, nothing started), also while it is
+   * unavailable for now (`declaredUnavailable`). One whose adapter cannot be built even so (a module
+   * whose factory never ran) cannot say, so it takes no session env: pinned, the launch might never
+   * run there. The answer then is why the instance cannot run (which names variables, never values).
    */
   private sessionEnvRefusal(name: string): string | undefined {
     try {
       return sessionEnvRefused(name, this.harness(name).sessionEnv);
     } catch (e) {
-      const inst = this.instanceOf(name);
-      if (inst?.unavailable !== undefined) {
-        try {
-          return sessionEnvRefused(name, this.build({ ...inst, unavailable: undefined }).sessionEnv);
-        } catch {
-          // Falls through to why the instance cannot run (which names variables, never values).
-        }
-      }
-      return (e as Error).message;
+      const a = this.declaredUnavailable(name);
+      return a ? sessionEnvRefused(name, a.sessionEnv) : (e as Error).message;
+    }
+  }
+
+  /**
+   * The adapter of an instance that is unavailable for now (an `env:` reference is not set), for
+   * what it declares as it will once it is available: its kind's adapter built from the config as
+   * it stands, only to read the declarations or take a session over (never opened, not kept).
+   * Nothing for one that is available, or whose adapter cannot be built even so (a module whose
+   * factory never ran).
+   */
+  private declaredUnavailable(name: string): HarnessAdapter | undefined {
+    const inst = this.instanceOf(name);
+    if (inst?.unavailable === undefined) return undefined;
+    try {
+      return this.build({ ...inst, unavailable: undefined });
+    } catch {
+      return undefined;
     }
   }
 
@@ -2911,7 +2920,9 @@ ${a.summary}` }],
 
   /**
    * The adapter of the session's instance `name` when its terminal UI takes sessions over
-   * (`attach: 'takeover'` with `takeover`): the launched session's when the session is one.
+   * (`attach: 'takeover'` with `takeover`): the launched session's when the session is one. One
+   * unavailable for now declares as it will once it is available (`declaredUnavailable`): Claude
+   * Code's terminal takes the session over without its headless adapter, as it always has.
    * Nothing for one that joins, or that cannot be built (the join path answers for it).
    */
   private takeoverAdapter(key: string, name: string): TakingOver | undefined {
@@ -2919,8 +2930,9 @@ ${a.summary}` }],
     try {
       a = this.launched.get(key)?.adapter(name) ?? this.declared(name);
     } catch {
-      return undefined;
+      // An unavailable instance's adapter cannot be built, launched or not: what it declares is read below.
     }
+    a ??= this.declaredUnavailable(name);
     return a?.attach === 'takeover' && typeof a.takeover === 'function' ? (a as TakingOver) : undefined;
   }
 

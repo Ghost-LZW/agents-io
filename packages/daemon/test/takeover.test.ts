@@ -183,6 +183,38 @@ describe("Claude Code's terminal UI takes the session over", () => {
     const mcp = JSON.parse(readFileSync(t.args[t.args.indexOf('--mcp-config') + 1]!, 'utf8')) as { mcpServers: Record<string, { command: string; args: string[] }> };
     expect(mcp.mcpServers['agents-io-bridge']).toMatchObject({ command: process.execPath, args: [fileURLToPath(new URL('../src/cli.js', import.meta.url)), 'tui-bridge'] });
   });
+
+  it("a claude-code instance that is unavailable for now (an `env:` reference is not set) still takes the session over when a preset set here names it: its TUI starts on a new Claude session without the headless adapter #LN-9", async () => {
+    const dir = tmp('aio-tku-');
+    mkdirSync(join(dir, 'work'), { recursive: true });
+    const raw = {
+      dataDir: dir,
+      cwd: join(dir, 'work'),
+      policy: { owners: ['fake:alice'], ownerSessionKey: 'main' },
+      local: { principal: 'fake:alice' },
+      harnesses: {
+        plug: { use: 'module', module: './fixtures/harness-declares.mjs' },
+        cc: { use: 'claude-code', env: { ANTHROPIC_API_KEY: 'env:AIO_TEST_UNSET_KEY' } },
+      },
+      presets: { claude: { harness: 'cc' } },
+      defaultHarness: 'plug',
+    };
+    const base = resolveConfig(raw, { env: {}, baseDir: here, cwd: dir });
+    expect(base.harnesses.cc!.unavailable).toContain('AIO_TEST_UNSET_KEY');
+    const socketPath = join(dir, 'run', 'aio.sock');
+    const chat = new FakeChannel('fake');
+    const gw = await Gateway.start({ config: { ...base, socketPath }, log: new MemorySessionLog(), channels: [{ adapter: chat }], logger: () => {} });
+    cleanups.push(() => gw.stop());
+    const client = await LocalClient.connect(socketPath);
+    cleanups.push(() => client.close());
+    await chat.inject({ ...dm, sender: alice, text: '/preset claude' });
+    await until(() => chat.sent.some((s) => (s.edits.at(-1)?.text ?? s.msg.text)?.startsWith('Preset claude from the next turn')));
+    const t = await client.tuiAttach();
+    expect(t).toMatchObject({ sessionKey: 'main', harness: 'cc', command: 'claude', cwd: join(dir, 'work') });
+    expect(t.args.slice(0, 2)).toEqual(['--session-id', t.nativeId]);
+    expect(t.args.slice(-2)).toEqual(['--model', 'haiku']);
+    expect(t.unsetEnv).toEqual(expect.arrayContaining(['CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_TOKEN']));
+  });
 });
 
 describe("a module harness's attach and takeover", () => {
