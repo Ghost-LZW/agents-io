@@ -132,6 +132,34 @@ describe('module harness: what its factory and opens get', () => {
     expect(plain.rec.fake.sessions[0]!.args.env).toEqual({ BASE: '1', X: 'y', AGENTS_IO_RUN_ID: 'r2' });
   });
 
+  it('unavailable for now (an env: reference in its config not set): its factory never ran, so a launch with env is launch_unsupported, saying why it cannot run; a cwd alone is fine', async () => {
+    const dir = realpathSync(tmp());
+    const a = join(dir, 'ws', 'a');
+    mkdirSync(a, { recursive: true });
+    const config = resolveConfig(
+      {
+        dataDir: dir,
+        local: { principal: 'me' },
+        cwd: dir,
+        // The default instance is built at start, so it is another one.
+        harnesses: { cc: { use: 'claude-code' }, plug: { use: 'module', module: './fixtures/harness-env.mjs', config: { key: `e${++keys}`, token: 'env:AIO_TEST_UNSET_TOKEN' } } },
+        defaultHarness: 'cc',
+        agents: { dev: { harness: 'plug', sessionParams: { cwdRoots: [join(dir, 'ws')], envKeys: ['FOO'] } } },
+        defaultAgent: 'dev',
+      },
+      { env: {}, baseDir: here, cwd: dir },
+    );
+    const gw = await Gateway.start({ config: { ...config, socketPath: join(dir, 'run', 'aio.sock') }, logger: () => {} });
+    cleanups.push(() => gw.stop());
+    const prep = (sessionKey: string, launch: { cwd?: string; env?: Record<string, string> }) => gw.prepareSession({ v: 1, type: 'session.prepare', id: 'x', sessionKey, agent: 'dev', launch } as never);
+    expect(prep('U1', { cwd: a, env: { FOO: 'bar' } })).toMatchObject({
+      ok: false,
+      code: 'launch_unsupported',
+      message: 'harness instance plug is unavailable: harnesses.plug.config.token: environment variable AIO_TEST_UNSET_TOKEN is not set; a session env cannot apply there (a cwd alone can)',
+    });
+    expect(prep('U2', { cwd: a })).toMatchObject({ ok: true, value: { created: true } });
+  });
+
   it("sessionEnv 'own-process' without ownProcess fails the start", async () => {
     await expect(start({ sessionEnv: 'own-process' })).rejects.toThrow(/harnesses\.plug \(module .*\): the factory did not return a HarnessAdapter \(bad sessionEnv \('own-process' needs ownProcess\)\)/);
   });

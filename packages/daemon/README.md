@@ -109,7 +109,10 @@ see `docs/E2E.md` §0). New:
   `'own-process'` (Codex over stdio) runs the session on the adapter `ownProcess({ env, cwd })`
   returns, disposed when the session's lane closes; `{ refused }` (Codex on a Unix socket:
   "a shared Codex app-server (unix transport)") refuses a launch with env
-  (`launch_unsupported`), a cwd alone is fine. A task run always gets a process of its own
+  (`launch_unsupported`), a cwd alone is fine. An instance that is unavailable for now (an
+  `env:` reference is not set) answers as it will once it is available; a module one, whose
+  factory never ran, cannot say, so a launch with env is refused too (`launch_unsupported`,
+  saying why it is unavailable). A task run always gets a process of its own
   when the adapter has `ownProcess` (the run's env joins the instance's, under its configured
   config dir). The agent's instructions arrive as `HarnessOpenArgs.instructions` (Claude Code
   appends them to its preset system prompt, Codex sends them as developer instructions); a

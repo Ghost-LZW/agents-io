@@ -1000,6 +1000,30 @@ export class Gateway {
     return this.declared(harnessId)?.adopts === true;
   }
 
+  /**
+   * Why a launched session's env cannot reach the instance `name`, if it cannot: what its adapter
+   * declares (`HarnessAdapter.sessionEnv`; built when asked, nothing started). An instance that is
+   * unavailable for now (an `env:` reference is not set) answers as it will once it is available:
+   * its kind's adapter is built from the config as it stands, only to read the declaration (never
+   * opened, not kept). One whose adapter cannot be built even so (a module whose factory never ran)
+   * cannot say, so it takes no session env: pinned, the launch might never run there.
+   */
+  private sessionEnvRefusal(name: string): string | undefined {
+    try {
+      return sessionEnvRefused(name, this.harness(name).sessionEnv);
+    } catch (e) {
+      const inst = this.instanceOf(name);
+      if (inst?.unavailable !== undefined) {
+        try {
+          return sessionEnvRefused(name, this.build({ ...inst, unavailable: undefined }).sessionEnv);
+        } catch {
+          // Falls through to why the instance cannot run (which names variables, never values).
+        }
+      }
+      return (e as Error).message;
+    }
+  }
+
   /** A module instance's adapter (its factory's, wrapped): every session of the instance shares it. */
   private sharedAdapter(a: HarnessAdapter): boolean {
     return a instanceof InstanceHarness && this.moduleAdapters.get(a.instance.name) === a.inner;
@@ -1139,8 +1163,8 @@ export class Gateway {
     } catch (e) {
       return { ok: false, code: e instanceof LaneUnavailableError ? e.code : 'no_agent', message: (e as Error).message };
     }
-    // Whether the agent's instance can take a session env at all is what its adapter declares (built when asked, nothing started).
-    const checked = checkLaunch(agent, launch, () => sessionEnvRefused(agent.harness, this.declared(agent.harness)?.sessionEnv));
+    // Whether the agent's instance can take a session env at all is what its adapter declares, also while it is unavailable.
+    const checked = checkLaunch(agent, launch, () => this.sessionEnvRefusal(agent.harness));
     if (!checked.ok) return checked;
     const pinned = this.records.launchOf(sessionKey);
     if (pinned) {

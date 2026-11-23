@@ -418,6 +418,37 @@ describe('session launch: Codex (§8.10)', () => {
     });
     expect(prep('U2', { cwd: fx.a })).toMatchObject({ ok: true });
   });
+
+  it('unix, unavailable for now (an env: reference not set): a launch with env is still launch_unsupported and pins nothing; cwd only is fine; unavailable stdio and Claude Code instances take the env as before #LA-3', async () => {
+    const fx = fixture();
+    const missing = { K: 'env:AIO_TEST_UNSET_VAR' };
+    const params = { cwdRoots: [fx.ws], envKeys: ['FOO'] };
+    const w = await world({
+      fx,
+      raw: {
+        harnesses: {
+          claude: { use: 'claude-code' },
+          cx: { use: 'codex', env: missing, transport: { kind: 'unix', spawn: 'own', stateDir: join(fx.d, 'cx') } },
+          cs: { use: 'codex', env: missing, transport: { kind: 'stdio' } },
+          cc: { use: 'claude-code', env: missing },
+        },
+        agents: agents(fx, { cdx: { harness: 'cx', sessionParams: params }, sto: { harness: 'cs', sessionParams: params }, cla: { harness: 'cc', sessionParams: params } }),
+      },
+      // The real adapters (never started), which an unavailable instance cannot build.
+      build: (i, fake) => (i.name === 'claude' ? new InstanceHarness(i, fake) : buildHarness(i)),
+    });
+    expect(() => w.gw.harness('cx')).toThrow('harness instance cx is unavailable: harnesses.cx.env.K: environment variable AIO_TEST_UNSET_VAR is not set');
+    const prep = (key: string, agent: string, launch: SessionLaunch) => w.gw.prepareSession({ v: 1, type: 'session.prepare', id: 'x', sessionKey: key, agent, launch } as never);
+    expect(prep('U1', 'cdx', { cwd: fx.a, env: { FOO: 'bar' } })).toMatchObject({
+      ok: false,
+      code: 'launch_unsupported',
+      message: 'harness instance cx is a shared Codex app-server (unix transport); a session env cannot apply there (a cwd alone can)',
+    });
+    // Nothing was pinned: the key takes another launch.
+    expect(prep('U1', 'cdx', { cwd: fx.a })).toMatchObject({ ok: true, value: { created: true } });
+    expect(prep('S1', 'sto', { cwd: fx.a, env: { FOO: 'bar' } })).toMatchObject({ ok: true });
+    expect(prep('C1', 'cla', { cwd: fx.a, env: { FOO: 'bar' } })).toMatchObject({ ok: true });
+  });
 });
 
 describe('session launch: visibility and leaks (§8.12–8.13)', () => {
