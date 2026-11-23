@@ -278,7 +278,7 @@ export interface HarnessTakeover {
    * got, e.g. the host's MCP endpoint, may go into it).
    */
   launch(): TakeoverLaunch;
-  /** End it now; idempotent. `services.onEnd` follows. */
+  /** End it now; idempotent. `services.onEnd` follows. The host logs a failure (a throw, a rejected promise) and goes on. */
   end(reason: string): void;
 }
 

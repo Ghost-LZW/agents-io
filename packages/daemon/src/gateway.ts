@@ -2934,7 +2934,7 @@ ${a.summary}` }],
   private async takeOver(key: string, lane: Lane, instance: string, adapter: TakingOver, model: string | undefined): Promise<Outcome> {
     const held = this.takeovers.get(key);
     if (held?.takeover.connected) return { ok: false, code: 'conflict', message: `${key}: a terminal UI is already attached` };
-    held?.takeover.end('replaced by a new attach');
+    if (held) this.endTakeover(held, 'replaced by a new attach');
     await lane.whenIdle();
     const released = await lane.release('a terminal UI takes the session');
     if (!released.ok) return { ok: false, code: 'busy', message: `${key}: a turn is running; try again when it ends` };
@@ -2967,13 +2967,18 @@ ${a.summary}` }],
     try {
       await lane.attachPoint();
     } catch (e) {
-      takeover.end('attach failed');
+      this.endTakeover(hold, 'attach failed');
       throw e;
     }
     const launch = takeover.launch();
     const cwd = this.laneInfo.get(key)?.cwd ?? this.o.config.cwd;
     this.log('info', `${key}: ${adapter.displayName ?? instance} TUI attaching to ${instance} ${nativeId}`);
     return { ok: true, value: { sessionKey: key, harness: instance, nativeId, cwd, ...launch } };
+  }
+
+  /** A takeover's `end` (`HarnessTakeover.end`): a failure (a throw, a rejected promise) is logged, never thrown (RS-8). */
+  private endTakeover(hold: { instance: string; takeover: HarnessTakeover }, reason: string): void {
+    void (async () => hold.takeover.end(reason))().catch((e: unknown) => this.log('warn', `harness ${hold.instance}: takeover end failed: ${e instanceof Error ? e.message : String(e)}`));
   }
 
   /** Where the owner's own chat goes now: its current topic (of the agent it talks to), without a fixed session. */
@@ -3312,7 +3317,7 @@ ${a.summary}` }],
     // The external MCP endpoint is the last registered: it closes first, so no new external write comes in.
     await this.modules.stop();
     // Terminals holding sessions leave: the sessions go on headless (their lanes close below).
-    for (const { takeover } of [...this.takeovers.values()]) takeover.end('daemon stopping');
+    for (const hold of [...this.takeovers.values()]) this.endTakeover(hold, 'daemon stopping');
     // Lives end first: the voice runs in the harness and the media peer in a channel, both about to go.
     await within(Promise.all([...this.lives.keys()].map((k) => this.leaveLive(k, 'gateway stopping'))), 5000);
     // Runs end (interrupted) while their connections can still hear run.ended.

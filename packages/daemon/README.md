@@ -165,7 +165,8 @@ see `docs/E2E.md` §0). New:
   idle (`busy` if a turn still runs), picks the session's native id on the instance (resumed) or
   a new one, opens the session on the takeover's `harness`, which stands in for the instance
   until the terminal leaves, and answers the takeover's `launch()`; `/status` says "a terminal
-  UI holds this session" while it is connected, and stopping ends every takeover first. The
+  UI holds this session" while it is connected, and stopping ends every takeover first (an `end`
+  that throws or rejects is logged, never thrown, like `detach` / `dispose`). The
   takeover gets a directory for its files (`<dataDir>/tui`), the CLI's path for helpers its
   terminal starts (`aio <command>` runs a command a built-in kind adds, `HarnessModule.cli`:
   Claude Code's `tui-bridge`) and local paths of stored files.

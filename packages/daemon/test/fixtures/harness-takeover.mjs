@@ -11,8 +11,10 @@ const script = (who) => async (t) => {
  * globalThis.__takeover[config.key] = { headless, takeovers }: the headless FakeHarness, and per
  * takeover its args, its terminal (a FakeHarness whose sessions bind the takeover's native id,
  * `terminal`), `connect()` / `leave(reason)` to play the terminal, `ended` (the reasons `end` was
- * called with) and `launches` (how often `launch` was asked). With `config.failOpen` the
- * terminal's sessions cannot open.
+ * called with), `closed` (the reasons its terminal's sessions were closed with) and `launches`
+ * (how often `launch` was asked). With `config.failOpen` the terminal's sessions cannot open; with
+ * `config.endFails` (`'throw'` / `'reject'`) its `end` is broken: it throws, or returns a rejected
+ * promise, and ends nothing.
  */
 export function createHarness(init) {
   const c = init.config ?? {};
@@ -26,6 +28,7 @@ export function createHarness(init) {
     open: (args) => headless.open(args),
     async takeover(a) {
       const terminal = new FakeHarness(script('terminal'), a.instance);
+      const t = { args: a, terminal, ended: [], closed: [], launches: 0 };
       // The terminal runs on the native session it was given: the session's log says so (`session.bound`).
       const harness = {
         id: a.instance,
@@ -35,12 +38,16 @@ export function createHarness(init) {
           const s = await terminal.open(args);
           s.nativeId = () => a.nativeId;
           s.queue.push({ ts: Date.now(), level: 'primary', audience: 'status', durability: 'durable', body: { t: 'session.bound', nativeId: a.nativeId } });
+          const close = s.close.bind(s);
+          s.close = (reason) => {
+            t.closed.push(reason);
+            return close(reason);
+          };
           return s;
         },
       };
       let connected = false;
       let over = false;
-      const t = { args: a, terminal, ended: [], launches: 0 };
       const leave = (reason) => {
         if (over) return;
         over = true;
@@ -63,6 +70,8 @@ export function createHarness(init) {
         },
         end(reason) {
           t.ended.push(reason);
+          if (c.endFails === 'throw') throw new Error('end broke');
+          if (c.endFails === 'reject') return Promise.reject(new Error('end broke'));
           leave(reason);
         },
       };

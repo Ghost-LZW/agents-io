@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -25,6 +25,7 @@ interface FakeTakeover {
   args: HarnessTakeoverArgs;
   terminal: FakeHarness;
   ended: string[];
+  closed: string[];
   launches: number;
   connect(): void;
   leave(reason: string): void;
@@ -32,7 +33,7 @@ interface FakeTakeover {
 const rec = (key: string) => (globalThis as { __takeover?: Record<string, { headless: FakeHarness; takeovers: FakeTakeover[] }> }).__takeover![key]!;
 let keys = 0;
 
-/** A daemon whose one instance `plug` is the takeover module harness; the owner's chat is session `main`. */
+/** A daemon whose one instance `plug` is the takeover module harness; the owner's chat is session `main`; `logs`: what it logged. */
 async function start(config: Record<string, unknown> = {}) {
   const key = `t${++keys}`;
   const dir = tmp('aio-tko-');
@@ -48,7 +49,8 @@ async function start(config: Record<string, unknown> = {}) {
   const base = resolveConfig(raw, { env: {}, baseDir: here, cwd: dir });
   const socketPath = join(dir, 'run', 'aio.sock');
   const chat = new FakeChannel('fake');
-  const gw = await Gateway.start({ config: { ...base, socketPath }, log: new MemorySessionLog(), channels: [{ adapter: chat }], logger: () => {} });
+  const logs: string[] = [];
+  const gw = await Gateway.start({ config: { ...base, socketPath }, log: new MemorySessionLog(), channels: [{ adapter: chat }], logger: (_level, msg) => void logs.push(msg) });
   cleanups.push(() => gw.stop());
   const client = await LocalClient.connect(socketPath);
   cleanups.push(() => client.close());
@@ -59,7 +61,7 @@ async function start(config: Record<string, unknown> = {}) {
     await chat.inject({ ...dm, sender: alice, text });
     return until(() => replies().slice(before).find((r) => r !== undefined && match(r)));
   };
-  return { gw, dir, client, say, rec: rec(key) };
+  return { gw, dir, socketPath, client, say, logs, rec: rec(key) };
 }
 
 describe('a harness whose terminal UI takes the session over', () => {
@@ -116,6 +118,35 @@ describe('a harness whose terminal UI takes the session over', () => {
     await expect(w.client.tuiAttach()).rejects.toMatchObject({ code: 'internal', message: expect.stringContaining('the terminal broke') });
     expect(w.rec.takeovers[0]!.ended).toEqual(['attach failed']);
     expect(await w.say('hi', (r) => r.endsWith('hi'))).toBe('headless: hi');
+  });
+
+  it("a takeover whose end throws, or rejects, does not break the daemon's stop: the failure is logged, and the session's lane still closes and the socket goes #RS-8 #LN-9", async () => {
+    for (const endFails of ['throw', 'reject']) {
+      const w = await start({ endFails });
+      await w.client.tuiAttach();
+      const [t] = w.rec.takeovers;
+      t!.connect();
+      await w.gw.stop();
+      expect(t!.ended, endFails).toEqual(['daemon stopping']);
+      // What comes after the ends ran: the lane closed the session it had open on the terminal, the local server closed.
+      expect(t!.closed, endFails).toEqual(['gateway stopping']);
+      expect(existsSync(w.socketPath), endFails).toBe(false);
+      expect(w.logs, endFails).toContain('harness plug: takeover end failed: end broke');
+    }
+  });
+
+  it("a takeover whose end throws is logged, never thrown: a new attach replaces it all the same, and a failed open reports the open's error #LN-9", async () => {
+    const w = await start({ endFails: 'throw' });
+    await w.client.tuiAttach();
+    const again = (await w.client.tuiAttach()) as TuiAttach;
+    expect(again.nativeId).toBe(w.rec.takeovers[0]!.args.nativeId);
+    expect(w.rec.takeovers[0]!.ended).toEqual(['replaced by a new attach']);
+    expect(w.logs).toContain('harness plug: takeover end failed: end broke');
+
+    const f = await start({ endFails: 'throw', failOpen: true });
+    await expect(f.client.tuiAttach()).rejects.toMatchObject({ code: 'internal', message: expect.stringContaining('the terminal broke') });
+    expect(f.rec.takeovers[0]!.ended).toEqual(['attach failed']);
+    expect(f.logs).toContain('harness plug: takeover end failed: end broke');
   });
 });
 
