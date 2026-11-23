@@ -29,7 +29,8 @@ agents-io 提供底层机制。信任、审批、模型选择、任务和记忆�
 | `packages/protocol` | 入站信封、会话事件、命令、通道与 harness 接口、`Policy` 钩子、进程外 JSONL 帧及客户端帧；`schema/` 下有 JSON Schema。 |
 | `packages/testkit` | 事件流与通道一致性检查；`FakeChannel` 和 `FakeHarness`。 |
 | `packages/session` | 带序号的内存或 SQLite 日志、订阅与快照、Lane 的合批、steer、对账与审批处理，以及默认策略、Outbox 和 Compositor。 |
-| `harness/claude-code` | 通过 Claude Agent SDK 驱动 Claude Code。 |
+| `packages/host-mcp` | 给模型的工具：内核的通道中立输出工具（`send_message`、`send_file`、`ask_choice`、`mention`、`reply_to`、`get_channel_context`）和模块的工具组，经 MCP 提供；也是对外 MCP 端点的服务端。 |
+| `harness/claude-code` | 通过 Claude Agent SDK 驱动 Claude Code；`aio tui` 的终端接管和它的 `aio tui-bridge` 也在这里。 |
 | `harness/codex` | 通过 stdio 或 Unix socket 使用 `codex app-server`；宿主重启不会打断进行中的轮次。 |
 | `channel/lark-bot` | 官方飞书/Lark 机器人，支持长连接和流式卡片；可用 [create-lark-bot](https://github.com/Ghost-LZW/create-lark-bot) 创建应用，也可以在控制台开通（`POST /api/bots/lark`，schema 在本包的 `schema/` 下）。 |
 | `channel/mail` | 通过 IMAP 收信、SMTP 发信，以 DKIM/DMARC 作为身份证据。 |

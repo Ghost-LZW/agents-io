@@ -322,7 +322,9 @@ core endpoints; import them and `LARK_BOT_ADMIN_ENDPOINTS` from
 `LarkBotJobs`, `larkEnvNames`, `LarkBotJobsOptions` or `StartOutcome`: they are
 `@agents-io/channel-lark-bot`'s, and `LarkBotJobsOptions` now takes a
 `ProvisionConfig` (the daemon's `ConfigStore` is one), `envRefs` and a plain
-log function. The HTTP API is unchanged on the wire.
+log function. The HTTP API is unchanged on the wire. This package no longer exports
+`runScenarios`, `SCENARIOS` or `e2eConfig` either: the real-platform scenarios (`aio e2e`) are the
+private package `@agents-io/daemon-e2e` (`packages/daemon-e2e`) now, which exports them.
 
 ```jsonc
 "console": {
@@ -656,11 +658,13 @@ ordinary message), the `host.hello` features, and `GET /api/status` `modules`
 (`[{ id, origin, enabled, status? }]`, every registered module). With no module the tool list,
 `/help`, the features and the error texts are byte for byte what they were before.
 
-`KernelContext` gives a module narrow views of the daemon, each one of the gateway's own
-capabilities: `log` (prefixed `module <id>: `), `events` and `head` (a session's log),
+`KernelContext` gives a module views of the daemon, each one of the gateway's own capabilities.
+A module is in-process code the composition root or the embedder registered, as trusted as the
+daemon (INVARIANTS ID-3 boundary 2): the views keep it to the kernel's rules, they are no sandbox
+(`db` is the whole records database, launched sessions' env values included). They are: `log` (prefixed `module <id>: `), `events` and `head` (a session's log),
 `appendNative` (a durable native event in a log of the module's own, such as
 `external:<client>`), `sessions` (`list`, `known`, `agentOf`), `status`, `stopping`, `policy`,
-`records` (values under `module:<id>:`), `db` (the log's database; tables `module_<id>_…`),
+`records` (values under `module:<id>:`), `db` (the log's database, unrestricted; name your tables `module_<id>_…` and leave the host's alone),
 `topics` (`bySession`, `siblings`, `titleSource`, `setAutoTitle`: a generated title, set only
 while the topic's title is still generated and still the one the module read, then the latest
 card edited to carry it; `rotate(sessionKey, turnId, { title, summary, operationId })` and

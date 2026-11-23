@@ -170,14 +170,14 @@ x-work-os 的执行器是"一轮一个无头进程、只通过命令输出、运
 
 不替代的：agent loop、工具语义、记忆与上下文、任务的真相、信任结论、产品界面。
 
-**护城河是这 7 件事的语义（`INVARIANTS.md` 的 102 条承诺），不是适配器的数量。** 适配器是可以买来的：Chat SDK 已经覆盖了一批 IM 平台，ACP 已经覆盖了一批 coding agent。但这些语义，没有哪个标准规定过。
+**护城河是这 7 件事的语义（`INVARIANTS.md` 的 103 条承诺），不是适配器的数量。** 适配器是可以买来的：Chat SDK 已经覆盖了一批 IM 平台，ACP 已经覆盖了一批 coding agent。但这些语义，没有哪个标准规定过。
 
 ### 9.3 怎样成为不耦合业务的通用组件
 
 1. **内核不认识任何具体通道、harness、模型**：由 `scripts/boundaries.mjs` 守住，基线只降（`docs/design/core-slimming/` §6）。内建适配器与第三方走同一条契约。
 2. **内核不发起模型调用、不带产品默认值**：话题标题、预设、陌生人放行、改运行配置的聊天命令，都做成可替换的模块或交还宿主（core-slimming §2 的 host 级）。
 3. **三个面都接标准协议**，这样框架接入时一行代码都不用改：
-   - **南向**：原生适配器接 Claude Code、Codex（最深：插话、对账、重启接管）；**一个 ACP 适配器**接一批支持 ACP 的 coding agent；**一个 AG-UI 客户端适配器**接以 AG-UI 暴露后端的框架；JSONL harness 帧兜底任意程序。
+   - **南向**：原生适配器接 Claude Code、Codex（最深：插话、对账、重启接管）；**一个 ACP 适配器**接一批支持 ACP 的 coding agent；**一个 AG-UI 客户端适配器**接以 AG-UI 暴露后端的框架；JSONL harness 帧兜底任意程序（帧已定义，宿主端还没有实现，core-slimming §3 G9）。
    - **北向**：原生通道（飞书、邮件）、JSONL 桥、**Chat SDK 桥**（复用它的 Slack / Teams / Discord / Telegram / WhatsApp 等适配器）；会话按标准协议对外投影：**AG-UI 服务端**让网页界面订阅任意会话，**ACP 服务端**让编辑器加入会话，MCP 端点（已有）给外部 agent，A2A 服务端（规划）给调用方形态的 agent 通信。
    - **宿主**：`Policy` 钩子和宿主协议，任意语言（HOSTS §1）。
 4. **语义可以离开 TS 验证**：一致性 fixture（core-slimming G8）让其他语言的实现和宿主不跑 TS 也能自检。实现语言的取舍见 core-slimming §8。

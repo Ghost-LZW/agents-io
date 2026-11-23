@@ -109,6 +109,7 @@
 
 - **核心原则**：日志是唯一真相，各端是可升级到全保真的投影；模型只看文本与来源，工具按需开启；承诺写成可检验的不变量；守护进程升级不丢对话与 turn；只做 IO，不做真相。全文见 `docs/ROADMAP.md` §1。
 - **全模态进核心**（owner）：输入输出覆盖文本、图片、文件、音频、视频；实时语音是核心能力，不是通道插件。修订 `docs/design/thin-bridge.md` 的"不统一语音、不进核心"。
+  - **修订（2026-11-23，决定 16）**：live 部分由决定 16 修订：live 的协议、事件与 LN 不变量留在核心，`live_*` 工具、各通道与 harness 的 live 实现是模块（决定 16 "修订决定 12"）。
 - **agent 之间的通信**：对话方（消息）与调用方（任务）两种形态都做，另有发现、观察与控制、因果链与防循环（`docs/ROADMAP.md` §2）。**x-work-os 是协调的真相来源，agents-io 只负责 IO**（owner）：不记任务状态、分工、验收。
 - **宿主的两个面**（owner 认可，2026-10-10）：宿主的业务交互走 agent 的工作区（环境面），agents-io 只承载宿主对 IO 的控制（控制面）。现有宿主协议按此复查，能改成 agent 在工作区里直接调宿主命令的，收窄。见 `docs/ROADMAP.md` §1 第 7 条。
 - **代为审批**（owner）：agent 可以代另一个 agent 的请求作答，作为新的 Resolver 种类提供；与 `onBehalfOf` 一样须显式开启，日志记 `by.via`。
@@ -204,7 +205,7 @@
 
 日期：2026-11-23。owner 全部采纳 `docs/design/core-slimming/README.md` 的推荐（该文 §9）。
 
-- **功能分级**（owner）：按 core-slimming §2 执行。内核不认识任何具体通道、harness、模型；内建适配器与第三方走同一条契约（`use: "module"` / JSONL 桥）。改运行配置的聊天命令（`/model` `/effort` `/agent` `/preset` `/plan` `/bypass` `/compact`）、预设、陌生人放行、模型生成的话题标题归 **host** 级：agents-io 只留钩子，现有实现降为可替换的模块，默认部署仍开启（默认不变）。
+- **功能分级**（owner）：按 core-slimming §2 执行。内核不认识任何具体通道、harness、模型；内建适配器与第三方走同一条契约（`use: "module"` / JSONL 桥）。改运行配置的聊天命令（`/model` `/effort` `/agent` `/preset` `/plan` `/bypass` `/compact`）、预设、陌生人放行、模型生成的话题标题归 **host** 级：agents-io 只留钩子，现有实现降为可替换的模块，默认部署的行为不变（原来开着的照旧开着，陌生人放行照旧缺省关）。
 - **修订决定 12**（owner）："实时语音是核心能力"改为：live 的协议、事件与 LN 不变量留在核心；`live_*` 工具、各通道与 harness 的 live 实现是模块。全模态内容（文本、图片、文件、音频、视频块）仍是核心。
 - **实现语言**（owner）：参考实现继续用 TypeScript（Node 24），不重写。语言中立靠协议、JSON Schema 与一致性 fixture（core-slimming G8）。有宿主要把内核嵌进进程时，再按 core-slimming §8 只移植内核，首选 Rust。
 - **定位**（owner）：POSITIONING §9 生效：agents-io 是各 agent 框架共用的会话 IO 运行时；南向接 harness（原生、ACP、AG-UI、JSONL），北向接通道与投影（原生、JSONL、Chat SDK 桥；AG-UI / ACP / MCP / A2A 投影），宿主经 `Policy` 与宿主协议。

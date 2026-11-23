@@ -485,9 +485,12 @@ export interface KernelDatabase {
 }
 
 /**
- * What a module gets of the kernel: narrow views of the host's core objects, each an existing
- * capability of the host (nothing a built-in feature could not already do). Late-bound: only `id`
- * and `log` work during `setup`; every other member throws until `setup` returned.
+ * What a module gets of the kernel: views of the host's core objects, each an existing capability
+ * of the host (nothing a built-in feature could not already do). A module is in-process code the
+ * composition root (or the embedder) registered, as trusted as the daemon's own (INVARIANTS ID-3
+ * boundary 2): the views keep its untyped code to the kernel's rules (what it may stamp, say or
+ * set), they are no sandbox. `db` is the whole records database. Late-bound: only `id` and `log`
+ * work during `setup`; every other member throws until `setup` returned.
  */
 export interface KernelContext {
   /** The module's id. */
@@ -528,6 +531,10 @@ export interface KernelContext {
   /**
    * The session log's database (the daemon's SQLite file), shared with the host: name tables
    * `module_<id>_…` (dots and dashes as `_`). In memory, lost at stop, when the log is not a SQLite file.
+   * Not a narrowed view: nothing checks the table names, and the host's own tables are there too
+   * (the outbox, the routing records, launched sessions' env values, which are secret: never read,
+   * log or change another's tables). The built-in `strangers` module keeps its older names
+   * (`daemon_stranger_asks`, `daemon_guests`).
    */
   readonly db: KernelDatabase;
   /** Topics of flat conversations. */
