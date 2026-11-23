@@ -30,10 +30,15 @@
 - `pnpm invariants:affected [文件…]`：不给文件时取相对 `main` 的改动。按 INVARIANTS 各条"实现"里写的文件找出受影响的编号，列出每个编号在各层的测试数，打印要跑的 vitest 命令；没有任何编号提到的源文件也列出来（要么它不承担承诺，要么清单漏了一条）。
 - `node scripts/invariants.mjs list [编号…]`：每个编号下的测试。
 
+`scripts/boundaries.mjs` 也只读文本，守核心与模块的边界（`docs/design/core-slimming/` §6）：
+
+- `pnpm boundaries:check`：核心文件新增了不该有的包引用（`import:<包>`），或多了具体模块的名字（`vendor`：标识符里带 lark / codex / claude 等词，字符串等于模块 id）。分类在 `scripts/boundaries.json`，已知违例在 `scripts/boundaries.baseline.json`。计数高于基线就报错，退出码 1。
+- 基线只降不升：修掉违例后跑 `node scripts/boundaries.mjs shrink` 把新计数写进基线。新违例不许加进基线，要在代码里修掉。`report` 按文件列出现有计数。
+
 ## 给改 agents-io 的人和 agent 的规则
 
 1. 改之前：`pnpm invariants:affected <要改的文件>`，读命中的那几节 INVARIANTS。
-2. 改完：总是跑受影响编号的 core 测试（`affected` 打印的命令），再跑 `pnpm test`（core + local，几秒）。
+2. 改完：总是跑受影响编号的 core 测试（`affected` 打印的命令），再跑 `pnpm test`（core + local，几秒）和 `pnpm boundaries:check`。
 3. **core 红了 = 可能打破了一条承诺。** 先读那条不变量。是有意改变承诺的，先改 INVARIANTS（和相关决定），再改测试；不允许只改断言让它变绿。确实是测试写错了的，要能说清为什么。
 4. **local 红了 = 一个细节变了。** 确认是有意改的，就删掉或重写这个测试；它不是信任的来源。
 5. `affected` 命中的编号在 e2e 里有测试，或改动碰了传输与生命周期代码（`packages/daemon/src/gateway.ts`、`channel/jsonl-bridge/src`、`harness/*/src`）：跑 `pnpm test:e2e`。合并到 `main` 前无论如何跑一次。

@@ -2112,9 +2112,10 @@ ${a.summary}` }],
 
   private compose(sessionKey: string, ch: RunningChannel): void {
     const { adapter, tier, account } = ch;
-    const isLark = adapter instanceof LarkBotAdapter;
-    const openDelayMs = ch.source?.openDelayMs ?? (isLark ? 5000 : undefined);
-    const previewDelayMs = ch.source?.previewDelayMs ?? (isLark ? 2000 : undefined);
+    // The channel says how its replies are paced (ChannelCaps.pacing); the entry overrides the delays.
+    const pacing = adapter.caps(account).pacing;
+    const openDelayMs = ch.source?.openDelayMs ?? pacing?.openDelayMs;
+    const previewDelayMs = ch.source?.previewDelayMs ?? pacing?.previewDelayMs;
     const ack = ch.source?.ack;
     const c = new Compositor({
       hub: this.hub,
@@ -2128,11 +2129,10 @@ ${a.summary}` }],
       ...(tier ? { tier } : {}),
       ...(openDelayMs !== undefined ? { openDelayMs } : {}),
       ...(previewDelayMs !== undefined ? { previewDelayMs } : {}),
-      ...(isLark ? { holdAnswerUntilOpen: true } : {}),
-      ...(isLark && (openDelayMs ?? 0) > 0 ? { requireAnswerToOpen: true } : {}),
+      ...(pacing?.holdAnswerUntilOpen ? { holdAnswerUntilOpen: true } : {}),
+      ...(pacing?.requireAnswerToOpen && (openDelayMs ?? 0) > 0 ? { requireAnswerToOpen: true } : {}),
       ...(ack ? { ack: { doneAfterMs: (typeof ack === 'object' ? ack.doneAfterMs : undefined) ?? 60_000 } } : {}),
-      // In Lark, the early process bubble carries progress; keep the reply card free of Stop controls.
-      interruptButton: !isLark,
+      interruptButton: pacing?.interruptButton ?? true,
       // Cards of a topic session carry the topic's title (Lark: the card header).
       title: () => this.topics.bySession(sessionKey)?.title,
       onError: (err) => this.log('warn', `render to ${adapter.id} failed: ${(err as Error).message}`),

@@ -27,6 +27,27 @@ export const ChannelCaps = Type.Object({
   evidence: Type.Array(Evidence),
   /** Can attach a sender identity (`SendOp.as`) to outbound messages and recover it on echo. */
   declaresSender: Type.Boolean(),
+  /**
+   * How replies on this channel are best paced, as the adapter recommends (core-slimming G1:
+   * the gateway reads this instead of knowing the adapter). A channel entry's `openDelayMs` /
+   * `previewDelayMs` override the delays. Read when a session's compositor is made, so a
+   * bridge's pacing applies once its hello has arrived. Absent: the first message opens at
+   * once and carries a Stop control.
+   */
+  pacing: Type.Optional(
+    Type.Object({
+      /** Hold a turn's first message this long (ms); a quick answer then arrives whole. */
+      openDelayMs: Type.Optional(Type.Number()),
+      /** Show the process preview (`previewProgress`) after this delay, before the first message. */
+      previewDelayMs: Type.Optional(Type.Number()),
+      /** Answer text does not open the first message before `openDelayMs`. */
+      holdAnswerUntilOpen: Type.Optional(Type.Boolean()),
+      /** When the delay is above 0 and expires, wait for answer text instead of opening an empty card. */
+      requireAnswerToOpen: Type.Optional(Type.Boolean()),
+      /** A Stop control on the streaming reply (default true); off where the preview carries it. */
+      interruptButton: Type.Optional(Type.Boolean()),
+    }),
+  ),
 });
 export type ChannelCaps = Static<typeof ChannelCaps>;
 

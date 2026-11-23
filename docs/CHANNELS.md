@@ -223,7 +223,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
   - 不显示 diff 和 token 用量。
 - **装饰**：`config.style` 可选 `emoji`（默认，带状态和面板图标）或 `plain`（只用文字，状态由标题颜色表示）。
 - **像人一样回复**（守护进程的飞书通道默认启用，配置见 `channel/lark-bot/README.md` "Reply timing in the daemon"）：
-  - 通道条目上的 `openDelayMs` 默认 5000、`previewDelayMs` 默认 2000：短回复完成后直接发最终消息；5 秒后仍没有答案正文时继续只显示过程预览，正文开始后再开卡片。其他通道不采用这两个默认值；
+  - 通道条目上的 `openDelayMs` 默认 5000、`previewDelayMs` 默认 2000：短回复完成后直接发最终消息；5 秒后仍没有答案正文时继续只显示过程预览，正文开始后再开卡片。这些默认值由飞书适配器在 `ChannelCaps.pacing` 里声明（同时声明回复卡不带停止按钮，停止按钮在思维链气泡上），守护进程不认具体通道；其他通道不声明，就不采用；
   - `config.look: "chat"` 默认启用：卡片以答案为主体，不留空的状态行和页脚；话题标题用蓝色标题栏，只有在等审批、失败、中断时才显示一行状态；
   - `config.cotOn: "tool"`：第一次调用工具时才打开思维链气泡，只思考、直接回答的轮次没有气泡；
   - `config.processByChat`：私聊和群分别设置 `process`，例如群里设 `"off"`。

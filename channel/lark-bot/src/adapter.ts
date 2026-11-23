@@ -244,6 +244,9 @@ export class LarkBotAdapter implements ChannelAdapter {
       defaultTier: 'card',
       evidence: ['platform_signed'],
       declaresSender: true,
+      // The thinking bubble shows progress first; the reply card opens only with an answer,
+      // and carries no Stop control (the bubble has it).
+      pacing: { openDelayMs: 5000, previewDelayMs: 2000, holdAnswerUntilOpen: true, requireAnswerToOpen: true, interruptButton: false },
     };
   }
 

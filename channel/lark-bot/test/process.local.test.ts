@@ -180,6 +180,16 @@ describe('process card: degradation', () => {
     expect(lark.cards.size).toBe(0);
     expect(JSON.parse(lark.messages[0]!.content).body.elements.some((e: any) => e.element_id === 'answer')).toBe(false);
   });
+
+  it('declares its reply pacing in caps, so the daemon need not know it is Lark', () => {
+    expect(make().adapter.caps().pacing).toEqual({
+      openDelayMs: 5000,
+      previewDelayMs: 2000,
+      holdAnswerUntilOpen: true,
+      requireAnswerToOpen: true,
+      interruptButton: false,
+    });
+  });
 });
 
 describe('native thinking bubble (message_cot)', () => {

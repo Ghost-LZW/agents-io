@@ -199,3 +199,13 @@
 - **Codex（S1）与 Claude（S2）桌面模式同时做**（owner）。
 - **陌生人的消息由主人选择放行**（owner）：`policy.strangers: "drop" | "ask"`，默认 `drop`（现状）。`ask` 时，陌生人私聊机器人或在群里 @ 它，主人的私聊里出现一张卡片：允许这一次 / 以后都允许 / 忽略。允许后原消息按原发送者投到该会话（`restricted`，审批找主人）；"以后都允许"把此人记为带 `guest` 标签的持久身份。谁可信由主人决定，agents-io 只提供"问主人"的机制（POSITIONING §2）。
 - **实施（2026-10-13）**：`aio tui`。Codex：终端是同一 app-server thread 的另一个客户端（`HarnessAdapter.nativeClient`），会话仍由 lane 驱动，终端退出不影响会话（LN-8）。Claude Code：终端接管，持有者就是 lane 该实例的适配器（`ClaudeTuiHarness`），输入经终端自己拉起的 bridge 写 inbox，过程与审批经 hooks；终端退出即"离开"，下一轮无头 `--resume` 同一会话（LN-9）。陌生人放行（ID-9）。没有单独的持有者状态机：lane 的"一个 session 一个写者"已经保证 HD-1/HD-2，持有者变化记为 `runtime_restart` 通知与 `session.bound`。
+
+## 决定 16：瘦身；live 的协议留核心、实现做模块；实现语言不换；定位扩展
+
+日期：2026-11-23。owner 全部采纳 `docs/design/core-slimming/README.md` 的推荐（该文 §9）。
+
+- **功能分级**（owner）：按 core-slimming §2 执行。内核不认识任何具体通道、harness、模型；内建适配器与第三方走同一条契约（`use: "module"` / JSONL 桥）。改运行配置的聊天命令（`/model` `/effort` `/agent` `/preset` `/plan` `/bypass` `/compact`）、预设、陌生人放行、模型生成的话题标题归 **host** 级：agents-io 只留钩子，现有实现降为可替换的模块，默认部署仍开启（默认不变）。
+- **修订决定 12**（owner）："实时语音是核心能力"改为：live 的协议、事件与 LN 不变量留在核心；`live_*` 工具、各通道与 harness 的 live 实现是模块。全模态内容（文本、图片、文件、音频、视频块）仍是核心。
+- **实现语言**（owner）：参考实现继续用 TypeScript（Node 24），不重写。语言中立靠协议、JSON Schema 与一致性 fixture（core-slimming G8）。有宿主要把内核嵌进进程时，再按 core-slimming §8 只移植内核，首选 Rust。
+- **定位**（owner）：POSITIONING §9 生效：agents-io 是各 agent 框架共用的会话 IO 运行时；南向接 harness（原生、ACP、AG-UI、JSONL），北向接通道与投影（原生、JSONL、Chat SDK 桥；AG-UI / ACP / MCP / A2A 投影），宿主经 `Policy` 与宿主协议。
+- **守卫**：`pnpm boundaries:check`（core-slimming §6），基线只降不升；新违例在代码里修掉。搬家 PR 只搬代码或抽接口、不改行为；INVARIANTS 不因搬家而改。
