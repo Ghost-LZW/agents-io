@@ -287,12 +287,14 @@ export class Gateway {
   readonly watches: WatchDispatcher;
   /** Inbound media (channels put, harnesses read). */
   readonly blobs: FsBlobStore;
+  /** The blob store as harness adapters get it (`HarnessFactoryInit.blobs`, the built-in ones too): read-only, bound. */
+  readonly harnessBlobs: BlobAccess;
   /** Host output tools, when some agent has `tools` on; mounted over MCP into those agents' harness bindings only. */
   readonly tools: HostTools | undefined;
   private readonly mcp: HostMcpServer | undefined;
   /** The external MCP endpoint (config `externalMcp`), once listening. */
   private externalMcp: { endpoint: ExternalMcp; url: string } | undefined;
-  /** Sends of external clients in flight: who, for the outbound record when they settle. */
+  /** Sends of external clients in flight: who, taken into the in-flight mark (`sendTime`) for the outbound record. */
   private readonly externalSends = new Map<string, ExternalSender>();
   /** The durable host inbound queue (`on: "host"` rules), in the log's database. */
   readonly hostQueue: HostQueue;
@@ -357,6 +359,7 @@ export class Gateway {
     const c = o.config;
     // The default harness is built below and captures its media resolvers now.
     this.blobs = new FsBlobStore(c.blobs);
+    this.harnessBlobs = readOnlyBlobs(this.blobs);
     // The default instance must be usable (e.g. its env refs set); others fail when a turn names them.
     // A module default is checked in `start`, once its module is loaded.
     if (o.harness || o.buildHarness || c.harnesses[c.defaultHarness]?.kind !== 'module') this.harness();
@@ -478,8 +481,8 @@ export class Gateway {
       // DL-1: the outcome, the outbound index and delivery.settled commit together (records share the log's connection).
       atomic: log instanceof SqliteSessionLog && this.records.db === log.db,
       // Which turn sent which platform message (the outbound index), and explain of a side effect by operationId.
-      atSend: (d) => this.provenanceAtSend(d),
-      onSettled: (d, rec, atSend) => this.indexOutbound(d, rec, atSend as OutboundRecord['provenance']),
+      atSend: (d) => this.sendTime(d),
+      onSettled: (d, rec, atSend) => this.indexOutbound(d, rec, atSend as SendTime | undefined),
       // Agent-authored sends carry their hop out-of-band where the channel can (mail X-Agents-IO-Hop).
       causeOf: (d) => this.sendCause(d.sessionKey, d.turnId),
     });
@@ -942,7 +945,7 @@ export class Gateway {
   private build(inst: HarnessInstance): HarnessAdapter {
     const own = this.o.buildHarness?.(inst);
     if (own) return own;
-    if (inst.kind !== 'module') return buildHarness(inst, this.blobs);
+    if (inst.kind !== 'module') return buildHarness(inst, this.harnessBlobs);
     const a = this.moduleAdapters.get(inst.name);
     if (!a) throw new Error(inst.unavailable ? `harness instance ${inst.name} is unavailable: ${inst.unavailable}` : `harness instance ${inst.name}: its module was not loaded`);
     return new InstanceHarness(inst, a);
@@ -967,7 +970,7 @@ export class Gateway {
           if (!c.harnesses[name]) throw new Error(`unknown harness instance ${JSON.stringify(name)} (configured: ${Object.keys(c.harnesses).join(', ')})`);
           return { id: name, probe: () => this.harness(name).probe(), open: (args) => this.harness(name).open(args) };
         },
-        blobs: this.blobs,
+        blobs: this.harnessBlobs,
       }).catch((e: Error) => {
         throw new ConfigError(e.message);
       });
@@ -1558,10 +1561,18 @@ export class Gateway {
   }
 
   /**
-   * Outbox `atSend`: the sending turn's provenance (chain and flags) when the delivery starts.
-   * Taken at send time, not at settle: the lane may be closed by then (a parked topic, a stop)
-   * and a recovered echo must still carry the turn's flags (EX-5, never laundered).
+   * Outbox `atSend`: the sending turn's provenance when the delivery starts, or the external client
+   * that sends it. Taken at send time, not at settle, and kept in the in-flight mark: the lane may be
+   * closed by then (a parked topic, a stop) and a recovered echo must still carry the turn's flags
+   * (EX-5, never laundered); a send settled after a restart still names its client (EX-8).
    */
+  private sendTime(d: { operationId: string; sessionKey: string; turnId?: string }): SendTime | undefined {
+    const provenance = this.provenanceAtSend(d);
+    const external = this.externalSends.get(d.operationId);
+    return provenance || external ? { ...(provenance ? { provenance } : {}), ...(external ? { external } : {}) } : undefined;
+  }
+
+  /** The sending turn's provenance (chain and flags), while its lane is open or just closed. */
   private provenanceAtSend(d: { sessionKey: string; turnId?: string }): OutboundRecord['provenance'] {
     if (d.turnId === undefined) return undefined;
     // A closed lane's turns: what its renderers flush while it closes is still that turn's.
@@ -1573,8 +1584,9 @@ export class Gateway {
    * Outbox `onSettled`: every settled delivery, with the turn and the turn's chain (as at send time) when a turn made it,
    * or the inputs it answers (a system reply). Part of the settlement's transaction (DL-1): an error here fails it.
    */
-  private indexOutbound(d: { sessionKey: string; turnId?: string; inputIds?: string[] }, rec: DeliveryRecord, atSend?: OutboundRecord['provenance']): void {
-    const p = atSend ?? this.provenanceAtSend(d);
+  private indexOutbound(d: { sessionKey: string; turnId?: string; inputIds?: string[] }, rec: DeliveryRecord, atSend?: SendTime): void {
+    const p = atSend?.provenance ?? this.provenanceAtSend(d);
+    const external = atSend?.external ?? this.externalSends.get(rec.operationId);
     const agent = this.agentOfSession(d.sessionKey);
     this.records.putOutbound({
       operationId: rec.operationId,
@@ -1588,7 +1600,7 @@ export class Gateway {
       result: rec.status,
       ...(d.turnId === undefined && d.inputIds?.length ? { inputIds: [...d.inputIds] } : {}),
       ...(p ? { provenance: p } : {}),
-      ...(this.externalSends.has(rec.operationId) ? { external: this.externalSends.get(rec.operationId)! } : {}),
+      ...(external ? { external } : {}),
       at: Date.now(),
     });
   }
@@ -3093,6 +3105,14 @@ export function withAgent(a: HarnessAdapter, agent: AgentConfig, cwd: string | u
   return new InstanceHarness({ ...a.instance, ...(cwd !== undefined ? { cwd } : {}) } as HarnessInstance, a.inner, a.env, agent.instructions ?? a.instructions);
 }
 
+/** What the outbox takes when a delivery starts (`OutboxOptions.atSend`), kept in its in-flight mark (JSON data). */
+interface SendTime {
+  /** The sending turn's provenance (`OutboundRecord.provenance`). */
+  provenance?: OutboundRecord['provenance'];
+  /** The external MCP client that sends it (`OutboundRecord.external`). */
+  external?: ExternalSender;
+}
+
 /** Per-session adapters of a launched session (`Gateway.launchAdapters`). */
 interface LaunchAdapters {
   adapter(name: string): HarnessAdapter;
@@ -3301,14 +3321,39 @@ async function loadHarnessModule(o: {
   } catch (e) {
     throw new Error(`${where}: factory failed: ${(e as Error).message}`);
   }
-  const a = adapter as unknown as Partial<Record<string, unknown>> | null;
-  const bad =
-    !a || typeof a.id !== 'string' || !a.id
-      ? 'id (a non-empty string)'
-      : ((['probe', 'open'] as const).find((k) => typeof a[k] !== 'function') ??
-        (a.sessionEnv === 'own-process' && typeof a.ownProcess !== 'function' ? "sessionEnv ('own-process' needs ownProcess)" : undefined));
+  const bad = badHarnessAdapter(adapter as unknown as Partial<Record<string, unknown>> | null);
   if (bad) throw new Error(`${where}: the factory did not return a HarnessAdapter (bad ${bad})`);
   return adapter;
+}
+
+/**
+ * The first member of a module's adapter that is not what `HarnessAdapter` says, described; none when
+ * all are. A module is untyped code: what the host reads later (the static declarations, the
+ * lifecycle calls) is checked once here, so a wrong shape fails the start (CF-4) instead of a
+ * command or a stop.
+ */
+function badHarnessAdapter(a: Partial<Record<string, unknown>> | null): string | undefined {
+  if (!a || typeof a.id !== 'string' || !a.id) return 'id (a non-empty string)';
+  const required = (['probe', 'open'] as const).find((k) => typeof a[k] !== 'function');
+  if (required) return required;
+  const method = (['detach', 'dispose', 'ownProcess'] as const).find((k) => a[k] !== undefined && typeof a[k] !== 'function');
+  if (method) return `${method} (a function when present)`;
+  const flag = (['adopts', 'ownerProfileSwitch', 'ephemeralOpen'] as const).find((k) => a[k] !== undefined && typeof a[k] !== 'boolean');
+  if (flag) return `${flag} (true or false when present)`;
+  const nonEmpty = (v: unknown) => typeof v === 'string' && v.length > 0;
+  const record = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null;
+  if (a.displayName !== undefined && !nonEmpty(a.displayName)) return 'displayName (a non-empty string when present)';
+  if (a.compact !== undefined && !(record(a.compact) && nonEmpty(a.compact.command))) return 'compact ({ command } with a non-empty string, when present)';
+  if (a.modes !== undefined && !(Array.isArray(a.modes) && a.modes.every((m) => m === 'plan'))) return "modes (an array of 'plan' when present)";
+  const env = a.sessionEnv;
+  if (env !== undefined && env !== 'open' && env !== 'own-process' && !(record(env) && nonEmpty(env.refused))) return "sessionEnv ('open', 'own-process' or { refused } with a non-empty string, when present)";
+  if (env === 'own-process' && typeof a.ownProcess !== 'function') return "sessionEnv ('own-process' needs ownProcess)";
+  return undefined;
+}
+
+/** `store` as `BlobAccess` and nothing more: no writes, and each method works detached from the object. */
+function readOnlyBlobs(store: BlobAccess): BlobAccess {
+  return Object.freeze({ stat: (ref: string) => store.stat(ref), get: (ref: string) => store.get(ref) });
 }
 
 /** What a live's voice is told when the agent gives no instructions (decision 11). */

@@ -64,13 +64,7 @@ describe('open → SDK options', () => {
   });
 });
 
-describe('what the host hands over: instructions, media', () => {
-  it("the agent instructions are appended to Claude Code's preset system prompt, over one options.sdk sets", async () => {
-    const { q } = await setup({ instructions: 'Be brief.' }, { sdk: { systemPrompt: 'replaced' } });
-    expect(q.options.systemPrompt).toEqual({ type: 'preset', preset: 'claude_code', append: 'Be brief.' });
-    expect((await setup({}, { sdk: { systemPrompt: 'replaced' } })).q.options.systemPrompt).toBe('replaced');
-  });
-
+describe('what the host hands over: media (instructions: claude-code.test.ts)', () => {
   it('media inputs resolve against the blob store it is given: an image inline, a file by its path; explicit options win', async () => {
     const bytes = new Uint8Array([1, 2, 3]);
     const blobs: BlobAccess = {

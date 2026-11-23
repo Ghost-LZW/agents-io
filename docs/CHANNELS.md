@@ -60,7 +60,7 @@ harness 事件 ──▶ SessionLog（seq）──▶ Compositor（读全量，�
   例如飞书 `reply=card markdown=basic maxChars=4000 buttons=yes media=image,file,audio`，邮件 `reply=final markdown=none maxChars=100000 buttons=no media=none`。
   档位含义：`card` 是一张边做边更新的卡片（含过程），`final` 是一轮结束后只发最终答案。`media` 只说明通道能发什么，不代表 agent 已经有发送工具。没有回复路由（只记录）的输入不带这一项。
 
-网关有一个按内容寻址的 blob 存储（默认 `<dataDir>/blobs`，目录 0700、文件 0600，单个默认上限 20MB，配置项 `blobs.dir` / `blobs.maxBytes`），所有通道都能往里存附件，引用形如 `sha256:<hex>`。两个内建 harness 都通过它读图片和文件（各自的适配器自己解析），module harness 的工厂也拿得到（`HarnessFactoryInit.blobs`）。
+网关有一个按内容寻址的 blob 存储（默认 `<dataDir>/blobs`，目录 0700、文件 0600，单个默认上限 20MB，配置项 `blobs.dir` / `blobs.maxBytes`），所有通道都能往里存附件，引用形如 `sha256:<hex>`。两个内建 harness 都通过它读图片和文件（各自的适配器自己解析），module harness 的工厂也拿得到（`HarnessFactoryInit.blobs`，只读视图：只有 `stat` / `get`，内建 harness 拿的也是它）。
 
 内容块的转换方式：
 

@@ -109,17 +109,24 @@ see `docs/E2E.md` §0). New:
   `'own-process'` (Codex over stdio) runs the session on the adapter `ownProcess({ env, cwd })`
   returns, disposed when the session's lane closes; `{ refused }` (Codex on a Unix socket:
   "a shared Codex app-server (unix transport)") refuses a launch with env
-  (`launch_unsupported`), a cwd alone is fine. An instance that is unavailable for now (an
-  `env:` reference is not set) answers as it will once it is available; a module one, whose
+  (`launch_unsupported`), a cwd alone is fine. `sessionEnv` governs a launched session's env
+  only: a module harness's opens (also those on an adapter its `ownProcess` returned) always
+  carry the instance's `env` in the open args, with a task run's env over it. An instance that
+  is unavailable for now (an `env:` reference is not set) answers as it will once it is
+  available; a module one, whose
   factory never ran, cannot say, so a launch with env is refused too (`launch_unsupported`,
   saying why it is unavailable). A task run always gets a process of its own
   when the adapter has `ownProcess` (the run's env joins the instance's, under its configured
   config dir). The agent's instructions arrive as `HarnessOpenArgs.instructions` (Claude Code
   appends them to its preset system prompt, Codex sends them as developer instructions); a
   module harness also gets them as `options.developerInstructions` for now. A module's factory
-  gets the daemon's blob store (`init.blobs`: `stat` / `get`), which the built-in adapters
-  resolve media inputs with too (Claude Code's 3.75 MB inline image limit lives in its
-  package); resolvers given in the open options win.
+  gets a read-only view of the daemon's blob store (`init.blobs`: `stat` / `get` and nothing
+  else, each usable detached), which the built-in adapters resolve media inputs with too
+  (Claude Code's 3.75 MB inline image limit lives in its package); resolvers given in the open
+  options win. What the factory returns is checked before the daemon starts: a static
+  declaration or lifecycle member of the wrong type (`modes` that is not an array of `'plan'`,
+  `sessionEnv` that is `null` or an unknown string, `compact` without a `command`, a `detach` that
+  is not a function, …) fails the start, naming the instance and the member.
 - **Live (realtime voice, decision 11)**: a Codex instance with `"live": true` opts
   its app-server connection into Codex's experimental realtime API. Agents on it
   (with `tools`) get `live_join { target, channel?, instructions?, voice? }`,
@@ -476,3 +483,17 @@ aio console-link                                              (one-time console 
 `Gateway.start({ config, … })` starts everything in-process (tests and e2e use
 `harness` / `buildHarness` / `channels` to inject fakes); `LocalClient` speaks both
 client and host frames (`hello`, `runStart`, `runEndedOf`, `inboundRead`, `onRequest('inbound' | 'policy', …)`, …).
+
+What changed for embedders with core-slimming G3:
+
+- `GatewayOptions.buildHarness` is called with each instance as configured, and for a task run
+  with that instance carrying the run's cwd and env. It is no longer called with a rewritten
+  instance (env merged, stdio transport, `CODEX_HOME` as its home) for a launched session with
+  env on a Codex instance: the daemon reads the `sessionEnv` of the adapter `buildHarness`
+  returned for the instance and calls its `ownProcess({ env, cwd })` (`CodexHarness` does the
+  rewrite itself). An adapter that declares nothing (a test fake) takes the session's env in its
+  open args (`'open'`).
+- A `use: "module"` instance whose adapter cannot be built because it is unavailable for now (an
+  `env:` reference in its config is not set, so its factory never ran) refuses a launch with env
+  (`launch_unsupported`, saying why it is unavailable); before, such a launch was accepted and
+  pinned. A cwd alone is fine.

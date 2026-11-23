@@ -80,7 +80,7 @@ export interface ExternalMcpDeps {
   agentOf(key: string): string | undefined;
   /** The routing record of an input (explain). */
   record(e: RouteExplanation & { at: number }): void;
-  /** Remember who sends `operationId` until its delivery settles (the outbound record names them). */
+  /** Remember who sends `operationId` while its delivery runs (the outbound record names them, also when it settles after a restart). */
   sending(operationId: string, by: ExternalSender | undefined): void;
   stopped(): boolean;
   log: LogFn;

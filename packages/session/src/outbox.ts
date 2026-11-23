@@ -38,6 +38,11 @@ export interface InFlightDelivery {
   turnId?: string;
   /** The inputs it answers, when no turn made it (`Delivery.inputIds`): kept for its settlement after a restart. */
   inputIds?: string[];
+  /**
+   * What `OutboxOptions.atSend` took when the delivery started (JSON data, e.g. who sent it), kept
+   * so that a settlement after a restart hands it to `onSettled` too. Absent when it took nothing.
+   */
+  atSend?: unknown;
   /** The attempt that was started (1-based). */
   attempts: number;
   startedAt: number;
@@ -116,14 +121,17 @@ export interface OutboxOptions {
    * index which turn sent which platform message (agent-messaging §4.3.3) and to explain a
    * side effect by its operationId. Errors are ignored, except with `atomic`: there what it
    * writes is part of the settlement, and its error fails the settlement (rolled back, rethrown).
+   * `atSend` is what `OutboxOptions.atSend` took, also for a mark settled later (`recover`).
    */
   onSettled?: (d: Pick<Delivery, 'sessionKey' | 'turnId' | 'inputIds'>, rec: DeliveryRecord, atSend?: unknown) => void;
   /**
    * Taken once when a delivery starts (send time), handed back to `onSettled` as `atSend`:
-   * what the sending turn was then (its provenance), which may be gone by the time the
-   * delivery settles (the lane closed). Errors are ignored.
+   * what the sending turn was then (its provenance), or who sent it, which may be gone by the
+   * time the delivery settles (the lane closed, the process restarted). Kept in the in-flight
+   * mark (`InFlightDelivery.atSend`), so it must be JSON data for a store that persists marks.
+   * Errors are ignored.
    */
-  atSend?: (d: Pick<Delivery, 'sessionKey' | 'turnId'>) => unknown;
+  atSend?: (d: Pick<Delivery, 'operationId' | 'sessionKey' | 'turnId'>) => unknown;
   /** The chain position an agent-authored send (`as` set) carries out-of-band (`SendOp.cause`). */
   causeOf?: (d: Delivery) => SendOp['cause'] | undefined;
 }
@@ -248,6 +256,7 @@ export class Outbox {
         attempts: r.attempts,
         error: failed !== undefined ? `recording its outcome failed in this process (${failed}); not resent` : 'in flight when the previous process stopped; not resent',
       },
+      r.atSend,
     );
     this.unrecorded.delete(r.operationId);
     return rec;
@@ -297,6 +306,7 @@ export class Outbox {
         route: d.route,
         ...(d.turnId !== undefined ? { turnId: d.turnId } : {}),
         ...(d.inputIds?.length ? { inputIds: [...d.inputIds] } : {}),
+        ...(atSend !== undefined ? { atSend } : {}),
         attempts: n,
         startedAt: Date.now(),
       });

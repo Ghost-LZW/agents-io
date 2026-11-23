@@ -16,9 +16,14 @@ export interface HarnessOpenArgs {
   /** Harness-specific options from deployment config. */
   options?: Record<string, unknown>;
   /**
-   * Extra child-process environment for this session (a session launch, decision 7),
-   * over the adapter's own. Never logged or put on argv. Adapters that cannot apply
-   * it per session must not be given it (`HarnessAdapter.sessionEnv`).
+   * Extra child-process environment for this session, over the adapter's own. Never logged or
+   * put on argv. A launched session's env (decision 7) comes here only when the adapter declares
+   * `sessionEnv: 'open'` (the default); otherwise it goes to `ownProcess` or the launch is refused
+   * (`HarnessAdapter.sessionEnv`). A built-in adapter gets nothing else here: its instance's env
+   * and a task run's are part of how the host builds it. A module harness (`HarnessFactory`) runs
+   * in the host's process, so its opens also carry its instance's env here, with a task run's env
+   * (at least `AGENTS_IO_RUN_ID`) over it, whatever `sessionEnv` says, also the opens of an
+   * adapter its `ownProcess` returned: such an `open` takes them.
    */
   env?: Record<string, string>;
   /**
@@ -41,13 +46,17 @@ export interface BlobAccess {
 }
 
 /**
- * How an adapter honours a session's own env (`HarnessOpenArgs.env`, a session launch's):
- * - `'open'`: `open` applies `args.env` to that session's own child (Claude Code).
- * - `'own-process'`: one process serves every session, so `open` refuses an env; such a session
- *   runs on `ownProcess({ env })` instead (Codex over stdio).
+ * How an adapter honours a launched session's own env (decision 7):
+ * - `'open'`: it comes in `HarnessOpenArgs.env`, and `open` applies it to that session's own
+ *   child (Claude Code).
+ * - `'own-process'`: one process serves every session, so a launched session's env never comes
+ *   through `open` (Codex's refuses a non-empty one); such a session runs on `ownProcess({ env })`
+ *   instead (Codex over stdio).
  * - `{ refused }`: neither, e.g. a shared server that outlives the host (Codex over a Unix
  *   socket). A launch with env is refused (`launch_unsupported`: "harness instance <name> is
  *   <refused>; …"); a cwd alone is fine.
+ * Only a launched session's env follows it: a module harness's opens carry its instance's env and
+ * a task run's in `HarnessOpenArgs.env` whatever it declares.
  */
 export type SessionEnvSupport = 'open' | 'own-process' | { readonly refused: string };
 
@@ -231,8 +240,9 @@ export interface HarnessFactoryInit {
   /** Another configured instance's adapter (e.g. a text harness a voice harness hands its delegated turns to). */
   harness(name: string): HarnessAdapter;
   /**
-   * The host's blob store, read-only: what the media blocks of inputs (`ref`) point at. The
-   * built-in adapters resolve images and files with it; absent when the host has none.
+   * The host's blob store, read-only (`stat` and `get`, nothing else; each works detached): what
+   * the media blocks of inputs (`ref`) point at. The built-in adapters resolve images and files
+   * with the same view; absent when the host has none.
    */
   blobs?: BlobAccess;
 }
@@ -247,9 +257,11 @@ export interface HarnessFactoryInit {
  * instance gets them, whether or not a session used it; an adapter returned for several
  * instances gets each call once. Its other static declarations (`displayName`, `compact`,
  * `modes`, `ownerProfileSwitch`, `ephemeralOpen`, `sessionEnv`) and `ownProcess` are read as a
- * built-in adapter's. Its opens carry the instance's env in `args.env` (a task run's over it, and a
- * launched session's unless that went to `ownProcess`) and the agent's instructions in
- * `args.instructions`; during a transition also as `options.developerInstructions`, as before
- * `instructions` existed. `init.blobs` reads the media inputs point at.
+ * built-in adapter's; they and the lifecycle members are checked when the factory returns, and
+ * one of the wrong type fails the start. Its opens, the opens of an adapter its `ownProcess`
+ * returned included, carry the instance's env in `args.env`, a task run's over it, and a launched
+ * session's only with `sessionEnv: 'open'`; and the agent's instructions in `args.instructions`,
+ * during a transition also as `options.developerInstructions`, as before `instructions` existed.
+ * `init.blobs` reads the media inputs point at (`stat` and `get`, nothing else).
  */
 export type HarnessFactory = (init: HarnessFactoryInit) => HarnessAdapter | Promise<HarnessAdapter>;

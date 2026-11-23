@@ -354,6 +354,31 @@ describe('external MCP endpoint: stamping, loop guard, sends, explain', () => {
     expect(d).toMatchObject({ status: 'delivered' });
     expect((w.gw.explain('host:hd1', false) as { value: Record<string, unknown> }).value.external).toBeUndefined();
   });
+
+  it('an external send whose settlement failed still names its client when the next start settles it (who sent it is kept in the in-flight mark) #EX-8 #DL-1', async () => {
+    const { w, url } = await world();
+    // From here on this process's log refuses delivery.settled (a disk error; a crash at this point is the same).
+    const log = w.gw.hub.log;
+    const append = log.append.bind(log);
+    log.append = (key, d) => {
+      if (d.body.t === 'delivery.settled') throw new Error('disk I/O error');
+      return append(key, d);
+    };
+    const ops = await mcp(url, TOKENS.ops, { 'x-agents-io-declared': 'member-7' });
+    const r = await call(ops, 'send_message', { route: 'fake:default:c1', text: 'sent, settlement lost', operation_id: 'op-r' });
+    expect(r.isError).toBe(true);
+    expect(w.chat.sent).toHaveLength(1);
+    expect(w.gw.explain('external:ops:op-r', false)).toMatchObject({ ok: false, code: 'unknown_input' });
+    await w.stop();
+
+    const w2 = await daemon({ dir: w.dir });
+    expect(w2.gw.hub.log.read('external:ops', 0).map((e) => e.body)).toContainEqual(expect.objectContaining({ t: 'delivery.settled', operationId: 'external:ops:op-r', result: 'unknown' }));
+    expect(w2.gw.explain('external:ops:op-r', false)).toMatchObject({
+      ok: true,
+      value: { operationId: 'external:ops:op-r', sessionKey: 'external:ops', inputIds: [], result: 'unknown', external: { client: 'ops', principal: 'external:ops', declared: 'member-7' } },
+    });
+    expect(w2.chat.sent).toHaveLength(0);
+  });
 });
 
 describe('external MCP endpoint end to end', () => {

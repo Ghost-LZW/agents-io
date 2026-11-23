@@ -102,10 +102,10 @@ describe('module channel gateway', () => {
 
 describe('module harness (use: "module")', () => {
   /** Gateway.start with instance `plug` (the default harness) loaded from `module`; no buildHarness, so the gateway loads the module itself. */
-  async function startHarness(module: string) {
+  async function startHarness(module: string, config?: Record<string, unknown>) {
     const dir = tmp('aio-mh-');
     mkdirSync(join(dir, 'work'), { recursive: true });
-    const raw = { dataDir: dir, local: { principal: 'me' }, cwd: join(dir, 'work'), harnesses: { plug: { use: 'module', module } }, defaultHarness: 'plug' };
+    const raw = { dataDir: dir, local: { principal: 'me' }, cwd: join(dir, 'work'), harnesses: { plug: { use: 'module', module, ...(config ? { config } : {}) } }, defaultHarness: 'plug' };
     const base = resolveConfig(raw, { env: {}, baseDir: here, cwd: dir });
     const gw = await Gateway.start({ config: { ...base, socketPath: join(dir, 'run', 'aio.sock') }, logger: () => {}, listen: false });
     cleanups.push(() => gw.stop());
@@ -118,5 +118,39 @@ describe('module harness (use: "module")', () => {
     await expect(startHarness('./fixtures/harness-not-fn.mjs')).rejects.toThrow(/harnesses\.plug \(module .*harness-not-fn\.mjs\): export "createHarness" \(or default\) is not a function/);
     await expect(startHarness('./fixtures/harness-throws.mjs')).rejects.toThrow(/harnesses\.plug \(module .*\): factory failed: boom/);
     await expect(startHarness('./fixtures/harness-bad-shape.mjs')).rejects.toThrow(/harnesses\.plug \(module .*\): the factory did not return a HarnessAdapter \(bad open\)/);
+  });
+
+  it('an adapter whose static declarations or lifecycle members are of the wrong type fails the start, naming the instance and the member; right ones start #CF-4', async () => {
+    const declares = (members: Record<string, unknown>) => startHarness('./fixtures/harness-declares.mjs', { members });
+    const bad = (what: string) => `: the factory did not return a HarnessAdapter (bad ${what})`;
+    const cases: [Record<string, unknown>, string][] = [
+      [{ displayName: 7 }, 'displayName (a non-empty string when present)'],
+      [{ displayName: '' }, 'displayName (a non-empty string when present)'],
+      [{ compact: '/compact' }, 'compact ({ command } with a non-empty string, when present)'],
+      [{ compact: {} }, 'compact ({ command } with a non-empty string, when present)'],
+      [{ modes: { $set: ['plan'] } }, "modes (an array of 'plan' when present)"],
+      [{ modes: 'plan' }, "modes (an array of 'plan' when present)"],
+      [{ modes: ['plan', 'review'] }, "modes (an array of 'plan' when present)"],
+      [{ ownerProfileSwitch: 'yes' }, 'ownerProfileSwitch (true or false when present)'],
+      [{ ephemeralOpen: 1 }, 'ephemeralOpen (true or false when present)'],
+      [{ adopts: 'true' }, 'adopts (true or false when present)'],
+      [{ sessionEnv: null }, "sessionEnv ('open', 'own-process' or { refused } with a non-empty string, when present)"],
+      [{ sessionEnv: 'shared' }, "sessionEnv ('open', 'own-process' or { refused } with a non-empty string, when present)"],
+      [{ sessionEnv: { refused: '' } }, "sessionEnv ('open', 'own-process' or { refused } with a non-empty string, when present)"],
+      [{ sessionEnv: 'own-process' }, "sessionEnv ('own-process' needs ownProcess)"],
+      [{ detach: true }, 'detach (a function when present)'],
+      [{ dispose: {} }, 'dispose (a function when present)'],
+      [{ ownProcess: 'own' }, 'ownProcess (a function when present)'],
+    ];
+    for (const [members, what] of cases) {
+      const start = declares(members);
+      await expect(start, JSON.stringify(members)).rejects.toThrow(/^harnesses\.plug \(module .*harness-declares\.mjs\)/);
+      await expect(start, JSON.stringify(members)).rejects.toThrow(bad(what));
+    }
+    // Right ones (present or not) start, and the daemon reads them as declared.
+    const gw = await declares({ displayName: 'Plug', compact: { command: '/squash' }, modes: ['plan'], ownerProfileSwitch: false, ephemeralOpen: false, adopts: false, sessionEnv: { refused: 'a shared test server' } });
+    const plug = gw.harness('plug');
+    expect([plug.displayName, plug.compact, plug.modes, plug.ownerProfileSwitch, plug.sessionEnv]).toEqual(['Plug', { command: '/squash' }, ['plan'], false, { refused: 'a shared test server' }]);
+    await declares({ modes: [], sessionEnv: 'open' });
   });
 });

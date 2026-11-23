@@ -58,6 +58,16 @@ describe('open → SDK options', () => {
     expect(custom.q.options.systemPrompt).toEqual({ type: 'preset', preset: 'claude_code', append: 'Be brief.' });
   });
 
+  it("the agent's instructions (args.instructions) are appended to Claude Code's preset system prompt, over one options.sdk sets #RN-1 #CT-2", async () => {
+    // What a task run's agent (RN-1) and the agent of a session on another instance (CT-2, /preset) are given.
+    const { q } = await setup({ instructions: 'Be brief.' }, { sdk: { systemPrompt: 'replaced' } });
+    expect(q.options.systemPrompt).toEqual({ type: 'preset', preset: 'claude_code', append: 'Be brief.' });
+    const multi = await setup({ instructions: 'You are the executor.\n' });
+    expect(multi.q.options.systemPrompt).toEqual({ type: 'preset', preset: 'claude_code', append: 'You are the executor.\n' });
+    // Without them the options' own (or Claude Code's preset alone) stays.
+    expect((await setup({}, { sdk: { systemPrompt: 'replaced' } })).q.options.systemPrompt).toBe('replaced');
+  });
+
   it('host MCP token is passed through the env, never in mcpServers (the SDK puts those on the CLI argv) #SE-1', async () => {
     const { q } = await setup({ run, mcp: { url: 'http://h/mcp', token: 'sekrit-token-123' } });
     const o = q.options;

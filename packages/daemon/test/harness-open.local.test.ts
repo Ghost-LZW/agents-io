@@ -67,13 +67,17 @@ async function start(config: Record<string, unknown>) {
 }
 
 describe('module harness: what its factory and opens get', () => {
-  it('the factory gets the blob store: a stored ref stats to its file and reads back; a platform ref is not there', async () => {
+  it('the factory gets the blob store read-only (stat and get, each working detached): a stored ref stats to its file and reads back; a platform ref is not there', async () => {
     const w = await start({});
     const ref = await w.gw.blobs.put(new TextEncoder().encode('hello'), { mime: 'text/plain', name: 'h.txt' });
     const blobs = w.rec.init.blobs!;
-    expect(await blobs.stat(ref)).toMatchObject({ mime: 'text/plain', name: 'h.txt', size: 5, path: expect.stringMatching(/^\//) });
-    expect(new TextDecoder().decode((await blobs.get(ref)).bytes)).toBe('hello');
-    expect(await blobs.stat('lark-file:om_1/k')).toBeUndefined();
+    expect(Object.keys(blobs).sort()).toEqual(['get', 'stat']);
+    expect(Object.isFrozen(blobs)).toBe(true);
+    expect(blobs).not.toHaveProperty('put');
+    const { stat, get } = blobs;
+    expect(await stat(ref)).toMatchObject({ mime: 'text/plain', name: 'h.txt', size: 5, path: expect.stringMatching(/^\//) });
+    expect(new TextDecoder().decode((await get(ref)).bytes)).toBe('hello');
+    expect(await stat('lark-file:om_1/k')).toBeUndefined();
   });
 
   it("an open carries the agent's instructions, and still as options.developerInstructions", async () => {
@@ -166,7 +170,7 @@ describe('module harness: what its factory and opens get', () => {
 });
 
 describe('built-in harness instances', () => {
-  it("get the daemon's blob store and declare how a session env reaches them", async () => {
+  it("get the daemon's blob store as module harnesses do (read-only) and declare how a session env reaches them", async () => {
     const dir = tmp();
     const config = resolveConfig(
       { dataDir: dir, harnesses: { cc: { use: 'claude-code' }, cx: { use: 'codex' }, ux: { use: 'codex', transport: { kind: 'unix', spawn: 'own', stateDir: join(dir, 'ux') } } }, local: { principal: 'me' } },
@@ -175,8 +179,9 @@ describe('built-in harness instances', () => {
     const gw = await Gateway.start({ config: { ...config, socketPath: join(dir, 'run', 'aio.sock') }, logger: () => {} });
     cleanups.push(() => gw.stop());
     const inner = (name: string) => (gw.harness(name) as InstanceHarness).inner as unknown as { sessionEnv: unknown; config?: { blobs?: unknown }; opts?: { blobs?: unknown } };
-    expect(inner('cc').config!.blobs).toBe(gw.blobs);
-    expect(inner('cx').opts!.blobs).toBe(gw.blobs);
+    expect(inner('cc').config!.blobs).toBe(gw.harnessBlobs);
+    expect(inner('cx').opts!.blobs).toBe(gw.harnessBlobs);
+    expect(Object.keys(gw.harnessBlobs).sort()).toEqual(['get', 'stat']);
     expect([inner('cc').sessionEnv, inner('cx').sessionEnv, inner('ux').sessionEnv]).toEqual(['open', 'own-process', { refused: 'a shared Codex app-server (unix transport)' }]);
     // Read through the instance's wrapper, as the gateway reads it.
     expect(gw.harness('ux').sessionEnv).toEqual({ refused: 'a shared Codex app-server (unix transport)' });
