@@ -103,6 +103,36 @@ describe('the default evidence grant is the composition root\'s (channel-stampin
     await until(() => gw2.records.verify('channel:plain/ev-g').found);
     expect(gw2.records.verify('channel:plain/ev-g').records).toEqual([expect.objectContaining({ evidence: 'platform_signed', principal: 'plain:alice' })]);
   });
+
+  it('the keys every entry has are the host\'s: what a module\'s resolve returns for evidence, type or ack, or what its create does to the entry, does not count #ID-3 #ID-4', async () => {
+    // resolve grants itself, renames its type and turns ack on; create grants itself on the entry it got.
+    const resolving = fakeType('resolving', { extra: { resolve: (e: Record<string, unknown>) => ({ ...e, type: 'trusted', evidence: ['platform_signed'], ack: true, mine: 1 }) } });
+    const creating = fakeType('creating');
+    const create = creating.m.create;
+    creating.m = {
+      ...creating.m,
+      create: (entry, init) => {
+        (entry as { evidence?: string[] }).evidence = ['platform_signed'];
+        return create(entry, init);
+      },
+    };
+    const trusted = fakeType('trusted');
+    const registry = new ChannelRegistry([resolving.m, creating.m, trusted.m], { defaultEvidence: { trusted: 'caps' } });
+    const raw = { policy: { owners: ['resolving:alice', 'creating:alice'] }, channels: [{ type: 'resolving' }, { type: 'resolving', account: 'b', evidence: ['device_only'] }, { type: 'creating' }] };
+    const config = resolveConfig(raw, { env: {}, baseDir: '/base', cwd: '/work', channelRegistry: registry });
+    expect(config.channels).toEqual([
+      { type: 'resolving', account: 'default', mine: 1 },
+      { type: 'resolving', account: 'b', evidence: ['device_only'], mine: 1 },
+      { type: 'creating', account: 'default' },
+    ]);
+    const gw = await start(raw.channels, { registry, owners: raw.policy.owners });
+    await resolving.made[0]!.inject(signed('ev-r'));
+    await creating.made[0]!.inject(signed('ev-c'));
+    await until(() => gw.records.verify('channel:resolving/ev-r').found && gw.records.verify('channel:creating/ev-c').found);
+    expect(gw.records.verify('channel:resolving/ev-r').records).toEqual([expect.objectContaining({ evidence: 'none', principal: null })]);
+    expect(gw.records.verify('channel:creating/ev-c').records).toEqual([expect.objectContaining({ evidence: 'none', principal: null })]);
+    expect(gw.config.channels.map((c) => c.evidence)).toEqual([undefined, ['device_only'], undefined]);
+  });
 });
 
 describe('an entry\'s channel id belongs to its type (channel-stamping F4)', () => {

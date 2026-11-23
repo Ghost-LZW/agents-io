@@ -139,7 +139,8 @@ export interface ChannelModule<E = Record<string, unknown>, R = E> {
   /**
    * The entry as its adapter will use it: `"env:NAME"` values substituted (`ctx.substitute`),
    * paths resolved (`ctx.path`), defaults filled; violations reported with `ctx.fail`. The host
-   * keeps the keys it leaves out and sets `account`.
+   * keeps the keys it leaves out and sets `account`; the keys it owns (`type`, `tier`,
+   * `openDelayMs`, `previewDelayMs`, `ack`, `evidence`) stay as written, whatever this returns.
    */
   resolve(entry: E, ctx: ChannelResolveContext): R;
   /** Rules across this type's entries (all of them, in config order), after every entry resolved: `ctx.fail` on the first one broken. */
@@ -156,7 +157,11 @@ export interface ChannelModule<E = Record<string, unknown>, R = E> {
    * the type's one declared id (`ids` with a single id), else unknown.
    */
   idOf?(entry: R): string | undefined;
-  /** The adapter of one entry. Starts nothing: the host's `start` does. A throw fails the daemon's start (or that entry's live apply). */
+  /**
+   * The adapter of one entry (a copy of the resolved entry: changing it changes nothing the host
+   * reads). Starts nothing: the host's `start` does. A throw fails the daemon's start (or that
+   * entry's live apply).
+   */
   create(entry: R & { account: string }, init: ChannelInit): BuiltChannel | Promise<BuiltChannel>;
   /**
    * What the type adds to the host's admin API and console (core-slimming G5): console settings,

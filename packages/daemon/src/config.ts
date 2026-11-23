@@ -169,6 +169,9 @@ const ChannelCommon = {
 
 type ChannelCommonFields = Static<TObject<typeof ChannelCommon>>;
 
+/** The keys of a channel entry the host owns (`type` and `ChannelCommon`): what a type's `resolve` returns for them does not count. */
+const HOST_CHANNEL_KEYS: ReadonlySet<string> = new Set(['type', ...Object.keys(ChannelCommon)]);
+
 /**
  * Channel ids of the built-in adapters, local ends and agent addresses (`agent:<agent>:<sessionKey>`
  * routes, the `agent` identity namespace the daemon stamps, ID-7): no bridge or module channel may use them.
@@ -1526,7 +1529,9 @@ function resolveChannels(entries: readonly ChannelEntry[], env: Record<string, s
     // The file schema admits only registered types.
     const m = registry.get(ch.type)!;
     const ctx: ChannelResolveContext = { index, where: `channels[${index}]`, env, substitute, path, fail };
-    return { ...ch, ...m.resolve(ch, ctx), account: ch.account ?? 'default' } as ResolvedChannel;
+    // The host's keys stay as written (its `evidence` grant above all, ID-3 / ID-4): only the type's own keys come from its module.
+    const own = Object.entries((m.resolve(ch, ctx) ?? {}) as Record<string, unknown>).filter(([k]) => !HOST_CHANNEL_KEYS.has(k));
+    return { ...ch, ...Object.fromEntries(own), account: ch.account ?? 'default' } as ResolvedChannel;
   });
   const vctx: ChannelValidateContext = { reservedIds: registry.reservedIds, fail, warn: (msg) => void warnings.push(msg) };
   for (const m of registry.modules) {

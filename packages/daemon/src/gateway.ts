@@ -2531,7 +2531,8 @@ ${a.summary}` }],
       const m = this.channelRegistry.get(cfg.type);
       if (!m) throw new ConfigError(`channels[${index}]: channel type ${JSON.stringify(cfg.type)} is not registered with the gateway; give Gateway.start the channel registry the config was resolved with`);
       const config = (cfg as { config?: unknown }).config;
-      built = await m.create(cfg, {
+      // A copy: what `create` (or its adapter later) does to the entry never reaches the host's keys read from `source` (`evidence`, `ack`, …).
+      built = await m.create(hostKeysCopied(cfg), {
         index,
         account: cfg.account,
         config,
@@ -3732,6 +3733,15 @@ type BuiltChannel = {
 
 /** Its channel id is settled: anything but a bridge without `id` whose peer has not said hello yet (`BuiltChannel.idKnown`). */
 const idKnown = (b: { idKnown?: () => boolean }): boolean => b.idKnown?.() ?? true;
+
+/** A resolved channel entry for its type's `create`: a copy whose host keys (`evidence`, `ack`, …) are its own, so the module cannot change the entry's. */
+function hostKeysCopied(cfg: ResolvedChannel): ResolvedChannel {
+  return {
+    ...cfg,
+    ...(Array.isArray(cfg.evidence) ? { evidence: [...cfg.evidence] } : {}),
+    ...(cfg.ack !== null && typeof cfg.ack === 'object' ? { ack: { ...cfg.ack } } : {}),
+  };
+}
 
 /** What is wrong with a value `ChannelModule.create` returned, described: not a `BuiltChannel` with a `ChannelAdapter`; none when it is one. */
 function badBuiltChannel(v: unknown): string | undefined {
