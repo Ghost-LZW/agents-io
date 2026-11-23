@@ -1,11 +1,12 @@
-import type { TSchema } from '@sinclair/typebox';
+import type { Static, TSchema } from '@sinclair/typebox';
+import type { AdminSession, AdminStatus } from './admin.js';
 import type { AdminContribution } from './admin-module.js';
 import type { ChannelAdapter, RenderedMessage } from './channel.js';
 import type { ClientCommand } from './client.js';
 import type { ReplyRoute } from './common.js';
-import type { SessionEvent } from './events.js';
+import type { Audience, Level, SessionEvent } from './events.js';
 import type { HarnessAdapter } from './harness.js';
-import type { IdentityEntry, InboundItem, SessionScope } from './host.js';
+import type { ExternalCallout, ExternalCalloutAnswer, ExternalSender, IdentityEntry, InboundItem, RouteExplanation, SessionScope } from './host.js';
 import type { InboundEnvelope, InputRecord, Origin } from './inbound.js';
 import type { IdentifyArgs, Identity, Policy, TurnContext, TurnDraft } from './policy.js';
 import type { Resolver } from './requests.js';
@@ -23,11 +24,11 @@ import type { Topic } from './topic.js';
  * (`ChannelModule`, `HarnessModule`).
  *
  * In progress: the daemon reads the manifest (`id`, `kind`, `needs`, `config`, `features`,
- * `mcpTools`, `commands`, `setup`) and, of the instance, `tools`, `commands`, `status`, `start`
- * and `stop`. `admin`, `hooks` and `localFrames` are the contract the features that move into
- * modules next need (G6 steps 1-6); until the daemon serves one, a module that sets it fails to
- * register (`admin`) or to set up (`hooks.<name>`, `localFrames`), naming it, rather than being
- * silently ignored.
+ * `mcpTools`, `commands`, `setup`) and, of the instance, `tools`, `commands`, `features`,
+ * `status`, `start` and `stop`. `admin`, `hooks` and `localFrames` are the contract the features
+ * that move into modules next need (G6 steps 2-6); until the daemon serves one, a module that sets
+ * it fails to register (`admin`) or to set up (`hooks.<name>`, `localFrames`), naming it, rather
+ * than being silently ignored. The first built-in module is the external MCP endpoint (step 1).
  */
 
 /** Where a registered module comes from: shipped with the host (`builtin`), or someone else's (`module`). */
@@ -51,6 +52,12 @@ export interface ModuleResolveContext {
   substitute(v: unknown, where: string): unknown;
   /** A path from the config: `~` is the home directory, a relative one is relative to the config file. */
   path(p: string): string;
+  /**
+   * A value elsewhere in the config file, at a dotted path, as written (a copy; undefined when it
+   * is not set): for a rule across sections (an external MCP client's principal is none of
+   * `policy.owners`). The file schema has checked it. Never put a value in a message.
+   */
+  valueAt(dotted: string): unknown;
   /** Fail the config with this message. Messages name keys and variables, never values. */
   fail(msg: string): never;
 }
@@ -70,11 +77,12 @@ export interface ModuleConfig<C = unknown> {
   readonly schema: Readonly<Record<string, TSchema>>;
   /**
    * Where the settings were before they were the module's, as dotted paths of the config file
-   * (`policy.strangers`, `externalMcp`): read when the section is absent, as valued there (the file
-   * schema checks them where they are). The first that is set decides whether the module is on:
-   * `aliasEnabled` says, when the module has it; without it, an object with `enabled: false`
-   * (`externalMcp: { enabled: false }`) is off, as a section is, and any other value is on. A
-   * path is no other module's section or alias.
+   * (`policy.strangers`): read when the section is absent, as valued there (the file schema checks
+   * them where they are). The first that is set decides whether the module is on: `aliasEnabled`
+   * says, when the module has it; without it, an object with `enabled: false` is off, as a section
+   * is, and any other value is on. A path is no other module's section or alias. (A module whose
+   * settings keep their old top-level key takes it as its `section`: the external MCP endpoint's
+   * `externalMcp`.)
    */
   readonly aliases?: readonly string[];
   /**
@@ -214,7 +222,13 @@ export interface ModuleInstance {
   commands?: Readonly<Record<string, ModuleCommandHandler>>;
   hooks?: ModuleHooks;
   localFrames?: Readonly<Record<string, ModuleFrameHandler>>;
-  /** What the host's status (`GET /api/status` `modules[]`) shows of it; plain JSON. */
+  /**
+   * Which of the manifest's `features` it advertises now (default: all of them while it runs): for
+   * a module that runs without what a feature promises (an endpoint that could not listen: logged,
+   * not fatal). Names that are not the manifest's are ignored.
+   */
+  features?(): readonly string[];
+  /** What the host's status (`GET /api/status` `modules[]`) shows of it; plain JSON (undefined: nothing). */
   status?(): unknown;
   /** After the host's channels and local socket run; throwing fails the start. */
   start?(): Promise<void>;
@@ -265,6 +279,19 @@ export interface KernelSendResult {
   error?: string;
 }
 
+/** A send through the kernel's outbox that has settled: how it ended, and the route it went to. */
+export interface KernelSettledSend extends KernelSendResult {
+  route: ReplyRoute;
+}
+
+/** What a lane answered an input a module gave it (`KernelContext.lanes.input`). */
+export type KernelInputResult =
+  | { ok: true; disposition?: 'new_turn' | 'steer' | 'queued' | 'observe_only' | 'duplicate' }
+  | { ok: false; reason: string };
+
+/** What the host's `external` hook is asked (`ExternalCallout.args`). */
+export type ExternalCalloutArgs = Static<typeof ExternalCallout>['args'];
+
 /** A prepared SQL statement (node:sqlite's `StatementSync` is one). */
 export interface KernelStatement {
   run(...params: unknown[]): unknown;
@@ -290,6 +317,27 @@ export interface KernelContext {
   log(level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown): void;
   /** A session's log from `fromSeq` (default 0), in seq order (the hub). */
   events(sessionKey: string, fromSeq?: number): SessionEvent[];
+  /** The seq of a session's last logged event (0: none yet). */
+  head(sessionKey: string): number;
+  /**
+   * Append a durable native event (`body: { t: "native", name }`, `native` its payload) to a log of
+   * the module's own: what it did that no session's log records (the external MCP endpoint's
+   * sends, in `external:<client>`). Only native events: every other kind is the kernel's to write.
+   */
+  appendNative(logKey: string, e: { name: string; native: unknown; level: Level; audience: Audience; visibility: SessionEvent['visibility'] }): void;
+  /** The daemon's sessions. */
+  readonly sessions: {
+    /** As `GET /api/sessions` lists them. */
+    list(): AdminSession[];
+    /** One this daemon has run or registered: its log, a lane, a pinned agent or launch. */
+    known(sessionKey: string): boolean;
+    /** The agent a session runs: its lane's, else the one recorded for it. */
+    agentOf(sessionKey: string): string | undefined;
+  };
+  /** The daemon's status, as `GET /api/status` shows it. */
+  status(): AdminStatus;
+  /** The daemon is stopping: start no new work (the module's `stop` comes next). */
+  stopping(): boolean;
   /** The deployment's policy as lanes see it (a connected host's hooks over the local ones). */
   readonly policy: Policy;
   /** Small values of the module's own, kept across restarts (the host's records, under `module:<id>:`). */
@@ -320,6 +368,8 @@ export interface KernelContext {
     newTopic(agent: string, conversation: string, title?: string): string;
     /** The agent a flat conversation was switched to (`/agent`), if any. */
     conversationAgent(conversation: string): string | undefined;
+    /** Record how an input the module gives a lane itself (`lanes.input`) was placed: its routing record, what `explain <inputId>` shows. */
+    record(e: RouteExplanation & { at: number }): void;
   };
   /** Sessions' lanes. */
   readonly lanes: {
@@ -329,14 +379,38 @@ export interface KernelContext {
     open(sessionKey: string, agent?: string): Promise<void>;
     /** A client command (input, interrupt, resolve, …) to a session, as from `origin` (the policy decides as for any client). */
     command(cmd: ClientCommand, origin: Origin): Promise<KernelOutcome>;
+    /**
+     * Give a session's lane an input the module stamped itself (opening the lane when it is not
+     * open): a peer's (`origin.kind: "peer"`; any other kind throws), with its own cause. The lane
+     * decides as for any input (its loop guard may keep it as context: `observe_only`). Throws an
+     * error with a `code` when the session cannot open (its agent is gone).
+     */
+    input(sessionKey: string, input: InputRecord, mode?: 'queue' | 'steer' | 'interrupt'): Promise<KernelInputResult>;
   };
   /** The running adapter that sends to a route (its channel and account), if any. */
   channelFor(route: { channel: string; account: string }): ChannelAdapter | undefined;
   /**
+   * Where a send to `route` goes out: the route with the account of the running channel that sends
+   * it (a channel id with a single entry takes a route naming another account, as a host's
+   * `deliver` does), or why no running channel sends it (`message`: what is configured and what runs).
+   */
+  resolveRoute(route: ReplyRoute): { ok: true; route: ReplyRoute } | { ok: false; message: string };
+  /**
    * Send a message on a route through the outbox: once per `operationId` (also across restarts),
    * settled in `sessionKey`'s log. Undefined when no running channel sends to the route.
+   * `external`: the client outside the daemon it sends for; the outbound record and `explain`
+   * name it, also when the send settles after a restart (EX-8).
    */
-  send(route: ReplyRoute, msg: RenderedMessage, a: { operationId: string; sessionKey: string; turnId?: string }): Promise<KernelSendResult | undefined>;
+  send(route: ReplyRoute, msg: RenderedMessage, a: { operationId: string; sessionKey: string; turnId?: string; external?: ExternalSender }): Promise<KernelSendResult | undefined>;
+  /** A send through the outbox by `operationId`, once it has settled (also before a restart). */
+  settled(operationId: string): KernelSettledSend | undefined;
+  /**
+   * The outbound check of a send that is no turn's own reply (DL-6; `from`: who asks, as a
+   * one-input turn of the module's own log): a host that declared `outbound` decides, and while it
+   * is away nothing goes; else the embedder's `Policy.outbound`; else it is allowed (the module's
+   * own bounds, checked before, are the local allowance).
+   */
+  outbound(from: TurnContext, to: ReplyRoute): Promise<'allow' | 'deny'>;
   /** The owner's own chat with the deployment (no reply target), while known. */
   ownerRoute(): ReplyRoute | null;
   /**
@@ -352,5 +426,11 @@ export interface KernelContext {
     connected(): boolean;
     /** It answers this policy callout (`route`, `resolve`, `review`, `outbound`, `contact`, `external`). */
     answers(hook: string): boolean;
+    /** The host that last connected declaring `hook`, while it is not answering it: what that hook decides is denied until it is back. */
+    heldBy(hook: 'outbound' | 'external'): string | undefined;
+    /** Ask the host's `external` hook (while it `answers('external')`); throws when no valid answer comes in time. */
+    external(args: ExternalCalloutArgs): Promise<ExternalCalloutAnswer>;
+    /** Whether `token` is the host token (a module never gets the token itself). */
+    isToken(token: string): boolean;
   };
 }

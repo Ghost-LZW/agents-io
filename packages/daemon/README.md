@@ -425,6 +425,11 @@ host side: `docs/HOSTS.md` §4.2.
   (operationId `external:<name>:<operation_id>`, sent at most once) and
   `aio explain <operationId>` names the client.
 - A host whose hello lists the `external` callout decides every write (fail closed).
+- It is a built-in feature module (id `external-mcp`, `src/external-mcp.ts`, registered last in
+  `bundle.ts`: it starts after everything else and stops first). `host.hello` lists `external.mcp`
+  while it listens (after the kernel's features); `callouts.external` is always listed.
+  `GET /api/status` shows `externalMcp: { url, clients }` while it listens, and its `modules` entry.
+  A bad client token or token file fails the start; a port that is taken is logged, not fatal.
 
 ## Topics (decision 6)
 
@@ -513,43 +518,52 @@ aio console-link                                              (one-time console 
 
 A feature of the daemon can be a module: a `ModuleManifest` (`@agents-io/protocol`,
 `module.ts`) registered in a `ModuleRegistry` by the composition root (`bundle.ts`
-`builtinModules`, origin `builtin`; none is registered yet, so a deployment runs exactly the
-kernel). A third party's module has the same shape (origin `module`). The manifest says, without
-running anything:
+`builtinModules`, origin `builtin`; so far the external MCP endpoint, `external-mcp`). A third
+party's module has the same shape (origin `module`). The manifest says, without running anything:
 
 - `id` (`tools.watch`), `kind: 'feature'`, `needs` (`module:<id>`: another registered module,
   on whenever this one is; `kernel:<capability>`: a member of `KernelContext`);
 - `config`: its section of the config file, a top-level key holding the module's own keys
   (`schema`) and `enabled`, which the daemon adds and closes. Present, the module is on unless
   `enabled: false`; absent, the first of its `aliases` (older dotted paths such as
-  `policy.strangers`, `externalMcp`) that is set decides: the module's `aliasEnabled(value, alias)`
-  says on or off (`policy.strangers: "drop"` is off), or, without one, an object with
-  `enabled: false` is off (`externalMcp: { enabled: false }`, as a section) and any other value
-  is on; with neither, `defaultEnabled`. `resolve(raw, ctx)` turns the value (an alias's as it is
+  `policy.strangers`) that is set decides: the module's `aliasEnabled(value, alias)` says on or
+  off (`policy.strangers: "drop"` is off), or, without one, an object with `enabled: false` is
+  off (as a section) and any other value is on; with neither, `defaultEnabled`. (The external MCP
+  endpoint kept its key: its section is `externalMcp`.) `resolve(raw, ctx)` turns the value (an alias's as it is
   there) into the module's settings (`ctx` gives `where`, `alias`, `env`, `substitute`, `path`,
-  `fail`). Without the module registered its section is an unknown key, as any other;
+  `valueAt` (a copy of another value of the file, `policy.owners`), `fail`). The settings resolve
+  after the rest of the config. Without the module registered its section is an unknown key, as
+  any other; the sections come before `local` in the file schema;
 - `features` (`host.hello` features, advertised after the kernel's while the module runs),
   `mcpTools` (model tools: name, description, a JSON Schema object `input`, `readOnly`,
   `needsTurn`), `commands` (chat commands: name, `/help` line, `ownerOnly`, default true);
 - `setup(kernel, config)`, which returns the `ModuleInstance`: a handler per tool and per
-  command, `status()`, `start()`, `stop()`.
+  command, `features()` (which of its features it advertises now; default all while it runs),
+  `status()`, `start()`, `stop()`.
 
 The registry checks every manifest and what they claim together (ids; config sections and
-aliases; tools, commands and features are each one module's and never the kernel's). The
+aliases; tools, commands and features are each one module's and never the kernel's). Its option
+`fields` keeps a module's settings and status where they were before it was a module
+(`bundle.ts`: `{ 'external-mcp': { config: 'externalMcp', status: 'externalMcp' } }`):
+`Config.<config>` is the same object as its settings in `Config.modules` (deprecated, one
+release; given another value or removed before `Gateway.start`, it still decides), and
+`GET /api/status` has `<status>` holding what its `status()` returns while it runs. The
 lifecycle has five steps:
 
 1. **resolve** in `resolveConfig` / `loadConfig`: `Config.modules` lists every registered module
-   on or off with its settings (absent while the registry is empty). A module that is on and
+   on or off with its settings (absent when the registry is empty). A module that is on and
    needs one that is off is a config error.
 2. **setup** in `Gateway.start`, before the gateway builds its ingress: every module that is on
    builds its instance; what it returns must match its manifest (a handler for exactly its tools
    and commands). A `setup` that throws or returns something else fails the start with a
    `ConfigError` naming the module. The `KernelContext` is late-bound: only `id` and `log` work
    during `setup`.
-3. **start** after the channels, the local socket and the console run (before the external MCP
-   endpoint). One that throws fails the start; those started before it are stopped.
-4. **stop** first when the daemon stops (after the external MCP endpoint closes), in reverse
-   order, each bounded (2 s); failures are logged.
+3. **start** after the channels, the local socket and the console run, in registration order.
+   One that throws fails the start; those started before it are stopped. The error names the
+   module (`module <id>: start failed: …`), unless it is a `ConfigError` or `TokenError`: those
+   name the setting themselves and are thrown as they are (`aio serve` exits 2).
+4. **stop** first when the daemon stops, in reverse order, each bounded (2 s); failures are
+   logged.
 5. A change to a module's section takes effect at the next start: the console answers
    `applied: "restart"`.
 
@@ -563,18 +577,24 @@ off is an ordinary message), the `host.hello` features, and `GET /api/status` `m
 `/help`, the features and the error texts are byte for byte what they were before.
 
 `KernelContext` gives a module narrow views of the daemon, each one of the gateway's own
-capabilities: `log` (prefixed `module <id>: `), `events` (a session's log), `policy`, `records`
-(values under `module:<id>:`), `db` (the log's database; tables `module_<id>_…`), `topics`,
-`router` (`identify`, its own `setExtraIdentities`, `newTopic`, `conversationAgent`), `lanes`
-(`has`, `open`, `command`), `channelFor`, `send` (through the outbox), `ownerRoute`,
-`redispatch`, `explain` and `host` (`connected`, `answers`).
+capabilities: `log` (prefixed `module <id>: `), `events` and `head` (a session's log),
+`appendNative` (a durable native event in a log of the module's own, such as
+`external:<client>`), `sessions` (`list`, `known`, `agentOf`), `status`, `stopping`, `policy`,
+`records` (values under `module:<id>:`), `db` (the log's database; tables `module_<id>_…`),
+`topics`, `router` (`identify`, its own `setExtraIdentities`, `newTopic`, `conversationAgent`,
+`record`: an input's routing record), `lanes` (`has`, `open`, `command`, `input`: a peer's input
+the module stamped, any other origin kind is refused), `channelFor`, `resolveRoute`, `send`
+(through the outbox; `external` names the client outside the daemon it sends for, kept in the
+in-flight mark, EX-8), `settled`, `outbound` (the outbound check of a send that is no turn's
+reply, DL-6), `ownerRoute`, `redispatch`, `explain` and `host` (`connected`, `answers`, `heldBy`,
+`external`: the `external` callout, `isToken`: a module never gets the host token).
 
 Not served yet: `ModuleManifest.admin` (registering a module with it fails), and of the
 instance `hooks` (`onUndispatched`, `onAction`, `onTurnCompleted`, `onTopicChanged`, `resolver`,
 `planRun`, `harnessFor`, `inputHint`, `statusLines`, `identities`) and `localFrames` (setting one
 fails the setup, naming it). They are the seams the features that move into modules next need
-(external MCP, topic titles, the watch / topic / live tools, strangers, owner commands and
-presets, the Claude Code terminal); each is served with the move that needs it. A module
+(topic titles, the watch / topic / live tools, strangers, owner commands and presets, the Claude
+Code terminal); each is served with the move that needs it. A module
 section's strings are redacted by the console's general rule (a secret-looking key); `x-credential`
 marks in a module's schema are not read yet.
 
@@ -709,3 +729,22 @@ What changed for embedders with core-slimming G6 (feature modules):
 - `GET /api/status` has `modules` (an empty array here). Nothing else changes: the config file, the
   tools a harness is offered, `/help`, the `host.hello` features and every error text are as
   before.
+
+What changed for embedders with core-slimming G6 step 1 (the external MCP endpoint is a module):
+
+- `builtinModules` registers `external-mcp` (`externalMcpModule`, `src/external-mcp.ts`), so
+  `Config.modules` is always there from `resolveConfig` / `loadConfig` (give them and
+  `Gateway.start` the same `moduleRegistry`). A config without `modules` at all (built by hand)
+  still starts: the endpoint follows `Config.externalMcp`, as before. `ConfigFile` includes the built-in modules' sections
+  (`externalMcp`, before `local` as always); `configFileSchema(…, modules)` over another registry
+  has only that registry's. `ExternalMcpConfig`, `ExternalMcpClient` and
+  `DEFAULT_EXTERNAL_MCP_PORT` are exported from `bundle.ts` now (the same names from the package);
+  `Config.externalMcp` is deprecated (one release). `HostServiceDeps.externalMcp` is gone.
+- New: `ModuleInstance.features()`, `ModuleResolveContext.valueAt`, `ModuleRegistryOptions.fields`
+  (`ModuleFields`), `ModuleHost.report()`, the `KernelContext` members above (`head`,
+  `appendNative`, `sessions`, `status`, `stopping`, `router.record`, `lanes.input`, `resolveRoute`,
+  `send`'s `external`, `settled`, `outbound`, `host.heldBy`, `host.external`, `host.isToken`).
+- The config file, the defaults and every error text are as before. With the endpoint on,
+  `host.hello` lists `external.mcp` after the kernel's features (it was between
+  `callouts.external` and `session.compact`); `GET /api/status` `modules` lists `external-mcp`;
+  the endpoint's log lines carry the `module external-mcp: ` prefix.

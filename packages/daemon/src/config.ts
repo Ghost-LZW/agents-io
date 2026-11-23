@@ -15,19 +15,20 @@ import {
   type HarnessChildSecrets,
   type HarnessModule,
   type HarnessResolveContext,
+  type ModuleManifest,
   type Principal,
   type RunSpec,
   type WatchSource,
 } from '@agents-io/protocol';
-import { DEFAULT_BLOB_MAX_BYTES, OWNER_LABEL, Router, RouterError, checkIdentities, ownerIdentities, ownersTable, type AgentContactRule, type AgentSpec, type LoopGuardOptions } from '@agents-io/session';
-import { builtinChannels, builtinHarnesses, builtinModules, type BuiltinChannelEntry, type BuiltinChannelSettings } from './bundle.js';
+import { DEFAULT_BLOB_MAX_BYTES, Router, RouterError, checkIdentities, ownerIdentities, ownersTable, type AgentContactRule, type AgentSpec, type LoopGuardOptions } from '@agents-io/session';
+import { builtinChannels, builtinHarnesses, builtinModules, type BuiltinChannelEntry, type BuiltinChannelSettings, type BuiltinModuleSections, type ExternalMcpConfig } from './bundle.js';
 import type { ChannelRegistry } from './channel-registry.js';
 import { ConfigError } from './config-error.js';
 import { loadEnvFile } from './env-file.js';
 import type { HarnessRegistry } from './harness-registry.js';
 import { resolveModuleFile } from './module-loader.js';
 import type { ModuleRegistry, ResolvedModule } from './modules.js';
-import { TOOL_NAMES, parseScope, type ExternalScopes } from '@agents-io/host-mcp';
+import { TOOL_NAMES } from '@agents-io/host-mcp';
 
 /*
  * aio.config.json: what runs. Secrets never go in it: they come from the
@@ -330,11 +331,10 @@ const AgentEntry = Type.Object(
 );
 
 /**
- * The config file's schema over the built-in harness kinds and channel types, without module
- * sections (`configFileSchema` gives it over other registries', and adds the registered modules'
- * sections; the built-in module registry has none yet, so its schema is this one).
+ * The config file's own keys (the kernel's) over the built-in harness kinds and channel types:
+ * `ConfigFile` without the modules' sections (`configFileSchema` adds a registry's).
  */
-export const ConfigFile = Type.Object(
+const KernelFile = Type.Object(
   {
     /** State directory (default ~/.agents-io/aio). Relative paths are relative to the config file. */
     dataDir: Type.Optional(Type.String()),
@@ -494,59 +494,6 @@ export const ConfigFile = Type.Object(
      * The token is still copied to `<socket>.token` for the CLI.
      */
     host: Type.Optional(Type.Object({ tokenFile: Type.Optional(Type.String()) }, Closed)),
-    /**
-     * The external MCP endpoint (docs/design/external-mcp): agents outside this daemon (a
-     * Claude Code or Codex on the owner's machine, a host's proxy) read sessions and send
-     * through it, each as its own client. Off unless this section is present (and
-     * `enabled` is not false). Loopback only. Every client has its own token (`token:
-     * "env:NAME"`, or `tokenFile`: read, or generated 0600 like `host.tokenFile`) and the
-     * scopes it may use; nothing else is allowed (`read`, `read:<session pattern>`,
-     * `send:<route pattern>`, `input:<session pattern>`; `*` matches any run of characters).
-     */
-    externalMcp: Type.Optional(
-      Type.Object(
-        {
-          enabled: Type.Optional(Type.Boolean()),
-          /** `host:port` (default `127.0.0.1:7465`; port 0: any free port). Only loopback addresses. */
-          listen: Type.Optional(Type.String()),
-          clients: Type.Record(
-            Type.String(),
-            Type.Object(
-              {
-                /** `env:NAME`: the variable holding the token (never a literal). */
-                token: Type.Optional(Type.String()),
-                /** A token file (relative to the config file): read when it exists, else generated (0600). */
-                tokenFile: Type.Optional(Type.String()),
-                scopes: Type.Array(Type.String()),
-                /** The principal it acts as (default `external:<name>`); always `external:…`, never a person. */
-                principal: Type.Optional(Type.String()),
-                /** Extra principal labels (`external` is always there; `owner` is refused). */
-                labels: Type.Optional(Type.Array(Type.String())),
-                /** It may say whom it acts for (`X-Agents-IO-Declared` header), recorded as `origin.declared`. */
-                declare: Type.Optional(Type.Boolean()),
-              },
-              Closed,
-            ),
-          ),
-          limits: Type.Optional(
-            Type.Object(
-              {
-                /** Largest request body (default 256 KiB). */
-                maxBodyBytes: Type.Optional(Type.Integer({ minimum: 1024 })),
-                /** Longest `text` of a send or an input (default 16000 characters). */
-                maxTextChars: Type.Optional(Type.Integer({ minimum: 1 })),
-                /** Requests per client per minute (default 120); more answer 429. */
-                requestsPerMinute: Type.Optional(Type.Integer({ minimum: 1 })),
-                /** Sends and inputs per client per minute (default 20). */
-                writesPerMinute: Type.Optional(Type.Integer({ minimum: 1 })),
-              },
-              Closed,
-            ),
-          ),
-        },
-        Closed,
-      ),
-    ),
     /** Who local socket clients are. */
     local: Type.Optional(
       Type.Object(
@@ -563,7 +510,9 @@ export const ConfigFile = Type.Object(
   },
   Closed,
 );
-export type ConfigFile = Static<typeof ConfigFile>;
+
+/** The config file as written, over the built-in harness kinds, channel types and modules. */
+export type ConfigFile = Static<typeof KernelFile> & BuiltinModuleSections;
 
 const fileSchemas = new WeakMap<HarnessRegistry, WeakMap<ChannelRegistry, WeakMap<ModuleRegistry, TObject>>>();
 
@@ -576,7 +525,7 @@ function moduleSections(modules: ModuleRegistry): Record<string, TSchema> {
   for (const { manifest: m } of modules.modules) {
     if (!m.config) continue;
     const key = m.config.section;
-    if (Object.hasOwn(ConfigFile.properties, key)) throw new Error(`module ${m.id}: config section ${JSON.stringify(key)} is one of the config file's own keys`);
+    if (Object.hasOwn(KernelFile.properties, key)) throw new Error(`module ${m.id}: config section ${JSON.stringify(key)} is one of the config file's own keys`);
     out[key] = Type.Optional(Type.Object({ enabled: Type.Optional(Type.Boolean()), ...m.config.schema }, Closed));
   }
   return out;
@@ -586,24 +535,27 @@ function moduleSections(modules: ModuleRegistry): Record<string, TSchema> {
  * The config file's schema over a registry's harness kinds (`harnesses.<name>.use`, the older
  * `harness` block), a registry's channel types (`channels[].type` and the settings they add to
  * `console`; default the built-in ones) and a registry's modules (their config sections; default
- * the built-in ones); the rest is `ConfigFile`'s.
+ * the built-in ones); the rest is the kernel's own keys. The modules' sections come before `local`,
+ * where `externalMcp` was before it was a module, so a file's schema errors come in the order they
+ * always did. Built once per set of registries (`ConfigFile` is the built-in ones').
  */
 export function configFileSchema(registry: HarnessRegistry, channels: ChannelRegistry = builtinChannels, modules: ModuleRegistry = builtinModules): TObject {
-  if (registry === builtinHarnesses && channels === builtinChannels && !modules.size) return ConfigFile;
   let byChannels = fileSchemas.get(registry);
   if (!byChannels) fileSchemas.set(registry, (byChannels = new WeakMap()));
   let byModules = byChannels.get(channels);
   if (!byModules) byChannels.set(channels, (byModules = new WeakMap()));
   let s = byModules.get(modules);
   if (!s) {
+    const { local, ...head } = KernelFile.properties;
     s = Type.Object(
       {
-        ...ConfigFile.properties,
+        ...head,
         harnesses: harnessesSchema(registry),
         harness: legacyBlockSchema(registry),
         channels: Type.Optional(Type.Array(channelEntrySchema(channels))),
         console: Type.Optional(consoleSchema(channels)),
         ...moduleSections(modules),
+        local,
       },
       Closed,
     );
@@ -611,6 +563,12 @@ export function configFileSchema(registry: HarnessRegistry, channels: ChannelReg
   }
   return s;
 }
+
+/**
+ * The config file's schema over the built-in harness kinds, channel types and modules (`bundle.ts`):
+ * the kernel's keys and the built-in modules' sections (`externalMcp`).
+ */
+export const ConfigFile: TObject = configFileSchema(builtinHarnesses, builtinChannels, builtinModules);
 
 interface InstanceBase {
   /** Instance name: `RunSpec.harness`, and the `harness` of its session events. */
@@ -750,11 +708,16 @@ export interface Config {
   console: ConsoleConfig;
   /** The host connection: `tokenFile` is an absolute path when set. */
   host?: { tokenFile?: string };
-  /** The external MCP endpoint (`externalMcp`), when on. */
+  /**
+   * Deprecated, kept for one release: the external MCP endpoint's settings (section `externalMcp`),
+   * when it is on; the same object as its module's in `modules` (`ModuleFields.config`, set by
+   * `bundle.ts`). Given another value or removed before `Gateway.start`, it still turns the
+   * endpoint on, changes or off.
+   */
   externalMcp?: ExternalMcpConfig;
   /**
    * The registered feature modules, on or off, with their settings (`resolveModules`), in
-   * registration order; absent when the registry has none (the built-in one, for now).
+   * registration order; absent when the registry has none.
    */
   modules?: ResolvedModule[];
   /** Where this config came from (loadConfig): the file (it may not exist) and the env file found for it. */
@@ -847,81 +810,6 @@ function resolveConsole(c: ConfigFile['console'], channels: ChannelRegistry): Co
     ...Object.assign({}, ...channels.adminContributions.map(({ admin }) => consoleSettings(c, admin.console))),
     heartbeat: { intervalMs: c?.heartbeat?.intervalMs ?? DEFAULT_WS_HEARTBEAT_MS, timeoutMs: c?.heartbeat?.timeoutMs ?? DEFAULT_WS_HEARTBEAT_TIMEOUT_MS },
     liveChannels: c?.liveChannels === true,
-  };
-}
-
-/** One client of the external MCP endpoint, resolved. */
-export interface ExternalMcpClient {
-  /** Its name in `externalMcp.clients` (`[A-Za-z0-9._-]`, at most 64). */
-  name: string;
-  /** From `token: "env:NAME"`. SECRET: never log it. */
-  token?: string;
-  /** Absolute; read or generated when the endpoint starts. */
-  tokenFile?: string;
-  /** `external:<name>` unless configured (always `external:…`); labels always include `external`, never `owner`. */
-  principal: Principal;
-  scopes: ExternalScopes;
-  /** May declare whom it acts for (`X-Agents-IO-Declared`). */
-  declare: boolean;
-}
-
-export interface ExternalMcpConfig {
-  host: string;
-  port: number;
-  clients: ExternalMcpClient[];
-  limits: { maxBodyBytes: number; maxTextChars: number; requestsPerMinute: number; writesPerMinute: number };
-}
-
-export const DEFAULT_EXTERNAL_MCP_PORT = 7465;
-const CLIENT_NAME = /^[A-Za-z0-9._-]{1,64}$/;
-const EXTERNAL_PRINCIPAL = /^external:[^\s]{1,128}$/;
-
-function resolveExternalMcp(c: NonNullable<ConfigFile['externalMcp']>, env: Record<string, string | undefined>, path: (p: string) => string, owners: string[]): ExternalMcpConfig {
-  const listen = c.listen ?? `127.0.0.1:${DEFAULT_EXTERNAL_MCP_PORT}`;
-  const m = /^(\[[^\]]+\]|[^:]+):(\d{1,5})$/.exec(listen);
-  if (!m || Number(m[2]) > 65535) fail(`externalMcp.listen ${JSON.stringify(listen)} is not host:port`);
-  const host = m![1]!.replace(/^\[|\]$/g, '');
-  // Tokens are bearer credentials in clear text: never reachable off this machine.
-  if (!isLoopbackHost(host) || host.toLowerCase() === 'localhost') fail(`externalMcp.listen ${JSON.stringify(listen)}: the external MCP endpoint listens on a loopback address only (127.0.0.1 or ::1)`);
-  const clients = Object.entries(c.clients).map(([name, e]): ExternalMcpClient => {
-    const at = `externalMcp.clients.${name}`;
-    if (!CLIENT_NAME.test(name)) fail(`externalMcp.clients: ${JSON.stringify(name)} is not a client name (letters, digits, . _ -, at most 64)`);
-    if ((e.token === undefined) === (e.tokenFile === undefined)) fail(`${at}: give exactly one of token ("env:NAME") or tokenFile`);
-    let token: string | undefined;
-    if (e.token !== undefined) {
-      if (!e.token.startsWith('env:')) fail(`${at}.token must be "env:NAME" (a literal token does not belong in the config; or use tokenFile)`);
-      token = substituteEnv(e.token, env, `${at}.token`) as string;
-      if (token.length < 16 || /\s/.test(token)) fail(`${at}.token: the variable ${e.token.slice(4)} must hold at least 16 characters and no whitespace`);
-    }
-    const scopes: ExternalScopes = { read: [], readAll: false, send: [], input: [] };
-    e.scopes.forEach((x, i) => {
-      const p = parseScope(x);
-      if (!p) fail(`${at}.scopes[${i}]: ${JSON.stringify(x)} is not a scope (read, read:<session pattern>, send:<route pattern>, input:<session pattern>)`);
-      scopes[p!.kind].push(p!.pattern);
-      if (x === 'read') scopes.readAll = true;
-    });
-    const id = e.principal ?? `external:${name}`;
-    if (!EXTERNAL_PRINCIPAL.test(id)) fail(`${at}.principal must be "external:<id>" (an external client is never a person, an agent or a host)`);
-    if (owners.includes(id)) fail(`${at}.principal is an owner: an external client is never a person`);
-    const labels = [...new Set(['external', ...(e.labels ?? [])])];
-    if (labels.includes(OWNER_LABEL)) fail(`${at}.labels: an external client never carries the ${OWNER_LABEL} label`);
-    return {
-      name,
-      ...(token !== undefined ? { token } : {}),
-      ...(e.tokenFile !== undefined ? { tokenFile: path(e.tokenFile) } : {}),
-      principal: { id, labels },
-      scopes,
-      declare: e.declare === true,
-    };
-  });
-  const files = clients.map((x) => x.tokenFile).filter((f): f is string => f !== undefined);
-  if (new Set(files).size !== files.length) fail('externalMcp.clients: two clients name the same tokenFile');
-  const l = c.limits ?? {};
-  return {
-    host,
-    port: Number(m![2]),
-    clients,
-    limits: { maxBodyBytes: l.maxBodyBytes ?? 256 * 1024, maxTextChars: l.maxTextChars ?? 16_000, requestsPerMinute: l.requestsPerMinute ?? 120, writesPerMinute: l.writesPerMinute ?? 20 },
   };
 }
 
@@ -1057,14 +945,15 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
   // Off unless asked for (principle 2, decision 13: the default was true before 2026-10-11).
   const outputTools = c.outputTools ?? false;
   const presets = resolvePresets(c, harnesses);
-  const modules = resolveModules(raw as Record<string, unknown>, moduleRegistry, env, path);
-  const { agents, defaultAgent } = resolveAgents(c, harnesses, presets, defaultHarness, outputTools, path, registry.configDirKeys(), toolCatalog(moduleRegistry, modules));
+  // Which modules are on now (the tool catalog needs it); their settings resolve last (below).
+  const switches = moduleSwitches(raw as Record<string, unknown>, moduleRegistry);
+  const { agents, defaultAgent } = resolveAgents(c, harnesses, presets, defaultHarness, outputTools, path, registry.configDirKeys(), toolCatalog(moduleRegistry, switches));
   const identities = c.identities ?? [];
   const localSession = c.local?.session ?? ownerSessionKey ?? 'local:main';
   const table: BindingTable | undefined = c.bindings ? { version: 'config', bindings: c.bindings, identities: [] } : undefined;
   checkTable({ agents, defaultAgent, owners, identities, table, ownerSessionKey, localSession });
 
-  return {
+  const config: Config = {
     dataDir,
     logPath: path(c.logPath ?? join(dataDir, 'log.sqlite')),
     socketPath: path(c.socketPath ?? join(dataDir, 'run', 'aio.sock')),
@@ -1105,7 +994,19 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     },
     console: resolveConsole(c.console, channelRegistry),
     host: c.host?.tokenFile !== undefined ? { tokenFile: path(c.host.tokenFile) } : {},
-    ...(c.externalMcp && c.externalMcp.enabled !== false ? { externalMcp: resolveExternalMcp(c.externalMcp, env, path, c.policy?.owners ?? []) } : {}),
+  };
+  // After everything else, where the external MCP endpoint's settings were resolved before it was a
+  // module: a file with several mistakes fails on the one it always did.
+  const modules = moduleSettings(switches, { raw: raw as Record<string, unknown>, env, path });
+  const fields = moduleRegistry.fields;
+  for (const m of modules) {
+    const field = fields.get(m.id)?.config;
+    if (field === undefined || !m.enabled || m.config === undefined) continue;
+    if (Object.hasOwn(config, field) || ['table', 'modules', 'warnings', 'source'].includes(field)) throw new Error(`module ${m.id}: Config.${field} is one of the config's own fields`);
+    (config as unknown as Record<string, unknown>)[field] = m.config;
+  }
+  return {
+    ...config,
     ...(moduleRegistry.size ? { modules } : {}),
     ...(warnings.length ? { warnings } : {}),
   };
@@ -1128,13 +1029,29 @@ function at(raw: Record<string, unknown>, dotted: string): unknown {
  * decides: on unless its `aliasEnabled` says false or, without one, the value is an object with
  * `enabled: false` (`resolve` gets the value as it is); with neither, `defaultEnabled` (`resolve`
  * gets `{}`). A module that is on and needs another (`module:<id>`) that is off fails the config.
+ * Whether each is on is settled first, for all of them; then the ones that are on resolve.
  */
 export function resolveModules(raw: Record<string, unknown>, registry: ModuleRegistry, env: Record<string, string | undefined>, path: (p: string) => string): ResolvedModule[] {
-  const out: ResolvedModule[] = [];
+  return moduleSettings(moduleSwitches(raw, registry), { raw, env, path });
+}
+
+/** A module on or off, and, when on, what its `config.resolve` gets. */
+interface ModuleSwitch {
+  m: ModuleManifest<unknown>;
+  id: string;
+  enabled: boolean;
+  value?: unknown;
+  where?: string;
+  alias?: string;
+}
+
+/** `resolveModules`, first half: every module on or off (and the `needs` between them). */
+function moduleSwitches(raw: Record<string, unknown>, registry: ModuleRegistry): ModuleSwitch[] {
+  const out: ModuleSwitch[] = [];
   for (const { manifest: m } of registry.modules) {
     const cfg = m.config;
     if (!cfg) {
-      out.push({ id: m.id, enabled: true });
+      out.push({ m, id: m.id, enabled: true });
       continue;
     }
     const section = Object.hasOwn(raw, cfg.section) ? (raw[cfg.section] as Record<string, unknown>) : undefined;
@@ -1161,19 +1078,7 @@ export function resolveModules(raw: Record<string, unknown>, registry: ModuleReg
         value = {};
       }
     }
-    if (!enabled) {
-      out.push({ id: m.id, enabled: false });
-      continue;
-    }
-    const config = cfg.resolve(value, {
-      where,
-      ...(alias !== undefined ? { alias } : {}),
-      env,
-      substitute: (v, w) => substituteEnv(v, env, w),
-      path,
-      fail: (msg) => fail(msg),
-    });
-    out.push({ id: m.id, enabled: true, config });
+    out.push(enabled ? { m, id: m.id, enabled, value, where, ...(alias !== undefined ? { alias } : {}) } : { m, id: m.id, enabled });
   }
   const on = new Set(out.filter((x) => x.enabled).map((x) => x.id));
   for (const { manifest: m } of registry.modules) {
@@ -1183,6 +1088,24 @@ export function resolveModules(raw: Record<string, unknown>, registry: ModuleReg
   return out;
 }
 
+/** `resolveModules`, second half: the settings of the modules that are on, in registration order. */
+function moduleSettings(switches: readonly ModuleSwitch[], o: { raw: Record<string, unknown>; env: Record<string, string | undefined>; path: (p: string) => string }): ResolvedModule[] {
+  return switches.map((x): ResolvedModule => {
+    if (!x.enabled) return { id: x.id, enabled: false };
+    if (!x.m.config) return { id: x.id, enabled: true };
+    const config = x.m.config.resolve(x.value, {
+      where: x.where!,
+      ...(x.alias !== undefined ? { alias: x.alias } : {}),
+      env: o.env,
+      substitute: (v, w) => substituteEnv(v, o.env, w),
+      path: o.path,
+      valueAt: (dotted) => structuredClone(at(o.raw, dotted)),
+      fail: (msg) => fail(msg),
+    });
+    return { id: x.id, enabled: true, config };
+  });
+}
+
 /** The model tools agents may list (`agents.<name>.tools`): the kernel's, the modules' that are on; and whose tools are off. */
 interface ToolCatalog {
   names: readonly string[];
@@ -1190,7 +1113,7 @@ interface ToolCatalog {
   off: ReadonlyMap<string, string>;
 }
 
-function toolCatalog(registry: ModuleRegistry, modules: readonly ResolvedModule[]): ToolCatalog {
+function toolCatalog(registry: ModuleRegistry, modules: readonly { id: string; enabled: boolean }[]): ToolCatalog {
   const on = new Set(modules.filter((x) => x.enabled).map((x) => x.id));
   const names: string[] = [...TOOL_NAMES];
   const off = new Map<string, string>();

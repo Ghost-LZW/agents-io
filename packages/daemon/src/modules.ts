@@ -1,15 +1,23 @@
 import type {
   AdminModule,
+  AdminSession,
+  AdminStatus,
   ChannelAdapter,
   ClientCommand,
+  ExternalCalloutAnswer,
+  ExternalCalloutArgs,
+  ExternalSender,
   IdentifyArgs,
   Identity,
   IdentityEntry,
   InboundItem,
+  InputRecord,
   KernelContext,
   KernelDatabase,
+  KernelInputResult,
   KernelOutcome,
   KernelSendResult,
+  KernelSettledSend,
   ModuleInstance,
   ModuleManifest,
   ModuleOrigin,
@@ -18,14 +26,18 @@ import type {
   Policy,
   RenderedMessage,
   ReplyRoute,
+  RouteExplanation,
   SessionEvent,
   SessionScope,
   Topic,
+  TurnContext,
 } from '@agents-io/protocol';
+import { AdminStatus as AdminStatusSchema } from '@agents-io/protocol';
 import { TOOL_NAMES, moduleToolInput, type ModuleTools } from '@agents-io/host-mcp';
 import { CommandTable, KERNEL_COMMAND_NAMES, type ModuleCommand } from './commands.js';
 import { ConfigError } from './config-error.js';
 import { FEATURES } from './host.js';
+import { TokenError } from './token.js';
 
 /*
  * Feature modules (core-slimming G6): the registry the composition root fills (`bundle.ts`), and
@@ -48,20 +60,44 @@ export interface RegisteredModule {
   origin: ModuleOrigin;
 }
 
+/**
+ * Where a module's settings and status were before it was a module (`ModuleRegistryOptions.fields`;
+ * `bundle.ts`: the external MCP endpoint's `externalMcp`).
+ */
+export interface ModuleFields {
+  /**
+   * A field of the resolved `Config` that also holds what the module's section resolved to (the
+   * same object), while the module is on. Deprecated, kept for one release: given another value or
+   * removed before `Gateway.start`, it decides over `Config.modules`, as it did before.
+   */
+  config?: string;
+  /**
+   * An optional field of `GET /api/status` (one `AdminStatus` declares, not `modules`) that holds
+   * what its `status()` returns while it runs, besides its `modules` entry.
+   */
+  status?: string;
+}
+
 /** What `ModuleRegistry` takes besides the modules. */
 export interface ModuleRegistryOptions {
   /** The origin of the modules given as bare manifests (default `module`; `bundle.ts` registers the built-in ones as `builtin`). */
   origin?: ModuleOrigin;
+  /** Fields that keep a module's settings and status where they were before it was a module, by module id. */
+  fields?: Readonly<Record<string, ModuleFields>>;
 }
 
 /** What `kernel:<capability>` may name in `ModuleManifest.needs`: the members of `KernelContext`. */
-export const KERNEL_CAPABILITIES: readonly string[] = ['log', 'events', 'policy', 'records', 'db', 'topics', 'router', 'lanes', 'channelFor', 'send', 'ownerRoute', 'redispatch', 'explain', 'host'];
+export const KERNEL_CAPABILITIES: readonly string[] = [
+  'log', 'events', 'head', 'appendNative', 'sessions', 'status', 'stopping', 'policy', 'records', 'db', 'topics', 'router', 'lanes',
+  'channelFor', 'resolveRoute', 'send', 'settled', 'outbound', 'ownerRoute', 'redispatch', 'explain', 'host',
+];
 
 const MODULE_ID = /^[a-z0-9][a-z0-9._-]*$/;
 const SECTION = /^[A-Za-z][A-Za-z0-9_]*$/;
 const ALIAS = /^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*$/;
 const TOOL_NAME = /^[a-z][a-z0-9_]*$/;
 const COMMAND_NAME = /^[a-z][a-z0-9_-]*$/;
+const FIELD = /^[A-Za-z][A-Za-z0-9_]*$/;
 
 const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 const isFn = (v: unknown) => typeof v === 'function';
@@ -137,6 +173,8 @@ function badManifest(m: ModuleManifest<any>): string | undefined {
  */
 export class ModuleRegistry {
   private readonly byId = new Map<string, RegisteredModule>();
+  /** `ModuleRegistryOptions.fields`, checked. */
+  readonly fields: ReadonlyMap<string, ModuleFields>;
 
   constructor(modules: readonly (ModuleManifest<any> | RegisteredModule)[], o: ModuleRegistryOptions = {}) {
     const claims = new Map<string, string>();
@@ -171,6 +209,23 @@ export class ModuleRegistry {
         if (!this.byId.has(dep)) throw new Error(`module ${m.id}: needs module ${dep}, which is not registered`);
       }
     }
+    const fields = new Map<string, ModuleFields>();
+    for (const [id, f] of Object.entries(o.fields ?? {}) as [string, unknown][]) {
+      if (!this.byId.has(id)) throw new Error(`fields: module ${id} is not registered`);
+      if (!isObject(f)) throw new Error(`fields.${id} must be an object`);
+      const out: ModuleFields = {};
+      for (const k of ['config', 'status'] as const) {
+        const name = f[k];
+        if (name === undefined) continue;
+        if (typeof name !== 'string' || !FIELD.test(name)) throw new Error(`fields.${id}.${k}: ${JSON.stringify(name)} is not a field name`);
+        if (k === 'status' && (!Object.hasOwn(AdminStatusSchema.properties, name) || name === 'modules' || ((AdminStatusSchema.required ?? []) as readonly string[]).includes(name)))
+          throw new Error(`fields.${id}.status: ${name} is not an optional field of the status (AdminStatus) other than modules`);
+        claim(`${k} field ${name}`, id);
+        out[k] = name;
+      }
+      fields.set(id, out);
+    }
+    this.fields = fields;
   }
 
   get(id: string): RegisteredModule | undefined {
@@ -210,6 +265,13 @@ export interface ModuleHostOptions {
   registry: ModuleRegistry;
   /** As the config resolved them (`Config.modules`), against the same registry. */
   resolved: readonly ResolvedModule[] | undefined;
+  /**
+   * The resolved config itself (`Config`), for a module's deprecated field (`ModuleFields.config`):
+   * one given another value, or removed, since the config was resolved decides over `resolved`, as
+   * it did before the setting was a module's (`config.externalMcp = …` before `Gateway.start`); so
+   * does one of a config without `modules` at all.
+   */
+  config?: object;
   log: Log;
 }
 
@@ -241,7 +303,7 @@ function badInstance(m: ModuleManifest<any>, i: ModuleInstance): string | undefi
     for (const [k, v] of Object.entries(i.hooks)) if (v !== undefined && !SERVED_HOOKS.includes(k)) return `hooks.${k} is not served yet`;
   }
   if (i.localFrames !== undefined && (!isObject(i.localFrames) || Object.keys(i.localFrames).length)) return 'localFrames are not served yet';
-  for (const k of ['status', 'start', 'stop'] as const) if (i[k] !== undefined && !isFn(i[k])) return `${k} must be a function`;
+  for (const k of ['features', 'status', 'start', 'stop'] as const) if (i[k] !== undefined && !isFn(i[k])) return `${k} must be a function`;
   return undefined;
 }
 
@@ -268,8 +330,15 @@ export class ModuleHost {
     const byId = new Map((o.resolved ?? []).map((r) => [r.id, r]));
     for (const id of byId.keys()) if (!o.registry.get(id)) throw new ConfigError(`the config was resolved with module ${id}, which this daemon does not register: give loadConfig and Gateway.start the same moduleRegistry`);
     this.all = o.registry.modules.map((r) => {
-      const res = byId.get(r.manifest.id);
+      const field = o.registry.fields.get(r.manifest.id)?.config;
+      // A config without `modules` at all (one built by hand, as before modules): such a module is what its field says.
+      const res = byId.get(r.manifest.id) ?? (o.resolved === undefined && field !== undefined && o.config !== undefined ? { id: r.manifest.id, enabled: false } : undefined);
       if (!res) throw new ConfigError(`module ${r.manifest.id} is registered but the config was resolved without it: give loadConfig and Gateway.start the same moduleRegistry`);
+      if (field !== undefined && o.config !== undefined) {
+        // `resolveConfig` puts the module's settings there (the same object) while it is on; anything else was written since.
+        const legacy = (o.config as Record<string, unknown>)[field];
+        if (legacy !== (res.enabled ? res.config : undefined)) return { r, enabled: legacy !== undefined, config: legacy, started: false };
+      }
       return { r, enabled: res.enabled, config: res.config, started: false };
     });
   }
@@ -311,32 +380,66 @@ export class ModuleHost {
     return new CommandTable(commands);
   }
 
-  /** `host.hello` features of the modules that run (started, not stopped), in registration order. */
+  /**
+   * `host.hello` features of the modules that run (started, not stopped), in registration order:
+   * the manifest's, or those of them its instance's `features()` says it advertises now.
+   */
   features(): string[] {
-    return this.all.filter((m) => m.started).flatMap((m) => [...(m.r.manifest.features ?? [])]);
+    return this.all.filter((m) => m.started).flatMap((m) => {
+      const all = [...(m.r.manifest.features ?? [])];
+      if (!m.instance?.features) return all;
+      let now: Set<string>;
+      try {
+        now = new Set(m.instance.features());
+      } catch (e) {
+        this.o.log('warn', `module ${m.r.manifest.id}: features failed: ${(e as Error).message}`);
+        return [];
+      }
+      return all.filter((f) => now.has(f));
+    });
   }
 
   /** `GET /api/status` `modules`: every registered module; `status` from a module that runs. */
   status(): AdminModule[] {
-    return this.all.map((m) => {
+    return this.report().modules;
+  }
+
+  /**
+   * `GET /api/status`: `modules` (as `status()`), and the fields the registry keeps a module's
+   * status in where it was before it was a module (`ModuleFields.status`), for each that runs and
+   * shows one. Each module's `status()` is asked once.
+   */
+  report(): { modules: AdminModule[]; fields: Record<string, unknown> } {
+    const fields: Record<string, unknown> = {};
+    const modules = this.all.map((m): AdminModule => {
+      const id = m.r.manifest.id;
       let status: unknown;
       if (m.started && m.instance?.status) {
         try {
           status = m.instance.status();
         } catch (e) {
-          this.o.log('warn', `module ${m.r.manifest.id}: status failed: ${(e as Error).message}`);
+          this.o.log('warn', `module ${id}: status failed: ${(e as Error).message}`);
         }
       }
-      return { id: m.r.manifest.id, origin: m.r.origin, enabled: m.enabled, ...(status !== undefined ? { status } : {}) };
+      const field = this.o.registry.fields.get(id)?.status;
+      if (field !== undefined && status !== undefined) fields[field] = status;
+      return { id, origin: m.r.origin, enabled: m.enabled, ...(status !== undefined ? { status } : {}) };
     });
+    return { modules, fields };
   }
 
-  /** Step 3: start the set-up modules in registration order; one that throws fails the start (those started before it are stopped by `stop`). */
+  /**
+   * Step 3: start the set-up modules in registration order; one that throws fails the start (those
+   * started before it are stopped by `stop`). Its error says which module, unless it is a
+   * `ConfigError` or a `TokenError` (a setting or a token file it was given is wrong): that one
+   * names the setting itself and is thrown as it is (`aio serve` exits 2 for both).
+   */
   async start(): Promise<void> {
     for (const m of this.active()) {
       try {
         await m.instance!.start?.();
       } catch (e) {
+        if (e instanceof ConfigError || e instanceof TokenError) throw e;
         throw new Error(`module ${m.r.manifest.id}: start failed: ${(e as Error).message}`);
       }
       m.started = true;
@@ -369,6 +472,13 @@ export interface KernelBackend {
   ready(): boolean;
   log: Log;
   events(sessionKey: string, fromSeq: number): SessionEvent[];
+  head(sessionKey: string): number;
+  appendNative(logKey: string, e: Parameters<KernelContext['appendNative']>[1]): void;
+  sessions(): AdminSession[];
+  knownSession(sessionKey: string): boolean;
+  agentOf(sessionKey: string): string | undefined;
+  status(): AdminStatus;
+  stopping(): boolean;
   policy(): Policy;
   flag(name: string): string | undefined;
   setFlag(name: string, value: string | undefined): void;
@@ -380,16 +490,25 @@ export interface KernelBackend {
   setExtraIdentities(owner: string, entries: IdentityEntry[]): void;
   newTopic(agent: string, conversation: string, title: string | undefined): string;
   conversationAgent(conversation: string): string | undefined;
+  record(e: RouteExplanation & { at: number }): void;
   hasLane(sessionKey: string): boolean;
   openLane(sessionKey: string, agent: string | undefined): Promise<void>;
   command(cmd: ClientCommand, origin: Origin): Promise<KernelOutcome>;
+  /** The lane's answer to the input (the lane opened when it is not). */
+  laneInput(sessionKey: string, input: InputRecord, mode: 'queue' | 'steer' | 'interrupt'): Promise<KernelInputResult>;
   channelFor(route: { channel: string; account: string }): ChannelAdapter | undefined;
-  send(route: ReplyRoute, msg: RenderedMessage, a: { operationId: string; sessionKey: string; turnId?: string }): Promise<KernelSendResult | undefined>;
+  resolveRoute(route: ReplyRoute): { ok: true; route: ReplyRoute } | { ok: false; message: string };
+  send(route: ReplyRoute, msg: RenderedMessage, a: { operationId: string; sessionKey: string; turnId?: string; external?: ExternalSender }): Promise<KernelSendResult | undefined>;
+  settled(operationId: string): KernelSettledSend | undefined;
+  outbound(from: TurnContext, to: ReplyRoute): Promise<'allow' | 'deny'>;
   ownerRoute(): ReplyRoute | null;
   redispatch(item: InboundItem, o: { by: string; session?: SessionScope; agent?: string }): Promise<{ ok: true; sessionKey: string; inputId: string } | { ok: false; code: string; message: string }>;
   explain(inputId: string, chain: boolean): KernelOutcome;
   hostConnected(): boolean;
   hostAnswers(hook: string): boolean;
+  hostHeldBy(hook: 'outbound' | 'external'): string | undefined;
+  hostExternal(args: ExternalCalloutArgs): Promise<ExternalCalloutAnswer>;
+  isHostToken(token: string): boolean;
 }
 
 /** One module's `KernelContext` over the gateway's backend: its log prefix, its records namespace, its own extra identities. */
@@ -403,6 +522,15 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
     id,
     log: (level, msg, data) => k.log(level, `module ${id}: ${msg}`, data),
     events: (sessionKey, fromSeq) => live().events(sessionKey, fromSeq ?? 0),
+    head: (sessionKey) => live().head(sessionKey),
+    appendNative: (logKey, e) => live().appendNative(logKey, e),
+    sessions: {
+      list: () => live().sessions(),
+      known: (sessionKey) => live().knownSession(sessionKey),
+      agentOf: (sessionKey) => live().agentOf(sessionKey),
+    },
+    status: () => live().status(),
+    stopping: () => live().stopping(),
     get policy() {
       return live().policy();
     },
@@ -422,20 +550,32 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
       setExtraIdentities: (entries) => live().setExtraIdentities(`module:${id}`, entries),
       newTopic: (agent, conversation, title) => live().newTopic(agent, conversation, title),
       conversationAgent: (conversation) => live().conversationAgent(conversation),
+      record: (e) => live().record(e),
     },
     lanes: {
       has: (sessionKey) => live().hasLane(sessionKey),
       open: (sessionKey, agent) => live().openLane(sessionKey, agent),
       command: (cmd, origin) => live().command(cmd, origin),
+      input: async (sessionKey, input, mode) => {
+        // A module stamps only peers (agents outside this daemon): a person's or the kernel's origin is the kernel's to give.
+        if (input?.origin?.kind !== 'peer') throw new Error(`module ${id}: lanes.input takes a peer's input (origin.kind "peer", not ${JSON.stringify(input?.origin?.kind)})`);
+        return live().laneInput(sessionKey, input, mode ?? 'queue');
+      },
     },
     channelFor: (route) => live().channelFor(route),
+    resolveRoute: (route) => live().resolveRoute(route),
     send: (route, msg, a) => live().send(route, msg, a),
+    settled: (operationId) => live().settled(operationId),
+    outbound: (from, to) => live().outbound(from, to),
     ownerRoute: () => live().ownerRoute(),
     redispatch: (item, o) => live().redispatch(item, o),
     explain: (inputId, chain) => live().explain(inputId, chain ?? false),
     host: {
       connected: () => live().hostConnected(),
       answers: (hook) => live().hostAnswers(hook),
+      heldBy: (hook) => live().hostHeldBy(hook),
+      external: (args) => live().hostExternal(args),
+      isToken: (token) => live().isHostToken(token),
     },
   };
 }

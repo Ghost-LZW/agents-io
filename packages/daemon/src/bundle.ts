@@ -4,6 +4,7 @@ import { mailChannelModule, type MailChannelEntry } from '@agents-io/channel-mai
 import { claudeCodeHarnessModule } from '@agents-io/harness-claude-code';
 import { codexHarnessModule } from '@agents-io/harness-codex';
 import { ChannelRegistry } from './channel-registry.js';
+import { externalMcpModule, type ExternalMcpSection } from './external-mcp.js';
 import { HarnessRegistry } from './harness-registry.js';
 import { moduleChannelModule, type ModuleChannelEntry } from './module-channel.js';
 import { ModuleRegistry } from './modules.js';
@@ -35,11 +36,26 @@ export const builtinChannels = new ChannelRegistry([larkBotChannelModule, mailCh
 
 /**
  * The built-in feature modules (core-slimming G6), in the order their tools, commands, features and
- * status entries come after the kernel's own. None yet: the features that become modules (external
- * MCP, topic titles, the watch / topic / live tools, strangers, owner commands and presets, the
- * Claude Code terminal) still live in the gateway; each moves here as its own step.
+ * status entries come after the kernel's own, and the order they start (they stop in reverse). The
+ * external MCP endpoint (off unless its section `externalMcp` is in the file) is the last: it starts
+ * after everything else and stops first, so no external write comes in while the rest stops; a
+ * module added later goes before it. Its settings and status stay where they were before it was a
+ * module: `Config.externalMcp` (deprecated, one release) and `GET /api/status` `externalMcp`. The
+ * features still to move (topic titles, the watch / topic / live tools, strangers, owner commands
+ * and presets, the Claude Code terminal) live in the gateway; each moves here as its own step.
  */
-export const builtinModules = new ModuleRegistry([], { origin: 'builtin' });
+export const builtinModules = new ModuleRegistry([externalMcpModule], {
+  origin: 'builtin',
+  fields: { [externalMcpModule.id]: { config: 'externalMcp', status: 'externalMcp' } },
+});
+
+/** The built-in modules' sections of the config file, as written (`ConfigFile` adds them to the kernel's keys). */
+export interface BuiltinModuleSections {
+  externalMcp?: ExternalMcpSection;
+}
+
+/** The external MCP endpoint's settings and their parts (`Config.externalMcp`, deprecated: `Config.modules`). */
+export { DEFAULT_EXTERNAL_MCP_PORT, type ExternalMcpClient, type ExternalMcpConfig, type ExternalMcpSection } from './external-mcp.js';
 
 /** A built-in channel type's own keys, as written (`ChannelEntry` adds the keys every entry has). */
 export type BuiltinChannelEntry = LarkBotChannelEntry | MailChannelEntry | BridgeChannelEntry | ModuleChannelEntry;

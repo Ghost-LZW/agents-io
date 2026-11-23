@@ -43,6 +43,7 @@ import {
   type NativeClient,
   type ReplyRoute,
   type ExternalSender,
+  type KernelSendResult,
   type Resolver,
   type RunSpec,
   type SessionLaunch,
@@ -113,7 +114,6 @@ import { HostService, isHostOrigin, type CalloutHook } from './host.js';
 import { LocalServer } from './local-server.js';
 import { privateDb, privateDir } from './private.js';
 import { DaemonRecords, type CauseRecord, type OutboundRecord } from './records.js';
-import { ExternalMcp } from './external-mcp.js';
 import { checkLaunch, launchView, sameLaunch, type LaunchCheck } from './launch.js';
 import { RUN_RULE, Runs, type RunOverrides } from './runs.js';
 import { Strangers } from './strangers.js';
@@ -313,9 +313,10 @@ export class Gateway {
   /** Host output tools, when some agent has `tools` on; mounted over MCP into those agents' harness bindings only. */
   readonly tools: HostTools | undefined;
   private readonly mcp: HostMcpServer | undefined;
-  /** The external MCP endpoint (config `externalMcp`), once listening. */
-  private externalMcp: { endpoint: ExternalMcp; url: string } | undefined;
-  /** Sends of external clients in flight: who, taken into the in-flight mark (`sendTime`) for the outbound record. */
+  /**
+   * Sends for clients outside the daemon in flight (the external MCP module's, `KernelContext.send`
+   * `external`): who, taken into the in-flight mark (`sendTime`) for the outbound record.
+   */
   private readonly externalSends = new Map<string, ExternalSender>();
   /** The durable host inbound queue (`on: "host"` rules), in the log's database. */
   readonly hostQueue: HostQueue;
@@ -538,7 +539,6 @@ export class Gateway {
       redispatch: (name, f) => this.redispatch(name, f),
       compactSession: (f, origin) => this.compactSession(f, origin),
       calloutTimeouts: { resolve: c.hostCallouts.resolveTimeoutMs, review: c.hostCallouts.reviewTimeoutMs, outbound: c.hostCallouts.outboundTimeoutMs, external: c.hostCallouts.externalTimeoutMs },
-      externalMcp: () => this.externalMcp !== undefined,
       moduleFeatures: () => this.modules.features(),
       explain: (id, chain) => this.explain(id, chain),
       answerOnBehalf: c.policy.answerOnBehalf,
@@ -707,6 +707,15 @@ export class Gateway {
       ready: () => ref.gw !== undefined,
       log,
       events: (key, fromSeq) => gw().hub.log.read(key, fromSeq),
+      head: (key) => gw().hub.log.head(key),
+      appendNative: (key, e) => {
+        gw().hub.append(key, { ts: Date.now(), level: e.level, audience: e.audience, durability: 'durable', visibility: e.visibility, body: { t: 'native', name: e.name }, native: e.native });
+      },
+      sessions: () => gw().adminSessions().sessions,
+      knownSession: (key) => gw().isOurSession(key),
+      agentOf: (key) => gw().agentOfSession(key),
+      status: () => gw().adminStatus(),
+      stopping: () => gw().stopped,
       policy: () => gw().policy,
       flag: (name) => gw().records.flag(name),
       setFlag: (name, value) => gw().records.setFlag(name, value),
@@ -720,18 +729,39 @@ export class Gateway {
       setExtraIdentities: (owner, entries) => gw().setExtraIdentities(owner, entries),
       newTopic: (agent, conversation, title) => gw().router.newTopic(agent, conversation, title !== undefined ? { title } : {}, 'user').topic.id,
       conversationAgent: (conversation) => gw().router.conversationAgent(conversation),
+      record: (e) => gw().router.record(e),
       hasLane: (key) => gw().lanes.has(key),
       openLane: async (key, agent) => {
         await gw().laneAfterClose(key, agent);
       },
       command: (cmd, origin) => gw().command(cmd, origin),
+      laneInput: async (key, input, mode) => {
+        const lane = gw().lanes.get(key) ?? (await gw().laneAfterClose(key));
+        return lane.command({ type: 'input', sessionKey: key, input, mode });
+      },
       channelFor: (route) => gw().channelFor(route)?.adapter,
+      resolveRoute: (route) => {
+        const ch = gw().channelFor(route);
+        return ch ? { ok: true, route: { ...route, account: ch.account } } : { ok: false, message: gw().noChannelMessage(route) };
+      },
       send: async (route, msg, a) => {
         const ch = gw().channelFor(route);
         if (!ch) return undefined;
-        const rec = await gw().outbox.send(ch.adapter, { operationId: a.operationId, sessionKey: a.sessionKey, route, msg, ...(a.turnId !== undefined ? { turnId: a.turnId } : {}) });
-        return { status: rec.status, ...(rec.providerMessageId !== undefined ? { providerMessageId: rec.providerMessageId } : {}), ...(rec.error !== undefined ? { error: rec.error } : {}) };
+        // Who it is sent for, while it runs: the outbox takes it into the in-flight mark (EX-8).
+        if (a.external) gw().externalSends.set(a.operationId, a.external);
+        let rec: DeliveryRecord;
+        try {
+          rec = await gw().outbox.send(ch.adapter, { operationId: a.operationId, sessionKey: a.sessionKey, route, msg, ...(a.turnId !== undefined ? { turnId: a.turnId } : {}) });
+        } finally {
+          if (a.external) gw().externalSends.delete(a.operationId);
+        }
+        return sendResult(rec);
       },
+      settled: (operationId) => {
+        const rec = gw().outbox.get(operationId);
+        return rec ? { ...sendResult(rec), route: rec.route } : undefined;
+      },
+      outbound: (from, to) => gw().externalOutbound(from, to),
       ownerRoute: () => gw().ownerRoute(),
       redispatch: async (item, o) => {
         const r = await gw().ingress.redispatch(item, { by: o.by, ...(o.session !== undefined ? { session: o.session } : {}), ...(o.agent !== undefined ? { agent: o.agent } : {}) });
@@ -742,6 +772,9 @@ export class Gateway {
       explain: (id, chain) => gw().explain(id, chain),
       hostConnected: () => gw().router.hostConnected,
       hostAnswers: (hook) => gw().host.answers(hook as CalloutHook),
+      hostHeldBy: (hook) => (hook === 'outbound' ? gw().host.outboundHeldBy() : gw().host.externalHeldBy()),
+      hostExternal: (args) => gw().host.externalCallout(args),
+      isHostToken: (token) => token === gw().token,
     };
   }
 
@@ -759,7 +792,7 @@ export class Gateway {
     // Module lifecycle step 2 (step 1 ran in loadConfig): set up before the gateway builds its
     // ingress, so their tools and commands are assembled with the kernel's. Their kernel context is
     // late-bound: it works once the gateway exists.
-    const modules = new ModuleHost({ registry: o.moduleRegistry ?? builtinModules, resolved: o.config.modules, log: o.logger ?? defaultLog });
+    const modules = new ModuleHost({ registry: o.moduleRegistry ?? builtinModules, resolved: o.config.modules, config: o.config, log: o.logger ?? defaultLog });
     const ref: { gw?: Gateway } = {};
     const backend = Gateway.kernelBackend(ref, o.logger ?? defaultLog);
     await modules.setup((id) => kernelContext(id, backend));
@@ -788,9 +821,8 @@ export class Gateway {
         writeTokenFile(gw.tokenFile, gw.token);
       }
       if (o.console) await gw.startConsole();
-      // Step 3: after the channels, the local socket and the console.
+      // Step 3: after the channels, the local socket and the console (the external MCP endpoint last).
       await gw.modules.start();
-      if (o.config.externalMcp) await gw.startExternalMcp();
     } catch (e) {
       await gw.stop().catch(() => undefined);
       throw e;
@@ -884,51 +916,11 @@ export class Gateway {
   }
 
   /**
-   * The external MCP endpoint (docs/design/external-mcp). A bad client token or token file
-   * fails the start; a port that is taken is logged, not fatal (as for the console).
-   */
-  private async startExternalMcp(): Promise<void> {
-    const c = this.o.config;
-    const cfg = c.externalMcp!;
-    const endpoint = new ExternalMcp({
-      config: cfg,
-      hostToken: this.token,
-      hub: this.hub,
-      outbox: this.outbox,
-      host: this.host,
-      outbound: (from, to) => this.externalOutbound(from, to),
-      sessions: () => this.adminSessions().sessions,
-      explain: (id, chain) => this.explain(id, chain),
-      status: () => {
-        const st = this.adminStatus();
-        return { channels: st.channels, host: st.host, agents: st.agents, sessions: st.sessions };
-      },
-      channelFor: (r) => this.channelFor(r),
-      noChannelMessage: (r) => this.noChannelMessage(r),
-      isSession: (key) => this.isOurSession(key),
-      lane: async (key) => this.lanes.get(key) ?? (await this.laneAfterClose(key)),
-      agentOf: (key) => this.agentOfSession(key),
-      record: (e) => this.router.record(e),
-      sending: (op, by) => (by ? this.externalSends.set(op, by) : this.externalSends.delete(op)),
-      stopped: () => this.stopped,
-      log: (level, msg) => this.log(level, msg),
-    });
-    let url: string;
-    try {
-      url = await endpoint.listen();
-    } catch (e) {
-      this.log('error', `external MCP endpoint not started: cannot listen on ${cfg.host}:${cfg.port}: ${(e as Error).message}`);
-      return;
-    }
-    this.externalMcp = { endpoint, url };
-    this.log('info', `external MCP endpoint on ${url} (clients: ${cfg.clients.map((x) => x.name).join(', ') || 'none'})`);
-  }
-
-  /**
-   * The outbound check of an external client's send (DL-6): a host that declared `outbound`
-   * decides, and while it is away nothing goes (an external send is never a turn's own reply
-   * route); an embedder's own `Policy.outbound` decides; otherwise the client's send scope,
-   * checked before, is the local allowance (what preregistered routes are for a turn).
+   * The outbound check of an external client's send (DL-6; the external MCP module asks it as
+   * `KernelContext.outbound`): a host that declared `outbound` decides, and while it is away
+   * nothing goes (an external send is never a turn's own reply route); an embedder's own
+   * `Policy.outbound` decides; otherwise the client's send scope, checked before, is the local
+   * allowance (what preregistered routes are for a turn).
    */
   private async externalOutbound(from: TurnContext, to: ReplyRoute): Promise<'allow' | 'deny'> {
     const held = this.host.outboundHeldBy();
@@ -959,6 +951,8 @@ export class Gateway {
     const h = this.host.info();
     const st = this.router.hostTable();
     const sessions = this.sessions();
+    // The modules' entries, and the external MCP endpoint's block where it always was (`ModuleFields.status`).
+    const modules = this.modules.report();
     return {
       version: DAEMON_VERSION,
       protocol: PROTOCOL_VERSION,
@@ -988,8 +982,8 @@ export class Gateway {
       sessions: { total: sessions.length, live: sessions.filter((s) => s.live).length, running: sessions.filter((s) => s.turnId !== undefined).length },
       runs: { running: this.runs.running() },
       queue: { head: this.hostQueue.head() },
-      ...(this.externalMcp ? { externalMcp: { url: this.externalMcp.url, clients: (c.externalMcp?.clients ?? []).map((x) => x.name) } } : {}),
-      modules: this.modules.status(),
+      ...(modules.fields as Partial<AdminStatus>),
+      modules: modules.modules,
     };
   }
 
@@ -3192,9 +3186,8 @@ ${a.summary}` }],
     for (const t of this.parkedTimers.values()) clearTimeout(t);
     this.parkedTimers.clear();
     this.host.close();
-    // No new external writes while stopping (the tools also answer "stopping").
-    await within(this.externalMcp?.endpoint.close(), 2000);
     // Step 4: the modules stop first, in reverse order (each bounded), while what they use still runs.
+    // The external MCP endpoint is the last registered: it closes first, so no new external write comes in.
     await this.modules.stop();
     await this.claudeTui.close();
     // Lives end first: the voice runs in the harness and the media peer in a channel, both about to go.
@@ -3286,6 +3279,11 @@ function isHandedContext(id: string, context: Set<string>): boolean {
 
 function fail(code: string, message = code): Outcome {
   return { ok: false, code, message };
+}
+
+/** How an outbox send ended, as a module's `KernelContext.send` answers it. */
+function sendResult(rec: DeliveryRecord): KernelSendResult {
+  return { status: rec.status, ...(rec.providerMessageId !== undefined ? { providerMessageId: rec.providerMessageId } : {}), ...(rec.error !== undefined ? { error: rec.error } : {}) };
 }
 
 /** Profiles every harness maps without configuration (Claude Code and Codex alike): `run.overrides` may name them on any instance. */
