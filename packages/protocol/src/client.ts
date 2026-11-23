@@ -48,7 +48,10 @@ export const ClientCommand = Type.Union([
     op: Type.Union([Type.Literal('set_model'), Type.Literal('set_effort'), Type.Literal('reset'), Type.Literal('resume_interrupted')]),
     arg: Type.Optional(Type.String()),
   }),
-  /** Live events follow as `event` frames; `fromSeq` replays `seq > fromSeq` first, omitted starts with a snapshot. */
+  /**
+   * Live events follow as `event` frames; `fromSeq` replays `seq > fromSeq` first. Omitted,
+   * behind what the log retains, or ahead of its head (the log was rebuilt): a snapshot first.
+   */
   Type.Object({
     type: Type.Literal('subscribe'),
     sessionKey: Type.String(),

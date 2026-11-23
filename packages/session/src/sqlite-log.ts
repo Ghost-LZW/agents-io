@@ -23,6 +23,8 @@ export class SqliteSessionLog extends BaseSessionLog {
     del: StatementSync;
     sessions: StatementSync;
   };
+  /** Depth of `transaction` calls in progress (names their savepoints). */
+  private savepoints = 0;
 
   constructor(opts: SqliteLogOptions = {}) {
     super(opts);
@@ -80,6 +82,37 @@ export class SqliteSessionLog extends BaseSessionLog {
     return this.storedSnapshot(sessionKey)?.seq ?? 0;
   }
 
+  /**
+   * One transaction on this database (`SessionLog.transaction`): `BEGIN IMMEDIATE`, or a
+   * savepoint when one is already open (by this log or by another writer of the same
+   * connection, e.g. the daemon's records). A throw rolls the store and the memory view back.
+   */
+  transaction<T>(fn: () => T): T {
+    const nested = this.db.isTransaction;
+    const sp = `aio_log_${this.savepoints + 1}`;
+    this.db.exec(nested ? `SAVEPOINT ${sp}` : 'BEGIN IMMEDIATE');
+    this.savepoints++;
+    this.beginMemory();
+    try {
+      const r = fn();
+      this.db.exec(nested ? `RELEASE ${sp}` : 'COMMIT');
+      this.commitMemory();
+      return r;
+    } catch (err) {
+      // A failed statement may have ended the transaction already; the first error is the one to report.
+      try {
+        if (nested) this.db.exec(`ROLLBACK TO ${sp}; RELEASE ${sp}`);
+        else if (this.db.isTransaction) this.db.exec('ROLLBACK');
+      } catch {
+        // nothing left to roll back
+      }
+      this.rollbackMemory();
+      throw err;
+    } finally {
+      this.savepoints--;
+    }
+  }
+
   /** Fold and delete all but the newest `keep` durable events of a session. */
   compact(sessionKey: string, keep = 0): void {
     const cut = this.head(sessionKey) - keep;
@@ -88,15 +121,10 @@ export class SqliteSessionLog extends BaseSessionLog {
     const fold = this.storedSnapshot(sessionKey) ?? emptySnapshot(sessionKey);
     // Only stored (durable) events are folded here, so ephemeral deltas never leak into it.
     for (const r of this.q.upTo.all(sessionKey, from, cut) as { json: string }[]) foldSnapshot(fold, JSON.parse(r.json) as SessionEvent);
-    this.db.exec('BEGIN');
-    try {
+    this.transaction(() => {
       this.q.snapPut.run(sessionKey, cut, JSON.stringify(fold));
       this.q.del.run(sessionKey, cut);
-      this.db.exec('COMMIT');
-    } catch (err) {
-      this.db.exec('ROLLBACK');
-      throw err;
-    }
+    });
   }
 
   sessions(): string[] {

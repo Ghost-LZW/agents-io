@@ -474,6 +474,8 @@ export class Gateway {
       hub: this.hub,
       policy: this.policy,
       store: this.records,
+      // DL-1: the outcome, the outbound index and delivery.settled commit together (records share the log's connection).
+      atomic: log instanceof SqliteSessionLog && this.records.db === log.db,
       // Which turn sent which platform message (the outbound index), and explain of a side effect by operationId.
       atSend: (d) => this.provenanceAtSend(d),
       onSettled: (d, rec, atSend) => this.indexOutbound(d, rec, atSend as OutboundRecord['provenance']),

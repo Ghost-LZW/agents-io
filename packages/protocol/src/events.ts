@@ -146,7 +146,8 @@ export const Body = Type.Union([
   T('session.bound', { nativeId: Type.String() }),
   /**
    * Folded state for late joiners; sent before live events when the requested
-   * fromSeq is no longer retained. `seq` on this event is the last folded seq.
+   * fromSeq is no longer retained, or is ahead of the log's head. `seq` on this
+   * event is the last folded seq.
    */
   T('session.snapshot', { snapshot: Type.Unknown() }),
   /** One-line status for low-bandwidth ends (speaker, watch, meeting screen). */

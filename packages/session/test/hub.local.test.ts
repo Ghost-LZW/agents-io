@@ -15,6 +15,21 @@ describe('Hub', () => {
     expect(hub.locate({ turnId: 'nope' })).toBeUndefined();
   });
 
+  it('a batch on a log without transactions (in memory) just runs: each append is published at once, a throw undoes nothing', () => {
+    const hub = new Hub(new MemorySessionLog());
+    const probe = hub.subscribe({ sessionKey: 's', fromSeq: 0, tier: 'full', bufferSize: 1 });
+    expect(() =>
+      hub.batch(() => {
+        hub.append('s', draft({ t: 'headline', text: 'a' }));
+        hub.append('s', draft({ t: 'headline', text: 'b' }));
+        expect(probe.lagging).toBe(true);
+        throw new Error('x');
+      }),
+    ).toThrow('x');
+    expect(hub.log.head('s')).toBe(2);
+    expect(hub.batch(() => 42)).toBe(42);
+  });
+
   it('keeps internal events out unless asked for', () => {
     const e = { ...draft({ t: 'headline', text: 'x' }), v: 1, sessionKey: 's', seq: 1, harness: 'h', generation: 1, visibility: 'internal' } as SessionEvent;
     expect(passes(e, 'full')).toBe(false);

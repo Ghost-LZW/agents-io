@@ -88,6 +88,15 @@ export interface OutboxOptions {
   /** Where `delivery.settled` events are written. */
   hub?: Hub;
   store?: OutboxStore;
+  /**
+   * The store and `onSettled` write into the hub log's database, on the same connection (the
+   * daemon's records and SQLite log): a settlement — the outcome, what `onSettled` writes and
+   * `delivery.settled` — then commits as one transaction (`Hub.batch`) or not at all. One
+   * that fails (or a crash in the middle) leaves the in-flight mark, which `recover` (or the
+   * next `deliver` of that id) settles as `unknown`. Unset, each of the three commits on its
+   * own. Leave it unset for a store on another connection: it would wait for the log's lock.
+   */
+  atomic?: boolean;
   /** Checked when a delivery names the turn it comes from (agent-initiated sends). */
   policy?: Pick<Policy, 'outbound'>;
   maxAttempts?: number;
@@ -134,6 +143,9 @@ export interface Delivery {
  * process that died is settled as `unknown` (by `recover`, or by the next
  * `deliver` of that id) and never replayed. Retries use exponential backoff; an
  * outcome that stays unclear (retries run out, an attempt times out) is `unknown`.
+ * A settlement that throws is not a failed attempt: the error reaches the caller,
+ * nothing is sent again, and with `atomic` nothing of it is kept but the in-flight
+ * mark (settled `unknown` like a crash's).
  */
 export class Outbox {
   private readonly store: OutboxStore;
@@ -254,17 +266,9 @@ export class Outbox {
         attempts: n,
         startedAt: Date.now(),
       });
+      let r: SendResult | void | typeof TIMED_OUT;
       try {
-        const r = await withTimeout(Promise.resolve().then(() => attempt(n)), timeout);
-        // The platform may have it: unknown, not retried.
-        if (r === TIMED_OUT) return settle({ ...rec, error: `attempt ${n} timed out after ${timeout} ms` });
-        return settle({
-          ...rec,
-          status: 'delivered',
-          ...(r && r.providerMessageId !== undefined ? { providerMessageId: r.providerMessageId } : {}),
-          ...(r && r.providerMessageIds?.length ? { providerMessageIds: [...r.providerMessageIds] } : {}),
-          ...(r && r.providerThreadId !== undefined ? { providerThreadId: r.providerThreadId } : {}),
-        });
+        r = await withTimeout(Promise.resolve().then(() => attempt(n)), timeout);
       } catch (err) {
         rec.error = err instanceof Error ? err.message : String(err);
         if ((err as { retryable?: unknown })?.retryable === false) return settle({ ...rec, status: 'rejected' });
@@ -272,35 +276,55 @@ export class Outbox {
           if (!this.draining) await Promise.race([sleep(Math.min(cap, base * 2 ** (n - 1))), this.stopping]);
           if (this.draining) return settle({ ...rec, error: `${rec.error}; not retried: stopping` });
         }
+        continue;
       }
+      // The attempt is over; settling is outside its `try`: a settlement that throws is not a failed send and never sends again.
+      // Timed out: the platform may have it: unknown, not retried.
+      if (r === TIMED_OUT) return settle({ ...rec, error: `attempt ${n} timed out after ${timeout} ms` });
+      return settle({
+        ...rec,
+        status: 'delivered',
+        ...(r && r.providerMessageId !== undefined ? { providerMessageId: r.providerMessageId } : {}),
+        ...(r && r.providerMessageIds?.length ? { providerMessageIds: [...r.providerMessageIds] } : {}),
+        ...(r && r.providerThreadId !== undefined ? { providerThreadId: r.providerThreadId } : {}),
+      });
     }
     return settle(rec);
   }
 
+  /**
+   * The outcome, then `onSettled`, then `delivery.settled`. With `atomic`, in one transaction:
+   * a throw (the log refuses the event) rolls all three back and leaves the in-flight mark.
+   */
   private settle(d: Pick<Delivery, 'sessionKey' | 'turnId'>, rec: DeliveryRecord, atSend?: unknown): DeliveryRecord {
     // Closed: the in-flight mark stays, and the next process settles it as unknown.
     if (this.closed) return rec;
-    this.store.put(rec);
-    try {
-      this.o.onSettled?.(d, rec, atSend);
-    } catch {
-      // an index is best effort; the outcome is recorded
-    }
-    this.o.hub?.append(d.sessionKey, {
-      ts: Date.now(),
-      ...(d.turnId !== undefined ? { turnId: d.turnId } : {}),
-      level: 'detail',
-      audience: 'status',
-      durability: 'durable',
-      visibility: 'operators',
-      body: {
-        t: 'delivery.settled',
-        operationId: rec.operationId,
-        route: rec.route,
-        result: rec.status,
-        ...(rec.providerMessageId !== undefined ? { providerMessageId: rec.providerMessageId } : {}),
-      },
-    });
+    const hub = this.o.hub;
+    const write = () => {
+      this.store.put(rec);
+      try {
+        this.o.onSettled?.(d, rec, atSend);
+      } catch {
+        // an index is best effort; the outcome is recorded
+      }
+      hub?.append(d.sessionKey, {
+        ts: Date.now(),
+        ...(d.turnId !== undefined ? { turnId: d.turnId } : {}),
+        level: 'detail',
+        audience: 'status',
+        durability: 'durable',
+        visibility: 'operators',
+        body: {
+          t: 'delivery.settled',
+          operationId: rec.operationId,
+          route: rec.route,
+          result: rec.status,
+          ...(rec.providerMessageId !== undefined ? { providerMessageId: rec.providerMessageId } : {}),
+        },
+      });
+    };
+    if (this.o.atomic && hub) hub.batch(write);
+    else write();
     return rec;
   }
 }

@@ -1,8 +1,9 @@
+import type { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
 import { FakeChannel } from '@agents-io/testkit';
 import type { RenderedMessage, ReplyRoute, SendOp } from '@agents-io/protocol';
-import { DeliveryRejected, Hub, MemoryOutboxStore, MemorySessionLog, Outbox, defaultPolicy } from '../src/index.js';
-import { bodies, route } from './helpers.js';
+import { DeliveryRejected, Hub, MemoryOutboxStore, MemorySessionLog, Outbox, SqliteSessionLog, defaultPolicy, type OutboxStore, type SessionLog } from '../src/index.js';
+import { bodies, route, take } from './helpers.js';
 
 class FlakyChannel extends FakeChannel {
   calls = 0;
@@ -25,6 +26,33 @@ class HangingChannel extends FakeChannel {
     await new Promise<void>((res) => (this.release = res));
     return super.send(r, msg, op);
   }
+}
+
+/** An OutboxStore on the log's own SQLite connection, like the daemon's records. */
+function sqlStore(db: DatabaseSync): OutboxStore {
+  db.exec('CREATE TABLE settled (id TEXT PRIMARY KEY, json TEXT NOT NULL); CREATE TABLE fly (id TEXT PRIMARY KEY, json TEXT NOT NULL)');
+  const one = (sql: string, id: string) => (db.prepare(sql).get(id) as { json: string } | undefined)?.json;
+  return {
+    get: (id) => JSON.parse(one('SELECT json FROM settled WHERE id = ?', id) ?? 'null') ?? undefined,
+    put: (rec) => {
+      db.prepare('INSERT OR REPLACE INTO settled VALUES (?, ?)').run(rec.operationId, JSON.stringify(rec));
+      db.prepare('DELETE FROM fly WHERE id = ?').run(rec.operationId);
+    },
+    begin: (rec) => void db.prepare('INSERT OR REPLACE INTO fly VALUES (?, ?)').run(rec.operationId, JSON.stringify(rec)),
+    inFlight: (id) => JSON.parse(one('SELECT json FROM fly WHERE id = ? AND id NOT IN (SELECT id FROM settled)', id) ?? 'null') ?? undefined,
+    allInFlight: () => (db.prepare('SELECT json FROM fly WHERE id NOT IN (SELECT id FROM settled)').all() as { json: string }[]).map((r) => JSON.parse(r.json)),
+  };
+}
+
+/** From now on the log refuses `delivery.settled` (a disk error) until `heal()`. */
+function refuseSettled(log: SessionLog): { heal: () => void } {
+  const append = log.append.bind(log);
+  let refuse = true;
+  log.append = (key, d) => {
+    if (refuse && d.body.t === 'delivery.settled') throw new Error('disk I/O error');
+    return append(key, d);
+  };
+  return { heal: () => (refuse = false) };
 }
 
 const noSleep = async () => {};
@@ -143,6 +171,49 @@ describe('Outbox', () => {
     expect(await ob.send(ch, { ...d('x'), from })).toMatchObject({ status: 'rejected', error: 'outbound check failed: host gone' });
     expect(ch.calls).toBe(0);
     expect(bodies(hub.log.read('s', 0))).toMatchObject([{ t: 'delivery.settled', result: 'rejected' }]);
+  });
+
+  it('a settlement that throws is not a failed attempt: the adapter is not called again and the caller gets the error #DL-1 #DL-2', async () => {
+    const hub = new Hub(new MemorySessionLog());
+    refuseSettled(hub.log);
+    const ch = new FlakyChannel(0);
+    const ob = new Outbox({ hub, sleep: noSleep });
+    await expect(ob.send(ch, d('op'))).rejects.toThrow('disk I/O error');
+    expect(ch.calls).toBe(1);
+  });
+
+  it('atomic: the outcome, what onSettled writes and delivery.settled commit together; refused, nothing is kept but the in-flight mark, nobody saw it, and recover settles it unknown #DL-1 #DL-2', async () => {
+    const log = new SqliteSessionLog();
+    const store = sqlStore(log.db);
+    log.db.exec('CREATE TABLE idx (id TEXT PRIMARY KEY, result TEXT NOT NULL)');
+    const hub = new Hub(log);
+    const sub = hub.subscribe({ sessionKey: 's', fromSeq: 0, tier: 'full' });
+    const onSettled = (_d: unknown, rec: { operationId: string; status: string }) => void log.db.prepare('INSERT OR REPLACE INTO idx VALUES (?, ?)').run(rec.operationId, rec.status);
+    const ob = new Outbox({ hub, store, atomic: true, onSettled, sleep: noSleep });
+    const ch = new FlakyChannel(0);
+    expect(await ob.send(ch, d('ok'))).toMatchObject({ status: 'delivered' });
+    expect(log.db.prepare('SELECT result FROM idx').all()).toEqual([{ result: 'delivered' }]);
+
+    const disk = refuseSettled(log);
+    await expect(ob.send(ch, d('op'))).rejects.toThrow('disk I/O error');
+    expect(ch.calls).toBe(2);
+    expect(store.get('op')).toBeUndefined();
+    expect(store.inFlight('op')).toMatchObject({ operationId: 'op', attempts: 1 });
+    expect(log.db.prepare("SELECT result FROM idx WHERE id = 'op'").all()).toEqual([]);
+    expect(log.head('s')).toBe(1);
+
+    // Healed (or the next process): the in-flight mark is settled unknown, logged and indexed once; never sent again.
+    disk.heal();
+    expect(ob.recover()).toMatchObject([{ operationId: 'op', status: 'unknown', attempts: 1 }]);
+    expect(await ob.send(ch, d('op'))).toMatchObject({ status: 'unknown' });
+    expect(ch.calls).toBe(2);
+    expect(log.db.prepare("SELECT result FROM idx WHERE id = 'op'").all()).toEqual([{ result: 'unknown' }]);
+    const seen = await take(sub, 2);
+    expect(seen.map((e) => [e.seq, e.body])).toEqual([
+      [1, { t: 'delivery.settled', operationId: 'ok', route: route(), result: 'delivered', providerMessageId: 'm1' }],
+      [2, { t: 'delivery.settled', operationId: 'op', route: route(), result: 'unknown' }],
+    ]);
+    sub.close();
   });
 
   it('drain waits for running attempts, stops retries; close leaves what still runs in flight for the next recover #DL-1', async () => {

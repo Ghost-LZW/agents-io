@@ -185,6 +185,14 @@ export interface SessionLog {
   /** Recent ephemeral events (bounded ring). */
   ephemeral(sessionKey: string): SessionEvent[];
   sessions(): string[];
+  /**
+   * Run `fn` (synchronous) as one transaction of the log's store, together with anything
+   * else written to the same database meanwhile: all of it commits, or a throw rolls all of
+   * it back, the in-memory head, fold and ephemeral ring included, and rethrows. A call
+   * inside another one is a savepoint of it. Only logs with a transactional store have it
+   * (`SqliteSessionLog`); `Hub.batch` uses it.
+   */
+  transaction?<T>(fn: () => T): T;
   close?(): void;
 }
 
@@ -202,10 +210,41 @@ interface SessionMeta {
 /** Shared seq/ring/fold logic; subclasses only store durable events. */
 export abstract class BaseSessionLog implements SessionLog {
   private meta = new Map<string, SessionMeta>();
+  /**
+   * Open undo frames, innermost last: each session's in-memory state as it was when the frame
+   * opened (undefined: not loaded then), taken before its first append in the frame.
+   */
+  private frames: Map<string, SessionMeta | undefined>[] = [];
   protected readonly ringSize: number;
 
   constructor(opts: LogOptions = {}) {
     this.ringSize = opts.ephemeralRing ?? 256;
+  }
+
+  /**
+   * For a subclass's `transaction`: from now on, what `append` changes in memory can be put
+   * back (`rollbackMemory`) or kept (`commitMemory`). Frames nest like savepoints.
+   */
+  protected beginMemory(): void {
+    this.frames.push(new Map());
+  }
+
+  /** The innermost frame's changes stay; an enclosing frame can still undo them. */
+  protected commitMemory(): void {
+    const frame = this.frames.pop();
+    const outer = this.frames.at(-1);
+    if (!frame || !outer) return;
+    for (const [key, before] of frame) if (!outer.has(key)) outer.set(key, before);
+  }
+
+  /** Put back what `append` changed in memory since the innermost frame opened. */
+  protected rollbackMemory(): void {
+    const frame = this.frames.pop();
+    if (!frame) return;
+    for (const [key, before] of frame) {
+      if (before) this.meta.set(key, before);
+      else this.meta.delete(key); // restored from the store when next asked
+    }
   }
 
   protected abstract persist(e: SessionEvent): void;
@@ -226,6 +265,11 @@ export abstract class BaseSessionLog implements SessionLog {
   }
 
   append(sessionKey: string, draft: EventDraft): SessionEvent {
+    const frame = this.frames.at(-1);
+    if (frame && !frame.has(sessionKey)) {
+      const was = this.meta.get(sessionKey);
+      frame.set(sessionKey, was && { head: was.head, fold: structuredClone(was.fold), ring: [...was.ring] });
+    }
     const m = this.metaOf(sessionKey);
     const ephemeral = isEphemeral(draft);
     // Spread first so unknown fields from newer producers are preserved.

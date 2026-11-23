@@ -39,7 +39,8 @@ export interface SubscribeOptions {
   sessionKey: string;
   /**
    * Last seq the subscriber has seen. Omitted: start with a snapshot (late joiner).
-   * Behind the log's floor: snapshot, then everything after it. Otherwise replay
+   * Behind the log's floor, or ahead of its head (a cursor from before the log was
+   * rebuilt or replaced): snapshot, then everything after it. Otherwise replay
    * `seq > fromSeq`, then live.
    */
   fromSeq?: number;
@@ -63,11 +64,17 @@ export interface Subscription extends AsyncIterable<SessionEvent> {
 /** How many turn/request ids `Hub.locate` remembers. */
 const LOCATE_WINDOW = 10_000;
 
-/** Fan-out over a `SessionLog`. All writes to a session go through `append`. */
+/**
+ * Fan-out over a `SessionLog`. All writes to a session go through `append`. Subscribers get
+ * events in seq order; a slow one loses only ephemeral events (`Subscription.dropped`) and
+ * re-reads durable ones from the log (`lagging`), it is never cut off (INVARIANTS LN-10).
+ */
 export class Hub {
   private subs = new Map<string, Set<Sub>>();
   /** `turn:<id>` / `req:<id>` → session key, from what was appended in this process. */
   private where = new Map<string, string>();
+  /** Appended inside the outermost `batch` in progress, published when it commits. */
+  private pending: SessionEvent[] | undefined;
 
   constructor(
     readonly log: SessionLog,
@@ -76,9 +83,38 @@ export class Hub {
 
   append(sessionKey: string, draft: EventDraft): SessionEvent {
     const e = this.log.append(sessionKey, draft);
-    this.index(e);
-    for (const s of this.subs.get(sessionKey) ?? []) s.offer(e);
+    if (this.pending) this.pending.push(e);
+    else this.publish(e);
     return e;
+  }
+
+  /**
+   * Run `fn` (synchronous) as one transaction of the log (`SessionLog.transaction`), with
+   * whatever else it writes to the log's database: its appends commit together and reach
+   * subscribers (and `locate`) only after the commit, in seq order. A throw rolls all of it
+   * back, the log's memory view included; nobody sees those events, and the error is
+   * rethrown. A batch inside a batch is a savepoint, published with the outer one. On a log
+   * without transactions (in memory) `fn` just runs and each append is published at once.
+   */
+  batch<T>(fn: () => T): T {
+    if (!this.log.transaction) return fn();
+    const outer = this.pending;
+    const mine: SessionEvent[] = [];
+    this.pending = mine;
+    let r: T;
+    try {
+      r = this.log.transaction(fn);
+    } finally {
+      this.pending = outer;
+    }
+    if (outer) outer.push(...mine);
+    else for (const e of mine) this.publish(e);
+    return r;
+  }
+
+  private publish(e: SessionEvent): void {
+    this.index(e);
+    for (const s of this.subs.get(e.sessionKey) ?? []) s.offer(e);
   }
 
   /**
@@ -133,13 +169,13 @@ class Sub implements Subscription {
     private readonly cap: number,
     private readonly detach: () => void,
   ) {
-    const head = log.head(o.sessionKey);
-    if (o.fromSeq === undefined || o.fromSeq < log.floor(o.sessionKey)) {
+    // Ahead of the head is not "nothing missed": the log this cursor came from is not this one.
+    if (o.fromSeq === undefined || o.fromSeq < log.floor(o.sessionKey) || o.fromSeq > log.head(o.sessionKey)) {
       const snap = log.snapshot(o.sessionKey);
       this.queue.push(snapshotEvent(projectSnapshot(snap, this.o.tier)));
       this.cursor = snap.seq;
     } else {
-      this.cursor = Math.min(o.fromSeq, head);
+      this.cursor = o.fromSeq;
     }
     // Replay synchronously: appends are synchronous too, so nothing slips in between.
     this.catchUp();
@@ -155,6 +191,8 @@ class Sub implements Subscription {
       return;
     }
     if (this.lagging) return;
+    // Already read from the log: it subscribed inside a batch that had not committed yet.
+    if (e.seq <= this.cursor) return;
     if (this.queue.length >= this.cap) {
       // Never drop a durable event: stop buffering and re-read from the log later.
       this.lagging = true;

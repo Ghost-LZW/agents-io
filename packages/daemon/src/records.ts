@@ -145,12 +145,20 @@ export class DaemonRecords implements OutboxStore {
 
   // ---- outbound index and causes (agent-messaging §4.3) -------------------
 
+  /** The row and its parts in one savepoint (inside the outbox's settlement transaction, INVARIANTS DL-1). */
   putOutbound(r: OutboundRecord): void {
     // Only a delivered message a turn made is a key the index answers by.
     const msg = r.result === 'delivered' && r.turnId !== undefined && r.providerMessageId !== undefined ? r.providerMessageId : null;
-    this.q.obPut.run(r.operationId, r.channel, msg, r.at, JSON.stringify(r));
-    if (msg === null) return;
-    for (const id of r.providerMessageIds ?? []) if (id !== msg) this.q.obPartPut.run(r.channel, id, r.operationId, r.at);
+    this.db.exec('SAVEPOINT outbound_put');
+    try {
+      this.q.obPut.run(r.operationId, r.channel, msg, r.at, JSON.stringify(r));
+      if (msg !== null) for (const id of r.providerMessageIds ?? []) if (id !== msg) this.q.obPartPut.run(r.channel, id, r.operationId, r.at);
+      this.db.exec('RELEASE outbound_put');
+    } catch (e) {
+      this.db.exec('ROLLBACK TO outbound_put');
+      this.db.exec('RELEASE outbound_put');
+      throw e;
+    }
   }
 
   /** The delivery an operationId names, if it settled. */
@@ -218,7 +226,7 @@ export class DaemonRecords implements OutboxStore {
     return r ? (JSON.parse(r.json) as DeliveryRecord) : undefined;
   }
 
-  /** The outcome and the end of the in-flight mark in one savepoint (also inside another transaction). */
+  /** The outcome and the end of the in-flight mark in one savepoint (also inside the outbox's settlement transaction). */
   put(rec: DeliveryRecord): void {
     this.db.exec('SAVEPOINT outbox_settle');
     try {

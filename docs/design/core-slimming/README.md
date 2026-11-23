@@ -1,6 +1,6 @@
 # 瘦身：定义核心流程，给每个功能分级，其余移成模块或交还宿主
 
-> 状态：已采纳（2026-11-23，决定 16）。§9 各项 owner 全部按推荐拍板。第 0 阶段已全部落地：守卫（§6）、第一条接缝 G1（`ChannelCaps.pacing`）、生产代码不再用 testkit、`aio e2e` 移出 daemon、飞书机器人开通连同它的 admin 类型移进 lark-bot。其余按 §4 推进。
+> 状态：已采纳（2026-11-23，决定 16）。§9 各项 owner 全部按推荐拍板。第 0 阶段已全部落地：守卫（§6）、第一条接缝 G1（`ChannelCaps.pacing`）、生产代码不再用 testkit、`aio e2e` 移出 daemon、飞书机器人开通连同它的 admin 类型移进 lark-bot。G10（outbox 结算一个事务、游标超前给快照、LN-10）也已落地。其余按 §4 推进。
 >
 > 参照：persona 的 [#13411](https://github.com/nwverse/persona/issues/13411)（功能瘦身：定义核心流程、给每个功能分级）、#13430（Persona Core 与模块、只降不升的守卫）、#13438 / #13551 / #13555（内建领域按第三方同一契约做成扩展；`interactive_sessions`、`work_executor` 契约）。persona 在 agent IO 上的做法见 §7。
 
@@ -118,7 +118,7 @@ flowchart LR
 | G7 | 标准投影 `attention`：从日志 fold 出"现在需要人"（有未答的人工请求、失败、等待），并用 fixture 固定。persona #13552 正需要这个，现在每个宿主各算一遍 | 宿主的角标、推送 |
 | G8 | 与语言无关的一致性 fixture：JSON 写的"输入序列 → 期望的事件与帧"，非 TS 的实现或宿主不用跑 TS 就能自检（persona 的 `spec/fixtures` 做法） | §8 的语言选择、§9 的通用组件定位 |
 | G9 | 标准协议适配：南向 ACP harness，北向 AG-UI / ACP 投影（POSITIONING §9） | 成为各框架的 IO 层 |
-| G10 | outbox 结算合成一个事务：结算记录、出站索引、`delivery.settled` 一起提交，扇出推迟到提交之后（`hub.batch`）。今天在 put 之后、append 之前崩溃，日志里就永远没有这条 settled，也不会自愈。附带：`fromSeq > head` 改发快照 | DL-1、EX-2、ID-8 的缝 |
+| G10 | outbox 结算合成一个事务：结算记录、出站索引、`delivery.settled` 一起提交，扇出推迟到提交之后（`hub.batch`）。原先在 put 之后、append 之前崩溃，日志里就永远没有这条 settled，也不会自愈。附带：`fromSeq > head` 改发快照。**已完成**：`SessionLog.transaction`（SQLite 日志：`BEGIN IMMEDIATE` / savepoint，回滚连同内存里的 head、fold）、`Hub.batch`、`OutboxOptions.atomic`（守护进程在日志与 records 同一连接时开）；结算抛错不再被当成失败的尝试重发。DL-1 先以 `it.fails` 复现再修好；新承诺 LN-10 | DL-1、EX-2、ID-8 的缝 |
 | G11 | 客户端命令的操作 id（feature `client.opId`）：回执与事件同一事务写入，重放时答第一次的结果，冲突时答 `op_id_conflict`，应答带 `seq` | 客户端断线重发导致重复打断、重复建话题和监听 |
 
 ## 4. 阶段
@@ -169,7 +169,7 @@ persona 在自己的 Go 服务里做了一整套 agent IO（代码位置以 `ori
 
 | persona 的机制 | agents-io 的对应物 | 借鉴什么 |
 |---|---|---|
-| 每会话一条 seq，批次带 `from_seq` / `to_seq`，客户端记录已覆盖到哪、用 `after_seq` 补洞；订阅者的队列（512 条）满了就断开，不静默丢消息（`docs/protocol/protocol.md`） | Log 的 seq、Hub 的 `fromSeq` 与快照；慢订阅者只丢 ephemeral 事件（`Subscription.dropped` 计数），durable 事件改从日志重读（`lagging`），不用断开 | agents-io 这里做得更细，但 INVARIANTS 没有对应条目。补一条"慢订阅者不丢 durable 事件"，并配上测试 |
+| 每会话一条 seq，批次带 `from_seq` / `to_seq`，客户端记录已覆盖到哪、用 `after_seq` 补洞；订阅者的队列（512 条）满了就断开，不静默丢消息（`docs/protocol/protocol.md`） | Log 的 seq、Hub 的 `fromSeq` 与快照；慢订阅者只丢 ephemeral 事件（`Subscription.dropped` 计数），durable 事件改从日志重读（`lagging`），不用断开 | agents-io 这里做得更细。已补 LN-10"慢订阅者只丢 ephemeral 事件、durable 事件从日志重读、游标超前先给快照"，配上测试 |
 | 三种状态分开：客户端操作回执（`X-Persona-Op-Id`：pending / done / failed / unknown，重试时重放）、传输状态（processing / delivered / failed / unknown）、执行状态（`Session.status`）；"1 秒内显示 Processing"写成超级规则 | `input.admitted` / `consumed` / `rejected`、`delivery.settled`、`session.state`、`acknowledge` 表情 | 方向一致。可以补上：客户端发命令也带操作 id，按 id 重放结果；把"多快给出已接收反馈"写成可测的承诺 |
 | `needs_you` / `working` / `unread` 等状态，以及 needs-you 计数，用 `spec/fixtures/{needs-you,attention}` 固定 | 没有 | G7 |
 | Claude Code 跑在交互式 TUI 面板里，靠 tail transcript、hooks 和插件桥工作；明确不用 `claude -p` 跑 agent（`docs/server/architecture.md`） | Agent SDK 无头运行，外加外部持有会话（决定 15） | "人在原生 TUI 里用、agents-io 旁挂 IO"是一等形态，不是边角情况。G3 的 `attach` 要按这种用法设计：谁持有进程、谁写输入 |
@@ -207,9 +207,9 @@ t3code（pingdotgg/t3code，MIT，Effect-TS）是开源 coding agent 控制台�
 |---|---|
 | `ProviderAdapterV2` + 能力标记，缺失时由编排层显式降级，不按 provider 名字分支 | G3。教训：它约 72 个能力标记里有约 46 个没有任何读取方，所以每个新 cap 都要有读取方和测试 |
 | 每个请求标注 `responseCapability`：进程在才能答、可以用新消息作答、重启后不可续 | `request.opened` 加可选字段，配合 RQ-2 和 RS 系列 |
-| 命令回执、事件、投影、outbox 在一个 SQLite 事务里，先提交后发布 | G10：outbox 结算今天分三步各自提交，见 §3 |
+| 命令回执、事件、投影、outbox 在一个 SQLite 事务里，先提交后发布 | G10（已完成）：outbox 结算的三步一个事务，提交之后才扇出，见 §3 |
 | 客户端带 `commandId`；被拒的也记回执；id 冲突单独报错；应答带 `sequence`，客户端据此读到自己的写 | G11：客户端命令的操作 id |
-| 续传有上限：游标超前、或者积压太多，就改发快照 | `fromSeq > head` 今天会被静默夹到 head，应改发快照（G10 附带） |
+| 续传有上限：游标超前、或者积压太多，就改发快照 | `fromSeq > head` 原先被静默夹到 head，现在改发快照（G10 附带，LN-10）；积压多时仍按批从日志重读，不改发快照 |
 | 真实 provider 的录制回放：NDJSON transcript，加上输入脚本和断言 | G8：transcript 沿用它的格式；输入和断言也写成数据，按端保持顺序、端与端之间不排序 |
 | Peer Link 的权限只缩不扩；子 agent 的 turn 结束不关父 Run | agent 之间的通信（`agent_run`）与 item 树各补一条不变量 |
 | 一次性配对码换取有 scope、可撤销的 session | 以后有远程或移动端接入时用；本地形态下，现在的 token 文件和每客户端令牌够用 |

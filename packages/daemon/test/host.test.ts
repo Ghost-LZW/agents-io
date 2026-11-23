@@ -249,6 +249,34 @@ describe('deliver, input.verify, explain', () => {
     expect(w2.chat.sent).toHaveLength(0);
   });
 
+  // INVARIANTS DL-1 不成立: the settled record commits before delivery.settled is written; nothing recovers it.
+  it('a settlement that fails after its record and before delivery.settled leaves nothing settled: the next start settles it unknown in its session, indexed, and does not send again #DL-1 #DL-2 #EX-2', async () => {
+    const w = await daemon();
+    const route = { channel: 'fake', account: 'default', conversationId: 'dm-alice' };
+    let calls = 0;
+    const send = w.chat.send.bind(w.chat);
+    w.chat.send = (r, m, op) => (calls++, send(r, m, op));
+    // From here on this process's log refuses delivery.settled (a disk error; a crash at this point is the same).
+    const log = w.gw.hub.log;
+    const append = log.append.bind(log);
+    log.append = (key, d) => {
+      if (d.body.t === 'delivery.settled') throw new Error('disk I/O error');
+      return append(key, d);
+    };
+    const h = await w.host();
+    await expect(h.deliver({ operationId: 'op-f', route, message: { text: 'sent, settlement lost' } })).rejects.toThrow('disk I/O error');
+    // The send worked: the adapter is not called again because the settlement failed.
+    expect(calls).toBe(1);
+    expect(log.read('host:xwo', 0).filter((e) => e.body.t === 'delivery.settled')).toEqual([]);
+    await w.stop();
+    const w2 = await daemon({ dir: w.dir });
+    expect(w2.gw.hub.log.read('host:xwo', 0).map((e) => e.body)).toContainEqual({ t: 'delivery.settled', operationId: 'host:op-f', route, result: 'unknown' });
+    expect(w2.gw.outbox.get('host:op-f')).toMatchObject({ status: 'unknown' });
+    expect(w2.gw.records.outboundByOperation('host:op-f')).toMatchObject({ sessionKey: 'host:xwo', result: 'unknown' });
+    expect(await (await w2.host()).deliver({ operationId: 'op-f', route, message: { text: 'again' } })).toMatchObject({ status: 'unknown', duplicate: true });
+    expect(w2.chat.sent).toHaveLength(0);
+  });
+
   it('after the 30-day prune of settled outbox records, the same operationId is not sent again #DL-2', async () => {
     const w = await daemon();
     const route = { channel: 'fake', account: 'default', conversationId: 'dm-alice' };
