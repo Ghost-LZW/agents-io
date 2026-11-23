@@ -2,9 +2,8 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { AdminChannelsApplied, AdminLarkBotJob, AdminLarkBotJobState, AdminLarkBotRequest } from '@agents-io/protocol';
-import { envRefs, type ConfigStore } from './console-config.js';
-import type { LogFn } from './gateway.js';
+import type { AdminChannelsApplied, ConfigIssue } from '@agents-io/protocol';
+import { AdminLarkBotRequest, type AdminLarkBotJob, type AdminLarkBotJobState } from './admin.js';
 
 /*
  * Lark bot provisioning for the console (`POST /api/bots/lark`): runs
@@ -24,6 +23,9 @@ import type { LogFn } from './gateway.js';
  * The job may wait minutes for a scan, so the config is checked again, as it is
  * then, before anything is written (same account, variable names, a duplicate
  * app, the startup validation).
+ * The daemon owns the config file, the env file and the log, and hands them in
+ * (`ProvisionConfig`, `envRefs`, `log`); its console serves the endpoints
+ * (admin.ts) and validates the `POST` body with `request`.
  */
 
 const FINAL = new Set<AdminLarkBotJobState>(['succeeded', 'failed', 'expired']);
@@ -52,8 +54,6 @@ const larkEntries = (raw: unknown): LarkEntry[] => {
 const accountOf = (c: LarkEntry) => (typeof c.account === 'string' ? c.account : 'default');
 /** An entry without explicit appId / appSecret reads the fixed LARK_APP_* variables. */
 const fallback = (c: LarkEntry) => c.config?.appId === undefined && c.config?.appSecret === undefined;
-/** Variables an entry reads its credentials from. */
-const entryVars = (c: LarkEntry): string[] => [...envRefs(c.config ?? {}), ...(fallback(c) ? ['LARK_APP_ID', 'LARK_APP_SECRET', 'LARK_DOMAIN'] : [])];
 
 /** A provisioning step refused against the config as it is now. */
 class ProvisionConflict extends Error {
@@ -65,15 +65,37 @@ class ProvisionConflict extends Error {
   }
 }
 
+/** What provisioning needs of the daemon's config file (the daemon's `ConfigStore` is one). */
+export interface ProvisionConfig {
+  /** The file's parsed content ({} when missing). */
+  read(): { raw: unknown };
+  /** Which of `names` the env file or the environment sets (names only; values never leave). */
+  defined(names: string[]): string[];
+  /** The env file create-lark-bot writes the credentials to. */
+  envFilePath(): string;
+  /** The value of one variable (same lookup as `defined`); compared with app ids only. */
+  lookup(name: string): string | undefined;
+  /**
+   * Write `fn`'s result if it passes the checks `PUT /api/config` runs; otherwise nothing is
+   * written and the issues come back. Errors thrown by `fn` propagate (nothing written).
+   */
+  updateValidated(fn: (raw: Record<string, unknown>) => Record<string, unknown>): { ok: true; revision: string } | { ok: false; issues: ConfigIssue[] };
+}
+
+/** The daemon's log, as provisioning writes to it. */
+export type ProvisionLog = (level: 'info' | 'warn', msg: string) => void;
+
 export interface LarkBotJobsOptions {
   /** argv of create-lark-bot (config `console.larkBotCommand`). */
   command: string[];
   /** Private work directory for QR and avatar files (0700). */
   dir: string;
-  config: ConfigStore;
+  config: ProvisionConfig;
+  /** Every `env:NAME` a channel entry's `config` references (the daemon's `envRefs`). */
+  envRefs: (config: Record<string, unknown>) => string[];
   /** `console.liveChannels`: apply the config's channels after a bot was added (the gateway's `applyChannels`). */
   applyChannels?: () => Promise<{ channels: AdminChannelsApplied } | undefined>;
-  log: LogFn;
+  log: ProvisionLog;
   /** Environment of the child (default process.env). */
   env?: NodeJS.ProcessEnv;
   /** Give up after this long (default 10 min). */
@@ -99,6 +121,8 @@ interface Job {
 export type StartOutcome = { ok: true; job: string } | { ok: false; status: 400 | 409; code: string; message: string };
 
 export class LarkBotJobs {
+  /** Schema of the `POST /api/bots/lark` body, checked before `start`. */
+  readonly request = AdminLarkBotRequest;
   private readonly jobs = new Map<string, Job>();
   private readonly now: () => number;
 
@@ -165,9 +189,14 @@ export class LarkBotJobs {
     const names = larkEnvNames(account);
     const mine = new Set([names.appId, names.appSecret, names.domain]);
     for (const c of entries) {
-      const shared = entryVars(c).filter((v) => mine.has(v));
+      const shared = this.entryVars(c).filter((v) => mine.has(v));
       if (shared.length) throw new ProvisionConflict('conflict', `the lark-bot channel with account ${accountOf(c)} reads ${[...new Set(shared)].join(', ')}, where account ${account}'s credentials would go; choose another account name`);
     }
+  }
+
+  /** Variables an entry reads its credentials from. */
+  private entryVars(c: LarkEntry): string[] {
+    return [...this.o.envRefs(c.config ?? {}), ...(fallback(c) ? ['LARK_APP_ID', 'LARK_APP_SECRET', 'LARK_DOMAIN'] : [])];
   }
 
   /** The app id an entry runs (its explicit appId, `env:` resolved, or LARK_APP_ID for a fallback entry). */
@@ -284,7 +313,7 @@ export class LarkBotJobs {
     if (addChannel || owner) {
       // The credentials are in the env file by now; if the config is not written they stay there, unreferenced.
       const left = `the credentials were written to ${this.o.config.envFilePath()} as ${names.appId}, ${names.appSecret}, ${names.domain}; no channel references them: remove them by hand (provisioning account ${account} again is refused while they are set)`;
-      let w: ReturnType<ConfigStore['updateValidated']>;
+      let w: ReturnType<ProvisionConfig['updateValidated']>;
       try {
         w = this.o.config.updateValidated((raw) => {
           if (addChannel) {

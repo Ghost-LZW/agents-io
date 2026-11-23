@@ -192,7 +192,11 @@ before any host frame; after it, the connection's client frames carry the origin
 
 `aio serve` also serves the console API of `packages/protocol/src/admin.ts`
 (HTTP under `/api`, WebSocket `/ws`), so a web UI in another repo can be built
-against the protocol alone.
+against the protocol alone. Lark bot provisioning (`/api/bots/lark`) belongs to
+the lark-bot module: its schemas are `channel/lark-bot/src/admin.ts`
+(`LARK_BOT_ADMIN_ENDPOINTS`, JSON Schemas in `channel/lark-bot/schema/`) and its
+jobs `LarkBotJobs` (`channel/lark-bot/src/provision.ts`); the daemon hands it the
+config file and serves the endpoints with the same auth.
 
 ```jsonc
 "console": {

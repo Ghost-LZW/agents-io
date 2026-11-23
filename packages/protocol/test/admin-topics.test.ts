@@ -110,7 +110,7 @@ describe('admin API', () => {
   it('lists every endpoint once, with schemas #PR-1', () => {
     const keys = ADMIN_ENDPOINTS.map((e) => `${e.method} ${e.path}`);
     expect(new Set(keys).size).toBe(keys.length);
-    for (const k of ['GET /api/status', 'GET /api/config', 'PUT /api/config', 'POST /api/config/validate', 'GET /api/explain/:inputId', 'GET /api/queue', 'GET /api/sessions', 'POST /api/bots/lark', 'GET /api/bots/lark/:job']) {
+    for (const k of ['GET /api/status', 'GET /api/config', 'PUT /api/config', 'POST /api/config/validate', 'GET /api/explain/:inputId', 'GET /api/queue', 'GET /api/sessions']) {
       expect(keys).toContain(k);
     }
     for (const e of ADMIN_ENDPOINTS) {

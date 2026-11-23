@@ -98,13 +98,12 @@ import { HostMcpServer, HostTools, ToolError, agentIdentity, type TopicHandover 
 import { ClaudeCodeHarness, findOnPath, type ClaudeCodeHarnessConfig } from '@agents-io/harness-claude-code';
 import { CodexHarness, type CodexProfile } from '@agents-io/harness-codex';
 import { loadChannelModule } from './channel-module.js';
-import { LarkBotAdapter } from '@agents-io/channel-lark-bot';
+import { LarkBotAdapter, LarkBotJobs } from '@agents-io/channel-lark-bot';
 import { MailChannel, type MailChannelConfig } from '@agents-io/channel-mail';
 import { spawnChannel, type BridgedChannel, type BridgeState } from '@agents-io/channel-jsonl-bridge';
 import { ConfigError, RESERVED_CHANNEL_IDS, UNGRANTED_EVIDENCE, agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type PresetConfig, type ResolvedChannel } from './config.js';
 import { ConsoleServer } from './console.js';
-import { ConfigStore, canonical } from './console-config.js';
-import { LarkBotJobs } from './provision.js';
+import { ConfigStore, canonical, envRefs } from './console-config.js';
 import type { ClientCommand, SessionInfo } from './frames.js';
 import { HostService, isHostOrigin } from './host.js';
 import { LocalServer } from './local-server.js';
@@ -646,6 +645,7 @@ export class Gateway {
         command: c.console.larkBotCommand,
         dir: join(c.dataDir, 'provision'),
         config: store,
+        envRefs,
         ...(c.console.liveChannels ? { applyChannels: () => this.applyChannels() } : {}),
         log: (level, msg) => this.log(level, msg),
         ...(o.consoleEnv ? { env: o.consoleEnv } : {}),

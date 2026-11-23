@@ -241,7 +241,7 @@
 ### HQ-6 同一时刻至多一个宿主；接管要 token；/ws 有心跳
 
 - **承诺**：带 `consumer` 或回调的 `hello` 才是宿主，同时至多一个；第二个默认 `host_connected`，`takeover: true` 且 token 正确才替换旧连接；`/ws` 心跳清掉半开连接。
-- **实现**：`host.ts:155-180`（`timingSafeEqual` 先于角色判断）；`packages/daemon/src/console.ts:435-456`。
+- **实现**：`host.ts:155-180`（`timingSafeEqual` 先于角色判断）；`packages/daemon/src/console.ts` `heartbeat`（`/ws` 心跳）。
 - **测试**：`host-liveness.test.ts` "closes a connection that stops answering pings, which frees the host role #HQ-6"、`host-liveness.e2e.test.ts` "keeps a connection that answers #HQ-6"、`host-liveness.test.ts` "without takeover a second host is refused; with it the old connection is closed and its unacked push goes to the new host #HQ-6 #HQ-1"、`host-liveness.e2e.test.ts` "over /ws: a takeover closes the old (half-open) connection, which goes away even though it never answers #HQ-6"、`host-liveness.test.ts` "takeover with no host connected is a plain hello #HQ-6"。
 - **状态**：有测试。
 - **注意**：心跳只在 `/ws`；unix socket 上的半开宿主连接一直占着宿主位，直到有人 takeover。
@@ -770,8 +770,8 @@
 ### PR-1 线上的每种值都有 schema，守护进程实际发出的值通过它
 
 - **承诺**：每个线上帧（通道、harness、客户端、宿主）、会话事件、宿主请求的结果值、admin 端点的请求与答复都有 TypeBox schema；守护进程实际发出的值通过对应的 schema；admin 端点各列一次。
-- **实现**：`packages/protocol/src/events.ts` `SessionEvent`；`packages/protocol/src/wire.ts` `ChannelHostFrame` / `ChannelAdapterFrame` / `HarnessHostFrame` / `HarnessAdapterFrame`；`packages/protocol/src/client.ts` `ClientFrame` / `ServerFrame`；`packages/protocol/src/host.ts` `HostRequestFrame` / `HostEventFrame` / `HOST_RESULT_VALUES`；`packages/protocol/src/admin.ts` `ADMIN_ENDPOINTS`；`packages/protocol/src/validate.ts` `check` / `errors`。收到的帧在入口校验（`packages/daemon/src/local-server.ts` 的 `check(HostRequestFrame, …)`、`channel/jsonl-bridge/src/host.ts` 的 `check(ChannelAdapterFrame, …)`）。
-- **测试**：标签 `#PR-1`；例：`packages/protocol/test/protocol.test.ts` "validates session events #PR-1"、"validates a binding table and host frames #PR-1"；`packages/protocol/test/admin-topics.test.ts` "a result-value schema for every host request #PR-1"、"lists every endpoint once, with schemas #PR-1"；`packages/daemon/test/host-results.test.ts` "match the protocol schemas #PR-1"；`packages/daemon/test/console.test.ts` "match the protocol schemas and the daemon state #PR-1"；`packages/daemon/test/frames.test.ts` "server frames validate #PR-1"。
+- **实现**：`packages/protocol/src/events.ts` `SessionEvent`；`packages/protocol/src/wire.ts` `ChannelHostFrame` / `ChannelAdapterFrame` / `HarnessHostFrame` / `HarnessAdapterFrame`；`packages/protocol/src/client.ts` `ClientFrame` / `ServerFrame`；`packages/protocol/src/host.ts` `HostRequestFrame` / `HostEventFrame` / `HOST_RESULT_VALUES`；`packages/protocol/src/admin.ts` `ADMIN_ENDPOINTS`（核心端点）；模块自带的端点与 schema：`channel/lark-bot/src/admin.ts` `LARK_BOT_ADMIN_ENDPOINTS`（飞书机器人开通）；`packages/protocol/src/validate.ts` `check` / `errors`。收到的帧在入口校验（`packages/daemon/src/local-server.ts` 的 `check(HostRequestFrame, …)`、`channel/jsonl-bridge/src/host.ts` 的 `check(ChannelAdapterFrame, …)`）。
+- **测试**：标签 `#PR-1`；例：`packages/protocol/test/protocol.test.ts` "validates session events #PR-1"、"validates a binding table and host frames #PR-1"；`packages/protocol/test/admin-topics.test.ts` "a result-value schema for every host request #PR-1"、"lists every endpoint once, with schemas #PR-1"；`channel/lark-bot/test/admin.test.ts` "lists its admin endpoints once, with schemas, none shared with ADMIN_ENDPOINTS #PR-1"；`packages/daemon/test/host-results.test.ts` "match the protocol schemas #PR-1"；`packages/daemon/test/console.test.ts` "match the protocol schemas and the daemon state #PR-1"；`packages/daemon/test/frames.test.ts` "server frames validate #PR-1"。
 - **状态**：有测试。
 - **注意**：守护进程运行时不校验自己发出的值，"发出的值通过 schema"只由上面的测试守着；新增结果字段或端点时要同时改 schema 与这些测试。
 

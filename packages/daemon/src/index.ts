@@ -9,4 +9,3 @@ export * from './token.js';
 export { FrameConn, LocalServer, type FrameTransport, type HostFrames, type LocalHost, type Peer } from './local-server.js';
 export * from './console.js';
 export * from './console-config.js';
-export * from './provision.js';

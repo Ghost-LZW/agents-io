@@ -2,7 +2,8 @@ import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { AdminConfigDocument, AdminLarkBotJob, check } from '@agents-io/protocol';
+import { AdminLarkBotJob } from '@agents-io/channel-lark-bot';
+import { AdminConfigDocument, check } from '@agents-io/protocol';
 import { consoleDaemon } from './console-helpers.js';
 
 const FAKE_BOT = fileURLToPath(new URL('./fixtures/fake-create-lark-bot.mjs', import.meta.url));

@@ -31,7 +31,7 @@ Lark / email / private channel (JSONL) / terminal
 | `packages/session` | In-memory or SQLite sequenced logs, subscriptions and snapshots, Lane batching, steering, reconciliation, and approval resolution, plus default policy, Outbox, and Compositor. |
 | `harness/claude-code` | Runs Claude Code through the Claude Agent SDK. |
 | `harness/codex` | Uses `codex app-server` over stdio or a Unix socket; a host restart does not interrupt an active turn. |
-| `channel/lark-bot` | Official Lark/Feishu bot with a long-lived connection and streaming cards. Create an app with [create-lark-bot](https://github.com/Ghost-LZW/create-lark-bot). |
+| `channel/lark-bot` | Official Lark/Feishu bot with a long-lived connection and streaming cards. Create an app with [create-lark-bot](https://github.com/Ghost-LZW/create-lark-bot), or from the console (`POST /api/bots/lark`, whose schemas live in this package's `schema/`). |
 | `channel/mail` | Receives via IMAP and sends via SMTP, using DKIM/DMARC as identity evidence. |
 | `channel/jsonl-bridge` | Connects private channels written in any language over stdio or a socket. |
 | `packages/daemon` | The `aio` daemon and CLI: channels, bindings, host protocol, task runs, host inbound queue, terminal endpoints, and an optional external MCP endpoint for agents outside the daemon. |

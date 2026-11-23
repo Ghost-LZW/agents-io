@@ -4,7 +4,7 @@ agents-io channel adapter for the official Feishu/Lark bot platform: events arri
 
 ## Create a bot
 
-Provision the app with [create-lark-bot](https://github.com/Ghost-LZW/create-lark-bot); this package does not create or configure apps. Pass it a custom name and avatar, and request at least what this adapter needs:
+Provision the app with [create-lark-bot](https://github.com/Ghost-LZW/create-lark-bot); the adapter does not create or configure apps. Pass it a custom name and avatar, and request at least what this adapter needs:
 
 - events `im.message.receive_v1`, `im.message.reaction.created_v1`, `im.message.reaction.deleted_v1`, callback `card.action.trigger`;
 - the tenant scopes in `src/requirements.ts` (`TENANT_SCOPES`, also exported). `runtime` scopes are required; `optional` ones enable reading non-@ group messages (and a group's history when @-ed) and attachment download.
@@ -21,6 +21,8 @@ npx github:Ghost-LZW/create-lark-bot#v0.2.3 verify --live
 ```
 
 `messaging` covers every scope, event and callback in `requirements.ts`; `contact` lets the tool resolve your union_id, which it writes as the owner key.
+
+The aio console can do this for you (`POST /api/bots/lark`, see the daemon README's Console API section): `LarkBotJobs` (`src/provision.ts`) runs create-lark-bot, follows it through the QR scan, and adds the channel to the config file the daemon hands it (`ProvisionConfig`). The endpoints and their schemas are `src/admin.ts` (`LARK_BOT_ADMIN_ENDPOINTS`; JSON Schemas in `schema/`).
 
 Inbound `merge_forward` messages are expanded with `im.v1.message.get`: the agent receives the child messages in their original hierarchy (`upper_message_id`), with numbered paths such as `2.3`, sender IDs, text, and rich text. The first four images/files/audio/video resources (including those in rich text) are downloaded using the outer forwarded message ID and attached after the text, labeled by the same path. Text is capped at 100 messages and 16,000 characters. If the bot cannot read the forwarded content or download a resource, the input says so explicitly.
 

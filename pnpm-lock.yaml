@@ -36,6 +36,9 @@ importers:
       '@larksuiteoapi/node-sdk':
         specifier: ^1.0.0
         version: 1.74.0
+      '@sinclair/typebox':
+        specifier: ^0.34.0
+        version: 0.34.52
     devDependencies:
       '@agents-io/testkit':
         specifier: workspace:*

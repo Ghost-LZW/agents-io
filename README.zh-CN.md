@@ -31,7 +31,7 @@ agents-io 提供底层机制。信任、审批、模型选择、任务和记忆�
 | `packages/session` | 带序号的内存或 SQLite 日志、订阅与快照、Lane 的合批、steer、对账与审批处理，以及默认策略、Outbox 和 Compositor。 |
 | `harness/claude-code` | 通过 Claude Agent SDK 驱动 Claude Code。 |
 | `harness/codex` | 通过 stdio 或 Unix socket 使用 `codex app-server`；宿主重启不会打断进行中的轮次。 |
-| `channel/lark-bot` | 官方飞书/Lark 机器人，支持长连接和流式卡片；可用 [create-lark-bot](https://github.com/Ghost-LZW/create-lark-bot) 创建应用。 |
+| `channel/lark-bot` | 官方飞书/Lark 机器人，支持长连接和流式卡片；可用 [create-lark-bot](https://github.com/Ghost-LZW/create-lark-bot) 创建应用，也可以在控制台开通（`POST /api/bots/lark`，schema 在本包的 `schema/` 下）。 |
 | `channel/mail` | 通过 IMAP 收信、SMTP 发信，以 DKIM/DMARC 作为身份证据。 |
 | `channel/jsonl-bridge` | 通过 stdio 或 socket 接入用任何语言编写的私有通道。 |
 | `packages/daemon` | `aio` 守护进程与命令行：通道、Binding 表、宿主协议、task run、宿主入站队列、终端端点，以及可选的对外 MCP 端点（给守护进程之外的 agent）。 |

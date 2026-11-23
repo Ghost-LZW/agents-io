@@ -11,7 +11,6 @@ import {
   type AdminChannelsApplied,
   AdminConfigPut,
   AdminConfigValidateRequest,
-  AdminLarkBotRequest,
   AdminLoginRequest,
   PROTOCOL_VERSION,
   check,
@@ -28,11 +27,12 @@ import { isLoopbackHost, isWildcardHost, type ConsoleConfig } from './config.js'
 import type { ConfigStore } from './console-config.js';
 import type { LogFn } from './gateway.js';
 import { FrameConn, type FrameTransport, type LocalHost } from './local-server.js';
-import type { LarkBotJobs } from './provision.js';
 
 /*
  * The console API (packages/protocol/src/admin.ts): HTTP endpoints under
  * `/api` and the WebSocket `/ws`, for web UIs built against the protocol only.
+ * Bot provisioning (`/api/bots/lark`) is a module's: its schemas and jobs are
+ * channel/lark-bot's (`admin.ts`, `provision.ts`), handed in as `BotProvisioning`.
  *
  * - Listens on loopback unless the config allows otherwise (config.ts refuses
  *   a non-loopback host without `console.allowRemote`).
@@ -73,6 +73,15 @@ const WS_HIGH_WATER = 4 * 1024 * 1024;
 const WS_CLOSE_GRACE_MS = 1000;
 const STATUS_TEXT: Record<number, string> = { 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found' };
 
+/** Bot provisioning jobs as the console serves them (`POST` a job, `GET` its state). */
+export interface BotProvisioning {
+  /** Schema of the `POST` body; `start` gets only bodies that pass it. */
+  readonly request: TSchema;
+  start(req: unknown): { ok: true; job: string } | { ok: false; status: 400 | 409; code: string; message: string };
+  /** The job's state, or undefined for an unknown job. */
+  get(id: string): unknown;
+}
+
 /** What the console needs from the daemon. */
 export interface ConsoleHost {
   /** For `/ws` connections (the same as the local socket's). */
@@ -87,7 +96,7 @@ export interface ConsoleHost {
   consoleOrigin(sessionKey: string): Origin;
   /** Absent: the daemon was started without a config file path (`/api/config*` answer 404). */
   readonly configStore?: ConfigStore;
-  readonly larkBots?: LarkBotJobs;
+  readonly larkBots?: BotProvisioning;
   /** `console.liveChannels`: apply the file's `channels` to the running daemon after a `PUT`. */
   applyChannels?(): Promise<{ applied: 'live' | 'restart'; channels: AdminChannelsApplied } | undefined>;
 }
@@ -352,7 +361,7 @@ export class ConsoleServer {
       const jobs = h.larkBots;
       if (!jobs) throw new HttpError(404, 'not_found', 'bot provisioning needs a config file');
       if (m === 'POST' && p === '/api/bots/lark') {
-        const r = jobs.start(await readJson(req, AdminLarkBotRequest));
+        const r = jobs.start(await readJson(req, jobs.request));
         if (!r.ok) throw new HttpError(r.status, r.code, r.message);
         return { status: 202, body: { job: r.job } };
       }

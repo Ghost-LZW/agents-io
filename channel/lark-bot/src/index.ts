@@ -10,3 +10,5 @@ export { DedupWindow, MemoryDeclaredSenderStore, type DeclaredSenderStore } from
 export { defaultLarkDeps } from './sdk.js';
 export type * from './types.js';
 export { APP_CALLBACKS, APP_EVENTS, REGISTERABLE_HANDLERS, TENANT_SCOPES, scopesJson, tenantScopeNames, type ScopeRequirement } from './requirements.js';
+export * from './admin.js';
+export { LarkBotJobs, larkEnvNames, type LarkBotJobsOptions, type ProvisionConfig, type ProvisionLog, type StartOutcome } from './provision.js';
