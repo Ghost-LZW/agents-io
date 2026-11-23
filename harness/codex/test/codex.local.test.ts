@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { FakeChannel, defaultChannelCaps } from '@agents-io/testkit';
 import { Compositor, Hub, Ingress, Lane, MemorySessionLog, Outbox, defaultPolicy } from '@agents-io/session';
-import { diffStats, summarizeItem } from '../src/index.js';
+import type { BlobAccess } from '@agents-io/protocol';
+import { CodexHarness, diffStats, summarizeItem, type CodexHarnessOptions } from '../src/index.js';
 import { displayCommand } from '../src/map.js';
 import { collector, input, isCompleted, open, run, setup, tick } from './codex-helpers.js';
 
@@ -18,6 +19,57 @@ describe('open', () => {
     expect(p.config.mcp_servers.agents_io).toEqual({ url: 'http://127.0.0.1:9/mcp', http_headers: { Authorization: 'Bearer tok' }, default_tools_approval_mode: 'approve' });
     // null keeps Codex's own base prompt (checked: codex-cli 0.162 records its ~20k-character prompt).
     expect(p).toMatchObject({ baseInstructions: null, developerInstructions: null });
+  });
+});
+
+describe('what the host hands over: instructions, a session env, media', () => {
+  it('the agent instructions are the developer instructions, over options.developerInstructions', async () => {
+    const { fake, harness } = setup();
+    await open(harness, { instructions: 'Be brief.', options: { developerInstructions: 'from the config' } });
+    await open(harness, { sessionKey: 's2', options: { developerInstructions: 'from the config' } });
+    expect(fake.sent('thread/start').map((m) => m.params.developerInstructions)).toEqual(['Be brief.', 'from the config']);
+  });
+
+  it("a session env needs an app-server of the session's own: stdio sets one up (ownProcess), a shared unix server refuses", () => {
+    const opts = (h: CodexHarness) => (h as unknown as { opts: CodexHarnessOptions }).opts;
+    const resolveMedia = () => null;
+    const stdio = new CodexHarness({ bin: '/x', env: { BASE: '1' }, codexHome: '/h1', transport: { kind: 'stdio' }, profiles: { p: { approvalPolicy: 'never' } }, resolveMedia });
+    expect(stdio.sessionEnv).toBe('own-process');
+    const own = stdio.ownProcess({ env: { FOO: 'bar', CODEX_HOME: '/h2' } });
+    expect(own).not.toBe(stdio);
+    expect(opts(own)).toMatchObject({ bin: '/x', env: { BASE: '1', FOO: 'bar', CODEX_HOME: '/h2' }, codexHome: '/h2', transport: { kind: 'stdio' }, profiles: { p: { approvalPolicy: 'never' } }, resolveMedia });
+    // Without CODEX_HOME in the env the instance's home stays.
+    expect(opts(stdio.ownProcess({ env: { FOO: 'x' } })).codexHome).toBe('/h1');
+
+    const unix = new CodexHarness({ bin: '/x', transport: { kind: 'unix', spawn: 'own', stateDir: '/nonexistent/state' } });
+    expect(unix.sessionEnv).toEqual({ refused: 'a shared Codex app-server (unix transport)' });
+    // A task run still gets one over stdio, which does not outlive the host.
+    const run = unix.ownProcess({ env: { AGENTS_IO_RUN_ID: 'r1' } });
+    expect(opts(run).transport).toEqual({ kind: 'stdio' });
+    expect(run.adopts).toBe(false);
+    expect(run.sessionEnv).toBe('own-process');
+  });
+
+  it('an own-process adapter runs its own server: opening on it starts another one', async () => {
+    const { fake, harness } = setup();
+    await open(harness);
+    await open(harness.ownProcess({ env: { FOO: 'bar' } }), { sessionKey: 's2' });
+    expect(fake.spawned).toBe(2);
+  });
+
+  it('media inputs resolve against the blob store it is given (local paths); an explicit resolver wins', async () => {
+    const blobs: BlobAccess = {
+      stat: async (ref) => (ref === 'sha256:1' ? { path: '/blobs/1.png', mime: 'image/png', size: 3 } : undefined),
+      get: async () => {
+        throw new Error('not read');
+      },
+    };
+    const resolve = (h: CodexHarness) => (h as unknown as { opts: CodexHarnessOptions }).opts.resolveMedia!;
+    const fromStore = resolve(new CodexHarness({ blobs }));
+    expect(await fromStore({ type: 'image', ref: 'sha256:1', mime: 'image/png' })).toEqual({ path: '/blobs/1.png' });
+    expect(await fromStore({ type: 'image', ref: 'lark-file:om_1/k', mime: 'image/*' })).toBeNull();
+    const own = () => ({ url: 'https://e.x/1.png' });
+    expect(resolve(new CodexHarness({ blobs, resolveMedia: own }))).toBe(own);
   });
 });
 

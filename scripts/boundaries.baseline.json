@@ -15,15 +15,7 @@
     "import:@agents-io/channel-mail": 1,
     "import:@agents-io/harness-claude-code": 1,
     "import:@agents-io/harness-codex": 1,
-    "vendor": 75
-  },
-  "packages/daemon/src/launch.ts": {
-    "vendor": 2
-  },
-  "packages/daemon/src/media.ts": {
-    "import:@agents-io/harness-claude-code": 1,
-    "import:@agents-io/harness-codex": 1,
-    "vendor": 2
+    "vendor": 64
   },
   "packages/daemon/src/tui-bridge.ts": {
     "vendor": 2

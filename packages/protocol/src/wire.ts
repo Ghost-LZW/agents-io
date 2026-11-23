@@ -103,6 +103,8 @@ export const HarnessHostFrame = Type.Union([
     options: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
     /** Extra child-process environment for this session (`HarnessOpenArgs.env`). */
     env: Type.Optional(Type.Record(Type.String(), Type.String())),
+    /** The agent's instructions for this session (`HarnessOpenArgs.instructions`). */
+    instructions: Type.Optional(Type.String()),
   }),
   Type.Object({
     ...Req('startTurn'),

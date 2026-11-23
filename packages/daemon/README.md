@@ -104,6 +104,19 @@ see `docs/E2E.md` §0). New:
   only on Codex"; else the instance name). Without them those commands answer that they are
   unavailable. `ephemeralOpen: true` (Codex) is transitional: topic titles are generated in an
   ephemeral session of a harness that declares it, until a host hook replaces them (G4).
+  A launched session's env (decision 7) reaches the harness as its adapter declares
+  (`sessionEnv`): `'open'` (the default; Claude Code) puts it in the open args;
+  `'own-process'` (Codex over stdio) runs the session on the adapter `ownProcess({ env, cwd })`
+  returns, disposed when the session's lane closes; `{ refused }` (Codex on a Unix socket:
+  "a shared Codex app-server (unix transport)") refuses a launch with env
+  (`launch_unsupported`), a cwd alone is fine. A task run always gets a process of its own
+  when the adapter has `ownProcess` (the run's env joins the instance's, under its configured
+  config dir). The agent's instructions arrive as `HarnessOpenArgs.instructions` (Claude Code
+  appends them to its preset system prompt, Codex sends them as developer instructions); a
+  module harness also gets them as `options.developerInstructions` for now. A module's factory
+  gets the daemon's blob store (`init.blobs`: `stat` / `get`), which the built-in adapters
+  resolve media inputs with too (Claude Code's 3.75 MB inline image limit lives in its
+  package); resolvers given in the open options win.
 - **Live (realtime voice, decision 11)**: a Codex instance with `"live": true` opts
   its app-server connection into Codex's experimental realtime API. Agents on it
   (with `tools`) get `live_join { target, channel?, instructions?, voice? }`,

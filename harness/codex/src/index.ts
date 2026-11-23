@@ -4,6 +4,7 @@ export { CodexSession, classifySteerError, type CodexOpenOptions, type TurnSnaps
 export {
   DEFAULT_PROFILES,
   FALLBACK_PROFILE,
+  blobMediaResolver,
   diffStats,
   CONTEXT_LABEL,
   renderInputs,

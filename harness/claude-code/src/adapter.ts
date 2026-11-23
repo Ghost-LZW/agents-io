@@ -3,7 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { accessSync, constants, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { delimiter, dirname, join } from 'node:path';
-import type { HarnessAdapter, HarnessCaps, HarnessOpenArgs, HarnessSession } from '@agents-io/protocol';
+import type { BlobAccess, HarnessAdapter, HarnessCaps, HarnessOpenArgs, HarnessSession } from '@agents-io/protocol';
+import { blobResolvers } from './media.js';
 import { AsyncQueue } from './queue.js';
 import { ClaudeCodeSession, defaultProfile, isEffort } from './session.js';
 import type { ClaudeCodeOptions, ClaudeProfile, Options, QueryFn, SDKUserMessage } from './types.js';
@@ -62,6 +63,11 @@ export interface ClaudeCodeHarnessConfig {
   additionalDirectories?: string[];
   /** Profile name → native settings, defaults for every session (per-open `options.profiles` win). */
   profiles?: Record<string, ClaudeProfile>;
+  /**
+   * The host's blob store (`HarnessFactoryInit.blobs`): media inputs resolve against it
+   * (`blobResolvers`) unless the open options give `resolveImage` / `resolveFile`.
+   */
+  blobs?: BlobAccess;
   /** Injected `query` (tests). Default: the Agent SDK's. */
   query?: QueryFn;
   /** Override detected versions (tests). */
@@ -116,6 +122,8 @@ export class ClaudeCodeHarness implements HarnessAdapter {
   readonly displayName = 'Claude Code';
   /** `/compact` sent as the turn's user message compacts the session (`compact_boundary`, no answer text). */
   readonly compact = { command: '/compact' } as const;
+  /** Every session runs its own CLI child: `args.env` is the top layer of its environment. */
+  readonly sessionEnv = 'open';
   private probed: Promise<{ version: string; caps: HarnessCaps }> | undefined;
 
   constructor(private readonly config: ClaudeCodeHarnessConfig = {}) {}
@@ -156,7 +164,8 @@ export class ClaudeCodeHarness implements HarnessAdapter {
     await this.probe();
     const c = this.config;
     const given = (args.options ?? {}) as ClaudeCodeOptions;
-    const options: ClaudeCodeOptions = { ...given, profiles: { ...c.profiles, ...given.profiles } };
+    // Explicit options win over the blob store's resolvers.
+    const options: ClaudeCodeOptions = { ...(c.blobs ? blobResolvers(c.blobs) : {}), ...given, profiles: { ...c.profiles, ...given.profiles } };
     const profile = options.profiles?.[args.run.profile] ?? defaultProfile(args.run.profile);
     const permissionMode = profile.permissionMode ?? 'default'; // never omit: the CLI default may be 'auto'
     const sessionId = args.resume ?? randomUUID();
@@ -203,6 +212,8 @@ export class ClaudeCodeHarness implements HarnessAdapter {
       // Without a systemPrompt the SDK sends an empty one: no Claude Code prompt, no tool guidance.
       systemPrompt: { type: 'preset', preset: 'claude_code' },
       ...options.sdk,
+      // The agent's instructions go after Claude Code's own prompt, over one the options set.
+      ...(args.instructions !== undefined ? { systemPrompt: { type: 'preset', preset: 'claude_code', append: args.instructions } } : {}),
       cwd: args.cwd,
       model: args.run.model,
       ...(isEffort(args.run.effort) ? { effort: args.run.effort } : {}),

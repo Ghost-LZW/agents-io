@@ -18,10 +18,38 @@ export interface HarnessOpenArgs {
   /**
    * Extra child-process environment for this session (a session launch, decision 7),
    * over the adapter's own. Never logged or put on argv. Adapters that cannot apply
-   * it per session must not be given it.
+   * it per session must not be given it (`HarnessAdapter.sessionEnv`).
    */
   env?: Record<string, string>;
+  /**
+   * The agent's instructions for this session, in the harness's own way: Claude Code appends
+   * them to its preset system prompt, Codex gives them as developer instructions. They replace
+   * whatever native instruction option the deployment config sets.
+   */
+  instructions?: string;
 }
+
+/**
+ * Read access to the host's blob store (the media channels put: `ContentBlock.ref`), for a
+ * harness that hands images and files to its agent.
+ */
+export interface BlobAccess {
+  /** Local path, mime and size of a stored blob; `undefined` for a ref the store does not hold (a platform ref such as `lark-file:…`). */
+  stat(ref: string): Promise<{ path: string; mime: string; name?: string; size: number } | undefined>;
+  /** The stored bytes; throws for a ref the store does not hold. */
+  get(ref: string): Promise<{ bytes: Uint8Array; mime: string; name?: string }>;
+}
+
+/**
+ * How an adapter honours a session's own env (`HarnessOpenArgs.env`, a session launch's):
+ * - `'open'`: `open` applies `args.env` to that session's own child (Claude Code).
+ * - `'own-process'`: one process serves every session, so `open` refuses an env; such a session
+ *   runs on `ownProcess({ env })` instead (Codex over stdio).
+ * - `{ refused }`: neither, e.g. a shared server that outlives the host (Codex over a Unix
+ *   socket). A launch with env is refused (`launch_unsupported`: "harness instance <name> is
+ *   <refused>; …"); a cwd alone is fine.
+ */
+export type SessionEnvSupport = 'open' | 'own-process' | { readonly refused: string };
 
 /** Start a realtime voice session on the harness session's native thread (decision 11). */
 export interface LiveStartArgs {
@@ -135,11 +163,29 @@ export interface HarnessAdapter {
   /**
    * Static, transitional (core-slimming G4 replaces it with a host hook): `open` takes
    * `options.ephemeral` (a throwaway session kept out of the harness's history),
-   * `options.preface: false`, `options.developerInstructions` and a read-only `options.profiles`
-   * entry (`approvalPolicy`, `sandbox`), so the host may generate topic titles on it. Codex
-   * declares it.
+   * `options.preface: false`, the title prompt as `instructions` and a read-only
+   * `options.profiles` entry (`approvalPolicy`, `sandbox`), so the host may generate topic
+   * titles on it. Codex declares it.
    */
   readonly ephemeralOpen?: boolean;
+  /**
+   * Static: how a launched session's env reaches its harness (`SessionEnvSupport`). Default
+   * `'open'`. `'own-process'` needs `ownProcess`.
+   */
+  readonly sessionEnv?: SessionEnvSupport;
+  /**
+   * An adapter like this one on a process of its own, for one launched session
+   * (`sessionEnv: 'own-process'`: `env` is the session's, the top layer of that process's
+   * environment, so it may name another config dir) or one task run. A task run always runs on
+   * one when the adapter has this method, whatever `sessionEnv` says: the host builds the
+   * instance's adapter for the run, the run's env (at least `AGENTS_IO_RUN_ID`) joined to the
+   * instance's own and so under its configured config dir, and calls `ownProcess({ env: {} })`
+   * on it. Starts nothing until its first `open`. The host keeps the result for that session or
+   * run (the session layer compares adapters by identity) and calls its `dispose` when the
+   * session's lane closes or the run ends. `cwd` is where that session or run works (its opens
+   * say so too).
+   */
+  ownProcess?(o: { env: Record<string, string>; cwd?: string }): HarnessAdapter;
 }
 
 /** A command that starts a harness's terminal UI attached to a running session. */
@@ -184,6 +230,11 @@ export interface HarnessFactoryInit {
   log(level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown): void;
   /** Another configured instance's adapter (e.g. a text harness a voice harness hands its delegated turns to). */
   harness(name: string): HarnessAdapter;
+  /**
+   * The host's blob store, read-only: what the media blocks of inputs (`ref`) point at. The
+   * built-in adapters resolve images and files with it; absent when the host has none.
+   */
+  blobs?: BlobAccess;
 }
 
 /**
@@ -195,6 +246,10 @@ export interface HarnessFactoryInit {
  * sessions are closed and then `dispose` is called; `adopts` is read at start. Every loaded
  * instance gets them, whether or not a session used it; an adapter returned for several
  * instances gets each call once. Its other static declarations (`displayName`, `compact`,
- * `modes`, `ownerProfileSwitch`, `ephemeralOpen`) are read as a built-in adapter's.
+ * `modes`, `ownerProfileSwitch`, `ephemeralOpen`, `sessionEnv`) and `ownProcess` are read as a
+ * built-in adapter's. Its opens carry the instance's env in `args.env` (a task run's over it, and a
+ * launched session's unless that went to `ownProcess`) and the agent's instructions in
+ * `args.instructions`; during a transition also as `options.developerInstructions`, as before
+ * `instructions` existed. `init.blobs` reads the media inputs point at.
  */
 export type HarnessFactory = (init: HarnessFactoryInit) => HarnessAdapter | Promise<HarnessAdapter>;

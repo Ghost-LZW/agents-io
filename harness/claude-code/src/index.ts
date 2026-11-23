@@ -2,5 +2,6 @@ export * from './adapter.js';
 export { ClaudeCodeSession, defaultProfile, mapAnswers } from './session.js';
 export { CONTEXT_LABEL, inputUuid, preface, convertBlock, toUserMessage } from './content.js';
 export * from './tools.js';
+export * from './media.js';
 export type * from './types.js';
 export * from './tui.js';

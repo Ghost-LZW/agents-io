@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { join } from 'node:path';
-import type { HarnessAdapter, HarnessCaps, HarnessOpenArgs, HarnessSession, NativeClient } from '@agents-io/protocol';
+import type { BlobAccess, HarnessAdapter, HarnessCaps, HarnessOpenArgs, HarnessSession, NativeClient, SessionEnvSupport } from '@agents-io/protocol';
 import type { ClientInfo } from './generated/ClientInfo.js';
 import type { InitializeParams } from './generated/InitializeParams.js';
 import type { InitializeResponse } from './generated/InitializeResponse.js';
@@ -12,7 +12,7 @@ import type { ThreadResumeParams } from './generated/v2/ThreadResumeParams.js';
 import type { ThreadResumeResponse } from './generated/v2/ThreadResumeResponse.js';
 import type { JsonValue } from './generated/serde_json/JsonValue.js';
 import { CODEX_CAPS, DEFAULT_OPT_OUT, LIVE_NOTIFICATIONS } from './caps.js';
-import { resolveProfile, sandboxModeOf, type CodexProfile, type MediaResolver } from './map.js';
+import { blobMediaResolver, resolveProfile, sandboxModeOf, type CodexProfile, type MediaResolver } from './map.js';
 import { RpcClient, spawnTransport, type Transport } from './rpc.js';
 import { CodexSession, type CodexOpenOptions, type SessionHost, type TurnSnapshot } from './session.js';
 import {
@@ -96,7 +96,10 @@ export interface CodexHarnessOptions {
   live?: boolean;
   /** Defaults for every session; `HarnessOpenArgs.options` overrides per session. */
   profiles?: Record<string, CodexProfile>;
+  /** How media inputs reach Codex; default with `blobs`: their local paths in the host's blob store. */
   resolveMedia?: MediaResolver;
+  /** The host's blob store (`HarnessFactoryInit.blobs`), read for media inputs. */
+  blobs?: BlobAccess;
 }
 
 interface Buffered {
@@ -397,13 +400,38 @@ export class CodexHarness implements HarnessAdapter {
   readonly ownerProfileSwitch = true;
   /** `thread/start { ephemeral }` (topic titles until G4). */
   readonly ephemeralOpen = true;
+  /**
+   * One app-server serves every session, so a launched session's env needs one of its own
+   * (`ownProcess`); a Unix socket's server is shared and outlives the host, so it cannot.
+   */
+  readonly sessionEnv: SessionEnvSupport;
   private server: Promise<AppServer> | undefined;
   private opening = 0;
   private readonly connector: Connector;
+  private readonly opts: CodexHarnessOptions;
 
-  constructor(private readonly opts: CodexHarnessOptions = {}) {
-    this.connector = makeConnector(opts);
-    this.adopts = typeof opts.transport === 'object' && opts.transport.kind === 'unix';
+  constructor(opts: CodexHarnessOptions = {}) {
+    // Media inputs resolve against the host's blob store unless the options say how.
+    this.opts = opts.resolveMedia || !opts.blobs ? opts : { ...opts, resolveMedia: blobMediaResolver(opts.blobs) };
+    this.connector = makeConnector(this.opts);
+    const unix = typeof opts.transport === 'object' && opts.transport.kind === 'unix';
+    this.adopts = unix;
+    this.sessionEnv = unix ? { refused: 'a shared Codex app-server (unix transport)' } : 'own-process';
+  }
+
+  /**
+   * These settings on an app-server of its own over stdio (`HarnessAdapter.ownProcess`), for one
+   * launched session or task run: `env` over this adapter's environment, its `CODEX_HOME` (a
+   * launched session's) as the home. Ended by `dispose`. Over a Unix socket too: a task run gets a
+   * server of its own even where a launched session cannot (`sessionEnv`).
+   */
+  ownProcess(o: { env: Record<string, string> }): CodexHarness {
+    return new CodexHarness({
+      ...this.opts,
+      env: { ...this.opts.env, ...o.env },
+      transport: typeof this.opts.transport === 'function' ? this.opts.transport : { kind: 'stdio' },
+      ...(o.env.CODEX_HOME !== undefined ? { codexHome: o.env.CODEX_HOME } : {}),
+    });
   }
 
   /**
@@ -499,7 +527,8 @@ export class CodexHarness implements HarnessAdapter {
       sandbox: sandboxModeOf(profile) ?? null,
       config: Object.keys(config).length ? config : null,
       baseInstructions: opts.baseInstructions ?? null,
-      developerInstructions: opts.developerInstructions ?? null,
+      // The agent's instructions replace the options' (`HarnessOpenArgs.instructions`).
+      developerInstructions: args.instructions ?? opts.developerInstructions ?? null,
       ...(args.run.model ? { model: args.run.model } : {}),
     };
     let res: ThreadStartResponse | ThreadResumeResponse;

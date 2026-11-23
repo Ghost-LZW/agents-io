@@ -163,7 +163,7 @@ describe('commands', () => {
     // The other instance runs as the same agent: its cwd and instructions.
     const opened = fakes.cc!.sessions[0]!.args;
     expect(opened.cwd).toBe(work);
-    expect((opened.options as { sdk?: { systemPrompt?: { append?: string } } }).sdk?.systemPrompt?.append).toBe('Be brief.');
+    expect(opened.instructions).toBe('Be brief.');
 
     await say('/status');
     expect(await reply('session ')).toContain('agent helper · preset claude · cc (claude-code) · model opus · effort high (set here)');

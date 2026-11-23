@@ -13,6 +13,7 @@ import {
   type AdminSessions,
   type AdminChannelsApplied,
   type AdminStatus,
+  type BlobAccess,
   type ChainExplanation,
   type ChainLink,
   type ChannelAdapter,
@@ -43,6 +44,7 @@ import {
   type SessionLaunch,
   type SessionPrepare,
   type SessionPrepareResult,
+  type SessionEnvSupport,
   type SessionCompact,
   type SessionCompactResult,
   type InboundRedispatch,
@@ -108,7 +110,6 @@ import type { ClientCommand, SessionInfo } from './frames.js';
 import { HostService, isHostOrigin } from './host.js';
 import { LocalServer } from './local-server.js';
 import { privateDb, privateDir } from './private.js';
-import { blobResolvers, type MediaResolvers } from './media.js';
 import { DaemonRecords, type CauseRecord, type OutboundRecord } from './records.js';
 import { ExternalMcp } from './external-mcp.js';
 import { checkLaunch, launchView, sameLaunch, type LaunchCheck } from './launch.js';
@@ -941,7 +942,7 @@ export class Gateway {
   private build(inst: HarnessInstance): HarnessAdapter {
     const own = this.o.buildHarness?.(inst);
     if (own) return own;
-    if (inst.kind !== 'module') return buildHarness(inst, blobResolvers(this.blobs));
+    if (inst.kind !== 'module') return buildHarness(inst, this.blobs);
     const a = this.moduleAdapters.get(inst.name);
     if (!a) throw new Error(inst.unavailable ? `harness instance ${inst.name} is unavailable: ${inst.unavailable}` : `harness instance ${inst.name}: its module was not loaded`);
     return new InstanceHarness(inst, a);
@@ -966,6 +967,7 @@ export class Gateway {
           if (!c.harnesses[name]) throw new Error(`unknown harness instance ${JSON.stringify(name)} (configured: ${Object.keys(c.harnesses).join(', ')})`);
           return { id: name, probe: () => this.harness(name).probe(), open: (args) => this.harness(name).open(args) };
         },
+        blobs: this.blobs,
       }).catch((e: Error) => {
         throw new ConfigError(e.message);
       });
@@ -1137,7 +1139,8 @@ export class Gateway {
     } catch (e) {
       return { ok: false, code: e instanceof LaneUnavailableError ? e.code : 'no_agent', message: (e as Error).message };
     }
-    const checked = checkLaunch(agent, launch, this.o.config.harnesses[agent.harness]);
+    // Whether the agent's instance can take a session env at all is what its adapter declares (built when asked, nothing started).
+    const checked = checkLaunch(agent, launch, () => sessionEnvRefused(agent.harness, this.declared(agent.harness)?.sessionEnv));
     if (!checked.ok) return checked;
     const pinned = this.records.launchOf(sessionKey);
     if (pinned) {
@@ -1306,40 +1309,37 @@ export class Gateway {
   /**
    * The adapters one launched session opens, built lazily per instance and kept
    * (the lane compares adapters by identity: a new object each time would restart
-   * the harness every turn). Claude takes the env per session; a Codex session with
-   * env gets its own stdio app-server (like a task run), closed with the lane.
+   * the harness every turn). The env reaches each as its adapter declares
+   * (`HarnessAdapter.sessionEnv`): through the open args (Claude Code), or on a process
+   * of the session's own (`ownProcess`: a Codex app-server over stdio), disposed with
+   * the lane; an instance that can do neither refuses the session (`launch_unsupported`).
    */
   private launchAdapters(agent: AgentConfig, launch: SessionLaunch): LaunchAdapters {
     const c = this.o.config;
     const env = launch.env ?? {};
     const hasEnv = Object.keys(env).length > 0;
+    const cwd = launch.cwd ?? agent.cwd;
     const cache = new Map<string, HarnessAdapter>();
     const owned: HarnessAdapter[] = [];
     const adapter = (name: string): HarnessAdapter => {
       const key = this.o.harness ? '' : name;
       let a = cache.get(key);
       if (a) return a;
-      if (this.o.harness) a = withLaunch(this.o.harness, undefined, hasEnv ? env : undefined);
-      else {
-        const inst = c.harnesses[name];
-        if (!inst) throw new Error(`unknown harness instance ${JSON.stringify(name)}`);
-        let base: HarnessAdapter;
-        let perOpen: Record<string, string> | undefined = hasEnv ? env : undefined;
-        if (inst.kind === 'codex' && hasEnv) {
-          if (inst.codex.transport.kind === 'unix') throw new Error(`launch_unsupported: harness instance ${name} is a shared Codex app-server (unix transport); this session's env cannot apply there`);
-          // The env reaches only this session's app-server; its CODEX_HOME replaces the instance's.
-          const own = {
-            ...inst,
-            env: { ...inst.env, ...env },
-            codex: { ...inst.codex, transport: { kind: 'stdio' as const }, ...(env.CODEX_HOME !== undefined ? { codexHome: env.CODEX_HOME } : {}) },
-          } as HarnessInstance;
-          base = this.build(own);
-          owned.push(base);
+      if (!this.o.harness && !c.harnesses[name]) throw new Error(`unknown harness instance ${JSON.stringify(name)}`);
+      let base = this.harness(name);
+      let perOpen: Record<string, string> | undefined = hasEnv ? env : undefined;
+      if (hasEnv) {
+        const refused = sessionEnvRefused(name, base.sessionEnv);
+        if (refused) throw new Error(`launch_unsupported: ${refused}; this session's env cannot apply there`);
+        if (base.sessionEnv === 'own-process' && typeof base.ownProcess === 'function') {
+          // The env reaches only this session's own process, which ends with the lane.
+          base = base.ownProcess({ env, ...(cwd !== undefined ? { cwd } : {}) });
+          if (!this.sharedAdapter(base)) owned.push(base);
           perOpen = undefined;
-        } else base = this.harness(name);
-        // Any instance (a session's preset may name another than the agent's) runs as the agent.
-        a = withLaunch(withAgent(base, agent, agent.cwd), launch.cwd ?? agent.cwd, perOpen);
+        }
       }
+      // Any instance (a session's preset may name another than the agent's) runs as the agent.
+      a = withLaunch(withAgent(base, agent, agent.cwd), cwd, perOpen);
       cache.set(key, a);
       return a;
     };
@@ -1444,14 +1444,11 @@ export class Gateway {
     let own: HarnessAdapter | undefined;
     if (this.o.harness) adapter = this.o.harness;
     else {
-      // A Codex run gets its own app-server over stdio: the env reaches only this run's child, which ends with it.
-      const runInst = {
-        ...inst,
-        cwd: r.cwd,
-        env: { ...inst.env, ...env },
-        ...(inst.kind === 'codex' ? { codex: { ...inst.codex, transport: { kind: 'stdio' as const } } } : {}),
-      } as HarnessInstance;
-      const built = this.build(runInst);
+      // The instance's adapter built for this run: the env joins the instance's (under its configured config dir, which
+      // a run cannot replace) and reaches only this run's child. An adapter that shares one process between sessions
+      // sets up one of the run's own (`ownProcess`: a Codex app-server over stdio), which ends with it.
+      const fresh = this.build({ ...inst, cwd: r.cwd, env: { ...inst.env, ...env } } as HarnessInstance);
+      const built = typeof fresh.ownProcess === 'function' ? fresh.ownProcess({ env: {}, cwd: r.cwd }) : fresh;
       // Disposed when the run ends, unless it is a module instance's adapter, which every session of the instance shares.
       if (!this.sharedAdapter(built)) own = built;
       adapter = withAgent(built, r.agent, r.cwd);
@@ -3059,31 +3056,23 @@ function agentRun(agent: Pick<AgentConfig, 'model' | 'effort'>, inst: HarnessIns
   return { harness: inst.name, model: agent.model ?? inst.run.model, ...(effort !== undefined ? { effort } : {}) };
 }
 
-/**
- * An instance adapter as one agent opens it: the agent's working directory and
- * instructions (Claude: appended to the preset system prompt; Codex: developer
- * instructions) over the instance's. Other adapters (tests) are used as they are.
- */
 /** `daemon_flags` key of the owner's own chat with the deployment (its latest DM route). */
 const OWNER_DM_FLAG = 'owner-dm-route';
 
+/**
+ * An instance adapter as one agent opens it: the agent's working directory and
+ * instructions (`HarnessOpenArgs.instructions`, each adapter applies them its own way)
+ * over the instance's. Other adapters (tests) are used as they are.
+ */
 export function withAgent(a: HarnessAdapter, agent: AgentConfig, cwd: string | undefined): HarnessAdapter {
   if (!(a instanceof InstanceHarness)) return a;
-  const i = a.instance;
-  let options = i.options;
-  if (agent.instructions !== undefined) {
-    options =
-      i.kind === 'claude-code'
-        ? { ...options, sdk: { ...(options.sdk as Record<string, unknown> | undefined), systemPrompt: { type: 'preset', preset: 'claude_code', append: agent.instructions } } }
-        : { ...options, developerInstructions: agent.instructions };
-  }
-  return new InstanceHarness({ ...i, ...(cwd !== undefined ? { cwd } : {}), options } as HarnessInstance, a.inner);
+  return new InstanceHarness({ ...a.instance, ...(cwd !== undefined ? { cwd } : {}) } as HarnessInstance, a.inner, a.env, agent.instructions ?? a.instructions);
 }
 
 /** Per-session adapters of a launched session (`Gateway.launchAdapters`). */
 interface LaunchAdapters {
   adapter(name: string): HarnessAdapter;
-  /** Some adapter runs its own process (a Codex app-server with the session's env). */
+  /** Some adapter runs on a process of its own with the session's env (`HarnessAdapter.ownProcess`). */
   owns(): boolean;
   dispose(): Promise<void>;
 }
@@ -3094,8 +3083,13 @@ interface LaunchAdapters {
  * get the env through their open args; their cwd is the lane's.
  */
 export function withLaunch(a: HarnessAdapter, cwd: string | undefined, env: Record<string, string> | undefined): HarnessAdapter {
-  if (a instanceof InstanceHarness) return new InstanceHarness({ ...a.instance, ...(cwd !== undefined ? { cwd } : {}) } as HarnessInstance, a.inner, env);
+  if (a instanceof InstanceHarness) return new InstanceHarness({ ...a.instance, ...(cwd !== undefined ? { cwd } : {}) } as HarnessInstance, a.inner, env, a.instructions);
   return env ? new LaunchEnvHarness(a, env) : a;
+}
+
+/** Why a launched session's env cannot reach the instance `name`'s adapter (`HarnessAdapter.sessionEnv`), if it cannot. */
+function sessionEnvRefused(name: string, how: SessionEnvSupport | undefined): string | undefined {
+  return typeof how === 'object' ? `harness instance ${name} is ${how.refused}` : undefined;
 }
 
 /** A gateway wrapper over the kind's adapter (`inner`): what that adapter declares statically reads through. */
@@ -3124,6 +3118,10 @@ abstract class WrappedHarness {
 
   get ephemeralOpen(): boolean {
     return this.inner.ephemeralOpen === true;
+  }
+
+  get sessionEnv(): SessionEnvSupport | undefined {
+    return this.inner.sessionEnv;
   }
 }
 
@@ -3165,16 +3163,21 @@ export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
   /** The kind's lifecycle calls, present only when its adapter has them (the gateway reads their presence). */
   readonly detach?: () => Promise<void>;
   readonly dispose?: () => Promise<void>;
+  /** The same instance on the kind's adapter's own process (`HarnessAdapter.ownProcess`), present only when it has one. */
+  readonly ownProcess?: (o: { env: Record<string, string>; cwd?: string }) => InstanceHarness;
   constructor(
     readonly instance: HarnessInstance,
     readonly inner: HarnessAdapter,
     /** A launched session's env (decision 7), over the child's environment at open. */
     readonly env?: Record<string, string>,
+    /** The agent's instructions (`HarnessOpenArgs.instructions`), unless an open gives its own. */
+    readonly instructions?: string,
   ) {
     super();
     this.id = instance.name;
     if (typeof inner.detach === 'function') this.detach = () => inner.detach!();
     if (typeof inner.dispose === 'function') this.dispose = () => inner.dispose!();
+    if (typeof inner.ownProcess === 'function') this.ownProcess = (o) => new InstanceHarness(instance, inner.ownProcess!(o), undefined, instructions);
   }
 
   probe(): Promise<{ version: string; caps: HarnessCaps }> {
@@ -3191,15 +3194,24 @@ export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
     // A module harness runs in the daemon's process: the instance's env reaches it through the open args.
     const instEnv = i.kind === 'module' ? definedEnv(i.env) : undefined;
     const env = instEnv || this.env ? { ...instEnv, ...args.env, ...this.env } : undefined;
-    return this.inner.open({ ...args, ...(i.cwd ? { cwd: i.cwd } : {}), options: { ...options, ...args.options }, ...(env ? { env } : {}) });
+    const instructions = args.instructions ?? this.instructions;
+    // Transitional: a module harness also gets them as `options.developerInstructions`, as before `instructions` existed.
+    const legacy = i.kind === 'module' && instructions !== undefined ? { developerInstructions: instructions } : {};
+    return this.inner.open({
+      ...args,
+      ...(i.cwd ? { cwd: i.cwd } : {}),
+      options: { ...options, ...legacy, ...args.options },
+      ...(env ? { env } : {}),
+      ...(instructions !== undefined ? { instructions } : {}),
+    });
   }
 }
 
 /**
  * The adapter for one instance. Environment values are handed to the child process only, never logged.
- * `media` resolves stored blob refs for the harness (Claude: inline image / file path; Codex: local path).
+ * `blobs` is the store media inputs point at: the adapter resolves them itself.
  */
-export function buildHarness(i: HarnessInstance, media?: MediaResolvers): InstanceHarness {
+export function buildHarness(i: HarnessInstance, blobs?: BlobAccess): InstanceHarness {
   if (i.unavailable) throw new Error(`harness instance ${i.name} is unavailable: ${i.unavailable}`);
   if (i.kind === 'module') throw new Error(`harness instance ${i.name} is a module harness; the gateway loads it at start`);
   if (i.kind === 'codex') {
@@ -3216,7 +3228,7 @@ export function buildHarness(i: HarnessInstance, media?: MediaResolvers): Instan
         ...(x.enable ? { enable: x.enable } : {}),
         ...(x.disable ? { disable: x.disable } : {}),
         ...(x.live ? { live: true } : {}),
-        ...(media ? { resolveMedia: media.resolveMedia } : {}),
+        ...(blobs ? { blobs } : {}),
       }),
     );
   }
@@ -3233,10 +3245,9 @@ export function buildHarness(i: HarnessInstance, media?: MediaResolvers): Instan
     ...(x.skills !== undefined ? { skills: x.skills } : {}),
     ...(x.extraArgs ? { extraArgs: x.extraArgs } : {}),
     ...(x.additionalDirectories ? { additionalDirectories: x.additionalDirectories } : {}),
+    ...(blobs ? { blobs } : {}),
   };
-  // Resolvers ride in the instance's open options; explicit options in the config win.
-  const inst = media ? { ...i, options: { resolveImage: media.resolveImage, resolveFile: media.resolveFile, ...i.options } } : i;
-  return new InstanceHarness(inst, new ClaudeCodeHarness(config));
+  return new InstanceHarness(i, new ClaudeCodeHarness(config));
 }
 
 /** The variables an env map sets (`undefined` removes one from a child's env; in-process there is nothing to remove). */
@@ -3251,6 +3262,7 @@ async function loadHarnessModule(o: {
   module: ModuleLaunch;
   log: (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
   harness: (name: string) => HarnessAdapter;
+  blobs: BlobAccess;
 }): Promise<HarnessAdapter> {
   const where = `harnesses.${o.name} (module ${o.module.file})`;
   const name = o.module.export ?? 'createHarness';
@@ -3261,12 +3273,16 @@ async function loadHarnessModule(o: {
   if (typeof factory !== 'function') throw new Error(`${where}: export ${JSON.stringify(name)}${o.module.export !== undefined ? '' : ' (or default)'} is not a function`);
   let adapter: HarnessAdapter;
   try {
-    adapter = await (factory as HarnessFactory)({ name: o.name, config: o.module.config, log: o.log, harness: o.harness });
+    adapter = await (factory as HarnessFactory)({ name: o.name, config: o.module.config, log: o.log, harness: o.harness, blobs: o.blobs });
   } catch (e) {
     throw new Error(`${where}: factory failed: ${(e as Error).message}`);
   }
   const a = adapter as unknown as Partial<Record<string, unknown>> | null;
-  const bad = !a || typeof a.id !== 'string' || !a.id ? 'id (a non-empty string)' : (['probe', 'open'] as const).find((k) => typeof a[k] !== 'function');
+  const bad =
+    !a || typeof a.id !== 'string' || !a.id
+      ? 'id (a non-empty string)'
+      : ((['probe', 'open'] as const).find((k) => typeof a[k] !== 'function') ??
+        (a.sessionEnv === 'own-process' && typeof a.ownProcess !== 'function' ? "sessionEnv ('own-process' needs ownProcess)" : undefined));
   if (bad) throw new Error(`${where}: the factory did not return a HarnessAdapter (bad ${bad})`);
   return adapter;
 }

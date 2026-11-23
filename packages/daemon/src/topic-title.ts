@@ -26,11 +26,12 @@ export async function generateTopicTitle(adapter: HarnessAdapter, args: { cwd: s
   const run: RunSpec = { ...args.run, profile: 'topic-title', effort: 'low', mode: 'default' };
   const session = await adapter.open({
     sessionKey: `topic-title:${id}`, generation: 1, cwd: args.cwd, run,
+    // In place of the agent's instructions.
+    instructions: 'You only return a brief title for supplied text. Do not use tools or read files.',
     options: {
       ephemeral: true,
       preface: false,
       profiles: { 'topic-title': { approvalPolicy: 'never', sandbox: 'read-only' } },
-      developerInstructions: 'You only return a brief title for supplied text. Do not use tools or read files.',
     },
   });
   let timer: ReturnType<typeof setTimeout> | undefined;
