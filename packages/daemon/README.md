@@ -522,10 +522,12 @@ running anything:
 - `config`: its section of the config file, a top-level key holding the module's own keys
   (`schema`) and `enabled`, which the daemon adds and closes. Present, the module is on unless
   `enabled: false`; absent, the first of its `aliases` (older dotted paths such as
-  `policy.strangers`) that is set turns it on with that value; with neither, `defaultEnabled`.
-  `resolve(raw, ctx)` turns the value into the module's settings (`ctx` gives `where`, `alias`,
-  `env`, `substitute`, `path`, `fail`). Without the module registered its section is an unknown
-  key, as any other;
+  `policy.strangers`, `externalMcp`) that is set decides: the module's `aliasEnabled(value, alias)`
+  says on or off (`policy.strangers: "drop"` is off), or, without one, an object with
+  `enabled: false` is off (`externalMcp: { enabled: false }`, as a section) and any other value
+  is on; with neither, `defaultEnabled`. `resolve(raw, ctx)` turns the value (an alias's as it is
+  there) into the module's settings (`ctx` gives `where`, `alias`, `env`, `substitute`, `path`,
+  `fail`). Without the module registered its section is an unknown key, as any other;
 - `features` (`host.hello` features, advertised after the kernel's while the module runs),
   `mcpTools` (model tools: name, description, a JSON Schema object `input`, `readOnly`,
   `needsTurn`), `commands` (chat commands: name, `/help` line, `ownerOnly`, default true);

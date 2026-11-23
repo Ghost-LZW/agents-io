@@ -1125,8 +1125,9 @@ function at(raw: Record<string, unknown>, dotted: string): unknown {
  * Step 1 of the module lifecycle (core-slimming G6): every registered module, on or off, with its
  * settings. A module without a config section is on. One with a section: the section present is on
  * unless `enabled: false` (`resolve` gets the rest); absent, the first of its `aliases` that is set
- * turns it on with that value; with neither, `defaultEnabled` (`resolve` gets `{}`). A module that is
- * on and needs another (`module:<id>`) that is off fails the config.
+ * decides: on unless its `aliasEnabled` says false or, without one, the value is an object with
+ * `enabled: false` (`resolve` gets the value as it is); with neither, `defaultEnabled` (`resolve`
+ * gets `{}`). A module that is on and needs another (`module:<id>`) that is off fails the config.
  */
 export function resolveModules(raw: Record<string, unknown>, registry: ModuleRegistry, env: Record<string, string | undefined>, path: (p: string) => string): ResolvedModule[] {
   const out: ResolvedModule[] = [];
@@ -1148,9 +1149,13 @@ export function resolveModules(raw: Record<string, unknown>, registry: ModuleReg
     } else {
       alias = cfg.aliases?.find((a) => at(raw, a) !== undefined);
       if (alias !== undefined) {
-        enabled = true;
         value = at(raw, alias);
         where = alias;
+        if (cfg.aliasEnabled) {
+          const on: unknown = cfg.aliasEnabled(value, alias);
+          if (typeof on !== 'boolean') fail(`module ${m.id}: config.aliasEnabled must return a boolean (got ${typeof on} for ${alias})`);
+          enabled = on;
+        } else enabled = !(value && typeof value === 'object' && !Array.isArray(value) && (value as { enabled?: unknown }).enabled === false);
       } else {
         enabled = cfg.defaultEnabled;
         value = {};

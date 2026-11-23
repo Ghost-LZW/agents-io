@@ -87,6 +87,10 @@ function badManifest(m: ModuleManifest<any>): string | undefined {
     if (!isObject(c.schema) || Object.values(c.schema).some((s) => !isObject(s))) return 'config.schema must map each key of the section to a JSON Schema';
     if (Object.hasOwn(c.schema, 'enabled')) return 'config.schema: every section has "enabled"; its module cannot declare it';
     if (c.aliases !== undefined && (!Array.isArray(c.aliases) || c.aliases.some((a) => typeof a !== 'string' || !ALIAS.test(a)))) return 'config.aliases must be dotted paths of the config file (policy.strangers)';
+    if (c.aliasEnabled !== undefined) {
+      if (!isFn(c.aliasEnabled)) return 'config.aliasEnabled must be a function';
+      if (!c.aliases?.length) return 'config.aliasEnabled is for a module with aliases';
+    }
     if (typeof c.defaultEnabled !== 'boolean') return 'config.defaultEnabled must be a boolean';
     if (!isFn(c.resolve)) return 'config.resolve must be a function';
   }
@@ -192,7 +196,7 @@ export class ModuleRegistry {
 /** A module as the config resolved it (`Config.modules`, in registration order). */
 export interface ResolvedModule {
   id: string;
-  /** On for this run: its section (unless `enabled: false`), an alias, or its `defaultEnabled`. */
+  /** On for this run: its section (unless `enabled: false`), else the first alias set (unless its value is off), else its `defaultEnabled`. */
   enabled: boolean;
   /** What its `config.resolve` returned (a module that is on, with a config section). */
   config?: unknown;

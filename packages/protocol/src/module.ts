@@ -59,9 +59,9 @@ export interface ModuleResolveContext {
  * A module's section of the host's config file: a top-level key (`section`) holding an object of
  * the module's own keys (`schema`) and `enabled`, which the host adds and owns; the host closes the
  * object (an unknown key is a config error). Present, the module is on unless `enabled` is
- * `false`; absent, the first alias path that is set is read instead (the module is on, `resolve`
- * gets that value); with neither, the module is on when `defaultEnabled`. A config change to a
- * section takes effect at the next start (the console answers `applied: "restart"`).
+ * `false`; absent, the first alias path that is set decides instead (on or off: see `aliases`);
+ * with neither, the module is on when `defaultEnabled`. A config change to a section or an alias
+ * takes effect at the next start (the console answers `applied: "restart"`).
  */
 export interface ModuleConfig<C = unknown> {
   /** The top-level key: ASCII letters, digits and `_`, starting with a letter; never one of the host's own keys. */
@@ -71,15 +71,24 @@ export interface ModuleConfig<C = unknown> {
   /**
    * Where the settings were before they were the module's, as dotted paths of the config file
    * (`policy.strangers`, `externalMcp`): read when the section is absent, as valued there (the file
-   * schema checks them where they are). A path is no other module's section or alias.
+   * schema checks them where they are). The first that is set decides whether the module is on:
+   * `aliasEnabled` says, when the module has it; without it, an object with `enabled: false`
+   * (`externalMcp: { enabled: false }`) is off, as a section is, and any other value is on. A
+   * path is no other module's section or alias.
    */
   readonly aliases?: readonly string[];
+  /**
+   * Whether the value set at an alias path (`alias`) turns the module on: for an old setting whose
+   * off value is not `enabled: false` (`policy.strangers: "drop"`). Returns a boolean (anything
+   * else fails the config); only for a module with `aliases`.
+   */
+  aliasEnabled?(value: unknown, alias: string): boolean;
   /** Whether the module is on when neither its section nor an alias is in the file. */
   readonly defaultEnabled: boolean;
   /**
    * The section's value (valid against `schema`, without `enabled`; `{}` when absent) or an alias's
-   * value, as the module's settings; called only when the module is on. Throwing (`ctx.fail`) fails
-   * the config.
+   * value as it is there (an object keeps its `enabled`), as the module's settings; called only
+   * when the module is on. Throwing (`ctx.fail`) fails the config.
    */
   resolve(raw: unknown, ctx: ModuleResolveContext): C;
 }

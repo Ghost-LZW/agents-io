@@ -31,7 +31,14 @@ interface Probe {
 function probe(
   id: string,
   seen: string[],
-  o: { defaultEnabled?: boolean; aliases?: string[]; needs?: string[]; instance?: (k: KernelContext, cfg: Probe) => Partial<ModuleInstance>; resolved?: { raw: unknown; ctx: ModuleResolveContext }[] } = {},
+  o: {
+    defaultEnabled?: boolean;
+    aliases?: string[];
+    aliasEnabled?: (value: unknown, alias: string) => boolean;
+    needs?: string[];
+    instance?: (k: KernelContext, cfg: Probe) => Partial<ModuleInstance>;
+    resolved?: { raw: unknown; ctx: ModuleResolveContext }[];
+  } = {},
 ): ModuleManifest<Probe> {
   return {
     id,
@@ -41,6 +48,7 @@ function probe(
       section: id,
       schema: { greeting: Type.Optional(Type.String()) },
       ...(o.aliases ? { aliases: o.aliases } : {}),
+      ...(o.aliasEnabled ? { aliasEnabled: o.aliasEnabled } : {}),
       defaultEnabled: o.defaultEnabled ?? true,
       resolve: (raw, ctx) => {
         o.resolved?.push({ raw, ctx });
@@ -105,6 +113,8 @@ describe('the module registry', () => {
     expect(bad({ needs: ['kernel:nope'] })).toThrow('module probe: needs: "kernel:nope" is neither module:<id> nor kernel:<capability>');
     expect(bad({ admin: {} })).toThrow('module probe: admin (an AdminContribution) is not served for feature modules yet');
     expect(bad({ config: { ...p.config!, schema: { enabled: Type.Boolean() } } })).toThrow('module probe: config.schema: every section has "enabled"; its module cannot declare it');
+    expect(bad({ config: { ...p.config!, aliases: ['outputTools'], aliasEnabled: true as never } })).toThrow('module probe: config.aliasEnabled must be a function');
+    expect(bad({ config: { ...p.config!, aliasEnabled: () => true } })).toThrow('module probe: config.aliasEnabled is for a module with aliases');
     // Claims across modules: a tool, a command, a feature, a config key are one module's.
     const other = probe('other', seen);
     expect(bad({ mcpTools: other.mcpTools! }, other)).toThrow("module probe: tool other_echo is also module other's");
@@ -137,6 +147,42 @@ describe('module config sections (lifecycle step 1)', () => {
     // An alias set (the section absent) turns it on with the alias's value.
     expect(resolve({ outputTools: true }, off).modules).toEqual([{ id: 'probe', enabled: true, config: { greeting: 'hello' } }]);
     expect(resolved.at(-1)).toMatchObject({ raw: true, ctx: { where: 'outputTools', alias: 'outputTools' } });
+  });
+
+  it('an alias set to an off value leaves the module off: an object with enabled: false (as a section), or what aliasEnabled says (policy.strangers: "drop")', () => {
+    const resolved: { raw: unknown; ctx: ModuleResolveContext }[] = [];
+    // Default on, so off can only come from the alias's value.
+    const r = new ModuleRegistry([
+      probe('ext', [], { aliases: ['externalMcp'], resolved }),
+      probe('guests', [], { aliases: ['policy.strangers'], aliasEnabled: (v) => v !== 'drop', resolved }),
+    ]);
+    const modules = (raw: Record<string, unknown>) => resolve(raw, r).modules;
+    const off = resolve({ externalMcp: { enabled: false, clients: {} }, policy: { strangers: 'drop' } }, r);
+    expect(off.modules).toEqual([{ id: 'ext', enabled: false }, { id: 'guests', enabled: false }]);
+    expect(off.externalMcp).toBeUndefined();
+    expect(resolved).toEqual([]);
+    // Any other value is on, handed to resolve as it is there.
+    expect(modules({ externalMcp: { clients: {} }, policy: { strangers: 'ask' } })).toEqual([
+      { id: 'ext', enabled: true, config: { greeting: 'hello' } },
+      { id: 'guests', enabled: true, config: { greeting: 'hello' } },
+    ]);
+    expect(resolved).toMatchObject([
+      { raw: { clients: {} }, ctx: { where: 'externalMcp', alias: 'externalMcp' } },
+      { raw: 'ask', ctx: { where: 'policy.strangers', alias: 'policy.strangers' } },
+    ]);
+    expect(modules({ externalMcp: { enabled: true, clients: {} } })![0]).toEqual({ id: 'ext', enabled: true, config: { greeting: 'hello' } });
+    expect(resolved.at(-2)!.raw).toEqual({ enabled: true, clients: {} });
+    // aliasEnabled decides alone: an object with enabled: false is what it says.
+    const own = new ModuleRegistry([probe('ext', [], { aliases: ['externalMcp'], aliasEnabled: () => true })]);
+    expect(resolve({ externalMcp: { enabled: false, clients: {} } }, own).modules).toEqual([{ id: 'ext', enabled: true, config: { greeting: 'hello' } }]);
+    // The section, when present, decides over an alias.
+    expect(modules({ ext: {}, externalMcp: { enabled: false, clients: {} }, guests: { greeting: 'hi' }, policy: { strangers: 'drop' } })).toEqual([
+      { id: 'ext', enabled: true, config: { greeting: 'hello' } },
+      { id: 'guests', enabled: true, config: { greeting: 'hi' } },
+    ]);
+    // aliasEnabled answers a boolean; anything else fails the config.
+    const sloppy = new ModuleRegistry([probe('guests', [], { aliases: ['policy.strangers'], aliasEnabled: () => 'yes' as never })]);
+    expect(thrown(() => resolve({ policy: { strangers: 'ask' } }, sloppy))).toBe('module guests: config.aliasEnabled must return a boolean (got string for policy.strangers)');
   });
 
   it('a module that is on and needs one that is off fails the config', () => {
@@ -281,6 +327,22 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     expect(inputs).toEqual([[{ type: 'text', text: '/probe' }]]);
     expect(seen).toEqual([]);
     expect(w.gw.adminStatus().modules).toEqual([{ id: 'probe', origin: 'module', enabled: false }]);
+  });
+
+  it('a module an alias turns off (externalMcp: { enabled: false }, policy.strangers: "drop") is never set up: no features, no status of its own', async () => {
+    const seen: string[] = [];
+    const registry = new ModuleRegistry([probe('ext', seen, { aliases: ['externalMcp'] }), probe('guests', seen, { aliases: ['policy.strangers'], aliasEnabled: (v) => v !== 'drop' })]);
+    const w = await daemon(registry, { externalMcp: { enabled: false, listen: '127.0.0.1:0', clients: {} }, policy: { owners: ['fake:alice'], strangers: 'drop' } });
+    expect(seen).toEqual([]);
+    expect(w.gw.adminStatus().externalMcp).toBeUndefined();
+    expect(w.gw.adminStatus().modules).toEqual([
+      { id: 'ext', origin: 'module', enabled: false },
+      { id: 'guests', origin: 'module', enabled: false },
+    ]);
+    const c = await LocalClient.connect(w.socketPath);
+    cleanups.push(() => c.close());
+    const hello = await c.hello({ token: readTokenFile(tokenPath(w.socketPath)), name: 'probe' });
+    expect(hello.features).toEqual(FEATURES.filter((f) => f !== 'resolve.onBehalfOf' && f !== 'external.mcp'));
   });
 
   it('setup and start failures fail the start naming the module; a hook not served yet, a missing handler, a config resolved without the registry too', async () => {

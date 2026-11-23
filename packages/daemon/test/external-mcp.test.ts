@@ -109,6 +109,13 @@ describe('external MCP endpoint: off by default, loopback, tokens, limits', () =
     expect(hello.features).not.toContain('external.mcp');
     const off = resolveConfig({ externalMcp: { enabled: false, clients: { a: { token: 'env:T', scopes: ['read'] } } } }, { env: {}, baseDir: tmp(), cwd: tmp() });
     expect(off.externalMcp).toBeUndefined();
+    // With enabled: false, the daemon is as without it: nothing listens, hello does not advertise it.
+    const d = await daemon({ raw: { externalMcp: { enabled: false, listen: '127.0.0.1:0', clients: { a: { token: 'env:T', scopes: ['read'] } } } } });
+    expect(d.gw.adminStatus().externalMcp).toBeUndefined();
+    const dc = await d.client();
+    const dhello = await dc.hello({ token: d.gw.token, name: 'probe' });
+    expect(dhello.features).toContain('callouts.external');
+    expect(dhello.features).not.toContain('external.mcp');
   });
 
   it('listens on loopback only; a literal token, a short one, a missing variable are config errors that never echo the value #SE-5 #SE-1', () => {

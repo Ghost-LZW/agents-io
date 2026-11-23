@@ -583,7 +583,7 @@
 ### FC-4 launch 不在允许范围就拒绝
 
 - **承诺**：agent 没有 `sessionParams` 时任何 launch 都是 `launch_not_allowed`；`cwd` / env 超出 `cwdRoots` / `envKeys` / `envPathRoots` 拒绝；`CLAUDE_CONFIG_DIR` / `CODEX_HOME` 列入 `envKeys` 必须配 `envPathRoots`（决定 7）。
-- **实现**：`packages/daemon/src/launch.ts:37`；`packages/daemon/src/config.ts:1288-1305`（`resolveSessionParams`；`:1301` 配置目录变量取自注册的各 harness 种类，`HarnessRegistry.configDirKeys`）；`harness/claude-code/src/module.ts`、`harness/codex/src/module.ts` 的 `defaults.configDirEnv`（`CLAUDE_CONFIG_DIR`、`CODEX_HOME`）。
+- **实现**：`packages/daemon/src/launch.ts:37`；`packages/daemon/src/config.ts:1293-1310`（`resolveSessionParams`；`:1306` 配置目录变量取自注册的各 harness 种类，`HarnessRegistry.configDirKeys`）；`harness/claude-code/src/module.ts`、`harness/codex/src/module.ts` 的 `defaults.configDirEnv`（`CLAUDE_CONFIG_DIR`、`CODEX_HOME`）。
 - **测试**：`session-launch.test.ts` "a callout launch for an agent without sessionParams goes to onFailure; session.prepare says launch_not_allowed #FC-4"；`packages/daemon/test/config.test.ts` "CLAUDE_CONFIG_DIR / CODEX_HOME in envKeys need envPathRoots #FC-4"。
 - **状态**：有测试。
 
@@ -735,7 +735,7 @@
 ### CF-4 模块 harness 配置错误使启动失败
 
 - **承诺**：`use: 'module'` 的模块不存在、有未知键是配置错误；导出既不是函数也不是描述符（有 `create` 函数的对象，`HarnessModule`）、工厂或描述符的 `create` 抛错、描述符的 `schema` 不接受条目的 `config`、返回的不是 adapter 都使启动失败，错误里有实例名（决定 11 补记；描述符是 2026-11-23 G3 工厂注册时加的）。返回的 adapter 有类型不对的静态声明或生命周期成员（`displayName` 不是非空字符串，`compact` 没有非空的 `command`，`modes` 不是只含 `'plan'` 的数组，`ownerProfileSwitch` / `ephemeralOpen` / `adopts` 不是布尔值，`sessionEnv` 不是 `'open'`、`'own-process'` 或带非空 `refused` 的对象，`'own-process'` 却没有 `ownProcess`，`detach` / `dispose` / `ownProcess` / `nativeClient` 不是函数）也算不是 adapter，错误里还有成员名；不写的成员不检查（2026-11-23，G3 的后续：原先这些值留到聊天命令、launch、终端加入或停止时才出错，`sessionEnv` 是 `null` 或别的字符串时还被静默当成 `'open'`；`nativeClient` 是同日 G2 的后续补上的）。
-- **实现**：`config.ts:102-112`（`ModuleInstance`：未知键）、`:1500-1507`（`resolveInstance` 的 module 分支：`resolveModuleFile`，模块不存在）；`gateway.ts:1109-1129`（`loadHarnessModules`：工厂的失败转为 `ConfigError`，`Gateway.start` 因此失败）；`module-loader.ts:133-182`（`loadHarnessModule`：导入，经与通道模块共用的 `loadExport`（写了 `export` 就不回落到 `default`）；描述符先按它的 `schema` 查 `config`（封闭）再调 `create`，否则调工厂；检查返回的 adapter）、`:184-187`（`harnessDescriptor`）、`:189-212`（`badHarnessAdapter`：逐个成员检查类型，答第一个不对的）。
+- **实现**：`config.ts:102-112`（`ModuleInstance`：未知键）、`:1505-1512`（`resolveInstance` 的 module 分支：`resolveModuleFile`，模块不存在）；`gateway.ts:1109-1129`（`loadHarnessModules`：工厂的失败转为 `ConfigError`，`Gateway.start` 因此失败）；`module-loader.ts:133-182`（`loadHarnessModule`：导入，经与通道模块共用的 `loadExport`（写了 `export` 就不回落到 `default`）；描述符先按它的 `schema` 查 `config`（封闭）再调 `create`，否则调工厂；检查返回的 adapter）、`:184-187`（`harnessDescriptor`）、`:189-212`（`badHarnessAdapter`：逐个成员检查类型，答第一个不对的）。
 - **测试**：`packages/daemon/test/module-channel.test.ts` "a missing module, a non-function export, a throwing factory and a value that is not an adapter each fail the start, naming the instance #CF-4"（模块不存在在解析配置时失败，其余三种让 `Gateway.start` 失败）、"an adapter whose static declarations or lifecycle members are of the wrong type fails the start, naming the instance and the member; right ones start #CF-4"、"a module may export a HarnessModule descriptor: its schema checks the config (a bad one fails the start, naming the instance); create gets the init with launch, env and profiles #CF-4"。
 - **状态**：有测试（决定 14 补上）。
 
