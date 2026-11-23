@@ -92,8 +92,8 @@ see `docs/E2E.md` §0). New:
   (`channel/*/src/module.ts`); `module` is the daemon's own (`src/module-channel.ts`).
   The bundle also says which types' adapters are trusted with their caps' evidence
   without an `evidence` grant (lark-bot, mail). The daemon's config code, its gateway and
-  the console's config editing name no type (the console's `/api/bots/lark` route still
-  does, until core-slimming G5).
+  its console name no type: what a type adds to the console (lark-bot's `/api/bots/lark`
+  and `console.larkBotCommand`) is its own `ChannelModule.admin` contribution.
 - **Harness instances** (`harnesses.<name>`, `use`: `claude-code`, `codex` or `module`;
   see `docs/E2E.md` §0). `claude-code` and `codex` are the harness kinds the daemon's
   composition root registers (`src/bundle.ts`): each is a `HarnessModule`
@@ -268,11 +268,19 @@ before any host frame; after it, the connection's client frames carry the origin
 
 `aio serve` also serves the console API of `packages/protocol/src/admin.ts`
 (HTTP under `/api`, WebSocket `/ws`), so a web UI in another repo can be built
-against the protocol alone. Lark bot provisioning (`/api/bots/lark`) belongs to
-the lark-bot module: its schemas are `channel/lark-bot/src/admin.ts`
-(`LARK_BOT_ADMIN_ENDPOINTS`, JSON Schemas in `channel/lark-bot/schema/`) and its
-jobs `LarkBotJobs` (`channel/lark-bot/src/provision.ts`); the daemon hands it the
-config file and serves the endpoints with the same auth.
+against the protocol alone. Channel types add to it (`ChannelModule.admin`, an
+`AdminContribution` of `packages/protocol/src/admin-module.ts`): keys of the
+`console` section, routes the console serves after its own with the same auth and
+conventions, and what runs behind them (`mount`, with an `AdminContext`: the type's
+console settings, the private directory `<dataDir>/provision`, the config file as a
+`ConfigAccess`). `adminEndpoints(registry)` lists the core endpoints
+(`ADMIN_ENDPOINTS`) and the registry's. Lark bot provisioning (`/api/bots/lark`,
+`console.larkBotCommand`) is the lark-bot module's (`larkBotAdmin` in
+`channel/lark-bot/src/provision-admin.ts`): its schemas are
+`channel/lark-bot/src/admin.ts` (`LARK_BOT_ADMIN_ENDPOINTS`, JSON Schemas in
+`channel/lark-bot/schema/`) and its jobs `LarkBotJobs`
+(`channel/lark-bot/src/provision.ts`). A daemon whose channel registry lacks
+lark-bot does not serve `/api/bots/lark` (404 `not_found`, as any unknown route).
 
 Moved (2026-11-23, core-slimming P0): `AdminLarkBotRequest`,
 `AdminLarkBotStarted`, `AdminLarkBotJob` and `AdminLarkBotJobState` are no
@@ -295,7 +303,7 @@ log function. The HTTP API is unchanged on the wire.
   "origins": ["https://ui.example"],   // CORS for a separately hosted UI; none by default
   "uiUrl": "https://ui.example",       // where login links point (default: the console itself)
   "sessionTtlMs": 43200000,
-  "larkBotCommand": ["npx", "-y", "github:Ghost-LZW/create-lark-bot#v0.2.4"],
+  "larkBotCommand": ["npx", "-y", "github:Ghost-LZW/create-lark-bot#v0.2.4"],  // lark-bot's setting (its default)
   "heartbeat": { "intervalMs": 30000, "timeoutMs": 10000 },  // /ws ping; no answer in timeoutMs → closed (0 interval: off)
   "liveChannels": false       // true: channel changes written through the console start/stop channels at once
 }
@@ -326,8 +334,9 @@ log function. The HTTP API is unchanged on the wire.
   advertised as `http://127.0.0.1:<port>`. Bodies must be `application/json`.
 - **Endpoints**: `GET /api/status`, `GET|PUT /api/config`,
   `POST /api/config/validate`, `GET /api/explain/:inputId`, `GET /api/queue`,
-  `GET /api/sessions`, `POST /api/bots/lark`, `GET /api/bots/lark/:job`; `GET /`
-  is a minimal page that completes a login link opened on the console itself.
+  `GET /api/sessions`, and the channel types' (`POST /api/bots/lark`,
+  `GET /api/bots/lark/:job` from lark-bot); `GET /` is a minimal page that completes
+  a login link opened on the console itself.
 - **Config**: credential fields follow the config schema: every value of an
   `env` map (harness instance, `mcpServers.<id>.env`, `settings.env`, bridge
   channel, codex `mcp_servers.<id>.env`), every header (`headers`,
@@ -583,3 +592,35 @@ What changed for embedders with core-slimming G2 (channel types):
 - `Gateway.larkBots` is gone: the console's Lark bot provisioning is built by `bundle.ts`
   (`builtinConsoleParts`, only when the registry has the built-in lark-bot type) until G5 makes
   it a route the lark-bot module contributes. The HTTP API is unchanged.
+
+What changed for embedders with core-slimming G5 (admin contributions):
+
+- Modules contribute to the console: `AdminContribution`, `AdminRoute`, `AdminContext`,
+  `ConfigAccess` (`@agents-io/protocol`, `admin-module.ts`) are new, and `ChannelModule.admin`
+  is an `AdminContribution`. The gateway builds one `AdminContext` per contribution of its
+  channel registry when the console starts, calls `mount`, serves `routes` after the core ones
+  and calls the mount's `close` when the console is gone (a `mount` that throws fails
+  `Gateway.start`). `new ChannelRegistry` checks the contributions (routes: GET / PUT / POST,
+  under `/api/`, status 200 or 202, a `response` schema and a `handle`, never `public`) and
+  refuses a route, a console key or a schema name two types contribute, and a route that is a
+  core endpoint; `ChannelRegistry.adminContributions` lists them. `adminEndpoints(registry)`
+  is the endpoint table (`ADMIN_ENDPOINTS` still lists the core endpoints only).
+- `builtinConsoleParts`, `ConsoleParts` and `ConsolePartsInit` (`bundle.ts`) are gone, and so
+  are `BotProvisioning` and `ConsoleHost.larkBots`: a host that builds a `ConsoleServer` itself
+  gives `ConsoleHost.routes` (`ContributedRoute[]`, each route with its `AdminContext`); Lark
+  bot provisioning is `larkBotAdmin`'s `mount` and `routes` (`@agents-io/channel-lark-bot`,
+  `larkBotChannelModule.admin`). A host that uses `Gateway` changes nothing.
+- The `console` section takes the registered types' keys (`AdminContribution.console`) between
+  the console server's keys and `liveChannels`, so `console.larkBotCommand` stays where it was,
+  with the same default. `ConsoleConfig` has no typed `larkBotCommand` any more: the types'
+  settings are an index signature (`config.console.larkBotCommand` still holds the value at
+  run time, typed `unknown`); `consoleSettings(section, keys)` resolves one contribution's.
+  `CREATE_LARK_BOT` moved to `@agents-io/channel-lark-bot` (still re-exported here, deprecated,
+  one release). With a registry without lark-bot, `console.larkBotCommand` is an unknown key.
+- `ConfigStore` implements `ConfigAccess` (it gained `envRefs`); lark-bot's `ProvisionConfig` is
+  `ConfigAccess` without `envRefs`.
+- A daemon whose registry lacks lark-bot answers `/api/bots/lark` with the 404 of an unknown
+  route (`no POST /api/bots/lark`), no longer `bot provisioning needs a config file`. A daemon
+  without a config file that serves the console makes an empty private `<dataDir>/provision`,
+  and its `POST /api/bots/lark` checks the body (400) before answering 404. The HTTP API, the
+  config file and the JSON Schema files are otherwise unchanged.

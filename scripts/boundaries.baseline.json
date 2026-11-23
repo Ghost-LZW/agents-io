@@ -1,10 +1,4 @@
 {
-  "packages/daemon/src/config.ts": {
-    "vendor": 6
-  },
-  "packages/daemon/src/console.ts": {
-    "vendor": 2
-  },
   "packages/daemon/src/gateway.ts": {
     "vendor": 18
   },

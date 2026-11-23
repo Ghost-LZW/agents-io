@@ -40,10 +40,12 @@ import { Topic } from './topic.js';
  * (with the daemon's host token) the host frames (`host.ts`). Nothing else.
  *
  * Modules add endpoints of their own under the same rules, with their schemas in
- * their package, not here: Lark bot provisioning (`POST /api/bots/lark`,
+ * their package, not here: the routes of their `AdminContribution`
+ * (`admin-module.ts`). Lark bot provisioning (`POST /api/bots/lark`,
  * `GET /api/bots/lark/:job`, the `unknown_job` and job `conflict` answers above) is
- * `LARK_BOT_ADMIN_ENDPOINTS` in `channel/lark-bot/src/admin.ts`, its JSON
- * Schemas in `channel/lark-bot/schema/`. `ADMIN_ENDPOINTS` lists the core ones.
+ * the lark-bot module's (`LARK_BOT_ADMIN_ENDPOINTS` in `channel/lark-bot/src/admin.ts`,
+ * its JSON Schemas in `channel/lark-bot/schema/`). `ADMIN_ENDPOINTS` lists the core
+ * ones; the daemon's `adminEndpoints(registry)` lists them with its modules'.
  */
 
 export const ADMIN_WS_PATH = '/ws';

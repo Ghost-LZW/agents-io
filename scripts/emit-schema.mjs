@@ -1,5 +1,6 @@
 // Writes JSON Schemas for non-TypeScript implementers: the protocol's to packages/protocol/schema/,
-// and a module's own wire types next to it (channel/lark-bot/schema/: its console endpoints).
+// and each built-in module's own wire types into its package: the `schemas` of its admin
+// contribution (`ChannelModule.admin`; channel/lark-bot/schema/: its console endpoints).
 // Every `$id` is `agents-io/v<PROTOCOL_VERSION>/<name>`, wherever the file lives.
 import { mkdirSync, writeFileSync } from 'node:fs';
 import * as lark from '../channel/lark-bot/dist/index.js';
@@ -24,18 +25,22 @@ const names = [
   'AdminError', 'AdminLoginRequest', 'AdminLoginResult', 'AdminStatus', 'AdminConfigDocument', 'AdminConfigPut', 'AdminConfigPutResult',
   'AdminChannelsApplied', 'AdminConfigValidateRequest', 'AdminConfigValidation', 'AdminQueue', 'AdminSessions',
 ];
-const sets = [
-  { dir: '../packages/protocol/schema/', mod: p, names },
+/** Modules whose admin contribution declares schemas, and where they go. */
+const modules = [
   // Lark bot provisioning (POST /api/bots/lark, GET /api/bots/lark/:job)
-  { dir: '../channel/lark-bot/schema/', mod: lark, names: ['AdminLarkBotRequest', 'AdminLarkBotStarted', 'AdminLarkBotJob'] },
+  { dir: '../channel/lark-bot/schema/', module: lark.larkBotChannelModule },
+];
+const sets = [
+  { dir: '../packages/protocol/schema/', schemas: Object.fromEntries(names.map((n) => [n, p[n]])) },
+  ...modules.map((m) => ({ dir: m.dir, schemas: m.module.admin?.schemas ?? {} })),
 ];
 let written = 0;
 for (const set of sets) {
   const dir = new URL(set.dir, import.meta.url);
   mkdirSync(dir, { recursive: true });
-  for (const n of set.names) {
-    if (!set.mod[n]) throw new Error(`${set.dir}: no schema ${n}`);
-    const schema = { $schema: 'https://json-schema.org/draft/2020-12/schema', $id: `agents-io/v${p.PROTOCOL_VERSION}/${n}`, ...set.mod[n] };
+  for (const [n, s] of Object.entries(set.schemas)) {
+    if (!s) throw new Error(`${set.dir}: no schema ${n}`);
+    const schema = { $schema: 'https://json-schema.org/draft/2020-12/schema', $id: `agents-io/v${p.PROTOCOL_VERSION}/${n}`, ...s };
     writeFileSync(new URL(`${n}.json`, dir), JSON.stringify(schema, null, 2) + '\n');
     written++;
   }

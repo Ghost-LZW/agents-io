@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { AdminChannelsApplied, ConfigIssue } from '@agents-io/protocol';
+import type { AdminChannelsApplied, ConfigAccess } from '@agents-io/protocol';
 import { AdminLarkBotRequest, type AdminLarkBotJob, type AdminLarkBotJobState } from './admin.js';
 
 /*
@@ -24,8 +24,10 @@ import { AdminLarkBotRequest, type AdminLarkBotJob, type AdminLarkBotJobState } 
  * then, before anything is written (same account, variable names, a duplicate
  * app, the startup validation).
  * The daemon owns the config file, the env file and the log, and hands them in
- * (`ProvisionConfig`, `envRefs`, `log`); its console serves the endpoints
- * (admin.ts) and validates the `POST` body with `request`.
+ * (`ProvisionConfig`, `envRefs`, `log`): the lark-bot module's admin contribution
+ * (provision-admin.ts) builds the jobs from its `AdminContext` and serves the
+ * endpoints (admin.ts) through the daemon's console, which validates the `POST`
+ * body with their `body` schema (`request`).
  */
 
 const FINAL = new Set<AdminLarkBotJobState>(['succeeded', 'failed', 'expired']);
@@ -65,22 +67,12 @@ class ProvisionConflict extends Error {
   }
 }
 
-/** What provisioning needs of the daemon's config file (the daemon's `ConfigStore` is one). */
-export interface ProvisionConfig {
-  /** The file's parsed content ({} when missing). */
-  read(): { raw: unknown };
-  /** Which of `names` the env file or the environment sets (names only; values never leave). */
-  defined(names: string[]): string[];
-  /** The env file create-lark-bot writes the credentials to. */
-  envFilePath(): string;
-  /** The value of one variable (same lookup as `defined`); compared with app ids only. */
-  lookup(name: string): string | undefined;
-  /**
-   * Write `fn`'s result if it passes the checks `PUT /api/config` runs; otherwise nothing is
-   * written and the issues come back. Errors thrown by `fn` propagate (nothing written).
-   */
-  updateValidated(fn: (raw: Record<string, unknown>) => Record<string, unknown>): { ok: true; revision: string } | { ok: false; issues: ConfigIssue[] };
-}
+/**
+ * What provisioning needs of the daemon's config file: its `ConfigAccess` (the daemon's
+ * `ConfigStore` is one) without `envRefs`, which `LarkBotJobsOptions` takes on its own. The env
+ * file is where create-lark-bot writes the credentials; `lookup` is compared with app ids only.
+ */
+export type ProvisionConfig = Omit<ConfigAccess, 'envRefs'>;
 
 /** The daemon's log, as provisioning writes to it. */
 export type ProvisionLog = (level: 'info' | 'warn', msg: string) => void;

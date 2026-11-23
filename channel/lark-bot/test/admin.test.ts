@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { ADMIN_ENDPOINTS } from '@agents-io/protocol';
 import { AdminLarkBotJob, AdminLarkBotRequest, AdminLarkBotStarted, LARK_BOT_ADMIN_ENDPOINTS } from '../src/admin.js';
+import { larkBotChannelModule } from '../src/module.js';
+import { CREATE_LARK_BOT, larkBotAdmin } from '../src/provision-admin.js';
 
 describe('admin API', () => {
   it('lists its admin endpoints once, with schemas, none shared with ADMIN_ENDPOINTS #PR-1', () => {
@@ -17,5 +19,17 @@ describe('admin API', () => {
       expect(e.response).toBeTypeOf('object');
       if (e.method === 'GET') expect('body' in e).toBe(false);
     }
+  });
+
+  it('contributes them as routes from its channel module, with their schemas and console.larkBotCommand (default the pinned create-lark-bot) #PR-1', () => {
+    expect(larkBotChannelModule.admin).toBe(larkBotAdmin);
+    const routes = larkBotAdmin.routes ?? [];
+    expect(routes.map(({ handle: _handle, ...e }) => e)).toEqual([...LARK_BOT_ADMIN_ENDPOINTS]);
+    for (const r of routes) expect(r.handle).toBeTypeOf('function');
+    // What `pnpm schema` writes to channel/lark-bot/schema/.
+    expect(larkBotAdmin.schemas).toEqual({ AdminLarkBotRequest, AdminLarkBotStarted, AdminLarkBotJob });
+    expect(Object.keys(larkBotAdmin.console ?? {})).toEqual(['larkBotCommand']);
+    expect(larkBotAdmin.console!.larkBotCommand).toMatchObject({ type: 'array', minItems: 1, items: { type: 'string' }, default: CREATE_LARK_BOT });
+    expect(CREATE_LARK_BOT).toEqual(['npx', '-y', 'github:Ghost-LZW/create-lark-bot#v0.2.4']);
   });
 });

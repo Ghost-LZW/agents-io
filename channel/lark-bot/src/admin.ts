@@ -2,11 +2,12 @@ import { Type, type Static } from '@sinclair/typebox';
 import type { AdminEndpoint } from '@agents-io/protocol';
 
 /*
- * The console (admin HTTP) endpoints of Lark bot provisioning: the daemon serves
- * them next to the core ones (`ADMIN_ENDPOINTS` in @agents-io/protocol), with the
- * same auth, error body (`AdminError`) and conventions, and runs the jobs with
- * `LarkBotJobs` (provision.ts). JSON Schemas: `channel/lark-bot/schema/`
- * (`$id` `agents-io/v1/AdminLarkBot*`, written by `pnpm schema`).
+ * The console (admin HTTP) endpoints of Lark bot provisioning: the lark-bot module
+ * contributes them as routes (`larkBotAdmin`, provision-admin.ts), which the daemon
+ * serves after the core ones (`ADMIN_ENDPOINTS` in @agents-io/protocol), with the
+ * same auth, error body (`AdminError`) and conventions; the jobs are `LarkBotJobs`
+ * (provision.ts). JSON Schemas: `channel/lark-bot/schema/` (`$id`
+ * `agents-io/v1/AdminLarkBot*`, the contribution's `schemas`, written by `pnpm schema`).
  */
 
 /**
@@ -95,7 +96,7 @@ export const AdminLarkBotJob = Type.Object({
 });
 export type AdminLarkBotJob = Static<typeof AdminLarkBotJob>;
 
-/** The admin endpoints of this module, for clients and route tables (none of them is in `ADMIN_ENDPOINTS`). */
+/** The admin endpoints of this module, for clients and route tables (none of them is in `ADMIN_ENDPOINTS`); its routes are these with their handlers. */
 export const LARK_BOT_ADMIN_ENDPOINTS = [
   { method: 'POST', path: '/api/bots/lark', body: AdminLarkBotRequest, status: 202, response: AdminLarkBotStarted },
   { method: 'GET', path: '/api/bots/lark/:job', status: 200, response: AdminLarkBotJob },

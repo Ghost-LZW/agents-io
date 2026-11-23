@@ -3,7 +3,7 @@ import { chmodSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, re
 import { dirname, join } from 'node:path';
 import type { TSchema } from '@sinclair/typebox';
 import { Value } from '@sinclair/typebox/value';
-import { ADMIN_REDACTED, type AdminConfigDocument, type AdminConfigPutResult, type AdminConfigValidation, type ChannelModule, type ConfigIssue } from '@agents-io/protocol';
+import { ADMIN_REDACTED, type AdminConfigDocument, type AdminConfigPutResult, type AdminConfigValidation, type ChannelModule, type ConfigAccess, type ConfigIssue } from '@agents-io/protocol';
 import { builtinChannels, builtinHarnesses } from './bundle.js';
 import type { ChannelRegistry } from './channel-registry.js';
 import { ConfigError, configFileSchema, findEnvFile, resolveConfig, type Config } from './config.js';
@@ -240,7 +240,8 @@ export type PutOutcome =
   | { status: 409; code: 'conflict'; message: string }
   | { status: 422; body: AdminConfigValidation };
 
-export class ConfigStore {
+/** The config file of a daemon; the `ConfigAccess` its modules' admin contributions get (`AdminContext.config`). */
+export class ConfigStore implements ConfigAccess {
   /**
    * The file as the running daemon reflects it: as it started, with `channels` replaced by
    * the ones last applied live. To tell whether a change needs a restart.
@@ -303,6 +304,11 @@ export class ConfigStore {
   defined(names: string[]): string[] {
     const env = this.env();
     return names.filter((n) => env[n] !== undefined && env[n] !== '');
+  }
+
+  /** Every variable `value` references as `"env:NAME"` (`envRefs`). */
+  envRefs(value: unknown): string[] {
+    return envRefs(value);
   }
 
   /** The file: its bytes' revision and parsed content ({} when missing). */
@@ -370,7 +376,7 @@ export class ConfigStore {
     return { status: 200, body: { revision, issues, applied: this.appliedOf(doc) } };
   }
 
-  /** Change the file programmatically (bot provisioning); same atomic 0600 write, no secret checks. */
+  /** Change the file programmatically (a module's admin route); same atomic 0600 write, no secret checks. */
   update(fn: (raw: Record<string, unknown>) => Record<string, unknown>): string {
     const cur = this.read();
     if (cur.parseError) throw new ConfigError(`${this.o.path} is not JSON: ${cur.parseError}`);

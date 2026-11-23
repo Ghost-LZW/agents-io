@@ -196,6 +196,70 @@ function channelEntrySchema(registry: ChannelRegistry): TSchema {
 export type ChannelEntry = ChannelCommonFields & BuiltinChannelEntry;
 const ChannelEntry = channelEntrySchema(builtinChannels) as TSchema & { static: ChannelEntry };
 
+/** The `console` section's own keys before the modules' ones: the console server's. */
+const ConsoleServerKeys = {
+  enabled: Type.Optional(Type.Boolean()),
+  host: Type.Optional(Type.String()),
+  /** 0: any free port (the URL is written next to the socket, `<socket>.console`). */
+  port: Type.Optional(Type.Integer({ minimum: 0, maximum: 65535 })),
+  allowRemote: Type.Optional(Type.Boolean()),
+  /**
+   * Extra names the `Host` header may carry (anti DNS rebinding), e.g. the LAN name or
+   * address remote browsers use. Loopback names and a concrete `host` are always accepted.
+   * Required with a wildcard `host` (0.0.0.0, ::) and `allowRemote`.
+   */
+  allowedHosts: Type.Optional(Type.Array(Type.String())),
+  /** Origins of separately hosted UIs allowed to call the API (CORS); none by default. */
+  origins: Type.Optional(Type.Array(Type.String())),
+  /** Where the UI is; login links point there (default: the console URL itself). */
+  uiUrl: Type.Optional(Type.String()),
+  /** Lifetime of console sessions from a login link (default 12 h). */
+  sessionTtlMs: Type.Optional(Type.Number({ minimum: 1000 })),
+  /**
+   * WebSocket heartbeat of `/ws`: a ping every `intervalMs` (default 30 s; 0 turns it off);
+   * a connection that has not answered (pong, or any message) within `timeoutMs` after a
+   * ping (default 10 s) is closed, which frees the host role it held.
+   */
+  heartbeat: Type.Optional(Type.Object({ intervalMs: Type.Optional(Type.Integer({ minimum: 0 })), timeoutMs: Type.Optional(Type.Integer({ minimum: 100 })) }, Closed)),
+};
+
+/** The `console` section's own keys after the modules' ones. */
+const ConsoleApplyKeys = {
+  /**
+   * Apply `channels` changes written through the console (`PUT /api/config`, or a module's
+   * route that adds a channel, such as a provisioned bot) to the running daemon: start new or
+   * changed entries, stop removed or changed ones, keep the rest. Default false (changes take
+   * effect at the next start).
+   */
+  liveChannels: Type.Optional(Type.Boolean()),
+};
+
+type ConsoleSection = TObject<typeof ConsoleServerKeys & typeof ConsoleApplyKeys>;
+const consoleSections = new WeakMap<ChannelRegistry, ConsoleSection>();
+
+/**
+ * The `console` section over a registry's channel types: the console's own keys and, between the
+ * server's and `liveChannels`, the settings the types contribute (`AdminContribution.console`,
+ * each optional, in registration order; lark-bot's `larkBotCommand` is where it always was).
+ * Closed, so a setting no registered type declares is a config error.
+ */
+function consoleSchema(registry: ChannelRegistry): ConsoleSection {
+  let s = consoleSections.get(registry);
+  if (!s) {
+    const contributed: Record<string, TSchema> = {};
+    for (const { type, admin } of registry.adminContributions) {
+      for (const [k, schema] of Object.entries(admin.console ?? {})) {
+        if (Object.hasOwn(ConsoleServerKeys, k) || Object.hasOwn(ConsoleApplyKeys, k)) throw new Error(`channel type ${JSON.stringify(type)}: admin setting console.${k} is the console's own`);
+        contributed[k] = Type.Optional(schema);
+      }
+    }
+    // The static type has the console's own keys only: `resolveConsole` reads the others by name.
+    s = Type.Object({ ...ConsoleServerKeys, ...contributed, ...ConsoleApplyKeys }, Closed) as unknown as ConsoleSection;
+    consoleSections.set(registry, s);
+  }
+  return s;
+}
+
 /** A named run preset: one harness instance with its model and effort (`presets.<name>`). */
 const PresetEntry = Type.Object(
   {
@@ -416,46 +480,7 @@ export const ConfigFile = Type.Object(
      * `aio serve`, on 127.0.0.1:7464. A non-loopback `host` is refused unless
      * `allowRemote` is true (then every request still needs a token).
      */
-    console: Type.Optional(
-      Type.Object(
-        {
-          enabled: Type.Optional(Type.Boolean()),
-          host: Type.Optional(Type.String()),
-          /** 0: any free port (the URL is written next to the socket, `<socket>.console`). */
-          port: Type.Optional(Type.Integer({ minimum: 0, maximum: 65535 })),
-          allowRemote: Type.Optional(Type.Boolean()),
-          /**
-           * Extra names the `Host` header may carry (anti DNS rebinding), e.g. the LAN name or
-           * address remote browsers use. Loopback names and a concrete `host` are always accepted.
-           * Required with a wildcard `host` (0.0.0.0, ::) and `allowRemote`.
-           */
-          allowedHosts: Type.Optional(Type.Array(Type.String())),
-          /** Origins of separately hosted UIs allowed to call the API (CORS); none by default. */
-          origins: Type.Optional(Type.Array(Type.String())),
-          /** Where the UI is; login links point there (default: the console URL itself). */
-          uiUrl: Type.Optional(Type.String()),
-          /** Lifetime of console sessions from a login link (default 12 h). */
-          sessionTtlMs: Type.Optional(Type.Number({ minimum: 1000 })),
-          /**
-           * WebSocket heartbeat of `/ws`: a ping every `intervalMs` (default 30 s; 0 turns it off);
-           * a connection that has not answered (pong, or any message) within `timeoutMs` after a
-           * ping (default 10 s) is closed, which frees the host role it held.
-           */
-          heartbeat: Type.Optional(
-            Type.Object({ intervalMs: Type.Optional(Type.Integer({ minimum: 0 })), timeoutMs: Type.Optional(Type.Integer({ minimum: 100 })) }, Closed),
-          ),
-          /** create-lark-bot invocation for `POST /api/bots/lark` (argv; default npx of the pinned release). */
-          larkBotCommand: Type.Optional(Type.Array(Type.String(), { minItems: 1 })),
-          /**
-           * Apply `channels` changes written through the console (`PUT /api/config`, a bot added by
-           * `POST /api/bots/lark`) to the running daemon: start new or changed entries, stop removed
-           * or changed ones, keep the rest. Default false (changes take effect at the next start).
-           */
-          liveChannels: Type.Optional(Type.Boolean()),
-        },
-        Closed,
-      ),
-    ),
+    console: Type.Optional(consoleSchema(builtinChannels)),
     /**
      * The host connection. `tokenFile`: an operator-set host token, stable across restarts
      * (relative paths are relative to the config file). Read when the file exists (it must be
@@ -539,8 +564,8 @@ const fileSchemas = new WeakMap<HarnessRegistry, WeakMap<ChannelRegistry, TObjec
 
 /**
  * The config file's schema over a registry's harness kinds (`harnesses.<name>.use`, the older
- * `harness` block) and a registry's channel types (`channels[].type`; default the built-in ones);
- * the rest is `ConfigFile`'s.
+ * `harness` block) and a registry's channel types (`channels[].type` and the settings they add to
+ * `console`; default the built-in ones); the rest is `ConfigFile`'s.
  */
 export function configFileSchema(registry: HarnessRegistry, channels: ChannelRegistry = builtinChannels): TObject {
   if (registry === builtinHarnesses && channels === builtinChannels) return ConfigFile;
@@ -548,7 +573,16 @@ export function configFileSchema(registry: HarnessRegistry, channels: ChannelReg
   if (!byChannels) fileSchemas.set(registry, (byChannels = new WeakMap()));
   let s = byChannels.get(channels);
   if (!s) {
-    s = Type.Object({ ...ConfigFile.properties, harnesses: harnessesSchema(registry), harness: legacyBlockSchema(registry), channels: Type.Optional(Type.Array(channelEntrySchema(channels))) }, Closed);
+    s = Type.Object(
+      {
+        ...ConfigFile.properties,
+        harnesses: harnessesSchema(registry),
+        harness: legacyBlockSchema(registry),
+        channels: Type.Optional(Type.Array(channelEntrySchema(channels))),
+        console: Type.Optional(consoleSchema(channels)),
+      },
+      Closed,
+    );
     byChannels.set(channels, s);
   }
   return s;
@@ -709,15 +743,17 @@ export interface ConsoleConfig {
   origins: string[];
   uiUrl?: string;
   sessionTtlMs: number;
-  larkBotCommand: string[];
   /** `/ws` ping interval (0: off) and how long a ping waits for an answer. */
   heartbeat: { intervalMs: number; timeoutMs: number };
   /** Apply channel changes written through the console at once. */
   liveChannels: boolean;
+  /**
+   * The settings the channel types contribute (`AdminContribution.console`; the built-in lark-bot
+   * type's `larkBotCommand`), by key, as `consoleSettings` resolves them: the value written, else
+   * the key's schema default.
+   */
+  readonly [setting: string]: unknown;
 }
-
-/** create-lark-bot, pinned. */
-export const CREATE_LARK_BOT = ['npx', '-y', 'github:Ghost-LZW/create-lark-bot#v0.2.4'];
 export const DEFAULT_CONSOLE_PORT = 7464;
 export const DEFAULT_WS_HEARTBEAT_MS = 30_000;
 export const DEFAULT_WS_HEARTBEAT_TIMEOUT_MS = 10_000;
@@ -734,7 +770,22 @@ export function isWildcardHost(host: string): boolean {
   return h === '0.0.0.0' || h === '::' || h === '';
 }
 
-function resolveConsole(c: ConfigFile['console']): ConsoleConfig {
+/**
+ * The console settings one contribution declares (`AdminContribution.console`), from a console
+ * section (as written, or a resolved `ConsoleConfig`): each key's value, else a copy of its
+ * schema's `default`; a key with neither is left out. What the module gets as `AdminContext.console`.
+ */
+export function consoleSettings(section: Readonly<Record<string, unknown>> | undefined, keys: Readonly<Record<string, TSchema>> | undefined): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, schema] of Object.entries(keys ?? {})) {
+    const written = section?.[k];
+    const v = written !== undefined ? written : structuredClone((schema as { default?: unknown }).default);
+    if (v !== undefined) out[k] = v;
+  }
+  return out;
+}
+
+function resolveConsole(c: ConfigFile['console'], channels: ChannelRegistry): ConsoleConfig {
   const host = c?.host ?? '127.0.0.1';
   if (!isLoopbackHost(host) && c?.allowRemote !== true)
     fail(`console.host ${JSON.stringify(host)} is not a loopback address; the console only listens on loopback unless console.allowRemote is true`);
@@ -764,7 +815,7 @@ function resolveConsole(c: ConfigFile['console']): ConsoleConfig {
     origins,
     ...(c?.uiUrl !== undefined ? { uiUrl: c.uiUrl.replace(/\/$/, '') } : {}),
     sessionTtlMs: c?.sessionTtlMs ?? 12 * 3_600_000,
-    larkBotCommand: c?.larkBotCommand ?? CREATE_LARK_BOT,
+    ...Object.assign({}, ...channels.adminContributions.map(({ admin }) => consoleSettings(c, admin.console))),
     heartbeat: { intervalMs: c?.heartbeat?.intervalMs ?? DEFAULT_WS_HEARTBEAT_MS, timeoutMs: c?.heartbeat?.timeoutMs ?? DEFAULT_WS_HEARTBEAT_TIMEOUT_MS },
     liveChannels: c?.liveChannels === true,
   };
@@ -1016,7 +1067,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
       principal: { id: c.local?.principal ?? owners[0] ?? 'local:owner', labels: c.local?.labels ?? ['owner'] },
       session: localSession,
     },
-    console: resolveConsole(c.console),
+    console: resolveConsole(c.console, channelRegistry),
     host: c.host?.tokenFile !== undefined ? { tokenFile: path(c.host.tokenFile) } : {},
     ...(c.externalMcp && c.externalMcp.enabled !== false ? { externalMcp: resolveExternalMcp(c.externalMcp, env, path, c.policy?.owners ?? []) } : {}),
     ...(warnings.length ? { warnings } : {}),

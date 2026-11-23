@@ -5,10 +5,14 @@ import type { Duplex } from 'node:stream';
 import { Type, type Static, type TSchema } from '@sinclair/typebox';
 import { WebSocketServer, type WebSocket } from 'ws';
 import {
+  ADMIN_ENDPOINTS,
   ADMIN_WS_BEARER_PREFIX,
   ADMIN_WS_PATH,
   ADMIN_WS_SUBPROTOCOL,
   type AdminChannelsApplied,
+  type AdminContext,
+  type AdminEndpoint,
+  type AdminRoute,
   AdminConfigPut,
   AdminConfigValidateRequest,
   AdminLoginRequest,
@@ -23,6 +27,7 @@ import {
   type AdminStatus,
   type Origin,
 } from '@agents-io/protocol';
+import type { ChannelRegistry } from './channel-registry.js';
 import { isLoopbackHost, isWildcardHost, type ConsoleConfig } from './config.js';
 import type { ConfigStore } from './console-config.js';
 import type { LogFn } from './gateway.js';
@@ -31,8 +36,10 @@ import { FrameConn, type FrameTransport, type LocalHost } from './local-server.j
 /*
  * The console API (packages/protocol/src/admin.ts): HTTP endpoints under
  * `/api` and the WebSocket `/ws`, for web UIs built against the protocol only.
- * Bot provisioning (`/api/bots/lark`) is a module's: its schemas and jobs are
- * channel/lark-bot's (`admin.ts`, `provision.ts`), handed in as `BotProvisioning`.
+ * Modules add routes of their own (`AdminContribution.routes`,
+ * packages/protocol/src/admin-module.ts), handed in as `ConsoleHost.routes` and
+ * served after the core ones with the same auth; the gateway's are its channel
+ * types' (lark-bot's bot provisioning).
  *
  * - Listens on loopback unless the config allows otherwise (config.ts refuses
  *   a non-loopback host without `console.allowRemote`).
@@ -73,13 +80,43 @@ const WS_HIGH_WATER = 4 * 1024 * 1024;
 const WS_CLOSE_GRACE_MS = 1000;
 const STATUS_TEXT: Record<number, string> = { 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found' };
 
-/** Bot provisioning jobs as the console serves them (`POST` a job, `GET` its state). */
-export interface BotProvisioning {
-  /** Schema of the `POST` body; `start` gets only bodies that pass it. */
-  readonly request: TSchema;
-  start(req: unknown): { ok: true; job: string } | { ok: false; status: 400 | 409; code: string; message: string };
-  /** The job's state, or undefined for an unknown job. */
-  get(id: string): unknown;
+/** A route a module contributed (`AdminContribution.routes`), with the context its handler gets. */
+export interface ContributedRoute {
+  route: AdminRoute;
+  ctx: AdminContext;
+}
+
+/**
+ * Every admin HTTP endpoint for clients and route tables of a console over `channels`: the core
+ * ones (`ADMIN_ENDPOINTS`), then the routes the registered types contribute
+ * (`AdminContribution.routes`, without their handlers), in registration order. The gateway's
+ * console serves these over its channel registry (and `POST /api/login-link`, `POST
+ * /api/console-proof` for `aio console-link`).
+ */
+export function adminEndpoints(channels: ChannelRegistry): AdminEndpoint[] {
+  return [...ADMIN_ENDPOINTS, ...channels.adminContributions.flatMap(({ admin }) => (admin.routes ?? []).map(({ handle: _handle, ...endpoint }) => endpoint))];
+}
+
+/**
+ * A contributed route with its path as a pattern: a `:name` segment matches one segment, and one
+ * that ends the path the rest of it, `/` included (as the core's `/api/explain/:inputId` takes it).
+ */
+interface CompiledRoute extends ContributedRoute {
+  pattern: RegExp;
+  names: string[];
+}
+
+function compileRoute(r: ContributedRoute): CompiledRoute {
+  const names: string[] = [];
+  const segments = r.route.path.split('/');
+  const source = segments
+    .map((x, i) => {
+      if (!x.startsWith(':')) return x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      names.push(x.slice(1));
+      return i === segments.length - 1 ? '(.*)' : '([^/]+)';
+    })
+    .join('/');
+  return { ...r, pattern: new RegExp(`^${source}$`), names };
 }
 
 /** What the console needs from the daemon. */
@@ -96,7 +133,8 @@ export interface ConsoleHost {
   consoleOrigin(sessionKey: string): Origin;
   /** Absent: the daemon was started without a config file path (`/api/config*` answer 404). */
   readonly configStore?: ConfigStore;
-  readonly larkBots?: BotProvisioning;
+  /** What modules add (`AdminContribution.routes`), served after the core routes; a path both serve is the core's. */
+  readonly routes?: readonly ContributedRoute[];
   /** `console.liveChannels`: apply the file's `channels` to the running daemon after a `PUT`. */
   applyChannels?(): Promise<{ applied: 'live' | 'restart'; channels: AdminChannelsApplied } | undefined>;
 }
@@ -188,9 +226,11 @@ export class ConsoleServer {
   private readonly wss = new WebSocketServer({ noServer: true, handleProtocols: (protocols) => (protocols.has(ADMIN_WS_SUBPROTOCOL) ? ADMIN_WS_SUBPROTOCOL : false) });
   private readonly conns = new Set<FrameConn>();
   private address: AddressInfo | undefined;
+  private readonly routes: CompiledRoute[];
 
   constructor(private readonly o: ConsoleServerOptions) {
     this.auth = new ConsoleAuth(o.host.token, o.config.sessionTtlMs, o.now);
+    this.routes = (o.host.routes ?? []).map(compileRoute);
   }
 
   /** `http://host:port` once listening. */
@@ -357,20 +397,14 @@ export class ConsoleServer {
         return { status: 200, body: res };
       }
     }
-    if (p === '/api/bots/lark' || p.startsWith('/api/bots/lark/')) {
-      const jobs = h.larkBots;
-      if (!jobs) throw new HttpError(404, 'not_found', 'bot provisioning needs a config file');
-      if (m === 'POST' && p === '/api/bots/lark') {
-        const r = jobs.start(await readJson(req, jobs.request));
-        if (!r.ok) throw new HttpError(r.status, r.code, r.message);
-        return { status: 202, body: { job: r.job } };
-      }
-      if (m === 'GET' && p.startsWith('/api/bots/lark/')) {
-        const id = param(p, '/api/bots/lark/');
-        const j = jobs.get(id);
-        if (!j) throw new HttpError(404, 'unknown_job', `no provisioning job ${id}`);
-        return { status: 200, body: j };
-      }
+    // What modules add, after the core routes and with their auth.
+    for (const r of this.routes) {
+      const match = r.route.method === m ? r.pattern.exec(p) : null;
+      if (!match) continue;
+      const params = Object.fromEntries(r.names.map((n, i) => [n, decode(match[i + 1]!)]));
+      const body = r.route.body ? await readJson(req, r.route.body) : undefined;
+      const out = await r.route.handle({ params, body }, r.ctx);
+      return { status: out.status, body: out.body };
     }
     throw new HttpError(404, 'not_found', `no ${m} ${p}`);
   }
@@ -479,8 +513,12 @@ export class ConsoleServer {
 }
 
 function param(path: string, prefix: string): string {
+  return decode(path.slice(prefix.length));
+}
+
+function decode(segment: string): string {
   try {
-    return decodeURIComponent(path.slice(prefix.length));
+    return decodeURIComponent(segment);
   } catch {
     throw new HttpError(400, 'invalid_request', 'bad URL encoding');
   }

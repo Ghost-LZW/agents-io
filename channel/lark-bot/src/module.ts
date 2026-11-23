@@ -2,11 +2,12 @@ import { Type } from '@sinclair/typebox';
 import type { ChannelModule } from '@agents-io/protocol';
 import { LarkBotAdapter } from './adapter.js';
 import { CHANNEL_ID } from './inbound.js';
+import { larkBotAdmin } from './provision-admin.js';
 
 /*
  * The lark-bot channel type (`{ "type": "lark-bot", … }`): its config keys, the app each entry
- * runs, the rules across entries (decision 8) and how its adapter is built. The daemon registers
- * it in its bundle.
+ * runs, the rules across entries (decision 8), how its adapter is built and what it adds to the
+ * console (bot provisioning, provision-admin.ts). The daemon registers it in its bundle.
  */
 
 /** A lark-bot entry's config after env substitution, with its app resolved. */
@@ -99,4 +100,7 @@ export const larkBotChannelModule: ChannelModule<LarkBotChannelEntry, LarkBotCha
       ),
     };
   },
+
+  // Bot provisioning from the console: `console.larkBotCommand`, `POST /api/bots/lark`, `GET /api/bots/lark/:job`.
+  admin: larkBotAdmin,
 };

@@ -1,4 +1,5 @@
 import type { TSchema } from '@sinclair/typebox';
+import type { AdminContribution } from './admin-module.js';
 import type { ChannelAdapter, ChannelFactoryInit } from './channel.js';
 
 /*
@@ -87,12 +88,6 @@ export interface BuiltChannel {
 }
 
 /**
- * What a channel module adds to the host's admin API and console: routes, console settings,
- * schemas (core-slimming G5). Reserved: the host reads none of it yet.
- */
-export interface ChannelAdminContribution {}
-
-/**
  * A channel type: what a config entry `{ "type": "<type>", … }` means. The host owns `type`, the
  * keys every entry has (`account`, default `default`; `tier`, `openDelayMs`, `previewDelayMs`,
  * `ack`, `evidence`) and the `"env:NAME"` substitution (`ChannelResolveContext.substitute`); the
@@ -103,7 +98,7 @@ export interface ChannelAdminContribution {}
  * composition root grants it when it registers the type (the daemon's `bundle.ts`: lark-bot and
  * mail their caps; every other type, bridge and module included, `device_only` only).
  *
- * In progress (core-slimming G2): the daemon reads all of it except `implicitEnv` and `admin`.
+ * In progress (core-slimming G2): the daemon reads all of it except `implicitEnv`.
  */
 export interface ChannelModule<E = Record<string, unknown>, R = E> {
   /**
@@ -163,6 +158,9 @@ export interface ChannelModule<E = Record<string, unknown>, R = E> {
   idOf?(entry: R): string | undefined;
   /** The adapter of one entry. Starts nothing: the host's `start` does. A throw fails the daemon's start (or that entry's live apply). */
   create(entry: R & { account: string }, init: ChannelInit): BuiltChannel | Promise<BuiltChannel>;
-  /** Reserved (core-slimming G5). */
-  readonly admin?: ChannelAdminContribution;
+  /**
+   * What the type adds to the host's admin API and console (core-slimming G5): console settings,
+   * schemas, routes and what runs while the console serves them (lark-bot: bot provisioning).
+   */
+  readonly admin?: AdminContribution;
 }

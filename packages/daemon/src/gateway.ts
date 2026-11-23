@@ -12,6 +12,7 @@ import {
   type AdminSession,
   type AdminSessions,
   type AdminChannelsApplied,
+  type AdminContext,
   type AdminStatus,
   type BlobAccess,
   type BuiltChannel as CreatedChannel,
@@ -99,13 +100,13 @@ import {
   settleLeftoverInputs,
 } from '@agents-io/session';
 import { HostMcpServer, HostTools, ToolError, agentIdentity, type TopicHandover } from '@agents-io/host-mcp';
-import { builtinChannels, builtinConsoleParts, builtinHarnesses, type ConsoleParts } from './bundle.js';
+import { builtinChannels, builtinHarnesses } from './bundle.js';
 import { badChannelAdapter, loadHarnessModule } from './module-loader.js';
-import { ConfigError, UNGRANTED_EVIDENCE, agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type PresetConfig, type ResolvedChannel } from './config.js';
-import { ConsoleServer } from './console.js';
+import { ConfigError, UNGRANTED_EVIDENCE, agentSpec, configTable, consoleSettings, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type PresetConfig, type ResolvedChannel } from './config.js';
+import { ConsoleServer, type ContributedRoute } from './console.js';
 import type { ChannelRegistry, DefaultEvidence } from './channel-registry.js';
 import type { HarnessRegistry } from './harness-registry.js';
-import { ConfigStore, canonical, envRefs } from './console-config.js';
+import { ConfigStore, canonical } from './console-config.js';
 import type { ClientCommand, SessionInfo } from './frames.js';
 import { HostService, isHostOrigin } from './host.js';
 import { LocalServer } from './local-server.js';
@@ -349,8 +350,8 @@ export class Gateway {
   private consoleFile: string | undefined;
   /** The config file as the console edits it (when the config came from a file). */
   readonly configStore: ConfigStore | undefined;
-  /** What the bundle's channel types add to the console (bot provisioning), with a config file. */
-  private readonly consoleParts: ConsoleParts | undefined;
+  /** What the channel types' admin contributions mounted with the console (`ChannelModule.admin`), ended with it. */
+  private readonly adminMounts: { type: string; close?(): void }[] = [];
   readonly startedAt = Date.now();
   private readonly log: LogFn;
   private stopped = false;
@@ -658,15 +659,6 @@ export class Gateway {
         harnessRegistry: this.harnessRegistry,
         channelRegistry: this.channelRegistry,
       });
-      this.consoleParts = builtinConsoleParts(this.channelRegistry, {
-        console: c.console,
-        dir: join(c.dataDir, 'provision'),
-        config: this.configStore,
-        envRefs,
-        ...(c.console.liveChannels ? { applyChannels: () => this.applyChannels() } : {}),
-        log: (level, msg) => this.log(level, msg),
-        ...(o.consoleEnv ? { env: o.consoleEnv } : {}),
-      });
     }
   }
 
@@ -723,7 +715,7 @@ export class Gateway {
    */
   private async startConsole(): Promise<void> {
     const c = this.o.config;
-    if (this.consoleParts) privateDir(join(c.dataDir, 'provision'), (msg) => this.log('warn', msg));
+    const routes = this.mountAdmin();
     const server = new ConsoleServer({
       config: c.console,
       host: {
@@ -735,7 +727,7 @@ export class Gateway {
         explain: (id) => this.router.explain(id),
         consoleOrigin: (key) => this.consoleOrigin(key),
         ...(this.configStore ? { configStore: this.configStore } : {}),
-        ...this.consoleParts?.host,
+        routes,
         ...(this.configStore && c.console.liveChannels ? { applyChannels: () => this.applyChannels() } : {}),
       },
       log: (level, msg) => this.log(level, msg),
@@ -747,6 +739,7 @@ export class Gateway {
       await server.listen();
     } catch (e) {
       this.log('error', `console API not started: cannot listen on ${c.console.host}:${c.console.port}: ${(e as Error).message}`);
+      this.closeAdmin();
       return;
     }
     this.console = server;
@@ -755,6 +748,45 @@ export class Gateway {
       // Next to the token file (same private directory), so `aio console-link` finds the port.
       this.consoleFile = urlFile;
       writeTokenFile(this.consoleFile, server.url);
+    }
+  }
+
+  /**
+   * Mount what the channel types add to the console (`ChannelModule.admin`, in registration order):
+   * each contribution gets a context of its own (its console settings, the private work directory
+   * `<dataDir>/provision`, the config file when the daemon has one) for its `mount` and every call
+   * of its routes. A `mount` that throws fails the start.
+   */
+  private mountAdmin(): ContributedRoute[] {
+    const c = this.o.config;
+    const contributions = this.channelRegistry.adminContributions;
+    const dir = join(c.dataDir, 'provision');
+    if (contributions.some(({ admin }) => admin.mount)) privateDir(dir, (msg) => this.log('warn', msg));
+    const routes: ContributedRoute[] = [];
+    for (const { type, admin } of contributions) {
+      const ctx: AdminContext = {
+        console: consoleSettings(c.console, admin.console),
+        dir,
+        log: (level, msg, data) => this.log(level, msg, data),
+        env: this.o.consoleEnv ?? process.env,
+        ...(this.configStore ? { config: this.configStore } : {}),
+        ...(this.configStore && c.console.liveChannels ? { applyChannels: () => this.applyChannels() } : {}),
+      };
+      const mounted = admin.mount?.(ctx);
+      if (mounted) this.adminMounts.push({ type, ...(mounted.close ? { close: () => mounted.close!() } : {}) });
+      for (const route of admin.routes ?? []) routes.push({ route, ctx });
+    }
+    return routes;
+  }
+
+  /** End what `mountAdmin` mounted (the console is gone). */
+  private closeAdmin(): void {
+    for (const m of this.adminMounts.splice(0)) {
+      try {
+        m.close?.();
+      } catch (e) {
+        this.log('warn', `channel type ${m.type}: closing its console part failed: ${(e as Error).message}`);
+      }
     }
   }
 
@@ -3075,7 +3107,7 @@ ${a.summary}` }],
     await within(this.runs.stop(), 10_000);
     this.server?.close('gateway stopping');
     this.console?.close('gateway stopping');
-    this.consoleParts?.close();
+    this.closeAdmin();
     if (this.tokenFile) removeTokenFile(this.tokenFile, this.token);
     if (this.consoleFile && this.console) removeTokenFile(this.consoleFile, this.console.url);
     this.watches.stop();
