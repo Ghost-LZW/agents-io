@@ -6,3 +6,5 @@ export * from './tools.js';
 export * from './media.js';
 export type * from './types.js';
 export * from './tui.js';
+export { claudeTuiTakeover, type ClaudeTuiSettings } from './takeover.js';
+export { TUI_BRIDGE_COMMAND, tuiBridge } from './bridge.js';

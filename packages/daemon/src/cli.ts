@@ -13,7 +13,7 @@ import { ConfigError, loadConfig, type LoadOptions } from './config.js';
 import { consoleProof } from './console.js';
 import { Gateway } from './gateway.js';
 import { TokenError, consoleUrlPath, readTokenFile, tokenPath } from './token.js';
-import { tuiBridge } from './tui-bridge.js';
+import { builtinHarnesses } from './bundle.js';
 import { WATCH_SPEC_HELP, formatWatch, parseDuration, parseWatchSpec } from './watch-spec.js';
 
 const USAGE = `aio: the agents-io daemon and its CLI
@@ -613,7 +613,16 @@ async function consoleLink(a: CliArgs): Promise<number> {
   return 0;
 }
 
-const COMMANDS: Record<string, (a: CliArgs) => Promise<number>> = { serve, attach, tui, 'tui-bridge': () => tuiBridge(), input, sessions, watch, run: runCmd, send, tail, ack, redispatch, bindings, explain, verify, 'console-link': consoleLink, console: consoleLink };
+const COMMANDS: Record<string, (a: CliArgs) => Promise<number>> = { serve, attach, tui, input, sessions, watch, run: runCmd, send, tail, ack, redispatch, bindings, explain, verify, 'console-link': consoleLink, console: consoleLink };
+
+/**
+ * A command a built-in harness kind adds (`HarnessModule.cli`; Claude Code's `tui-bridge`, which its
+ * terminal UI starts), with the positional arguments after its name. The CLI's own commands come first.
+ */
+function kindCommand(a: CliArgs): ((a: CliArgs) => Promise<number>) | undefined {
+  const run = builtinHarnesses.cliCommand(a.cmd);
+  return run ? () => run({ argv: a.rest, env: process.env }) : undefined;
+}
 
 export async function main(argv: string[]): Promise<number> {
   const a = parseCli(argv);
@@ -626,7 +635,7 @@ export async function main(argv: string[]): Promise<number> {
     console.error('aio e2e moved: run `pnpm e2e` from the repo root, or `aio-e2e` (packages/daemon-e2e), with the same options');
     return 2;
   }
-  const f = COMMANDS[a.cmd];
+  const f = COMMANDS[a.cmd] ?? kindCommand(a);
   if (!f) {
     console.error(`unknown command ${a.cmd}\n\n${USAGE}`);
     return 2;

@@ -1,12 +1,1 @@
-{
-  "packages/daemon/src/gateway.ts": {
-    "vendor": 18
-  },
-  "packages/daemon/src/tui-bridge.ts": {
-    "vendor": 2
-  },
-  "packages/daemon/src/tui-claude.ts": {
-    "import:@agents-io/harness-claude-code": 1,
-    "vendor": 7
-  }
-}
+{}

@@ -1,6 +1,7 @@
 import { Type, type Static } from '@sinclair/typebox';
 import type { HarnessModule, HarnessResolveContext } from '@agents-io/protocol';
 import { CLAUDE_CODE_DECLARATIONS, ClaudeCodeHarness, findOnPath, type ClaudeCodeHarnessConfig } from './adapter.js';
+import { TUI_BRIDGE_COMMAND, tuiBridge } from './bridge.js';
 
 /*
  * The Claude Code harness kind (`use: "claude-code"`, and the `claude-code` section of the older
@@ -53,6 +54,8 @@ export const claudeCodeHarnessModule: HarnessModule<ClaudeLaunch> = {
   declares: CLAUDE_CODE_DECLARATIONS,
   // The adapter reads them from the open options (`ClaudeCodeOptions.profiles`), as it always has.
   profilesInOpen: true,
+  // The terminal UI's bridge (`takeover`): its MCP config starts `aio tui-bridge` as the TUI's child.
+  cli: { [TUI_BRIDGE_COMMAND]: ({ env }) => tuiBridge(env) },
   legacy: {
     schema: LegacySection,
     envPrefixes: ['ANTHROPIC_', 'CLAUDE_'],
@@ -87,6 +90,8 @@ export const claudeCodeHarnessModule: HarnessModule<ClaudeLaunch> = {
     const config: ClaudeCodeHarnessConfig = {
       env: init.env,
       ...(claudePath ? { claudePath } : {}),
+      // The terminal UI runs the command as configured: `aio tui` looks a bare name up on its own PATH.
+      ...(x.claudePath ? { tuiCommand: x.claudePath } : {}),
       ...(x.configDir ? { configDir: x.configDir } : {}),
       ...(x.settings !== undefined ? { settings: x.settings as ClaudeCodeHarnessConfig['settings'] } : {}),
       ...(x.settingSources ? { settingSources: x.settingSources } : {}),

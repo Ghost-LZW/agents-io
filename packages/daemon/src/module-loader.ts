@@ -189,14 +189,14 @@ function harnessDescriptor(v: unknown): Pick<HarnessModule, 'create'> & { schema
 /**
  * The first member of a module's adapter that is not what `HarnessAdapter` says, described; none when
  * all are. A module is untyped code: what the host reads later (the static declarations, the
- * lifecycle calls, `nativeClient` for a terminal joining a session) is checked once here, so a
- * wrong shape fails the start (CF-4) instead of a command, an attach or a stop.
+ * lifecycle calls, `nativeClient` / `takeover` for a terminal joining or taking a session) is
+ * checked once here, so a wrong shape fails the start (CF-4) instead of a command, an attach or a stop.
  */
 function badHarnessAdapter(a: Partial<Record<string, unknown>> | null): string | undefined {
   if (!a || typeof a.id !== 'string' || !a.id) return 'id (a non-empty string)';
   const required = (['probe', 'open'] as const).find((k) => typeof a[k] !== 'function');
   if (required) return required;
-  const method = (['detach', 'dispose', 'ownProcess', 'nativeClient'] as const).find((k) => a[k] !== undefined && typeof a[k] !== 'function');
+  const method = (['detach', 'dispose', 'ownProcess', 'nativeClient', 'takeover'] as const).find((k) => a[k] !== undefined && typeof a[k] !== 'function');
   if (method) return `${method} (a function when present)`;
   const flag = (['adopts', 'ownerProfileSwitch', 'ephemeralOpen'] as const).find((k) => a[k] !== undefined && typeof a[k] !== 'boolean');
   if (flag) return `${flag} (true or false when present)`;
@@ -208,5 +208,7 @@ function badHarnessAdapter(a: Partial<Record<string, unknown>> | null): string |
   const env = a.sessionEnv;
   if (env !== undefined && env !== 'open' && env !== 'own-process' && !(record(env) && nonEmpty(env.refused))) return "sessionEnv ('open', 'own-process' or { refused } with a non-empty string, when present)";
   if (env === 'own-process' && typeof a.ownProcess !== 'function') return "sessionEnv ('own-process' needs ownProcess)";
+  if (a.attach !== undefined && a.attach !== 'join' && a.attach !== 'takeover') return "attach ('join' or 'takeover' when present)";
+  if (a.attach === 'takeover' && typeof a.takeover !== 'function') return "attach ('takeover' needs takeover)";
   return undefined;
 }

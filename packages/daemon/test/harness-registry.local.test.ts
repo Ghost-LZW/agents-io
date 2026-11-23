@@ -151,4 +151,16 @@ describe('harness registry', () => {
     expect(() => new HarnessRegistry([echo], { launchAliases: { other: 'x' } })).toThrow('launchAliases: harness kind "other" is not registered');
     expect(() => new HarnessRegistry([echo], { launchAliases: { echo: 'env' } })).toThrow('launchAliases: "env" is a HarnessInstance field');
   });
+
+  it('a kind may add commands to the CLI (`HarnessModule.cli`, Claude Code: `tui-bridge`), looked up by name; a bad name, a value that is not a function and a name two kinds add are refused', () => {
+    expect(builtinHarnesses.cliCommand('tui-bridge')).toBeTypeOf('function');
+    expect(builtinHarnesses.cliCommand('serve')).toBeUndefined();
+    const run = async () => 0;
+    const r = new HarnessRegistry([{ ...echo, cli: { 'echo-helper': run } }]);
+    expect(r.cliCommand('echo-helper')).toBe(run);
+    expect(r.cliCommand('tui-bridge')).toBeUndefined();
+    expect(() => new HarnessRegistry([{ ...echo, cli: { Echo: run } }])).toThrow('harness kind "echo": cli "Echo": a command name is lowercase letters, digits and -, starting with a letter');
+    expect(() => new HarnessRegistry([{ ...echo, cli: { 'echo-helper': 'run' as never } }])).toThrow('harness kind "echo": cli "echo-helper" is not a function');
+    expect(() => new HarnessRegistry([{ ...echo, cli: { 'echo-helper': run } }, { ...echo, kind: 'echo2', cli: { 'echo-helper': run } }])).toThrow('harness kind "echo2": cli "echo-helper": harness kind "echo" adds it too');
+  });
 });

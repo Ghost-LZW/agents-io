@@ -1,4 +1,4 @@
-import type { HarnessModule } from '@agents-io/protocol';
+import type { HarnessCliCommand, HarnessModule } from '@agents-io/protocol';
 
 /** What `HarnessRegistry` takes besides the modules. */
 export interface HarnessRegistryOptions {
@@ -23,12 +23,21 @@ const INSTANCE_FIELDS = new Set(['name', 'kind', 'launch', 'run', 'profiles', 'o
 export class HarnessRegistry {
   private readonly byKind = new Map<string, HarnessModule>();
   private readonly aliases = new Map<string, string>();
+  private readonly commands = new Map<string, { kind: string; run: HarnessCliCommand }>();
 
   constructor(modules: readonly HarnessModule[], o: HarnessRegistryOptions = {}) {
     for (const m of modules) {
       if (m.kind === 'module') throw new Error('harness kind "module" is the host\'s own (`use: "module"`); a registered kind needs another name');
       if (this.byKind.has(m.kind)) throw new Error(`harness kind ${JSON.stringify(m.kind)} is registered twice`);
       this.byKind.set(m.kind, m);
+      for (const [name, run] of Object.entries(m.cli ?? {})) {
+        const at = `harness kind ${JSON.stringify(m.kind)}: cli ${JSON.stringify(name)}`;
+        if (!CLI_NAME.test(name)) throw new Error(`${at}: a command name is lowercase letters, digits and -, starting with a letter`);
+        if (typeof run !== 'function') throw new Error(`${at} is not a function`);
+        const other = this.commands.get(name);
+        if (other) throw new Error(`${at}: harness kind ${JSON.stringify(other.kind)} adds it too`);
+        this.commands.set(name, { kind: m.kind, run });
+      }
     }
     for (const [kind, field] of Object.entries(o.launchAliases ?? {})) {
       if (!this.byKind.has(kind)) throw new Error(`launchAliases: harness kind ${JSON.stringify(kind)} is not registered`);
@@ -64,4 +73,12 @@ export class HarnessRegistry {
   launchAlias(kind: string): string | undefined {
     return this.aliases.get(kind);
   }
+
+  /** The CLI command a registered kind adds under this name (`HarnessModule.cli`), if one does. */
+  cliCommand(name: string): HarnessCliCommand | undefined {
+    return this.commands.get(name)?.run;
+  }
 }
+
+/** A name `HarnessModule.cli` may give a command. */
+const CLI_NAME = /^[a-z][a-z0-9-]*$/;

@@ -28,8 +28,9 @@ import type { Watch } from './watch.js';
  * `mcpTools`, `commands`, `setup`) and, of the instance, `tools`, `commands`, `features`,
  * `status`, `start`, `stop` and the hooks `onTurnCompleted`, `inputHint`, `onUndispatched`,
  * `onAction`, `resolver`, `identities` and `statusLines`. `admin`, the other `hooks` and
- * `localFrames` are the contract the feature that moves into a module next needs (G6 step 6);
- * until the daemon serves one, a module that sets it fails to register (`admin`) or to set up
+ * `localFrames` were sketched for the Claude Code terminal (G6 step 6), which became a harness
+ * capability instead (`HarnessAdapter.takeover`); they are served when a module needs them. Until
+ * the daemon serves one, a module that sets it fails to register (`admin`) or to set up
  * (`hooks.<name>`, `localFrames`), naming it, rather than being silently ignored. The built-in
  * modules are the topic titles (step 2), the watch, live and topic tools (step 3), the stranger
  * approval (step 4), the owner's run-config commands (step 5) and the external MCP endpoint (step 1).

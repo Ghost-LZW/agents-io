@@ -390,6 +390,8 @@ export const CODEX_DECLARATIONS = Object.freeze({
   ownerProfileSwitch: true,
   /** `thread/start { ephemeral }` (a module's ephemeral turns: topic titles). */
   ephemeralOpen: true,
+  /** Its TUI joins a thread as another client of the app-server (`nativeClient`, unix transports). */
+  attach: 'join',
 }) satisfies HarnessDeclarations;
 
 /**
@@ -411,6 +413,7 @@ export class CodexHarness implements HarnessAdapter {
   readonly modes = CODEX_DECLARATIONS.modes;
   readonly ownerProfileSwitch = CODEX_DECLARATIONS.ownerProfileSwitch;
   readonly ephemeralOpen = CODEX_DECLARATIONS.ephemeralOpen;
+  readonly attach = CODEX_DECLARATIONS.attach;
   /**
    * One app-server serves every session, so a launched session's env needs one of its own
    * (`ownProcess`); a Unix socket's server is shared and outlives the host, so it cannot.

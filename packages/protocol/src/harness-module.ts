@@ -9,9 +9,17 @@ import type { HarnessAdapter, HarnessFactoryInit } from './harness.js';
 
 /**
  * The static members of `HarnessAdapter` (`displayName`, `compact`, `modes`, `ownerProfileSwitch`,
- * `ephemeralOpen`, `adopts`, `sessionEnv`): what an adapter declares without starting anything.
+ * `ephemeralOpen`, `adopts`, `sessionEnv`, `attach`): what an adapter declares without starting anything.
  */
-export type HarnessDeclarations = Pick<HarnessAdapter, 'displayName' | 'compact' | 'modes' | 'ownerProfileSwitch' | 'ephemeralOpen' | 'adopts' | 'sessionEnv'>;
+export type HarnessDeclarations = Pick<HarnessAdapter, 'displayName' | 'compact' | 'modes' | 'ownerProfileSwitch' | 'ephemeralOpen' | 'adopts' | 'sessionEnv' | 'attach'>;
+
+/**
+ * A command a harness kind adds to the host's CLI (`HarnessModule.cli`): `argv` is what follows
+ * its name, `env` the process's environment; it answers the exit code. Such commands are for the
+ * kind's own processes to start (a terminal's helper, `TakeoverServices.cli`), not for people: the
+ * CLI's help does not list them.
+ */
+export type HarnessCliCommand = (o: { argv: readonly string[]; env: Readonly<Record<string, string | undefined>> }) => Promise<number>;
 
 /**
  * How an instance hands `"env:NAME"` values to its harness's child process: a setting that ends
@@ -116,6 +124,14 @@ export interface HarnessModule<L = unknown> {
    * instance's `options` set), besides `create`'s `profiles`. Claude Code.
    */
   readonly profilesInOpen?: boolean;
+  /**
+   * Commands it adds to the host's CLI, by name (lowercase letters, digits and `-`, starting with a
+   * letter): `aio <name> …` runs it. Only the kinds of the CLI's own bundle are reachable there (it
+   * loads no config to find others); two of them adding the same name is refused when the registry
+   * is built, and the CLI's own commands keep their names. Claude Code: `tui-bridge`, which its
+   * terminal UI starts.
+   */
+  readonly cli?: Readonly<Record<string, HarnessCliCommand>>;
   /** The adapter of one instance (or of a task run on it, its env joined to the instance's). Starts nothing: its first `probe` or `open` does. */
   create(init: HarnessModuleInit<L>): HarnessAdapter;
 }

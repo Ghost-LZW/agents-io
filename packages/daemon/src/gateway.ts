@@ -36,6 +36,8 @@ import {
   type LoopGuardTrip,
   type HarnessDeclarations,
   type HarnessFactoryInit,
+  type HarnessTakeover,
+  type HarnessTakeoverArgs,
   type Origin,
   type Policy,
   type NativeClient,
@@ -122,7 +124,6 @@ import { RUN_RULE, Runs, type RunOverrides } from './runs.js';
 import { runCommand, type CommandHost, type CommandTable } from './commands.js';
 import { ModuleHost, ModuleRegistry, kernelContext, type KernelBackend, type ResolvedModule } from './modules.js';
 import { ephemeralTurn } from './ephemeral-turn.js';
-import { ClaudeTuiService } from './tui-claude.js';
 import { consoleUrlPath, loadOrCreateTokenFile, removeTokenFile, TokenError, tokenPath, writeTokenFile } from './token.js';
 
 export type LogFn = (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
@@ -326,8 +327,8 @@ export class Gateway {
   private readonly externalSends = new Map<string, ExternalSender>();
   /** The durable host inbound queue (`on: "host"` rules), in the log's database. */
   readonly hostQueue: HostQueue;
-  /** Claude Code TUIs attached to sessions (decision 15, S2). */
-  private readonly claudeTui: ClaudeTuiService;
+  /** Sessions a harness's own terminal UI holds (`HarnessAdapter.takeover`, decision 15): the instance it stands in for. */
+  private readonly takeovers = new Map<string, { instance: string; takeover: HarnessTakeover }>();
   /** Who sent each channel message (`input.verify`), settled deliveries, session → agent. */
   readonly records: DaemonRecords;
   /** The host protocol on the local socket. */
@@ -548,14 +549,6 @@ export class Gateway {
       log: (level, msg, data) => this.log(level, msg, data),
       ...(o.hostPush?.timeoutMs !== undefined ? { pushTimeoutMs: o.hostPush.timeoutMs } : {}),
       ...(o.hostPush?.retryMs !== undefined ? { pushRetryMs: o.hostPush.retryMs } : {}),
-    });
-    this.claudeTui = new ClaudeTuiService({
-      dir: join(c.dataDir, 'tui'),
-      // The bridge runs as this CLI (`aio tui-bridge`), next to this module in dist/.
-      cli: fileURLToPath(new URL('./cli.js', import.meta.url)),
-      fileOf: (ref) => this.blobs.stat(ref),
-      onEnd: (h, reason) => this.log('info', `${h.sessionKey}: terminal UI left (${reason}); the session goes on headless`),
-      log: (level, msg) => this.log(level, msg),
     });
     // Watches live next to the log (same SQLite file), so they and their digest buffers survive a restart.
     const registry = o.watches ?? new WatchRegistry(log instanceof SqliteSessionLog ? { db: log.db } : {});
@@ -1225,10 +1218,10 @@ export class Gateway {
       },
       // A launched session's adapters go through both: the lane uses `harnessFor` whenever it is set.
       harness: launched ? launched.adapter(agent.harness) : this.agentHarness(agent),
-      // While a Claude Code TUI holds the session, its instance is that TUI (decision 15).
+      // While a harness's own terminal UI holds the session, its instance is that terminal (decision 15).
       harnessFor: (name: string) =>
-        this.claudeTui.holdOf(sessionKey)?.instance === name
-          ? this.claudeTui.holdOf(sessionKey)!.harness
+        this.takeovers.get(sessionKey)?.instance === name
+          ? this.takeovers.get(sessionKey)!.takeover.harness
           : launched
             ? launched.adapter(name)
             : this.agentHarness(agent, name),
@@ -2878,8 +2871,10 @@ ${a.summary}` }],
 
   /**
    * `tui.attach` (decision 15): open the session's harness and say how to start the harness's own
-   * terminal UI on it. Codex: the TUI is another client of the same thread (`--remote`); a thread
-   * that never ran a turn gets a context note first, or it has no rollout to resume.
+   * terminal UI on it. As its adapter declares (`HarnessAdapter.attach`): the TUI joins as another
+   * client of the same native session (`nativeClient`; Codex: `--remote` on the thread; a thread
+   * that never ran a turn gets a context note first, or it has no rollout to resume), or it takes
+   * the session over (`takeover`; Claude Code).
    */
   async tuiAttach(sessionKey?: string): Promise<Outcome> {
     const key = sessionKey ?? this.ownerCurrentSession() ?? this.o.config.local.session;
@@ -2889,11 +2884,10 @@ ${a.summary}` }],
     } catch (e) {
       return { ok: false, code: e instanceof LaneUnavailableError ? e.code : 'internal', message: (e as Error).message };
     }
-    // Claude Code's TUI takes the session over; other harnesses say how their own TUI joins a running session.
     // The instance is the session's (a preset set here may name another than the agent's).
     const run = this.sessionRun(key);
-    const inst = this.o.config.harnesses[run.harness];
-    if (inst?.kind === 'claude-code') return this.claudeTuiAttach(key, lane, inst, run.model);
+    const taking = this.takeoverAdapter(key, run.harness);
+    if (taking) return this.takeOver(key, lane, run.harness, taking, run.model);
     const { harnessId, nativeId } = await lane.attachPoint();
     if (!nativeId) return { ok: false, code: 'unsupported', message: `${key}: harness ${harnessId} reported no session id to attach to` };
     const adapter = this.launched.get(key)?.adapter(harnessId) ?? this.harness(harnessId);
@@ -2916,35 +2910,70 @@ ${a.summary}` }],
   }
 
   /**
-   * Claude Code's TUI takes the session (S2): the headless binding is released once idle, the TUI
-   * starts on the same Claude session id (`--resume`, or `--session-id` for a new one) with this
-   * launch's hooks and bridge, and the lane's turns go to it until it exits.
+   * The adapter of the session's instance `name` when its terminal UI takes sessions over
+   * (`attach: 'takeover'` with `takeover`): the launched session's when the session is one.
+   * Nothing for one that joins, or that cannot be built (the join path answers for it).
    */
-  private async claudeTuiAttach(key: string, lane: Lane, inst: HarnessInstance, model: string | undefined): Promise<Outcome> {
-    // The instance's launch settings as the claude-code kind resolves them (its `ClaudeLaunch`).
-    const settings = inst.launch as { claudePath?: string; configDir?: string };
-    if (this.claudeTui.holdOf(key)?.connected) return { ok: false, code: 'conflict', message: `${key}: a terminal UI is already attached` };
-    this.claudeTui.holdOf(key)?.end('replaced by a new attach');
+  private takeoverAdapter(key: string, name: string): TakingOver | undefined {
+    let a: HarnessAdapter | undefined;
+    try {
+      a = this.launched.get(key)?.adapter(name) ?? this.declared(name);
+    } catch {
+      return undefined;
+    }
+    return a?.attach === 'takeover' && typeof a.takeover === 'function' ? (a as TakingOver) : undefined;
+  }
+
+  /**
+   * The harness's own terminal UI takes the session (`HarnessAdapter.takeover`; Claude Code, S2):
+   * one already connected is a conflict; the headless binding is released once idle (a turn still
+   * running is `busy`); the terminal runs on the session's native id on the instance (resumed), or
+   * on a new one; the lane opens the session on the takeover's harness, which stands in for the
+   * instance (`harnessFor`) until the terminal leaves, and the lane's turns go to it meanwhile.
+   */
+  private async takeOver(key: string, lane: Lane, instance: string, adapter: TakingOver, model: string | undefined): Promise<Outcome> {
+    const held = this.takeovers.get(key);
+    if (held?.takeover.connected) return { ok: false, code: 'conflict', message: `${key}: a terminal UI is already attached` };
+    held?.takeover.end('replaced by a new attach');
     await lane.whenIdle();
     const released = await lane.release('a terminal UI takes the session');
     if (!released.ok) return { ok: false, code: 'busy', message: `${key}: a turn is running; try again when it ends` };
-    const prior = this.nativeIdOf(key, inst.name);
-    const hold = await this.claudeTui.hold(key, inst.name, prior ?? randomUUID());
+    const prior = this.nativeIdOf(key, instance);
+    const nativeId = prior ?? randomUUID();
+    let hold: { instance: string; takeover: HarnessTakeover } | undefined;
+    let endedEarly: string | undefined;
+    const takeover = await adapter.takeover({
+      sessionKey: key,
+      instance,
+      nativeId,
+      resume: prior !== undefined,
+      ...(model ? { model } : {}),
+      services: {
+        dir: join(this.o.config.dataDir, 'tui'),
+        // A helper the terminal starts runs as this CLI (`aio <command>`, a kind's `HarnessModule.cli`), next to this module in dist/.
+        cli: fileURLToPath(new URL('./cli.js', import.meta.url)),
+        fileOf: (ref) => this.blobs.stat(ref),
+        onEnd: (reason) => {
+          if (!hold) endedEarly = reason;
+          else if (this.takeovers.get(key) === hold) this.takeovers.delete(key);
+          this.log('info', `${key}: terminal UI left (${reason}); the session goes on headless`);
+        },
+      },
+    });
+    // A takeover over before it was handed back holds nothing.
+    if (endedEarly !== undefined) return { ok: false, code: 'internal', message: `${key}: the terminal UI's takeover ended at once (${endedEarly})` };
+    hold = { instance, takeover };
+    this.takeovers.set(key, hold);
     try {
       await lane.attachPoint();
     } catch (e) {
-      hold.end('attach failed');
+      takeover.end('attach failed');
       throw e;
     }
-    const launch = this.claudeTui.launch(hold, {
-      executable: settings.claudePath ?? 'claude',
-      resume: prior !== undefined,
-      ...(model ? { model } : {}),
-      ...(settings.configDir ? { configDir: settings.configDir } : {}),
-    });
+    const launch = takeover.launch();
     const cwd = this.laneInfo.get(key)?.cwd ?? this.o.config.cwd;
-    this.log('info', `${key}: Claude Code TUI attaching to ${inst.name} ${hold.nativeId}`);
-    return { ok: true, value: { sessionKey: key, harness: inst.name, nativeId: hold.nativeId, cwd, ...launch } };
+    this.log('info', `${key}: ${adapter.displayName ?? instance} TUI attaching to ${instance} ${nativeId}`);
+    return { ok: true, value: { sessionKey: key, harness: instance, nativeId, cwd, ...launch } };
   }
 
   /** Where the owner's own chat goes now: its current topic (of the agent it talks to), without a fixed session. */
@@ -3023,7 +3052,7 @@ ${a.summary}` }],
           `cwd ${this.laneInfo.get(key)?.cwd ?? agentOf(key).cwd ?? c.cwd}`,
           `state ${info?.state ?? 'not open'}${info?.turnId ? ` · turn ${info.turnId}` : ''}${info?.queued ? ` · ${info.queued} queued` : ''}${info?.pendingRequests.length ? ` · waiting on ${info.pendingRequests.length} approval(s)` : ''}`,
           ...(native ? [`native session ${native}`] : []),
-          ...(this.claudeTui.holdOf(key)?.connected ? ['a terminal UI holds this session'] : []),
+          ...(this.takeovers.get(key)?.takeover.connected ? ['a terminal UI holds this session'] : []),
         ].join('\n');
       },
       interrupt: async (sessionKey, origin, clear) => {
@@ -3282,7 +3311,8 @@ ${a.summary}` }],
     // Step 4: the modules stop first, in reverse order (each bounded), while what they use still runs.
     // The external MCP endpoint is the last registered: it closes first, so no new external write comes in.
     await this.modules.stop();
-    await this.claudeTui.close();
+    // Terminals holding sessions leave: the sessions go on headless (their lanes close below).
+    for (const { takeover } of [...this.takeovers.values()]) takeover.end('daemon stopping');
     // Lives end first: the voice runs in the harness and the media peer in a channel, both about to go.
     await within(Promise.all([...this.lives.keys()].map((k) => this.leaveLive(k, 'gateway stopping'))), 5000);
     // Runs end (interrupted) while their connections can still hear run.ended.
@@ -3446,6 +3476,9 @@ function sessionEnvRefused(name: string, how: SessionEnvSupport | undefined): st
   return typeof how === 'object' ? `harness instance ${name} is ${how.refused}` : undefined;
 }
 
+/** An adapter whose terminal UI takes sessions over (`attach: 'takeover'`), with its `takeover`. */
+type TakingOver = HarnessAdapter & Required<Pick<HarnessAdapter, 'takeover'>>;
+
 /** A gateway wrapper over the kind's adapter (`inner`): what that adapter declares statically reads through. */
 abstract class WrappedHarness {
   abstract readonly inner: HarnessAdapter;
@@ -3477,16 +3510,23 @@ abstract class WrappedHarness {
   get sessionEnv(): SessionEnvSupport | undefined {
     return this.inner.sessionEnv;
   }
+
+  get attach(): 'join' | 'takeover' | undefined {
+    return this.inner.attach;
+  }
 }
 
 class LaunchEnvHarness extends WrappedHarness implements HarnessAdapter {
   readonly id: string;
+  /** The kind's takeover (`HarnessAdapter.takeover`), present only when its adapter has one. */
+  readonly takeover?: (a: HarnessTakeoverArgs) => Promise<HarnessTakeover>;
   constructor(
     readonly inner: HarnessAdapter,
     private readonly env: Record<string, string>,
   ) {
     super();
     this.id = inner.id;
+    if (typeof inner.takeover === 'function') this.takeover = (a) => inner.takeover!(a);
   }
 
   probe(): Promise<{ version: string; caps: HarnessCaps }> {
@@ -3525,6 +3565,8 @@ export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
   readonly dispose?: () => Promise<void>;
   /** The same instance on the kind's adapter's own process (`HarnessAdapter.ownProcess`), present only when it has one. */
   readonly ownProcess?: (o: { env: Record<string, string>; cwd?: string }) => InstanceHarness;
+  /** The kind's takeover by its terminal UI (`HarnessAdapter.takeover`), present only when its adapter has one. */
+  readonly takeover?: (a: HarnessTakeoverArgs) => Promise<HarnessTakeover>;
   constructor(
     readonly instance: HarnessInstance,
     readonly inner: HarnessAdapter,
@@ -3540,6 +3582,7 @@ export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
     if (typeof inner.detach === 'function') this.detach = () => inner.detach!();
     if (typeof inner.dispose === 'function') this.dispose = () => inner.dispose!();
     if (typeof inner.ownProcess === 'function') this.ownProcess = (o) => new InstanceHarness(instance, inner.ownProcess!(o), undefined, instructions, this.profilesInOpen);
+    if (typeof inner.takeover === 'function') this.takeover = (a) => inner.takeover!(a);
   }
 
   probe(): Promise<{ version: string; caps: HarnessCaps }> {

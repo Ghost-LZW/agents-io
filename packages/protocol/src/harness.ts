@@ -120,6 +120,25 @@ export interface HarnessAdapter {
    */
   nativeClient?(nativeId: string): NativeClient | undefined;
   /**
+   * Static, like `adopts`: how the harness's own terminal UI comes onto a session the host keeps
+   * (`tui.attach`, decision 15). `'join'` (the default): as one more client of the session the
+   * host has open, which goes on driving it (`nativeClient`; Codex). `'takeover'`: the terminal
+   * holds the session while it runs, in place of this adapter, and the session goes on here
+   * when it leaves (`takeover`, which it needs; Claude Code).
+   */
+  readonly attach?: 'join' | 'takeover';
+  /**
+   * Hand a session to the harness's own terminal UI (`attach: 'takeover'`, decision 15). The host
+   * has released the session's binding (its lane was idle) and chosen the native session the
+   * terminal runs on: the session's own on this instance when it has one (`resume`), else a new
+   * id. While the takeover lasts, `harness` stands in for this instance on the session: the host
+   * opens the session on it, then asks for the terminal's command line (`launch`). It ends when
+   * the terminal leaves, or when the host ends it (`end`: a new attach replacing one that never
+   * connected, a failed open, the host stopping); either way `services.onEnd` follows, once, and
+   * the session's next turn opens on this adapter again, resuming the same native id.
+   */
+  takeover?(args: HarnessTakeoverArgs): Promise<HarnessTakeover>;
+  /**
    * The host is stopping and this harness outlives it (e.g. Codex: its app-server keeps a
    * turn running for the next host, or dies with the host but must not be told to stop it).
    * End every session of this adapter without interrupting or unsubscribing anything and
@@ -206,6 +225,63 @@ export interface NativeClient {
   env?: Record<string, string>;
 }
 
+/** What `HarnessAdapter.takeover` gets. */
+export interface HarnessTakeoverArgs {
+  sessionKey: string;
+  /**
+   * The instance the terminal stands in for (`harnesses.<name>`): the id of the takeover's
+   * `harness`, so the session's events and native id stay that instance's.
+   */
+  instance: string;
+  /** The native session the terminal runs on. */
+  nativeId: string;
+  /** `nativeId` is the session's own on the instance (the terminal resumes it); else it is new. */
+  resume: boolean;
+  /** The model the session's next turn would run, when one is set (`RunSpec.model`). */
+  model?: string;
+  services: TakeoverServices;
+}
+
+/** What the host gives a takeover. */
+export interface TakeoverServices {
+  /**
+   * A directory of the host's for the terminal's files of this launch only (settings, configs);
+   * a takeover writes under a directory of its own there (0700) and removes it when it ends.
+   */
+  dir: string;
+  /**
+   * The host's CLI as a script for `node`: `process.execPath <cli> <command>` runs a command a
+   * registered harness kind contributes to it (`HarnessModule.cli`), e.g. a helper the terminal
+   * starts as its own child.
+   */
+  cli: string;
+  /** A stored file an input refers to (`ContentBlock.ref`) as a local path the terminal can read; `undefined` for a ref the host's store does not hold. */
+  fileOf(ref: string): Promise<{ path: string; mime: string; name?: string } | undefined>;
+  /** Called once when the takeover ends, whatever ended it: why (e.g. "the terminal UI exited"). */
+  onEnd(reason: string): void;
+}
+
+/** How to start the terminal UI of a takeover (`tui.attach`'s answer). */
+export interface TakeoverLaunch extends NativeClient {
+  /** Removed from the caller's environment first (e.g. markers of a session of the harness the caller runs inside). */
+  unsetEnv?: string[];
+}
+
+/** A session held by the harness's own terminal UI (`HarnessAdapter.takeover`). */
+export interface HarnessTakeover {
+  /** Stands in for the instance on the session while the takeover lasts: the host's lane opens it. */
+  readonly harness: HarnessAdapter;
+  /** The terminal is connected and has not left: another attach is refused meanwhile (`conflict`). */
+  readonly connected: boolean;
+  /**
+   * The terminal's command line, asked once the session is open on `harness` (what that open
+   * got, e.g. the host's MCP endpoint, may go into it).
+   */
+  launch(): TakeoverLaunch;
+  /** End it now; idempotent. `services.onEnd` follows. */
+  end(reason: string): void;
+}
+
 export interface HarnessSession {
   /** Native session/thread id once known; the host persists it for resume. */
   nativeId(): string | undefined;
@@ -257,12 +333,13 @@ export interface HarnessFactoryInit {
  * sessions are closed and then `dispose` is called; `adopts` is read at start. Every loaded
  * instance gets them, whether or not a session used it; an adapter returned for several
  * instances gets each call once. Its other static declarations (`displayName`, `compact`,
- * `modes`, `ownerProfileSwitch`, `ephemeralOpen`, `sessionEnv`) and `ownProcess` are read as a
- * built-in adapter's; they and the lifecycle members are checked when the factory returns, and
- * one of the wrong type fails the start. Its opens, the opens of an adapter its `ownProcess`
- * returned included, carry the instance's env in `args.env`, a task run's over it, and a launched
- * session's only with `sessionEnv: 'open'`; and the agent's instructions in `args.instructions`,
- * during a transition also as `options.developerInstructions`, as before `instructions` existed.
+ * `modes`, `ownerProfileSwitch`, `ephemeralOpen`, `sessionEnv`, `attach`), `ownProcess` and
+ * `takeover` are read as a built-in adapter's; they and the lifecycle members are checked when
+ * the factory returns, and one of the wrong type fails the start. Its opens, the opens of an
+ * adapter its `ownProcess` returned included, carry the instance's env in `args.env`, a task
+ * run's over it, and a launched session's only with `sessionEnv: 'open'`; and the agent's
+ * instructions in `args.instructions`, during a transition also as
+ * `options.developerInstructions`, as before `instructions` existed.
  * `init.blobs` reads the media inputs point at (`stat` and `get`, nothing else). The module may
  * export a `HarnessModule` descriptor instead (`harness-module.ts`): its `create` gets this init too.
  */

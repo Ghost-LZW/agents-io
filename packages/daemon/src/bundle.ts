@@ -55,8 +55,9 @@ export const builtinChannels = new ChannelRegistry([larkBotChannelModule, mailCh
  * last: it starts after everything else and stops first, so no external write comes in while the
  * rest stops; a module added later goes before it. Its settings and status stay where they were
  * before it was a module: `Config.externalMcp` (deprecated, one release) and `GET /api/status`
- * `externalMcp`. The feature still to move (the Claude Code terminal) lives in the gateway; it
- * moves here as its own step.
+ * `externalMcp`. The Claude Code terminal is not one of these: it is what the claude-code harness
+ * kind's adapter does (`HarnessAdapter.takeover`, with the `tui-bridge` command its kind adds to the
+ * CLI), and the gateway's part of it names no harness.
  */
 export const builtinModules = new ModuleRegistry([topicTitleModule, watchToolsModule, liveToolsModule, topicToolsModule, strangersModule, ownerCommandsModule, externalMcpModule], {
   origin: 'builtin',

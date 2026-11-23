@@ -106,8 +106,8 @@ see `docs/E2E.md` §0). New:
   that owns its keys, its section of the older `harness` block, its default model and
   `AGENTS_IO_LIVE_*_MODEL` variable, its config-dir variable (`sessionParams.envPathRoots`),
   its rules across instances (Codex: no two share a `stateDir`) and how its adapter is built;
-  the daemon's config code and its construction of adapters name no kind (only the native
-  terminal takeover still knows Claude Code). A `module` entry's module exports a `HarnessFactory`
+  the daemon's config code, its construction of adapters and its gateway name no kind. A
+  `module` entry's module exports a `HarnessFactory`
   (`@agents-io/protocol`), or a `HarnessModule` (its `schema` checks the entry's `config` at
   start, its `create` gets the factory's init plus `launch` = that config, the instance's `env`
   and `profiles`); the adapter it returns serves every session of the instance.
@@ -157,6 +157,18 @@ see `docs/E2E.md` §0). New:
   declaration or lifecycle member of the wrong type (`modes` that is not an array of `'plan'`,
   `sessionEnv` that is `null` or an unknown string, `compact` without a `command`, a `detach` or
   `nativeClient` that is not a function, …) fails the start, naming the instance and the member.
+  The harness's own terminal UI comes onto a session (`aio tui`, `tui.attach`, decision 15) as
+  the adapter declares (`attach`, static): `'join'` (the default; Codex) answers how its TUI
+  joins the open session as one more client (`nativeClient`); `'takeover'` (Claude Code) hands
+  the session to it (`takeover`, which it then needs). For a takeover the daemon refuses a second
+  attach while one is connected (`conflict`), releases the session's binding once its lane is
+  idle (`busy` if a turn still runs), picks the session's native id on the instance (resumed) or
+  a new one, opens the session on the takeover's `harness`, which stands in for the instance
+  until the terminal leaves, and answers the takeover's `launch()`; `/status` says "a terminal
+  UI holds this session" while it is connected, and stopping ends every takeover first. The
+  takeover gets a directory for its files (`<dataDir>/tui`), the CLI's path for helpers its
+  terminal starts (`aio <command>` runs a command a built-in kind adds, `HarnessModule.cli`:
+  Claude Code's `tui-bridge`) and local paths of stored files.
 - **Live (realtime voice, decision 11)**: a Codex instance with `"live": true` opts
   its app-server connection into Codex's experimental realtime API. Agents on it
   (with `tools`) get `live_join { target, channel?, instructions?, voice? }`,
@@ -513,6 +525,9 @@ aio verify <channelRef>
 aio console-link                                              (one-time console login URL)
 ```
 
+- A built-in harness kind may add commands (`HarnessModule.cli`), for its own processes to
+  start, not listed above: Claude Code's `aio tui-bridge` is what its terminal UI starts as an
+  MCP server (decision 15). The CLI's own commands come first.
 - The end-to-end scenarios against the real harness are not in this package: they are
   `aio-e2e` in `packages/daemon-e2e` (`pnpm e2e` from the repo root, `docs/E2E.md` §1.1),
   with the options `aio e2e` had. `aio e2e` only says so and exits 2.
@@ -705,9 +720,9 @@ is set, `Policy.plan` with it applied (`withRunOverride`) and the IO-control com
 
 Not served yet: `ModuleManifest.admin` (registering a module with it fails), and of the
 instance the other `hooks` (`onTopicChanged`, `planRun`, `harnessFor`) and `localFrames`
-(setting one fails the setup, naming it; a hook that is not a function too). They are the seams
-the feature that moves into a module next needs (the Claude Code terminal); each is served with
-the move that needs it. A module
+(setting one fails the setup, naming it; a hook that is not a function too). They were sketched
+for the Claude Code terminal, which became a harness capability instead (`HarnessAdapter.takeover`,
+"Harness instances" above); each is served when a module needs it. A module
 section's strings are redacted by the console's general rule (a secret-looking key); `x-credential`
 marks in a module's schema are not read yet.
 
@@ -1007,3 +1022,27 @@ What changed for embedders with core-slimming G6 step 5 (the owner's run-config 
   this breaks an embedder that implements it; one that only uses `Gateway` changes nothing).
 - `/help`, `/status` and every reply of these commands are byte for byte as before; what a
   session has set (`run:<sessionKey>` in the records) is kept and applied as before.
+
+What changed for embedders with core-slimming G3's native terminal takeover (G6 step 6):
+
+- Whether a session's terminal UI joins it or takes it over is what the instance's adapter
+  declares (`HarnessAdapter.attach`: `'join'`, the default, or `'takeover'` with `takeover`),
+  no longer the instance's kind. `ClaudeCodeHarness` declares `'takeover'` and has `takeover`;
+  `CodexHarness` declares `'join'`. An embedder whose `harness` / `buildHarness` gives a
+  claude-code instance an adapter of its own gets the terminal takeover only when that adapter
+  declares it too (a test fake: `attach: 'takeover'` and `takeover: (a) => claudeTuiTakeover(a)`
+  from `@agents-io/harness-claude-code`); otherwise `tui.attach` asks it for a `nativeClient`,
+  as for any joining harness.
+- New in `@agents-io/protocol`: `HarnessAdapter.attach` / `takeover`, `HarnessTakeoverArgs`,
+  `TakeoverServices`, `HarnessTakeover`, `TakeoverLaunch`; `attach` in `HarnessDeclarations`;
+  `HarnessModule.cli` (`HarnessCliCommand`: a command a kind adds to the CLI). New here:
+  `HarnessRegistry.cliCommand` (the registry refuses a bad command name, a value that is not a
+  function and a name two kinds add). New in `@agents-io/harness-claude-code`:
+  `claudeTuiTakeover`, `ClaudeTuiSettings`, `tuiBridge`, `TUI_BRIDGE_COMMAND`,
+  `ClaudeCodeHarnessConfig.tuiCommand` (the command its terminal UI runs as; the kind sets it to
+  the instance's `executable` as written).
+- The daemon no longer has `tui-claude.ts` or `tui-bridge.ts` (neither was exported): they are
+  `harness/claude-code/src/takeover.ts` and `bridge.ts`. `aio tui-bridge` is the claude-code
+  kind's CLI command now, the MCP config the takeover writes runs it as before
+  (`node <daemon dist/cli.js> tui-bridge`). Each takeover listens on a local port of its own,
+  closed when it ends (before, all of them shared one until the daemon stopped).

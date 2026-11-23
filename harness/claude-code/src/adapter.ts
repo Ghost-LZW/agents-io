@@ -3,10 +3,11 @@ import { randomUUID } from 'node:crypto';
 import { accessSync, constants, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { delimiter, dirname, join } from 'node:path';
-import type { BlobAccess, HarnessAdapter, HarnessCaps, HarnessDeclarations, HarnessOpenArgs, HarnessSession } from '@agents-io/protocol';
+import type { BlobAccess, HarnessAdapter, HarnessCaps, HarnessDeclarations, HarnessOpenArgs, HarnessSession, HarnessTakeover, HarnessTakeoverArgs } from '@agents-io/protocol';
 import { blobResolvers } from './media.js';
 import { AsyncQueue } from './queue.js';
 import { ClaudeCodeSession, defaultProfile, isEffort } from './session.js';
+import { claudeTuiTakeover } from './takeover.js';
 import type { ClaudeCodeOptions, ClaudeProfile, Options, QueryFn, SDKUserMessage } from './types.js';
 
 /** SDK 0.x: the minor is the breaking component. */
@@ -36,6 +37,12 @@ export const claudeCodeCaps: HarnessCaps = {
 export interface ClaudeCodeHarnessConfig {
   /** Path of the `claude` CLI to drive (default: first `claude` on PATH). */
   claudePath?: string;
+  /**
+   * The `claude` command its own terminal UI runs as when it takes a session over (`takeover`),
+   * started by the host's `aio tui` client: a bare name is looked up on that client's PATH.
+   * Default: `claudePath`, else `claude`.
+   */
+  tuiCommand?: string;
   /**
    * Environment for the CLI, over `process.env` (an `undefined` value removes
    * the variable). Per-open `ClaudeCodeOptions.env` goes over this.
@@ -120,6 +127,8 @@ export const CLAUDE_CODE_DECLARATIONS = Object.freeze({
   compact: Object.freeze({ command: '/compact' } as const),
   /** Every session runs its own CLI child: `args.env` is the top layer of its environment. */
   sessionEnv: 'open',
+  /** Its own TUI takes a session over (`takeover`): one Claude session has one writer. */
+  attach: 'takeover',
 }) satisfies HarnessDeclarations;
 
 /**
@@ -131,9 +140,20 @@ export class ClaudeCodeHarness implements HarnessAdapter {
   readonly displayName = CLAUDE_CODE_DECLARATIONS.displayName;
   readonly compact = CLAUDE_CODE_DECLARATIONS.compact;
   readonly sessionEnv = CLAUDE_CODE_DECLARATIONS.sessionEnv;
+  readonly attach = CLAUDE_CODE_DECLARATIONS.attach;
   private probed: Promise<{ version: string; caps: HarnessCaps }> | undefined;
 
   constructor(private readonly config: ClaudeCodeHarnessConfig = {}) {}
+
+  /**
+   * Claude Code's interactive TUI takes the session (decision 15, S2): it starts on the same
+   * Claude session id with hooks and a bridge of this launch only (`claudeTuiTakeover`), in this
+   * instance's config dir; its `harness` (`ClaudeTuiHarness`) runs the session's turns meanwhile.
+   */
+  takeover(a: HarnessTakeoverArgs): Promise<HarnessTakeover> {
+    const executable = this.config.tuiCommand ?? this.config.claudePath;
+    return claudeTuiTakeover(a, { ...(executable ? { executable } : {}), ...(this.config.configDir ? { configDir: this.config.configDir } : {}) });
+  }
 
   private claudePath(): string {
     const p = this.config.claudePath ?? findOnPath('claude');
