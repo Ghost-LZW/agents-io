@@ -628,11 +628,13 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     expect(await k.watches.remove('fake:default:elsewhere', 'w1')).toMatchObject({ ok: false, code: 'forbidden' });
     expect(await k.watches.remove(sessionKey, 'w1')).toEqual({ ok: true, removed: true });
     // A handover or a live is for the turn running in the session, nothing else.
-    await expect(k.topics.rotate(sessionKey, 't_nope', { title: 'X', summary: 'none' })).rejects.toThrow(`no turn t_nope is running in session ${sessionKey}`);
-    await expect(k.topics.switch(sessionKey, 't_nope', 'tp_x')).rejects.toThrow(`no turn t_nope is running in session ${sessionKey}`);
+    await expect(k.topics.rotate(sessionKey, 't_nope', { title: 'X', summary: 'none', operationId: 'op_r' })).rejects.toThrow(`no turn t_nope is running in session ${sessionKey}`);
+    await expect(k.topics.switch(sessionKey, 't_nope', { topicId: 'tp_x', operationId: 'op_s' })).rejects.toThrow(`no turn t_nope is running in session ${sessionKey}`);
     await expect(k.live.join(sessionKey, 't_nope', { target: 'new' })).rejects.toThrow(`no turn t_nope is running in session ${sessionKey}`);
-    await expect(k.topics.rotate(sessionKey, turns[0]!, { title: 1 as never, summary: 'none' })).rejects.toThrow('module probe: topics.rotate: title must be a string');
-    await expect(k.topics.switch(sessionKey, turns[0]!, 'tp_x')).rejects.toThrow('no topic tp_x in this conversation');
+    await expect(k.topics.rotate(sessionKey, turns[0]!, { title: 1 as never, summary: 'none', operationId: 'op_r' })).rejects.toThrow('module probe: topics.rotate: title must be a string');
+    await expect(k.topics.rotate(sessionKey, turns[0]!, { title: 'X', summary: 'none' } as never)).rejects.toThrow('module probe: topics.rotate: operationId must be a string');
+    await expect(k.topics.switch(sessionKey, turns[0]!, 'tp_x' as never)).rejects.toThrow('module probe: topics.switch: topicId must be a string');
+    await expect(k.topics.switch(sessionKey, turns[0]!, { topicId: 'tp_x', operationId: 'op_s' })).rejects.toThrow('no topic tp_x in this conversation');
     await expect(k.live.join(sessionKey, turns[0]!, { target: 'new' })).rejects.toThrow('cannot open a live session');
     await expect(k.live.say(sessionKey, 'hello', { operationId: 'op1', turnId: turns[0]! })).rejects.toThrow('no live is running in this session; live_join first');
     expect(await k.live.leave(sessionKey)).toBe(false);

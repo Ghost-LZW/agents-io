@@ -6,6 +6,7 @@ import type { HarnessAdapter, Policy } from '@agents-io/protocol';
 import { FakeChannel, FakeHarness, type FakeTurnScript } from '@agents-io/testkit';
 import { LocalClient } from '../src/client.js';
 import type { ChannelRegistry } from '../src/channel-registry.js';
+import type { ModuleRegistry } from '../src/modules.js';
 import { resolveConfig, type Config, type HarnessInstance } from '../src/config.js';
 import { Gateway, InstanceHarness, type GatewayOptions } from '../src/gateway.js';
 import { readTokenFile, tokenPath } from '../src/token.js';
@@ -69,6 +70,8 @@ export async function daemon(
     declares?: HarnessDeclares;
     /** The channel types the config is resolved with and the daemon runs (default the built-in ones). */
     channelRegistry?: ChannelRegistry;
+    /** The feature modules the config is resolved with and the daemon runs (default the built-in ones). */
+    moduleRegistry?: ModuleRegistry;
   } = {},
 ): Promise<World> {
   const dir = o.dir ?? tmp();
@@ -78,7 +81,7 @@ export async function daemon(
     const c = (raw as { console?: Record<string, unknown> }).console;
     (raw as Record<string, unknown>).console = { port: 0, ...c };
   }
-  const base = resolveConfig(raw, { env: {}, baseDir: dir, cwd: dir, ...(o.channelRegistry ? { channelRegistry: o.channelRegistry } : {}) });
+  const base = resolveConfig(raw, { env: {}, baseDir: dir, cwd: dir, ...(o.channelRegistry ? { channelRegistry: o.channelRegistry } : {}), ...(o.moduleRegistry ? { moduleRegistry: o.moduleRegistry } : {}) });
   const configPath = join(dir, 'aio.config.json');
   if (o.console && !o.dir) writeFileSync(configPath, JSON.stringify(raw, null, 2) + '\n', { mode: 0o600 });
   const config = { ...base, socketPath: join(dir, 'run', 'aio.sock'), ...(o.console ? { source: { path: configPath, envFile: join(dir, '.env.live') } } : {}) };
@@ -101,6 +104,7 @@ export async function daemon(
     ...(o.channelAdapter ? { channelAdapter: o.channelAdapter } : {}),
     ...(o.channelStartGraceMs !== undefined ? { channelStartGraceMs: o.channelStartGraceMs } : {}),
     ...(o.channelRegistry ? { channelRegistry: o.channelRegistry } : {}),
+    ...(o.moduleRegistry ? { moduleRegistry: o.moduleRegistry } : {}),
   });
   let stopped = false;
   const stop = async () => {

@@ -434,18 +434,23 @@ export interface KernelContext {
     /**
      * Hand the running turn `turnId` of a topic session to a new topic of its conversation
      * (`title`; current from now on), `summary` (what the new topic should know) saved on the topic
-     * left and handed ahead of the turn's messages: the kernel's handover (TP-1), which then moves
-     * the conversation's messages still queued behind the turn. Throws an error named `ToolError`,
-     * the reason for the model, when the session is no topic or the handover fails (the
-     * conversation then stays where it was); and when `turnId` is not the turn running there.
+     * left and handed ahead of the turn's messages: the kernel's handover, which then moves the
+     * conversation's messages still queued behind the turn. The kernel holds TP-1 whoever asks: a
+     * turn is handed over once (by `rotate` or `switch`; the same `operationId` again, a retry,
+     * answers what that one did, also while it is in flight; another is refused), only while its
+     * topic is the conversation's current one, only with a message of its own (not only context
+     * items), and never when all its messages were just handed here (no ping-pong). Throws an error
+     * named `ToolError`, the reason for the model, when one of these refuses, the session is no
+     * topic or the handover fails (the conversation then stays where it was, and the turn may try
+     * again); and when `turnId` is not the turn running there.
      */
-    rotate(sessionKey: string, turnId: string, a: { title: string; summary: string }): Promise<ModuleTopicHandover>;
+    rotate(sessionKey: string, turnId: string, a: { title: string; summary: string; operationId: string }): Promise<ModuleTopicHandover>;
     /**
      * Hand the running turn `turnId` of a topic session to another topic of the same conversation and
-     * agent (`topicId`), current again; its harness session resumes. Throws as `rotate`, also for a
-     * topic of another conversation or agent.
+     * agent (`topicId`), current again; its harness session resumes. Throws as `rotate` (TP-1 the
+     * same), also for a topic of another conversation or agent and for the topic the turn runs in.
      */
-    switch(sessionKey: string, turnId: string, topicId: string): Promise<ModuleTopicHandover>;
+    switch(sessionKey: string, turnId: string, a: { topicId: string; operationId: string }): Promise<ModuleTopicHandover>;
   };
   /**
    * Watches as a session's agent (the watch tools): the agent of `sessionKey` acts (kind `agent`,

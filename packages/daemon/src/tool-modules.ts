@@ -55,7 +55,11 @@ export const liveToolsModule: ModuleManifest<ToolModuleConfig> = {
   }),
 };
 
-/** `session_*`: the agent moves the conversation to a new topic or back to an earlier one, handing it the message (TP-1). */
+/**
+ * `session_*`: the agent moves the conversation to a new topic or back to an earlier one, handing it
+ * the message. TP-1 is the kernel's (`KernelContext.topics.rotate` / `switch` hold it for any
+ * caller); the handlers check it first too, so the model reads the refusal before its arguments.
+ */
 export const topicToolsModule: ModuleManifest<ToolModuleConfig> = {
   id: 'tools.topics',
   kind: 'feature',
@@ -66,7 +70,7 @@ export const topicToolsModule: ModuleManifest<ToolModuleConfig> = {
     tools: topicToolHandlers({
       list: (sessionKey) => (k.topics.bySession(sessionKey) ? k.topics.siblings(sessionKey) : undefined),
       rotate: (sessionKey, turn, a) => k.topics.rotate(sessionKey, turn.turnId, a),
-      switch: (sessionKey, turn, a) => k.topics.switch(sessionKey, turn.turnId, a.topicId),
+      switch: (sessionKey, turn, a) => k.topics.switch(sessionKey, turn.turnId, a),
     }),
     hooks: { inputHint: (agent) => topicHint(k, agent) },
   }),

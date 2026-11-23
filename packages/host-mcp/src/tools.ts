@@ -24,7 +24,7 @@ import {
 } from '@agents-io/protocol';
 import { z } from 'zod';
 import { TOOL_DEFS, TOOL_GROUPS, type ToolGroup } from './defs.js';
-import type { DeliveryRecord, Hub, InboundRewrite, Outbox, Participant } from '@agents-io/session';
+import { TOPIC_ALREADY_HERE, TOPIC_HANDED_ALREADY, handoverRefusal, type DeliveryRecord, type Hub, type InboundRewrite, type Outbox, type Participant } from '@agents-io/session';
 import {
   CHOICE_KEY,
   MENTIONS_KEY,
@@ -195,10 +195,10 @@ export interface LiveControl {
 export interface TopicControl {
   /** The topics of the conversation this session is a topic of (newest activity first), or undefined when it is not a topic session. */
   list(sessionKey: string): Topic[] | undefined;
-  /** Start a new topic (current from now on) and hand the turn's inputs to it, the summary first as a labelled context item. */
-  rotate(sessionKey: string, turn: TurnContext, a: { title: string; summary: string }): Promise<TopicHandover>;
-  /** Make a parked topic current again (its harness session resumes natively) and hand the turn's inputs to it. */
-  switch(sessionKey: string, turn: TurnContext, a: { topicId: string }): Promise<TopicHandover>;
+  /** Start a new topic (current from now on) and hand the turn's inputs to it, the summary first as a labelled context item; `operationId` is the tool call's (TP-1: a retry of it answers the same). */
+  rotate(sessionKey: string, turn: TurnContext, a: { title: string; summary: string; operationId: string }): Promise<TopicHandover>;
+  /** Make a parked topic current again (its harness session resumes natively) and hand the turn's inputs to it; `operationId` as for `rotate`. */
+  switch(sessionKey: string, turn: TurnContext, a: { topicId: string; operationId: string }): Promise<TopicHandover>;
 }
 
 export interface TopicHandover {
@@ -832,9 +832,9 @@ export function liveToolHandlers(live: LiveControl | undefined): Record<LiveTool
 }
 
 /**
- * The topic tools (`session_rotate`, `session_list`, `session_switch`) over `control`: a turn is
- * handed over once (a retried call answers the same), never a message just handed here (TP-1).
- * Without `control` each says topics are not available.
+ * The topic tools (`session_rotate`, `session_list`, `session_switch`) over `control`: TP-1's rules
+ * first (`handoverRefusal`; once per turn, a retry answers the same), then `control` with the call's
+ * operationId (the daemon's kernel applies them again). Without `control` each says topics are not available.
  */
 export function topicToolHandlers(control: TopicControl | undefined): Record<TopicToolName, ModuleToolHandler> {
   /** Session + turn → what its session_rotate / session_switch did (a retried call answers the same; a second handover is refused). */
@@ -964,27 +964,24 @@ async function handover(
   const hk = `${sessionKey}\u0000${turn.turnId}`;
   const prior = handovers.get(hk);
   if (prior?.key === operationId) return prior.result;
-  if (prior) throw new ToolError('this turn was already handed to another topic; end the turn now without answering');
+  if (prior) throw new ToolError(TOPIC_HANDED_ALREADY);
   const { control, topics } = topicsOf(c, sessionKey);
-  const me = topics.find((t) => t.sessionKey === sessionKey);
-  if (me && me.state !== 'current') throw new ToolError("this topic is no longer the conversation's current one (the user or another turn switched); just answer here");
-  const own = turn.inputs.filter((i) => i.channelContext.context !== true);
-  if (!own.length) throw new ToolError('this turn has no message to hand over');
-  // A message just handed here by a rotate/switch is this topic's to answer: no ping-pong between topics.
-  if (own.every((i) => i.channelContext.handedFrom !== undefined)) throw new ToolError('this message was just handed to this topic by a topic switch; answer it here, in this turn');
+  // TP-1's refusals before the arguments are read (the kernel's handover applies them again, for every caller).
+  const refusal = handoverRefusal(topics.find((t) => t.sessionKey === sessionKey), turn.inputs);
+  if (refusal) throw new ToolError(refusal);
   let r: TopicHandover;
   if (tool === 'session_rotate') {
     const title = str(args.title, 'title')!.trim();
     const summary = str(args.summary, 'summary')!.trim();
     if (!title) throw new ToolError('title is required');
     if (!summary) throw new ToolError('summary is required: what the new topic should know from this one (or "none")');
-    r = await control.rotate(sessionKey, turn, { title, summary });
+    r = await control.rotate(sessionKey, turn, { title, summary, operationId });
   } else {
     const topicId = str(args.topicId ?? args.topic_id, 'topicId')!;
     const target = topics.find((t) => t.id === topicId);
     if (!target) throw new ToolError(`no topic ${topicId} in this conversation; session_list shows the topic ids`);
-    if (target.sessionKey === sessionKey) throw new ToolError('you are already in that topic; just answer');
-    r = await control.switch(sessionKey, turn, { topicId });
+    if (target.sessionKey === sessionKey) throw new ToolError(TOPIC_ALREADY_HERE);
+    r = await control.switch(sessionKey, turn, { topicId, operationId });
   }
   const label = `"${r.topic.title ?? r.topic.id}"`;
   const short = r.topic.title ?? (tool === 'session_rotate' ? 'new topic' : 'earlier topic');

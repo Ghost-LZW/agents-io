@@ -457,8 +457,8 @@ goes to its current topic, also from `per-thread` rules such as the default
   e.g. an answer to a question a parked topic asked, carries that topic) and, in the
   current topic and when the target agent is offered a topic tool, `topicTools`: one line on when to call `session_rotate` / `session_switch`
   (without it, small models never rotate). A message handed over by a rotate or
-  switch carries `handedFrom` and a line saying to answer it there; the tools
-  refuse to move it again, so topics cannot ping-pong.
+  switch carries `handedFrom` and a line saying to answer it there; the handover
+  refuses to move it again, so topics cannot ping-pong.
 - When to switch is the agent's call, with the host output tools:
   `session_rotate({ title, summary })` starts a new topic and hands the turn's
   triggering inputs to it (new input ids `<id>><topicId>`), the summary first as a
@@ -604,9 +604,11 @@ capabilities: `log` (prefixed `module <id>: `), `events` and `head` (a session's
 `records` (values under `module:<id>:`), `db` (the log's database; tables `module_<id>_…`),
 `topics` (`bySession`, `siblings`, `titleSource`, `setAutoTitle`: a generated title, set only
 while the topic's title is still generated and still the one the module read, then the latest
-card edited to carry it; `rotate(sessionKey, turnId, { title, summary })` and
-`switch(sessionKey, turnId, topicId)`: the kernel's handover of the turn running in the session,
-TP-1, refused for any other turn), `watches` (`add`, `remove`, `list`: as the session's agent,
+card edited to carry it; `rotate(sessionKey, turnId, { title, summary, operationId })` and
+`switch(sessionKey, turnId, { topicId, operationId })`: the kernel's handover of the turn running
+in the session, refused for any other turn, under TP-1 whoever calls: once per turn, the same
+`operationId` again answering what that one did, only from the conversation's current topic,
+never a message just handed here, never to the turn's own topic), `watches` (`add`, `remove`, `list`: as the session's agent,
 `agentOrigin`, a watch always delivering into the session; `Policy.watch` decides), `live`
 (`join(sessionKey, turnId, a)`, `say`, `leave`: the kernel's live mechanism, decision 16; a join
 only for the turn running in the session), `agents` (`tools(agent)`: the tools an agent's
@@ -634,7 +636,8 @@ harness is offered are byte for byte what the kernel offered) and runs it with
 `watchToolHandlers(k.watches)`, `liveToolHandlers(…)` over `k.live`, `topicToolHandlers(…)` over
 `k.topics`; the topic tools add the hint (`inputHint`) for an agent offered one of them. The
 watches and their routing, the live mechanism (its protocol, events and LN invariants) and the
-topic handover stay the kernel's. The live tools are offered also when no channel can open a
+topic handover with its rules (TP-1: the kernel checks them for every caller; the tools check the
+same ones first, `handoverRefusal` from `@agents-io/session`) stay the kernel's. The live tools are offered also when no channel can open a
 live, as before (dropping them then would change the tool list: a later change).
 
 Not served yet: `ModuleManifest.admin` (registering a module with it fails), and of the
@@ -882,3 +885,15 @@ What changed for embedders with core-slimming G6 step 3 (the watch, live and top
   they answer and every error text are as before; the config error for a tool of a group that is
   off names its module (`agents.<name>.tools: "watch_add" is a tool of module tools.watch, which
   is off`).
+- Follow-up: TP-1 is the kernel's for every caller. `KernelContext.topics.rotate` /
+  `switch` (`KernelBackend.rotateTopic` / `switchTopic`) checked only that `turnId` is the turn
+  running there, and the rules lived in the topic tools' handler: another module with
+  `kernel:topics` could hand one turn to two topics, or a message just handed over on again. Now
+  the gateway hands a turn over once (claimed before its first await, so a concurrent second call
+  finds it; the same `operationId` again answers what that one did; a failed one is not kept),
+  never from a topic no longer current, never a turn with no message of its own or whose messages
+  were all just handed here, never to the turn's own topic. `rotate` takes `{ title, summary,
+  operationId }`, `switch` `{ topicId, operationId }` (it took the topic id); `TopicControl.rotate`
+  / `switch` (`@agents-io/host-mcp`) are given the call's `operationId` too. `@agents-io/session`
+  exports the rules: `handoverRefusal`, `TOPIC_HANDED_ALREADY`, `TOPIC_ALREADY_HERE`. The tools
+  check the same rules before their arguments, so what a model reads is as before.

@@ -563,9 +563,9 @@ export interface KernelBackend {
   addWatch(sessionKey: string, draft: WatchDraft): Promise<KernelWatchResult>;
   removeWatch(sessionKey: string, id: string): Promise<KernelUnwatchResult>;
   listWatches(sessionKey: string): Watch[];
-  /** The kernel's handover of the running turn `turnId` (`KernelContext.topics.rotate` / `switch`). */
-  rotateTopic(sessionKey: string, turnId: string, a: { title: string; summary: string }): Promise<ModuleTopicHandover>;
-  switchTopic(sessionKey: string, turnId: string, topicId: string): Promise<ModuleTopicHandover>;
+  /** The kernel's handover of the running turn `turnId` under TP-1 (`KernelContext.topics.rotate` / `switch`). */
+  rotateTopic(sessionKey: string, turnId: string, a: { title: string; summary: string; operationId: string }): Promise<ModuleTopicHandover>;
+  switchTopic(sessionKey: string, turnId: string, a: { topicId: string; operationId: string }): Promise<ModuleTopicHandover>;
   /** The kernel's live mechanism (`KernelContext.live`). */
   joinLive(sessionKey: string, turnId: string, a: { target: string; channel?: string; instructions?: string; voice?: string }): Promise<{ liveId: string; title: string; route: string }>;
   sayLive(sessionKey: string, text: string, a: { operationId: string; turnId: string }): Promise<void>;
@@ -640,8 +640,9 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
       titleSource: (topicId) => live().titleSource(topicId),
       setAutoTitle: (topicId, expected, title) => live().setAutoTitle(topicId, expected, title),
       // Only what the module may say (strings): its untyped code passes nothing else on.
-      rotate: async (sessionKey, turnId, a) => live().rotateTopic(sessionKey, turnId, { title: text(a?.title, 'topics.rotate: title'), summary: text(a?.summary, 'topics.rotate: summary') }),
-      switch: async (sessionKey, turnId, topicId) => live().switchTopic(sessionKey, turnId, topicId),
+      rotate: async (sessionKey, turnId, a) =>
+        live().rotateTopic(sessionKey, turnId, { title: text(a?.title, 'topics.rotate: title'), summary: text(a?.summary, 'topics.rotate: summary'), operationId: text(a?.operationId, 'topics.rotate: operationId') }),
+      switch: async (sessionKey, turnId, a) => live().switchTopic(sessionKey, turnId, { topicId: text(a?.topicId, 'topics.switch: topicId'), operationId: text(a?.operationId, 'topics.switch: operationId') }),
     },
     watches: {
       add: async (sessionKey, draft) => live().addWatch(sessionKey, draft),

@@ -75,6 +75,8 @@ import {
   Router,
   SqliteSessionLog,
   SOURCE_MISMATCH,
+  TOPIC_ALREADY_HERE,
+  TOPIC_HANDED_ALREADY,
   TopicError,
   TopicRegistry,
   WatchDispatcher,
@@ -98,6 +100,7 @@ import {
   type TopicRecord,
   topicContext,
   topicView,
+  handoverRefusal,
   settleLeftoverInputs,
 } from '@agents-io/session';
 import { HostMcpServer, HostTools, ToolError, agentIdentity, agentOrigin, toolCatalog, type TopicHandover } from '@agents-io/host-mcp';
@@ -704,8 +707,8 @@ export class Gateway {
       removeWatch: (key, id) => gw().removeWatch(agentOrigin(key, gw().agentOfSession(key)), id),
       listWatches: (key) => gw().listWatches(key),
       // Decision 6: the agent decides when a conversation moves to another topic (the handover is the kernel's, TP-1).
-      rotateTopic: (key, turnId, a) => gw().rotateTopic(key, gw().runningTurn(key, turnId), a),
-      switchTopic: (key, turnId, topicId) => gw().switchTopicFor(key, gw().runningTurn(key, turnId), topicId),
+      rotateTopic: (key, turnId, a) => gw().handOverTurn(key, turnId, a.operationId, (turn) => gw().rotateTopic(key, turn, a)),
+      switchTopic: (key, turnId, a) => gw().handOverTurn(key, turnId, a.operationId, (turn) => gw().switchTopicFor(key, turn, a.topicId)),
       // Decision 9: realtime voice on the session's harness, the media peer from a channel.
       joinLive: (key, turnId, a) => gw().joinLive(key, gw().runningTurn(key, turnId), a),
       sayLive: (key, text, a) => gw().sayLive(key, text, a),
@@ -1993,6 +1996,41 @@ export class Gateway {
   }
 
   /**
+   * Session + turn → the handover of that turn (`handOverTurn`), claimed before its first await:
+   * TP-1's once per turn, whoever asks. A failed one is forgotten (the conversation stays in the
+   * topic, which may try again). The latest 1000.
+   */
+  private readonly handovers = new Map<string, { operationId: string; done: Promise<TopicHandover> }>();
+
+  /**
+   * The kernel's handover of the running turn `turnId` of a topic session (`KernelContext.topics.rotate` /
+   * `switch`, by `to`), under TP-1 for every caller: once per turn (the same `operationId` again
+   * answers what that one did, in flight or done; another is refused), and not at all when
+   * `handoverRefusal` says so (the topic is no longer current, the turn has no message of its own,
+   * or all of them were just handed here: no ping-pong).
+   */
+  private async handOverTurn(sessionKey: string, turnId: string, operationId: string, to: (turn: TurnContext) => Promise<TopicHandover>): Promise<TopicHandover> {
+    const key = `${sessionKey}\u0000${turnId}`;
+    const prior = this.handovers.get(key);
+    if (prior?.operationId === operationId) return prior.done;
+    if (prior) throw new ToolError(TOPIC_HANDED_ALREADY);
+    const turn = this.runningTurn(sessionKey, turnId);
+    const refusal = handoverRefusal(this.topicOfSession(sessionKey), turn.inputs);
+    if (refusal) throw new ToolError(refusal);
+    // No await before the claim: a second call for this turn, even a concurrent one, finds it.
+    const done = to(turn);
+    this.handovers.set(key, { operationId, done });
+    for (const k of this.handovers.keys()) {
+      if (this.handovers.size <= 1000) break;
+      this.handovers.delete(k);
+    }
+    done.catch(() => {
+      if (this.handovers.get(key)?.done === done) this.handovers.delete(key);
+    });
+    return done;
+  }
+
+  /**
    * The model tools an agent's sessions are offered (`KernelContext.agents.tools`): its tools list,
    * or the endpoint's whole catalog for `tools: true`; none without tools.
    */
@@ -2199,6 +2237,7 @@ ${a.summary}` }],
     const from = this.topicOfSession(sessionKey);
     const target = this.topics.get(topicId);
     if (!target || target.conversation !== from.conversation || target.agent !== from.agent) throw new ToolError(`no topic ${topicId} in this conversation`);
+    if (target.id === from.id) throw new ToolError(TOPIC_ALREADY_HERE);
     const r = this.topics.switchTo(topicId, 'agent', { turn: turnRef(turn) });
     const handed = await this.handOver(from, r.topic, turn);
     this.log('info', `${sessionKey}: switched back to topic ${r.topic.id} (${r.topic.sessionKey}), ${handed.length} input(s) handed over`);
