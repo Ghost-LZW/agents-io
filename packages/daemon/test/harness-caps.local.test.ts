@@ -3,8 +3,9 @@ import { nextKey, rec, start } from './harness-caps-helpers.js';
 import { until } from './helpers.js';
 
 /*
- * Topic titles (G4 makes them a host hook) are generated in an ephemeral session of a harness that
- * declares `ephemeralOpen`; a `use: "module"` harness declaring it gets them (fixtures/harness-caps.mjs).
+ * Topic titles (the `topic-title` module, G4; when it titles: topic-title.local.test.ts) are
+ * generated in an ephemeral session of a harness that declares `ephemeralOpen`; a `use: "module"`
+ * harness declaring it gets them (fixtures/harness-caps.mjs).
  * The CT-2 / CT-3 capabilities are in harness-caps.test.ts.
  */
 

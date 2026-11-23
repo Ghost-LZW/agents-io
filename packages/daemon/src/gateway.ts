@@ -3,7 +3,6 @@ import { readFileSync, rmSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { generateTopicTitle, topicTitlePrompt } from './topic-title.js';
 import {
   PROTOCOL_VERSION,
   formatAddress,
@@ -43,6 +42,7 @@ import {
   type NativeClient,
   type ReplyRoute,
   type ExternalSender,
+  type KernelLaneHarness,
   type KernelSendResult,
   type Resolver,
   type RunSpec,
@@ -104,7 +104,7 @@ import {
 import { HostMcpServer, HostTools, ToolError, agentIdentity, type TopicHandover } from '@agents-io/host-mcp';
 import { builtinChannels, builtinHarnesses, builtinModules } from './bundle.js';
 import { badChannelAdapter, loadHarnessModule } from './module-loader.js';
-import { ConfigError, UNGRANTED_EVIDENCE, agentSpec, configTable, consoleSettings, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type PresetConfig, type ResolvedChannel } from './config.js';
+import { ConfigError, UNGRANTED_EVIDENCE, agentSpec, configTable, consoleSettings, resolveModules, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type PresetConfig, type ResolvedChannel } from './config.js';
 import { ConsoleServer, type ContributedRoute } from './console.js';
 import type { ChannelRegistry, DefaultEvidence } from './channel-registry.js';
 import type { HarnessRegistry } from './harness-registry.js';
@@ -118,7 +118,7 @@ import { checkLaunch, launchView, sameLaunch, type LaunchCheck } from './launch.
 import { RUN_RULE, Runs, type RunOverrides } from './runs.js';
 import { Strangers } from './strangers.js';
 import { runCommand, type CommandHost, type CommandTable } from './commands.js';
-import { ModuleHost, kernelContext, type KernelBackend, type ModuleRegistry } from './modules.js';
+import { ModuleHost, ModuleRegistry, kernelContext, type KernelBackend, type ResolvedModule } from './modules.js';
 import { ClaudeTuiService } from './tui-claude.js';
 import { consoleUrlPath, loadOrCreateTokenFile, removeTokenFile, TokenError, tokenPath, writeTokenFile } from './token.js';
 
@@ -376,7 +376,6 @@ export class Gateway {
   private stopped = false;
   /** Parked topic sessions whose lane closes when this fires (`topics.parkedIdleMs`). */
   private readonly parkedTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  private readonly titleJobs = new Set<string>();
 
   private constructor(
     private readonly o: GatewayOptions,
@@ -725,6 +724,8 @@ export class Gateway {
         return t ? topicView(t) : undefined;
       },
       siblings: (key) => (gw().topics.bySession(key) ? gw().topics.siblings(key).map(topicView) : []),
+      titleSource: (topicId) => gw().topics.titleSource(topicId),
+      setAutoTitle: (topicId, expected, title) => gw().setAutoTitle(topicId, expected, title),
       identify: (a) => gw().router.identify(a),
       setExtraIdentities: (owner, entries) => gw().setExtraIdentities(owner, entries),
       newTopic: (agent, conversation, title) => gw().router.newTopic(agent, conversation, title !== undefined ? { title } : {}, 'user').topic.id,
@@ -739,6 +740,7 @@ export class Gateway {
         const lane = gw().lanes.get(key) ?? (await gw().laneAfterClose(key));
         return lane.command({ type: 'input', sessionKey: key, input, mode });
       },
+      laneHarness: (key) => gw().laneHarness(key),
       channelFor: (route) => gw().channelFor(route)?.adapter,
       resolveRoute: (route) => {
         const ch = gw().channelFor(route);
@@ -792,7 +794,9 @@ export class Gateway {
     // Module lifecycle step 2 (step 1 ran in loadConfig): set up before the gateway builds its
     // ingress, so their tools and commands are assembled with the kernel's. Their kernel context is
     // late-bound: it works once the gateway exists.
-    const modules = new ModuleHost({ registry: o.moduleRegistry ?? builtinModules, resolved: o.config.modules, config: o.config, log: o.logger ?? defaultLog });
+    const registry = o.moduleRegistry ?? builtinModules;
+    const defaults = o.config.modules === undefined ? builtinDefaults(registry) : undefined;
+    const modules = new ModuleHost({ registry, resolved: o.config.modules, config: o.config, ...(defaults ? { defaults } : {}), log: o.logger ?? defaultLog });
     const ref: { gw?: Gateway } = {};
     const backend = Gateway.kernelBackend(ref, o.logger ?? defaultLog);
     await modules.setup((id) => kernelContext(id, backend));
@@ -1244,9 +1248,8 @@ export class Gateway {
         if (e.body.t === 'session.bound') this.topics.setNativeId(sessionKey, e.body.nativeId);
         this.o.onHarnessEvent?.(sessionKey, e);
       },
-      onTurnCompleted: (turnId, status) => {
-        if (status === 'completed') void this.updateTopicTitle(sessionKey, turnId).catch((e) => this.log('warn', `${sessionKey}: title update failed: ${(e as Error).message}`));
-      },
+      // The modules' hook (topic titles).
+      onTurnCompleted: (turnId, status) => this.modules.turnCompleted({ sessionKey, turnId, status }),
     });
     this.lanes.set(sessionKey, lane);
     this.laneInfo.set(sessionKey, { agent, ...(agent.configured ? { cwd } : {}) });
@@ -2203,34 +2206,33 @@ ${a.summary}` }],
     if (c.from && c.from.sessionKey !== c.to.sessionKey && this.lanes.has(c.from.sessionKey)) this.idleOut(c.from.sessionKey);
   }
 
-  private async updateTopicTitle(sessionKey: string, turnId: string): Promise<void> {
-    const topic = this.topics.bySession(sessionKey);
+  /**
+   * A generated topic title (`KernelContext.topics.setAutoTitle`): set while the topic's title is
+   * still auto and still `expected`, then the latest card of its session refreshed on each channel.
+   */
+  private setAutoTitle(topicId: string, expected: string | undefined, title: string): boolean {
+    if (!this.topics.setAutoTitle(topicId, expected, title)) return false;
+    const sessionKey = this.topics.get(topicId)!.sessionKey;
+    for (const c of this.sessionCompositors.get(sessionKey) ?? []) void c.refreshLatestTitle().catch((e) => this.log('warn', `${sessionKey}: title card refresh failed: ${(e as Error).message}`));
+    return true;
+  }
+
+  /** What a configured agent's open lane runs on (`KernelContext.lanes.harness`); not a task run's. */
+  private laneHarness(sessionKey: string): KernelLaneHarness | undefined {
     const info = this.laneInfo.get(sessionKey);
-    if (!topic || this.topics.titleSource(topic.id) !== 'auto' || !info?.agent.configured || this.titleJobs.has(topic.id)) return;
-    const events = this.hub.log.read(sessionKey, 0);
-    const started = events.find((e) => e.body.t === 'turn.started' && e.body.turnId === turnId);
-    if (started?.body.t !== 'turn.started' || !started.body.inputIds.length) return;
-    // The turn's own instance: a session's preset may have moved it off the agent's.
-    const name = started.body.run?.harness ?? info.agent.harness;
-    const adapter = this.launched.get(sessionKey)?.adapter(name) ?? this.agentHarness(info.agent, name);
-    // Titles come from an ephemeral session (topic-title.ts) on a harness that declares one (Codex); G4 makes this a host hook.
-    if (adapter.ephemeralOpen !== true) return;
-    const eligible = new Set(events.filter((e) => e.body.t === 'turn.started' && e.body.inputIds.length > 0).map((e) => e.body.t === 'turn.started' ? e.body.turnId : ''));
-    const completed = events.filter((e) => e.body.t === 'turn.completed' && e.body.status === 'completed' && eligible.has(e.body.turnId)).length;
-    if (completed !== 1 && completed % 3 !== 1) return;
-    const expected = topic.title;
-    const prompt = topicTitlePrompt(events, expected);
-    if (!prompt) return;
-    const run = started.body.run ?? { ...agentRun(info.agent, this.o.config.harnesses[name]!), profile: 'restricted' };
-    this.titleJobs.add(topic.id);
-    try {
-      const title = await generateTopicTitle(adapter, { cwd: info.cwd ?? this.o.config.cwd, run, prompt });
-      if (!this.stopped && title && this.topics.setAutoTitle(topic.id, expected, title)) {
-        for (const c of this.sessionCompositors.get(sessionKey) ?? []) void c.refreshLatestTitle().catch((e) => this.log('warn', `${sessionKey}: title card refresh failed: ${(e as Error).message}`));
-      }
-    } finally {
-      this.titleJobs.delete(topic.id);
-    }
+    if (!info?.agent.configured || sessionKey.startsWith('run:')) return undefined;
+    const agent = info.agent;
+    return {
+      agent: agent.name,
+      instance: agent.harness,
+      cwd: info.cwd ?? this.o.config.cwd,
+      adapter: (name) => this.launched.get(sessionKey)?.adapter(name) ?? this.agentHarness(agent, name),
+      run: (name) => {
+        const inst = this.o.config.harnesses[name];
+        if (!inst) throw new Error(`unknown harness instance ${JSON.stringify(name)} (configured: ${Object.keys(this.o.config.harnesses).join(', ')})`);
+        return agentRun(agent, inst);
+      },
+    };
   }
 
   /** Close a parked topic's lane after `topics.parkedIdleMs` (later while it still has work); switching back reopens and resumes it. */
@@ -3293,6 +3295,15 @@ const BUILTIN_PROFILES = ['bypass', 'restricted'];
 const OVERRIDE_VALUE = /^[^\s\u0000-\u001f]{1,256}$/;
 /** A host-chosen input id (`session.compact`), as `run.start`'s: a plain token, not the lane's own `ctxo_…`. */
 const HOST_INPUT_ID = /^(?!ctxo_)[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
+
+/**
+ * For a config without `modules` (built by hand, as before modules): the registry's built-in
+ * modules as a file without their sections makes them (`ModuleHostOptions.defaults`).
+ */
+function builtinDefaults(registry: ModuleRegistry): ResolvedModule[] | undefined {
+  const builtin = registry.modules.filter((m) => m.origin === 'builtin');
+  return builtin.length ? resolveModules({}, new ModuleRegistry(builtin), {}, (p) => resolvePath(p)) : undefined;
+}
 
 /** An agent's (or a preset's) RunSpec over its instance's defaults (without the profile). */
 function agentRun(agent: Pick<AgentConfig, 'model' | 'effort'>, inst: HarnessInstance): Omit<RunSpec, 'profile'> {

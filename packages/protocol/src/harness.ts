@@ -170,11 +170,11 @@ export interface HarnessAdapter {
    */
   readonly ownerProfileSwitch?: boolean;
   /**
-   * Static, transitional (core-slimming G4 replaces it with a host hook): `open` takes
-   * `options.ephemeral` (a throwaway session kept out of the harness's history),
-   * `options.preface: false`, the title prompt as `instructions` and a read-only
-   * `options.profiles` entry (`approvalPolicy`, `sandbox`), so the host may generate topic
-   * titles on it. Codex declares it.
+   * Static: `open` takes `options.ephemeral` (a throwaway session kept out of the harness's
+   * history), `options.preface: false`, the title prompt as `instructions` and a read-only
+   * `options.profiles` entry (`approvalPolicy`, `sandbox`), so the daemon's topic titles module
+   * (`topic-title`, core-slimming G4; a host may turn it off) generates topic titles on it. The
+   * options are Codex's shape (transitional). Codex declares it.
    */
   readonly ephemeralOpen?: boolean;
   /**

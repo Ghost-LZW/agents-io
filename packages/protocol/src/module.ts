@@ -25,10 +25,11 @@ import type { Topic } from './topic.js';
  *
  * In progress: the daemon reads the manifest (`id`, `kind`, `needs`, `config`, `features`,
  * `mcpTools`, `commands`, `setup`) and, of the instance, `tools`, `commands`, `features`,
- * `status`, `start` and `stop`. `admin`, `hooks` and `localFrames` are the contract the features
- * that move into modules next need (G6 steps 2-6); until the daemon serves one, a module that sets
- * it fails to register (`admin`) or to set up (`hooks.<name>`, `localFrames`), naming it, rather
- * than being silently ignored. The first built-in module is the external MCP endpoint (step 1).
+ * `status`, `start`, `stop` and the hook `onTurnCompleted`. `admin`, the other `hooks` and
+ * `localFrames` are the contract the features that move into modules next need (G6 steps 3-6);
+ * until the daemon serves one, a module that sets it fails to register (`admin`) or to set up
+ * (`hooks.<name>`, `localFrames`), naming it, rather than being silently ignored. The built-in
+ * modules are the topic titles (step 2) and the external MCP endpoint (step 1).
  */
 
 /** Where a registered module comes from: shipped with the host (`builtin`), or someone else's (`module`). */
@@ -185,15 +186,20 @@ export interface ModuleTopicChange {
 export type ModuleTurnStatus = Extract<SessionEvent['body'], { t: 'turn.completed' }>['status'];
 
 /**
- * What a module hooks into. Not served yet (see the file comment): a module that sets one fails to
- * set up, naming it. Each says which feature it is for.
+ * What a module hooks into. The daemon serves `onTurnCompleted`; a module that sets any other fails
+ * to set up, naming it (see the file comment). Each says which feature it is for.
  */
 export interface ModuleHooks {
   /** An input no rule dispatched and no host took (a stranger's message to be asked about). */
   onUndispatched?(a: { env: InboundEnvelope; origin: Origin; input: InputRecord }): void | Promise<void>;
   /** Clicks on buttons whose action id starts with `prefix` (the stranger cards' `aio:stranger:`). */
   onAction?: { prefix: string; handle(a: { actionId: string; env: InboundEnvelope; origin: Origin }): ModuleActionResult | undefined | Promise<ModuleActionResult | undefined> };
-  /** A turn ended (topic titles). */
+  /**
+   * A turn of a session ended, whatever its status (not a task run's turn): called right after its
+   * `turn.completed` is in the session's log, from when the daemon runs until it stops its modules,
+   * for every module in registration order. Return at once (start the work, don't await it): a
+   * throw or a rejected promise is logged, nothing else. Topic titles.
+   */
   onTurnCompleted?(a: { sessionKey: string; turnId: string; status: ModuleTurnStatus }): void;
   /** A conversation's current topic changed. */
   onTopicChanged?(c: ModuleTopicChange): void;
@@ -289,6 +295,24 @@ export type KernelInputResult =
   | { ok: true; disposition?: 'new_turn' | 'steer' | 'queued' | 'observe_only' | 'duplicate' }
   | { ok: false; reason: string };
 
+/** What the lane of a configured agent's session runs on (`KernelContext.lanes.harness`). */
+export interface KernelLaneHarness {
+  /** The session's agent. */
+  agent: string;
+  /** The agent's harness instance; a turn's `run.harness` may name another (a preset moved the session). */
+  instance: string;
+  /** The session's working directory. */
+  cwd: string;
+  /**
+   * The adapter the session's turns open on an instance: the session's launch's, else the agent's
+   * (its working directory and instructions over the instance's). Read what it declares
+   * (`ephemeralOpen`) before opening on it. Throws for an instance that is not configured.
+   */
+  adapter(instance: string): HarnessAdapter;
+  /** The agent's run on an instance, without a profile (its model and effort over the instance's). Throws for an instance that is not configured. */
+  run(instance: string): Omit<RunSpec, 'profile'>;
+}
+
 /** What the host's `external` hook is asked (`ExternalCallout.args`). */
 export type ExternalCalloutArgs = Static<typeof ExternalCallout>['args'];
 
@@ -357,6 +381,20 @@ export interface KernelContext {
     bySession(sessionKey: string): Topic | undefined;
     /** The topics of the conversation a session is a topic of (newest activity first); empty when it is not one. */
     siblings(sessionKey: string): Topic[];
+    /**
+     * Where a topic's title comes from: `auto` (made from its first message, or by a module's
+     * `setAutoTitle`) or `explicit` (given: `/new <title>`, `topic.switch` with a title, the
+     * model's `session_rotate`); undefined for no such topic.
+     */
+    titleSource(topicId: string): 'auto' | 'explicit' | undefined;
+    /**
+     * Give a topic a generated title, which stays `auto`: only while its title is still `auto` and
+     * still `expected` (what the module read before it made one: a title given or made meanwhile
+     * wins), so a result that comes back late never overwrites a name. Then the latest card of the
+     * topic's session is edited on each channel to carry it (a card header: Lark). False when
+     * nothing changed (also for the same title).
+     */
+    setAutoTitle(topicId: string, expected: string | undefined, title: string): boolean;
   };
   /** The binding tables' router. */
   readonly router: {
@@ -386,6 +424,13 @@ export interface KernelContext {
      * error with a `code` when the session cannot open (its agent is gone).
      */
     input(sessionKey: string, input: InputRecord, mode?: 'queue' | 'steer' | 'interrupt'): Promise<KernelInputResult>;
+    /**
+     * What the open lane of a configured agent's session runs on, to open a session of the
+     * module's own beside it (an ephemeral one: topic titles). Undefined when no lane is open for
+     * the session, for a task run's session, and when its agent is not a configured one (the
+     * default agent of a deployment without `agents`).
+     */
+    harness(sessionKey: string): KernelLaneHarness | undefined;
   };
   /** The running adapter that sends to a route (its channel and account), if any. */
   channelFor(route: { channel: string; account: string }): ChannelAdapter | undefined;

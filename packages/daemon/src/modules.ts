@@ -15,6 +15,7 @@ import type {
   KernelContext,
   KernelDatabase,
   KernelInputResult,
+  KernelLaneHarness,
   KernelOutcome,
   KernelSendResult,
   KernelSettledSend,
@@ -22,6 +23,7 @@ import type {
   ModuleManifest,
   ModuleOrigin,
   ModuleToolDef,
+  ModuleTurnStatus,
   Origin,
   Policy,
   RenderedMessage,
@@ -52,6 +54,8 @@ import { TokenError } from './token.js';
  *   5. a config change to a module's section takes effect at the next start (the console answers
  *      `applied: "restart"`; nothing is applied live).
  * A module that is off does not exist for the deployment: no tools, no commands, no features.
+ * The hooks the daemon serves (`onTurnCompleted`) are called from when the gateway is built until
+ * step 4.
  */
 
 /** A module as registered: its manifest and where it comes from. */
@@ -272,6 +276,13 @@ export interface ModuleHostOptions {
    * does one of a config without `modules` at all.
    */
   config?: object;
+  /**
+   * For a config without `modules` at all (`resolved` undefined: built by hand, as before modules):
+   * what the modules resolve to from a file without their sections (`resolveModules({}, …)`). A
+   * built-in module without a field takes its entry here: a feature that was the kernel's before
+   * it was a module (topic titles) runs as it did. A module of someone else's still fails the start.
+   */
+  defaults?: readonly ResolvedModule[];
   log: Log;
 }
 
@@ -284,8 +295,8 @@ interface Running {
   started: boolean;
 }
 
-/** Hook members the daemon serves (none yet): any other a module sets fails its setup. */
-const SERVED_HOOKS: readonly string[] = [];
+/** Hook members the daemon serves (functions): any other a module sets fails its setup. */
+const SERVED_HOOKS: readonly string[] = ['onTurnCompleted'];
 
 /** What is wrong with what `setup` returned (the first thing), or undefined. */
 function badInstance(m: ModuleManifest<any>, i: ModuleInstance): string | undefined {
@@ -300,7 +311,11 @@ function badInstance(m: ModuleManifest<any>, i: ModuleInstance): string | undefi
   for (const k of Object.keys(i.commands ?? {})) if (!commands.has(k)) return `commands.${k}: not one of its commands`;
   if (i.hooks !== undefined) {
     if (!isObject(i.hooks)) return 'hooks must be an object';
-    for (const [k, v] of Object.entries(i.hooks)) if (v !== undefined && !SERVED_HOOKS.includes(k)) return `hooks.${k} is not served yet`;
+    for (const [k, v] of Object.entries(i.hooks)) {
+      if (v === undefined) continue;
+      if (!SERVED_HOOKS.includes(k)) return `hooks.${k} is not served yet`;
+      if (!isFn(v)) return `hooks.${k} must be a function`;
+    }
   }
   if (i.localFrames !== undefined && (!isObject(i.localFrames) || Object.keys(i.localFrames).length)) return 'localFrames are not served yet';
   for (const k of ['features', 'status', 'start', 'stop'] as const) if (i[k] !== undefined && !isFn(i[k])) return `${k} must be a function`;
@@ -325,14 +340,21 @@ export const MODULE_STOP_MS = 2000;
 export class ModuleHost {
   private readonly all: Running[];
   private setUp = false;
+  /** Step 4 began: no more hooks. */
+  private stopping = false;
 
   constructor(private readonly o: ModuleHostOptions) {
     const byId = new Map((o.resolved ?? []).map((r) => [r.id, r]));
     for (const id of byId.keys()) if (!o.registry.get(id)) throw new ConfigError(`the config was resolved with module ${id}, which this daemon does not register: give loadConfig and Gateway.start the same moduleRegistry`);
+    const defaults = new Map((o.defaults ?? []).map((r) => [r.id, r]));
     this.all = o.registry.modules.map((r) => {
       const field = o.registry.fields.get(r.manifest.id)?.config;
-      // A config without `modules` at all (one built by hand, as before modules): such a module is what its field says.
-      const res = byId.get(r.manifest.id) ?? (o.resolved === undefined && field !== undefined && o.config !== undefined ? { id: r.manifest.id, enabled: false } : undefined);
+      // A config without `modules` at all (one built by hand, as before modules): such a module is what its field
+      // says; a built-in one without a field is as a file without its section makes it.
+      const bare = o.resolved === undefined;
+      const res =
+        byId.get(r.manifest.id) ??
+        (bare && field !== undefined && o.config !== undefined ? { id: r.manifest.id, enabled: false } : bare && field === undefined && r.origin === 'builtin' ? defaults.get(r.manifest.id) : undefined);
       if (!res) throw new ConfigError(`module ${r.manifest.id} is registered but the config was resolved without it: give loadConfig and Gateway.start the same moduleRegistry`);
       if (field !== undefined && o.config !== undefined) {
         // `resolveConfig` puts the module's settings there (the same object) while it is on; anything else was written since.
@@ -446,8 +468,28 @@ export class ModuleHost {
     }
   }
 
-  /** Step 4: stop the started modules in reverse order, each bounded (`MODULE_STOP_MS`); failures are logged. */
+  /**
+   * A turn of a session ended (`ModuleHooks.onTurnCompleted`): each set-up module's hook, in
+   * registration order, until step 4 begins. One that throws or rejects is logged; the others still run.
+   */
+  turnCompleted(a: { sessionKey: string; turnId: string; status: ModuleTurnStatus }): void {
+    if (this.stopping) return;
+    for (const m of this.active()) {
+      const hooks = m.instance!.hooks;
+      if (!hooks?.onTurnCompleted) continue;
+      const failed = (e: unknown) => this.o.log('warn', `module ${m.r.manifest.id}: onTurnCompleted failed: ${(e as Error)?.message ?? String(e)}`);
+      try {
+        const r: unknown = hooks.onTurnCompleted(a);
+        if (r && typeof (r as Promise<unknown>).then === 'function') (r as Promise<unknown>).then(undefined, failed);
+      } catch (e) {
+        failed(e);
+      }
+    }
+  }
+
+  /** Step 4: stop the started modules in reverse order, each bounded (`MODULE_STOP_MS`); failures are logged. Their hooks are no longer called. */
   async stop(): Promise<void> {
+    this.stopping = true;
     for (const m of [...this.all].reverse()) {
       if (!m.started) continue;
       m.started = false;
@@ -485,6 +527,9 @@ export interface KernelBackend {
   db(): KernelDatabase;
   topic(sessionKey: string): Topic | undefined;
   siblings(sessionKey: string): Topic[];
+  titleSource(topicId: string): 'auto' | 'explicit' | undefined;
+  /** Set while still auto and `expected`, then the cards that show it refreshed (`KernelContext.topics.setAutoTitle`). */
+  setAutoTitle(topicId: string, expected: string | undefined, title: string): boolean;
   identify(a: IdentifyArgs): Identity;
   /** One owner's extra identity entries (a module's, by id), merged with the others'. */
   setExtraIdentities(owner: string, entries: IdentityEntry[]): void;
@@ -496,6 +541,7 @@ export interface KernelBackend {
   command(cmd: ClientCommand, origin: Origin): Promise<KernelOutcome>;
   /** The lane's answer to the input (the lane opened when it is not). */
   laneInput(sessionKey: string, input: InputRecord, mode: 'queue' | 'steer' | 'interrupt'): Promise<KernelInputResult>;
+  laneHarness(sessionKey: string): KernelLaneHarness | undefined;
   channelFor(route: { channel: string; account: string }): ChannelAdapter | undefined;
   resolveRoute(route: ReplyRoute): { ok: true; route: ReplyRoute } | { ok: false; message: string };
   send(route: ReplyRoute, msg: RenderedMessage, a: { operationId: string; sessionKey: string; turnId?: string; external?: ExternalSender }): Promise<KernelSendResult | undefined>;
@@ -544,6 +590,8 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
     topics: {
       bySession: (sessionKey) => live().topic(sessionKey),
       siblings: (sessionKey) => live().siblings(sessionKey),
+      titleSource: (topicId) => live().titleSource(topicId),
+      setAutoTitle: (topicId, expected, title) => live().setAutoTitle(topicId, expected, title),
     },
     router: {
       identify: async (a) => live().identify(a),
@@ -561,6 +609,7 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
         if (input?.origin?.kind !== 'peer') throw new Error(`module ${id}: lanes.input takes a peer's input (origin.kind "peer", not ${JSON.stringify(input?.origin?.kind)})`);
         return live().laneInput(sessionKey, input, mode ?? 'queue');
       },
+      harness: (sessionKey) => live().laneHarness(sessionKey),
     },
     channelFor: (route) => live().channelFor(route),
     resolveRoute: (route) => live().resolveRoute(route),

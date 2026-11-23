@@ -1,5 +1,79 @@
 import { randomUUID } from 'node:crypto';
-import type { HarnessAdapter, InputRecord, RunSpec, SessionEvent } from '@agents-io/protocol';
+import type { HarnessAdapter, InputRecord, KernelContext, ModuleManifest, RunSpec, SessionEvent } from '@agents-io/protocol';
+
+/*
+ * Topic titles made by the model, as a built-in feature module (core-slimming G4, G6 step 2;
+ * `bundle.ts` registers it, nothing else in the daemon imports it). After a completed turn of a
+ * configured agent's topic session, on the 1st completed turn and every 3rd after, it asks the
+ * harness that turn ran on (when it declares `ephemeralOpen`: Codex) for a short title in an
+ * ephemeral session of its own, and gives it to the topic while the topic's title is still the
+ * generated one it read (`KernelContext.topics.setAutoTitle`, which also edits the latest card).
+ * A host-level feature (decision 16): on by default; `topicTitles: { enabled: false }` turns it
+ * off, and a host names its topics itself (docs/HOSTS.md §4.4).
+ */
+
+/** The `topicTitles` section of the config file: only `enabled` (the daemon's). */
+export interface TopicTitleSection {
+  enabled?: boolean;
+}
+
+/** What the section resolves to: nothing of its own yet. */
+export type TopicTitleConfig = Record<string, never>;
+
+export const topicTitleModule: ModuleManifest<TopicTitleConfig> = {
+  id: 'topic-title',
+  kind: 'feature',
+  needs: ['kernel:events', 'kernel:topics', 'kernel:lanes', 'kernel:stopping'],
+  config: {
+    section: 'topicTitles',
+    schema: {},
+    // On, as it was before it was a module: a file without the section titles topics.
+    defaultEnabled: true,
+    resolve: () => ({}),
+  },
+  setup: (kernel) => {
+    // One title job per topic at a time.
+    const jobs = new Set<string>();
+    return {
+      hooks: {
+        onTurnCompleted: ({ sessionKey, turnId, status }) => {
+          if (status === 'completed') void titleTopic(kernel, jobs, sessionKey, turnId).catch((e) => kernel.log('warn', `${sessionKey}: title update failed: ${(e as Error).message}`));
+        },
+      },
+    };
+  },
+};
+
+/** After a completed turn: title the session's topic when the turn is its 1st or every 3rd after (see the file comment). */
+async function titleTopic(k: KernelContext, jobs: Set<string>, sessionKey: string, turnId: string): Promise<void> {
+  const topic = k.topics.bySession(sessionKey);
+  if (!topic || k.topics.titleSource(topic.id) !== 'auto') return;
+  const lane = k.lanes.harness(sessionKey);
+  if (!lane || jobs.has(topic.id)) return;
+  const events = k.events(sessionKey);
+  const started = events.find((e) => e.body.t === 'turn.started' && e.body.turnId === turnId);
+  if (started?.body.t !== 'turn.started' || !started.body.inputIds.length) return;
+  // The turn's own instance: a session's preset may have moved it off the agent's.
+  const name = started.body.run?.harness ?? lane.instance;
+  const adapter = lane.adapter(name);
+  // An ephemeral session of the harness that ran the turn, where it can open one (Codex).
+  if (adapter.ephemeralOpen !== true) return;
+  const eligible = new Set(events.filter((e) => e.body.t === 'turn.started' && e.body.inputIds.length > 0).map((e) => e.body.t === 'turn.started' ? e.body.turnId : ''));
+  const completed = events.filter((e) => e.body.t === 'turn.completed' && e.body.status === 'completed' && eligible.has(e.body.turnId)).length;
+  if (completed !== 1 && completed % 3 !== 1) return;
+  const expected = topic.title;
+  const prompt = topicTitlePrompt(events, expected);
+  if (!prompt) return;
+  const run = started.body.run ?? { ...lane.run(name), profile: 'restricted' };
+  jobs.add(topic.id);
+  try {
+    const title = await generateTopicTitle(adapter, { cwd: lane.cwd, run, prompt });
+    // A name given meanwhile wins (setAutoTitle checks it is still auto and still `expected`).
+    if (!k.stopping() && title) k.topics.setAutoTitle(topic.id, expected, title);
+  } finally {
+    jobs.delete(topic.id);
+  }
+}
 
 const MAX_CONTEXT = 4000;
 const MAX_TITLE = 36;

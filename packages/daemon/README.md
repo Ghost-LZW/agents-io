@@ -125,8 +125,9 @@ see `docs/E2E.md` §0). New:
   only on Codex"; else the instance name). Without them those commands answer that they are
   unavailable; when no configured instance declares `modes` / `ownerProfileSwitch`, the reply
   names the registered kinds that do (`HarnessModule.declares`), so a deployment with only Claude
-  Code configured still hears "/plan is available only on Codex". `ephemeralOpen: true` (Codex) is transitional: topic titles are generated in an
-  ephemeral session of a harness that declares it, until a host hook replaces them (G4).
+  Code configured still hears "/plan is available only on Codex". `ephemeralOpen: true` (Codex): the
+  topic titles module (`topic-title`, below) generates titles in an ephemeral session of a harness
+  that declares it; the open options it sends are still Codex's shape.
   A launched session's env (decision 7) reaches the harness as its adapter declares
   (`sessionEnv`): `'open'` (the default; Claude Code) puts it in the open args;
   `'own-process'` (Codex over stdio) runs the session on the adapter `ownProcess({ env, cwd })`
@@ -483,6 +484,13 @@ goes to its current topic, also from `per-thread` rules such as the default
   `invalid_frame` when both or neither are given).
 - Cards of a topic session carry `channelData["agents-io/topic"] = { title }`; the
   Lark adapter shows it as the card header title (the status moves to the subtitle).
+- A topic's first title is made from its opening message. The built-in module `topic-title`
+  (on unless `topicTitles: { enabled: false }`) then asks the model for a short one: after the
+  1st completed turn of a configured agent's topic and every 3rd after, in an ephemeral session
+  of the instance the turn ran on, when that instance declares `ephemeralOpen` (Codex). A title
+  given explicitly (`/new <title>`, `topic.switch` with `new.title`, `session_rotate`) is never
+  replaced, nor one given while a title was being made; the latest card is edited to carry a
+  new title.
 
 ## CLI
 
@@ -518,7 +526,8 @@ aio console-link                                              (one-time console 
 
 A feature of the daemon can be a module: a `ModuleManifest` (`@agents-io/protocol`,
 `module.ts`) registered in a `ModuleRegistry` by the composition root (`bundle.ts`
-`builtinModules`, origin `builtin`; so far the external MCP endpoint, `external-mcp`). A third
+`builtinModules`, origin `builtin`; so far the topic titles, `topic-title`, and the external MCP
+endpoint, `external-mcp`). A third
 party's module has the same shape (origin `module`). The manifest says, without running anything:
 
 - `id` (`tools.watch`), `kind: 'feature'`, `needs` (`module:<id>`: another registered module,
@@ -539,7 +548,11 @@ party's module has the same shape (origin `module`). The manifest says, without 
   `needsTurn`), `commands` (chat commands: name, `/help` line, `ownerOnly`, default true);
 - `setup(kernel, config)`, which returns the `ModuleInstance`: a handler per tool and per
   command, `features()` (which of its features it advertises now; default all while it runs),
-  `status()`, `start()`, `stop()`.
+  `status()`, `start()`, `stop()`, and `hooks.onTurnCompleted({ sessionKey, turnId, status })`:
+  called for every turn of a session (not a task run's) right after its `turn.completed` is
+  logged, whatever its status, for each module in registration order, from when the gateway is
+  built until step 4; it returns at once (a throw or a rejected promise is logged as
+  `module <id>: onTurnCompleted failed: …`).
 
 The registry checks every manifest and what they claim together (ids; config sections and
 aliases; tools, commands and features are each one module's and never the kernel's). Its option
@@ -581,20 +594,24 @@ capabilities: `log` (prefixed `module <id>: `), `events` and `head` (a session's
 `appendNative` (a durable native event in a log of the module's own, such as
 `external:<client>`), `sessions` (`list`, `known`, `agentOf`), `status`, `stopping`, `policy`,
 `records` (values under `module:<id>:`), `db` (the log's database; tables `module_<id>_…`),
-`topics`, `router` (`identify`, its own `setExtraIdentities`, `newTopic`, `conversationAgent`,
-`record`: an input's routing record), `lanes` (`has`, `open`, `command`, `input`: a peer's input
-the module stamped, any other origin kind is refused), `channelFor`, `resolveRoute`, `send`
+`topics` (`bySession`, `siblings`, `titleSource`, `setAutoTitle`: a generated title, set only
+while the topic's title is still generated and still the one the module read, then the latest
+card edited to carry it), `router` (`identify`, its own `setExtraIdentities`, `newTopic`,
+`conversationAgent`, `record`: an input's routing record), `lanes` (`has`, `open`, `command`,
+`input`: a peer's input the module stamped, any other origin kind is refused; `harness`: what a
+configured agent's open lane runs on, `{ agent, instance, cwd, adapter(instance), run(instance) }`,
+undefined for a task run's or the unconfigured default agent's), `channelFor`, `resolveRoute`, `send`
 (through the outbox; `external` names the client outside the daemon it sends for, kept in the
 in-flight mark, EX-8), `settled`, `outbound` (the outbound check of a send that is no turn's
 reply, DL-6), `ownerRoute`, `redispatch`, `explain` and `host` (`connected`, `answers`, `heldBy`,
 `external`: the `external` callout, `isToken`: a module never gets the host token).
 
 Not served yet: `ModuleManifest.admin` (registering a module with it fails), and of the
-instance `hooks` (`onUndispatched`, `onAction`, `onTurnCompleted`, `onTopicChanged`, `resolver`,
+instance the other `hooks` (`onUndispatched`, `onAction`, `onTopicChanged`, `resolver`,
 `planRun`, `harnessFor`, `inputHint`, `statusLines`, `identities`) and `localFrames` (setting one
-fails the setup, naming it). They are the seams the features that move into modules next need
-(topic titles, the watch / topic / live tools, strangers, owner commands and presets, the Claude
-Code terminal); each is served with the move that needs it. A module
+fails the setup, naming it; a hook that is not a function too). They are the seams the features
+that move into modules next need (the watch / topic / live tools, strangers, owner commands and
+presets, the Claude Code terminal); each is served with the move that needs it. A module
 section's strings are redacted by the console's general rule (a secret-looking key); `x-credential`
 marks in a module's schema are not read yet.
 
@@ -748,3 +765,22 @@ What changed for embedders with core-slimming G6 step 1 (the external MCP endpoi
   `host.hello` lists `external.mcp` after the kernel's features (it was between
   `callouts.external` and `session.compact`); `GET /api/status` `modules` lists `external-mcp`;
   the endpoint's log lines carry the `module external-mcp: ` prefix.
+
+What changed for embedders with core-slimming G6 step 2 (topic titles are a module, G4):
+
+- `builtinModules` registers `topic-title` (`topicTitleModule`, `src/topic-title.ts`) first, before
+  `external-mcp`. Its section is `topicTitles` (only `enabled`; absent means on, so existing
+  configs title topics as before; `topicTitles: { enabled: false }` turns it off). It titles a
+  configured agent's topic after its 1st completed turn and every 3rd after, on the instance that
+  turn ran on when it declares `ephemeralOpen` (Codex), while the title is still generated; the
+  gateway no longer does. `ConfigFile` has `topicTitles` before `externalMcp`; `GET /api/status`
+  `modules` lists `topic-title` first.
+- New: the hook `onTurnCompleted` (served), `KernelContext.topics.titleSource` /
+  `setAutoTitle`, `KernelContext.lanes.harness` (`KernelLaneHarness`), `ModuleHost.turnCompleted`,
+  `ModuleHostOptions.defaults`; `TopicTitleSection` from `bundle.ts`. A config without `modules` at
+  all (built by hand) still starts and titles topics: `Gateway.start` gives the built-in modules
+  without a field what a file without their sections makes them (`resolveModules({}, …)`); a
+  third party's module still fails such a config.
+- The topic titles, their trigger, the card edit and every error text are as before. Its log line
+  `title update failed` carries the `module topic-title: ` prefix; a turn that completes after the
+  daemon began stopping its modules no longer starts a title (its result was dropped before).
