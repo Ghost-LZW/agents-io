@@ -60,7 +60,7 @@ async function start(config: Record<string, unknown>) {
   /** One turn on `sessionKey` (prepared with `launch` first, when given), done. */
   const turn = async (sessionKey: string, launch?: { cwd?: string; env?: Record<string, string> }) => {
     if (launch) await h.call('session.prepare', { sessionKey, agent: 'dev', launch });
-    h.input(sessionKey, 'hi');
+    await h.input(sessionKey, 'hi');
     await until(() => gw.hub.log.read(sessionKey, 0).some((e) => e.body.t === 'turn.completed'));
   };
   return { gw, h, rec, ws, stop, turn };
