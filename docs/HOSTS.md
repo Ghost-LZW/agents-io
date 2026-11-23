@@ -132,6 +132,8 @@
 | `inbound.redispatch` | 宿主 → 守护进程 | 把宿主入站队列里的一条输入按原始来源投递到指定会话（§2.1） |
 | `session.compact` | 宿主 → 守护进程 | 让一个安静的、lane 打开着的会话的 harness 立刻压缩上下文（见下） |
 
+**`deliver` 的结果没能记下时**（INVARIANTS DL-1 细节 5）：结算记录、出站索引与会话日志里的 `delivery.settled` 在一个事务里提交。消息发出之后这一步失败（磁盘满、I/O 错误）时，这次 `deliver` 答 `internal`（消息是原错误），消息可能已经发出，什么都还没记下（`explain <operationId>` 答 `unknown_input`）。同一个 operationId 再 `deliver` 不会再发：同一进程里答 `status: "unknown"`、`duplicate: false`、`error: "recording its outcome failed in this process (…); not resent"`；守护进程重启之后，启动时已把它记为 `unknown`（`error: "in flight when the previous process stopped; not resent"`），再 `deliver` 答 `duplicate: true`。按 `unknown` 处理（交给人或宿主自己的规则），不要换一个 operationId 重发：可能发两次。
+
 **任务运行的三个可选项**（方案见 `docs/design/run-overrides`，不变量 RN-2、RN-3、EX-7；旧守护进程接受这些字段然后忽略，宿主必须先看 `features`）：
 
 - **`overrides: { preset?, model?, effort?, profile? }`**（feature `run.overrides`）：只改这一次运行。`preset` 把 harness 实例、模型、力度换成那个 preset 的（运行仍以这个 agent 的身份：缺省 cwd 仍是 agent 自己的，不跟着 preset 的实例走；指令也是 agent 的）；`model` / `effort` 再盖在上面，原样传给 harness；`profile` 缺省取 agent 的、再缺省 `restricted`。值不是一个普通记号、preset 没有配置，或（带 `profile` 或 `preset` 时）profile 既不是运行所在实例的 `profiles` 里有的、也不是内置的（`bypass`、`restricted`），整个请求答 `bad_override`，什么都不起。`run.start` 的答复带 `run`：实际用的 RunSpec（与日志里 `turn.started.run` 相同）。守护进程不按 agent 限定宿主能选什么：`profile` 可以升到 `bypass`，`preset` 可以挪到任何已配置的实例（连同它的凭据与配置目录）。替别人发起运行的宿主（例如把工作委派给 task agent）要自己限定可选的 preset、模型与 profile，并总是给出 `cwd`。
@@ -173,6 +175,12 @@
 - **记录**：发送记在客户端的日志 `external:<名>`（`native` 事件 `agents-io.external` 与 `delivery.settled`，同宿主 `deliver` 的 `host:<名>`），operationId 为 `external:<名>:<operation_id>`、同一个只发一次；`aio explain <operationId>` 的 `external` 说出客户端、主体与 `declared`。输入有路由记录，`aio explain <inputId>` 可查。
 - **宿主怎样再收紧**：`external` 钩子决定每一次写，`outbound` 钩子照样决定发送（§4.1）；读由 scope 决定，宿主的代理可以自己再过滤。
 - **对严格校验的宿主可见的协议变化**（2026-10-20）：`policy` 帧多了 `hook: "external"`；`features` 多了 `callouts.external`、`external.mcp`；`EffectExplanation.external`、`AdminStatus.externalMcp` 是新的可选字段；输入的 `origin.kind` 可能是 `peer`（schema 里早有）；会话列表里可能出现 `external:<名>`（与 `host:<名>` 一样是投递日志）。
+
+### 4.3 类型与 schema 的位置变化
+
+给直接用 TypeScript 包或 JSON Schema 文件的宿主（例如自己做控制台界面的）。线上的帧与 admin HTTP API 不变。
+
+- **2026-11-23（core-slimming P0）**：飞书机器人开通的 admin 类型 `AdminLarkBotRequest`、`AdminLarkBotStarted`、`AdminLarkBotJob`、`AdminLarkBotJobState` 不再由 `@agents-io/protocol` 导出，`ADMIN_ENDPOINTS` 也只列核心端点；它们与 `LARK_BOT_ADMIN_ENDPOINTS`（`POST /api/bots/lark`、`GET /api/bots/lark/:job`）改由 `@agents-io/channel-lark-bot` 导出（`channel/lark-bot/src/admin.ts`）。三个 JSON Schema 从 `packages/protocol/schema/` 移到 `channel/lark-bot/schema/`，内容与 `$id`（`agents-io/v1/AdminLarkBot*`）不变。`@agents-io/daemon` 不再转出 `LarkBotJobs`、`larkEnvNames`（以及 `LarkBotJobsOptions`、`StartOutcome`），也从 `@agents-io/channel-lark-bot` 取；`LarkBotJobsOptions.config` 改为结构化的 `ProvisionConfig`（守护进程的 `ConfigStore` 满足它），另要 `envRefs`。照抄过这些类型的宿主，注释里的出处要跟着改。
 
 ## 5. 命令行（给不想写 socket 客户端的宿主）
 

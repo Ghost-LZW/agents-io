@@ -168,7 +168,15 @@ before any host frame; after it, the connection's client frames carry the origin
   Exit codes: 0 completed, 1 failed, 3 ambiguous, 124 timed out, 130 interrupted.
 - `deliver`: through the outbox, idempotent per `operationId` (also across
   restarts: settled deliveries are in the database). Value: the delivery record
-  plus `duplicate`.
+  plus `duplicate`. When the outcome cannot be recorded after the send (the
+  record, the outbound index and `delivery.settled` commit together; a full
+  disk or an I/O error fails all three) the answer is `internal` with that
+  error, the message may have gone out, and nothing is settled yet (`explain`
+  of the operationId: `unknown_input`). The same `operationId` again is never
+  sent: in the same process it settles `unknown` (`duplicate: false`, `error:
+  "recording its outcome failed in this process (…); not resent"`); after a
+  restart the start has settled it `unknown` (`duplicate: true`). Treat it as
+  unknown; a new `operationId` may send it twice (INVARIANTS DL-1).
 - `input.verify { channelRef }`: what the channel reported about that message's
   author (channel user id, display name, bot flag), its evidence, and the
   principal / labels the identity map stamped, per receiving account; `found:
@@ -197,6 +205,18 @@ the lark-bot module: its schemas are `channel/lark-bot/src/admin.ts`
 (`LARK_BOT_ADMIN_ENDPOINTS`, JSON Schemas in `channel/lark-bot/schema/`) and its
 jobs `LarkBotJobs` (`channel/lark-bot/src/provision.ts`); the daemon hands it the
 config file and serves the endpoints with the same auth.
+
+Moved (2026-11-23, core-slimming P0): `AdminLarkBotRequest`,
+`AdminLarkBotStarted`, `AdminLarkBotJob` and `AdminLarkBotJobState` are no
+longer exported by `@agents-io/protocol`, and `ADMIN_ENDPOINTS` lists only the
+core endpoints; import them and `LARK_BOT_ADMIN_ENDPOINTS` from
+`@agents-io/channel-lark-bot`. Their JSON Schemas moved from
+`packages/protocol/schema/` to `channel/lark-bot/schema/`, content and `$id`
+(`agents-io/v1/AdminLarkBot*`) unchanged. This package no longer re-exports
+`LarkBotJobs`, `larkEnvNames`, `LarkBotJobsOptions` or `StartOutcome`: they are
+`@agents-io/channel-lark-bot`'s, and `LarkBotJobsOptions` now takes a
+`ProvisionConfig` (the daemon's `ConfigStore` is one), `envRefs` and a plain
+log function. The HTTP API is unchanged on the wire.
 
 ```jsonc
 "console": {

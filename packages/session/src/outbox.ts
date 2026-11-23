@@ -36,6 +36,8 @@ export interface InFlightDelivery {
   sessionKey: string;
   route: ReplyRoute;
   turnId?: string;
+  /** The inputs it answers, when no turn made it (`Delivery.inputIds`): kept for its settlement after a restart. */
+  inputIds?: string[];
   /** The attempt that was started (1-based). */
   attempts: number;
   startedAt: number;
@@ -92,9 +94,10 @@ export interface OutboxOptions {
    * The store and `onSettled` write into the hub log's database, on the same connection (the
    * daemon's records and SQLite log): a settlement — the outcome, what `onSettled` writes and
    * `delivery.settled` — then commits as one transaction (`Hub.batch`) or not at all. One
-   * that fails (or a crash in the middle) leaves the in-flight mark, which `recover` (or the
-   * next `deliver` of that id) settles as `unknown`. Unset, each of the three commits on its
-   * own. Leave it unset for a store on another connection: it would wait for the log's lock.
+   * that fails (any of the three throws, `onSettled` included, or a crash in the middle)
+   * leaves the in-flight mark, which `recover` (or the next `deliver` of that id) settles as
+   * `unknown`. Unset, each of the three commits on its own and `onSettled` is best effort.
+   * Leave it unset for a store on another connection: it would wait for the log's lock.
    */
   atomic?: boolean;
   /** Checked when a delivery names the turn it comes from (agent-initiated sends). */
@@ -111,9 +114,10 @@ export interface OutboxOptions {
   /**
    * Every settled outcome of a delivery (not a duplicate answered from the store), e.g. to
    * index which turn sent which platform message (agent-messaging §4.3.3) and to explain a
-   * side effect by its operationId. Errors are ignored.
+   * side effect by its operationId. Errors are ignored, except with `atomic`: there what it
+   * writes is part of the settlement, and its error fails the settlement (rolled back, rethrown).
    */
-  onSettled?: (d: Pick<Delivery, 'sessionKey' | 'turnId'>, rec: DeliveryRecord, atSend?: unknown) => void;
+  onSettled?: (d: Pick<Delivery, 'sessionKey' | 'turnId' | 'inputIds'>, rec: DeliveryRecord, atSend?: unknown) => void;
   /**
    * Taken once when a delivery starts (send time), handed back to `onSettled` as `atSend`:
    * what the sending turn was then (its provenance), which may be gone by the time the
@@ -130,6 +134,11 @@ export interface Delivery {
   route: ReplyRoute;
   turnId?: string;
   /**
+   * The inputs a delivery no turn made answers (a system reply to a command), for `onSettled`;
+   * kept in the in-flight mark, so a settlement after a restart has them too.
+   */
+  inputIds?: string[];
+  /**
    * The turn this send comes from. When given, `Policy.outbound` must allow the
    * destination. Leave out for the turn's own reply route rendering.
    */
@@ -145,11 +154,13 @@ export interface Delivery {
  * outcome that stays unclear (retries run out, an attempt times out) is `unknown`.
  * A settlement that throws is not a failed attempt: the error reaches the caller,
  * nothing is sent again, and with `atomic` nothing of it is kept but the in-flight
- * mark (settled `unknown` like a crash's).
+ * mark (settled `unknown` like a crash's, with an error that says what happened).
  */
 export class Outbox {
   private readonly store: OutboxStore;
   private inflight = new Map<string, Promise<DeliveryRecord>>();
+  /** Operations whose settlement failed in this process: why, for the error their in-flight mark is settled with. */
+  private unrecorded = new Map<string, string>();
   private draining = false;
   private closed = false;
   private wake!: () => void;
@@ -221,11 +232,25 @@ export class Outbox {
     this.wake();
   }
 
+  /**
+   * An in-flight mark nobody is running: left by an earlier process, or by a settlement that
+   * failed in this one. Unknown either way (the platform may have it), never resent.
+   */
   private settleStale(r: InFlightDelivery): DeliveryRecord {
-    return this.settle(
-      { sessionKey: r.sessionKey, ...(r.turnId !== undefined ? { turnId: r.turnId } : {}) },
-      { operationId: r.operationId, sessionKey: r.sessionKey, route: r.route, status: 'unknown', attempts: r.attempts, error: 'in flight when the previous process stopped; not resent' },
+    const failed = this.unrecorded.get(r.operationId);
+    const rec = this.settle(
+      { sessionKey: r.sessionKey, ...(r.turnId !== undefined ? { turnId: r.turnId } : {}), ...(r.inputIds?.length ? { inputIds: r.inputIds } : {}) },
+      {
+        operationId: r.operationId,
+        sessionKey: r.sessionKey,
+        route: r.route,
+        status: 'unknown',
+        attempts: r.attempts,
+        error: failed !== undefined ? `recording its outcome failed in this process (${failed}); not resent` : 'in flight when the previous process stopped; not resent',
+      },
     );
+    this.unrecorded.delete(r.operationId);
+    return rec;
   }
 
   private async run(d: Delivery, attempt: (n: number) => Promise<SendResult | void>): Promise<DeliveryRecord> {
@@ -241,7 +266,15 @@ export class Outbox {
     } catch {
       // best effort, like onSettled
     }
-    const settle = (rec: DeliveryRecord) => this.settle(d, rec, atSend);
+    const settle = (rec: DeliveryRecord) => {
+      try {
+        return this.settle(d, rec, atSend);
+      } catch (err) {
+        // Its in-flight mark (if one is left) is settled later as unknown, saying so.
+        this.unrecorded.set(d.operationId, err instanceof Error ? err.message : String(err));
+        throw err;
+      }
+    };
 
     if (d.from !== undefined && this.o.policy?.outbound) {
       let verdict: string;
@@ -263,6 +296,7 @@ export class Outbox {
         sessionKey: d.sessionKey,
         route: d.route,
         ...(d.turnId !== undefined ? { turnId: d.turnId } : {}),
+        ...(d.inputIds?.length ? { inputIds: [...d.inputIds] } : {}),
         attempts: n,
         startedAt: Date.now(),
       });
@@ -294,18 +328,26 @@ export class Outbox {
 
   /**
    * The outcome, then `onSettled`, then `delivery.settled`. With `atomic`, in one transaction:
-   * a throw (the log refuses the event) rolls all three back and leaves the in-flight mark.
+   * a throw of any of the three (the log refuses the event, the index cannot be written) rolls
+   * all three back and leaves the in-flight mark. Without it, `onSettled` is best effort.
    */
-  private settle(d: Pick<Delivery, 'sessionKey' | 'turnId'>, rec: DeliveryRecord, atSend?: unknown): DeliveryRecord {
+  private settle(d: Pick<Delivery, 'sessionKey' | 'turnId' | 'inputIds'>, rec: DeliveryRecord, atSend?: unknown): DeliveryRecord {
     // Closed: the in-flight mark stays, and the next process settles it as unknown.
     if (this.closed) return rec;
     const hub = this.o.hub;
+    const atomic = this.o.atomic === true && hub !== undefined;
     const write = () => {
       this.store.put(rec);
-      try {
+      if (atomic) {
+        // Not caught: a failed write may have ended the whole transaction (SQLITE_FULL, IOERR),
+        // and what came after it would commit on its own.
         this.o.onSettled?.(d, rec, atSend);
-      } catch {
-        // an index is best effort; the outcome is recorded
+      } else {
+        try {
+          this.o.onSettled?.(d, rec, atSend);
+        } catch {
+          // an index is best effort; the outcome is recorded
+        }
       }
       hub?.append(d.sessionKey, {
         ts: Date.now(),
@@ -323,7 +365,7 @@ export class Outbox {
         },
       });
     };
-    if (this.o.atomic && hub) hub.batch(write);
+    if (atomic) hub.batch(write);
     else write();
     return rec;
   }

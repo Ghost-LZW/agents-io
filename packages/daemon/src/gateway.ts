@@ -1513,8 +1513,11 @@ export class Gateway {
     return p ? { external: p.external, watched: p.watched, group: p.group, ...(p.cause ? { cause: p.cause } : {}) } : undefined;
   }
 
-  /** Outbox `onSettled`: every settled delivery, with the turn and the turn's chain (as at send time) when a turn made it. */
-  private indexOutbound(d: { sessionKey: string; turnId?: string }, rec: DeliveryRecord, atSend?: OutboundRecord['provenance']): void {
+  /**
+   * Outbox `onSettled`: every settled delivery, with the turn and the turn's chain (as at send time) when a turn made it,
+   * or the inputs it answers (a system reply). Part of the settlement's transaction (DL-1): an error here fails it.
+   */
+  private indexOutbound(d: { sessionKey: string; turnId?: string; inputIds?: string[] }, rec: DeliveryRecord, atSend?: OutboundRecord['provenance']): void {
     const p = atSend ?? this.provenanceAtSend(d);
     const agent = this.agentOfSession(d.sessionKey);
     this.records.putOutbound({
@@ -1527,6 +1530,7 @@ export class Gateway {
       ...(agent !== undefined ? { agent } : {}),
       route: rec.route,
       result: rec.status,
+      ...(d.turnId === undefined && d.inputIds?.length ? { inputIds: [...d.inputIds] } : {}),
       ...(p ? { provenance: p } : {}),
       ...(this.externalSends.has(rec.operationId) ? { external: this.externalSends.get(rec.operationId)! } : {}),
       at: Date.now(),
@@ -1728,10 +1732,8 @@ export class Gateway {
       return;
     }
     const { replyToMessageId: _r, ...route } = { ...a.route, account: ch.account };
-    await this.outbox.send(ch.adapter, { operationId: a.operationId, sessionKey: a.sessionKey, route, msg: { text: a.text } });
-    // No turn wrote it: explain of its operationId names the input it answers (EX-2).
-    const ob = a.inputId !== undefined ? this.records.outboundByOperation(a.operationId) : undefined;
-    if (ob && !ob.inputIds) this.records.putOutbound({ ...ob, inputIds: [a.inputId!] });
+    // No turn wrote it: explain of its operationId names the input it answers (EX-2), indexed with its settlement.
+    await this.outbox.send(ch.adapter, { operationId: a.operationId, sessionKey: a.sessionKey, ...(a.inputId !== undefined ? { inputIds: [a.inputId] } : {}), route, msg: { text: a.text } });
   }
 
   /**

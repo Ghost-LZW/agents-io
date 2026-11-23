@@ -185,6 +185,31 @@ describe('explain from a side effect', () => {
     await h.deliver({ operationId: 'note-1', route: { channel: 'fake', account: 'default', conversationId: 'c7' }, message: { text: 'from the host' } });
     expect(ok<EffectExplanation>(w.gw.explain('host:note-1'))).toMatchObject({ sessionKey: 'host:xwo', inputIds: [] });
   });
+
+  it('a system reply indexes the input it answers with its settlement: one whose settlement failed still names it when the next start settles it #EX-2 #DL-2', async () => {
+    const { w } = await topicsWorld();
+    await w.chat.inject({ sender: alice, text: 'hello' });
+    await until(() => turnsIn(w, CONV).length === 1);
+    // From here on this process's log refuses the settlement of topic command replies (a disk error; a crash there is the same).
+    const log = w.gw.hub.log;
+    const append = log.append.bind(log);
+    let refused = false;
+    log.append = (key, d) => {
+      if (d.body.t === 'delivery.settled' && d.body.operationId.startsWith('topic-cmd:')) {
+        refused = true;
+        throw new Error('disk I/O error');
+      }
+      return append(key, d);
+    };
+    const r = await w.chat.inject({ sender: alice, text: '/topics' });
+    const reply = await until(() => w.chat.sent.find((s) => /^Topics/.test(s.msg.text ?? '')));
+    await until(() => refused);
+    expect(w.gw.records.outboundByOperation(reply.op.operationId)).toBeUndefined();
+    await w.stop();
+    const { w: w2 } = await topicsWorld(w.dir);
+    expect(ok<EffectExplanation>(w2.gw.explain(reply.op.operationId))).toMatchObject({ inputIds: [r.inputId], result: 'unknown' });
+    expect(w2.chat.sent).toHaveLength(0);
+  });
 });
 
 describe('loop guard through the daemon', () => {

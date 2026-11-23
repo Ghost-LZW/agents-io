@@ -118,7 +118,7 @@ flowchart LR
 | G7 | 标准投影 `attention`：从日志 fold 出"现在需要人"（有未答的人工请求、失败、等待），并用 fixture 固定。persona #13552 正需要这个，现在每个宿主各算一遍 | 宿主的角标、推送 |
 | G8 | 与语言无关的一致性 fixture：JSON 写的"输入序列 → 期望的事件与帧"，非 TS 的实现或宿主不用跑 TS 就能自检（persona 的 `spec/fixtures` 做法） | §8 的语言选择、§9 的通用组件定位 |
 | G9 | 标准协议适配：南向 ACP harness，北向 AG-UI / ACP 投影（POSITIONING §9） | 成为各框架的 IO 层 |
-| G10 | outbox 结算合成一个事务：结算记录、出站索引、`delivery.settled` 一起提交，扇出推迟到提交之后（`hub.batch`）。原先在 put 之后、append 之前崩溃，日志里就永远没有这条 settled，也不会自愈。附带：`fromSeq > head` 改发快照。**已完成**：`SessionLog.transaction`（SQLite 日志：`BEGIN IMMEDIATE` / savepoint，回滚连同内存里的 head、fold）、`Hub.batch`、`OutboxOptions.atomic`（守护进程在日志与 records 同一连接时开）；结算抛错不再被当成失败的尝试重发。DL-1 先以 `it.fails` 复现再修好；新承诺 LN-10 | DL-1、EX-2、ID-8 的缝 |
+| G10 | outbox 结算合成一个事务：结算记录、出站索引、`delivery.settled` 一起提交，扇出推迟到提交之后（`hub.batch`）。原先在 put 之后、append 之前崩溃，日志里就永远没有这条 settled，也不会自愈。附带：`fromSeq > head` 改发快照。**已完成**：`SessionLog.transaction`（SQLite 日志：`BEGIN IMMEDIATE` / savepoint，回滚连同内存里的 head、fold）、`Hub.batch`、`OutboxOptions.atomic`（守护进程在日志与 records 同一连接时开）；结算抛错不再被当成失败的尝试重发。DL-1 先以 `it.fails` 复现再修好；新承诺 LN-10。后续（同日）：`atomic` 时 `onSettled`（出站索引）出错也回滚整个结算，不再吞掉；本进程结算失败的补结算写明原因；系统回复的 `inputIds` 经进行中记录随结算写入（EX-2） | DL-1、EX-2、ID-8 的缝 |
 | G11 | 客户端命令的操作 id（feature `client.opId`）：回执与事件同一事务写入，重放时答第一次的结果，冲突时答 `op_id_conflict`，应答带 `seq` | 客户端断线重发导致重复打断、重复建话题和监听 |
 
 ## 4. 阶段
@@ -129,7 +129,7 @@ flowchart LR
 - [x] G1 `ChannelCaps.pacing`：基线从 318 降到 311。
 - [x] `AsyncQueue`、`loadEnvFile` 移出 testkit；daemon 的 `dependencies` 去掉 testkit（只留在 `devDependencies`，给测试用）。
 - [x] `aio e2e` 场景运行器移出 daemon 生产包：`packages/daemon-e2e`（`aio-e2e`），`aio e2e` 只提示改用它、退出码 2。这两项把基线从 311 降到 295。
-- [x] `AdminLarkBot*` 类型移出 `protocol/src/admin.ts`，连同 `provision.ts` 一起搬进 lark-bot（`channel/lark-bot/src/admin.ts`、`provision.ts`；三个 JSON Schema 移到 `channel/lark-bot/schema/`，内容和 `$id` 不变）。console 只认一个结构化接口，用它的 `request` schema 校验请求体，admin HTTP API 在线上不变。基线从 295 降到 233。
+- [x] `AdminLarkBot*` 类型移出 `protocol/src/admin.ts`，连同 `provision.ts` 一起搬进 lark-bot（`channel/lark-bot/src/admin.ts`、`provision.ts`；三个 JSON Schema 移到 `channel/lark-bot/schema/`，内容和 `$id` 不变）。console 只认一个结构化接口，用它的 `request` schema 校验请求体，admin HTTP API 在线上不变。基线从 295 降到 233。宿主须知（包导出与 schema 位置的变化）写在 HOSTS §4.3 与 `packages/daemon/README.md`。
 
 **P1：补接缝。** 依次做 G3（harness caps）、G2（通道模块契约）、G6（模块清单）、G5（admin 贡献）。每一步都是"抽接口、不改行为"的 PR；守卫的计数只降。
 

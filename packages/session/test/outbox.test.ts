@@ -216,6 +216,60 @@ describe('Outbox', () => {
     sub.close();
   });
 
+  it('atomic: an onSettled that throws fails the settlement, even when its error ended the whole transaction; nothing commits on its own and recover settles it unknown #DL-1 #DL-2', async () => {
+    const log = new SqliteSessionLog();
+    const store = sqlStore(log.db);
+    const hub = new Hub(log);
+    const sub = hub.subscribe({ sessionKey: 's', fromSeq: 0, tier: 'full' });
+    let full = true;
+    // The index write fails the way SQLITE_FULL does: SQLite has already rolled the whole transaction back.
+    const onSettled = () => {
+      if (!full) return;
+      log.db.exec('ROLLBACK');
+      throw new Error('database or disk is full');
+    };
+    const ob = new Outbox({ hub, store, atomic: true, onSettled, sleep: noSleep });
+    const ch = new FlakyChannel(0);
+    await expect(ob.send(ch, d('op'))).rejects.toThrow('database or disk is full');
+    expect(ch.calls).toBe(1);
+    expect(store.get('op')).toBeUndefined();
+    expect(store.inFlight('op')).toMatchObject({ operationId: 'op', attempts: 1 });
+    // delivery.settled did not commit outside the transaction: the stored log and the memory view agree.
+    expect(log.db.prepare('SELECT seq FROM events').all()).toEqual([]);
+    expect(log.head('s')).toBe(0);
+
+    full = false;
+    expect(ob.recover()).toMatchObject([{ operationId: 'op', status: 'unknown', attempts: 1 }]);
+    expect(ch.calls).toBe(1);
+    const [e] = await take(sub, 1);
+    expect([e!.seq, e!.body]).toEqual([1, { t: 'delivery.settled', operationId: 'op', route: route(), result: 'unknown' }]);
+    sub.close();
+
+    // Without atomic, onSettled is best effort: the outcome and delivery.settled are kept.
+    const plain = new Hub(new MemorySessionLog());
+    const best = new Outbox({ hub: plain, onSettled: () => { throw new Error('index down'); }, sleep: noSleep });
+    expect(await best.send(ch, d('p'))).toMatchObject({ status: 'delivered' });
+    expect(bodies(plain.log.read('s', 0))).toMatchObject([{ t: 'delivery.settled', operationId: 'p', result: 'delivered' }]);
+  });
+
+  it('a mark whose settlement failed in this process is settled unknown saying so; a mark an earlier process left says that #DL-1 #DL-2', async () => {
+    const log = new SqliteSessionLog();
+    const store = sqlStore(log.db);
+    const hub = new Hub(log);
+    const disk = refuseSettled(log);
+    const ch = new FlakyChannel(0);
+    const ob = new Outbox({ hub, store, atomic: true, sleep: noSleep });
+    await expect(ob.send(ch, d('a'))).rejects.toThrow('disk I/O error');
+    await expect(ob.send(ch, d('b'))).rejects.toThrow('disk I/O error');
+    disk.heal();
+    // The same operationId again in this process: not resent.
+    expect(await ob.send(ch, d('a'))).toMatchObject({ status: 'unknown', attempts: 1, error: 'recording its outcome failed in this process (disk I/O error); not resent' });
+    // The process stops here; the next one finds b's mark.
+    const next = new Outbox({ hub, store, atomic: true, sleep: noSleep });
+    expect(next.recover()).toMatchObject([{ operationId: 'b', status: 'unknown', attempts: 1, error: 'in flight when the previous process stopped; not resent' }]);
+    expect(ch.calls).toBe(2);
+  });
+
   it('drain waits for running attempts, stops retries; close leaves what still runs in flight for the next recover #DL-1', async () => {
     const store = new MemoryOutboxStore();
     const ob = new Outbox({ store, baseDelayMs: 60_000, maxDelayMs: 60_000 });

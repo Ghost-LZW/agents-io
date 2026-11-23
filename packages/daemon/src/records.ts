@@ -155,8 +155,7 @@ export class DaemonRecords implements OutboxStore {
       if (msg !== null) for (const id of r.providerMessageIds ?? []) if (id !== msg) this.q.obPartPut.run(r.channel, id, r.operationId, r.at);
       this.db.exec('RELEASE outbound_put');
     } catch (e) {
-      this.db.exec('ROLLBACK TO outbound_put');
-      this.db.exec('RELEASE outbound_put');
+      rollbackTo(this.db, 'outbound_put');
       throw e;
     }
   }
@@ -234,8 +233,7 @@ export class DaemonRecords implements OutboxStore {
       this.q.flyDel.run(rec.operationId);
       this.db.exec('RELEASE outbox_settle');
     } catch (e) {
-      this.db.exec('ROLLBACK TO outbox_settle');
-      this.db.exec('RELEASE outbox_settle');
+      rollbackTo(this.db, 'outbox_settle');
       throw e;
     }
   }
@@ -311,5 +309,17 @@ export class DaemonRecords implements OutboxStore {
 
   close(): void {
     if (this.ownsDb) this.db.close();
+  }
+}
+
+/**
+ * Undo a savepoint after a failed write. The failure may have ended the whole transaction
+ * already (SQLITE_FULL, IOERR), and the savepoint with it: the write's error is the one to report.
+ */
+function rollbackTo(db: DatabaseSync, savepoint: string): void {
+  try {
+    db.exec(`ROLLBACK TO ${savepoint}; RELEASE ${savepoint}`);
+  } catch {
+    // nothing left to roll back
   }
 }
