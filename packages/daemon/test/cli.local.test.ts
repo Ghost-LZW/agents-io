@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { parseCli, parseEnvPairs, runRequest, socketOf } from '../src/cli.js';
 import { ConfigError, configTable, resolveConfig } from '../src/config.js';
+import { cli } from './cli-helpers.js';
 import { tmp } from './helpers.js';
 
 const ctx = (dir: string) => ({ env: {}, baseDir: dir, cwd: dir });
@@ -62,5 +63,13 @@ describe('cli arguments', () => {
   it('--socket / $AIO_SOCKET pick the daemon without loading a config', () => {
     expect(socketOf(parseCli(['tail', '--socket', '/x/aio.sock']))).toBe('/x/aio.sock');
     expect(socketOf(parseCli(['tail']), { AIO_SOCKET: '/y/aio.sock' })).toBe('/y/aio.sock');
+  });
+
+  it('`aio e2e` moved out of the daemon: it names `pnpm e2e` and `aio-e2e` and exits 2', async () => {
+    const r = await cli(['e2e', '--only', 'a']);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain('pnpm e2e');
+    expect(r.err).toContain('aio-e2e');
+    expect(r.out).toBe('');
   });
 });

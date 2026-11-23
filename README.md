@@ -34,7 +34,8 @@ Lark / email / private channel (JSONL) / terminal
 | `channel/lark-bot` | Official Lark/Feishu bot with a long-lived connection and streaming cards. Create an app with [create-lark-bot](https://github.com/Ghost-LZW/create-lark-bot). |
 | `channel/mail` | Receives via IMAP and sends via SMTP, using DKIM/DMARC as identity evidence. |
 | `channel/jsonl-bridge` | Connects private channels written in any language over stdio or a socket. |
-| `packages/daemon` | The `aio` daemon and CLI: channels, bindings, host protocol, task runs, host inbound queue, terminal endpoints, an optional external MCP endpoint for agents outside the daemon, and end-to-end scenarios. |
+| `packages/daemon` | The `aio` daemon and CLI: channels, bindings, host protocol, task runs, host inbound queue, terminal endpoints, and an optional external MCP endpoint for agents outside the daemon. |
+| `packages/daemon-e2e` | `aio-e2e` (`pnpm e2e`): end-to-end scenarios against the real Claude Code or Codex from the config, each in its own in-process daemon. Private; not part of the daemon package. |
 | `examples/dev-gateway` | `aio-dev`, a compatibility wrapper for the former name of `aio`. |
 
 ## Getting started

@@ -6,10 +6,7 @@ import { CodexHarness } from '@agents-io/harness-codex';
 import { TOPIC_KEY, isSnapshotEvent, passes, type TopicCardData } from '@agents-io/session';
 import { CHOICE_KEY, OUTPUT_EVENT, parseChoiceActionId, type ChoiceData, type OutputRecord } from '@agents-io/host-mcp';
 import { FakeChannel, checkEventStream, defaultChannelCaps } from '@agents-io/testkit';
-import type { ClientSubscription } from './client.js';
-import { LocalClient } from './client.js';
-import { DEFAULT_AGENT, defaultInstance, withDefaultInstance, type Config, type HarnessInstance } from './config.js';
-import { Gateway } from './gateway.js';
+import { DEFAULT_AGENT, Gateway, LocalClient, defaultInstance, withDefaultInstance, type ClientSubscription, type Config, type HarnessInstance } from '@agents-io/daemon';
 
 /*
  * Scenarios against the REAL harness from the config. Each one starts its own

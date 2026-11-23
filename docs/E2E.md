@@ -17,6 +17,7 @@ channels(lark-bot / mail / bridge…) ─▶ Ingress ─▶ Lane(每 session 一
 pnpm install && pnpm build
 cp packages/daemon/aio.config.example.json aio.config.json   # 已 gitignore
 alias aio="node $PWD/packages/daemon/dist/cli.js"        # examples/dev-gateway 的 aio-dev 是同一个 CLI
+alias aio-e2e="node $PWD/packages/daemon-e2e/dist/cli.js"   # §1.1 的自动场景（原来的 aio e2e）
 ```
 
 - 配置文件：`--config <path>`、`$AIO_CONFIG` 或当前目录的 `aio.config.json`（不存在就全用默认值：claude-code + haiku、无通道）。相对路径按配置文件所在目录解析。
@@ -81,10 +82,12 @@ alias aio="node $PWD/packages/daemon/dist/cli.js"        # examples/dev-gateway 
 ```sh
 pnpm e2e                                   # 根目录：build 后跑 claude-code
 pnpm e2e --harness codex                   # 实例名，或种类名（取该种类的第一个实例）
-aio e2e --harness claude-gateway --only a
-aio e2e --only a,d --verbose           # 只跑某几个；--verbose 打印过程
-aio e2e --only p,q --data-dir ~/.agents-io/e2e   # 场景目录放在短路径下（Unix socket 路径须 < 104 字节；默认系统临时目录）
+aio-e2e --harness claude-gateway --only a
+aio-e2e --only a,d --verbose           # 只跑某几个；--verbose 打印过程
+aio-e2e --only p,q --data-dir ~/.agents-io/e2e   # 场景目录放在短路径下（Unix socket 路径须 < 104 字节；默认系统临时目录）
 ```
+
+场景运行器在 `packages/daemon-e2e`（`@agents-io/daemon-e2e`，私有包，bin `aio-e2e`），不在守护进程的生产包里：它在运行时要用 testkit 的 `FakeChannel` 和 Codex harness（瘦身 P0，`docs/design/core-slimming/` §4）。选项与输出同原来的 `aio e2e`；现在 `aio e2e` 只提示改用 `pnpm e2e` / `aio-e2e`，退出码 2。`pnpm e2e` 在 `packages/daemon-e2e` 目录里运行（原来是 `packages/daemon`），相对的 `--config`、`--env-file` 和默认的 `./aio.config.json` 按这个目录找；用 `$AIO_CONFIG` 或绝对路径就不受影响。
 
 e2e 跑的是默认实例（`--harness` 可换），保留它的 `env`、`configDir`/`home`、`settings` 等启动设置，但会话放在场景临时目录里。每个场景起一个独立的进程内网关（临时目录、SQLite log、本地 socket），一个脚本化通道 `e2e`（主人 `e2e:alice`、`e2e:bob`），对**真实** harness 发便宜且确定的提示，在订阅流上断言，逐个打印 `PASS/FAIL/SKIP` 和原因：
 

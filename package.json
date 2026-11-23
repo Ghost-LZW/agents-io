@@ -14,7 +14,7 @@
     "invariants:check": "node scripts/invariants.mjs check",
     "invariants:affected": "node scripts/invariants.mjs affected",
     "boundaries:check": "node scripts/boundaries.mjs check",
-    "e2e": "pnpm build && pnpm --filter @agents-io/daemon e2e",
+    "e2e": "pnpm build && pnpm --filter @agents-io/daemon-e2e e2e",
     "schema": "pnpm build && node scripts/emit-schema.mjs"
   },
   "devDependencies": {

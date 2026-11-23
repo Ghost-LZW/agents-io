@@ -10,6 +10,10 @@
       "bundle": []
     },
     "packages/testkit": { "role": "test", "may": ["packages/protocol"] },
+    "packages/daemon-e2e": {
+      "role": "test",
+      "may": ["packages/protocol", "packages/session", "packages/host-mcp", "packages/daemon", "packages/testkit", "harness/codex"]
+    },
     "harness/claude-code": { "role": "module", "may": ["packages/protocol"] },
     "harness/codex": { "role": "module", "may": ["packages/protocol"] },
     "channel/lark-bot": { "role": "module", "may": ["packages/protocol"] },

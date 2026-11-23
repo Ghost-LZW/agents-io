@@ -11,8 +11,7 @@
   "files": ["dist", "aio.config.example.json"],
   "scripts": {
     "serve": "node dist/cli.js serve",
-    "attach": "node dist/cli.js attach",
-    "e2e": "node dist/cli.js e2e"
+    "attach": "node dist/cli.js attach"
   },
   "dependencies": {
     "@agents-io/channel-jsonl-bridge": "workspace:*",
@@ -23,11 +22,11 @@
     "@agents-io/harness-codex": "workspace:*",
     "@agents-io/protocol": "workspace:*",
     "@agents-io/session": "workspace:*",
-    "@agents-io/testkit": "workspace:*",
     "@sinclair/typebox": "^0.34.0",
     "ws": "^8.22.0"
   },
   "devDependencies": {
+    "@agents-io/testkit": "workspace:*",
     "@modelcontextprotocol/sdk": "1.32.1",
     "@types/ws": "^8.18.2"
   }

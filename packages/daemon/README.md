@@ -381,7 +381,7 @@ goes to its current topic, also from `per-thread` rules such as the default
 ## CLI
 
 ```
-aio serve | e2e | attach | input | sessions | watch …           (as aio-dev; `aio-dev send` is `aio input`)
+aio serve | attach | input | sessions | watch …                 (as aio-dev; `aio-dev send` is `aio input`)
 aio run --agent <task agent> [--run-id <id>] [--cwd <dir>] [--env K=V …] [--timeout 10m] [--observe <route json> …]
         [--preset <name>] [--model <m>] [--effort <e>] [--profile <p>] [--input-id <id>] [--correlation <id>] -- <instruction>
 aio send --route <route json> --operation-id <id> [--file message.json|-] [--text <text>]
@@ -393,6 +393,9 @@ aio verify <channelRef>
 aio console-link                                              (one-time console login URL)
 ```
 
+- The end-to-end scenarios against the real harness are not in this package: they are
+  `aio-e2e` in `packages/daemon-e2e` (`pnpm e2e` from the repo root, `docs/E2E.md` §1.1),
+  with the options `aio e2e` had. `aio e2e` only says so and exits 2.
 - Host commands find the socket from `--socket`, `$AIO_SOCKET`, or the config, and
   read the token next to it; `--name` sets the host name (default `aio-<command>`).
 - `aio run` subscribes to `run:<runId>` first, starts the run, streams one short

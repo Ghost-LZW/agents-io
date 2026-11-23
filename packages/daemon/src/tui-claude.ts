@@ -5,7 +5,7 @@ import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import type { HarnessOpenArgs } from '@agents-io/protocol';
 import { ClaudeTuiHarness, type TuiFileOf, type TuiHook, type TuiLink } from '@agents-io/harness-claude-code';
-import { AsyncQueue } from '@agents-io/testkit';
+import { AsyncQueue } from '@agents-io/session';
 
 /**
  * Claude Code's own TUI on a session (decision 15, S2): the plumbing between the daemon and one

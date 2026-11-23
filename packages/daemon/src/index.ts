@@ -10,4 +10,3 @@ export { FrameConn, LocalServer, type FrameTransport, type HostFrames, type Loca
 export * from './console.js';
 export * from './console-config.js';
 export * from './provision.js';
-export { runScenarios, SCENARIOS, e2eConfig } from './e2e.js';

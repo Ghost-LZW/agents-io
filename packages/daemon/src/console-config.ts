@@ -3,8 +3,8 @@ import { chmodSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, re
 import { dirname, join } from 'node:path';
 import { Value } from '@sinclair/typebox/value';
 import { ADMIN_REDACTED, type AdminConfigDocument, type AdminConfigPutResult, type AdminConfigValidation, type ConfigIssue } from '@agents-io/protocol';
-import { loadEnvFile } from '@agents-io/testkit';
 import { ConfigError, ConfigFile, findEnvFile, resolveConfig, type Config } from './config.js';
+import { loadEnvFile } from './env-file.js';
 
 /*
  * The config file as the console sees it (`GET/PUT /api/config`,

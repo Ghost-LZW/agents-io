@@ -42,6 +42,6 @@
 3. **core 红了 = 可能打破了一条承诺。** 先读那条不变量。是有意改变承诺的，先改 INVARIANTS（和相关决定），再改测试；不允许只改断言让它变绿。确实是测试写错了的，要能说清为什么。
 4. **local 红了 = 一个细节变了。** 确认是有意改的，就删掉或重写这个测试；它不是信任的来源。
 5. `affected` 命中的编号在 e2e 里有测试，或改动碰了传输与生命周期代码（`packages/daemon/src/gateway.ts`、`channel/jsonl-bridge/src`、`harness/*/src`）：跑 `pnpm test:e2e`。合并到 `main` 前无论如何跑一次。
-6. 改了通道或 harness 适配器：列出要跑的 live 项（`pnpm test:live` 加对应环境变量、`aio e2e --only …`、`docs/E2E.md` 的手工步骤）交给人，写明没跑。
+6. 改了通道或 harness 适配器：列出要跑的 live 项（`pnpm test:live` 加对应环境变量、`pnpm e2e --only …`（即 `aio-e2e`，`packages/daemon-e2e`）、`docs/E2E.md` 的手工步骤）交给人，写明没跑。
 7. 新承诺：先在 INVARIANTS 写一节、给编号，再写带标签的测试。新功能没有承诺的，测试放 `*.local.test.ts`。
 8. 发现一条不成立的路径：先写 `it.fails`，在 INVARIANTS 的"不成立"里记一条，再决定修不修。

@@ -1,6 +1,6 @@
 # 瘦身：定义核心流程，给每个功能分级，其余移成模块或交还宿主
 
-> 状态：已采纳（2026-11-23，决定 16）。§9 各项 owner 全部按推荐拍板。第 0 阶段的守卫（§6）和第一条接缝 G1（`ChannelCaps.pacing`）已落地，其余按 §4 推进。
+> 状态：已采纳（2026-11-23，决定 16）。§9 各项 owner 全部按推荐拍板。第 0 阶段的守卫（§6）、第一条接缝 G1（`ChannelCaps.pacing`）、生产代码不再用 testkit、`aio e2e` 移出 daemon 已落地，其余按 §4 推进。
 >
 > 参照：persona 的 [#13411](https://github.com/nwverse/persona/issues/13411)（功能瘦身：定义核心流程、给每个功能分级）、#13430（Persona Core 与模块、只降不升的守卫）、#13438 / #13551 / #13555（内建领域按第三方同一契约做成扩展；`interactive_sessions`、`work_executor` 契约）。persona 在 agent IO 上的做法见 §7。
 
@@ -101,8 +101,8 @@ flowchart LR
 | 宿主入站队列、补投、Binding 表、各回调 | `session/src/host-queue.ts`、`host.ts` | core | – | – |
 | agent 之间的通信：地址、因果链、跳数上限、`Policy.contact` | session、daemon | core（ROADMAP §2） | – | – |
 | 回执表情、会话历史、回复链 | `ChannelAdapter` 的可选方法 | core 接口；实现归模块 | – | – |
-| `aio e2e` 场景运行器 | `daemon/src/e2e.ts`，在运行时依赖 testkit | 移出生产包（单独的 `daemon-e2e` 包或仅测试用的 bin） | – | P0 |
-| testkit 里被生产代码用到的工具（`AsyncQueue`、`loadEnvFile`） | `daemon` 的 `client.ts`、`config.ts`、`console-config.ts`、`tui-claude.ts` | 搬到 session（或单独的 util 出口） | – | P0 |
+| `aio e2e` 场景运行器 | `daemon/src/e2e.ts`，在运行时依赖 testkit | 移出生产包：`packages/daemon-e2e`（私有，bin `aio-e2e`，`pnpm e2e`） | – | **已完成** |
+| testkit 里被生产代码用到的工具（`AsyncQueue`、`loadEnvFile`） | `daemon` 的 `client.ts`、`config.ts`、`console-config.ts`、`tui-claude.ts` | `AsyncQueue` 搬到 session，`parseEnv` / `loadEnvFile` 搬进 daemon 的 `env-file.ts`；testkit 留着自己的一份 | – | **已完成** |
 | `aio-dev` 旧名包装 | `examples/dev-gateway` | delete（定一个日期） | – | P3 |
 
 ## 3. 接缝缺口
@@ -127,8 +127,8 @@ flowchart LR
 
 - [x] §6 守卫、分类文件和初始基线。
 - [x] G1 `ChannelCaps.pacing`：基线从 318 降到 311。
-- [ ] `AsyncQueue`、`loadEnvFile` 移出 testkit；daemon 的 `dependencies` 去掉 testkit。
-- [ ] `aio e2e` 场景运行器移出 daemon 生产包。
+- [x] `AsyncQueue`、`loadEnvFile` 移出 testkit；daemon 的 `dependencies` 去掉 testkit（只留在 `devDependencies`，给测试用）。
+- [x] `aio e2e` 场景运行器移出 daemon 生产包：`packages/daemon-e2e`（`aio-e2e`），`aio e2e` 只提示改用它、退出码 2。这两项把基线从 311 降到 295。
 - [ ] `AdminLarkBot*` 类型移出 `protocol/src/admin.ts`，放到 lark-bot 或 console 包（schema 文件同步）。
 
 **P1：补接缝。** 依次做 G3（harness caps）、G2（通道模块契约）、G6（模块清单）、G5（admin 贡献）。每一步都是"抽接口、不改行为"的 PR；守卫的计数只降。
@@ -160,7 +160,7 @@ flowchart LR
   - `import:<包>`：生产代码（`src/`）引用了不在许可列表里的工作区包。
   - `vendor`：core 文件（组合根除外）的代码里出现具体模块的名字，包括含 lark、feishu、codex、claude、imap、smtp 的标识符，以及等于模块 id 的字符串字面量。注释不算；`mail` 不算，它同时是一种会话类型。
 - **基线**：`scripts/boundaries.baseline.json`。计数超过基线就报错；修掉违例后跑 `shrink` 把新计数写进基线，`shrink` 在有计数超标时拒绝执行。
-- **现状**：初始基线 318 处，做完 G1 后是 311 处，全部在 `packages/daemon` 和 `protocol/src/admin.ts`。`session` 和 `host-mcp` 已经是 0。
+- **现状**：初始基线 318 处，做完 G1 后是 311 处，P0 去掉 testkit 和 e2e 之后是 295 处，全部在 `packages/daemon` 和 `protocol/src/admin.ts`。`session` 和 `host-mcp` 已经是 0。
 - **已知盲区**：模板字符串 `${…}` 里的代码不检查。
 
 ## 7. 从 persona 学到的

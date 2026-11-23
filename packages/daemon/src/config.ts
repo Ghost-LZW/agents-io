@@ -5,7 +5,7 @@ import { Type, type Static } from '@sinclair/typebox';
 import { Binding, Evidence, IdentityEntry, Tier, WatchDraft, errors, type BindingTable, type Principal, type RunSpec, type WatchSource } from '@agents-io/protocol';
 import { DEFAULT_BLOB_MAX_BYTES, OWNER_LABEL, Router, RouterError, checkIdentities, ownerIdentities, ownersTable, type AgentContactRule, type AgentSpec, type LoopGuardOptions } from '@agents-io/session';
 import { resolveChannelModule } from './channel-module.js';
-import { loadEnvFile } from '@agents-io/testkit';
+import { loadEnvFile } from './env-file.js';
 import type { CodexTransportOption } from '@agents-io/harness-codex';
 import { TOOL_NAMES, parseScope, type ExternalScopes } from '@agents-io/host-mcp';
 
