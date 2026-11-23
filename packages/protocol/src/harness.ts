@@ -160,6 +160,8 @@ export interface HarnessFactoryInit {
  * a throw fails the daemon's start. The adapter it returns serves every session of the
  * instance, task runs included, so the daemon never disposes it when one ends; it gets the
  * same lifecycle calls as a built-in adapter: at stop `detach` when it has one, else its
- * sessions are closed and then `dispose` is called; `adopts` is read at start.
+ * sessions are closed and then `dispose` is called; `adopts` is read at start. Every loaded
+ * instance gets them, whether or not a session used it; an adapter returned for several
+ * instances gets each call once.
  */
 export type HarnessFactory = (init: HarnessFactoryInit) => HarnessAdapter | Promise<HarnessAdapter>;

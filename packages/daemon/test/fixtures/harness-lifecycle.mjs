@@ -11,10 +11,13 @@ async function script(t) {
 /**
  * A module harness with the lifecycle members its `config` asks for (`detach`, `dispose`,
  * `adopts`). Each factory call (each daemon start) appends `{ fake, calls }` to
- * globalThis.__lifecycle[config.key].
+ * globalThis.__lifecycle[config.key], except with `config.share`: then every instance
+ * whose config names the same `share` gets the adapter the first one got (one record).
  */
 export function createHarness(init) {
   const c = init.config ?? {};
+  const shared = (globalThis.__lifecycleShared ??= {});
+  if (c.share !== undefined && shared[c.share]) return shared[c.share];
   const fake = new FakeHarness(script);
   const rec = { fake, calls: [] };
   ((globalThis.__lifecycle ??= {})[c.key] ??= []).push(rec);
@@ -22,5 +25,6 @@ export function createHarness(init) {
   if (c.detach) adapter.detach = async () => void rec.calls.push('detach');
   if (c.dispose) adapter.dispose = async () => void rec.calls.push('dispose');
   if (c.adopts) adapter.adopts = true;
+  if (c.share !== undefined) shared[c.share] = adapter;
   return adapter;
 }

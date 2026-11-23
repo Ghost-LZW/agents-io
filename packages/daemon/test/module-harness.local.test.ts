@@ -20,15 +20,20 @@ type Rec = { fake: FakeHarness; calls: string[] };
 const recs = (key: string): Rec[] => ((globalThis as { __lifecycle?: Record<string, Rec[]> }).__lifecycle ??= {})[key] ?? [];
 let keys = 0;
 
-/** A daemon on `dir`'s log whose default instance `plug` is the lifecycle module with `config`. */
-async function start(dir: string, config: Record<string, unknown>, agents?: Record<string, unknown>) {
+const lifecycle = (config: Record<string, unknown>) => ({ use: 'module', module: './fixtures/harness-lifecycle.mjs', config });
+
+/**
+ * A daemon on `dir`'s log whose default instance `plug` is the lifecycle module with `config`;
+ * `others` adds more instances of it (name → its config).
+ */
+async function start(dir: string, config: Record<string, unknown>, agents?: Record<string, unknown>, others: Record<string, Record<string, unknown>> = {}) {
   mkdirSync(join(dir, 'work'), { recursive: true });
   const raw = {
     dataDir: dir,
     policy: { owners: ['fake:alice'] },
     local: { principal: 'me' },
     cwd: join(dir, 'work'),
-    harnesses: { plug: { use: 'module', module: './fixtures/harness-lifecycle.mjs', config } },
+    harnesses: { plug: lifecycle(config), ...Object.fromEntries(Object.entries(others).map(([name, c]) => [name, lifecycle(c)])) },
     defaultHarness: 'plug',
     ...(agents ? { agents } : {}),
   };
@@ -122,5 +127,30 @@ describe('module harness lifecycle', () => {
       throw new Error('boom');
     };
     await expect(a.stop()).resolves.toBeUndefined();
+  });
+
+  it('every module instance gets its lifecycle calls at stop: one no session used, one only task runs used; an adapter two instances share gets each call once', async () => {
+    const [plug, idle, runs, twin] = [`k${++keys}`, `k${++keys}`, `k${++keys}`, `k${++keys}`];
+    const dir = tmp();
+    const a = await start(
+      dir,
+      { key: plug },
+      { exec: { harness: 'runs', mode: 'task' } },
+      {
+        idle: { key: idle, detach: true, dispose: true },
+        runs: { key: runs, dispose: true },
+        twin1: { key: twin, share: twin, detach: true },
+        twin2: { key: twin, share: twin, detach: true },
+      },
+    );
+    const h = await a.host();
+    await h.runStart({ runId: 'r1', agent: 'exec', input: [{ type: 'text', text: 'pong' }] });
+    expect(await h.runEndedOf('r1')).toMatchObject({ status: 'completed', exitCode: 0 });
+    expect(recs(runs)[0]!.fake.sessions).toHaveLength(1);
+    await a.stop();
+    expect(recs(idle)[0]!.calls).toEqual(['detach']);
+    expect(recs(runs)[0]!.calls).toEqual(['dispose']);
+    expect(recs(twin)).toHaveLength(1);
+    expect(recs(twin)[0]!.calls).toEqual(['detach']);
   });
 });

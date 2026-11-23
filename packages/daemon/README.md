@@ -91,7 +91,9 @@ see `docs/E2E.md` §0). New:
   without it its sessions are closed and then `dispose()` is called, when it has one.
   With `adopts: true` (static) a restarted daemon reopens the sessions left mid-turn so
   the harness can adopt the turn; otherwise such a turn is settled ambiguous
-  (`host_restarted`) at start without opening the harness. Codex declares `detach` on
+  (`host_restarted`) at start without opening the harness. Every loaded module instance
+  gets these calls at stop, whether or not a session or task run used it; an adapter
+  object that several instances share gets each call once. Codex declares `detach` on
   both transports and `adopts` on a Unix socket only; Claude Code declares none.
 - **Live (realtime voice, decision 11)**: a Codex instance with `"live": true` opts
   its app-server connection into Codex's experimental realtime API. Agents on it

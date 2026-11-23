@@ -970,6 +970,8 @@ export class Gateway {
         throw new ConfigError(e.message);
       });
       this.moduleAdapters.set(inst.name, adapter);
+      // Kept from now on (wrapping starts nothing): stop gives every module instance its lifecycle calls, used or not.
+      this.harness(inst.name);
     }
   }
 
@@ -2958,7 +2960,8 @@ ${a.summary}` }],
     const detached = [...this.lanes.values()].filter(detaching);
     const closed = [...this.lanes.values()].filter((l) => !detaching(l));
     for (const l of detached) l.detach('gateway stopping');
-    const adapters = this.o.harness ? [this.o.harness] : [...this.instances.values()];
+    // Every built instance (every module instance from start), each adapter once: two module instances may share one.
+    const adapters = this.o.harness ? [this.o.harness] : [...new Map([...this.instances.values()].map((a) => [innerAdapter(a), a])).values()];
     // Bounded by a timer that holds the event loop: harness close() may wait on unref'd timers only.
     await within(
       Promise.all([
