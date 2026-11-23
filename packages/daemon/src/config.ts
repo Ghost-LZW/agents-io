@@ -411,7 +411,8 @@ const KernelFile = Type.Object(
           /**
            * Messages from people the deployment does not know, addressed to it (a DM, an @ in a group;
            * not mail): `drop` (default) leaves them as routed; `ask` asks the owner, in the chat of
-           * `ownerSessionKey`, whether to let the agent answer (decision 15).
+           * `ownerSessionKey`, whether to let the agent answer (decision 15). The stranger approval
+           * module's setting (an alias of its section `strangers`: `ask` turns it on, `drop` off).
            */
           strangers: Type.Optional(Type.Union([Type.Literal('drop'), Type.Literal('ask')])),
           routes: Type.Optional(Type.Array(Type.String())),
@@ -684,7 +685,12 @@ export interface Config {
     selfAccounts: string[];
     agentAccounts: string[];
     ownerSessionKey?: string;
-    /** `policy.strangers` (default `drop`). */
+    /**
+     * `policy.strangers` (default `drop`). Deprecated, kept for one release: whether the stranger
+     * approval module is on (`ask`) or off (`drop`), as `modules` says (its section `strangers`
+     * decides over `policy.strangers`). Given the other value before `Gateway.start`, or in a config
+     * without `modules`, it still turns the module on or off (`ModuleFields.switch`).
+     */
     strangers: 'drop' | 'ask';
     routes: string[];
     watchAllowlist: Partial<Pick<WatchSource, 'channel' | 'account' | 'conversation' | 'conversationKind'>>[];
@@ -1000,6 +1006,14 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
   const modules = moduleSettings(switches, { raw: raw as Record<string, unknown>, env, path });
   const fields = moduleRegistry.fields;
   for (const m of modules) {
+    // Where a module's on/off was before it was a module (`policy.strangers`): what it is now (deprecated).
+    const sw = fields.get(m.id)?.switch;
+    if (sw !== undefined) {
+      const keys = sw.path.split('.');
+      const parent = keys.slice(0, -1).reduce<unknown>((o, k) => (o && typeof o === 'object' && !Array.isArray(o) ? (o as Record<string, unknown>)[k] : undefined), config);
+      if (!parent || typeof parent !== 'object' || Array.isArray(parent)) throw new Error(`module ${m.id}: Config.${sw.path} is not in an object of the config`);
+      (parent as Record<string, unknown>)[keys.at(-1)!] = m.enabled ? sw.on : sw.off;
+    }
     const field = fields.get(m.id)?.config;
     if (field === undefined || !m.enabled || m.config === undefined) continue;
     if (Object.hasOwn(config, field) || ['table', 'modules', 'warnings', 'source'].includes(field)) throw new Error(`module ${m.id}: Config.${field} is one of the config's own fields`);

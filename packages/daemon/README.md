@@ -530,8 +530,8 @@ aio console-link                                              (one-time console 
 A feature of the daemon can be a module: a `ModuleManifest` (`@agents-io/protocol`,
 `module.ts`) registered in a `ModuleRegistry` by the composition root (`bundle.ts`
 `builtinModules`, origin `builtin`; so far the topic titles, `topic-title`, the watch, live and
-topic tools, `tools.watch`, `tools.live`, `tools.topics`, and the external MCP endpoint,
-`external-mcp`). A third
+topic tools, `tools.watch`, `tools.live`, `tools.topics`, the stranger approval, `strangers`, and
+the external MCP endpoint, `external-mcp`). A third
 party's module has the same shape (origin `module`). The manifest says, without running anything:
 
 - `id` (`tools.watch`), `kind: 'feature'`, `needs` (`module:<id>`: another registered module,
@@ -559,7 +559,21 @@ party's module has the same shape (origin `module`). The manifest says, without 
   `module <id>: onTurnCompleted failed: …`); and `inputHint(agent)`: the line an input routed to a
   conversation's current topic carries for the agent it goes to (`channelContext.topicTools`;
   the modules' lines in registration order, joined by a newline; none, no line), asked from when
-  the gateway is built to the end (a throw is logged as `module <id>: inputHint failed: …`).
+  the gateway is built to the end (a throw is logged as `module <id>: inputHint failed: …`);
+  `onUndispatched({ env, origin, input, addressed })`: an input no rule dispatched and no host took,
+  for each module in registration order (each awaited; a throw is logged as
+  `module <id>: onUndispatched failed: …` and the next still hears it), `addressed` saying whether it
+  addresses the deployment (a DM, an @ of one of its accounts; not an adapter's `observe`);
+  `onAction: { prefix, handle }`: clicks whose action id starts with the prefix (no two modules'
+  prefixes overlap: setup fails), before they are routed; a result (`{ ok: true }` or
+  `{ ok: false, reason }`) is the click's and nothing is routed, undefined routes it as usual;
+  `resolver(ctx)`: who answers a turn's request before the built-in policy's resolver (the first
+  module that gives one; a connected host's `resolve` callout still comes first, an embedder's
+  `Policy.resolve` replaces both; a throw or something that is no `Resolver` is the policy's error,
+  so the request is denied); and `identities()`: the module's identity entries, asked once right
+  after the gateway is built and before its channels run (a throw or anything but identity entries
+  fails the start), below the configured identities and a host's map, replaced later by its
+  `router.setExtraIdentities`. All four are served from when the gateway is built to the end.
 
 The registry checks every manifest and what they claim together (ids; config sections and
 aliases; tools, commands and features are each one module's and never the kernel's). Its option
@@ -567,7 +581,13 @@ aliases; tools, commands and features are each one module's and never the kernel
 (`bundle.ts`: `{ 'external-mcp': { config: 'externalMcp', status: 'externalMcp' } }`):
 `Config.<config>` is the same object as its settings in `Config.modules` (deprecated, one
 release; given another value or removed before `Gateway.start`, it still decides), and
-`GET /api/status` has `<status>` holding what its `status()` returns while it runs. The
+`GET /api/status` has `<status>` holding what its `status()` returns while it runs. A `switch`
+(`bundle.ts`: `{ strangers: { switch: { path: 'policy.strangers', on: 'ask', off: 'drop' } } }`)
+is an old on/off field of the resolved `Config` at a dotted path: `resolveConfig` writes `on` or
+`off` there as the module is on or off (deprecated, one release); given another value before
+`Gateway.start`, or set in a config without `modules`, it decides, the module being what a file
+with that value at the path makes it (the path is one of the module's aliases, its `aliasEnabled`
+must say on for `on` and off for `off`, and the module needs no other module). The
 lifecycle has five steps:
 
 1. **resolve** in `resolveConfig` / `loadConfig`: `Config.modules` lists every registered module
@@ -626,8 +646,10 @@ kernel's, `via` the module's id); the module gives only the prompt and the instr
 anything else it passes is dropped), `channelFor`, `resolveRoute`, `send`
 (through the outbox; `external` names the client outside the daemon it sends for, kept in the
 in-flight mark, EX-8), `settled`, `outbound` (the outbound check of a send that is no turn's
-reply, DL-6), `ownerRoute`, `redispatch`, `explain` and `host` (`connected`, `answers`, `heldBy`,
-`external`: the `external` callout, `isToken`: a module never gets the host token).
+reply, DL-6), `owner` (the owner's principals, `policy.owners` and `AGENTS_IO_OWNERS`, and the
+fixed `policy.ownerSessionKey`, if any), `ownerRoute`, `redispatch`, `explain` and `host`
+(`connected`, `answers`, `heldBy`, `external`: the `external` callout, `isToken`: a module never
+gets the host token).
 
 The watch, live and topic tools (`src/tool-modules.ts`) are such modules over host-mcp's library:
 each declares its group of `TOOL_GROUP_DEFS` (`@agents-io/host-mcp`; a module tool that is one of
@@ -640,12 +662,20 @@ topic handover with its rules (TP-1: the kernel checks them for every caller; th
 same ones first, `handoverRefusal` from `@agents-io/session`) stay the kernel's. The live tools are offered also when no channel can open a
 live, as before (dropping them then would change the tool list: a later change).
 
+The stranger approval (`src/strangers.ts`, `strangersModule`) is such a module over those four
+hooks: off unless `policy.strangers: "ask"` (its alias, where the setting always was; `drop` or
+nothing leaves it off) or its section `strangers` (only `enabled`) is in the file. A stranger's
+message addressed to the deployment becomes a card in the owner's chat (`ownerRoute`, the
+kernel's), its buttons (`aio:stranger:`) let the messages in through `redispatch`, its guests are
+its identities, and a guest's turn asks the owner (`resolver`). Its tables keep their names
+(`daemon_stranger_asks`, `daemon_guests`), so guests and open asks carry over. A channel whose
+adapter declares `ChannelCaps.openInbox` (mail: anyone may write to it) is never asked about.
+
 Not served yet: `ModuleManifest.admin` (registering a module with it fails), and of the
-instance the other `hooks` (`onUndispatched`, `onAction`, `onTopicChanged`, `resolver`,
-`planRun`, `harnessFor`, `statusLines`, `identities`) and `localFrames` (setting one
-fails the setup, naming it; a hook that is not a function too). They are the seams the features
-that move into modules next need (strangers, owner commands and presets, the Claude Code
-terminal); each is served with the move that needs it. A module
+instance the other `hooks` (`onTopicChanged`, `planRun`, `harnessFor`, `statusLines`) and
+`localFrames` (setting one fails the setup, naming it; a hook that is not a function too). They
+are the seams the features that move into modules next need (owner commands and presets, the
+Claude Code terminal); each is served with the move that needs it. A module
 section's strings are redacted by the console's general rule (a secret-looking key); `x-credential`
 marks in a module's schema are not read yet.
 
@@ -897,3 +927,29 @@ What changed for embedders with core-slimming G6 step 3 (the watch, live and top
   / `switch` (`@agents-io/host-mcp`) are given the call's `operationId` too. `@agents-io/session`
   exports the rules: `handoverRefusal`, `TOPIC_HANDED_ALREADY`, `TOPIC_ALREADY_HERE`. The tools
   check the same rules before their arguments, so what a model reads is as before.
+
+What changed for embedders with core-slimming G6 step 4 (the stranger approval is a module):
+
+- `builtinModules` registers `strangers` (`strangersModule`, `src/strangers.ts`) after
+  `tools.topics` and before `external-mcp`. `policy.strangers` keeps its place, values and
+  default (`drop`: off); the new section `strangers` (only `enabled`) turns it on as well and
+  decides over `policy.strangers` when both are there. `ConfigFile` has `strangers` after
+  `topicTools`; `GET /api/status` `modules` lists `strangers`. `Config.policy.strangers` says
+  whether the module is on (`ask` / `drop`, deprecated, one release) and, given the other value
+  before `Gateway.start` or set in a config without `modules`, still turns it on or off
+  (`ModuleFields.switch`). The gateway no longer builds `Strangers` itself and has no `askOwner`.
+- The hooks `onUndispatched` (its argument has `addressed`), `onAction`, `resolver` and
+  `identities` are served; new `KernelContext.owner`, `ModuleHost.hooked`, `undispatched`,
+  `action`, `resolver`, `identities`, `ModuleHostOptions.switched`, `ModuleFields.switch`
+  (`ModuleSwitchField`), `KERNEL_CAPABILITIES` has `owner`; `StrangersSection` from `bundle.ts`.
+  `KernelBackend` gains `owner` (required, so this breaks an embedder that implements it).
+- `ChannelCaps.openInbox` (`@agents-io/protocol`, optional, additive: the JSON Schemas
+  `ChannelCaps` and `ChannelHello` have it) is new and the mail adapter declares it. The stranger
+  approval leaves out the messages of a channel that declares it, where it left out the channel
+  id `mail` before: the same for the bundled mail adapter, but an adapter of an embedder's own
+  under the id `mail` is asked about unless it declares `openInbox`, and any channel (a bridge
+  peer's hello too) that declares it is left out.
+- The cards, the guests, the held messages, who is asked and every reply text are as before. Its
+  log lines carry the `module strangers: ` prefix, and a failure while handling a stranger's
+  message is logged as `module strangers: onUndispatched failed: …` (it was
+  `topic command reply failed: …`).

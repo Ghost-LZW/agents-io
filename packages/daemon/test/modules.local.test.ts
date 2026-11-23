@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { Type } from '@sinclair/typebox';
 import type { HarnessAdapter, InputRecord, KernelContext, ModuleInstance, ModuleManifest, ModuleResolveContext, ModuleToolCall } from '@agents-io/protocol';
 import { MemorySessionLog, TOPIC_KEY } from '@agents-io/session';
-import { FakeChannel, FakeHarness, type FakeTurnScript } from '@agents-io/testkit';
+import { FakeChannel, FakeHarness, fakeEnvelope, type FakeTurnScript } from '@agents-io/testkit';
 import { KERNEL_TOOL_NAMES } from '@agents-io/host-mcp';
 import { builtinHarnesses, builtinModules } from '../src/bundle.js';
 import { LocalClient } from '../src/client.js';
@@ -82,6 +82,9 @@ function probe(
 const TOOL_MODULES_RESOLVED = [{ id: 'tools.watch', enabled: true, config: {} }, { id: 'tools.live', enabled: true, config: {} }, { id: 'tools.topics', enabled: true, config: {} }];
 /** The watch, live and topic tools in `GET /api/status` `modules`, on. */
 const TOOL_MODULES = [{ id: 'tools.watch', origin: 'builtin', enabled: true }, { id: 'tools.live', origin: 'builtin', enabled: true }, { id: 'tools.topics', origin: 'builtin', enabled: true }];
+/** The stranger approval as a file without `policy.strangers` (or its section) resolves it, and in `GET /api/status` `modules`: off. */
+const STRANGERS_RESOLVED = { id: 'strangers', enabled: false };
+const STRANGERS = { id: 'strangers', origin: 'builtin', enabled: false };
 
 const resolve = (raw: Record<string, unknown>, moduleRegistry?: ModuleRegistry) => resolveConfig(raw, { env: {}, baseDir: '/base', cwd: '/work', ...(moduleRegistry ? { moduleRegistry } : {}) });
 
@@ -95,20 +98,21 @@ const thrown = (f: () => unknown): string => {
 };
 
 describe('the module registry', () => {
-  it('the built-in ones are the topic titles and the watch, live and topic tools, on by default, and the external MCP endpoint, off by default: their sections are in ConfigFile where externalMcp always was; an empty registry has no modules', () => {
-    expect(builtinModules.modules.map((m) => [m.manifest.id, m.origin])).toEqual([['topic-title', 'builtin'], ['tools.watch', 'builtin'], ['tools.live', 'builtin'], ['tools.topics', 'builtin'], ['external-mcp', 'builtin']]);
+  it('the built-in ones are the topic titles and the watch, live and topic tools, on by default, the stranger approval and the external MCP endpoint, off by default: their sections are in ConfigFile where externalMcp always was; an empty registry has no modules', () => {
+    expect(builtinModules.modules.map((m) => [m.manifest.id, m.origin])).toEqual([['topic-title', 'builtin'], ['tools.watch', 'builtin'], ['tools.live', 'builtin'], ['tools.topics', 'builtin'], ['strangers', 'builtin'], ['external-mcp', 'builtin']]);
     expect(configFileSchema(builtinHarnesses)).toBe(ConfigFile);
-    expect(Object.keys(ConfigFile.properties).slice(-7)).toEqual(['host', 'topicTitles', 'watchTools', 'liveTools', 'topicTools', 'externalMcp', 'local']);
-    expect(resolve({}).modules).toEqual([{ id: 'topic-title', enabled: true, config: {} }, ...TOOL_MODULES_RESOLVED, { id: 'external-mcp', enabled: false }]);
+    expect(Object.keys(ConfigFile.properties).slice(-8)).toEqual(['host', 'topicTitles', 'watchTools', 'liveTools', 'topicTools', 'strangers', 'externalMcp', 'local']);
+    expect(resolve({}).modules).toEqual([{ id: 'topic-title', enabled: true, config: {} }, ...TOOL_MODULES_RESOLVED, STRANGERS_RESOLVED, { id: 'external-mcp', enabled: false }]);
     expect(resolve({}).externalMcp).toBeUndefined();
     // On: its settings are the module's, and (deprecated) Config.externalMcp is the same object.
     const on = resolve({ externalMcp: { clients: {} } });
     expect(on.modules).toEqual([
       { id: 'topic-title', enabled: true, config: {} },
       ...TOOL_MODULES_RESOLVED,
+      STRANGERS_RESOLVED,
       { id: 'external-mcp', enabled: true, config: { host: '127.0.0.1', port: 7465, clients: [], limits: { maxBodyBytes: 262144, maxTextChars: 16000, requestsPerMinute: 120, writesPerMinute: 20 } } },
     ]);
-    expect(on.externalMcp).toBe(on.modules![4]!.config);
+    expect(on.externalMcp).toBe(on.modules![5]!.config);
     // Without the module, the section is an unknown key (as any other); an empty registry gives no modules.
     const none = new ModuleRegistry([]);
     expect(resolve({}, none).modules).toBeUndefined();
@@ -155,6 +159,28 @@ describe('the module registry', () => {
     expect(thrown(() => resolve({}, new ModuleRegistry([p], { fields: { probe: { config: 'modules' } } })))).toBe('module probe: Config.modules is one of the config\'s own fields');
     const kept = new ModuleRegistry([p], { fields: { probe: { config: 'probeSettings' } } });
     expect((resolve({ probe: { greeting: 'hi' } }, kept) as unknown as Record<string, unknown>).probeSettings).toEqual({ greeting: 'hi' });
+  });
+
+  it('a switch field (an old on/off setting): one of the module\'s aliases, two values its aliasEnabled tells apart, a module that needs none; resolveConfig writes on or off there', () => {
+    const guests = (o: { needs?: string[] } = {}) => probe('guests', [], { aliases: ['policy.strangers'], aliasEnabled: (v) => v === 'ask', defaultEnabled: false, ...o });
+    const sw = (s: Record<string, unknown>, ...modules: ModuleManifest<any>[]) => () =>
+      new ModuleRegistry(modules.length ? modules : [guests()], { fields: { guests: { switch: { path: 'policy.strangers', on: 'ask', off: 'drop', ...s } as never } } });
+    expect(sw({ path: 'policy.routes' })).toThrow("fields.guests.switch: policy.routes is not one of the module's config.aliases");
+    expect(sw({ path: 'a..b' })).toThrow('fields.guests.switch: must be { path: a dotted path of the config, on, off }');
+    expect(sw({ off: 'ask' })).toThrow('fields.guests.switch: on and off must be two different non-empty strings');
+    expect(sw({ on: 'yes' })).toThrow('fields.guests.switch: the module\'s config.aliasEnabled must say on for "yes" and off for "drop"');
+    expect(sw({}, probe('guests', [], { aliases: ['policy.strangers'] }))).toThrow('fields.guests.switch: the module\'s config.aliasEnabled must say on for "ask" and off for "drop"');
+    expect(sw({}, probe('base', []), guests({ needs: ['module:base'] }))).toThrow('fields.guests.switch: the module needs another module (a module with a switch is resolved alone)');
+    const r = sw({})();
+    expect(r.fields.get('guests')).toEqual({ switch: { path: 'policy.strangers', on: 'ask', off: 'drop' } });
+    // The old field says what the module is: written on or off (the section decides over it, the alias when the section is absent).
+    const policyOf = (raw: Record<string, unknown>) => resolve(raw, r).policy.strangers;
+    expect(policyOf({})).toBe('drop');
+    expect(policyOf({ policy: { strangers: 'ask' } })).toBe('ask');
+    expect(policyOf({ guests: {} })).toBe('ask');
+    expect(policyOf({ guests: { enabled: false }, policy: { strangers: 'ask' } })).toBe('drop');
+    // Without the module, it is what the file says (default drop).
+    expect(resolve({ policy: { strangers: 'ask' } }, new ModuleRegistry([])).policy.strangers).toBe('ask');
   });
 });
 
@@ -301,7 +327,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     expect(w.gw.adminStatus().modules).toEqual([]);
     const b = await daemon(builtinModules);
     expect(await features(b.socketPath)).toEqual(KERNEL_HELLO);
-    expect(b.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, { id: 'external-mcp', origin: 'builtin', enabled: false }]);
+    expect(b.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, { id: 'external-mcp', origin: 'builtin', enabled: false }]);
     expect(b.gw.adminStatus()).not.toHaveProperty('externalMcp');
   });
 
@@ -311,7 +337,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     const st = w.gw.adminStatus();
     expect(st.externalMcp).toEqual({ url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\//), clients: [] });
     expect(Object.keys(st).slice(-2)).toEqual(['externalMcp', 'modules']);
-    expect(st.modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, { id: 'external-mcp', origin: 'builtin', enabled: true, status: st.externalMcp }]);
+    expect(st.modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, { id: 'external-mcp', origin: 'builtin', enabled: true, status: st.externalMcp }]);
     // Stopping closes it first: nothing listens there afterwards.
     await w.gw.stop();
     await expect(fetch(st.externalMcp!.url, { method: 'POST' })).rejects.toThrow();
@@ -324,7 +350,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     const busy = await daemon(builtinModules, { externalMcp: { listen: `127.0.0.1:${port}`, clients: {} } }, undefined, undefined, (level, msg) => logs.push(`${level}: ${msg}`));
     expect(await features(busy.socketPath)).toEqual(KERNEL_HELLO);
     expect(busy.gw.adminStatus()).not.toHaveProperty('externalMcp');
-    expect(busy.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, { id: 'external-mcp', origin: 'builtin', enabled: true }]);
+    expect(busy.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, { id: 'external-mcp', origin: 'builtin', enabled: true }]);
     expect(logs).toContainEqual(expect.stringMatching(new RegExp(`^error: module external-mcp: external MCP endpoint not started: cannot listen on 127\\.0\\.0\\.1:${port}: `)));
   });
 
@@ -332,10 +358,10 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     const settings = resolveConfig({ externalMcp: { listen: '127.0.0.1:0', clients: {} } }, { env: {}, baseDir: '/base', cwd: '/work' }).externalMcp!;
     const on = await daemon(builtinModules, {}, undefined, undefined, undefined, (c) => ({ ...c, externalMcp: settings }));
     expect(await features(on.socketPath)).toEqual([...KERNEL_HELLO, 'external.mcp']);
-    expect(on.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, { id: 'external-mcp', origin: 'builtin', enabled: true, status: { url: expect.any(String), clients: [] } }]);
+    expect(on.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, { id: 'external-mcp', origin: 'builtin', enabled: true, status: { url: expect.any(String), clients: [] } }]);
     const off = await daemon(builtinModules, { externalMcp: { listen: '127.0.0.1:0', clients: {} } }, undefined, undefined, undefined, ({ externalMcp: _, ...c }) => c);
     expect(await features(off.socketPath)).toEqual(KERNEL_HELLO);
-    expect(off.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, { id: 'external-mcp', origin: 'builtin', enabled: false }]);
+    expect(off.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, { id: 'external-mcp', origin: 'builtin', enabled: false }]);
     // A config without modules at all (built by hand, as before modules): the field still decides; a built-in module
     // without one is as a file without its section makes it (the topic titles, on as before); any other module is still an error.
     const dir = mkdtempSync(join(tmpdir(), 'aio-mod-'));
@@ -345,7 +371,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     const gw = await Gateway.start({ config: bare, harness: new FakeHarness(), log: new MemorySessionLog(), logger: () => {} });
     cleanups.push(() => gw.stop());
     expect(await features(bare.socketPath)).toEqual([...KERNEL_HELLO, 'external.mcp']);
-    expect(gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, { id: 'external-mcp', origin: 'builtin', enabled: true, status: { url: expect.any(String), clients: [] } }]);
+    expect(gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, { id: 'external-mcp', origin: 'builtin', enabled: true, status: { url: expect.any(String), clients: [] } }]);
     await gw.stop();
     const withProbe = new ModuleRegistry([...builtinModules.modules, { manifest: probe('probe', []), origin: 'module' as const }], { fields: { 'external-mcp': { config: 'externalMcp' } } });
     await expect(Gateway.start({ config: bare, harness: new FakeHarness(), log: new MemorySessionLog(), listen: false, moduleRegistry: withProbe, logger: () => {} })).rejects.toThrow('module probe is registered but the config was resolved without it');
@@ -593,6 +619,155 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     expect(none[0]!.channelContext).not.toHaveProperty('topicTools');
   });
 
+  it('identities and onUndispatched: each module\'s entries at the start, below the configured identities (router.setExtraIdentities replaces them); every module hears an input nothing dispatched, in registration order, with addressed; a hook that throws is logged, the next still hears it', async () => {
+    const logs: string[] = [];
+    const heard: string[] = [];
+    const kernels: KernelContext[] = [];
+    const entry = (user: string, principal: string) => ({ channel: 'fake', channelUserId: user, principal, labels: ['friend'] });
+    const registry = new ModuleRegistry([
+      probe('first', [], {
+        instance: (k) => {
+          kernels.push(k);
+          return {
+            hooks: {
+              identities: () => [entry('bob', 'person:bob'), entry('carol', 'person:carol-module')],
+              onUndispatched: (a) => {
+                heard.push(`first ${a.env.sender.channelUserId} ${a.origin.principal?.id ?? null} ${a.addressed}`);
+                throw new Error('boom');
+              },
+            },
+          };
+        },
+      }),
+      probe('second', [], { instance: () => ({ hooks: { onUndispatched: async (a) => void heard.push(`second ${a.env.sender.channelUserId} ${a.addressed}`) } }) }),
+    ]);
+    const w = await daemon(registry, { identities: [{ channel: 'fake', channelUserId: 'carol', principal: 'person:carol', labels: [] }] }, undefined, undefined, (level, msg) => logs.push(`${level}: ${msg}`));
+    const someone = (id: string) => ({ channelUserId: id, evidence: 'platform_signed' as const });
+    await w.chat.inject({ conversation: { id: 'c-bob', kind: 'dm' }, sender: someone('bob'), text: 'hi' });
+    await until(() => heard.length === 2);
+    expect(heard).toEqual(['first bob person:bob true', 'second bob true']);
+    expect(logs).toContain('warn: module first: onUndispatched failed: boom');
+    // The configured entry wins for the same channel identity; a group message the adapter says is not for us is not addressed.
+    await w.chat.inject({ conversation: { id: 'g1', kind: 'group' }, sender: someone('carol'), admission: 'observe', text: 'chatting' });
+    await until(() => heard.length === 4);
+    expect(heard.slice(2)).toEqual(['first carol person:carol false', 'second carol false']);
+    // Its entries from now on replace those of the start.
+    kernels[0]!.router.setExtraIdentities([]);
+    await w.chat.inject({ conversation: { id: 'c-bob', kind: 'dm' }, sender: someone('bob'), text: 'again' });
+    await until(() => heard.length === 6);
+    expect(heard[4]).toBe('first bob null true');
+    // An owner's message a rule dispatches is nobody's to hear.
+    await w.chat.inject({ sender: alice, text: 'mine' });
+    await until(() => w.chat.sent.some((s) => s.finalized));
+    expect(heard).toHaveLength(6);
+    expect(kernels[0]!.owner()).toEqual({ principals: ['fake:alice'] });
+    const fixed = await daemon(new ModuleRegistry([probe('first', [], { instance: (k) => (kernels.push(k), {}) })]), { policy: { owners: ['fake:alice'], ownerSessionKey: 'main' } });
+    expect(kernels.at(-1)!.owner()).toEqual({ principals: ['fake:alice'], sessionKey: 'main' });
+    await fixed.gw.stop();
+  });
+
+  it('onAction: the module whose prefix a click\'s action id starts with answers it (only ok, or ok false with a reason); undefined routes the click as usual; overlapping prefixes fail the setup', async () => {
+    const clicks: string[] = [];
+    const registry = new ModuleRegistry([
+      probe('first', [], {
+        instance: () => ({
+          hooks: {
+            onAction: {
+              prefix: 'p:one:',
+              handle: (a) => {
+                clicks.push(`${a.actionId} ${a.origin.principal?.id}`);
+                const what = a.actionId.slice('p:one:'.length);
+                return what === 'pass' ? undefined : what === 'no' ? ({ ok: false, reason: 7 } as never) : ({ ok: true, extra: 1 } as never);
+              },
+            },
+          },
+        }),
+      }),
+      probe('second', [], { instance: () => ({ hooks: { onAction: { prefix: 'p:two:', handle: () => ({ ok: false, reason: 'not_now' }) } } }) }),
+    ]);
+    const turns: string[] = [];
+    const w = await daemon(registry, {}, async (t) => {
+      turns.push(t.turnId);
+      t.emit({ t: 'text.snapshot', text: 'ok', final: true }, { audience: 'answer' });
+    });
+    const click = (actionId: string) => w.gw.accept(fakeEnvelope({ sender: alice, content: [{ type: 'event', name: 'action', data: { actionId } }] }));
+    expect(await click('p:one:yes')).toMatchObject({ accepted: true, action: 'command', result: { ok: true } });
+    expect((await click('p:one:yes')).result).toEqual({ ok: true });
+    expect((await click('p:one:no')).result).toEqual({ ok: false, reason: 'refused' });
+    expect((await click('p:two:x')).result).toEqual({ ok: false, reason: 'not_now' });
+    expect(clicks).toEqual(['p:one:yes fake:alice', 'p:one:yes fake:alice', 'p:one:no fake:alice']);
+    expect(turns).toEqual([]);
+    // Left to be routed: the owner's click is an input of their chat, as without the module.
+    expect((await click('p:one:pass')).action).toBe('dispatch');
+    await until(() => turns.length === 1);
+    const overlap = new ModuleRegistry([
+      probe('first', [], { instance: () => ({ hooks: { onAction: { prefix: 'p:', handle: () => undefined } } }) }),
+      probe('second', [], { instance: () => ({ hooks: { onAction: { prefix: 'p:two:', handle: () => undefined } } }) }),
+    ]);
+    await expect(daemon(overlap)).rejects.toThrow(new ConfigError('module second: hooks.onAction: its prefix "p:two:" overlaps module first\'s "p:"'));
+    await expect(daemon(new ModuleRegistry([probe('first', [], { instance: () => ({ hooks: { onAction: { prefix: '', handle: () => undefined } } }) })]))).rejects.toThrow(
+      new ConfigError('module first: hooks.onAction must be { prefix: a non-empty string, handle: a function }'),
+    );
+  });
+
+  it('resolver: the first module that gives one answers a turn\'s request, before the local policy\'s; one that answers no resolver is the policy\'s error (denied)', async () => {
+    const asked: string[] = [];
+    const decisions: string[] = [];
+    let answer: unknown = { kind: 'auto', decision: { kind: 'deny', message: 'first says no' } };
+    const registry = new ModuleRegistry([
+      probe('first', [], { instance: () => ({ hooks: { resolver: (ctx) => (asked.push(`first ${ctx.turnId}`), answer as never) } }) }),
+      probe('second', [], { instance: () => ({ hooks: { resolver: () => (asked.push('second'), { kind: 'auto', decision: { kind: 'allow_once' } }) } }) }),
+    ]);
+    const w = await daemon(registry, {}, async (t) => {
+      t.emit({ t: 'request.opened', requestId: `r${decisions.length}`, kind: 'tool_approval', title: 'rm -rf build', allowedDecisions: ['allow_once', 'deny'], allowAlways: false, defaultDeny: true });
+      const d = await t.waitDecision(`r${decisions.length}`);
+      decisions.push(`${d.kind}${d.kind === 'deny' && d.message ? ` ${d.message}` : ''}`);
+      t.emit({ t: 'text.snapshot', text: 'ok', final: true }, { audience: 'answer' });
+    });
+    await w.chat.inject({ sender: alice, text: 'one' });
+    await until(() => decisions.length === 1);
+    expect(decisions).toEqual(['deny first says no']);
+    expect(asked).toEqual([expect.stringMatching(/^first /)]);
+    // None from the first: the next module's.
+    answer = undefined;
+    await w.chat.inject({ sender: alice, text: 'two' });
+    await until(() => decisions.length === 2);
+    expect(decisions[1]).toBe('allow_once');
+    expect(asked.slice(1)).toEqual([expect.stringMatching(/^first /), 'second']);
+    answer = { kind: 'nope' };
+    await w.chat.inject({ sender: alice, text: 'three' });
+    await until(() => decisions.length === 3);
+    expect(decisions[2]).toBe('deny policy error: module first: resolver answered no Resolver');
+  });
+
+  it('the stranger approval is off unless policy.strangers is ask (or its section strangers is in the file); Config.policy.strangers says which, and written before the start, or in a config without modules, still decides', async () => {
+    const on = (w: { gw: Gateway }) => w.gw.adminStatus().modules!.find((m) => m.id === 'strangers')!.enabled;
+    const owners = ['fake:alice'];
+    expect(resolve({}).policy.strangers).toBe('drop');
+    expect(resolve({ policy: { strangers: 'ask' } }).modules!.find((m) => m.id === 'strangers')).toEqual({ id: 'strangers', enabled: true, config: {} });
+    expect(resolve({ strangers: {} }).policy.strangers).toBe('ask');
+    expect(resolve({ strangers: { enabled: false }, policy: { strangers: 'ask' } }).policy.strangers).toBe('drop');
+    expect(thrown(() => resolve({ strangers: { ask: true } }))).toBe('invalid config: /strangers/ask: Unexpected property');
+    expect(on(await daemon(builtinModules))).toBe(false);
+    expect(on(await daemon(builtinModules, { policy: { owners, strangers: 'ask' } }))).toBe(true);
+    expect(on(await daemon(builtinModules, { strangers: {} }))).toBe(true);
+    // Written since the config resolved, the old field decides, as it did before the module.
+    expect(on(await daemon(builtinModules, {}, undefined, undefined, undefined, (c) => ({ ...c, policy: { ...c.policy, strangers: 'ask' } })))).toBe(true);
+    expect(on(await daemon(builtinModules, { policy: { owners, strangers: 'ask' } }, undefined, undefined, undefined, (c) => ({ ...c, policy: { ...c.policy, strangers: 'drop' } })))).toBe(false);
+    // A config without modules at all (built by hand): the field decides.
+    const dir = mkdtempSync(join(tmpdir(), 'aio-mod-'));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const bare = { ...resolveConfig({ policy: { owners, strangers: 'ask' } }, { env: {}, baseDir: dir, cwd: dir, moduleRegistry: new ModuleRegistry([]) }), socketPath: join(dir, 'run', 'aio.sock') };
+    expect(bare.modules).toBeUndefined();
+    const gw = await Gateway.start({ config: bare, harness: new FakeHarness(), log: new MemorySessionLog(), listen: false, logger: () => {} });
+    cleanups.push(() => gw.stop());
+    expect(on({ gw })).toBe(true);
+    await gw.stop();
+    const off = await Gateway.start({ config: { ...bare, policy: { ...bare.policy, strangers: 'drop' } }, harness: new FakeHarness(), log: new MemorySessionLog(), listen: false, logger: () => {} });
+    cleanups.push(() => off.stop());
+    expect(on({ gw: off })).toBe(false);
+  });
+
   it('watches, topics.rotate / switch, live and agents.tools: the kernel acts for a session\'s agent and its running turn; a watch always delivers into the session; an argument that is not a string is refused', async () => {
     const kernels: KernelContext[] = [];
     const turns: string[] = [];
@@ -645,8 +820,11 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     const seen: string[] = [];
     const start = (m: ModuleManifest<any>[], raw: Record<string, unknown> = {}) => daemon(new ModuleRegistry(m), raw);
     await expect(start([probe('probe', seen, { instance: () => { throw new Error('boom'); } })])).rejects.toThrow(new ConfigError('module probe: setup failed: boom'));
-    await expect(start([probe('probe', seen, { instance: () => ({ hooks: { onUndispatched: async () => {} } }) })])).rejects.toThrow(new ConfigError('module probe: hooks.onUndispatched is not served yet'));
+    await expect(start([probe('probe', seen, { instance: () => ({ hooks: { onTopicChanged: () => {} } }) })])).rejects.toThrow(new ConfigError('module probe: hooks.onTopicChanged is not served yet'));
     await expect(start([probe('probe', seen, { instance: () => ({ hooks: { onTurnCompleted: 1 as never } }) })])).rejects.toThrow(new ConfigError('module probe: hooks.onTurnCompleted must be a function'));
+    // The identities of the start: a hook that throws or answers no identity entries fails it.
+    await expect(start([probe('probe', seen, { instance: () => ({ hooks: { identities: () => { throw new Error('no db'); } } }) })])).rejects.toThrow('module probe: identities failed: no db');
+    await expect(start([probe('probe', seen, { instance: () => ({ hooks: { identities: () => [{ channel: 'fake' }] as never } }) })])).rejects.toThrow('module probe: identities must return an array of identity entries');
     await expect(start([probe('probe', seen, { instance: () => ({ localFrames: { 'tui.attach': async () => ({ ok: true, value: null }) } }) })])).rejects.toThrow('module probe: localFrames are not served yet');
     await expect(start([probe('probe', seen, { instance: () => ({ tools: {} }) })])).rejects.toThrow('module probe: tools.probe_echo: no handler for its tool probe_echo');
     // A start that throws fails the daemon's start; those started before it stop.

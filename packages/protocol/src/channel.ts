@@ -28,6 +28,13 @@ export const ChannelCaps = Type.Object({
   /** Can attach a sender identity (`SendOp.as`) to outbound messages and recover it on echo. */
   declaresSender: Type.Boolean(),
   /**
+   * Anyone may write to the deployment here, with nothing in between deciding who can reach it
+   * (mail: any address on the internet), so a message from someone the deployment does not know
+   * is routine there, not a stranger to ask the owner about: the stranger approval module
+   * (`policy.strangers: "ask"`) leaves this channel's messages as routed. Default false.
+   */
+  openInbox: Type.Optional(Type.Boolean()),
+  /**
    * How replies on this channel are best paced, as the adapter recommends (core-slimming G1:
    * the gateway reads this instead of knowing the adapter). A channel entry's `openDelayMs` /
    * `previewDelayMs` override the delays. Read when a session's compositor is made, so a

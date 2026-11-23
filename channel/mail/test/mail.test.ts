@@ -79,6 +79,14 @@ describe('inbound', () => {
     await boom.stop();
   });
 
+  it('declares an open inbox (anyone may write to it), so its unknown senders are never asked about, with or without internal delivery #ID-9', async () => {
+    for (const cfg of [{}, { internalDelivery: { domains: ['example.com'] } }]) {
+      const h = await harness({ cfg });
+      expect(h.adapter.caps('bot').openInbox).toBe(true);
+      await h.stop();
+    }
+  });
+
   it('verdictFromAuth requires aligned DKIM for the From domain #ID-4', () => {
     const dmarc = (dkim: string | false, status = 'pass') => ({ domain: 'example.com', status: { result: status }, alignment: { dkim: { result: dkim, strict: false }, spf: { result: 'pass', strict: false } } });
     const res = (d: unknown, results: unknown[] = []) => ({ dkim: { headerFrom: ['example.com'], envelopeFrom: false, results }, dmarc: d }) as never;

@@ -10,6 +10,7 @@ import type {
   IdentifyArgs,
   Identity,
   IdentityEntry,
+  InboundEnvelope,
   InboundItem,
   InputRecord,
   KernelContext,
@@ -21,6 +22,7 @@ import type {
   KernelSettledSend,
   KernelUnwatchResult,
   KernelWatchResult,
+  ModuleActionResult,
   ModuleInstance,
   ModuleManifest,
   ModuleOrigin,
@@ -31,6 +33,7 @@ import type {
   Policy,
   RenderedMessage,
   ReplyRoute,
+  Resolver,
   RouteExplanation,
   SessionEvent,
   SessionScope,
@@ -39,7 +42,8 @@ import type {
   Watch,
   WatchDraft,
 } from '@agents-io/protocol';
-import { AdminStatus as AdminStatusSchema } from '@agents-io/protocol';
+import { AdminStatus as AdminStatusSchema, IdentityEntry as IdentityEntrySchema, Resolver as ResolverSchema } from '@agents-io/protocol';
+import { Value } from '@sinclair/typebox/value';
 import { KERNEL_TOOL_NAMES, moduleToolInput, type ModuleTools } from '@agents-io/host-mcp';
 import { CommandTable, KERNEL_COMMAND_NAMES, type ModuleCommand } from './commands.js';
 import { ConfigError } from './config-error.js';
@@ -60,7 +64,9 @@ import { TokenError } from './token.js';
  *      `applied: "restart"`; nothing is applied live).
  * A module that is off does not exist for the deployment: no tools, no commands, no features.
  * The hooks the daemon serves are called from when the gateway is built: `onTurnCompleted` until
- * step 4, `inputHint` (a pure answer for an input being routed) to the end.
+ * step 4; `inputHint`, `resolver` (pure answers for an input being routed, a request being
+ * opened), `onUndispatched` and `onAction` (inputs, which come in until late in the daemon's stop)
+ * to the end; `identities` once, right after the gateway is built and before its channels run.
  */
 
 /** A module as registered: its manifest and where it comes from. */
@@ -85,6 +91,24 @@ export interface ModuleFields {
    * what its `status()` returns while it runs, besides its `modules` entry.
    */
   status?: string;
+  /**
+   * A field of the resolved `Config`, at a dotted path, that said whether the feature was on before
+   * it was a module (deprecated, kept for one release; `bundle.ts`: the stranger approval's
+   * `policy.strangers`, `ask` / `drop`): `resolveConfig` writes `on` there while the module is on
+   * and `off` while it is off. Given the other value (or any other) before `Gateway.start`, or set in
+   * a config without `modules` at all, it decides over `Config.modules`, as it did before: the
+   * module is then what a file with that value at `path` and nothing else makes it. `path` is one
+   * of the module's `config.aliases`, its `aliasEnabled` says on for `on` and off for `off`, and
+   * the module needs no other module (it is resolved alone).
+   */
+  switch?: ModuleSwitchField;
+}
+
+/** `ModuleFields.switch`: where the old on/off field is and its two values. */
+export interface ModuleSwitchField {
+  path: string;
+  on: string;
+  off: string;
 }
 
 /** What `ModuleRegistry` takes besides the modules. */
@@ -98,7 +122,7 @@ export interface ModuleRegistryOptions {
 /** What `kernel:<capability>` may name in `ModuleManifest.needs`: the members of `KernelContext`. */
 export const KERNEL_CAPABILITIES: readonly string[] = [
   'log', 'events', 'head', 'appendNative', 'sessions', 'status', 'stopping', 'policy', 'records', 'db', 'topics', 'watches', 'live', 'agents',
-  'router', 'lanes', 'channelFor', 'resolveRoute', 'send', 'settled', 'outbound', 'ownerRoute', 'redispatch', 'explain', 'host',
+  'router', 'lanes', 'channelFor', 'resolveRoute', 'send', 'settled', 'outbound', 'owner', 'ownerRoute', 'redispatch', 'explain', 'host',
 ];
 
 const MODULE_ID = /^[a-z0-9][a-z0-9._-]*$/;
@@ -171,6 +195,32 @@ function badManifest(m: ModuleManifest<any>): string | undefined {
   return undefined;
 }
 
+/** What is wrong with a module's switch field (`ModuleFields.switch`), or undefined. */
+function badSwitch(m: ModuleManifest<any>, sw: unknown): string | undefined {
+  if (!isObject(sw) || typeof sw.path !== 'string' || !ALIAS.test(sw.path)) return 'must be { path: a dotted path of the config, on, off }';
+  if (!nonEmpty(sw.on) || !nonEmpty(sw.off) || sw.on === sw.off) return 'on and off must be two different non-empty strings';
+  if (!m.config?.aliases?.includes(sw.path)) return `${sw.path} is not one of the module's config.aliases`;
+  const decide = m.config.aliasEnabled;
+  if (!decide || decide(sw.on, sw.path) !== true || decide(sw.off, sw.path) !== false) return `the module's config.aliasEnabled must say on for ${JSON.stringify(sw.on)} and off for ${JSON.stringify(sw.off)}`;
+  if (m.needs?.some((n) => n.startsWith('module:'))) return 'the module needs another module (a module with a switch is resolved alone)';
+  return undefined;
+}
+
+/** The value at a dotted path of an object (a resolved `Config`), if set. */
+function valueAtPath(o: unknown, dotted: string): unknown {
+  let cur: unknown = o;
+  for (const k of dotted.split('.')) {
+    if (!isObject(cur) || !Object.hasOwn(cur, k)) return undefined;
+    cur = cur[k];
+  }
+  return cur;
+}
+
+/** `{ a: { b: value } }` for the dotted path `a.b`: a file with only that value set. */
+function fileWith(dotted: string, value: unknown): Record<string, unknown> {
+  return dotted.split('.').reduceRight<Record<string, unknown>>((inner, k) => ({ [k]: inner }), value as Record<string, unknown>) as Record<string, unknown>;
+}
+
 /**
  * The feature modules a deployment may run (`ModuleManifest`), in registration order: the order
  * their tools, commands, features and status entries come in, and the order they start (they
@@ -232,6 +282,13 @@ export class ModuleRegistry {
         claim(`${k} field ${name}`, id);
         out[k] = name;
       }
+      if (f.switch !== undefined) {
+        const bad = badSwitch(this.byId.get(id)!.manifest, f.switch);
+        if (bad) throw new Error(`fields.${id}.switch: ${bad}`);
+        const sw = f.switch as ModuleSwitchField;
+        claim(`switch field ${sw.path}`, id);
+        out.switch = { path: sw.path, on: sw.on, off: sw.off };
+      }
       fields.set(id, out);
     }
     this.fields = fields;
@@ -288,6 +345,13 @@ export interface ModuleHostOptions {
    * it was a module (topic titles) runs as it did. A module of someone else's still fails the start.
    */
   defaults?: readonly ResolvedModule[];
+  /**
+   * For a module with a switch field (`ModuleFields.switch`) that decides (its value in `config`
+   * is not what `resolved` says, or the config has no `modules`): what the module resolves to from
+   * `file`, a file with only that value set at the field's path (the gateway: `resolveModules` of
+   * the module alone). Without it, switch fields are not read.
+   */
+  switched?(id: string, file: Record<string, unknown>): ResolvedModule;
   log: Log;
 }
 
@@ -300,8 +364,8 @@ interface Running {
   started: boolean;
 }
 
-/** Hook members the daemon serves (functions): any other a module sets fails its setup. */
-const SERVED_HOOKS: readonly string[] = ['onTurnCompleted', 'inputHint'];
+/** Hook members the daemon serves (functions, but `onAction`: `{ prefix, handle }`): any other a module sets fails its setup. */
+const SERVED_HOOKS: readonly string[] = ['onTurnCompleted', 'inputHint', 'onUndispatched', 'onAction', 'resolver', 'identities'];
 
 /** What is wrong with what `setup` returned (the first thing), or undefined. */
 function badInstance(m: ModuleManifest<any>, i: ModuleInstance): string | undefined {
@@ -319,6 +383,10 @@ function badInstance(m: ModuleManifest<any>, i: ModuleInstance): string | undefi
     for (const [k, v] of Object.entries(i.hooks)) {
       if (v === undefined) continue;
       if (!SERVED_HOOKS.includes(k)) return `hooks.${k} is not served yet`;
+      if (k === 'onAction') {
+        if (!isObject(v) || !nonEmpty(v.prefix) || !isFn(v.handle)) return 'hooks.onAction must be { prefix: a non-empty string, handle: a function }';
+        continue;
+      }
       if (!isFn(v)) return `hooks.${k} must be a function`;
     }
   }
@@ -366,6 +434,15 @@ export class ModuleHost {
         const legacy = (o.config as Record<string, unknown>)[field];
         if (legacy !== (res.enabled ? res.config : undefined)) return { r, enabled: legacy !== undefined, config: legacy, started: false };
       }
+      const sw = o.registry.fields.get(r.manifest.id)?.switch;
+      if (sw !== undefined && o.config !== undefined && o.switched) {
+        // `resolveConfig` writes `on` there while the module is on, `off` while it is off; anything else was written since.
+        const legacy = valueAtPath(o.config, sw.path);
+        if (bare || legacy !== (res.enabled ? sw.on : sw.off)) {
+          const now = o.switched(r.manifest.id, fileWith(sw.path, legacy));
+          return { r, enabled: now.enabled, config: now.config, started: false };
+        }
+      }
       return { r, enabled: res.enabled, config: res.config, started: false };
     });
   }
@@ -389,8 +466,95 @@ export class ModuleHost {
       }
       const bad = badInstance(m.r.manifest, instance);
       if (bad) throw new ConfigError(`module ${id}: ${bad}`);
+      // One module's clicks: a prefix that starts another's (or is its start) would take them.
+      const prefix = instance.hooks?.onAction?.prefix;
+      if (prefix !== undefined) {
+        for (const other of this.active()) {
+          const theirs = other.instance!.hooks?.onAction?.prefix;
+          if (theirs !== undefined && (theirs.startsWith(prefix) || prefix.startsWith(theirs)))
+            throw new ConfigError(`module ${id}: hooks.onAction: its prefix ${JSON.stringify(prefix)} overlaps module ${other.r.manifest.id}'s ${JSON.stringify(theirs)}`);
+        }
+      }
       m.instance = instance;
     }
+  }
+
+  /** Whether a set-up module has the hook (the gateway hands its ingress `onUndispatched` / `onAction` only then). */
+  hooked(name: 'onUndispatched' | 'onAction'): boolean {
+    return this.active().some((m) => m.instance!.hooks?.[name] !== undefined);
+  }
+
+  /**
+   * The set-up modules' identity entries when the daemon starts (`ModuleHooks.identities`), each
+   * module's given to `set` (its own extra entries). A hook that throws or answers anything but an
+   * array of identity entries fails the start, naming the module.
+   */
+  identities(set: (id: string, entries: IdentityEntry[]) => void): void {
+    for (const m of this.active()) {
+      const hook = m.instance!.hooks?.identities;
+      if (!hook) continue;
+      const id = m.r.manifest.id;
+      let entries: unknown;
+      try {
+        entries = hook();
+      } catch (e) {
+        throw new Error(`module ${id}: identities failed: ${(e as Error)?.message ?? String(e)}`);
+      }
+      if (!Array.isArray(entries) || !entries.every((x) => Value.Check(IdentityEntrySchema, x))) throw new Error(`module ${id}: identities must return an array of identity entries`);
+      set(id, entries as IdentityEntry[]);
+    }
+  }
+
+  /**
+   * An input no rule dispatched and no host took (`ModuleHooks.onUndispatched`): each set-up
+   * module's hook in registration order, each awaited; one that throws or rejects is logged, the
+   * next still hears it.
+   */
+  async undispatched(a: { env: InboundEnvelope; origin: Origin; input: InputRecord; addressed: boolean }): Promise<void> {
+    for (const m of this.active()) {
+      const hook = m.instance!.hooks?.onUndispatched;
+      if (!hook) continue;
+      try {
+        await hook({ env: a.env, origin: a.origin, input: a.input, addressed: a.addressed });
+      } catch (e) {
+        this.o.log('warn', `module ${m.r.manifest.id}: onUndispatched failed: ${(e as Error)?.message ?? String(e)}`);
+      }
+    }
+  }
+
+  /**
+   * A click (`ModuleHooks.onAction`): the module whose prefix the action id starts with answers
+   * (prefixes never overlap); undefined when none does, or it leaves the click to be routed. Only
+   * what a result may say comes back (`{ ok: true }`, or `{ ok: false, reason }` with `refused` for
+   * a reason that is not a string). A throw is the click's.
+   */
+  async action(a: { actionId: string; env: InboundEnvelope; origin: Origin }): Promise<ModuleActionResult | undefined> {
+    for (const m of this.active()) {
+      const hook = m.instance!.hooks?.onAction;
+      if (!hook || !a.actionId.startsWith(hook.prefix)) continue;
+      const r: unknown = await hook.handle({ actionId: a.actionId, env: a.env, origin: a.origin });
+      if (r === undefined || r === null) return undefined;
+      if (isObject(r) && r.ok === true) return { ok: true };
+      return { ok: false, reason: isObject(r) && typeof r.reason === 'string' ? r.reason : 'refused' };
+    }
+    return undefined;
+  }
+
+  /**
+   * Who answers a request of the turn (`ModuleHooks.resolver`): the first set-up module, in
+   * registration order, that gives a resolver; undefined when none does. A hook that throws, or
+   * answers something that is no resolver, throws (the policy's error: the lane denies the request).
+   */
+  resolver(ctx: TurnContext): Resolver | undefined {
+    for (const m of this.active()) {
+      const hook = m.instance!.hooks?.resolver;
+      if (!hook) continue;
+      const r: unknown = hook(ctx);
+      if (r === undefined || r === null) continue;
+      if (!Value.Check(ResolverSchema, r)) throw new Error(`module ${m.r.manifest.id}: resolver answered no Resolver`);
+      return r as Resolver;
+    }
+    return undefined;
   }
 
   /** The set-up modules' tools, for the host MCP endpoint (`HostToolsOptions.modules`); modules without tools are left out. */
@@ -590,6 +754,8 @@ export interface KernelBackend {
   send(route: ReplyRoute, msg: RenderedMessage, a: { operationId: string; sessionKey: string; turnId?: string; external?: ExternalSender }): Promise<KernelSendResult | undefined>;
   settled(operationId: string): KernelSettledSend | undefined;
   outbound(from: TurnContext, to: ReplyRoute): Promise<'allow' | 'deny'>;
+  /** The owner's principals and fixed session (`KernelContext.owner`). */
+  owner(): { principals: string[]; sessionKey?: string };
   ownerRoute(): ReplyRoute | null;
   redispatch(item: InboundItem, o: { by: string; session?: SessionScope; agent?: string }): Promise<{ ok: true; sessionKey: string; inputId: string } | { ok: false; code: string; message: string }>;
   explain(inputId: string, chain: boolean): KernelOutcome;
@@ -696,6 +862,10 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
     send: (route, msg, a) => live().send(route, msg, a),
     settled: (operationId) => live().settled(operationId),
     outbound: (from, to) => live().outbound(from, to),
+    owner: () => {
+      const o = live().owner();
+      return { principals: [...o.principals], ...(o.sessionKey !== undefined ? { sessionKey: o.sessionKey } : {}) };
+    },
     ownerRoute: () => live().ownerRoute(),
     redispatch: (item, o) => live().redispatch(item, o),
     explain: (inputId, chain) => live().explain(inputId, chain ?? false),

@@ -26,12 +26,13 @@ import type { Watch } from './watch.js';
  *
  * In progress: the daemon reads the manifest (`id`, `kind`, `needs`, `config`, `features`,
  * `mcpTools`, `commands`, `setup`) and, of the instance, `tools`, `commands`, `features`,
- * `status`, `start`, `stop` and the hooks `onTurnCompleted` and `inputHint`. `admin`, the other
- * `hooks` and `localFrames` are the contract the features that move into modules next need (G6
- * steps 4-6); until the daemon serves one, a module that sets it fails to register (`admin`) or to
- * set up (`hooks.<name>`, `localFrames`), naming it, rather than being silently ignored. The
- * built-in modules are the topic titles (step 2), the watch, live and topic tools (step 3) and the
- * external MCP endpoint (step 1).
+ * `status`, `start`, `stop` and the hooks `onTurnCompleted`, `inputHint`, `onUndispatched`,
+ * `onAction`, `resolver` and `identities`. `admin`, the other `hooks` and `localFrames` are the
+ * contract the features that move into modules next need (G6 steps 5-6); until the daemon serves
+ * one, a module that sets it fails to register (`admin`) or to set up (`hooks.<name>`,
+ * `localFrames`), naming it, rather than being silently ignored. The built-in modules are the
+ * topic titles (step 2), the watch, live and topic tools (step 3), the stranger approval (step 4)
+ * and the external MCP endpoint (step 1).
  */
 
 /** Where a registered module comes from: shipped with the host (`builtin`), or someone else's (`module`). */
@@ -204,13 +205,32 @@ export type KernelUnwatchResult = { ok: true; removed: boolean } | { ok: false; 
 export type ModuleTurnStatus = Extract<SessionEvent['body'], { t: 'turn.completed' }>['status'];
 
 /**
- * What a module hooks into. The daemon serves `onTurnCompleted` and `inputHint`; a module that sets
- * any other fails to set up, naming it (see the file comment). Each says which feature it is for.
+ * What a module hooks into. The daemon serves `onTurnCompleted`, `inputHint`, `onUndispatched`,
+ * `onAction`, `resolver` and `identities`; a module that sets any other fails to set up, naming it
+ * (see the file comment). Each says which feature it is for.
  */
 export interface ModuleHooks {
-  /** An input no rule dispatched and no host took (a stranger's message to be asked about). */
-  onUndispatched?(a: { env: InboundEnvelope; origin: Origin; input: InputRecord }): void | Promise<void>;
-  /** Clicks on buttons whose action id starts with `prefix` (the stranger cards' `aio:stranger:`). */
+  /**
+   * An input no rule dispatched and no host took (dropped, or only recorded as context), after it
+   * was routed: for every module in registration order, each awaited, from when the daemon runs
+   * (inputs come in once its channels run, before the modules' `start`) to the end (its stop too,
+   * until it refuses inbound). `addressed`: the input addresses the deployment (a DM, an @ of one
+   * of its accounts, a click: what a binding's `mentions: ["self"]` matches), unless the adapter
+   * says it does not (`admission: "observe"`, a reaction). A throw or a rejected promise is logged
+   * (`module <id>: onUndispatched failed: …`); the next module still hears it. The stranger
+   * approval: a stranger's message to ask the owner about.
+   */
+  onUndispatched?(a: { env: InboundEnvelope; origin: Origin; input: InputRecord; addressed: boolean }): void | Promise<void>;
+  /**
+   * Clicks on buttons whose action id starts with `prefix` (a non-empty string no other module's
+   * prefix starts, or is the start of: the stranger cards' `aio:stranger:`), before the click is
+   * routed and after the kernel's own buttons (approvals, questions, stop) are told apart, for
+   * clicks that are not the deployment's own echo or dropped by the adapter. A result means it was
+   * handled: nothing is routed, and the click's result is it (a `reason` that is not a string is
+   * `refused`). Undefined routes the click as usual (a binding's `actionPrefix`). A throw is the
+   * click's error, as the ingress's own would be. Served from when the daemon runs to the end. The
+   * stranger approval: the owner's answer on a card.
+   */
   onAction?: { prefix: string; handle(a: { actionId: string; env: InboundEnvelope; origin: Origin }): ModuleActionResult | undefined | Promise<ModuleActionResult | undefined> };
   /**
    * A turn of a session ended, whatever its status (not a task run's turn): called right after its
@@ -221,7 +241,14 @@ export interface ModuleHooks {
   onTurnCompleted?(a: { sessionKey: string; turnId: string; status: ModuleTurnStatus }): void;
   /** A conversation's current topic changed. */
   onTopicChanged?(c: ModuleTopicChange): void;
-  /** Who answers a turn's requests, before the local policy's resolver (asking the owner about a guest's turn). */
+  /**
+   * Who answers a request of a turn (`ctx`), before the local policy's resolver: the first module,
+   * in registration order, that gives one decides; with none, the local policy's (`Policy.resolve`
+   * of the built-in policy) does. A connected host whose hello lists `resolve` is asked before
+   * both, and they decide when it cannot answer; an embedder's own `Policy.resolve` replaces both.
+   * Synchronous and quick; a throw is the policy's error (the lane denies the request). Served
+   * from when the daemon runs to the end. The stranger approval: a guest's turn asks the owner.
+   */
   resolver?(ctx: TurnContext): Resolver | undefined;
   /** The run of a session's next turn, over what the agent's policy planned (presets, the owner's overrides). */
   planRun?(a: { sessionKey: string; run: RunSpec; draft: TurnDraft }): RunSpec;
@@ -238,7 +265,13 @@ export interface ModuleHooks {
   inputHint?(agent: string | undefined): string | undefined;
   /** Lines `/status` adds for a session. */
   statusLines?(sessionKey: string): string[];
-  /** Identity map entries next to the configured ones (guests). */
+  /**
+   * The module's identity map entries when the daemon starts (`KernelContext.router.setExtraIdentities`
+   * replaces them later): asked once, when the kernel is ready and before any input is identified
+   * (before the channels run). They rank below the configured identities and a host's map, which
+   * win for the same channel identity. A throw, or anything but an array, fails the start. The
+   * stranger approval: its guests.
+   */
   identities?(): IdentityEntry[];
 }
 
@@ -497,7 +530,7 @@ export interface KernelContext {
   readonly router: {
     /** Who a channel identity is (the identity maps: the config's, a host's, the modules' extra entries). */
     identify(a: IdentifyArgs): Promise<Identity>;
-    /** This module's extra identity map entries (replacing its earlier ones), below the configured and the host's. */
+    /** This module's extra identity map entries (replacing its earlier ones, those of its `identities` hook too), below the configured and the host's. */
     setExtraIdentities(entries: IdentityEntry[]): void;
     /** A new topic of a flat conversation with an agent (current from now on); its id. */
     newTopic(agent: string, conversation: string, title?: string): string;
@@ -553,6 +586,11 @@ export interface KernelContext {
    * own bounds, checked before, are the local allowance).
    */
   outbound(from: TurnContext, to: ReplyRoute): Promise<'allow' | 'deny'>;
+  /**
+   * The deployment's owner: the principals that are it (`policy.owners`, and `AGENTS_IO_OWNERS`),
+   * and the one session every owner DM goes to (`policy.ownerSessionKey`), when the deployment fixes one.
+   */
+  owner(): { principals: string[]; sessionKey?: string };
   /** The owner's own chat with the deployment (no reply target), while known. */
   ownerRoute(): ReplyRoute | null;
   /**

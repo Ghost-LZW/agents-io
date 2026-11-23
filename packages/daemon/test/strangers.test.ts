@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { SessionEvent } from '@agents-io/protocol';
 import { MemorySessionLog } from '@agents-io/session';
-import { FakeChannel, FakeHarness, type FakeTurnScript } from '@agents-io/testkit';
+import { FakeChannel, FakeHarness, defaultChannelCaps, type FakeTurnScript } from '@agents-io/testkit';
 import { resolveConfig } from '../src/config.js';
 import { Gateway } from '../src/gateway.js';
 import { cleanups, until } from './gateway-helpers.js';
@@ -17,7 +17,7 @@ import { cleanups, until } from './gateway-helpers.js';
 const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };
 const eve = { channelUserId: 'eve', displayName: 'Eve', evidence: 'platform_signed' as const };
 
-async function setup(o: { strangers?: 'drop' | 'ask'; script?: FakeTurnScript } = {}) {
+async function setup(o: { strangers?: 'drop' | 'ask'; script?: FakeTurnScript; more?: FakeChannel[] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'aio-strangers-'));
   const base = resolveConfig(
     { policy: { owners: ['fake:alice'], ownerSessionKey: 'main', strangers: o.strangers ?? 'ask' }, local: { principal: 'me' } },
@@ -26,7 +26,7 @@ async function setup(o: { strangers?: 'drop' | 'ask'; script?: FakeTurnScript } 
   const config = { ...base, socketPath: join(dir, 'run', 'aio.sock') };
   const chat = new FakeChannel('fake');
   const harness = new FakeHarness(o.script);
-  const gw = await Gateway.start({ config, harness, log: new MemorySessionLog(), channels: [{ adapter: chat }], logger: () => {} });
+  const gw = await Gateway.start({ config, harness, log: new MemorySessionLog(), channels: [{ adapter: chat }, ...(o.more ?? []).map((adapter) => ({ adapter }))], logger: () => {} });
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   cleanups.push(() => gw.stop());
   // The owner's chat becomes known with the owner's first message.
@@ -136,6 +136,17 @@ describe('strangers: ask', () => {
     await click(w.chat, allow.id);
     const reply = await until(() => w.chat.sent.find((s) => s.route.conversationId === 'c-eve' && s.finalized));
     expect(reply.edits.at(-1)?.text ?? reply.msg.text).toBe('got allow_once');
+  });
+
+  it('a stranger\'s message on a channel anyone may write to (caps.openInbox: mail) is never asked about and runs nothing #ID-9', async () => {
+    const inbox = new FakeChannel('post', { ...defaultChannelCaps, evidence: ['dkim_pass'], openInbox: true });
+    const w = await setup({ more: [inbox] });
+    await inbox.inject({ conversation: { id: '<m1@x>', kind: 'mail' }, sender: { channelUserId: 'eve@example.com', evidence: 'dkim_pass' }, text: 'buy now' });
+    await inbox.inject({ conversation: { id: 'c-eve', kind: 'dm' }, sender: { channelUserId: 'eve@example.com', evidence: 'dkim_pass' }, text: 'hello?' });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(askCard(w.chat)).toBeUndefined();
+    expect(inbox.sent).toEqual([]);
+    expect(w.harness.sessions).toHaveLength(1);
   });
 
   it('default "drop": a stranger\'s DM is dropped and nobody is asked #ID-9', async () => {

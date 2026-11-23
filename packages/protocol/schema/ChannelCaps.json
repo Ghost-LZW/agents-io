@@ -203,6 +203,9 @@
     "declaresSender": {
       "type": "boolean"
     },
+    "openInbox": {
+      "type": "boolean"
+    },
     "pacing": {
       "type": "object",
       "properties": {

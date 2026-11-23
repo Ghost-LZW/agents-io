@@ -1,6 +1,5 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, rmSync } from 'node:fs';
-import { DatabaseSync } from 'node:sqlite';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -44,7 +43,6 @@ import {
   type ExternalSender,
   type KernelLaneHarness,
   type KernelSendResult,
-  type Resolver,
   type RunSpec,
   type SessionLaunch,
   type SessionPrepare,
@@ -118,7 +116,6 @@ import { privateDb, privateDir } from './private.js';
 import { DaemonRecords, type CauseRecord, type OutboundRecord } from './records.js';
 import { checkLaunch, launchView, sameLaunch, type LaunchCheck } from './launch.js';
 import { RUN_RULE, Runs, type RunOverrides } from './runs.js';
-import { Strangers } from './strangers.js';
 import { runCommand, type CommandHost, type CommandTable } from './commands.js';
 import { ModuleHost, ModuleRegistry, kernelContext, type KernelBackend, type ResolvedModule } from './modules.js';
 import { ephemeralTurn } from './ephemeral-turn.js';
@@ -308,7 +305,7 @@ export class Gateway {
   readonly modules: ModuleHost;
   /** The chat commands: the kernel's, then the active modules'. */
   private readonly commandTable: CommandTable;
-  /** Extra identity map entries by who set them (the stranger guests, each module's), merged into the router's. */
+  /** Extra identity map entries by who set them (each module's: the stranger approval's guests), merged into the router's. */
   private readonly extraIdentities = new Map<string, IdentityEntry[]>();
   /** Host output tools, when some agent has `tools` on; mounted over MCP into those agents' harness bindings only. */
   readonly tools: HostTools | undefined;
@@ -322,8 +319,6 @@ export class Gateway {
   private readonly externalSends = new Map<string, ExternalSender>();
   /** The durable host inbound queue (`on: "host"` rules), in the log's database. */
   readonly hostQueue: HostQueue;
-  /** `policy.strangers: "ask"`: messages from people the deployment does not know are asked about (decision 15). */
-  private readonly strangers: Strangers | undefined;
   /** Claude Code TUIs attached to sessions (decision 15, S2). */
   private readonly claudeTui: ClaudeTuiService;
   /** Who sent each channel message (`input.verify`), settled deliveries, session → agent. */
@@ -452,8 +447,8 @@ export class Gateway {
       ...base,
       // The router's identity maps (the owners config; a host's map once one is pushed).
       identify: async (a) => router.identify(a),
-      // With `strangers: ask`, what a non-owner's turn asks for is asked of the owner, in their chat (decision 15).
-      resolve: async (req, ctx, extra) => this.askOwner(ctx) ?? base.resolve(req, ctx, extra),
+      // The modules' resolvers first (the stranger approval: a guest's turn asks the owner, in their chat, decision 15).
+      resolve: async (req, ctx, extra) => modules.resolver(ctx) ?? base.resolve(req, ctx, extra),
       // The host (authenticated with the token) may interrupt and cancel what it started and what it watches.
       control: async (a) => (isHostOrigin(a.origin) ? 'allow' : base.control(a)),
       ...o.policy,
@@ -623,36 +618,23 @@ export class Gateway {
       onHistoryError: (err, a) => this.log('warn', `history (${a.scope}) for ${a.inputId} in ${a.sessionKey} not handed: ${(err as Error).message}`),
       // `/help`, `/status`, `/stop`, `/model`… from the owner, answered on the route they came from.
       onCommand: (a) => this.command$(a),
-      ...(c.policy.strangers === 'ask'
+      // The modules' clicks (the stranger cards' buttons) and inputs nothing dispatched (a stranger's
+      // message), only when a module hooks them.
+      ...(modules.hooked('onAction')
         ? {
-            onAction: (a) => this.strangers?.action(a),
+            onAction: async (a: { actionId: string; env: InboundEnvelope; origin: Origin }) => {
+              const result = await modules.action(a);
+              return result && { accepted: true, action: 'command' as const, origin: a.origin, result };
+            },
+          }
+        : {}),
+      ...(modules.hooked('onUndispatched')
+        ? {
             // Addressed: a DM or an @ of us, unless the adapter says it is not (`observe`: a reaction, RT-2).
-            onUndispatched: (a) => this.strangers?.undispatched(a, addressesSelf(a.env, new Set(c.policy.selfAccounts))),
+            onUndispatched: (a: { env: InboundEnvelope; origin: Origin; input: InputRecord }) => modules.undispatched({ ...a, addressed: addressesSelf(a.env, new Set(c.policy.selfAccounts)) }),
           }
         : {}),
     });
-    if (c.policy.strangers === 'ask') {
-      this.strangers = new Strangers({
-        db: db.db ?? new DatabaseSync(':memory:'),
-        ownerRoute: () => this.ownerRoute(),
-        send: async (route, msg, operationId) => {
-          const ch = this.channelFor(route);
-          if (!ch) return undefined;
-          const rec = await this.outbox.send(ch.adapter, { operationId, sessionKey: c.policy.ownerSessionKey ?? 'strangers', route, msg });
-          return rec.status === 'delivered' ? rec.providerMessageId : undefined;
-        },
-        edit: async (route, id, msg) => {
-          await this.channelFor(route)?.adapter.edit?.(route, id, msg, { operationId: `stranger:${id}:answered`, sequence: 1 });
-        },
-        admit: async (item, session) => {
-          const r = await this.ingress.redispatch(item, { session, by: 'owner' });
-          if (!r.ok) return { ok: false, message: r.message };
-          return r.outcome.result?.ok === false ? { ok: false, message: r.outcome.result.reason } : { ok: true };
-        },
-        onGuests: (entries) => this.setExtraIdentities('strangers', entries),
-        log: (level, msg) => this.log(level, msg),
-      });
-    }
     if (c.source) {
       this.configStore = new ConfigStore({
         path: c.source.path,
@@ -666,7 +648,7 @@ export class Gateway {
     }
   }
 
-  /** One owner's extra identity map entries (`strangers`: the guests; `module:<id>`: a module's), replacing its earlier ones. */
+  /** One owner's extra identity map entries (`module:<id>`: a module's, such as the stranger approval's guests), replacing its earlier ones. */
   private setExtraIdentities(owner: string, entries: IdentityEntry[]): void {
     this.extraIdentities.set(owner, entries);
     this.router.setExtraIdentities([...this.extraIdentities.values()].flat());
@@ -752,6 +734,10 @@ export class Gateway {
         return rec ? { ...sendResult(rec), route: rec.route } : undefined;
       },
       outbound: (from, to) => gw().externalOutbound(from, to),
+      owner: () => {
+        const p = gw().config.policy;
+        return { principals: p.owners, ...(p.ownerSessionKey !== undefined ? { sessionKey: p.ownerSessionKey } : {}) };
+      },
       ownerRoute: () => gw().ownerRoute(),
       redispatch: async (item, o) => {
         const r = await gw().ingress.redispatch(item, { by: o.by, ...(o.session !== undefined ? { session: o.session } : {}), ...(o.agent !== undefined ? { agent: o.agent } : {}) });
@@ -784,13 +770,23 @@ export class Gateway {
     // late-bound: it works once the gateway exists.
     const registry = o.moduleRegistry ?? builtinModules;
     const defaults = o.config.modules === undefined ? builtinDefaults(registry) : undefined;
-    const modules = new ModuleHost({ registry, resolved: o.config.modules, config: o.config, ...(defaults ? { defaults } : {}), log: o.logger ?? defaultLog });
+    const modules = new ModuleHost({
+      registry,
+      resolved: o.config.modules,
+      config: o.config,
+      ...(defaults ? { defaults } : {}),
+      // An old on/off field written since the config resolved (`Config.policy.strangers`): the module as that value in a file makes it.
+      switched: (id, file) => resolveModules(file, new ModuleRegistry([registry.get(id)!]), {}, (p) => resolvePath(p))[0]!,
+      log: o.logger ?? defaultLog,
+    });
     const ref: { gw?: Gateway } = {};
     const backend = Gateway.kernelBackend(ref, o.logger ?? defaultLog);
     await modules.setup((id) => kernelContext(id, backend));
     const gw = new Gateway(o, modules);
     ref.gw = gw;
     try {
+      // The modules' identities (the stranger approval's guests) before any input is identified.
+      modules.identities((id, entries) => gw.setExtraIdentities(`module:${id}`, entries));
       await gw.loadHarnessModules();
       gw.harness();
       if (gw.mcp) {
@@ -3109,20 +3105,6 @@ ${a.summary}` }],
     if (!r) return null;
     const { replyToMessageId: _r, ...route } = r;
     return route;
-  }
-
-  /**
-   * `strangers: ask`: a turn none of whose inputs is the owner's (a guest's, or one the owner
-   * let in) asks the owner about its requests, in the owner's chat. Owner turns, live
-   * delegations (decision 11 amendment) and turns with no owner chat known keep the local policy.
-   */
-  private askOwner(ctx: TurnContext): Resolver | undefined {
-    const c = this.o.config;
-    if (c.policy.strangers !== 'ask' || ctx.run.profile === 'bypass' || ctx.live) return undefined;
-    if (ctx.inputs.some((i) => (i.origin.principal?.labels ?? []).includes('owner'))) return undefined;
-    const to = this.ownerRoute();
-    if (!to || !c.policy.owners.length) return undefined;
-    return { kind: 'human', principals: [...c.policy.owners], routes: [routeKey(to)] };
   }
 
   /**
