@@ -52,7 +52,9 @@ see `docs/E2E.md` §0). New:
 - An **agent** is a named run configuration: harness instance (or `preset`), `model`, `effort`,
   `profile`, `cwd`, `tools` (mount the host MCP output tools; default top-level
   `outputTools`, which defaults to **false** since 2026-10-11: turn tools on per
-  agent with `"tools": true`, or for all agents with `"outputTools": true`), `instructionsFile` (Claude: appended to the preset system
+  agent with `"tools": true`, or for all agents with `"outputTools": true`; the watch, live and
+  topic tools are built-in modules, each group on unless its section says so:
+  `watchTools` / `liveTools` / `topicTools: { "enabled": false }`), `instructionsFile` (Claude: appended to the preset system
   prompt; Codex: developer instructions), `mode`. Without `instructionsFile` the
   harness keeps its own system prompt (Claude Code's preset, Codex's base instructions).
 - `mode: "task"` agents only run through `run.start` / `aio run`. A binding (config
@@ -453,7 +455,7 @@ goes to its current topic, also from `per-thread` rules such as the default
 - Inputs routed to a topic carry `channelContext.topic` / `topicTitle` (the model
   sees them in its input preface; an input rewritten into another topic's session,
   e.g. an answer to a question a parked topic asked, carries that topic) and, in the
-  current topic and when the target agent has the output tools, `topicTools`: one line on when to call `session_rotate` / `session_switch`
+  current topic and when the target agent is offered a topic tool, `topicTools`: one line on when to call `session_rotate` / `session_switch`
   (without it, small models never rotate). A message handed over by a rotate or
   switch carries `handedFrom` and a line saying to answer it there; the tools
   refuse to move it again, so topics cannot ping-pong.
@@ -527,8 +529,9 @@ aio console-link                                              (one-time console 
 
 A feature of the daemon can be a module: a `ModuleManifest` (`@agents-io/protocol`,
 `module.ts`) registered in a `ModuleRegistry` by the composition root (`bundle.ts`
-`builtinModules`, origin `builtin`; so far the topic titles, `topic-title`, and the external MCP
-endpoint, `external-mcp`). A third
+`builtinModules`, origin `builtin`; so far the topic titles, `topic-title`, the watch, live and
+topic tools, `tools.watch`, `tools.live`, `tools.topics`, and the external MCP endpoint,
+`external-mcp`). A third
 party's module has the same shape (origin `module`). The manifest says, without running anything:
 
 - `id` (`tools.watch`), `kind: 'feature'`, `needs` (`module:<id>`: another registered module,
@@ -549,11 +552,14 @@ party's module has the same shape (origin `module`). The manifest says, without 
   `needsTurn`), `commands` (chat commands: name, `/help` line, `ownerOnly`, default true);
 - `setup(kernel, config)`, which returns the `ModuleInstance`: a handler per tool and per
   command, `features()` (which of its features it advertises now; default all while it runs),
-  `status()`, `start()`, `stop()`, and `hooks.onTurnCompleted({ sessionKey, turnId, status })`:
+  `status()`, `start()`, `stop()`, and the hooks `onTurnCompleted({ sessionKey, turnId, status })`:
   called for every turn of a session (not a task run's) right after its `turn.completed` is
   logged, whatever its status, for each module in registration order, from when the gateway is
   built until step 4; it returns at once (a throw or a rejected promise is logged as
-  `module <id>: onTurnCompleted failed: …`).
+  `module <id>: onTurnCompleted failed: …`); and `inputHint(agent)`: the line an input routed to a
+  conversation's current topic carries for the agent it goes to (`channelContext.topicTools`;
+  the modules' lines in registration order, joined by a newline; none, no line), asked from when
+  the gateway is built to the end (a throw is logged as `module <id>: inputHint failed: …`).
 
 The registry checks every manifest and what they claim together (ids; config sections and
 aliases; tools, commands and features are each one module's and never the kernel's). Its option
@@ -582,9 +588,10 @@ lifecycle has five steps:
    `applied: "restart"`.
 
 The daemon assembles from the kernel's entries and the active modules' (a module that is off is
-not there at all): the model tool catalog (`toolCatalog`: the kernel's tools in `TOOL_DEFS`
-order, then the modules'; `agents.<name>.tools` may list a module's tool while it is on, and
-naming one of a module that is off is a config error saying which module), the chat command
+not there at all): the model tool catalog (`toolCatalog`: the kernel's six tools,
+`KERNEL_TOOL_NAMES`, in `TOOL_DEFS` order, then the modules'; `agents.<name>.tools` may list a
+module's tool while it is on, and naming one of a module that is off is a config error saying
+which module, `"watch_add" is a tool of module tools.watch, which is off`), the chat command
 table (`/help` lists the kernel's commands, then the modules'; the `/name` of a module that is
 off is an ordinary message), the `host.hello` features, and `GET /api/status` `modules`
 (`[{ id, origin, enabled, status? }]`, every registered module). With no module the tool list,
@@ -597,7 +604,13 @@ capabilities: `log` (prefixed `module <id>: `), `events` and `head` (a session's
 `records` (values under `module:<id>:`), `db` (the log's database; tables `module_<id>_…`),
 `topics` (`bySession`, `siblings`, `titleSource`, `setAutoTitle`: a generated title, set only
 while the topic's title is still generated and still the one the module read, then the latest
-card edited to carry it), `router` (`identify`, its own `setExtraIdentities`, `newTopic`,
+card edited to carry it; `rotate(sessionKey, turnId, { title, summary })` and
+`switch(sessionKey, turnId, topicId)`: the kernel's handover of the turn running in the session,
+TP-1, refused for any other turn), `watches` (`add`, `remove`, `list`: as the session's agent,
+`agentOrigin`, a watch always delivering into the session; `Policy.watch` decides), `live`
+(`join(sessionKey, turnId, a)`, `say`, `leave`: the kernel's live mechanism, decision 16; a join
+only for the turn running in the session), `agents` (`tools(agent)`: the tools an agent's
+sessions are offered, its list or for `tools: true` the endpoint's whole catalog), `router` (`identify`, its own `setExtraIdentities`, `newTopic`,
 `conversationAgent`, `record`: an input's routing record), `lanes` (`has`, `open`, `command`,
 `input`: a peer's input the module stamped, any other origin kind is refused; `harness`: what the
 module may run beside a configured agent's open lane, `{ ephemeral(turnId), ephemeralTurn({ turnId,
@@ -614,12 +627,22 @@ in-flight mark, EX-8), `settled`, `outbound` (the outbound check of a send that 
 reply, DL-6), `ownerRoute`, `redispatch`, `explain` and `host` (`connected`, `answers`, `heldBy`,
 `external`: the `external` callout, `isToken`: a module never gets the host token).
 
+The watch, live and topic tools (`src/tool-modules.ts`) are such modules over host-mcp's library:
+each declares its group of `TOOL_GROUP_DEFS` (`@agents-io/host-mcp`; a module tool that is one of
+these definition objects is listed and checked exactly as `TOOL_DEFS` has it, so the tools a
+harness is offered are byte for byte what the kernel offered) and runs it with
+`watchToolHandlers(k.watches)`, `liveToolHandlers(…)` over `k.live`, `topicToolHandlers(…)` over
+`k.topics`; the topic tools add the hint (`inputHint`) for an agent offered one of them. The
+watches and their routing, the live mechanism (its protocol, events and LN invariants) and the
+topic handover stay the kernel's. The live tools are offered also when no channel can open a
+live, as before (dropping them then would change the tool list: a later change).
+
 Not served yet: `ModuleManifest.admin` (registering a module with it fails), and of the
 instance the other `hooks` (`onUndispatched`, `onAction`, `onTopicChanged`, `resolver`,
-`planRun`, `harnessFor`, `inputHint`, `statusLines`, `identities`) and `localFrames` (setting one
+`planRun`, `harnessFor`, `statusLines`, `identities`) and `localFrames` (setting one
 fails the setup, naming it; a hook that is not a function too). They are the seams the features
-that move into modules next need (the watch / topic / live tools, strangers, owner commands and
-presets, the Claude Code terminal); each is served with the move that needs it. A module
+that move into modules next need (strangers, owner commands and presets, the Claude Code
+terminal); each is served with the move that needs it. A module
 section's strings are redacted by the console's general rule (a secret-looking key); `x-credential`
 marks in a module's schema are not read yet.
 
@@ -823,3 +846,39 @@ What changed for embedders with the follow-ups to core-slimming G4 / G6:
   before that hello: the offline caps after a failed first connect, so a granted owner was taken
   as a stranger); an inbound frame of a connection whose hello failed or was refused is never
   emitted (the peer is killed and redelivers to the next one). Frames are unchanged.
+
+What changed for embedders with core-slimming G6 step 3 (the watch, live and topic tools are modules):
+
+- `builtinModules` registers `tools.watch`, `tools.live` and `tools.topics` (`watchToolsModule`,
+  `liveToolsModule`, `topicToolsModule`, `src/tool-modules.ts`) after `topic-title` and before
+  `external-mcp`, so their tools come after the kernel's six in the order they always had. Their
+  sections are `watchTools`, `liveTools`, `topicTools` (only `enabled`; absent means on, so
+  existing configs offer the same tools; `{ "enabled": false }` turns a group off). `ConfigFile`
+  has them after `topicTitles`, before `externalMcp`; `GET /api/status` `modules` lists them.
+  The gateway no longer passes `HostToolsOptions.watches` / `topics` / `live` (or `agentOf`) to
+  its `HostTools`, and no longer computes the topic hint itself: the inputs of a current topic
+  carry what the modules' `inputHint` gives.
+- An embedder that gives `Gateway.start` a `ModuleRegistry` of its own gets these tools only when
+  it registers the modules (start from `builtinModules.modules`, as for the topic titles); with a
+  registry without them the agents are offered the kernel's six tools and no topic hint. A config
+  without `modules` at all (built by hand) still has them: `Gateway.start` gives the built-in
+  modules without a field their defaults (on).
+- New: the hook `inputHint` (served), `ModuleHost.inputHint`, `KernelContext.watches`,
+  `KernelContext.live`, `KernelContext.agents`, `KernelContext.topics.rotate` / `switch`,
+  `ModuleTopicHandover`, `KernelWatchResult`, `KernelUnwatchResult` (`@agents-io/protocol`);
+  `KERNEL_CAPABILITIES` has `watches`, `live`, `agents`; `ToolModuleSection` from `bundle.ts`.
+  `KernelBackend` gains `addWatch`, `removeWatch`, `listWatches`, `rotateTopic`, `switchTopic`,
+  `joinLive`, `sayLive`, `leaveLive` and `agentTools` (required, so this breaks an embedder that
+  implements it; one that only uses `Gateway` changes nothing).
+- `@agents-io/host-mcp`: `TOOL_DEFS` / `TOOL_NAMES` / `ToolName` live in `src/defs.ts` (the same
+  exports), next to the new `KERNEL_TOOL_NAMES`, `TOOL_GROUPS` and `ToolGroup`; new
+  `TOOL_GROUP_DEFS`, `watchToolHandlers`, `liveToolHandlers`, `topicToolHandlers`,
+  `SessionWatches`, `sessionWatches`. `HostToolsOptions.watches` / `topics` / `live` work as
+  before (their tools are then the kernel's, and a module offering the same group clashes); a
+  module may now offer a tool named like one of the groups' when the host passes no control for it
+  (it was refused as a kernel tool). `ModuleToolEntry.input` may be a zod shape (for one of
+  `TOOL_GROUP_DEFS`).
+- The tools a harness is offered (names, descriptions, input schemas, annotations, order), what
+  they answer and every error text are as before; the config error for a tool of a group that is
+  off names its module (`agents.<name>.tools: "watch_add" is a tool of module tools.watch, which
+  is off`).

@@ -23,6 +23,7 @@ import {
   type WatchDraft,
 } from '@agents-io/protocol';
 import { z } from 'zod';
+import { TOOL_DEFS, TOOL_GROUPS, type ToolGroup } from './defs.js';
 import type { DeliveryRecord, Hub, InboundRewrite, Outbox, Participant } from '@agents-io/session';
 import {
   CHOICE_KEY,
@@ -115,7 +116,10 @@ export interface HostToolsOptions {
   as?(sessionKey: string): string | undefined;
   /** The agent a session runs: its address `<agent>/<sessionKey>` is what the agent acts as (watches). */
   agentOf?(sessionKey: string): string | undefined;
-  /** Watch control (dev-gateway `addWatch`/`removeWatch`/`listWatches`); absent = no watch tools. */
+  /**
+   * Watch control (dev-gateway `addWatch`/`removeWatch`/`listWatches`); absent = no watch tools of
+   * the kernel's (a module may offer them: `TOOL_GROUP_DEFS.watch`, `watchToolHandlers`).
+   */
   watches?: WatchControl;
   /** Provenance of a session's turn (`Lane.provenance`), attached to every write the turn makes. */
   provenance?(sessionKey: string, turnId: string): TurnProvenance | undefined;
@@ -125,13 +129,15 @@ export interface HostToolsOptions {
    * the agent can @ anyone it has seen there, not only who spoke this turn. Absent: only this turn's.
    */
   participants?(sessionKey: string): Participant[];
-  /** Topics of the caller's conversation (decision 6); absent = no session_* tools. */
+  /** Topics of the caller's conversation (decision 6); absent = no session_* tools of the kernel's (a module may offer them: `TOOL_GROUP_DEFS.topics`). */
   topics?: TopicControl;
-  /** Live (realtime voice) control (decision 11); absent = no live_* tools. */
+  /** Live (realtime voice) control (decision 11); absent = no live_* tools of the kernel's (a module may offer them: `TOOL_GROUP_DEFS.live`). */
   live?: LiveControl;
   /**
    * Tools of the host's active modules (core-slimming G6), offered after the kernel's own, in
-   * this order; a module that is off is not here. Names are unique and none is a kernel tool's.
+   * this order; a module that is off is not here. Names are unique and none is a kernel tool's
+   * (the kernel's six, `KERNEL_TOOL_NAMES`, and a group's whose control the host passed). A tool
+   * that is one of `TOOL_GROUP_DEFS` is listed and checked as `TOOL_DEFS` has it.
    */
   modules?: readonly ModuleTools[];
 }
@@ -145,12 +151,16 @@ export interface ModuleTools {
   handlers: Readonly<Record<string, ModuleToolHandler>>;
 }
 
-/** A module's tool as the endpoint lists it: its input schema as zod (what the MCP SDK registers). */
+/**
+ * A module's tool as the endpoint lists it: its input schema as zod (what the MCP SDK registers):
+ * its JSON Schema as zod (`moduleToolInput`), or, for one of `TOOL_GROUP_DEFS`, the zod shape
+ * `TOOL_DEFS` has.
+ */
 export interface ModuleToolEntry {
   module: string;
   name: string;
   description: string;
-  input: z.ZodType;
+  input: z.ZodRawShape | z.ZodType;
   readOnly: boolean;
 }
 
@@ -271,15 +281,31 @@ export class HostTools {
   private readonly eventOnly: Set<string>;
   /** The active modules' tools by name, in catalog order (`HostToolsOptions.modules`). */
   private readonly moduleTools = new Map<string, { entry: ModuleToolEntry; def: ModuleToolDef; handler: ModuleToolHandler }>();
+  /**
+   * The tool groups of `TOOL_DEFS` (`TOOL_GROUPS`) by tool name: over the host's control when it
+   * passed one (`offered`), else over none (a direct `call` answers that the group is not available,
+   * unless a module offers the tool).
+   */
+  private readonly groupTools = new Map<string, { handler: ModuleToolHandler; needsTurn: boolean; offered: boolean }>();
 
   constructor(private readonly o: HostToolsOptions) {
     this.eventOnly = new Set(o.eventOnlyChannels ?? ['local']);
+    const groups: { readonly [G in ToolGroup]: [Record<string, ModuleToolHandler>, boolean] } = {
+      watch: [watchToolHandlers(o.watches ? sessionWatches(o.watches, o.agentOf) : undefined), !!o.watches],
+      live: [liveToolHandlers(o.live), !!o.live],
+      topics: [topicToolHandlers(o.topics), !!o.topics],
+    };
+    for (const g of Object.keys(TOOL_GROUPS) as ToolGroup[]) {
+      const [handlers, offered] = groups[g];
+      for (const def of TOOL_GROUP_DEFS[g]) this.groupTools.set(def.name, { handler: handlers[def.name]!, needsTurn: def.needsTurn !== false, offered });
+    }
     for (const m of o.modules ?? []) {
       for (const def of m.tools) {
         if (this.moduleTools.has(def.name)) throw new Error(`module ${m.module}: tool ${JSON.stringify(def.name)} is also module ${this.moduleTools.get(def.name)!.entry.module}'s`);
         const handler = m.handlers[def.name];
         if (typeof handler !== 'function') throw new Error(`module ${m.module}: tool ${JSON.stringify(def.name)} has no handler`);
-        const entry: ModuleToolEntry = { module: m.module, name: def.name, description: def.description, input: moduleToolInput(def), readOnly: def.readOnly === true };
+        // One of host-mcp's own group definitions is listed and checked as TOOL_DEFS has it (its zod shape).
+        const entry: ModuleToolEntry = { module: m.module, name: def.name, description: def.description, input: GROUP_SHAPES.get(def) ?? moduleToolInput(def), readOnly: def.readOnly === true };
         this.moduleTools.set(def.name, { entry, def, handler });
       }
     }
@@ -300,29 +326,28 @@ export class HostTools {
     return turn ? this.o.provenance?.(b.sessionKey, turn.turnId) : undefined;
   }
 
-  /** Whether the watch tools are offered (the host passed `watches`). */
+  /** Whether the watch tools are offered as the kernel's (the host passed `watches`; a module may offer them otherwise). */
   get hasWatches(): boolean {
     return !!this.o.watches;
   }
 
-  /** Whether the live_* tools are offered (the host passed `live`). */
+  /** Whether the live_* tools are offered as the kernel's (the host passed `live`; a module may offer them otherwise). */
   get hasLive(): boolean {
     return !!this.o.live;
   }
 
-  /** Whether the session_* tools are offered (the host passed `topics`). */
+  /** Whether the session_* tools are offered as the kernel's (the host passed `topics`; a module may offer them otherwise). */
   get hasTopics(): boolean {
     return !!this.o.topics;
   }
 
-  /** Session + turn → what its session_rotate / session_switch did (a retried call answers the same; a second handover is refused). */
-  private readonly handovers = new Map<string, { key: string; result: Record<string, unknown> }>();
-
   /** Run one tool. Returns the JSON text result; throws ToolError for anything the model should fix. */
   async call(b: ToolBinding, name: string, args: Record<string, unknown>, meta: CallMeta = {}): Promise<string> {
-    if (name === 'watch_add' || name === 'watch_remove' || name === 'watch_list') return json(await this.watchTool(b, name, args));
-    if (name === 'session_list') return json(this.sessionList(b));
-    const mod = this.moduleTools.get(name);
+    // A group tool runs over the host's control when it passed one; else a module's tool of that name, if any.
+    const g = this.groupTools.get(name);
+    const mod = g?.offered ? undefined : this.moduleTools.get(name);
+    const group = mod ? undefined : g;
+    if (group && !group.needsTurn) return json(await group.handler({ sessionKey: b.sessionKey, args }));
     if (mod && mod.def.needsTurn === false) return json(await this.moduleTool(mod.handler, { sessionKey: b.sessionKey, args }));
     const turn = this.o.turn(b.sessionKey);
     if (!turn) throw new ToolError('no turn is running in this session: output tools only work while you are answering a message');
@@ -340,14 +365,8 @@ export class HostTools {
       case 'reply_to':
       case 'send_message':
         return json(await this.message(b, turn, name, args, operationId));
-      case 'session_rotate':
-      case 'session_switch':
-        return json(await this.handover(b, turn, name, args, operationId));
-      case 'live_join':
-      case 'live_say':
-      case 'live_leave':
-        return json(await this.liveTool(b, turn, name, args, operationId));
       default:
+        if (group) return json(await group.handler({ sessionKey: b.sessionKey, turn, args, operationId }));
         if (mod) return json(await this.moduleTool(mod.handler, { sessionKey: b.sessionKey, turn, args, operationId }));
         throw new ToolError(`unknown tool ${name}`);
     }
@@ -362,39 +381,6 @@ export class HostTools {
       if (e instanceof ToolError) throw e;
       if (e instanceof Error && e.name === 'ToolError') throw new ToolError(e.message);
       throw e;
-    }
-  }
-
-  // ---- live (decision 11) ------------------------------------------------------------------
-
-  private async liveTool(b: ToolBinding, turn: TurnContext, name: 'live_join' | 'live_say' | 'live_leave', args: Record<string, unknown>, operationId: string) {
-    const live = this.o.live;
-    if (!live) throw new ToolError('live sessions are not available in this deployment');
-    try {
-      switch (name) {
-        case 'live_join': {
-          const target = str(args.target, 'target')!;
-          const r = await live.join(b.sessionKey, turn, {
-            target,
-            ...(str(args.channel, 'channel', true) ? { channel: args.channel as string } : {}),
-            ...(str(args.instructions, 'instructions', true) ? { instructions: args.instructions as string } : {}),
-            ...(str(args.voice, 'voice', true) ? { voice: args.voice as string } : {}),
-          });
-          return {
-            ok: true,
-            ...r,
-            note: 'You are now in the live session by voice. What people say there reaches you as delegated turns (inputs marked live=true); your answer in such a turn is spoken by the voice side, so keep it short and plain. The voice side may paraphrase wrongly: send results that matter as text (send_message to "current") as well. Call live_leave when asked to leave.',
-          };
-        }
-        case 'live_say':
-          await live.say(b.sessionKey, str(args.text, 'text')!, { operationId, turnId: turn.turnId });
-          return { ok: true };
-        case 'live_leave':
-          return { ok: true, left: await live.leave(b.sessionKey) };
-      }
-    } catch (e) {
-      if (e instanceof ToolError) throw e;
-      throw new ToolError(`${name} failed: ${(e as Error).message}`);
     }
   }
 
@@ -674,136 +660,6 @@ export class HostTools {
     return this.sent(rec);
   }
 
-  // ---- watches ----------------------------------------------------------------------------
-
-  private async watchTool(b: ToolBinding, name: 'watch_add' | 'watch_remove' | 'watch_list', args: Record<string, unknown>) {
-    const w = this.o.watches;
-    if (!w) throw new ToolError('watches are not available on this host');
-    const by = agentOrigin(b.sessionKey, this.o.agentOf?.(b.sessionKey));
-    const me = agentIdentity(b.sessionKey);
-    const view = (x: Watch) => ({ ...x, mine: x.createdBy === me });
-    if (name === 'watch_list') return { ok: true, session: b.sessionKey, watches: w.list(b.sessionKey).map(view) };
-    if (name === 'watch_remove') {
-      const id = str(args.id, 'id')!;
-      const existing = w.list(b.sessionKey).find((x) => x.id === id);
-      if (existing && existing.createdBy !== me) throw new ToolError(`watch ${id} was created by ${existing.createdBy}; you may only remove watches you created`);
-      const r = await w.remove(by, id);
-      if (!r.ok) throw new ToolError(r.code === 'forbidden' ? `you may only remove watches you created (${r.message})` : r.message);
-      return { ok: true, removed: r.removed, id };
-    }
-    // watch_add: the target is always the caller's own session.
-    if (args.target !== undefined || args.sessionKey !== undefined) throw new ToolError('watch_add has no target: a watch always delivers to your own session; remove the target argument');
-    const src = args.source as Record<string, unknown> | undefined;
-    if (!src || typeof src !== 'object') throw new ToolError('source is required: { channel, account?, conversation?, conversationKind?, senders? }');
-    const channel = str(src.channel, 'source.channel')!;
-    const kind = str(src.conversationKind, 'source.conversationKind', true);
-    if (kind && !WATCH_KINDS.includes(kind)) throw new ToolError(`source.conversationKind must be one of ${WATCH_KINDS.join(', ')}`);
-    const mode = str(args.mode, 'mode')!;
-    if (!WATCH_MODES.includes(mode)) throw new ToolError(`mode must be one of ${WATCH_MODES.join(', ')}`);
-    const senders = Array.isArray(src.senders) ? (src.senders as unknown[]).map(String) : undefined;
-    const keywords = Array.isArray(args.keywords) ? (args.keywords as unknown[]).map(String) : undefined;
-    const mentions = Array.isArray(args.mentions) ? (args.mentions as unknown[]).map(String) : undefined;
-    const every = typeof args.digest_every_minutes === 'number' ? args.digest_every_minutes : undefined;
-    const maxItems = typeof args.digest_max_items === 'number' ? args.digest_max_items : undefined;
-    if (mode === 'digest' && every === undefined) throw new ToolError('digest mode needs digest_every_minutes');
-    const expiresIn = typeof args.expires_in_minutes === 'number' ? args.expires_in_minutes : undefined;
-    const id = str(args.id, 'id', true);
-    const note = str(args.note, 'note', true);
-    const account = str(src.account, 'source.account', true);
-    const conversation = str(src.conversation, 'source.conversation', true);
-    const draft: WatchDraft = {
-      ...(id ? { id } : {}),
-      source: { channel, ...(account ? { account } : {}), ...(conversation ? { conversation } : {}), ...(kind ? { conversationKind: kind as never } : {}), ...(senders?.length ? { senders } : {}) },
-      ...(keywords?.length || mentions?.length ? { filter: { ...(keywords?.length ? { keywords } : {}), ...(mentions?.length ? { mentions } : {}) } } : {}),
-      target: { sessionKey: b.sessionKey },
-      mode: mode as WatchDraft['mode'],
-      ...(mode === 'digest' ? { digest: { everyMs: Math.round(every! * 60_000), ...(maxItems ? { maxItems } : {}) } } : {}),
-      ...(expiresIn ? { expiresAt: Date.now() + Math.round(expiresIn * 60_000) } : {}),
-      ...(note ? { note } : {}),
-    };
-    const r = await w.add(by, draft);
-    if (!r.ok) {
-      const what = [channel, account, conversation ?? kind].filter(Boolean).join(':');
-      if (r.code === 'forbidden' && /not allowed to watch/.test(r.message))
-        throw new ToolError(`the source ${what} is not on the owner's watch allowlist, so you cannot watch it; ask the owner to add it (policy.watchAllowlist) or to create the watch themselves`);
-      throw new ToolError(r.message);
-    }
-    return { ok: true, watch: view(r.watch) };
-  }
-
-  // ---- topics -----------------------------------------------------------------------------
-
-  private topicsOf(b: ToolBinding): { control: TopicControl; topics: Topic[] } {
-    const control = this.o.topics;
-    if (!control) throw new ToolError('topics are not available on this host');
-    const topics = control.list(b.sessionKey);
-    if (!topics) throw new ToolError('this conversation does not keep topics (its binding does not use session "topic", or it is threaded): session_rotate / session_switch are not available here; just answer');
-    return { control, topics };
-  }
-
-  private sessionList(b: ToolBinding) {
-    const { topics } = this.topicsOf(b);
-    return {
-      ok: true,
-      topics: topics.map((t) => ({
-        topicId: t.id,
-        title: t.title ?? null,
-        current: t.state === 'current',
-        ...(t.sessionKey === b.sessionKey ? { you: true } : {}),
-        summary: t.summary ?? null,
-        lastActiveAt: new Date(t.lastActiveAt).toISOString(),
-      })),
-      note: 'Newest activity first; `you` marks the topic this session is. session_switch({topicId}) resumes a parked topic with its full earlier context; session_rotate({title, summary}) starts a new one.',
-    };
-  }
-
-  private async handover(b: ToolBinding, turn: TurnContext, tool: 'session_rotate' | 'session_switch', args: Record<string, unknown>, operationId: string) {
-    const hk = `${b.sessionKey}\u0000${turn.turnId}`;
-    const prior = this.handovers.get(hk);
-    if (prior?.key === operationId) return prior.result;
-    if (prior) throw new ToolError('this turn was already handed to another topic; end the turn now without answering');
-    const { control, topics } = this.topicsOf(b);
-    const me = topics.find((t) => t.sessionKey === b.sessionKey);
-    if (me && me.state !== 'current') throw new ToolError("this topic is no longer the conversation's current one (the user or another turn switched); just answer here");
-    const own = turn.inputs.filter((i) => i.channelContext.context !== true);
-    if (!own.length) throw new ToolError('this turn has no message to hand over');
-    // A message just handed here by a rotate/switch is this topic's to answer: no ping-pong between topics.
-    if (own.every((i) => i.channelContext.handedFrom !== undefined)) throw new ToolError('this message was just handed to this topic by a topic switch; answer it here, in this turn');
-    let r: TopicHandover;
-    if (tool === 'session_rotate') {
-      const title = str(args.title, 'title')!.trim();
-      const summary = str(args.summary, 'summary')!.trim();
-      if (!title) throw new ToolError('title is required');
-      if (!summary) throw new ToolError('summary is required: what the new topic should know from this one (or "none")');
-      r = await control.rotate(b.sessionKey, turn, { title, summary });
-    } else {
-      const topicId = str(args.topicId ?? args.topic_id, 'topicId')!;
-      const target = topics.find((t) => t.id === topicId);
-      if (!target) throw new ToolError(`no topic ${topicId} in this conversation; session_list shows the topic ids`);
-      if (target.sessionKey === b.sessionKey) throw new ToolError('you are already in that topic; just answer');
-      r = await control.switch(b.sessionKey, turn, { topicId });
-    }
-    const label = `"${r.topic.title ?? r.topic.id}"`;
-    const short = r.topic.title ?? (tool === 'session_rotate' ? 'new topic' : 'earlier topic');
-    const result = {
-      ok: true,
-      topic: { topicId: r.topic.id, title: r.topic.title ?? null },
-      ...(r.previous ? { previous: { topicId: r.previous.id, title: r.previous.title ?? null } } : {}),
-      handed: r.handed.length,
-      note:
-        (tool === 'session_rotate'
-          ? `The conversation moved to the new topic ${label}. The user's message has been handed to it, with your summary as context, and that topic's session answers it there.`
-          : `The conversation is back in topic ${label}; its session resumes with its full earlier context and answers the user's message there.`) +
-        ` Do NOT answer the message in this turn: end the turn now, writing nothing more (at most one short line such as "→ ${short}").`,
-    };
-    this.handovers.set(hk, { key: operationId, result });
-    for (const k of this.handovers.keys()) {
-      if (this.handovers.size <= 1000) break;
-      this.handovers.delete(k);
-    }
-    return result;
-  }
-
   // ---- answers coming back ----------------------------------------------------------------
 
   /** A choice this gateway asked (memory first, then the session logs: survives a restart). */
@@ -905,6 +761,250 @@ export class HostTools {
       return this.choiceAnswer(c.data.choiceId, numbers, 'command').content;
     });
   }
+}
+
+// ---- the tool groups: watches, live (decision 11), topics (decision 6) -------------------------
+
+type WatchToolName = (typeof TOOL_GROUPS.watch)[number];
+type LiveToolName = (typeof TOOL_GROUPS.live)[number];
+type TopicToolName = (typeof TOOL_GROUPS.topics)[number];
+
+/** The zod shape of each of `TOOL_GROUP_DEFS`, by the definition object: what an endpoint registers for a module's tool that is one. */
+const GROUP_SHAPES = new Map<ModuleToolDef, z.ZodRawShape>();
+
+/** A group tool of `TOOL_DEFS` as a module tool definition (`TOOL_GROUP_DEFS`): its `input` the JSON Schema of its zod shape. */
+function groupDef(name: WatchToolName | LiveToolName | TopicToolName, needsTurn: boolean): ModuleToolDef {
+  const def = TOOL_DEFS[name];
+  const { $schema: _s, ...input } = z.toJSONSchema(z.object(def.input), { target: 'draft-7', io: 'input' });
+  const out: ModuleToolDef = Object.freeze({ name, description: def.description, input: input as unknown as ModuleToolDef['input'], ...('readOnly' in def && def.readOnly ? { readOnly: true } : {}), needsTurn });
+  GROUP_SHAPES.set(out, def.input);
+  return out;
+}
+
+/**
+ * The tool groups of `TOOL_DEFS` beyond the kernel's own (`TOOL_GROUPS`) as module tool definitions
+ * (core-slimming G6), for a module that offers a group: it declares these objects as its
+ * `mcpTools` and runs them with `watchToolHandlers` / `liveToolHandlers` / `topicToolHandlers`
+ * (the daemon's `tools.watch`, `tools.live`, `tools.topics`). An endpoint lists and checks a
+ * module's tool that is one of these objects (the same object) exactly as `TOOL_DEFS` has it, so
+ * what a model is offered does not depend on who offers the group. `input` is the JSON Schema of
+ * the zod shape, for what reads a manifest. The watch tools and `session_list` need no turn.
+ */
+export const TOOL_GROUP_DEFS: { readonly [G in ToolGroup]: readonly ModuleToolDef[] } = Object.freeze({
+  watch: Object.freeze(TOOL_GROUPS.watch.map((n) => groupDef(n, false))),
+  live: Object.freeze(TOOL_GROUPS.live.map((n) => groupDef(n, true))),
+  topics: Object.freeze(TOOL_GROUPS.topics.map((n) => groupDef(n, n !== 'session_list'))),
+});
+
+/**
+ * What the watch tools need: the watches of a session as its agent (the daemon's
+ * `KernelContext.watches`). `Policy.watch` is applied behind `add`.
+ */
+export interface SessionWatches {
+  /** Create or replace a watch as the session's agent (`agentOrigin`), delivering into the session (`draft.target`). */
+  add(sessionKey: string, draft: WatchDraft): Promise<{ ok: true; watch: Watch } | { ok: false; code: string; message: string }>;
+  /** Remove a watch as the session's agent. */
+  remove(sessionKey: string, id: string): Promise<{ ok: true; removed: boolean } | { ok: false; code: string; message: string }>;
+  /** The watches delivering into the session. */
+  list(sessionKey: string): Watch[];
+}
+
+/** A host's `WatchControl` as `SessionWatches`: the session's agent acts as `agentOrigin(sessionKey, agentOf(sessionKey))`. */
+export function sessionWatches(w: WatchControl, agentOf?: (sessionKey: string) => string | undefined): SessionWatches {
+  const by = (sessionKey: string) => agentOrigin(sessionKey, agentOf?.(sessionKey));
+  return { add: (key, d) => w.add(by(key), d), remove: (key, id) => w.remove(by(key), id), list: (key) => w.list(key) };
+}
+
+/**
+ * The watch tools (`watch_add`, `watch_remove`, `watch_list`) over `w`: a watch always delivers into
+ * the calling session, and an agent removes only watches it created. Without `w` each says watches
+ * are not available.
+ */
+export function watchToolHandlers(w: SessionWatches | undefined): Record<WatchToolName, ModuleToolHandler> {
+  const tool = (name: WatchToolName): ModuleToolHandler => (c) => watchTool(w, c.sessionKey, name, c.args);
+  return { watch_add: tool('watch_add'), watch_remove: tool('watch_remove'), watch_list: tool('watch_list') };
+}
+
+/** The live tools (`live_join`, `live_say`, `live_leave`) over `live`; without it each says live sessions are not available. */
+export function liveToolHandlers(live: LiveControl | undefined): Record<LiveToolName, ModuleToolHandler> {
+  const tool = (name: LiveToolName): ModuleToolHandler => (c) => liveTool(live, c.sessionKey, c.turn!, name, c.args, c.operationId!);
+  return { live_join: tool('live_join'), live_say: tool('live_say'), live_leave: tool('live_leave') };
+}
+
+/**
+ * The topic tools (`session_rotate`, `session_list`, `session_switch`) over `control`: a turn is
+ * handed over once (a retried call answers the same), never a message just handed here (TP-1).
+ * Without `control` each says topics are not available.
+ */
+export function topicToolHandlers(control: TopicControl | undefined): Record<TopicToolName, ModuleToolHandler> {
+  /** Session + turn → what its session_rotate / session_switch did (a retried call answers the same; a second handover is refused). */
+  const handovers = new Map<string, { key: string; result: Record<string, unknown> }>();
+  return {
+    session_rotate: (c) => handover(control, handovers, c.sessionKey, c.turn!, 'session_rotate', c.args, c.operationId!),
+    session_list: (c) => sessionList(control, c.sessionKey),
+    session_switch: (c) => handover(control, handovers, c.sessionKey, c.turn!, 'session_switch', c.args, c.operationId!),
+  };
+}
+
+async function liveTool(live: LiveControl | undefined, sessionKey: string, turn: TurnContext, name: LiveToolName, args: Record<string, unknown>, operationId: string) {
+  if (!live) throw new ToolError('live sessions are not available in this deployment');
+  try {
+    switch (name) {
+      case 'live_join': {
+        const target = str(args.target, 'target')!;
+        const r = await live.join(sessionKey, turn, {
+          target,
+          ...(str(args.channel, 'channel', true) ? { channel: args.channel as string } : {}),
+          ...(str(args.instructions, 'instructions', true) ? { instructions: args.instructions as string } : {}),
+          ...(str(args.voice, 'voice', true) ? { voice: args.voice as string } : {}),
+        });
+        return {
+          ok: true,
+          ...r,
+          note: 'You are now in the live session by voice. What people say there reaches you as delegated turns (inputs marked live=true); your answer in such a turn is spoken by the voice side, so keep it short and plain. The voice side may paraphrase wrongly: send results that matter as text (send_message to "current") as well. Call live_leave when asked to leave.',
+        };
+      }
+      case 'live_say':
+        await live.say(sessionKey, str(args.text, 'text')!, { operationId, turnId: turn.turnId });
+        return { ok: true };
+      case 'live_leave':
+        return { ok: true, left: await live.leave(sessionKey) };
+    }
+  } catch (e) {
+    if (e instanceof ToolError) throw e;
+    throw new ToolError(`${name} failed: ${(e as Error).message}`);
+  }
+}
+
+async function watchTool(w: SessionWatches | undefined, sessionKey: string, name: WatchToolName, args: Record<string, unknown>) {
+  if (!w) throw new ToolError('watches are not available on this host');
+  const me = agentIdentity(sessionKey);
+  const view = (x: Watch) => ({ ...x, mine: x.createdBy === me });
+  if (name === 'watch_list') return { ok: true, session: sessionKey, watches: w.list(sessionKey).map(view) };
+  if (name === 'watch_remove') {
+    const id = str(args.id, 'id')!;
+    const existing = w.list(sessionKey).find((x) => x.id === id);
+    if (existing && existing.createdBy !== me) throw new ToolError(`watch ${id} was created by ${existing.createdBy}; you may only remove watches you created`);
+    const r = await w.remove(sessionKey, id);
+    if (!r.ok) throw new ToolError(r.code === 'forbidden' ? `you may only remove watches you created (${r.message})` : r.message);
+    return { ok: true, removed: r.removed, id };
+  }
+  // watch_add: the target is always the caller's own session.
+  if (args.target !== undefined || args.sessionKey !== undefined) throw new ToolError('watch_add has no target: a watch always delivers to your own session; remove the target argument');
+  const src = args.source as Record<string, unknown> | undefined;
+  if (!src || typeof src !== 'object') throw new ToolError('source is required: { channel, account?, conversation?, conversationKind?, senders? }');
+  const channel = str(src.channel, 'source.channel')!;
+  const kind = str(src.conversationKind, 'source.conversationKind', true);
+  if (kind && !WATCH_KINDS.includes(kind)) throw new ToolError(`source.conversationKind must be one of ${WATCH_KINDS.join(', ')}`);
+  const mode = str(args.mode, 'mode')!;
+  if (!WATCH_MODES.includes(mode)) throw new ToolError(`mode must be one of ${WATCH_MODES.join(', ')}`);
+  const senders = Array.isArray(src.senders) ? (src.senders as unknown[]).map(String) : undefined;
+  const keywords = Array.isArray(args.keywords) ? (args.keywords as unknown[]).map(String) : undefined;
+  const mentions = Array.isArray(args.mentions) ? (args.mentions as unknown[]).map(String) : undefined;
+  const every = typeof args.digest_every_minutes === 'number' ? args.digest_every_minutes : undefined;
+  const maxItems = typeof args.digest_max_items === 'number' ? args.digest_max_items : undefined;
+  if (mode === 'digest' && every === undefined) throw new ToolError('digest mode needs digest_every_minutes');
+  const expiresIn = typeof args.expires_in_minutes === 'number' ? args.expires_in_minutes : undefined;
+  const id = str(args.id, 'id', true);
+  const note = str(args.note, 'note', true);
+  const account = str(src.account, 'source.account', true);
+  const conversation = str(src.conversation, 'source.conversation', true);
+  const draft: WatchDraft = {
+    ...(id ? { id } : {}),
+    source: { channel, ...(account ? { account } : {}), ...(conversation ? { conversation } : {}), ...(kind ? { conversationKind: kind as never } : {}), ...(senders?.length ? { senders } : {}) },
+    ...(keywords?.length || mentions?.length ? { filter: { ...(keywords?.length ? { keywords } : {}), ...(mentions?.length ? { mentions } : {}) } } : {}),
+    target: { sessionKey: sessionKey },
+    mode: mode as WatchDraft['mode'],
+    ...(mode === 'digest' ? { digest: { everyMs: Math.round(every! * 60_000), ...(maxItems ? { maxItems } : {}) } } : {}),
+    ...(expiresIn ? { expiresAt: Date.now() + Math.round(expiresIn * 60_000) } : {}),
+    ...(note ? { note } : {}),
+  };
+  const r = await w.add(sessionKey, draft);
+  if (!r.ok) {
+    const what = [channel, account, conversation ?? kind].filter(Boolean).join(':');
+    if (r.code === 'forbidden' && /not allowed to watch/.test(r.message))
+      throw new ToolError(`the source ${what} is not on the owner's watch allowlist, so you cannot watch it; ask the owner to add it (policy.watchAllowlist) or to create the watch themselves`);
+    throw new ToolError(r.message);
+  }
+  return { ok: true, watch: view(r.watch) };
+}
+
+function topicsOf(control: TopicControl | undefined, sessionKey: string): { control: TopicControl; topics: Topic[] } {
+  if (!control) throw new ToolError('topics are not available on this host');
+  const topics = control.list(sessionKey);
+  if (!topics) throw new ToolError('this conversation does not keep topics (its binding does not use session "topic", or it is threaded): session_rotate / session_switch are not available here; just answer');
+  return { control, topics };
+}
+
+function sessionList(control: TopicControl | undefined, sessionKey: string) {
+  const { topics } = topicsOf(control, sessionKey);
+  return {
+    ok: true,
+    topics: topics.map((t) => ({
+      topicId: t.id,
+      title: t.title ?? null,
+      current: t.state === 'current',
+      ...(t.sessionKey === sessionKey ? { you: true } : {}),
+      summary: t.summary ?? null,
+      lastActiveAt: new Date(t.lastActiveAt).toISOString(),
+    })),
+    note: 'Newest activity first; `you` marks the topic this session is. session_switch({topicId}) resumes a parked topic with its full earlier context; session_rotate({title, summary}) starts a new one.',
+  };
+}
+
+async function handover(
+  c: TopicControl | undefined,
+  handovers: Map<string, { key: string; result: Record<string, unknown> }>,
+  sessionKey: string,
+  turn: TurnContext,
+  tool: 'session_rotate' | 'session_switch',
+  args: Record<string, unknown>,
+  operationId: string,
+) {
+  const hk = `${sessionKey}\u0000${turn.turnId}`;
+  const prior = handovers.get(hk);
+  if (prior?.key === operationId) return prior.result;
+  if (prior) throw new ToolError('this turn was already handed to another topic; end the turn now without answering');
+  const { control, topics } = topicsOf(c, sessionKey);
+  const me = topics.find((t) => t.sessionKey === sessionKey);
+  if (me && me.state !== 'current') throw new ToolError("this topic is no longer the conversation's current one (the user or another turn switched); just answer here");
+  const own = turn.inputs.filter((i) => i.channelContext.context !== true);
+  if (!own.length) throw new ToolError('this turn has no message to hand over');
+  // A message just handed here by a rotate/switch is this topic's to answer: no ping-pong between topics.
+  if (own.every((i) => i.channelContext.handedFrom !== undefined)) throw new ToolError('this message was just handed to this topic by a topic switch; answer it here, in this turn');
+  let r: TopicHandover;
+  if (tool === 'session_rotate') {
+    const title = str(args.title, 'title')!.trim();
+    const summary = str(args.summary, 'summary')!.trim();
+    if (!title) throw new ToolError('title is required');
+    if (!summary) throw new ToolError('summary is required: what the new topic should know from this one (or "none")');
+    r = await control.rotate(sessionKey, turn, { title, summary });
+  } else {
+    const topicId = str(args.topicId ?? args.topic_id, 'topicId')!;
+    const target = topics.find((t) => t.id === topicId);
+    if (!target) throw new ToolError(`no topic ${topicId} in this conversation; session_list shows the topic ids`);
+    if (target.sessionKey === sessionKey) throw new ToolError('you are already in that topic; just answer');
+    r = await control.switch(sessionKey, turn, { topicId });
+  }
+  const label = `"${r.topic.title ?? r.topic.id}"`;
+  const short = r.topic.title ?? (tool === 'session_rotate' ? 'new topic' : 'earlier topic');
+  const result = {
+    ok: true,
+    topic: { topicId: r.topic.id, title: r.topic.title ?? null },
+    ...(r.previous ? { previous: { topicId: r.previous.id, title: r.previous.title ?? null } } : {}),
+    handed: r.handed.length,
+    note:
+      (tool === 'session_rotate'
+        ? `The conversation moved to the new topic ${label}. The user's message has been handed to it, with your summary as context, and that topic's session answers it there.`
+        : `The conversation is back in topic ${label}; its session resumes with its full earlier context and answers the user's message there.`) +
+      ` Do NOT answer the message in this turn: end the turn now, writing nothing more (at most one short line such as "→ ${short}").`,
+  };
+  handovers.set(hk, { key: operationId, result });
+  for (const k of handovers.keys()) {
+    if (handovers.size <= 1000) break;
+    handovers.delete(k);
+  }
+  return result;
 }
 
 function inside(p: string, dir: string): boolean {

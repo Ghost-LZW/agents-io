@@ -7,7 +7,7 @@ import { Type } from '@sinclair/typebox';
 import type { HarnessAdapter, InputRecord, KernelContext, ModuleInstance, ModuleManifest, ModuleResolveContext, ModuleToolCall } from '@agents-io/protocol';
 import { MemorySessionLog, TOPIC_KEY } from '@agents-io/session';
 import { FakeChannel, FakeHarness, type FakeTurnScript } from '@agents-io/testkit';
-import { TOOL_NAMES } from '@agents-io/host-mcp';
+import { KERNEL_TOOL_NAMES } from '@agents-io/host-mcp';
 import { builtinHarnesses, builtinModules } from '../src/bundle.js';
 import { LocalClient } from '../src/client.js';
 import { ConfigError, ConfigFile, configFileSchema, resolveConfig, type Config } from '../src/config.js';
@@ -78,6 +78,11 @@ function probe(
   };
 }
 
+/** The watch, live and topic tools as a file without their sections resolves them (on). */
+const TOOL_MODULES_RESOLVED = [{ id: 'tools.watch', enabled: true, config: {} }, { id: 'tools.live', enabled: true, config: {} }, { id: 'tools.topics', enabled: true, config: {} }];
+/** The watch, live and topic tools in `GET /api/status` `modules`, on. */
+const TOOL_MODULES = [{ id: 'tools.watch', origin: 'builtin', enabled: true }, { id: 'tools.live', origin: 'builtin', enabled: true }, { id: 'tools.topics', origin: 'builtin', enabled: true }];
+
 const resolve = (raw: Record<string, unknown>, moduleRegistry?: ModuleRegistry) => resolveConfig(raw, { env: {}, baseDir: '/base', cwd: '/work', ...(moduleRegistry ? { moduleRegistry } : {}) });
 
 const thrown = (f: () => unknown): string => {
@@ -90,19 +95,20 @@ const thrown = (f: () => unknown): string => {
 };
 
 describe('the module registry', () => {
-  it('the built-in ones are the topic titles, on by default, and the external MCP endpoint, off by default: their sections are in ConfigFile where externalMcp always was; an empty registry has no modules', () => {
-    expect(builtinModules.modules.map((m) => [m.manifest.id, m.origin])).toEqual([['topic-title', 'builtin'], ['external-mcp', 'builtin']]);
+  it('the built-in ones are the topic titles and the watch, live and topic tools, on by default, and the external MCP endpoint, off by default: their sections are in ConfigFile where externalMcp always was; an empty registry has no modules', () => {
+    expect(builtinModules.modules.map((m) => [m.manifest.id, m.origin])).toEqual([['topic-title', 'builtin'], ['tools.watch', 'builtin'], ['tools.live', 'builtin'], ['tools.topics', 'builtin'], ['external-mcp', 'builtin']]);
     expect(configFileSchema(builtinHarnesses)).toBe(ConfigFile);
-    expect(Object.keys(ConfigFile.properties).slice(-4)).toEqual(['host', 'topicTitles', 'externalMcp', 'local']);
-    expect(resolve({}).modules).toEqual([{ id: 'topic-title', enabled: true, config: {} }, { id: 'external-mcp', enabled: false }]);
+    expect(Object.keys(ConfigFile.properties).slice(-7)).toEqual(['host', 'topicTitles', 'watchTools', 'liveTools', 'topicTools', 'externalMcp', 'local']);
+    expect(resolve({}).modules).toEqual([{ id: 'topic-title', enabled: true, config: {} }, ...TOOL_MODULES_RESOLVED, { id: 'external-mcp', enabled: false }]);
     expect(resolve({}).externalMcp).toBeUndefined();
     // On: its settings are the module's, and (deprecated) Config.externalMcp is the same object.
     const on = resolve({ externalMcp: { clients: {} } });
     expect(on.modules).toEqual([
       { id: 'topic-title', enabled: true, config: {} },
+      ...TOOL_MODULES_RESOLVED,
       { id: 'external-mcp', enabled: true, config: { host: '127.0.0.1', port: 7465, clients: [], limits: { maxBodyBytes: 262144, maxTextChars: 16000, requestsPerMinute: 120, writesPerMinute: 20 } } },
     ]);
-    expect(on.externalMcp).toBe(on.modules![1]!.config);
+    expect(on.externalMcp).toBe(on.modules![4]!.config);
     // Without the module, the section is an unknown key (as any other); an empty registry gives no modules.
     const none = new ModuleRegistry([]);
     expect(resolve({}, none).modules).toBeUndefined();
@@ -221,7 +227,7 @@ describe('module config sections (lifecycle step 1)', () => {
     const r = new ModuleRegistry([probe('probe', []), probe('probe2', [])]);
     const tools = (list: string[], raw: Record<string, unknown> = {}) => resolve({ ...raw, agents: { chat: { harness: 'claude-code', tools: list } }, defaultAgent: 'chat' }, r);
     expect(tools(['probe_echo', 'send_message']).agents.chat).toMatchObject({ tools: true, toolNames: ['probe_echo', 'send_message'] });
-    expect(thrown(() => tools(['nope']))).toBe(`agents.chat.tools: unknown tool "nope" (tools: ${[...TOOL_NAMES, 'probe_echo', 'probe2_echo'].join(', ')})`);
+    expect(thrown(() => tools(['nope']))).toBe(`agents.chat.tools: unknown tool "nope" (tools: ${[...KERNEL_TOOL_NAMES, 'probe_echo', 'probe2_echo'].join(', ')})`);
     expect(thrown(() => tools(['probe2_echo'], { probe2: { enabled: false } }))).toBe('agents.chat.tools: "probe2_echo" is a tool of module probe2, which is off');
   });
 
@@ -295,7 +301,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     expect(w.gw.adminStatus().modules).toEqual([]);
     const b = await daemon(builtinModules);
     expect(await features(b.socketPath)).toEqual(KERNEL_HELLO);
-    expect(b.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, { id: 'external-mcp', origin: 'builtin', enabled: false }]);
+    expect(b.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, { id: 'external-mcp', origin: 'builtin', enabled: false }]);
     expect(b.gw.adminStatus()).not.toHaveProperty('externalMcp');
   });
 
@@ -305,7 +311,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     const st = w.gw.adminStatus();
     expect(st.externalMcp).toEqual({ url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\//), clients: [] });
     expect(Object.keys(st).slice(-2)).toEqual(['externalMcp', 'modules']);
-    expect(st.modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, { id: 'external-mcp', origin: 'builtin', enabled: true, status: st.externalMcp }]);
+    expect(st.modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, { id: 'external-mcp', origin: 'builtin', enabled: true, status: st.externalMcp }]);
     // Stopping closes it first: nothing listens there afterwards.
     await w.gw.stop();
     await expect(fetch(st.externalMcp!.url, { method: 'POST' })).rejects.toThrow();
@@ -318,7 +324,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     const busy = await daemon(builtinModules, { externalMcp: { listen: `127.0.0.1:${port}`, clients: {} } }, undefined, undefined, (level, msg) => logs.push(`${level}: ${msg}`));
     expect(await features(busy.socketPath)).toEqual(KERNEL_HELLO);
     expect(busy.gw.adminStatus()).not.toHaveProperty('externalMcp');
-    expect(busy.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, { id: 'external-mcp', origin: 'builtin', enabled: true }]);
+    expect(busy.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, { id: 'external-mcp', origin: 'builtin', enabled: true }]);
     expect(logs).toContainEqual(expect.stringMatching(new RegExp(`^error: module external-mcp: external MCP endpoint not started: cannot listen on 127\\.0\\.0\\.1:${port}: `)));
   });
 
@@ -326,10 +332,10 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     const settings = resolveConfig({ externalMcp: { listen: '127.0.0.1:0', clients: {} } }, { env: {}, baseDir: '/base', cwd: '/work' }).externalMcp!;
     const on = await daemon(builtinModules, {}, undefined, undefined, undefined, (c) => ({ ...c, externalMcp: settings }));
     expect(await features(on.socketPath)).toEqual([...KERNEL_HELLO, 'external.mcp']);
-    expect(on.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, { id: 'external-mcp', origin: 'builtin', enabled: true, status: { url: expect.any(String), clients: [] } }]);
+    expect(on.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, { id: 'external-mcp', origin: 'builtin', enabled: true, status: { url: expect.any(String), clients: [] } }]);
     const off = await daemon(builtinModules, { externalMcp: { listen: '127.0.0.1:0', clients: {} } }, undefined, undefined, undefined, ({ externalMcp: _, ...c }) => c);
     expect(await features(off.socketPath)).toEqual(KERNEL_HELLO);
-    expect(off.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, { id: 'external-mcp', origin: 'builtin', enabled: false }]);
+    expect(off.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, { id: 'external-mcp', origin: 'builtin', enabled: false }]);
     // A config without modules at all (built by hand, as before modules): the field still decides; a built-in module
     // without one is as a file without its section makes it (the topic titles, on as before); any other module is still an error.
     const dir = mkdtempSync(join(tmpdir(), 'aio-mod-'));
@@ -339,7 +345,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     const gw = await Gateway.start({ config: bare, harness: new FakeHarness(), log: new MemorySessionLog(), logger: () => {} });
     cleanups.push(() => gw.stop());
     expect(await features(bare.socketPath)).toEqual([...KERNEL_HELLO, 'external.mcp']);
-    expect(gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, { id: 'external-mcp', origin: 'builtin', enabled: true, status: { url: expect.any(String), clients: [] } }]);
+    expect(gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, { id: 'external-mcp', origin: 'builtin', enabled: true, status: { url: expect.any(String), clients: [] } }]);
     await gw.stop();
     const withProbe = new ModuleRegistry([...builtinModules.modules, { manifest: probe('probe', []), origin: 'module' as const }], { fields: { 'external-mcp': { config: 'externalMcp' } } });
     await expect(Gateway.start({ config: bare, harness: new FakeHarness(), log: new MemorySessionLog(), listen: false, moduleRegistry: withProbe, logger: () => {} })).rejects.toThrow('module probe is registered but the config was resolved without it');
@@ -374,7 +380,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     // Tools: the kernel's in order, then the module's; it runs with the turn and the call's operationId.
     await w.chat.inject({ sender: alice, text: 'hi' });
     await until(() => calls.length === 1);
-    expect(offered[0]).toEqual([...TOOL_NAMES, 'probe_echo']);
+    expect(offered[0]).toEqual([...KERNEL_TOOL_NAMES, 'probe_echo']);
     const r = JSON.parse(calls[0]!.text) as Record<string, unknown>;
     expect(calls[0]!.isError).toBe(false);
     const sessionKey = w.harness.sessions[0]!.args.sessionKey;
@@ -413,7 +419,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     holder.h = w.harness;
     await w.chat.inject({ sender: alice, text: '/probe' });
     await until(() => offered.length === 1);
-    expect(offered[0]).toEqual(TOOL_NAMES);
+    expect(offered[0]).toEqual(KERNEL_TOOL_NAMES);
     expect(inputs).toEqual([[{ type: 'text', text: '/probe' }]]);
     expect(seen).toEqual([]);
     expect(w.gw.adminStatus().modules).toEqual([{ id: 'probe', origin: 'module', enabled: false }]);
@@ -553,6 +559,84 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     await w.chat.inject({ sender: alice, text: 'hi' });
     await until(() => heard.length === 1);
     expect(heard).toEqual([w.harness.sessions.find((s) => !s.args.sessionKey.startsWith('run:'))!.args.sessionKey]);
+  });
+
+  it('inputHint: the line inputs of a current topic carry for the agent they go to is every set-up module\'s, in registration order, joined by a newline; a hook that throws is logged and gives none; none gives no line', async () => {
+    const logs: string[] = [];
+    const seen: InputRecord[] = [];
+    const asked: (string | undefined)[] = [];
+    const registry = new ModuleRegistry([
+      probe('first', [], { instance: () => ({ hooks: { inputHint: (agent) => (asked.push(agent), `first for ${agent}`) } }) }),
+      probe('second', [], { instance: () => ({ hooks: { inputHint: () => { throw new Error('boom'); } } }) }),
+      probe('third', [], { instance: () => ({ hooks: { inputHint: () => 'third' } }) }),
+      probe('fourth', [], { instance: () => ({ hooks: { inputHint: () => undefined } }) }),
+    ]);
+    const w = await daemon(registry, { agents: { helper: { harness: 'claude-code' } } }, async (t) => {
+      seen.push(...t.inputs);
+      t.emit({ t: 'text.snapshot', text: 'ok', final: true }, { audience: 'answer' });
+    }, undefined, (level, msg) => logs.push(`${level}: ${msg}`));
+    await w.chat.inject({ sender: alice, text: 'hi' });
+    await until(() => seen.length === 1);
+    expect(seen[0]!.channelContext.topic).toBeDefined();
+    expect(seen[0]!.channelContext.topicTools).toBe('first for helper\nthird');
+    expect(asked).toEqual(['helper']);
+    expect(logs).toContain('warn: module second: inputHint failed: boom');
+    // Without a module that gives one, an input of a current topic carries no hint (as an agent without the topic tools).
+    const none: InputRecord[] = [];
+    const v = await daemon(new ModuleRegistry([probe('fourth', [], { instance: () => ({ hooks: { inputHint: () => undefined } }) })]), {}, async (t) => {
+      none.push(...t.inputs);
+      t.emit({ t: 'text.snapshot', text: 'ok', final: true }, { audience: 'answer' });
+    });
+    await v.chat.inject({ sender: alice, text: 'hi' });
+    await until(() => none.length === 1);
+    expect(none[0]!.channelContext.topic).toBeDefined();
+    expect(none[0]!.channelContext).not.toHaveProperty('topicTools');
+  });
+
+  it('watches, topics.rotate / switch, live and agents.tools: the kernel acts for a session\'s agent and its running turn; a watch always delivers into the session; an argument that is not a string is refused', async () => {
+    const kernels: KernelContext[] = [];
+    const turns: string[] = [];
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const registry = new ModuleRegistry([probe('probe', [], { instance: (k) => (kernels.push(k), {}) })]);
+    const raw = { policy: { owners: ['fake:alice'], watchAllowlist: [{ channel: 'fake' }] }, agents: { helper: { harness: 'claude-code', tools: ['send_message', 'probe_echo'] }, quiet: { harness: 'claude-code', tools: false } }, defaultAgent: 'helper' };
+    const w = await daemon(registry, raw, async (t) => {
+      turns.push(t.turnId);
+      await held;
+      t.emit({ t: 'text.snapshot', text: 'ok', final: true }, { audience: 'answer' });
+    });
+    const k = kernels[0]!;
+    // The tools an agent is offered: its list; none without tools; every tool of the endpoint for tools: true.
+    expect(k.agents.tools('helper')).toEqual(['send_message', 'probe_echo']);
+    expect(k.agents.tools(undefined)).toEqual(['send_message', 'probe_echo']);
+    expect(k.agents.tools('quiet')).toEqual([]);
+    expect(k.agents.tools('nobody')).toEqual([]);
+    const all = await daemon(new ModuleRegistry([probe('probe', [], { instance: (k2) => (kernels.push(k2), {}) })]));
+    expect(kernels[1]!.agents.tools(undefined)).toEqual([...KERNEL_TOOL_NAMES, 'probe_echo']);
+    await all.gw.stop();
+
+    await w.chat.inject({ sender: alice, text: 'hi' });
+    await until(() => turns.length === 1);
+    const sessionKey = w.harness.sessions[0]!.args.sessionKey;
+    // A watch as the session's agent, delivering into the session whatever the draft says.
+    const added = await k.watches.add(sessionKey, { id: 'w1', source: { channel: 'fake', conversation: 'c-team' }, target: { sessionKey: 'fake:default:elsewhere' }, mode: 'context' });
+    expect(added).toMatchObject({ ok: true, watch: { id: 'w1', target: { sessionKey }, createdBy: `session:${sessionKey}`, mode: 'context' } });
+    expect(k.watches.list(sessionKey).map((x) => x.id)).toEqual(['w1']);
+    expect(k.watches.list('fake:default:elsewhere')).toEqual([]);
+    // Not the owner: a source off the allowlist is refused (Policy.watch), and another agent's watch is not its to remove.
+    expect(await k.watches.add(sessionKey, { source: { channel: 'other' }, target: { sessionKey }, mode: 'context' })).toMatchObject({ ok: false, code: 'forbidden' });
+    expect(await k.watches.remove('fake:default:elsewhere', 'w1')).toMatchObject({ ok: false, code: 'forbidden' });
+    expect(await k.watches.remove(sessionKey, 'w1')).toEqual({ ok: true, removed: true });
+    // A handover or a live is for the turn running in the session, nothing else.
+    await expect(k.topics.rotate(sessionKey, 't_nope', { title: 'X', summary: 'none' })).rejects.toThrow(`no turn t_nope is running in session ${sessionKey}`);
+    await expect(k.topics.switch(sessionKey, 't_nope', 'tp_x')).rejects.toThrow(`no turn t_nope is running in session ${sessionKey}`);
+    await expect(k.live.join(sessionKey, 't_nope', { target: 'new' })).rejects.toThrow(`no turn t_nope is running in session ${sessionKey}`);
+    await expect(k.topics.rotate(sessionKey, turns[0]!, { title: 1 as never, summary: 'none' })).rejects.toThrow('module probe: topics.rotate: title must be a string');
+    await expect(k.topics.switch(sessionKey, turns[0]!, 'tp_x')).rejects.toThrow('no topic tp_x in this conversation');
+    await expect(k.live.join(sessionKey, turns[0]!, { target: 'new' })).rejects.toThrow('cannot open a live session');
+    await expect(k.live.say(sessionKey, 'hello', { operationId: 'op1', turnId: turns[0]! })).rejects.toThrow('no live is running in this session; live_join first');
+    expect(await k.live.leave(sessionKey)).toBe(false);
+    release();
   });
 
   it('setup and start failures fail the start naming the module; a hook not served yet, a missing handler, a config resolved without the registry too', async () => {

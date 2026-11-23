@@ -8,6 +8,7 @@ import { externalMcpModule, type ExternalMcpSection } from './external-mcp.js';
 import { HarnessRegistry } from './harness-registry.js';
 import { moduleChannelModule, type ModuleChannelEntry } from './module-channel.js';
 import { ModuleRegistry } from './modules.js';
+import { liveToolsModule, topicToolsModule, watchToolsModule, type ToolModuleSection } from './tool-modules.js';
 import { topicTitleModule, type TopicTitleSection } from './topic-title.js';
 
 /*
@@ -39,15 +40,17 @@ export const builtinChannels = new ChannelRegistry([larkBotChannelModule, mailCh
  * The built-in feature modules (core-slimming G6), in the order their tools, commands, features and
  * status entries come after the kernel's own, and the order they start (they stop in reverse).
  * Topic titles made by the model (on unless `topicTitles: { enabled: false }`; a host-level
- * feature, decision 16) come first. The external MCP endpoint (off unless its section
- * `externalMcp` is in the file) is the last: it starts after everything else and stops first, so
- * no external write comes in while the rest stops; a module added later goes before it. Its
- * settings and status stay where they were before it was a module: `Config.externalMcp`
- * (deprecated, one release) and `GET /api/status` `externalMcp`. The features still to move (the
- * watch / topic / live tools, strangers, owner commands and presets, the Claude Code terminal)
- * live in the gateway; each moves here as its own step.
+ * feature, decision 16) come first. Then the model tools beyond the kernel's six, each group on
+ * unless its section says `enabled: false`, in the order the tools were always listed: the watch
+ * tools (`watchTools`), the live tools (`liveTools`), the topic tools (`topicTools`). The external
+ * MCP endpoint (off unless its section `externalMcp` is in the file) is the last: it starts after
+ * everything else and stops first, so no external write comes in while the rest stops; a module
+ * added later goes before it. Its settings and status stay where they were before it was a
+ * module: `Config.externalMcp` (deprecated, one release) and `GET /api/status` `externalMcp`. The
+ * features still to move (strangers, owner commands and presets, the Claude Code terminal) live in
+ * the gateway; each moves here as its own step.
  */
-export const builtinModules = new ModuleRegistry([topicTitleModule, externalMcpModule], {
+export const builtinModules = new ModuleRegistry([topicTitleModule, watchToolsModule, liveToolsModule, topicToolsModule, externalMcpModule], {
   origin: 'builtin',
   fields: { [externalMcpModule.id]: { config: 'externalMcp', status: 'externalMcp' } },
 });
@@ -55,11 +58,17 @@ export const builtinModules = new ModuleRegistry([topicTitleModule, externalMcpM
 /** The built-in modules' sections of the config file, as written (`ConfigFile` adds them to the kernel's keys). */
 export interface BuiltinModuleSections {
   topicTitles?: TopicTitleSection;
+  watchTools?: ToolModuleSection;
+  liveTools?: ToolModuleSection;
+  topicTools?: ToolModuleSection;
   externalMcp?: ExternalMcpSection;
 }
 
 /** The topic titles' section (`topicTitles`: only `enabled`). */
 export type { TopicTitleSection } from './topic-title.js';
+
+/** The section of the watch, live and topic tools (`watchTools`, `liveTools`, `topicTools`: only `enabled`). */
+export type { ToolModuleSection } from './tool-modules.js';
 
 /** The external MCP endpoint's settings and their parts (`Config.externalMcp`, deprecated: `Config.modules`). */
 export { DEFAULT_EXTERNAL_MCP_PORT, type ExternalMcpClient, type ExternalMcpConfig, type ExternalMcpSection } from './external-mcp.js';

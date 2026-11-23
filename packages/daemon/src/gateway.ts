@@ -75,7 +75,6 @@ import {
   Router,
   SqliteSessionLog,
   SOURCE_MISMATCH,
-  TOPIC_TOOLS_HINT,
   TopicError,
   TopicRegistry,
   WatchDispatcher,
@@ -101,7 +100,7 @@ import {
   topicView,
   settleLeftoverInputs,
 } from '@agents-io/session';
-import { HostMcpServer, HostTools, ToolError, agentIdentity, type TopicHandover } from '@agents-io/host-mcp';
+import { HostMcpServer, HostTools, ToolError, agentIdentity, agentOrigin, toolCatalog, type TopicHandover } from '@agents-io/host-mcp';
 import { builtinChannels, builtinHarnesses, builtinModules } from './bundle.js';
 import { badChannelAdapter, loadHarnessModule } from './module-loader.js';
 import { ConfigError, UNGRANTED_EVIDENCE, agentSpec, configTable, consoleSettings, resolveModules, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type PresetConfig, type ResolvedChannel } from './config.js';
@@ -257,9 +256,6 @@ const DAEMON_VERSION: string = (() => {
 })();
 
 /** Local ends post to this route; no adapter renders it, they read the stream instead. */
-/** The agent has the session_* tools (all tools, or a list naming one). */
-const hasTopicTools = (a: AgentConfig | undefined): boolean => !!a?.tools && (!a.toolNames || a.toolNames.some((n) => n.startsWith('session_')));
-
 /** `Gateway.accept`'s refusal while stopping: "not now", never `permanent` (IN-7). */
 const GATEWAY_STOPPING = 'gateway stopping';
 
@@ -314,6 +310,8 @@ export class Gateway {
   /** Host output tools, when some agent has `tools` on; mounted over MCP into those agents' harness bindings only. */
   readonly tools: HostTools | undefined;
   private readonly mcp: HostMcpServer | undefined;
+  /** The names of the tools the endpoint offers, in order (`agentTools` for `tools: true`), once asked. */
+  private catalogNames: string[] | undefined;
   /**
    * Sends for clients outside the daemon in flight (the external MCP module's, `KernelContext.send`
    * `external`): who, taken into the in-flight mark (`sendTime`) for the outbound record.
@@ -574,42 +572,16 @@ export class Gateway {
         turn: (key) => this.lanes.get(key)?.currentTurn(),
         adapter: (r) => this.channelFor(r)?.adapter,
         as: (key) => agentIdentity(key),
-        agentOf: (key) => this.agentOfSession(key),
         blobs: this.blobs,
         cwd: (key) => this.laneInfo.get(key)?.cwd ?? this.instanceOf(this.lanes.get(key)?.harnessId)?.cwd ?? c.cwd,
         tier: (r) => this.channelFor(r)?.tier,
         routes: () => c.policy.routes,
-        // Agents add watches as themselves (kind agent); Policy.watch decides, the target is pinned to their session.
-        watches: { add: (by, d) => this.addWatch(by, d), remove: (by, id) => this.removeWatch(by, id), list: (key) => this.listWatches(key) },
         // Decision 4: every write carries where the turn's inputs came from.
         provenance: (key, turnId) => this.lanes.get(key)?.provenance(turnId),
         // People seen in the session's conversations: the agent can @ them, not only this turn's senders.
         participants: (key) => this.lanes.get(key)?.participants() ?? [],
-        // Decision 6: the agent decides when a conversation moves to another topic.
-        topics: {
-          list: (key) => (this.topics.bySession(key) ? this.topics.siblings(key).map(topicView) : undefined),
-          rotate: (key, turn, a) => this.rotateTopic(key, turn, a),
-          switch: (key, turn, a) => this.switchTopicFor(key, turn, a.topicId),
-        },
-        // Decision 9: realtime voice on the session's harness, the media peer from a channel.
-        live: {
-          join: (key, turn, a) => this.joinLive(key, turn, a),
-          say: async (key, text, a) => {
-            const lane = this.lanes.get(key);
-            if (!lane?.liveInfo()) throw new ToolError('no live is running in this session; live_join first');
-            // Same operationId = the same call retried: said once (DL-2), and explainable either way (EX-2).
-            if (this.records.outboundByOperation(a.operationId)) return;
-            let result: 'delivered' | 'unknown' = 'unknown';
-            const route = lane.liveInfo()!.route;
-            try {
-              result = (await lane.liveSay(text, a)).result;
-            } finally {
-              this.indexOutbound({ sessionKey: key, turnId: a.turnId }, { operationId: a.operationId, sessionKey: key, route, status: result, attempts: 1 });
-            }
-          },
-          leave: (key) => this.leaveLive(key, 'left by the agent'),
-        },
-        // The active modules' tools, after the kernel's (core-slimming G6).
+        // The active modules' tools, after the kernel's (core-slimming G6): the watch, live and topic
+        // tools are the built-in modules' (`tool-modules.ts`), over the kernel's watches, live and topic handover.
         ...(moduleTools.length ? { modules: moduleTools } : {}),
       });
       const tools = this.tools;
@@ -635,8 +607,8 @@ export class Gateway {
       ...(tools ? { rewrite: (a) => tools.rewriteInbound(a) } : {}),
       // `/new`, `/topics`, `/switch` answer with one short message on the route they came from.
       systemReply: (a) => this.systemReply(a),
-      // Inputs of a current topic say how to move between topics, to agents that have the session_* tools.
-      ...(tools ? { topicHint: (agent: string | undefined) => (hasTopicTools(c.agents[agent ?? c.defaultAgent ?? '']) ? TOPIC_TOOLS_HINT : undefined) } : {}),
+      // Inputs of a current topic say how to move between topics: the modules' hint (the topic tools', to agents offered them).
+      topicHint: (agent: string | undefined) => this.modules.inputHint(agent),
       onReplyError: (err) => this.log('warn', `topic command reply failed: ${(err as Error).message}`),
       // A session whose agent is gone refuses the input: its log says so, and the route
       // too when the message was addressed to it (observe-only messages stay silent).
@@ -727,6 +699,18 @@ export class Gateway {
       siblings: (key) => (gw().topics.bySession(key) ? gw().topics.siblings(key).map(topicView) : []),
       titleSource: (topicId) => gw().topics.titleSource(topicId),
       setAutoTitle: (topicId, expected, title) => gw().setAutoTitle(topicId, expected, title),
+      // Agents add watches as themselves (kind agent); Policy.watch decides, the target is pinned to their session.
+      addWatch: (key, draft) => gw().addWatch(agentOrigin(key, gw().agentOfSession(key)), { ...draft, target: { sessionKey: key } }),
+      removeWatch: (key, id) => gw().removeWatch(agentOrigin(key, gw().agentOfSession(key)), id),
+      listWatches: (key) => gw().listWatches(key),
+      // Decision 6: the agent decides when a conversation moves to another topic (the handover is the kernel's, TP-1).
+      rotateTopic: (key, turnId, a) => gw().rotateTopic(key, gw().runningTurn(key, turnId), a),
+      switchTopic: (key, turnId, topicId) => gw().switchTopicFor(key, gw().runningTurn(key, turnId), topicId),
+      // Decision 9: realtime voice on the session's harness, the media peer from a channel.
+      joinLive: (key, turnId, a) => gw().joinLive(key, gw().runningTurn(key, turnId), a),
+      sayLive: (key, text, a) => gw().sayLive(key, text, a),
+      leaveLive: (key) => gw().leaveLive(key, 'left by the agent'),
+      agentTools: (agent) => gw().agentTools(agent),
       identify: (a) => gw().router.identify(a),
       setExtraIdentities: (owner, entries) => gw().setExtraIdentities(owner, entries),
       newTopic: (agent, conversation, title) => gw().router.newTopic(agent, conversation, title !== undefined ? { title } : {}, 'user').topic.id,
@@ -2001,8 +1985,42 @@ export class Gateway {
     return t;
   }
 
-  /** session_rotate: a new topic, current from now on, gets the turn's inputs with the summary ahead of them. */
+  /** The running turn `turnId` of a session, for what a module does for it (a topic handover, a live). */
+  private runningTurn(sessionKey: string, turnId: string): TurnContext {
+    const turn = this.lanes.get(sessionKey)?.currentTurn();
+    if (!turn || turn.turnId !== turnId) throw new ToolError(`no turn ${turnId} is running in session ${sessionKey}`);
+    return turn;
+  }
+
+  /**
+   * The model tools an agent's sessions are offered (`KernelContext.agents.tools`): its tools list,
+   * or the endpoint's whole catalog for `tools: true`; none without tools.
+   */
+  private agentTools(agent: string | undefined): string[] {
+    const c = this.o.config;
+    const a = c.agents[agent ?? c.defaultAgent ?? ''];
+    if (!a?.tools) return [];
+    if (a.toolNames) return [...a.toolNames];
+    this.catalogNames ??= this.tools ? toolCatalog(this.tools).map((t) => t.name) : [];
+    return [...this.catalogNames];
+  }
+
   // ---- live (decision 11) ----------------------------------------------------
+
+  /** live_say: said once per operationId (DL-2), explainable by it either way (EX-2). */
+  private async sayLive(sessionKey: string, text: string, a: { operationId: string; turnId: string }): Promise<void> {
+    const lane = this.lanes.get(sessionKey);
+    if (!lane?.liveInfo()) throw new ToolError('no live is running in this session; live_join first');
+    // Same operationId = the same call retried: said once (DL-2), and explainable either way (EX-2).
+    if (this.records.outboundByOperation(a.operationId)) return;
+    let result: 'delivered' | 'unknown' = 'unknown';
+    const route = lane.liveInfo()!.route;
+    try {
+      result = (await lane.liveSay(text, a)).result;
+    } finally {
+      this.indexOutbound({ sessionKey, turnId: a.turnId }, { operationId: a.operationId, sessionKey, route, status: result, attempts: 1 });
+    }
+  }
 
   private async joinLive(sessionKey: string, turn: TurnContext, a: { target: string; channel?: string; instructions?: string; voice?: string }) {
     const lane = this.lanes.get(sessionKey);
@@ -2158,6 +2176,7 @@ export class Gateway {
     void cur.endpoint.close(reason).catch((e: Error) => this.log('warn', `${sessionKey}: closing live ${liveId}: ${e.message}`));
   }
 
+  /** session_rotate: a new topic, current from now on, gets the turn's inputs with the summary ahead of them. */
   private async rotateTopic(sessionKey: string, turn: TurnContext, a: { title: string; summary: string }): Promise<TopicHandover> {
     const from = this.topicOfSession(sessionKey);
     // The summary describes the topic being left: it is saved on it (and handed to the new one as context).

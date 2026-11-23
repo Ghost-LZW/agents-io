@@ -19,10 +19,13 @@ import type {
   KernelOutcome,
   KernelSendResult,
   KernelSettledSend,
+  KernelUnwatchResult,
+  KernelWatchResult,
   ModuleInstance,
   ModuleManifest,
   ModuleOrigin,
   ModuleToolDef,
+  ModuleTopicHandover,
   ModuleTurnStatus,
   Origin,
   Policy,
@@ -33,9 +36,11 @@ import type {
   SessionScope,
   Topic,
   TurnContext,
+  Watch,
+  WatchDraft,
 } from '@agents-io/protocol';
 import { AdminStatus as AdminStatusSchema } from '@agents-io/protocol';
-import { TOOL_NAMES, moduleToolInput, type ModuleTools } from '@agents-io/host-mcp';
+import { KERNEL_TOOL_NAMES, moduleToolInput, type ModuleTools } from '@agents-io/host-mcp';
 import { CommandTable, KERNEL_COMMAND_NAMES, type ModuleCommand } from './commands.js';
 import { ConfigError } from './config-error.js';
 import { FEATURES } from './host.js';
@@ -54,8 +59,8 @@ import { TokenError } from './token.js';
  *   5. a config change to a module's section takes effect at the next start (the console answers
  *      `applied: "restart"`; nothing is applied live).
  * A module that is off does not exist for the deployment: no tools, no commands, no features.
- * The hooks the daemon serves (`onTurnCompleted`) are called from when the gateway is built until
- * step 4.
+ * The hooks the daemon serves are called from when the gateway is built: `onTurnCompleted` until
+ * step 4, `inputHint` (a pure answer for an input being routed) to the end.
  */
 
 /** A module as registered: its manifest and where it comes from. */
@@ -92,8 +97,8 @@ export interface ModuleRegistryOptions {
 
 /** What `kernel:<capability>` may name in `ModuleManifest.needs`: the members of `KernelContext`. */
 export const KERNEL_CAPABILITIES: readonly string[] = [
-  'log', 'events', 'head', 'appendNative', 'sessions', 'status', 'stopping', 'policy', 'records', 'db', 'topics', 'router', 'lanes',
-  'channelFor', 'resolveRoute', 'send', 'settled', 'outbound', 'ownerRoute', 'redispatch', 'explain', 'host',
+  'log', 'events', 'head', 'appendNative', 'sessions', 'status', 'stopping', 'policy', 'records', 'db', 'topics', 'watches', 'live', 'agents',
+  'router', 'lanes', 'channelFor', 'resolveRoute', 'send', 'settled', 'outbound', 'ownerRoute', 'redispatch', 'explain', 'host',
 ];
 
 const MODULE_ID = /^[a-z0-9][a-z0-9._-]*$/;
@@ -143,7 +148,7 @@ function badManifest(m: ModuleManifest<any>): string | undefined {
     if (!Array.isArray(m.mcpTools)) return 'mcpTools must be an array';
     for (const t of m.mcpTools) {
       if (!isObject(t) || typeof t.name !== 'string' || !TOOL_NAME.test(t.name)) return `mcpTools: ${JSON.stringify(isObject(t) ? t.name : t)} is not a tool name (lower-case ASCII letters, digits and _, starting with a letter)`;
-      if ((TOOL_NAMES as readonly string[]).includes(t.name)) return `mcpTools: ${t.name} is a kernel tool`;
+      if ((KERNEL_TOOL_NAMES as readonly string[]).includes(t.name)) return `mcpTools: ${t.name} is a kernel tool`;
       if (!nonEmpty(t.description)) return `mcpTools: ${t.name} needs a description`;
       if (!optBool(t.readOnly) || !optBool(t.needsTurn)) return `mcpTools: ${t.name}: readOnly and needsTurn are booleans`;
       try {
@@ -296,7 +301,7 @@ interface Running {
 }
 
 /** Hook members the daemon serves (functions): any other a module sets fails its setup. */
-const SERVED_HOOKS: readonly string[] = ['onTurnCompleted'];
+const SERVED_HOOKS: readonly string[] = ['onTurnCompleted', 'inputHint'];
 
 /** What is wrong with what `setup` returned (the first thing), or undefined. */
 function badInstance(m: ModuleManifest<any>, i: ModuleInstance): string | undefined {
@@ -487,6 +492,27 @@ export class ModuleHost {
     }
   }
 
+  /**
+   * The line inputs routed to a current topic carry for `agent` (`ModuleHooks.inputHint`): the
+   * set-up modules' lines, in registration order, joined with a newline; undefined when none gives
+   * one. Asked also while the daemon stops (inputs routed then still carry it). A hook that throws
+   * is logged and gives no line.
+   */
+  inputHint(agent: string | undefined): string | undefined {
+    const lines: string[] = [];
+    for (const m of this.active()) {
+      const hint = m.instance!.hooks?.inputHint;
+      if (!hint) continue;
+      try {
+        const line: unknown = hint(agent);
+        if (typeof line === 'string' && line) lines.push(line);
+      } catch (e) {
+        this.o.log('warn', `module ${m.r.manifest.id}: inputHint failed: ${(e as Error)?.message ?? String(e)}`);
+      }
+    }
+    return lines.length ? lines.join('\n') : undefined;
+  }
+
   /** Step 4: stop the started modules in reverse order, each bounded (`MODULE_STOP_MS`); failures are logged. Their hooks are no longer called. */
   async stop(): Promise<void> {
     this.stopping = true;
@@ -533,6 +559,19 @@ export interface KernelBackend {
   titleSource(topicId: string): 'auto' | 'explicit' | undefined;
   /** Set while still auto and `expected`, then the cards that show it refreshed (`KernelContext.topics.setAutoTitle`). */
   setAutoTitle(topicId: string, expected: string | undefined, title: string): boolean;
+  /** A watch as the session's agent, delivering into the session (`KernelContext.watches.add`). */
+  addWatch(sessionKey: string, draft: WatchDraft): Promise<KernelWatchResult>;
+  removeWatch(sessionKey: string, id: string): Promise<KernelUnwatchResult>;
+  listWatches(sessionKey: string): Watch[];
+  /** The kernel's handover of the running turn `turnId` (`KernelContext.topics.rotate` / `switch`). */
+  rotateTopic(sessionKey: string, turnId: string, a: { title: string; summary: string }): Promise<ModuleTopicHandover>;
+  switchTopic(sessionKey: string, turnId: string, topicId: string): Promise<ModuleTopicHandover>;
+  /** The kernel's live mechanism (`KernelContext.live`). */
+  joinLive(sessionKey: string, turnId: string, a: { target: string; channel?: string; instructions?: string; voice?: string }): Promise<{ liveId: string; title: string; route: string }>;
+  sayLive(sessionKey: string, text: string, a: { operationId: string; turnId: string }): Promise<void>;
+  leaveLive(sessionKey: string): Promise<boolean>;
+  /** The tools an agent's sessions are offered (`KernelContext.agents.tools`). */
+  agentTools(agent: string | undefined): string[];
   identify(a: IdentifyArgs): Identity;
   /** One owner's extra identity entries (a module's, by id), merged with the others'. */
   setExtraIdentities(owner: string, entries: IdentityEntry[]): void;
@@ -568,6 +607,10 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
     return k;
   };
   const flag = (name: string) => `module:${id}:${name}`;
+  const text = (v: unknown, what: string): string => {
+    if (typeof v !== 'string') throw new Error(`module ${id}: ${what} must be a string`);
+    return v;
+  };
   return {
     id,
     log: (level, msg, data) => k.log(level, `module ${id}: ${msg}`, data),
@@ -596,6 +639,25 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
       siblings: (sessionKey) => live().siblings(sessionKey),
       titleSource: (topicId) => live().titleSource(topicId),
       setAutoTitle: (topicId, expected, title) => live().setAutoTitle(topicId, expected, title),
+      // Only what the module may say (strings): its untyped code passes nothing else on.
+      rotate: async (sessionKey, turnId, a) => live().rotateTopic(sessionKey, turnId, { title: text(a?.title, 'topics.rotate: title'), summary: text(a?.summary, 'topics.rotate: summary') }),
+      switch: async (sessionKey, turnId, topicId) => live().switchTopic(sessionKey, turnId, topicId),
+    },
+    watches: {
+      add: async (sessionKey, draft) => live().addWatch(sessionKey, draft),
+      remove: async (sessionKey, wid) => live().removeWatch(sessionKey, wid),
+      list: (sessionKey) => live().listWatches(sessionKey),
+    },
+    live: {
+      join: async (sessionKey, turnId, a) => {
+        const opt = (k: 'channel' | 'instructions' | 'voice') => (typeof a?.[k] === 'string' ? { [k]: a[k] } : {});
+        return live().joinLive(sessionKey, turnId, { target: text(a?.target, 'live.join: target'), ...opt('channel'), ...opt('instructions'), ...opt('voice') });
+      },
+      say: async (sessionKey, said, a) => live().sayLive(sessionKey, said, { operationId: text(a?.operationId, 'live.say: operationId'), turnId: text(a?.turnId, 'live.say: turnId') }),
+      leave: async (sessionKey) => live().leaveLive(sessionKey),
+    },
+    agents: {
+      tools: (agent) => live().agentTools(agent),
     },
     router: {
       identify: async (a) => live().identify(a),

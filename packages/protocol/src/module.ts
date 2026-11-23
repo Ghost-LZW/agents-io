@@ -2,7 +2,7 @@ import type { Static, TSchema } from '@sinclair/typebox';
 import type { AdminSession, AdminStatus } from './admin.js';
 import type { AdminContribution } from './admin-module.js';
 import type { ChannelAdapter, RenderedMessage } from './channel.js';
-import type { ClientCommand } from './client.js';
+import type { ClientCommand, WatchDraft } from './client.js';
 import type { ReplyRoute } from './common.js';
 import type { Audience, Level, SessionEvent } from './events.js';
 import type { HarnessAdapter } from './harness.js';
@@ -12,6 +12,7 @@ import type { IdentifyArgs, Identity, Policy, TurnContext, TurnDraft } from './p
 import type { Resolver } from './requests.js';
 import type { RunSpec } from './run.js';
 import type { Topic } from './topic.js';
+import type { Watch } from './watch.js';
 
 /*
  * A feature of the host as a module (core-slimming G6): what it adds to the deployment (a config
@@ -25,11 +26,12 @@ import type { Topic } from './topic.js';
  *
  * In progress: the daemon reads the manifest (`id`, `kind`, `needs`, `config`, `features`,
  * `mcpTools`, `commands`, `setup`) and, of the instance, `tools`, `commands`, `features`,
- * `status`, `start`, `stop` and the hook `onTurnCompleted`. `admin`, the other `hooks` and
- * `localFrames` are the contract the features that move into modules next need (G6 steps 3-6);
- * until the daemon serves one, a module that sets it fails to register (`admin`) or to set up
- * (`hooks.<name>`, `localFrames`), naming it, rather than being silently ignored. The built-in
- * modules are the topic titles (step 2) and the external MCP endpoint (step 1).
+ * `status`, `start`, `stop` and the hooks `onTurnCompleted` and `inputHint`. `admin`, the other
+ * `hooks` and `localFrames` are the contract the features that move into modules next need (G6
+ * steps 4-6); until the daemon serves one, a module that sets it fails to register (`admin`) or to
+ * set up (`hooks.<name>`, `localFrames`), naming it, rather than being silently ignored. The
+ * built-in modules are the topic titles (step 2), the watch, live and topic tools (step 3) and the
+ * external MCP endpoint (step 1).
  */
 
 /** Where a registered module comes from: shipped with the host (`builtin`), or someone else's (`module`). */
@@ -182,12 +184,28 @@ export interface ModuleTopicChange {
   created: boolean;
 }
 
+/** What a handover of a turn to another topic did (`KernelContext.topics.rotate` / `switch`). */
+export interface ModuleTopicHandover {
+  /** The topic now current, which got the turn's messages. */
+  topic: Topic;
+  /** The topic left. */
+  previous?: Topic;
+  /** The input ids as handed to `topic`. */
+  handed: string[];
+}
+
+/** How a watch the kernel was asked to create ended (`KernelContext.watches.add`). */
+export type KernelWatchResult = { ok: true; watch: Watch } | { ok: false; code: string; message: string };
+
+/** How a watch the kernel was asked to remove ended (`KernelContext.watches.remove`). */
+export type KernelUnwatchResult = { ok: true; removed: boolean } | { ok: false; code: string; message: string };
+
 /** How a turn ended (`turn.completed.status`). */
 export type ModuleTurnStatus = Extract<SessionEvent['body'], { t: 'turn.completed' }>['status'];
 
 /**
- * What a module hooks into. The daemon serves `onTurnCompleted`; a module that sets any other fails
- * to set up, naming it (see the file comment). Each says which feature it is for.
+ * What a module hooks into. The daemon serves `onTurnCompleted` and `inputHint`; a module that sets
+ * any other fails to set up, naming it (see the file comment). Each says which feature it is for.
  */
 export interface ModuleHooks {
   /** An input no rule dispatched and no host took (a stranger's message to be asked about). */
@@ -209,7 +227,14 @@ export interface ModuleHooks {
   planRun?(a: { sessionKey: string; run: RunSpec; draft: TurnDraft }): RunSpec;
   /** The adapter a session's instance runs on instead of its own (a native terminal holding the session). */
   harnessFor?(a: { sessionKey: string; instance: string }): HarnessAdapter | undefined;
-  /** A line the inputs of a current topic carry for the model (how to move between topics). */
+  /**
+   * A line the inputs routed to a conversation's current topic carry for the model
+   * (`channelContext.topicTools`: how to move between topics), for the agent the input goes to
+   * (undefined: the deployment's default agent); undefined for none. Asked for every such input,
+   * from when the daemon runs (its stop too), of every module in registration order: the lines
+   * given are joined with a newline. Synchronous and quick; a throw is logged and gives no line.
+   * The topic tools.
+   */
   inputHint?(agent: string | undefined): string | undefined;
   /** Lines `/status` adds for a session. */
   statusLines?(sessionKey: string): string[];
@@ -406,6 +431,62 @@ export interface KernelContext {
      * nothing changed (also for the same title).
      */
     setAutoTitle(topicId: string, expected: string | undefined, title: string): boolean;
+    /**
+     * Hand the running turn `turnId` of a topic session to a new topic of its conversation
+     * (`title`; current from now on), `summary` (what the new topic should know) saved on the topic
+     * left and handed ahead of the turn's messages: the kernel's handover (TP-1), which then moves
+     * the conversation's messages still queued behind the turn. Throws an error named `ToolError`,
+     * the reason for the model, when the session is no topic or the handover fails (the
+     * conversation then stays where it was); and when `turnId` is not the turn running there.
+     */
+    rotate(sessionKey: string, turnId: string, a: { title: string; summary: string }): Promise<ModuleTopicHandover>;
+    /**
+     * Hand the running turn `turnId` of a topic session to another topic of the same conversation and
+     * agent (`topicId`), current again; its harness session resumes. Throws as `rotate`, also for a
+     * topic of another conversation or agent.
+     */
+    switch(sessionKey: string, turnId: string, topicId: string): Promise<ModuleTopicHandover>;
+  };
+  /**
+   * Watches as a session's agent (the watch tools): the agent of `sessionKey` acts (kind `agent`,
+   * evidence `daemon`, declared `session:<sessionKey>`; never an owner), and `Policy.watch` decides
+   * as for any agent (the default policy: only `policy.watchAllowlist` sources).
+   */
+  readonly watches: {
+    /** Create or replace a watch delivering into the session (its `target` is set to the session, whatever the draft says). */
+    add(sessionKey: string, draft: WatchDraft): Promise<KernelWatchResult>;
+    /** Remove a watch as the session's agent (one it may remove: its own). */
+    remove(sessionKey: string, id: string): Promise<KernelUnwatchResult>;
+    /** The watches delivering into the session. */
+    list(sessionKey: string): Watch[];
+  };
+  /**
+   * The live (realtime voice) mechanism of a session's harness (decision 11): its protocol, events
+   * and LN invariants are the kernel's; the module only asks. Errors the model should read are named
+   * `ToolError`.
+   */
+  readonly live: {
+    /**
+     * Join a live for the running turn `turnId` of the session: on `channel` (a channel id or
+     * `channel:account`; default the turn's reply channel), `target` in the channel's terms, the
+     * voice told `instructions` (default the kernel's), speaking with `voice`. At most one per
+     * session; the destination goes through the outbound check (DL-5). Throws when `turnId` is not
+     * the turn running there.
+     */
+    join(sessionKey: string, turnId: string, a: { target: string; channel?: string; instructions?: string; voice?: string }): Promise<{ liveId: string; title: string; route: string }>;
+    /** Say `text` in the session's live, once per `operationId` (also when retried; `explain` traces it to `turnId`, EX-2). */
+    say(sessionKey: string, text: string, a: { operationId: string; turnId: string }): Promise<void>;
+    /** Leave the session's live; false when none runs. */
+    leave(sessionKey: string): Promise<boolean>;
+  };
+  /** The deployment's agents. */
+  readonly agents: {
+    /**
+     * The model tools an agent's sessions are offered: its `agents.<name>.tools` list, or for
+     * `tools: true` every tool the host's endpoint offers (the kernel's, then the active modules',
+     * in that order); empty when it has none or no such agent runs. `undefined`: the default agent.
+     */
+    tools(agent: string | undefined): string[];
   };
   /** The binding tables' router. */
   readonly router: {

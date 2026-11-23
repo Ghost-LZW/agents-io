@@ -1,7 +1,21 @@
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it } from 'vitest';
 import { Hub, MemorySessionLog, Outbox, defaultPolicy } from '@agents-io/session';
-import { HostMcpServer, HostTools, MemoryBlobStore, TOOL_NAMES, toolCatalog, type HostToolsOptions } from '../src/index.js';
+import {
+  HostMcpServer,
+  HostTools,
+  KERNEL_TOOL_NAMES,
+  MemoryBlobStore,
+  TOOL_GROUP_DEFS,
+  TOOL_GROUPS,
+  TOOL_NAMES,
+  liveToolHandlers,
+  topicToolHandlers,
+  toolCatalog,
+  watchToolHandlers,
+  type HostToolsOptions,
+  type ModuleTools,
+} from '../src/index.js';
 
 /*
  * The tool catalog (core-slimming G6): the kernel's tools, then the active modules'. With no module
@@ -53,5 +67,36 @@ describe('the host MCP tool catalog', () => {
     const s = new HostMcpServer({ tools: hostTools() });
     servers.push(s);
     expect((await toolsList(s, ['session_list', 'send_message'])).tools.map((t) => t.name)).toEqual(['send_message', 'session_list']);
+  });
+
+  it('modules that offer the tool groups (TOOL_GROUP_DEFS, run by watchToolHandlers / liveToolHandlers / topicToolHandlers), with no control of the host\'s, list the same 15 tools byte for byte; a group the host passed a control for is the kernel\'s #CF-6', async () => {
+    const groups: ModuleTools[] = [
+      { module: 'tools.watch', tools: TOOL_GROUP_DEFS.watch, handlers: watchToolHandlers(undefined) },
+      { module: 'tools.live', tools: TOOL_GROUP_DEFS.live, handlers: liveToolHandlers(undefined) },
+      { module: 'tools.topics', tools: TOOL_GROUP_DEFS.topics, handlers: topicToolHandlers(undefined) },
+    ];
+    const tools = hostTools({ modules: groups });
+    expect(toolCatalog(tools).map((t) => [t.name, t.module])).toEqual([
+      ...KERNEL_TOOL_NAMES.map((n) => [n, undefined]),
+      ...TOOL_GROUPS.watch.map((n) => [n, 'tools.watch']),
+      ...TOOL_GROUPS.live.map((n) => [n, 'tools.live']),
+      ...TOOL_GROUPS.topics.map((n) => [n, 'tools.topics']),
+    ]);
+    const s = new HostMcpServer({ tools });
+    servers.push(s);
+    expect(JSON.stringify(await toolsList(s), null, 2) + '\n').toBe(readFileSync(new URL('./fixtures/tools-list.json', import.meta.url), 'utf8'));
+    // The definitions are what TOOL_DEFS says; the watch tools and session_list need no turn.
+    expect(Object.values(TOOL_GROUP_DEFS).flat().map((d) => [d.name, d.needsTurn])).toEqual([
+      ['watch_add', false], ['watch_remove', false], ['watch_list', false],
+      ['live_join', true], ['live_say', true], ['live_leave', true],
+      ['session_rotate', true], ['session_list', false], ['session_switch', true],
+    ]);
+    // Over no control each says its group is not available, as the kernel's did; one that needs a turn asks for one first.
+    const b = { sessionKey: 's1', generation: 1 };
+    await expect(tools.call(b, 'watch_list', {})).rejects.toThrow('watches are not available on this host');
+    await expect(tools.call(b, 'session_list', {})).rejects.toThrow('topics are not available on this host');
+    await expect(tools.call(b, 'live_leave', {})).rejects.toThrow('no turn is running in this session');
+    // With the host's control for a group, a module offering it clashes with the kernel's.
+    expect(() => toolCatalog(hostTools({ watches: { add: refuse, remove: refuse, list: () => [] }, modules: [groups[0]!] }))).toThrow('module tools.watch: tool "watch_add" is a kernel tool');
   });
 });

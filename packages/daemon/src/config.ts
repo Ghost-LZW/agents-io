@@ -28,7 +28,7 @@ import { loadEnvFile } from './env-file.js';
 import type { HarnessRegistry } from './harness-registry.js';
 import { resolveModuleFile } from './module-loader.js';
 import type { ModuleRegistry, ResolvedModule } from './modules.js';
-import { TOOL_NAMES } from '@agents-io/host-mcp';
+import { KERNEL_TOOL_NAMES } from '@agents-io/host-mcp';
 
 /*
  * aio.config.json: what runs. Secrets never go in it: they come from the
@@ -1106,7 +1106,10 @@ function moduleSettings(switches: readonly ModuleSwitch[], o: { raw: Record<stri
   });
 }
 
-/** The model tools agents may list (`agents.<name>.tools`): the kernel's, the modules' that are on; and whose tools are off. */
+/**
+ * The model tools agents may list (`agents.<name>.tools`): the kernel's six, then the modules' that
+ * are on (the watch, live and topic tools are the built-in modules'), in that order; and whose tools are off.
+ */
 interface ToolCatalog {
   names: readonly string[];
   /** A tool of a registered module that is off → that module. */
@@ -1115,7 +1118,7 @@ interface ToolCatalog {
 
 function toolCatalog(registry: ModuleRegistry, modules: readonly { id: string; enabled: boolean }[]): ToolCatalog {
   const on = new Set(modules.filter((x) => x.enabled).map((x) => x.id));
-  const names: string[] = [...TOOL_NAMES];
+  const names: string[] = [...KERNEL_TOOL_NAMES];
   const off = new Map<string, string>();
   for (const { manifest: m } of registry.modules) for (const t of m.mcpTools ?? []) (on.has(m.id) ? names.push(t.name) : off.set(t.name, m.id));
   return { names, off };
