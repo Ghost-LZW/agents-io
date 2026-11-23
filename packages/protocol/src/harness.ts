@@ -262,6 +262,7 @@ export interface HarnessFactoryInit {
  * returned included, carry the instance's env in `args.env`, a task run's over it, and a launched
  * session's only with `sessionEnv: 'open'`; and the agent's instructions in `args.instructions`,
  * during a transition also as `options.developerInstructions`, as before `instructions` existed.
- * `init.blobs` reads the media inputs point at (`stat` and `get`, nothing else).
+ * `init.blobs` reads the media inputs point at (`stat` and `get`, nothing else). The module may
+ * export a `HarnessModule` descriptor instead (`harness-module.ts`): its `create` gets this init too.
  */
 export type HarnessFactory = (init: HarnessFactoryInit) => HarnessAdapter | Promise<HarnessAdapter>;

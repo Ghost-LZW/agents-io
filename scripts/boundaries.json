@@ -7,7 +7,7 @@
     "packages/daemon": {
       "role": "core",
       "may": ["packages/protocol", "packages/session", "packages/host-mcp"],
-      "bundle": []
+      "bundle": ["src/bundle.ts"]
     },
     "packages/testkit": { "role": "test", "may": ["packages/protocol"] },
     "packages/daemon-e2e": {

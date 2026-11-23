@@ -113,6 +113,16 @@ describe('commands', () => {
     expect(w.replies().every((t) => t.includes('available only on Codex'))).toBe(true);
   });
 
+  it('in the default deployment (only Claude Code configured) /plan and /bypass say they are available only on Codex #CT-2', async () => {
+    // No configured instance declares Plan mode or the profile switch: the reply names the registered kind that does.
+    const w = await setup();
+    await w.say('/plan on');
+    await w.say('/bypass off');
+    await until(() => w.replies().length === 2);
+    expect(w.replies()).toEqual(['/plan is available only on Codex (this session runs claude-code).', '/bypass is available only on Codex (this session runs claude-code).']);
+    expect(w.harness.sessions).toHaveLength(0);
+  });
+
   it('/preset switches the session to another harness, model and effort as its agent (cwd, instructions); /preset default goes back #CT-2', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'aio-cmd-'));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));

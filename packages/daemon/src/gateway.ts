@@ -3,9 +3,11 @@ import { readFileSync, rmSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { Type, type TSchema } from '@sinclair/typebox';
 import { generateTopicTitle, topicTitlePrompt } from './topic-title.js';
 import {
   PROTOCOL_VERSION,
+  errors,
   formatAddress,
   routeKey,
   type AdminQueue,
@@ -33,7 +35,10 @@ import {
   type LiveSpeaker,
   type LiveStartArgs,
   type LoopGuardTrip,
+  type HarnessDeclarations,
   type HarnessFactory,
+  type HarnessFactoryInit,
+  type HarnessModule,
   type Origin,
   type Policy,
   type NativeClient,
@@ -97,14 +102,14 @@ import {
   settleLeftoverInputs,
 } from '@agents-io/session';
 import { HostMcpServer, HostTools, ToolError, agentIdentity, type TopicHandover } from '@agents-io/host-mcp';
-import { ClaudeCodeHarness, findOnPath, type ClaudeCodeHarnessConfig } from '@agents-io/harness-claude-code';
-import { CodexHarness, type CodexProfile } from '@agents-io/harness-codex';
+import { builtinHarnesses } from './bundle.js';
 import { loadChannelModule } from './channel-module.js';
 import { LarkBotAdapter, LarkBotJobs } from '@agents-io/channel-lark-bot';
 import { MailChannel, type MailChannelConfig } from '@agents-io/channel-mail';
 import { spawnChannel, type BridgedChannel, type BridgeState } from '@agents-io/channel-jsonl-bridge';
 import { ConfigError, RESERVED_CHANNEL_IDS, UNGRANTED_EVIDENCE, agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type PresetConfig, type ResolvedChannel } from './config.js';
 import { ConsoleServer } from './console.js';
+import type { HarnessRegistry } from './harness-registry.js';
 import { ConfigStore, canonical, envRefs } from './console-config.js';
 import type { ClientCommand, SessionInfo } from './frames.js';
 import { HostService, isHostOrigin } from './host.js';
@@ -134,6 +139,8 @@ export interface GatewayOptions {
   harness?: HarnessAdapter;
   /** Build instance adapters with this instead of `buildHarness` (tests). */
   buildHarness?: (instance: HarnessInstance) => HarnessAdapter;
+  /** The harness kinds instances are built from (default the built-in ones, `bundle.ts`): the registry the config was resolved with. */
+  harnessRegistry?: HarnessRegistry;
   /** In-process channels besides the configured ones. */
   channels?: ExtraChannel[];
   /** Build a configured channel's adapter with this instead of the built-in one when it returns one (embedding, tests). */
@@ -289,6 +296,8 @@ export class Gateway {
   readonly blobs: FsBlobStore;
   /** The blob store as harness adapters get it (`HarnessFactoryInit.blobs`, the built-in ones too): read-only, bound. */
   readonly harnessBlobs: BlobAccess;
+  /** The harness kinds (`GatewayOptions.harnessRegistry`): how instances are built, and what each kind declares. */
+  readonly harnessRegistry: HarnessRegistry;
   /** Host output tools, when some agent has `tools` on; mounted over MCP into those agents' harness bindings only. */
   readonly tools: HostTools | undefined;
   private readonly mcp: HostMcpServer | undefined;
@@ -360,6 +369,7 @@ export class Gateway {
     // The default harness is built below and captures its media resolvers now.
     this.blobs = new FsBlobStore(c.blobs);
     this.harnessBlobs = readOnlyBlobs(this.blobs);
+    this.harnessRegistry = o.harnessRegistry ?? builtinHarnesses;
     // The default instance must be usable (e.g. its env refs set); others fail when a turn names them.
     // A module default is checked in `start`, once its module is loaded.
     if (o.harness || o.buildHarness || c.harnesses[c.defaultHarness]?.kind !== 'module') this.harness();
@@ -941,14 +951,26 @@ export class Gateway {
     return a;
   }
 
-  /** An instance's adapter, built now: a module instance wraps what its factory returned at start. */
+  /** An instance's adapter, built now: a registered kind's by its module, a module instance wraps what its factory returned at start. */
   private build(inst: HarnessInstance): HarnessAdapter {
     const own = this.o.buildHarness?.(inst);
     if (own) return own;
-    if (inst.kind !== 'module') return buildHarness(inst, this.harnessBlobs);
+    if (inst.kind !== 'module') return buildHarness(inst, this.harnessBlobs, { registry: this.harnessRegistry, log: this.instanceLog(inst.name), harness: (name) => this.otherInstance(name) });
     const a = this.moduleAdapters.get(inst.name);
     if (!a) throw new Error(inst.unavailable ? `harness instance ${inst.name} is unavailable: ${inst.unavailable}` : `harness instance ${inst.name}: its module was not loaded`);
     return new InstanceHarness(inst, a);
+  }
+
+  /** The daemon log as an instance's adapter gets it (`HarnessFactoryInit.log`). */
+  private instanceLog(name: string): HarnessFactoryInit['log'] {
+    return (level, msg, data) => this.log(level, `harness ${name}: ${msg}`, data);
+  }
+
+  /** Another configured instance's adapter as an adapter gets it (`HarnessFactoryInit.harness`): built when first used. */
+  private otherInstance(name: string): HarnessAdapter {
+    const c = this.o.config;
+    if (!c.harnesses[name]) throw new Error(`unknown harness instance ${JSON.stringify(name)} (configured: ${Object.keys(c.harnesses).join(', ')})`);
+    return { id: name, probe: () => this.harness(name).probe(), open: (args) => this.harness(name).open(args) };
   }
 
   /**
@@ -964,13 +986,12 @@ export class Gateway {
       if (inst.kind !== 'module' || inst.unavailable) continue;
       const adapter = await loadHarnessModule({
         name: inst.name,
-        module: inst.module,
-        log: (level, msg, data) => this.log(level, `harness ${inst.name}: ${msg}`, data),
-        harness: (name) => {
-          if (!c.harnesses[name]) throw new Error(`unknown harness instance ${JSON.stringify(name)} (configured: ${Object.keys(c.harnesses).join(', ')})`);
-          return { id: name, probe: () => this.harness(name).probe(), open: (args) => this.harness(name).open(args) };
-        },
+        module: inst.launch as ModuleLaunch,
+        log: this.instanceLog(inst.name),
+        harness: (name) => this.otherInstance(name),
         blobs: this.harnessBlobs,
+        env: inst.env,
+        profiles: inst.profiles,
       }).catch((e: Error) => {
         throw new ConfigError(e.message);
       });
@@ -2640,7 +2661,9 @@ ${a.summary}` }],
    * starts on the same Claude session id (`--resume`, or `--session-id` for a new one) with this
    * launch's hooks and bridge, and the lane's turns go to it until it exits.
    */
-  private async claudeTuiAttach(key: string, lane: Lane, inst: Extract<HarnessInstance, { kind: 'claude-code' }>, model: string | undefined): Promise<Outcome> {
+  private async claudeTuiAttach(key: string, lane: Lane, inst: HarnessInstance, model: string | undefined): Promise<Outcome> {
+    // The instance's launch settings as the claude-code kind resolves them (its `ClaudeLaunch`).
+    const settings = inst.launch as { claudePath?: string; configDir?: string };
     if (this.claudeTui.holdOf(key)?.connected) return { ok: false, code: 'conflict', message: `${key}: a terminal UI is already attached` };
     this.claudeTui.holdOf(key)?.end('replaced by a new attach');
     await lane.whenIdle();
@@ -2655,10 +2678,10 @@ ${a.summary}` }],
       throw e;
     }
     const launch = this.claudeTui.launch(hold, {
-      executable: inst.claude.claudePath ?? 'claude',
+      executable: settings.claudePath ?? 'claude',
       resume: prior !== undefined,
       ...(model ? { model } : {}),
-      ...(inst.claude.configDir ? { configDir: inst.claude.configDir } : {}),
+      ...(settings.configDir ? { configDir: settings.configDir } : {}),
     });
     const cwd = this.laneInfo.get(key)?.cwd ?? this.o.config.cwd;
     this.log('info', `${key}: Claude Code TUI attaching to ${inst.name} ${hold.nativeId}`);
@@ -2792,11 +2815,15 @@ ${a.summary}` }],
         };
       },
       offering: (cap) => {
-        const names = Object.keys(c.harnesses).map((name) => {
+        const has = (d: HarnessDeclarations | undefined) => d !== undefined && (cap === 'plan' ? d.modes?.includes('plan') === true : d.ownerProfileSwitch === true);
+        const configured = Object.keys(c.harnesses).map((name) => {
           const a = this.declared(name);
-          return a && (cap === 'plan' ? a.modes?.includes('plan') : a.ownerProfileSwitch) ? (a.displayName ?? name) : undefined;
+          return has(a) ? (a!.displayName ?? name) : undefined;
         });
-        return [...new Set(names.filter((n) => n !== undefined))];
+        const names = configured.filter((n) => n !== undefined);
+        // None configured has it: the registered kinds that declare it (only Claude Code configured still hears "only on Codex").
+        if (!names.length) for (const m of this.harnessRegistry.modules) if (has(m.declares)) names.push(m.declares!.displayName ?? m.kind);
+        return [...new Set(names)];
       },
       setRun: (key, o) => {
         const cur = this.runOverride(key);
@@ -3102,7 +3129,7 @@ const OWNER_DM_FLAG = 'owner-dm-route';
  */
 export function withAgent(a: HarnessAdapter, agent: AgentConfig, cwd: string | undefined): HarnessAdapter {
   if (!(a instanceof InstanceHarness)) return a;
-  return new InstanceHarness({ ...a.instance, ...(cwd !== undefined ? { cwd } : {}) } as HarnessInstance, a.inner, a.env, agent.instructions ?? a.instructions);
+  return new InstanceHarness({ ...a.instance, ...(cwd !== undefined ? { cwd } : {}) }, a.inner, a.env, agent.instructions ?? a.instructions, a.profilesInOpen);
 }
 
 /** What the outbox takes when a delivery starts (`OutboxOptions.atSend`), kept in its in-flight mark (JSON data). */
@@ -3127,7 +3154,7 @@ interface LaunchAdapters {
  * get the env through their open args; their cwd is the lane's.
  */
 export function withLaunch(a: HarnessAdapter, cwd: string | undefined, env: Record<string, string> | undefined): HarnessAdapter {
-  if (a instanceof InstanceHarness) return new InstanceHarness({ ...a.instance, ...(cwd !== undefined ? { cwd } : {}) } as HarnessInstance, a.inner, env, a.instructions);
+  if (a instanceof InstanceHarness) return new InstanceHarness({ ...a.instance, ...(cwd !== undefined ? { cwd } : {}) }, a.inner, env, a.instructions, a.profilesInOpen);
   return env ? new LaunchEnvHarness(a, env) : a;
 }
 
@@ -3204,6 +3231,12 @@ function innerAdapter(a: HarnessAdapter): HarnessAdapter {
  */
 export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
   readonly id: string;
+  /**
+   * Every open's `options.profiles` is the instance's `profiles` (`HarnessModule.profilesInOpen`):
+   * a module instance's, and a registered kind's that takes them there (Claude Code). Default: what
+   * the built-in registry says of the instance's kind.
+   */
+  readonly profilesInOpen: boolean;
   /** The kind's lifecycle calls, present only when its adapter has them (the gateway reads their presence). */
   readonly detach?: () => Promise<void>;
   readonly dispose?: () => Promise<void>;
@@ -3216,12 +3249,14 @@ export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
     readonly env?: Record<string, string>,
     /** The agent's instructions (`HarnessOpenArgs.instructions`), unless an open gives its own. */
     readonly instructions?: string,
+    profilesInOpen?: boolean,
   ) {
     super();
     this.id = instance.name;
+    this.profilesInOpen = profilesInOpen ?? (instance.kind === 'module' || builtinHarnesses.get(instance.kind)?.profilesInOpen === true);
     if (typeof inner.detach === 'function') this.detach = () => inner.detach!();
     if (typeof inner.dispose === 'function') this.dispose = () => inner.dispose!();
-    if (typeof inner.ownProcess === 'function') this.ownProcess = (o) => new InstanceHarness(instance, inner.ownProcess!(o), undefined, instructions);
+    if (typeof inner.ownProcess === 'function') this.ownProcess = (o) => new InstanceHarness(instance, inner.ownProcess!(o), undefined, instructions, this.profilesInOpen);
   }
 
   probe(): Promise<{ version: string; caps: HarnessCaps }> {
@@ -3234,7 +3269,7 @@ export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
 
   open(args: HarnessOpenArgs): Promise<HarnessSession> {
     const i = this.instance;
-    const options = i.kind === 'claude-code' || i.kind === 'module' ? { ...i.options, profiles: i.profiles } : i.options;
+    const options = this.profilesInOpen ? { ...i.options, profiles: i.profiles } : i.options;
     // A module harness runs in the daemon's process: the instance's env reaches it through the open args.
     const instEnv = i.kind === 'module' ? definedEnv(i.env) : undefined;
     const env = instEnv || this.env ? { ...instEnv, ...args.env, ...this.env } : undefined;
@@ -3252,46 +3287,36 @@ export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
 }
 
 /**
- * The adapter for one instance. Environment values are handed to the child process only, never logged.
- * `blobs` is the store media inputs point at: the adapter resolves them itself.
+ * The adapter for one instance of a registered kind, built by the kind's module (`HarnessModule.create`;
+ * default registry: the built-in kinds). Environment values are handed to the child process only, never
+ * logged. `blobs` is the store media inputs point at: the adapter resolves them itself. `log` and
+ * `harness` are what the adapter gets as `HarnessFactoryInit` (outside a gateway: no log, no other instances).
  */
-export function buildHarness(i: HarnessInstance, blobs?: BlobAccess): InstanceHarness {
+export function buildHarness(
+  i: HarnessInstance,
+  blobs?: BlobAccess,
+  o: { registry?: HarnessRegistry; log?: HarnessFactoryInit['log']; harness?: HarnessFactoryInit['harness'] } = {},
+): InstanceHarness {
   if (i.unavailable) throw new Error(`harness instance ${i.name} is unavailable: ${i.unavailable}`);
   if (i.kind === 'module') throw new Error(`harness instance ${i.name} is a module harness; the gateway loads it at start`);
-  if (i.kind === 'codex') {
-    const x = i.codex;
-    return new InstanceHarness(
-      i,
-      new CodexHarness({
-        bin: x.bin ?? 'codex',
-        env: i.env,
-        transport: x.transport,
-        profiles: i.profiles as Record<string, CodexProfile>,
-        ...(x.codexHome ? { codexHome: x.codexHome } : {}),
-        ...(x.config ? { config: x.config } : {}),
-        ...(x.enable ? { enable: x.enable } : {}),
-        ...(x.disable ? { disable: x.disable } : {}),
-        ...(x.live ? { live: true } : {}),
-        ...(blobs ? { blobs } : {}),
+  const registry = o.registry ?? builtinHarnesses;
+  const kind = registry.get(i.kind);
+  if (!kind) throw new Error(`harness instance ${i.name}: harness kind ${JSON.stringify(i.kind)} is not registered (registered: ${registry.kinds.join(', ')})`);
+  const adapter = kind.create({
+    name: i.name,
+    config: undefined,
+    log: o.log ?? (() => {}),
+    harness:
+      o.harness ??
+      ((name) => {
+        throw new Error(`harness instance ${i.name}: no instance ${JSON.stringify(name)} outside a gateway`);
       }),
-    );
-  }
-  const x = i.claude;
-  const claudePath = x.claudePath && !x.claudePath.includes('/') ? (findOnPath(x.claudePath, i.env.PATH ?? process.env.PATH) ?? x.claudePath) : x.claudePath;
-  const config: ClaudeCodeHarnessConfig = {
-    env: i.env,
-    ...(claudePath ? { claudePath } : {}),
-    ...(x.configDir ? { configDir: x.configDir } : {}),
-    ...(x.settings !== undefined ? { settings: x.settings as ClaudeCodeHarnessConfig['settings'] } : {}),
-    ...(x.settingSources ? { settingSources: x.settingSources } : {}),
-    ...(x.mcpServers ? { mcpServers: x.mcpServers as ClaudeCodeHarnessConfig['mcpServers'] } : {}),
-    ...(x.plugins ? { plugins: x.plugins } : {}),
-    ...(x.skills !== undefined ? { skills: x.skills } : {}),
-    ...(x.extraArgs ? { extraArgs: x.extraArgs } : {}),
-    ...(x.additionalDirectories ? { additionalDirectories: x.additionalDirectories } : {}),
     ...(blobs ? { blobs } : {}),
-  };
-  return new InstanceHarness(i, new ClaudeCodeHarness(config));
+    launch: i.launch,
+    env: i.env,
+    profiles: i.profiles,
+  });
+  return new InstanceHarness(i, adapter, undefined, undefined, kind.profilesInOpen === true);
 }
 
 /** The variables an env map sets (`undefined` removes one from a child's env; in-process there is nothing to remove). */
@@ -3300,13 +3325,18 @@ function definedEnv(env: Record<string, string | undefined>): Record<string, str
   return Object.keys(out).length ? out : undefined;
 }
 
-/** Import a harness module, run its factory, and check the adapter's shape. */
+/**
+ * Import a harness module, run its factory (or its descriptor's `create`, `HarnessModule`), and check
+ * the adapter's shape.
+ */
 async function loadHarnessModule(o: {
   name: string;
   module: ModuleLaunch;
   log: (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
   harness: (name: string) => HarnessAdapter;
   blobs: BlobAccess;
+  env: Record<string, string | undefined>;
+  profiles: Record<string, Record<string, unknown>>;
 }): Promise<HarnessAdapter> {
   const where = `harnesses.${o.name} (module ${o.module.file})`;
   const name = o.module.export ?? 'createHarness';
@@ -3314,16 +3344,45 @@ async function loadHarnessModule(o: {
     throw new Error(`${where}: cannot import: ${e.message}`);
   })) as Record<string, unknown>;
   const factory = o.module.export !== undefined ? mod[name] : (mod[name] ?? mod.default);
-  if (typeof factory !== 'function') throw new Error(`${where}: export ${JSON.stringify(name)}${o.module.export !== undefined ? '' : ' (or default)'} is not a function`);
+  const descriptor = harnessDescriptor(factory);
+  if (typeof factory !== 'function' && !descriptor) throw new Error(`${where}: export ${JSON.stringify(name)}${o.module.export !== undefined ? '' : ' (or default)'} is not a function`);
+  const init: HarnessFactoryInit = { name: o.name, config: o.module.config, log: o.log, harness: o.harness, blobs: o.blobs };
   let adapter: HarnessAdapter;
-  try {
-    adapter = await (factory as HarnessFactory)({ name: o.name, config: o.module.config, log: o.log, harness: o.harness, blobs: o.blobs });
-  } catch (e) {
-    throw new Error(`${where}: factory failed: ${(e as Error).message}`);
+  if (descriptor) {
+    // A descriptor: its `schema` checks the entry's `config` (closed; an absent one is `{}`), which is its `launch`.
+    const launch = o.module.config ?? {};
+    const schema: unknown = descriptor.schema;
+    if (schema !== undefined) {
+      let errs: string[];
+      try {
+        const properties = (schema as { properties?: unknown } | null)?.properties;
+        if (typeof properties !== 'object' || properties === null) throw new Error('not a TypeBox object schema');
+        errs = errors(Type.Object(properties as Record<string, TSchema>, { additionalProperties: false }), launch);
+      } catch (e) {
+        throw new Error(`${where}: the descriptor's schema cannot be checked: ${(e as Error).message}`);
+      }
+      if (errs.length) throw new Error(`${where}: invalid config: ${errs.slice(0, 5).map((e) => `config${e}`).join('; ')}`);
+    }
+    try {
+      adapter = await descriptor.create({ ...init, launch, env: o.env, profiles: o.profiles });
+    } catch (e) {
+      throw new Error(`${where}: create failed: ${(e as Error).message}`);
+    }
+  } else {
+    try {
+      adapter = await (factory as HarnessFactory)(init);
+    } catch (e) {
+      throw new Error(`${where}: factory failed: ${(e as Error).message}`);
+    }
   }
   const bad = badHarnessAdapter(adapter as unknown as Partial<Record<string, unknown>> | null);
-  if (bad) throw new Error(`${where}: the factory did not return a HarnessAdapter (bad ${bad})`);
+  if (bad) throw new Error(`${where}: ${descriptor ? 'create' : 'the factory'} did not return a HarnessAdapter (bad ${bad})`);
   return adapter;
+}
+
+/** A module's export as a harness kind descriptor (`HarnessModule`: an object with a `create` function), if it is one. */
+function harnessDescriptor(v: unknown): Pick<HarnessModule, 'create'> & { schema?: unknown } | undefined {
+  return typeof v === 'object' && v !== null && typeof (v as { create?: unknown }).create === 'function' ? (v as Pick<HarnessModule, 'create'>) : undefined;
 }
 
 /**

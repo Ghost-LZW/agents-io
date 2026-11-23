@@ -83,8 +83,17 @@ see `docs/E2E.md` §0). New:
   store, so load only code you trust. Two channels with the same (id, account)
   fail the start. See `docs/CHANNELS.md` §5.
 - **Harness instances** (`harnesses.<name>`, `use`: `claude-code`, `codex` or `module`;
-  see `docs/E2E.md` §0). A `module` entry's module exports a `HarnessFactory`
-  (`@agents-io/protocol`); the adapter it returns serves every session of the instance.
+  see `docs/E2E.md` §0). `claude-code` and `codex` are the harness kinds the daemon's
+  composition root registers (`src/bundle.ts`): each is a `HarnessModule`
+  (`@agents-io/protocol`, `harness-module.ts`) in its own package (`harness/*/src/module.ts`)
+  that owns its keys, its section of the older `harness` block, its default model and
+  `AGENTS_IO_LIVE_*_MODEL` variable, its config-dir variable (`sessionParams.envPathRoots`),
+  its rules across instances (Codex: no two share a `stateDir`) and how its adapter is built;
+  the daemon's config code and its construction of adapters name no kind (only the native
+  terminal takeover still knows Claude Code). A `module` entry's module exports a `HarnessFactory`
+  (`@agents-io/protocol`), or a `HarnessModule` (its `schema` checks the entry's `config` at
+  start, its `create` gets the factory's init plus `launch` = that config, the instance's `env`
+  and `profiles`); the adapter it returns serves every session of the instance.
   Stop and restart follow what the adapter declares, built-in or module alike
   (`HarnessAdapter` in `packages/protocol/src/harness.ts`): with `detach()` its lanes are
   detached at stop (a running turn stays open in the log) and `detach()` is called once;
@@ -102,7 +111,9 @@ see `docs/E2E.md` §0). New:
   Codex), `ownerProfileSwitch: true` (`/bypass`; Codex only, although Claude Code maps
   `bypass` too) and `displayName` (how replies name the harness, e.g. "/plan is available
   only on Codex"; else the instance name). Without them those commands answer that they are
-  unavailable. `ephemeralOpen: true` (Codex) is transitional: topic titles are generated in an
+  unavailable; when no configured instance declares `modes` / `ownerProfileSwitch`, the reply
+  names the registered kinds that do (`HarnessModule.declares`), so a deployment with only Claude
+  Code configured still hears "/plan is available only on Codex". `ephemeralOpen: true` (Codex) is transitional: topic titles are generated in an
   ephemeral session of a harness that declares it, until a host hook replaces them (G4).
   A launched session's env (decision 7) reaches the harness as its adapter declares
   (`sessionEnv`): `'open'` (the default; Claude Code) puts it in the open args;
@@ -486,6 +497,17 @@ client and host frames (`hello`, `runStart`, `runEndedOf`, `inboundRead`, `onReq
 
 What changed for embedders with core-slimming G3:
 
+- Harness kinds come from a `HarnessRegistry` (exported, with `builtinHarnesses`: Claude Code,
+  then Codex). `resolveConfig` / `loadConfig` and `Gateway.start` take `harnessRegistry` (default
+  the built-in one; give both the same); `configFileSchema(registry)` is the file schema over it
+  (`ConfigFile` is the built-in one's). A `HarnessInstance` is `{ kind: string, launch }`: the
+  kind's settings moved from `claude` / `codex` / `module` to `launch` (same values; their types
+  are `ClaudeLaunch` from `@agents-io/harness-claude-code`, `CodexLaunch` from
+  `@agents-io/harness-codex`, `ModuleLaunch` here). `codexStateDir` moved to
+  `@agents-io/harness-codex`; `HarnessKind` is a `string`. `buildHarness(instance, blobs?, { registry, log, harness })`
+  builds through the kind's `create`. `InstanceHarness` puts the instance's `profiles` into the
+  open options of a `module` instance and of a kind that declares `profilesInOpen` (Claude Code),
+  as before.
 - `GatewayOptions.buildHarness` is called with each instance as configured, and for a task run
   with that instance carrying the run's cwd and env. It is no longer called with a rewritten
   instance (env merged, stdio transport, `CODEX_HOME` as its home) for a launched session with

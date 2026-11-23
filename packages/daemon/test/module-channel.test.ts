@@ -102,10 +102,10 @@ describe('module channel gateway', () => {
 
 describe('module harness (use: "module")', () => {
   /** Gateway.start with instance `plug` (the default harness) loaded from `module`; no buildHarness, so the gateway loads the module itself. */
-  async function startHarness(module: string, config?: Record<string, unknown>) {
+  async function startHarness(module: string, config?: Record<string, unknown>, entry: Record<string, unknown> = {}) {
     const dir = tmp('aio-mh-');
     mkdirSync(join(dir, 'work'), { recursive: true });
-    const raw = { dataDir: dir, local: { principal: 'me' }, cwd: join(dir, 'work'), harnesses: { plug: { use: 'module', module, ...(config ? { config } : {}) } }, defaultHarness: 'plug' };
+    const raw = { dataDir: dir, local: { principal: 'me' }, cwd: join(dir, 'work'), harnesses: { plug: { use: 'module', module, ...(config ? { config } : {}), ...entry } }, defaultHarness: 'plug' };
     const base = resolveConfig(raw, { env: {}, baseDir: here, cwd: dir });
     const gw = await Gateway.start({ config: { ...base, socketPath: join(dir, 'run', 'aio.sock') }, logger: () => {}, listen: false });
     cleanups.push(() => gw.stop());
@@ -152,5 +152,18 @@ describe('module harness (use: "module")', () => {
     const plug = gw.harness('plug');
     expect([plug.displayName, plug.compact, plug.modes, plug.ownerProfileSwitch, plug.sessionEnv]).toEqual(['Plug', { command: '/squash' }, ['plan'], false, { refused: 'a shared test server' }]);
     await declares({ modes: [], sessionEnv: 'open' });
+  });
+
+  it('a module may export a HarnessModule descriptor: its schema checks the config (a bad one fails the start, naming the instance); create gets the init with launch, env and profiles #CF-4', async () => {
+    const module = './fixtures/harness-descriptor.mjs';
+    await expect(startHarness(module, { key: 'd0', extra: 1 })).rejects.toThrow(/^harnesses\.plug \(module .*harness-descriptor\.mjs\): invalid config: config\/extra: Unexpected property/);
+    await expect(startHarness(module)).rejects.toThrow(/^harnesses\.plug \(module .*\): invalid config: config\/key: Expected required property/);
+    await expect(startHarness(module, { key: 'd1', throws: true })).rejects.toThrow(/^harnesses\.plug \(module .*\): create failed: no adapter today/);
+    const profiles = { tight: { sandbox: 'read-only' } };
+    const gw = await startHarness(module, { key: 'd2' }, { env: { BASE: '1' }, profiles });
+    const { init } = (globalThis as { __descriptor?: Record<string, { init: Record<string, unknown> }> }).__descriptor!.d2!;
+    expect(init).toMatchObject({ name: 'plug', config: { key: 'd2' }, launch: { key: 'd2' }, env: { BASE: '1' }, profiles });
+    expect(typeof (init.blobs as { stat?: unknown }).stat).toBe('function');
+    expect(gw.harness('plug').displayName).toBe('Described');
   });
 });

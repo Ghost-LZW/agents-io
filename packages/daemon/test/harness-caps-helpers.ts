@@ -6,6 +6,7 @@ import { FakeChannel, type FakeHarness } from '@agents-io/testkit';
 import { LocalClient } from '../src/client.js';
 import { resolveConfig } from '../src/config.js';
 import { Gateway } from '../src/gateway.js';
+import type { HarnessRegistry } from '../src/harness-registry.js';
 import { readTokenFile, tokenPath } from '../src/token.js';
 import { cleanups, tmp, until } from './helpers.js';
 
@@ -28,8 +29,9 @@ const caps = (config: Record<string, unknown>) => ({ use: 'module', module: './f
 /**
  * A daemon whose instances are the caps module with each config (name → config); the first is the
  * default. `agents` may name `<dataDir>/helper.md` (it holds "Be helpful.") as an instructions file.
+ * `harnessRegistry`: the harness kinds the deployment registers (default the built-in ones).
  */
-export async function start(harnesses: Record<string, Record<string, unknown>>, agents?: (dir: string) => Record<string, unknown>) {
+export async function start(harnesses: Record<string, Record<string, unknown>>, agents?: (dir: string) => Record<string, unknown>, o: { harnessRegistry?: HarnessRegistry } = {}) {
   const dir = tmp();
   mkdirSync(join(dir, 'work'), { recursive: true });
   writeFileSync(join(dir, 'helper.md'), 'Be helpful.');
@@ -41,10 +43,10 @@ export async function start(harnesses: Record<string, Record<string, unknown>>, 
     harnesses: Object.fromEntries(Object.entries(harnesses).map(([name, c]) => [name, caps(c)])),
     ...(agents ? { agents: agents(dir) } : {}),
   };
-  const base = resolveConfig(raw, { env: {}, baseDir: here, cwd: dir });
+  const base = resolveConfig(raw, { env: {}, baseDir: here, cwd: dir, ...o });
   const socketPath = join(dir, 'run', 'aio.sock');
   const chat = new FakeChannel('fake');
-  const gw = await Gateway.start({ config: { ...base, socketPath }, channels: [{ adapter: chat }], logger: () => {} });
+  const gw = await Gateway.start({ config: { ...base, socketPath }, channels: [{ adapter: chat }], logger: () => {}, ...o });
   cleanups.push(() => gw.stop());
   const host = async () => {
     const c = await LocalClient.connect(socketPath);

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { join } from 'node:path';
-import type { BlobAccess, HarnessAdapter, HarnessCaps, HarnessOpenArgs, HarnessSession, NativeClient, SessionEnvSupport } from '@agents-io/protocol';
+import type { BlobAccess, HarnessAdapter, HarnessCaps, HarnessDeclarations, HarnessOpenArgs, HarnessSession, NativeClient, SessionEnvSupport } from '@agents-io/protocol';
 import type { ClientInfo } from './generated/ClientInfo.js';
 import type { InitializeParams } from './generated/InitializeParams.js';
 import type { InitializeResponse } from './generated/InitializeResponse.js';
@@ -379,6 +379,20 @@ class AppServer implements SessionHost {
 }
 
 /**
+ * What every Codex adapter declares statically, whatever its transport (`HarnessModule.declares`);
+ * `adopts` and `sessionEnv` depend on the transport, so each adapter declares them itself.
+ */
+export const CODEX_DECLARATIONS = Object.freeze({
+  displayName: 'Codex',
+  /** Plan is a collaboration mode of the turn (`RunSpec.mode`). */
+  modes: Object.freeze(['plan'] as const),
+  /** `bypass` and `restricted` map to Codex approval policies and sandboxes per turn. */
+  ownerProfileSwitch: true,
+  /** `thread/start { ephemeral }` (topic titles until G4). */
+  ephemeralOpen: true,
+}) satisfies HarnessDeclarations;
+
+/**
  * Harness adapter for Codex. One app-server per adapter instance; each `open()`
  * is one Codex thread on it. Over stdio the process is a child of this host and
  * is stopped with the last session. Over a Unix socket the server outlives the
@@ -393,13 +407,10 @@ export class CodexHarness implements HarnessAdapter {
    * app-server outlives the host (over stdio it dies with it, so the host settles the turn).
    */
   readonly adopts: boolean;
-  readonly displayName = 'Codex';
-  /** Plan is a collaboration mode of the turn (`RunSpec.mode`). */
-  readonly modes = ['plan'] as const;
-  /** `bypass` and `restricted` map to Codex approval policies and sandboxes per turn. */
-  readonly ownerProfileSwitch = true;
-  /** `thread/start { ephemeral }` (topic titles until G4). */
-  readonly ephemeralOpen = true;
+  readonly displayName = CODEX_DECLARATIONS.displayName;
+  readonly modes = CODEX_DECLARATIONS.modes;
+  readonly ownerProfileSwitch = CODEX_DECLARATIONS.ownerProfileSwitch;
+  readonly ephemeralOpen = CODEX_DECLARATIONS.ephemeralOpen;
   /**
    * One app-server serves every session, so a launched session's env needs one of its own
    * (`ownProcess`); a Unix socket's server is shared and outlives the host, so it cannot.

@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { HarnessAdapter } from '@agents-io/protocol';
-import { ClaudeCodeHarness } from '@agents-io/harness-claude-code';
-import { CodexHarness } from '@agents-io/harness-codex';
+import { ClaudeCodeHarness, claudeCodeHarnessModule } from '@agents-io/harness-claude-code';
+import { CodexHarness, codexHarnessModule } from '@agents-io/harness-codex';
+import { builtinHarnesses } from '../src/bundle.js';
+import { HarnessRegistry } from '../src/harness-registry.js';
 import { CLAUDE_CODE_DECLARES, CODEX_DECLARES } from './declares.js';
 import { nextKey, rec, start } from './harness-caps-helpers.js';
 import { until } from './helpers.js';
@@ -21,6 +23,16 @@ describe('harness capabilities', () => {
     const blank = { displayName: undefined, compact: undefined, modes: undefined, ownerProfileSwitch: undefined, ephemeralOpen: undefined };
     expect(declared(new CodexHarness({ bin: '/nonexistent', transport: { kind: 'stdio' } }))).toEqual({ ...blank, ...CODEX_DECLARES });
     expect(declared(new ClaudeCodeHarness({ claudePath: '/nonexistent' }))).toEqual({ ...blank, ...CLAUDE_CODE_DECLARES });
+  });
+
+  it('each built-in kind declares without an adapter what its adapters declare (the names /plan and /bypass give when no configured instance has them) #CT-2', () => {
+    expect(builtinHarnesses.kinds).toEqual(['claude-code', 'codex']);
+    const adapters: Record<string, HarnessAdapter> = { 'claude-code': new ClaudeCodeHarness({ claudePath: '/nonexistent' }), codex: new CodexHarness({ bin: '/nonexistent', transport: { kind: 'stdio' } }) };
+    for (const m of builtinHarnesses.modules) {
+      for (const [k, v] of Object.entries(m.declares ?? {})) expect((adapters[m.kind] as unknown as Record<string, unknown>)[k], `${m.kind} ${k}`).toEqual(v);
+    }
+    expect(claudeCodeHarnessModule.declares).toMatchObject(CLAUDE_CODE_DECLARES);
+    expect(codexHarnessModule.declares).toMatchObject(CODEX_DECLARES);
   });
 
   it('a module harness declaring them: /plan and /bypass apply to the next turns, /status shows Plan mode, /compact and session.compact send its own command as a turn of its own #CT-2 #CT-3', async () => {
@@ -66,8 +78,9 @@ describe('harness capabilities', () => {
     expect(rec(bare).fake.sessions.map((s) => s.args.sessionKey)).toEqual([sessionKey]);
   });
 
-  it('no configured harness has Plan mode or the profile switch: /plan and /bypass say so #CT-2', async () => {
-    const w = await start({ bare: { key: nextKey() } });
+  it('no configured harness and no registered kind has Plan mode or the profile switch: /plan and /bypass say so #CT-2', async () => {
+    // A deployment whose bundle registers only Claude Code: no kind declares them either.
+    const w = await start({ bare: { key: nextKey() } }, undefined, { harnessRegistry: new HarnessRegistry([claudeCodeHarnessModule]) });
     expect(await w.say('/plan')).toBe('/plan is not available on any harness configured here (this session runs module).');
     expect(await w.say('/bypass')).toBe('/bypass is not available on any harness configured here (this session runs module).');
   });

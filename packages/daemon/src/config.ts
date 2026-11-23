@@ -1,12 +1,27 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { Type, type Static } from '@sinclair/typebox';
-import { Binding, Evidence, IdentityEntry, Tier, WatchDraft, errors, type BindingTable, type Principal, type RunSpec, type WatchSource } from '@agents-io/protocol';
+import { Type, type Static, type TObject, type TSchema } from '@sinclair/typebox';
+import {
+  Binding,
+  Evidence,
+  IdentityEntry,
+  Tier,
+  WatchDraft,
+  errors,
+  type BindingTable,
+  type HarnessChildSecrets,
+  type HarnessModule,
+  type HarnessResolveContext,
+  type Principal,
+  type RunSpec,
+  type WatchSource,
+} from '@agents-io/protocol';
 import { DEFAULT_BLOB_MAX_BYTES, OWNER_LABEL, Router, RouterError, checkIdentities, ownerIdentities, ownersTable, type AgentContactRule, type AgentSpec, type LoopGuardOptions } from '@agents-io/session';
+import { builtinHarnesses } from './bundle.js';
 import { resolveChannelModule } from './channel-module.js';
 import { loadEnvFile } from './env-file.js';
-import type { CodexTransportOption } from '@agents-io/harness-codex';
+import type { HarnessRegistry } from './harness-registry.js';
 import { TOOL_NAMES, parseScope, type ExternalScopes } from '@agents-io/host-mcp';
 
 /*
@@ -18,7 +33,10 @@ import { TOOL_NAMES, parseScope, type ExternalScopes } from '@agents-io/host-mcp
  * `settings`, codex `config`) never get the value itself: it goes into the
  * child's environment and the setting names the variable (`${NAME}`,
  * `settings.env`, codex `env_http_headers` / `bearer_token_env_var` /
- * `env_key` / `env_vars`); where that is impossible "env:" is refused.
+ * `env_key` / `env_vars`); where that is impossible "env:" is refused. Each
+ * harness kind's module does that for its own keys (`HarnessModule.resolve`,
+ * through `HarnessChildSecrets`); the kinds are the ones a `HarnessRegistry`
+ * holds (`bundle.ts` registers Claude Code and Codex).
  *
  * Agents (`agents: { <name>: { harness | preset, model?, effort?, profile?, cwd?,
  * mode?, tools?, instructionsFile? } }`) are named run configurations over the
@@ -40,8 +58,8 @@ import { TOOL_NAMES, parseScope, type ExternalScopes } from '@agents-io/host-mcp
 
 const Closed = { additionalProperties: false } as const;
 
-const HarnessKind = Type.Union([Type.Literal('claude-code'), Type.Literal('codex')]);
-export type HarnessKind = Static<typeof HarnessKind>;
+/** A registered harness kind's name (`HarnessModule.kind`, the `use` of its instances). */
+export type HarnessKind = string;
 
 const RunDefaults = Type.Object({ model: Type.Optional(Type.String()), effort: Type.Optional(Type.String()) }, Closed);
 const Profiles = Type.Record(Type.String(), Type.Record(Type.String(), Type.Unknown()));
@@ -54,20 +72,6 @@ const LegacySection = {
   /** Passed through as HarnessOpenArgs.options (ClaudeCodeOptions / CodexOpenOptions). */
   options: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 };
-
-const CodexTransport = Type.Union([
-  Type.Object({ kind: Type.Literal('stdio') }, Closed),
-  Type.Object(
-    {
-      kind: Type.Literal('unix'),
-      spawn: Type.Union([Type.Literal('own'), Type.Literal('daemon'), Type.Literal('none')]),
-      path: Type.Optional(Type.String()),
-      stateDir: Type.Optional(Type.String()),
-      reconnectWindowMs: Type.Optional(Type.Number()),
-    },
-    Closed,
-  ),
-]);
 
 const InstanceCommon = {
   /**
@@ -85,67 +89,47 @@ const InstanceCommon = {
   options: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 };
 
-const ClaudeInstance = Type.Object(
-  {
-    use: Type.Literal('claude-code'),
-    ...InstanceCommon,
-    /** CLAUDE_CONFIG_DIR: login, user settings, user skills/agents/commands, transcripts (default ~/.claude). */
-    configDir: Type.Optional(Type.String()),
-    /** The `claude` CLI (default: first on PATH). */
-    executable: Type.Optional(Type.String()),
-    /** Flag-layer settings: a settings.json path, or an inline object (Agent SDK `settings`). */
-    settings: Type.Optional(Type.Union([Type.String(), Type.Record(Type.String(), Type.Unknown())])),
-    /** Which settings files load (`[]` = none; default all). */
-    settingSources: Type.Optional(Type.Array(Type.Union([Type.Literal('user'), Type.Literal('project'), Type.Literal('local')]))),
-    mcpServers: Type.Optional(Type.Record(Type.String(), Type.Record(Type.String(), Type.Unknown()))),
-    /** Local plugin directories (each may carry skills, agents, commands, hooks). */
-    plugins: Type.Optional(Type.Array(Type.String())),
-    /** Skills to enable: "all" or names (default: the CLI's own). */
-    skills: Type.Optional(Type.Union([Type.Literal('all'), Type.Array(Type.String())])),
-    /** Extra CLI flags: name without `--` → value, null for a bare flag. */
-    extraArgs: Type.Optional(Type.Record(Type.String(), Type.Union([Type.String(), Type.Null()]))),
-    additionalDirectories: Type.Optional(Type.Array(Type.String())),
-  },
-  Closed,
-);
-
-const CodexInstance = Type.Object(
-  {
-    use: Type.Literal('codex'),
-    ...InstanceCommon,
-    /** CODEX_HOME: config.toml, auth, sessions, skills (default ~/.codex). */
-    home: Type.Optional(Type.String()),
-    /** The `codex` binary (default `codex` on PATH). */
-    executable: Type.Optional(Type.String()),
-    /** Dotted key → value, passed as `-c key=<TOML>` to `codex app-server` (argv: "env:NAME" only where Codex can name a variable). */
-    config: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
-    enable: Type.Optional(Type.Array(Type.String())),
-    disable: Type.Optional(Type.Array(Type.String())),
-    transport: Type.Optional(CodexTransport),
-    /** Realtime voice (decision 11): opt the app-server connection into Codex's experimental realtime API, so `live_join` works. Default false. */
-    live: Type.Optional(Type.Boolean()),
-    /** Not supported: `codex app-server` rejects --profile (checked: codex-cli 0.160). Listed to give a clear error. */
-    profile: Type.Optional(Type.String()),
-  },
-  Closed,
-);
-
 /**
- * In-process harness plugin: an ES module exporting a HarnessFactory (`@agents-io/protocol`).
- * `module` resolves like a channel module's (relative to the config file, absolute, a package
- * directory, or a bare specifier); `config` is env-substituted and handed to the factory.
+ * In-process harness plugin: an ES module exporting a HarnessFactory (`@agents-io/protocol`), or a
+ * HarnessModule. `module` resolves like a channel module's (relative to the config file, absolute,
+ * a package directory, or a bare specifier); `config` is env-substituted and handed to the factory.
  */
 const ModuleInstance = Type.Object(
   {
     use: Type.Literal('module'),
     ...InstanceCommon,
     module: Type.String(),
-    /** Export holding the factory (default `createHarness`, else `default`). */
+    /** Export holding the factory or descriptor (default `createHarness`, else `default`). */
     export: Type.Optional(Type.String()),
     config: Type.Optional(Type.Unknown()),
   },
   Closed,
 );
+
+const instanceSchemas = new WeakMap<HarnessModule, TObject>();
+
+/** A registered kind's instance entry: `use`, the keys every instance has, then the kind's own (closed). */
+function instanceSchema(m: HarnessModule): TObject {
+  let s = instanceSchemas.get(m);
+  if (!s) instanceSchemas.set(m, (s = Type.Object({ use: Type.Literal(m.kind), ...InstanceCommon, ...m.schema.properties }, Closed)));
+  return s;
+}
+
+/** Named instances (`harnesses`): each entry's `use` is a registered kind or `module`; the rest is checked against that. */
+function harnessesSchema(registry: HarnessRegistry) {
+  return Type.Optional(Type.Record(Type.String(), Type.Object({ use: registry.kinds.length ? Type.Union([kindSchema(registry), Type.Literal('module')]) : Type.Literal('module') })));
+}
+
+/** The older single `harness` block: `use`, then each kind's section (`HarnessModule.legacy`), named after it. */
+function legacyBlockSchema(registry: HarnessRegistry) {
+  const sections = registry.modules.flatMap((m) => (m.legacy ? [[m.kind, Type.Optional(Type.Object({ ...LegacySection, ...m.legacy.schema.properties }, Closed))] as const] : []));
+  return Type.Optional(Type.Object({ use: Type.Optional(kindSchema(registry)), ...Object.fromEntries(sections) }, Closed));
+}
+
+/** One of the registered kinds (`Type.Never` for none). */
+function kindSchema(registry: HarnessRegistry): TSchema {
+  return Type.Union(registry.kinds.map((k) => Type.Literal(k)));
+}
 
 const INSTANCE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
@@ -300,6 +284,7 @@ const AgentEntry = Type.Object(
   Closed,
 );
 
+/** The config file's schema over the built-in harness kinds (`configFileSchema` gives it over another registry's). */
 export const ConfigFile = Type.Object(
   {
     /** State directory (default ~/.agents-io/aio). Relative paths are relative to the config file. */
@@ -316,21 +301,12 @@ export const ConfigFile = Type.Object(
     blobs: Type.Optional(Type.Object({ dir: Type.Optional(Type.String()), maxBytes: Type.Optional(Type.Number({ minimum: 1 })) }, Closed)),
     /** Working directory for harness sessions (default: the current directory). */
     cwd: Type.Optional(Type.String()),
-    /** Named harness instances; `RunSpec.harness` is the name. Each entry is checked against its `use`. */
-    harnesses: Type.Optional(Type.Record(Type.String(), Type.Object({ use: Type.Union([HarnessKind, Type.Literal('module')]) }))),
+    /** Named harness instances; `RunSpec.harness` is the name. Each entry is checked against its `use` (a registered kind, or `module`). */
+    harnesses: harnessesSchema(builtinHarnesses),
     /** Instance the default policy plans (default: the only one, else the first). */
     defaultHarness: Type.Optional(Type.String()),
     /** Older single-harness form; each section becomes an instance named after its kind. */
-    harness: Type.Optional(
-      Type.Object(
-        {
-          use: Type.Optional(HarnessKind),
-          'claude-code': Type.Optional(Type.Object({ ...LegacySection, claudePath: Type.Optional(Type.String()) }, Closed)),
-          codex: Type.Optional(Type.Object({ ...LegacySection, bin: Type.Optional(Type.String()), transport: Type.Optional(CodexTransport) }, Closed)),
-        },
-        Closed,
-      ),
-    ),
+    harness: legacyBlockSchema(builtinHarnesses),
     /**
      * Named presets: harness instance + model + effort. An agent's `preset` is its default;
      * the owner switches one session to another with `/preset <name>` (`default` is reserved).
@@ -579,6 +555,16 @@ export const ConfigFile = Type.Object(
 );
 export type ConfigFile = Static<typeof ConfigFile>;
 
+const fileSchemas = new WeakMap<HarnessRegistry, TObject>();
+
+/** The config file's schema over a registry's harness kinds (`harnesses.<name>.use`, the older `harness` block); the rest is `ConfigFile`'s. */
+export function configFileSchema(registry: HarnessRegistry): TObject {
+  if (registry === builtinHarnesses) return ConfigFile;
+  let s = fileSchemas.get(registry);
+  if (!s) fileSchemas.set(registry, (s = Type.Object({ ...ConfigFile.properties, harnesses: harnessesSchema(registry), harness: legacyBlockSchema(registry) }, Closed)));
+  return s;
+}
+
 interface InstanceBase {
   /** Instance name: `RunSpec.harness`, and the `harness` of its session events. */
   name: string;
@@ -595,30 +581,6 @@ interface InstanceBase {
   unavailable?: string;
 }
 
-/** Claude Code launch settings (ClaudeCodeHarnessConfig). */
-export interface ClaudeLaunch {
-  claudePath?: string;
-  configDir?: string;
-  settings?: string | Record<string, unknown>;
-  settingSources?: ('user' | 'project' | 'local')[];
-  mcpServers?: Record<string, Record<string, unknown>>;
-  plugins?: string[];
-  skills?: 'all' | string[];
-  extraArgs?: Record<string, string | null>;
-  additionalDirectories?: string[];
-}
-
-/** Codex launch settings (CodexHarnessOptions). */
-export interface CodexLaunch {
-  bin?: string;
-  codexHome?: string;
-  config?: Record<string, unknown>;
-  enable?: string[];
-  disable?: string[];
-  transport: CodexTransportOption;
-  live?: boolean;
-}
-
 /** A harness plugin module (`use: "module"`). */
 export interface ModuleLaunch {
   /** The resolved file to import. */
@@ -629,8 +591,15 @@ export interface ModuleLaunch {
   config?: unknown;
 }
 
-export type HarnessInstance = InstanceBase &
-  ({ kind: 'claude-code'; claude: ClaudeLaunch } | { kind: 'codex'; codex: CodexLaunch } | { kind: 'module'; module: ModuleLaunch });
+export type HarnessInstance = InstanceBase & {
+  /** A registered kind (`HarnessModule.kind`, e.g. `claude-code`, `codex`), or `module`. */
+  kind: string;
+  /**
+   * The kind's launch settings, as its module resolved the entry (`HarnessModule.resolve`, e.g.
+   * `ClaudeLaunch` / `CodexLaunch` of the harness packages); for `module`, a `ModuleLaunch`.
+   */
+  launch: unknown;
+};
 
 /** A named run preset (`presets.<name>`). */
 export interface PresetConfig {
@@ -673,8 +642,8 @@ export interface SessionParams {
   envPathRoots: Record<string, string[]>;
 }
 
-/** Variables naming a harness config dir: in `envKeys` only with roots in `envPathRoots`. */
-export const CONFIG_DIR_KEYS = ['CLAUDE_CONFIG_DIR', 'CODEX_HOME'];
+/** Variables naming a built-in harness's config dir (`HarnessModule.defaults.configDirEnv`): in `envKeys` only with roots in `envPathRoots`. */
+export const CONFIG_DIR_KEYS: string[] = builtinHarnesses.configDirKeys();
 
 export interface Config {
   /** Not fatal, logged at start (e.g. a lark-bot account with ':'). */
@@ -899,10 +868,11 @@ export class ConfigError extends Error {
   override name = 'ConfigError';
 }
 
-const DEFAULT_MODEL: Record<HarnessKind | 'module', string> = { 'claude-code': 'haiku', codex: '', module: '' };
-const MODEL_ENV: Record<HarnessKind, string> = { 'claude-code': 'AGENTS_IO_LIVE_CLAUDE_MODEL', codex: 'AGENTS_IO_LIVE_CODEX_MODEL' };
-/** `.env.live` keys handed to the harness CLI; everything else (Lark, mail secrets) stays in this process. */
-const HARNESS_ENV = /^(ANTHROPIC_|CLAUDE_|OPENAI_|CODEX_|HTTPS?_PROXY$|NO_PROXY$)/;
+/**
+ * `.env.live` keys the older block's instances get besides their kinds' own (`legacy.envPrefixes`);
+ * everything else (Lark, mail secrets) stays in this process.
+ */
+const PROXY_ENV = /^(HTTPS?_PROXY|NO_PROXY)$/;
 
 /**
  * Where `.env.live` is: an explicit path, next to the config file, or the nearest one up from `cwd`.
@@ -941,6 +911,8 @@ export interface LoadOptions {
   cwd?: string;
   /** Resolve `channels` (default true). Clients and e2e leave them out, so they need no channel secrets. */
   channels?: boolean;
+  /** The harness kinds `use` may name (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
+  harnessRegistry?: HarnessRegistry;
 }
 
 export function loadConfig(o: LoadOptions = {}): Config {
@@ -959,7 +931,7 @@ export function loadConfig(o: LoadOptions = {}): Config {
   const envPath = findEnvFile({ envFile: o.envFile, configDir: dirname(path), cwd });
   const fileEnv = envPath ? loadEnvFile(envPath) : {};
   const env: Record<string, string | undefined> = { ...fileEnv, ...procEnv };
-  const c = resolveConfig(raw, { env, fileEnv, baseDir: dirname(path), harness: o.harness, cwd, channels: o.channels });
+  const c = resolveConfig(raw, { env, fileEnv, baseDir: dirname(path), harness: o.harness, cwd, channels: o.channels, ...(o.harnessRegistry ? { harnessRegistry: o.harnessRegistry } : {}) });
   return { ...c, source: { path, ...(envPath ? { envFile: resolve(cwd, envPath) } : {}) } };
 }
 
@@ -971,11 +943,14 @@ export interface ResolveContext {
   harness?: string;
   cwd?: string;
   channels?: boolean;
+  /** The harness kinds `use` may name (default the built-in ones, `bundle.ts`). */
+  harnessRegistry?: HarnessRegistry;
 }
 
 /** Validate a parsed config file and fill defaults. Error messages name keys, never values. */
 export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
-  const errs = errors(ConfigFile, raw);
+  const registry = ctx.harnessRegistry ?? builtinHarnesses;
+  const errs = errors(configFileSchema(registry), raw);
   if (errs.length) throw new ConfigError(`invalid config: ${errs.slice(0, 5).join('; ')}`);
   const c = raw as ConfigFile;
   const env = ctx.env;
@@ -986,14 +961,14 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
 
   const warnings: string[] = [];
   const dataDir = path(c.dataDir ?? join(homedir(), '.agents-io', 'aio'));
-  const { harnesses, defaultHarness } = resolveHarnesses(c, ctx, path);
+  const { harnesses, defaultHarness } = resolveHarnesses(c, ctx, path, registry);
 
   const owners = [...(c.policy?.owners ?? []), ...(env.AGENTS_IO_OWNERS ?? '').split(',').map((s) => s.trim()).filter(Boolean)];
   const ownerSessionKey = c.policy?.ownerSessionKey;
   // Off unless asked for (principle 2, decision 13: the default was true before 2026-10-11).
   const outputTools = c.outputTools ?? false;
   const presets = resolvePresets(c, harnesses);
-  const { agents, defaultAgent } = resolveAgents(c, harnesses, presets, defaultHarness, outputTools, path);
+  const { agents, defaultAgent } = resolveAgents(c, harnesses, presets, defaultHarness, outputTools, path, registry.configDirKeys());
   const identities = c.identities ?? [];
   const localSession = c.local?.session ?? ownerSessionKey ?? 'local:main';
   const table: BindingTable | undefined = c.bindings ? { version: 'config', bindings: c.bindings, identities: [] } : undefined;
@@ -1076,6 +1051,7 @@ function resolveAgents(
   defaultHarness: string,
   outputTools: boolean,
   path: (p: string) => string,
+  configDirKeys: readonly string[],
 ): { agents: Record<string, AgentConfig>; defaultAgent: string | undefined } {
   if (!c.agents) {
     if (c.defaultAgent !== undefined && c.defaultAgent !== DEFAULT_AGENT) fail('`defaultAgent` needs `agents`');
@@ -1102,7 +1078,7 @@ function resolveAgents(
         fail(`${where}.instructionsFile: cannot read ${file}: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`);
       }
     }
-    const sessionParams = a.sessionParams && resolveSessionParams(a.sessionParams, `${where}.sessionParams`, a.mode ?? 'interactive', path);
+    const sessionParams = a.sessionParams && resolveSessionParams(a.sessionParams, `${where}.sessionParams`, a.mode ?? 'interactive', path, configDirKeys);
     let toolNames: string[] | undefined;
     if (Array.isArray(a.tools)) {
       const unknown = a.tools.filter((t) => !(TOOL_NAMES as readonly string[]).includes(t));
@@ -1133,7 +1109,7 @@ function resolveAgents(
   return { agents, defaultAgent: c.defaultAgent ?? Object.values(agents).find((a) => a.mode === 'interactive')?.name };
 }
 
-function resolveSessionParams(p: NonNullable<AgentEntry['sessionParams']>, where: string, mode: 'interactive' | 'task', path: (p: string) => string): SessionParams {
+function resolveSessionParams(p: NonNullable<AgentEntry['sessionParams']>, where: string, mode: 'interactive' | 'task', path: (p: string) => string, configDirKeys: readonly string[]): SessionParams {
   if (mode === 'task') fail(`${where}: task agents take their cwd and env per run (run.start), not sessionParams`);
   for (const k of p.envKeys) {
     if (!VAR_NAME.test(k)) fail(`${where}.envKeys: ${JSON.stringify(k)} is not a variable name`);
@@ -1145,7 +1121,8 @@ function resolveSessionParams(p: NonNullable<AgentEntry['sessionParams']>, where
     if (!roots.length) fail(`${where}.envPathRoots.${k}: needs at least one root`);
     envPathRoots[k] = roots.map(path);
   }
-  for (const k of CONFIG_DIR_KEYS) {
+  // Each harness kind's config-dir variables (`HarnessModule.defaults.configDirEnv`).
+  for (const k of configDirKeys) {
     if (p.envKeys.includes(k) && !envPathRoots[k]) fail(`${where}: ${k} is in envKeys, so envPathRoots.${k} must say under which roots its value may point`);
   }
   return { cwdRoots: p.cwdRoots.map(path), envKeys: [...p.envKeys], envPathRoots };
@@ -1213,14 +1190,9 @@ export function withDefaultInstance(c: Config, i: HarnessInstance): Config {
   return { ...c, harnesses: { ...c.harnesses, [c.defaultHarness]: i } };
 }
 
-/** Where a codex instance keeps its socket, server record and turn snapshots unless it sets `transport.stateDir`. */
-export function codexStateDir(name: string): string {
-  return join(homedir(), '.agents-io', `codex.${name}`);
-}
+type Section = { run?: { model?: string; effort?: string }; profiles?: Record<string, Record<string, unknown>>; options?: Record<string, unknown> };
 
-const pathish = (p: string) => p.startsWith('~') || p.startsWith('.') || p.includes('/');
-
-function resolveHarnesses(c: ConfigFile, ctx: ResolveContext, path: (p: string) => string): { harnesses: Record<string, HarnessInstance>; defaultHarness: string } {
+function resolveHarnesses(c: ConfigFile, ctx: ResolveContext, path: (p: string) => string, registry: HarnessRegistry): { harnesses: Record<string, HarnessInstance>; defaultHarness: string } {
   const env = ctx.env;
   if (c.harness && c.harnesses) fail('use either `harnesses` (named instances) or the older `harness` block, not both');
   const out: Record<string, HarnessInstance> = {};
@@ -1228,89 +1200,70 @@ function resolveHarnesses(c: ConfigFile, ctx: ResolveContext, path: (p: string) 
   if (c.harnesses) {
     const names = Object.keys(c.harnesses);
     if (!names.length) fail('`harnesses` is empty');
-    for (const name of names) out[name] = resolveInstance(name, c.harnesses[name], env, path);
+    for (const name of names) out[name] = resolveInstance(name, c.harnesses[name], env, path, registry);
     def = c.defaultHarness ?? names[0]!;
     if (!out[def]) fail(`defaultHarness ${JSON.stringify(def)} is not one of the harnesses (${names.join(', ')})`);
   } else {
     if (c.defaultHarness) fail('`defaultHarness` needs `harnesses`');
     // Older form: one instance per present section, named after its kind, with the
-    // harness-ish `.env.live` keys passed through as before.
-    const legacyEnv = Object.fromEntries(Object.entries(ctx.fileEnv ?? {}).filter(([k]) => HARNESS_ENV.test(k)));
-    def = c.harness?.use ?? 'claude-code';
-    const cc = c.harness?.['claude-code'];
-    if (cc || def === 'claude-code') {
-      out['claude-code'] = {
-        ...base('claude-code', 'claude-code', cc ?? {}),
-        env: legacyEnv,
-        kind: 'claude-code',
-        claude: cc?.claudePath ? { claudePath: path(cc.claudePath) } : {},
-      };
-    }
-    const cx = c.harness?.codex;
-    if (cx || def === 'codex') {
-      out.codex = {
-        ...base('codex', 'codex', cx ?? {}),
-        env: legacyEnv,
-        kind: 'codex',
-        // stateDir stays the adapter default (~/.agents-io/codex), so a running deployment keeps adopting its turns.
-        codex: { ...(cx?.bin ? { bin: cx.bin } : {}), transport: transportOf(cx?.transport, undefined, path) },
-      };
+    // harness-ish `.env.live` keys (the kinds' `legacy.envPrefixes`, proxies) passed through as before.
+    const block = (c.harness ?? {}) as Record<string, unknown> & { use?: string };
+    const prefixes = registry.modules.flatMap((m) => m.legacy?.envPrefixes ?? []);
+    const legacyEnv = Object.fromEntries(Object.entries(ctx.fileEnv ?? {}).filter(([k]) => PROXY_ENV.test(k) || prefixes.some((x) => k.startsWith(x))));
+    def = block.use ?? registry.defaultKind ?? fail('no harness kind is registered: configure `harnesses`');
+    for (const m of registry.modules) {
+      const sec = block[m.kind] as (Section & Record<string, unknown>) | undefined;
+      if (!sec && def !== m.kind) continue;
+      out[m.kind] = m.legacy
+        ? { ...base(m.kind, m, sec ?? {}), env: legacyEnv, kind: m.kind, launch: m.legacy.resolve(sec ?? {}, { name: m.kind, where: `harness.${m.kind}`, path, fail }) }
+        : { ...resolveInstance(m.kind, { use: m.kind }, env, path, registry), env: legacyEnv };
     }
   }
 
   // --harness: an instance name, or a kind (its first instance, else one with defaults).
   const pick = ctx.harness;
   if (pick !== undefined && !out[pick]) {
-    const kind = pick === 'claude-code' || pick === 'codex' ? pick : undefined;
+    const kind = registry.get(pick) ? pick : undefined;
     if (!kind) fail(`unknown harness instance ${JSON.stringify(pick)} (configured: ${Object.keys(out).join(', ')})`);
     const first = Object.values(out).find((i) => i.kind === kind);
     if (first) def = first.name;
     else {
-      out[kind] =
-        kind === 'codex'
-          ? { ...base(kind, kind, {}), env: {}, kind, codex: { transport: { kind: 'stdio' } } }
-          : { ...base(kind, kind, {}), env: {}, kind, claude: {} };
+      out[kind] = resolveInstance(kind, { use: kind }, env, path, registry);
       def = kind;
     }
   } else if (pick !== undefined) def = pick;
 
   // Env model override applies to the default instance only (other instances may target other providers).
   const d = out[def]!;
-  const envModel = d.kind === 'module' ? undefined : env[MODEL_ENV[d.kind]];
+  const modelEnv = registry.get(d.kind)?.defaults?.modelEnv;
+  const envModel = modelEnv !== undefined ? env[modelEnv] : undefined;
   if (envModel) d.run = { ...d.run, model: envModel };
 
-  // Two codex instances must never share a server record or turn snapshots: restart adoption would cross them.
-  const dirs = new Map<string, string>();
-  for (const i of Object.values(out)) {
-    if (i.kind !== 'codex' || i.codex.transport.kind !== 'unix') continue;
-    const dir = i.codex.transport.stateDir ?? '(default ~/.agents-io/codex)';
-    const other = dirs.get(dir);
-    if (other) fail(`harnesses ${other} and ${i.name} use the same codex stateDir ${dir}; give each its own`);
-    dirs.set(dir, i.name);
+  // Rules across one kind's instances (e.g. two codex instances never share a stateDir).
+  for (const m of registry.modules) {
+    const broken = m.checkAll?.(Object.values(out).filter((i) => i.kind === m.kind).map((i) => ({ name: i.name, launch: i.launch })));
+    if (broken) fail(broken);
   }
   return { harnesses: out, defaultHarness: def };
 }
 
-function base(name: string, kind: HarnessKind | 'module', sec: { run?: { model?: string; effort?: string }; profiles?: Record<string, Record<string, unknown>>; options?: Record<string, unknown> }) {
+/** An instance's name, RunSpec defaults (the kind's default model), profiles and options. */
+function base(name: string, kind: HarnessModule | undefined, sec: Section) {
   return {
     name,
-    run: { harness: name, model: sec.run?.model ?? DEFAULT_MODEL[kind], ...(sec.run?.effort ? { effort: sec.run.effort } : {}) },
+    run: { harness: name, model: sec.run?.model ?? kind?.defaults?.model ?? '', ...(sec.run?.effort ? { effort: sec.run.effort } : {}) },
     profiles: sec.profiles ?? {},
     options: sec.options ?? {},
   };
 }
 
-function transportOf(t: Static<typeof CodexTransport> | undefined, defaultStateDir: string | undefined, path: (p: string) => string): CodexTransportOption {
-  if (!t || t.kind === 'stdio') return { kind: 'stdio' };
-  const stateDir = t.stateDir ? path(t.stateDir) : defaultStateDir;
-  return { ...t, ...(t.path ? { path: path(t.path) } : {}), ...(stateDir ? { stateDir } : {}) };
-}
-
-function resolveInstance(name: string, raw: unknown, env: Record<string, string | undefined>, path: (p: string) => string): HarnessInstance {
+function resolveInstance(name: string, raw: unknown, env: Record<string, string | undefined>, path: (p: string) => string, registry: HarnessRegistry): HarnessInstance {
   const where = `harnesses.${name}`;
   if (!INSTANCE_NAME.test(name)) fail(`${where}: instance names are letters, digits, '.', '_' and '-' (at most 64)`);
-  const use = (raw as { use: HarnessKind | 'module' }).use;
-  const errs = errors(use === 'codex' ? CodexInstance : use === 'module' ? ModuleInstance : ClaudeInstance, raw);
+  const use = (raw as { use: string }).use;
+  // `use` is a registered kind or `module` (the file schema says so).
+  const kind = use === 'module' ? undefined : registry.get(use);
+  const errs = errors(kind ? instanceSchema(kind) : ModuleInstance, raw);
   if (errs.length) fail(`invalid config: ${errs.slice(0, 5).map((e) => `${where}${e}`).join('; ')}`);
   // A missing "env:NAME" makes only this instance unusable (reported when it is built), not the whole config.
   let unavailable: string | undefined;
@@ -1330,7 +1283,8 @@ function resolveInstance(name: string, raw: unknown, env: Record<string, string 
   // "env:NAME" in settings that end up on the child's command line (codex `-c`, claude
   // `--mcp-config` / `--settings`, readable by other local users via ps) never becomes the
   // value there: the value goes into the child's environment and the setting names the variable.
-  const secrets: ChildSecrets = {
+  // The kind's module decides which of its settings those are (`HarnessModule.resolve`).
+  const secrets: HarnessChildSecrets = {
     value: (name, at) => {
       if (!VAR_NAME.test(name)) fail(`${at}: ${JSON.stringify(name)} is not a variable name`);
       const v = env[name];
@@ -1343,170 +1297,26 @@ function resolveInstance(name: string, raw: unknown, env: Record<string, string 
     },
   };
   const common = {
-    ...base(name, use, raw as Static<typeof CodexInstance>),
+    ...base(name, kind, raw as Section),
     env: envOut,
     ...((raw as { cwd?: string }).cwd ? { cwd: path((raw as { cwd: string }).cwd) } : {}),
   };
-  if (use === 'module') {
+  if (!kind) {
     const x = raw as Static<typeof ModuleInstance>;
     const spec = x.module;
     const rel = spec.startsWith('.') || spec.startsWith('~') || isAbsolute(spec);
     const r = resolveChannelModule(spec, rel ? path(spec) : undefined, path('.'));
     if ('error' in r) fail(`${where}.module: ${r.error}`);
     const module: ModuleLaunch = { file: r.file, ...(x.export ? { export: x.export } : {}), ...(x.config !== undefined ? { config: sub(x.config, 'config') } : {}) };
-    return { ...common, kind: 'module', module, ...(unavailable ? { unavailable } : {}) };
+    return { ...common, kind: 'module', launch: module, ...(unavailable ? { unavailable } : {}) };
   }
-  if (use === 'codex') {
-    const x = raw as Static<typeof CodexInstance>;
-    if (x.profile !== undefined)
-      fail(`${where}.profile: \`codex app-server\` does not accept --profile (codex-cli 0.160 rejects it, and \`-c profile=…\` is legacy); use \`config\` keys or a separate \`home\``);
-    if ('CODEX_HOME' in envOut && x.home) fail(`${where}: set \`home\` or env.CODEX_HOME, not both`);
-    const transport = transportOf(x.transport, codexStateDir(name), path);
-    if ((x.config && Object.keys(x.config).length) || x.enable?.length || x.disable?.length) {
-      if (transport.kind === 'unix' && transport.spawn !== 'own')
-        fail(`${where}: config/enable/disable only apply to a server the gateway starts (stdio or unix spawn "own"), not spawn "${transport.spawn}"`);
-    }
-    const codex: CodexLaunch = {
-      ...(x.executable ? { bin: pathish(x.executable) ? path(x.executable) : x.executable } : {}),
-      ...(x.home ? { codexHome: path(x.home) } : {}),
-      ...(x.config ? { config: codexConfigViaEnv(x.config, `${where}.config`, secrets) } : {}),
-      ...(x.enable ? { enable: x.enable } : {}),
-      ...(x.disable ? { disable: x.disable } : {}),
-      ...(x.live ? { live: true } : {}),
-      transport,
-    };
-    return { ...common, kind: 'codex', codex, ...(unavailable ? { unavailable } : {}) };
-  }
-  const x = raw as Static<typeof ClaudeInstance>;
-  if ('CLAUDE_CONFIG_DIR' in envOut && x.configDir) fail(`${where}: set \`configDir\` or env.CLAUDE_CONFIG_DIR, not both`);
-  const claude: ClaudeLaunch = {
-    ...(x.executable ? { claudePath: pathish(x.executable) ? path(x.executable) : x.executable } : {}),
-    ...(x.configDir ? { configDir: path(x.configDir) } : {}),
-    ...(x.settings !== undefined ? { settings: typeof x.settings === 'string' ? path(x.settings) : claudeSettingsViaEnv(x.settings, `${where}.settings`, secrets) } : {}),
-    ...(x.settingSources ? { settingSources: x.settingSources } : {}),
-    ...(x.mcpServers ? { mcpServers: claudeMcpViaEnv(x.mcpServers, `${where}.mcpServers`, secrets) } : {}),
-    ...(x.plugins ? { plugins: x.plugins.map(path) } : {}),
-    ...(x.skills !== undefined ? { skills: x.skills } : {}),
-    ...(x.extraArgs ? { extraArgs: x.extraArgs } : {}),
-    ...(x.additionalDirectories ? { additionalDirectories: x.additionalDirectories.map(path) } : {}),
-  };
-  return { ...common, kind: 'claude-code', claude, ...(unavailable ? { unavailable } : {}) };
+  const rctx: HarnessResolveContext = { name, where, env: envOut, path, secrets, fail };
+  const r: { launch: unknown; unavailable?: string } = kind.resolve ? kind.resolve(raw as Record<string, unknown>, rctx) : { launch: raw };
+  unavailable ??= r.unavailable;
+  return { ...common, kind: kind.kind, launch: r.launch, ...(unavailable ? { unavailable } : {}) };
 }
 
 export const VAR_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const envRef = (v: unknown): string | undefined => (typeof v === 'string' && v.startsWith('env:') ? v.slice(4) : undefined);
-
-/** How a harness instance hands "env:NAME" values to its child process. */
-interface ChildSecrets {
-  /** The variable's value; undefined (instance unavailable) when it is not set. */
-  value(name: string, at: string): string | undefined;
-  /** Put `k=v` into the child's environment. */
-  toChild(k: string, v: string, at: string): void;
-}
-
-/** Claude `mcpServers`: "env:NAME" becomes `${NAME}` (the CLI expands it in command, args, env, url, headers). */
-function claudeMcpViaEnv<T>(v: T, at: string, s: ChildSecrets): T {
-  const name = envRef(v);
-  if (name !== undefined) {
-    const value = s.value(name, at);
-    if (value !== undefined) s.toChild(name, value, at);
-    return `\${${name}}` as T;
-  }
-  if (Array.isArray(v)) return v.map((x, i) => claudeMcpViaEnv(x, `${at}[${i}]`, s)) as T;
-  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, claudeMcpViaEnv(x, `${at}.${k}`, s)])) as T;
-  return v;
-}
-
-/** Claude inline `settings` (passed as `--settings <json>`): "env:NAME" only under `settings.env`, moved to the child env. */
-function claudeSettingsViaEnv(st: Record<string, unknown>, at: string, s: ChildSecrets): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(st)) {
-    if (k === 'env' && v && typeof v === 'object' && !Array.isArray(v)) {
-      const kept: Record<string, unknown> = {};
-      for (const [vk, vv] of Object.entries(v)) {
-        const name = envRef(vv);
-        if (name === undefined) kept[vk] = vv;
-        else if (!VAR_NAME.test(vk)) fail(`${at}.env: ${JSON.stringify(vk)} is not a variable name`);
-        else {
-          const value = s.value(name, `${at}.env.${vk}`);
-          if (value !== undefined) s.toChild(vk, value, `${at}.env.${vk}`);
-        }
-      }
-      out[k] = kept;
-    } else out[k] = noEnvRefs(v, `${at}.${k}`, 'the claude command line (--settings)', 'set it under settings.env or the instance env');
-  }
-  return out;
-}
-
-function noEnvRefs(v: unknown, at: string, line: string, hint: string): unknown {
-  if (envRef(v) !== undefined) fail(`${at}: "env:" values would be on ${line}, visible to other local users via ps; ${hint}`);
-  if (Array.isArray(v)) v.forEach((x, i) => noEnvRefs(x, `${at}[${i}]`, line, hint));
-  else if (v && typeof v === 'object') for (const [k, x] of Object.entries(v)) noEnvRefs(x, `${at}.${k}`, line, hint);
-  return v;
-}
-
-const TOML_SEG = /[A-Za-z0-9_][A-Za-z0-9_-]*|"[^"\\]*"/g;
-const tomlKey = (segs: string[]) => segs.map((x) => (/^[A-Za-z0-9_-]+$/.test(x) ? x : JSON.stringify(x))).join('.');
-
-/**
- * Codex `config` (passed as `-c key=value`): each "env:NAME" is replaced by the Codex setting
- * that names a variable instead of holding the value, with the value in the app-server's env:
- * `…http_headers.H` → `…env_http_headers.H`, `…bearer_token` → `…bearer_token_env_var`,
- * `…experimental_bearer_token` → `…env_key`, `mcp_servers.<id>.env.VAR` → `mcp_servers.<id>.env_vars`.
- * Anywhere else it is an error.
- */
-function codexConfigViaEnv(config: Record<string, unknown>, at: string, s: ChildSecrets): Record<string, unknown> {
-  const DROP = Symbol('drop');
-  const extra: [string, unknown][] = [];
-  const forward = new Map<string, string[]>();
-  const visit = (v: unknown, segs: string[]): unknown => {
-    const name = envRef(v);
-    if (name !== undefined) {
-      const where = `${at}.${segs.join('.')}`;
-      const [last, parent] = [segs.at(-1)!, segs.at(-2)];
-      const value = s.value(name, where);
-      if (parent === 'env' && segs.length >= 3 && VAR_NAME.test(last)) {
-        // A stdio MCP server's env: forward the variable from the app-server's environment.
-        const server = tomlKey(segs.slice(0, -2));
-        forward.set(server, [...(forward.get(server) ?? []), last]);
-        if (value !== undefined) s.toChild(last, value, where);
-        return DROP;
-      }
-      let key: string[] | undefined;
-      if (parent === 'http_headers') key = [...segs.slice(0, -2), 'env_http_headers', last];
-      else if (last === 'bearer_token') key = [...segs.slice(0, -1), 'bearer_token_env_var'];
-      else if (last === 'experimental_bearer_token') key = [...segs.slice(0, -1), 'env_key'];
-      if (!key)
-        fail(
-          `${where}: "env:" values would be on the codex app-server command line, visible to other local users via ps; ` +
-            'use a setting that names a variable (http_headers → env_http_headers, bearer_token → bearer_token_env_var, ' +
-            'experimental_bearer_token → env_key, mcp_servers.<id>.env.<VAR>) or write a non-secret value literally',
-        );
-      if (value !== undefined) s.toChild(name, value, where);
-      extra.push([tomlKey(key), name]);
-      return DROP;
-    }
-    if (Array.isArray(v)) return v.map((x, i) => visit(x, [...segs, `[${i}]`]));
-    if (v && typeof v === 'object') {
-      const out: Record<string, unknown> = {};
-      for (const [k, x] of Object.entries(v)) {
-        const r = visit(x, [...segs, k]);
-        if (r !== DROP) out[k] = r;
-      }
-      return out;
-    }
-    return v;
-  };
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(config)) {
-    const segs = (k.match(TOML_SEG) ?? [k]).map((x) => x.replace(/^"|"$/g, ''));
-    const r = visit(v, segs);
-    if (r !== DROP) out[k] = r;
-  }
-  for (const [k, v] of extra) out[k] = v;
-  for (const [server, vars] of forward) out[`${server}.env_vars`] = vars;
-  return out;
-}
 
 /**
  * Every channel entry, plus the rules across lark-bot entries (decision 8): one

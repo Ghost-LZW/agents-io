@@ -6,6 +6,6 @@
   "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
   "files": ["dist"],
   "scripts": { "gen-types": "scripts/gen-types.sh" },
-  "dependencies": { "@agents-io/protocol": "workspace:*", "ws": "^8.22.0" },
+  "dependencies": { "@agents-io/protocol": "workspace:*", "@sinclair/typebox": "^0.34.0", "ws": "^8.22.0" },
   "devDependencies": { "@agents-io/session": "workspace:*", "@agents-io/testkit": "workspace:*", "@types/ws": "^8.18.2" }
 }

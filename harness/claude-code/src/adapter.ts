@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { accessSync, constants, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { delimiter, dirname, join } from 'node:path';
-import type { BlobAccess, HarnessAdapter, HarnessCaps, HarnessOpenArgs, HarnessSession } from '@agents-io/protocol';
+import type { BlobAccess, HarnessAdapter, HarnessCaps, HarnessDeclarations, HarnessOpenArgs, HarnessSession } from '@agents-io/protocol';
 import { blobResolvers } from './media.js';
 import { AsyncQueue } from './queue.js';
 import { ClaudeCodeSession, defaultProfile, isEffort } from './session.js';
@@ -113,17 +113,24 @@ export function assertSupported(sdk: string, cli: string): void {
     throw new Error(`@agents-io/harness-claude-code: unsupported Claude Code CLI ${cli} (supported: 2.x)`);
 }
 
+/** What every Claude Code adapter declares statically (`HarnessModule.declares`). */
+export const CLAUDE_CODE_DECLARATIONS = Object.freeze({
+  displayName: 'Claude Code',
+  /** `/compact` sent as the turn's user message compacts the session (`compact_boundary`, no answer text). */
+  compact: Object.freeze({ command: '/compact' } as const),
+  /** Every session runs its own CLI child: `args.env` is the top layer of its environment. */
+  sessionEnv: 'open',
+}) satisfies HarnessDeclarations;
+
 /**
  * Drives the locally installed Claude Code CLI through the official Agent SDK's
  * `query()` with streaming input. No agent loop of its own.
  */
 export class ClaudeCodeHarness implements HarnessAdapter {
   readonly id = 'claude-code';
-  readonly displayName = 'Claude Code';
-  /** `/compact` sent as the turn's user message compacts the session (`compact_boundary`, no answer text). */
-  readonly compact = { command: '/compact' } as const;
-  /** Every session runs its own CLI child: `args.env` is the top layer of its environment. */
-  readonly sessionEnv = 'open';
+  readonly displayName = CLAUDE_CODE_DECLARATIONS.displayName;
+  readonly compact = CLAUDE_CODE_DECLARATIONS.compact;
+  readonly sessionEnv = CLAUDE_CODE_DECLARATIONS.sessionEnv;
   private probed: Promise<{ version: string; caps: HarnessCaps }> | undefined;
 
   constructor(private readonly config: ClaudeCodeHarnessConfig = {}) {}
