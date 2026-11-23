@@ -11,10 +11,10 @@ agents-io 的包级分层是干净的：`protocol` 不依赖任何包，`session
 | 指标（`main` 638eccf） | 数值 |
 |---|---|
 | 非测试源码 | 约 37.5K 行。daemon 11.6K（`gateway.ts` 3263、`config.ts` 1615），session 8.0K，codex 4.7K，lark-bot 4.2K，protocol 3.3K，host-mcp 1.9K，claude-code 1.8K |
-| 宿主协议 feature 标记 | 32 个（`packages/daemon/src/host.ts` `FEATURES`） |
+| 宿主协议 feature 标记 | 17 个（`packages/daemon/src/host.ts` `FEATURES`） |
 | 会话事件种类 | 31 种（`packages/protocol/src/events.ts`） |
 | 聊天命令 | 16 个（`packages/daemon/src/commands.ts`） |
-| 给模型的工具 | 内部 13 个（`host-mcp`）、对外端点 6 个 |
+| 给模型的工具 | 内部 15 个（`host-mcp/src/server.ts`）、对外端点 6 个 |
 | 不变量 | 102 条（`docs/INVARIANTS.md`） |
 | 核心文件越界（§6 守卫初始基线） | 318 处：`gateway.ts` 直接 import 5 个适配器包，按 `instanceof LarkBotAdapter`、`kind === 'codex'` 分支；`config.ts` 115 处飞书 / Codex 专属校验；`protocol/src/admin.ts` 带着飞书机器人开通的类型；生产代码从 `testkit` 取 `AsyncQueue`、`loadEnvFile` |
 
@@ -118,6 +118,8 @@ flowchart LR
 | G7 | 标准投影 `attention`：从日志 fold 出"现在需要人"（有未答的人工请求、失败、等待），并用 fixture 固定。persona #13552 正需要这个，现在每个宿主各算一遍 | 宿主的角标、推送 |
 | G8 | 与语言无关的一致性 fixture：JSON 写的"输入序列 → 期望的事件与帧"，非 TS 的实现或宿主不用跑 TS 就能自检（persona 的 `spec/fixtures` 做法） | §8 的语言选择、§9 的通用组件定位 |
 | G9 | 标准协议适配：南向 ACP harness，北向 AG-UI / ACP 投影（POSITIONING §9） | 成为各框架的 IO 层 |
+| G10 | outbox 结算合成一个事务：结算记录、出站索引、`delivery.settled` 一起提交，扇出推迟到提交之后（`hub.batch`）。今天在 put 之后、append 之前崩溃，日志里就永远没有这条 settled，也不会自愈。附带：`fromSeq > head` 改发快照 | DL-1、EX-2、ID-8 的缝 |
+| G11 | 客户端命令的操作 id（feature `client.opId`）：回执与事件同一事务写入，重放时答第一次的结果，冲突时答 `op_id_conflict`，应答带 `seq` | 客户端断线重发导致重复打断、重复建话题和监听 |
 
 ## 4. 阶段
 
@@ -185,6 +187,34 @@ persona 在自己的 Go 服务里做了一整套 agent IO（代码位置以 `ori
 - Lark 搬出去之前需要的中立卡片模型，对应 Compositor 与 tier。
 
 这是 agents-io 作为通用组件可以提供给 persona 这类宿主的部分，详见 POSITIONING §9。
+
+### 7.1 从 t3code 学到的
+
+t3code（pingdotgg/t3code，MIT，Effect-TS）是开源 coding agent 控制台。2026-11-23 读了它的源码（homelab 评估见 lan-bing-homes `docs/homelab/parts/t3code.md`）。
+
+**协议的取舍：不采用它的协议。** 它的 WS RPC 契约（`packages/contracts`，Effect Schema，0.x，nightly）是一个产品的内部接口，不是标准。它的模型是单用户、只有自己的客户端、投影为真相、事件只留约 1 天。缺的那一半正是 agents-io 的核心：通道、身份盖章、投递义务、多方同场，还有宿主策略。和它互通走 ACP：t3code 本身支持任意 ACP agent，agents-io 把会话暴露成 ACP agent（G9 的北向投影），它就能接上，Zed、JetBrains 也一样。概念能一一对上，所以真需要接它的客户端时，再做一个 t3code 投影模块：
+
+| t3code | agents-io |
+|---|---|
+| AppThread | session（`sessionKey`） |
+| Run | turn |
+| ExecutionNode 树 | item 树（`itemId` / `parentItemId`） |
+| ProviderThread | `nativeId`（`session.bound`） |
+
+**借鉴的设计：**
+
+| t3code | 借鉴到哪 |
+|---|---|
+| `ProviderAdapterV2` + 能力标记，缺失时由编排层显式降级，不按 provider 名字分支 | G3。教训：它约 72 个能力标记里有约 46 个没有任何读取方，所以每个新 cap 都要有读取方和测试 |
+| 每个请求标注 `responseCapability`：进程在才能答、可以用新消息作答、重启后不可续 | `request.opened` 加可选字段，配合 RQ-2 和 RS 系列 |
+| 命令回执、事件、投影、outbox 在一个 SQLite 事务里，先提交后发布 | G10：outbox 结算今天分三步各自提交，见 §3 |
+| 客户端带 `commandId`；被拒的也记回执；id 冲突单独报错；应答带 `sequence`，客户端据此读到自己的写 | G11：客户端命令的操作 id |
+| 续传有上限：游标超前、或者积压太多，就改发快照 | `fromSeq > head` 今天会被静默夹到 head，应改发快照（G10 附带） |
+| 真实 provider 的录制回放：NDJSON transcript，加上输入脚本和断言 | G8：transcript 沿用它的格式；输入和断言也写成数据，按端保持顺序、端与端之间不排序 |
+| Peer Link 的权限只缩不扩；子 agent 的 turn 结束不关父 Run | agent 之间的通信（`agent_run`）与 item 树各补一条不变量 |
+| 一次性配对码换取有 scope、可撤销的 session | 以后有远程或移动端接入时用；本地形态下，现在的 token 文件和每客户端令牌够用 |
+
+**不借鉴的：** effect 的"至少一次、可回放就重跑"（平台发送不可撤回，DL-2 的"unknown 不重发"是对的）；fork、rollback、checkpoint、跨 provider 交接（属于 agent 状态，归宿主）；17K 行的 Orchestrator（正是瘦身要避开的形态）。
 
 ## 8. 实现语言
 
