@@ -941,6 +941,13 @@ What changed for embedders with core-slimming G6 (feature modules):
 - `GET /api/status` has `modules` (an empty array here). Nothing else changes: the config file, the
   tools a harness is offered, `/help`, the `host.hello` features and every error text are as
   before.
+- Since the review of core-slimming: a module acts in a session only as a peer (an agent outside
+  this daemon). `KernelContext.lanes.command(cmd, origin)` rejects an origin that is not
+  `kind: "peer"` (it took any before), and both it and `lanes.input` reject a principal carrying
+  the `owner` label or named in `policy.owners` (the default policy runs an owner's turn with
+  `bypass`). `lanes.input` drops `channelContext.nativeCommand` and `loopGuard` (only the kernel
+  sets them). No built-in module is affected: the external MCP endpoint, the one caller, stamps its
+  clients' inputs as peers that are never owners.
 
 What changed for embedders with core-slimming G6 step 1 (the external MCP endpoint is a module):
 

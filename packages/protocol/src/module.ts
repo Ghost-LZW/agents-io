@@ -638,13 +638,19 @@ export interface KernelContext {
     has(sessionKey: string): boolean;
     /** Open the session's lane (with this agent, for a new session). */
     open(sessionKey: string, agent?: string): Promise<void>;
-    /** A client command (input, interrupt, resolve, …) to a session, as from `origin` (the policy decides as for any client). */
+    /**
+     * A client command (input, interrupt, resolve, …) to a session, as from `origin`: a peer's, as
+     * for `input` (any other origin rejects); the policy decides as for any client.
+     */
     command(cmd: ClientCommand, origin: Origin): Promise<KernelOutcome>;
     /**
      * Give a session's lane an input the module stamped itself (opening the lane when it is not
-     * open): a peer's (`origin.kind: "peer"`; any other kind throws), with its own cause. The lane
-     * decides as for any input (its loop guard may keep it as context: `observe_only`). Throws an
-     * error with a `code` when the session cannot open (its agent is gone).
+     * open): a peer's (`origin.kind: "peer"`, an agent outside this daemon), with its own cause.
+     * Any other kind, a principal carrying the `owner` label and one of the owners
+     * (`policy.owners`) reject: a person's, a host's or the kernel's origin is the kernel's to give.
+     * `channelContext.nativeCommand` and `loopGuard` are dropped (only the kernel sets them). The
+     * lane decides as for any input (its loop guard may keep it as context: `observe_only`).
+     * Throws an error with a `code` when the session cannot open (its agent is gone).
      */
     input(sessionKey: string, input: InputRecord, mode?: 'queue' | 'steer' | 'interrupt'): Promise<KernelInputResult>;
     /**

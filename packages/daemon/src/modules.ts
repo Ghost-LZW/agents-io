@@ -48,6 +48,7 @@ import type {
 import { AdminStatus as AdminStatusSchema, IdentityEntry as IdentityEntrySchema, Resolver as ResolverSchema } from '@agents-io/protocol';
 import { Value } from '@sinclair/typebox/value';
 import { KERNEL_TOOL_NAMES, moduleToolInput, type ModuleTools } from '@agents-io/host-mcp';
+import { OWNER_LABEL } from '@agents-io/session';
 import { CommandTable, KERNEL_COMMAND_NAMES, type ModuleCommand } from './commands.js';
 import { ConfigError } from './config-error.js';
 import { FEATURES } from './host.js';
@@ -880,11 +881,20 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
     lanes: {
       has: (sessionKey) => live().hasLane(sessionKey),
       open: (sessionKey, agent) => live().openLane(sessionKey, agent),
-      command: (cmd, origin) => live().command(cmd, origin),
+      command: async (cmd, origin) => {
+        // As lanes.input: a module acts in a session only as a peer, never as a person, a host, the kernel or an owner.
+        const refused = peerRefusal(origin, live().owner().principals);
+        if (refused) throw new Error(`module ${id}: lanes.command takes a peer's origin (${refused})`);
+        return live().command(cmd, origin);
+      },
       input: async (sessionKey, input, mode) => {
         // A module stamps only peers (agents outside this daemon): a person's or the kernel's origin is the kernel's to give.
         if (input?.origin?.kind !== 'peer') throw new Error(`module ${id}: lanes.input takes a peer's input (origin.kind "peer", not ${JSON.stringify(input?.origin?.kind)})`);
-        return live().laneInput(sessionKey, input, mode ?? 'queue');
+        const refused = peerRefusal(input.origin, live().owner().principals);
+        if (refused) throw new Error(`module ${id}: lanes.input takes a peer's input (${refused})`);
+        // Only the kernel marks a harness's native command (CT-2), and the loop guard's label is the lane's.
+        const { nativeCommand: _n, loopGuard: _l, ...channelContext } = input.channelContext ?? {};
+        return live().laneInput(sessionKey, { ...input, channelContext }, mode ?? 'queue');
       },
       harness: (sessionKey) => {
         const lane = live().laneHarness(sessionKey, id);
@@ -930,6 +940,20 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
       isToken: (token) => live().isHostToken(token),
     },
   };
+}
+
+/**
+ * Why a module may not act in a session as `origin` (`KernelContext.lanes.command` / `input`), if
+ * it may not: only as a peer (an agent outside this daemon), never one carrying the owner label or
+ * named as an owner (`policy.owners`). A person's, a host's or the kernel's origin is the kernel's
+ * to give, and an owner's would make the policy run the turn as the owner's (`Policy.plan`: bypass).
+ */
+function peerRefusal(origin: Origin | undefined, owners: readonly string[]): string | undefined {
+  if (origin?.kind !== 'peer') return `origin.kind "peer", not ${JSON.stringify(origin?.kind)}`;
+  const p = origin.principal;
+  if (Array.isArray(p?.labels) && p.labels.includes(OWNER_LABEL)) return `a peer never carries the ${OWNER_LABEL} label`;
+  if (p && owners.includes(p.id)) return `${p.id} is an owner, never a peer`;
+  return undefined;
 }
 
 /** Only what `KernelContext.runConfig.set` may say: its untyped code passes nothing else on. */
