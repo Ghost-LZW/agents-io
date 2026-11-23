@@ -1,29 +1,36 @@
 import { createHash } from 'node:crypto';
 import { chmodSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import type { TSchema } from '@sinclair/typebox';
 import { Value } from '@sinclair/typebox/value';
 import { ADMIN_REDACTED, type AdminConfigDocument, type AdminConfigPutResult, type AdminConfigValidation, type ConfigIssue } from '@agents-io/protocol';
-import { ConfigError, ConfigFile, findEnvFile, resolveConfig, type Config } from './config.js';
+import { builtinChannels, builtinHarnesses } from './bundle.js';
+import type { ChannelRegistry } from './channel-registry.js';
+import { ConfigError, configFileSchema, findEnvFile, resolveConfig, type Config } from './config.js';
 import { loadEnvFile } from './env-file.js';
+import type { HarnessRegistry } from './harness-registry.js';
 
 /*
  * The config file as the console sees it (`GET/PUT /api/config`,
  * `POST /api/config/validate`). Secrets never leave the daemon. Which fields
  * are credentials follows the config schema (`isCredential`): every value of
  * an `env` map (harness instance, claude `mcpServers.<id>`, `settings.env`,
- * bridge channel, codex `mcp_servers.<id>.env`), every header (`headers`,
- * `http_headers`, anywhere), codex `bearer_token`s, mail `auth.pass` /
+ * codex `mcp_servers.<id>.env`), every header (`headers`, `http_headers`,
+ * anywhere), codex `bearer_token`s, external MCP clients' `token`; in a
+ * channel entry, what its type marks (`ChannelModule`: a string at or under a
+ * schema marked `x-credential`, e.g. a bridge's `env`; what its `isCredential`
+ * says, e.g. a bridge argument after a secret-looking flag, mail `auth.pass` /
  * `auth.accessToken`, lark-bot `appSecret` / `encryptKey` /
- * `verificationToken`, external MCP clients' `token`, a bridge argument after a secret-looking flag; and, in
- * the free-form parts the daemon passes through (channel `config`, `options`,
- * …), any string under a secret-looking key. GET shows a credential only as
- * its `env:NAME` reference or ADMIN_REDACTED; writing ADMIN_REDACTED back to a
- * credential field keeps the stored value, and any new literal in a credential
- * field is refused (`inline_secret`). Validation is the startup one
- * (`resolveConfig`, with the env file read afresh). Writes are atomic (temp
- * file + fsync + rename) and 0600. The daemon does not reload its config: a
- * changed file takes effect at the next start (`applied: "restart"`), except
- * `channels` with `console.liveChannels` (the gateway applies them and calls
+ * `verificationToken`); and, in the free-form parts the daemon passes through
+ * (channel `config`, `options`, …), any string under a secret-looking key. GET
+ * shows a credential only as its `env:NAME` reference or ADMIN_REDACTED;
+ * writing ADMIN_REDACTED back to a credential field keeps the stored value,
+ * and any new literal in a credential field is refused (`inline_secret`).
+ * Validation is the startup one (`resolveConfig` over the daemon's registries,
+ * with the env file read afresh). Writes are atomic (temp file + fsync +
+ * rename) and 0600. The daemon does not reload its config: a changed file
+ * takes effect at the next start (`applied: "restart"`), except `channels`
+ * with `console.liveChannels` (the gateway applies them and calls
  * `channelsApplied`).
  */
 
@@ -34,8 +41,6 @@ const SECRET_KEY = /(secret|password|passwd|passphrase|token|api[-_]?key|credent
 const NAMES_A_VARIABLE = /(env_var|env_key|_var|Var|Env)$/;
 
 const isSecretKey = (k: string) => SECRET_KEY.test(k) && !NAMES_A_VARIABLE.test(k);
-/** A command-line flag naming a secret (`--token`, `--api-key=`): the next argument (or its value) is one. */
-const SECRET_FLAG = /^--?[\w-]*(secret|password|passwd|token|api[-_]?key|credential|auth)[\w-]*$/i;
 const envRef = (v: unknown): string | undefined => (typeof v === 'string' && v.startsWith('env:') ? v.slice(4) : undefined);
 const pointer = (segs: (string | number)[]) => segs.map((s) => '/' + String(s).replace(/~/g, '~0').replace(/\//g, '~1')).join('');
 
@@ -45,11 +50,38 @@ type Path = (string | number)[];
 /** Codex `config` keys are dotted TOML paths (`mcp_servers.x.env`); split them into segments. */
 const tomlSegs = (k: string) => (k.match(/[A-Za-z0-9_][A-Za-z0-9_-]*|"[^"\\]*"/g) ?? [k]).map((x) => x.replace(/^"|"$/g, ''));
 
+/** The `x-credential` mark (`ChannelModule.entry`). */
+const marked = (s: TSchema | undefined) => (s as { 'x-credential'?: unknown } | undefined)?.['x-credential'] === true;
+
+/**
+ * Whether the schema marks the value at `path` under `s` as a credential: a schema marked
+ * `x-credential` at the path or above it (a map or array of secrets). Follows object properties,
+ * maps (`Type.Record`), array items and every member of a union; a part it cannot follow
+ * (`Type.Unknown`, free-form) marks nothing.
+ */
+function credentialMark(s: TSchema | undefined, path: readonly string[]): boolean {
+  if (!s) return false;
+  if (marked(s)) return true;
+  const [seg, ...rest] = path;
+  if (seg === undefined) return false;
+  const x = s as { anyOf?: TSchema[]; properties?: Record<string, TSchema>; patternProperties?: Record<string, TSchema>; additionalProperties?: unknown; items?: unknown };
+  if (Array.isArray(x.anyOf)) return x.anyOf.some((m) => credentialMark(m, path));
+  if (x.properties && Object.hasOwn(x.properties, seg)) return credentialMark(x.properties[seg], rest);
+  if (x.patternProperties) {
+    for (const [re, v] of Object.entries(x.patternProperties)) if (new RegExp(re).test(seg)) return credentialMark(v, rest);
+  }
+  if (x.additionalProperties && typeof x.additionalProperties === 'object') return credentialMark(x.additionalProperties as TSchema, rest);
+  if (x.items && typeof x.items === 'object' && !Array.isArray(x.items) && /^\d+$/.test(seg)) return credentialMark(x.items as TSchema, rest);
+  return false;
+}
+
 /**
  * Whether the string at `at` in `doc` is a credential, by where the config
- * schema (config.ts) puts it.
+ * schema (config.ts) puts it. A channel entry's type says for its own keys
+ * (`channels`: the registry the document's types come from, default the
+ * built-in one): its `x-credential` marks and `isCredential`.
  */
-export function isCredential(doc: Json, at: Path): boolean {
+export function isCredential(doc: Json, at: Path, channels: ChannelRegistry = builtinChannels): boolean {
   const s = at.map(String);
   const leaf = s.at(-1);
   // `host.tokenFile` is a path, not the token.
@@ -71,20 +103,12 @@ export function isCredential(doc: Json, at: Path): boolean {
     }
   }
   if (s[0] === 'channels' && s.length >= 3) {
-    const ch = get(doc, at.slice(0, 2)) as { type?: unknown; args?: unknown } | undefined;
-    const rest = s.slice(2);
-    if (ch?.type === 'bridge' && rest[0] === 'env') return true;
-    if (ch?.type === 'bridge' && rest[0] === 'args' && rest.length === 2) {
-      const args = Array.isArray(ch.args) ? ch.args : [];
-      const i = Number(rest[1]);
-      const prev = args[i - 1];
-      const self = args[i];
-      if (typeof prev === 'string' && SECRET_FLAG.test(prev)) return true;
-      if (typeof self === 'string' && self.includes('=') && SECRET_FLAG.test(self.slice(0, self.indexOf('=')))) return true;
-      return false;
-    }
-    if (ch?.type === 'mail' && rest[0] === 'config' && (rest[1] === 'imap' || rest[1] === 'smtp') && rest[2] === 'auth' && (leaf === 'pass' || leaf === 'accessToken')) return true;
-    if (ch?.type === 'lark-bot' && rest[0] === 'config' && rest.length === 2 && (leaf === 'appSecret' || leaf === 'encryptKey' || leaf === 'verificationToken')) return true;
+    const ch = get(doc, at.slice(0, 2));
+    const type = ch && typeof ch === 'object' ? (ch as { type?: unknown }).type : undefined;
+    const m = typeof type === 'string' ? channels.get(type) : undefined;
+    const [key, ...below] = s.slice(2) as [string, ...string[]];
+    const own = m && Object.hasOwn(m.entry, key) ? m.entry[key] : undefined;
+    if (m && (credentialMark(own, below) || m.isCredential?.([key, ...below], ch as Record<string, unknown>) === true)) return true;
   }
   // Free-form parts: a secret-looking key.
   const key = [...at].reverse().find((x): x is string => typeof x === 'string');
@@ -109,11 +133,11 @@ function get(v: Json, at: Path): Json {
 }
 
 /** A literal (not an `env:` reference, not empty) in a credential field. */
-const literalCredential = (doc: Json, value: string, at: Path) => value !== '' && envRef(value) === undefined && isCredential(doc, at);
+const literalCredential = (doc: Json, value: string, at: Path, channels: ChannelRegistry) => value !== '' && envRef(value) === undefined && isCredential(doc, at, channels);
 
-/** The document with every literal credential replaced by ADMIN_REDACTED. */
-export function redact(raw: Json): Json {
-  return walk(raw, [], (value, at) => (literalCredential(raw, value, at) ? ADMIN_REDACTED : undefined));
+/** The document with every literal credential replaced by ADMIN_REDACTED (`channels`: as for `isCredential`). */
+export function redact(raw: Json, channels: ChannelRegistry = builtinChannels): Json {
+  return walk(raw, [], (value, at) => (literalCredential(raw, value, at, channels) ? ADMIN_REDACTED : undefined));
 }
 
 /** Every `env:NAME` the document references, in order of first use. */
@@ -131,16 +155,16 @@ export function envRefs(raw: Json): string[] {
  * Put the stored values back where a document says ADMIN_REDACTED. Returns the
  * document and the paths kept that way; an ADMIN_REDACTED with no stored
  * literal at its path, or in a field that is not a credential (GET would show
- * the stored value there), is an issue.
+ * the stored value there), is an issue (`channels`: as for `isCredential`).
  */
-export function unredact(next: Json, stored: Json): { doc: Json; kept: Set<string>; issues: ConfigIssue[] } {
+export function unredact(next: Json, stored: Json, channels: ChannelRegistry = builtinChannels): { doc: Json; kept: Set<string>; issues: ConfigIssue[] } {
   const kept = new Set<string>();
   const issues: ConfigIssue[] = [];
   const doc = walk(next, [], (value, at) => {
     if (value !== ADMIN_REDACTED) return undefined;
     const old = get(stored, at);
     const path = pointer(at);
-    if (typeof old !== 'string' || old === ADMIN_REDACTED || !isCredential(next, at) || !isCredential(stored, at)) {
+    if (typeof old !== 'string' || old === ADMIN_REDACTED || !isCredential(next, at, channels) || !isCredential(stored, at, channels)) {
       issues.push({ path, code: 'redacted_without_value', message: `${ADMIN_REDACTED} keeps the stored value of a secret field, but the file has none here; write an "env:NAME" reference`, severity: 'error' });
       return undefined;
     }
@@ -151,10 +175,10 @@ export function unredact(next: Json, stored: Json): { doc: Json; kept: Set<strin
 }
 
 /** Literal secrets: errors, except at `kept` paths (already in the file), which are warnings. */
-function secretIssues(raw: Json, kept: Set<string> | 'all'): ConfigIssue[] {
+function secretIssues(raw: Json, kept: Set<string> | 'all', channels: ChannelRegistry): ConfigIssue[] {
   const issues: ConfigIssue[] = [];
   walk(raw, [], (value, at) => {
-    if (!literalCredential(raw, value, at)) return undefined;
+    if (!literalCredential(raw, value, at, channels)) return undefined;
     const path = pointer(at);
     const old = kept === 'all' || kept.has(path);
     const arg = at[0] === 'channels' && at[2] === 'args';
@@ -173,10 +197,10 @@ function secretIssues(raw: Json, kept: Set<string> | 'all'): ConfigIssue[] {
   return issues;
 }
 
-/** Map a ConfigError message (`agents.x.harness: …`) to a JSON pointer when it names a key. */
-function pathOfMessage(msg: string): string {
+/** Map a ConfigError message (`agents.x.harness: …`) to a JSON pointer when it names a key of the file (`file`: its schema). */
+function pathOfMessage(msg: string, file: { properties: Record<string, unknown> }): string {
   const m = /^(?:invalid config: )?`?([A-Za-z_][\w-]*(?:\[\d+\])*(?:\.[\w-]+(?:\[\d+\])*)*)`?(?:[: ]|$)/.exec(msg);
-  if (!m || !(m[1]!.split(/[.[]/)[0]! in ConfigFile.properties)) return '';
+  if (!m || !(m[1]!.split(/[.[]/)[0]! in file.properties)) return '';
   return pointer(m[1]!.split('.').flatMap((s) => s.split(/\[(\d+)\]/).filter(Boolean)));
 }
 
@@ -188,6 +212,10 @@ export interface ConfigStoreOptions {
   /** Process environment (default process.env); wins over the env file, as at startup. */
   env?: NodeJS.ProcessEnv;
   cwd?: string;
+  /** The harness kinds the file may name (default the built-in ones): the daemon's (`Gateway.harnessRegistry`). */
+  harnessRegistry?: HarnessRegistry;
+  /** The channel types the file may name, and what they mark as credentials (default the built-in ones): the daemon's (`Gateway.channelRegistry`). */
+  channelRegistry?: ChannelRegistry;
 }
 
 export type PutOutcome =
@@ -201,8 +229,12 @@ export class ConfigStore {
    * the ones last applied live. To tell whether a change needs a restart.
    */
   private running: Record<string, unknown>;
+  private readonly harnesses: HarnessRegistry;
+  private readonly channels: ChannelRegistry;
 
   constructor(private readonly o: ConfigStoreOptions) {
+    this.harnesses = o.harnessRegistry ?? builtinHarnesses;
+    this.channels = o.channelRegistry ?? builtinChannels;
     const raw = this.read().raw;
     this.running = raw && typeof raw === 'object' && !Array.isArray(raw) ? structuredClone(raw as Record<string, unknown>) : {};
   }
@@ -221,7 +253,7 @@ export class ConfigStore {
 
   /** The startup resolution of `raw`, with the env file read afresh (throws `ConfigError`). */
   resolve(raw: Json): Config {
-    return resolveConfig(raw, { env: this.env(), baseDir: dirname(this.o.path), ...(this.o.cwd ? { cwd: this.o.cwd } : {}) });
+    return resolveConfig(raw, { env: this.env(), baseDir: dirname(this.o.path), ...(this.o.cwd ? { cwd: this.o.cwd } : {}), harnessRegistry: this.harnesses, channelRegistry: this.channels });
   }
 
   get path(): string {
@@ -275,7 +307,7 @@ export class ConfigStore {
     return {
       path: this.o.path,
       revision,
-      config: redact(raw) as Record<string, unknown>,
+      config: redact(raw, this.channels) as Record<string, unknown>,
       issues,
       env: envRefs(raw).map((name) => ({ name, set: env[name] !== undefined })),
     };
@@ -288,24 +320,25 @@ export class ConfigStore {
   }
 
   private prepare(next: Record<string, unknown>): { doc: Json; issues: ConfigIssue[] } {
-    const { doc, kept, issues } = unredact(next, this.read().raw);
+    const { doc, kept, issues } = unredact(next, this.read().raw, this.channels);
     return { doc, issues: [...issues, ...this.check(doc, kept)] };
   }
 
   /** Schema issues (with paths), literal secrets, then the startup checks. */
   private check(raw: Json, kept: Set<string> | 'all'): ConfigIssue[] {
     const issues: ConfigIssue[] = [];
-    for (const e of Value.Errors(ConfigFile, raw)) {
+    const file = configFileSchema(this.harnesses, this.channels);
+    for (const e of Value.Errors(file, raw)) {
       issues.push({ path: e.path, code: 'schema', message: e.message, severity: 'error' });
       if (issues.length >= 20) break;
     }
-    issues.push(...secretIssues(raw, kept));
+    issues.push(...secretIssues(raw, kept, this.channels));
     if (!issues.some((i) => i.code === 'schema')) {
       try {
         this.resolve(raw);
       } catch (e) {
         if (!(e instanceof ConfigError)) throw e;
-        issues.push({ path: pathOfMessage(e.message), code: 'invalid', message: e.message, severity: 'error' });
+        issues.push({ path: pathOfMessage(e.message, file), code: 'invalid', message: e.message, severity: 'error' });
       }
     }
     return issues;

@@ -18,6 +18,9 @@ export type LarkBotChannelEntry = { type: 'lark-bot'; config?: Record<string, un
 /** A `lark-bot` entry's own keys, resolved: its config with the app. */
 export type LarkBotChannelSettings = { type: 'lark-bot'; config: LarkChannelConfig };
 
+/** The keys of an entry's `config` that hold its app's credentials. */
+const CREDENTIALS = new Set(['appSecret', 'encryptKey', 'verificationToken']);
+
 /** With several bots, accounts are plain names: they go into route and session keys, separated by ':'. */
 const PLAIN_ACCOUNT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
@@ -38,6 +41,9 @@ export const larkBotChannelModule: ChannelModule<LarkBotChannelEntry, LarkBotCha
      */
     config: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
   },
+
+  // `config` is free-form, so the schema cannot mark its app's credentials.
+  isCredential: (path) => path.length === 2 && path[0] === 'config' && CREDENTIALS.has(path[1]!),
 
   resolve(entry, ctx) {
     const where = `${ctx.where}.config`;

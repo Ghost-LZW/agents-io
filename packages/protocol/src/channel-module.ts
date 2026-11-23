@@ -53,14 +53,25 @@ export interface ChannelValidateContext {
 export interface ChannelInit extends ChannelFactoryInit {
   /** The entry's position in `channels`. */
   index: number;
-  /** A directory of this channel account's own under the host's data directory, for state kept across restarts; it may not exist yet. */
+  /** The host's log, as is: a module prefixes its messages itself (the daemon's `module` type: `channel module <file>: `). */
+  log(level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown): void;
+  /**
+   * A directory of this channel account's own under the host's data directory, for state kept
+   * across restarts (the daemon's: `<dataDir>/channels/<type>.<account, URI-encoded>`); it may not
+   * exist yet.
+   */
   stateDir: string;
   /**
    * Asked before taking a channel id the adapter learns only once running (a bridge's `hello`):
    * a reason refuses it (that id belongs to another adapter here, or is reserved).
    */
   acceptId(id: string): string | undefined;
-  /** Report the connection state of an adapter that connects after it is built (a bridge's peer). */
+  /**
+   * Report the connection state of an adapter that connects after it is built (a bridge's peer):
+   * the host lists it `failed` with the reason until it reports connected. A channel that reports
+   * before `create` returns has its `evidence` grant checked against its caps when it reports
+   * connected (its caps are its peer's), not when it starts.
+   */
   onState(s: { connected: boolean; error?: string }): void;
 }
 
@@ -88,10 +99,11 @@ export interface ChannelAdminContribution {}
  * type owns the rest of the entry. `E` is the entry as written, `R` what it resolves to; both are
  * the type's own keys with `type` (the common ones are there too, untyped).
  *
- * In progress (core-slimming G2): the daemon reads `type`, `ids`, `entry`, `resolve` and
- * `validateAll` (config validation and resolution). It still builds the built-in types itself and
- * judges credentials by its own rules; `create`, `owner`, `idOf`, `isCredential`, `implicitEnv` and
- * `x-credential` are read from the steps that move those.
+ * The evidence an entry gives without its own `evidence` grant is not the module's to say: the
+ * composition root grants it when it registers the type (the daemon's `bundle.ts`: lark-bot and
+ * mail their caps; every other type, bridge and module included, `device_only` only).
+ *
+ * In progress (core-slimming G2): the daemon reads all of it except `implicitEnv` and `admin`.
  */
 export interface ChannelModule<E = Record<string, unknown>, R = E> {
   /** The `type` that selects it. */
@@ -105,10 +117,16 @@ export interface ChannelModule<E = Record<string, unknown>, R = E> {
    * The entry's own keys beside `type` and the common ones, in the order the schema lists them;
    * the host closes the object (an unknown key is a config error). A string that holds a
    * credential is marked `{ 'x-credential': true }` (e.g. `Type.String({ 'x-credential': true })`),
-   * so the console redacts it and refuses a literal there; `isCredential` says what a schema cannot.
+   * so the console redacts it and refuses a literal there; a mark on a map or an array marks every
+   * string in it. `isCredential` says what a schema cannot.
    */
   readonly entry: Readonly<Record<string, TSchema>>;
-  /** Whether the string at `path` (from the entry, e.g. `['args', '3']`) is a credential where the schema cannot say so (a bridge's argument after `--token`). */
+  /**
+   * Whether the string at `path` (from the entry, e.g. `['args', '3']`) is a credential where the
+   * schema cannot say so: a bridge's argument after `--token`, a key in a free-form `config`. True
+   * marks it; false leaves it to the host's rule for free-form parts (a secret-looking key). `entry`
+   * is the entry as the document has it (the console asks about documents that may not validate).
+   */
   isCredential?(path: readonly string[], entry: E): boolean;
   /** Variables the entry reads without naming them as `"env:NAME"` (a lark-bot entry without its own app: `LARK_APP_*`). */
   implicitEnv?(entry: E): string[];
@@ -121,11 +139,16 @@ export interface ChannelModule<E = Record<string, unknown>, R = E> {
   /** Rules across this type's entries (all of them, in config order), after every entry resolved: `ctx.fail` on the first one broken. */
   validateAll?(entries: ReadonlyArray<ChannelValidateEntry<E, R>>, ctx: ChannelValidateContext): void;
   /**
-   * Who an entry's channel id belongs to (channel-stamping F4): entries sharing an id must share
-   * an owner, only their accounts differ. Default the type (one adapter per type).
+   * Who an entry's channel id belongs to (channel-stamping F4), among this type's entries: entries
+   * sharing an id must share an owner, only their accounts differ. The host names it
+   * `<type>:<owner>` (a bridge: `bridge:["node",["peer.js"]]`), so no type can claim another's;
+   * without it, the type (one adapter per type).
    */
   owner?(entry: R): string;
-  /** The entry's channel id when it is known before the adapter is built (a bridge's `id`). */
+  /**
+   * The entry's channel id when it is known before the adapter is built (a bridge's `id`). Default
+   * the type's one declared id (`ids` with a single id), else unknown.
+   */
   idOf?(entry: R): string | undefined;
   /** The adapter of one entry. Starts nothing: the host's `start` does. A throw fails the daemon's start (or that entry's live apply). */
   create(entry: R & { account: string }, init: ChannelInit): BuiltChannel | Promise<BuiltChannel>;

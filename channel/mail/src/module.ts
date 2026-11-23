@@ -18,6 +18,11 @@ export const mailChannelModule: ChannelModule<MailChannelEntry> = {
     /** IMAP/SMTP mail: a MailChannelConfig (use "env:NAME" for passwords). */
     config: Type.Record(Type.String(), Type.Unknown()),
   },
+  // `config` is free-form, so the schema cannot mark the servers' passwords and tokens.
+  isCredential: (path) => {
+    const leaf = path.at(-1);
+    return path[0] === 'config' && (path[1] === 'imap' || path[1] === 'smtp') && path[2] === 'auth' && (leaf === 'pass' || leaf === 'accessToken');
+  },
   resolve: (entry, ctx) => ({ ...entry, config: ctx.substitute(entry.config, 'mail.config') as Record<string, unknown> }),
   create: (entry) => ({ adapter: new MailChannel({ ...entry.config, account: entry.account } as MailChannelConfig) }),
 };

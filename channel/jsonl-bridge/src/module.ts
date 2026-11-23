@@ -11,6 +11,12 @@ import { spawnChannel } from './host.js';
 /** A `bridge` entry's own keys (`env` and `config` env-substituted, `cwd` a resolved path once resolved). */
 export type BridgeChannelEntry = { type: 'bridge'; id?: string; command: string; args?: string[]; env?: Record<string, string>; cwd?: string; config?: unknown };
 
+/** The program an entry runs: entries sharing a channel id must run the same one (channel-stamping F4). */
+const programOf = (entry: BridgeChannelEntry) => JSON.stringify([entry.command, entry.args ?? []]);
+
+/** A command-line flag naming a secret (`--token`, `--api-key=`): the next argument (or its value) is one. */
+const SECRET_FLAG = /^--?[\w-]*(secret|password|passwd|token|api[-_]?key|credential|auth)[\w-]*$/i;
+
 export const bridgeChannelModule: ChannelModule<BridgeChannelEntry> = {
   type: 'bridge',
   entry: {
@@ -23,9 +29,21 @@ export const bridgeChannelModule: ChannelModule<BridgeChannelEntry> = {
     id: Type.Optional(Type.String({ minLength: 1 })),
     command: Type.String(),
     args: Type.Optional(Type.Array(Type.String())),
-    env: Type.Optional(Type.Record(Type.String(), Type.String())),
+    /** The peer's environment: every value is a credential (write "env:NAME"). */
+    env: Type.Optional(Type.Record(Type.String(), Type.String(), { 'x-credential': true })),
     cwd: Type.Optional(Type.String()),
     config: Type.Optional(Type.Unknown()),
+  },
+
+  // An argument after a secret-looking flag, or the value of `--flag=value`: other local users can read argv (ps).
+  isCredential(path, entry) {
+    if (path[0] !== 'args' || path.length !== 2) return false;
+    const args: unknown[] = Array.isArray(entry.args) ? entry.args : [];
+    const i = Number(path[1]);
+    const prev = args[i - 1];
+    const self = args[i];
+    if (typeof prev === 'string' && SECRET_FLAG.test(prev)) return true;
+    return typeof self === 'string' && self.includes('=') && SECRET_FLAG.test(self.slice(0, self.indexOf('=')));
   },
 
   resolve: (entry, ctx) => ({
@@ -35,6 +53,11 @@ export const bridgeChannelModule: ChannelModule<BridgeChannelEntry> = {
     ...(entry.config !== undefined ? { config: ctx.substitute(entry.config, 'bridge.config') } : {}),
   }),
 
+  // One program (command and args) is one adapter.
+  owner: programOf,
+  // Without `id`, the first hello's.
+  idOf: (entry) => entry.id,
+
   // One channel id belongs to one adapter, only accounts differ (channel-stamping F4). A bridge's id
   // without `id` is only known once connected; the gateway checks that one.
   validateAll(bridges, ctx) {
@@ -42,7 +65,7 @@ export const bridgeChannelModule: ChannelModule<BridgeChannelEntry> = {
     for (const { index, resolved: ch } of bridges) {
       if (ch.id === undefined) continue;
       if (ctx.reservedIds.includes(ch.id)) ctx.fail(`channels[${index}]: bridge id ${JSON.stringify(ch.id)} is a built-in channel id; a bridge cannot use it`);
-      const program = JSON.stringify([ch.command, ch.args ?? []]);
+      const program = programOf(ch);
       const prior = programs.get(ch.id);
       if (prior && prior.program !== program) ctx.fail(`channels[${prior.index}] and channels[${index}] run different programs under one channel id ${JSON.stringify(ch.id)}; one channel id belongs to one adapter (entries sharing it differ only in account)`);
       programs.set(ch.id, { program, index });

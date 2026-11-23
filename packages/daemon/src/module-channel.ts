@@ -27,6 +27,9 @@ export const moduleChannelModule: ChannelModule<ModuleChannelEntry> = {
     config: Type.Optional(Type.Unknown()),
   },
 
+  // One module file and export is one adapter (channel-stamping F4).
+  owner: (entry) => JSON.stringify([entry.module, entry.export ?? null]),
+
   resolve(entry, ctx) {
     const spec = entry.module;
     const rel = spec.startsWith('.') || spec.startsWith('~') || isAbsolute(spec);

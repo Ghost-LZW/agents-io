@@ -157,9 +157,10 @@ const ChannelCommon = {
   ack: Type.Optional(Type.Union([Type.Boolean(), Type.Object({ doneAfterMs: Type.Optional(Type.Integer({ minimum: 0 })) }, Closed)])),
   /**
    * Sender evidence this channel may give (channel-stamping): the cap is this ∩ the
-   * adapter's `caps.evidence`, and stronger claims become `none`. Default: lark-bot and
-   * mail `caps.evidence`; bridge and module channels only `device_only` (never
-   * `platform_signed` / `dkim_pass` unless granted here).
+   * adapter's `caps.evidence`, and stronger claims become `none`. Default: what the
+   * type was registered with (`ChannelRegistry.defaultEvidence`; `bundle.ts`: lark-bot
+   * and mail `caps.evidence`); bridge and module channels, and any type registered
+   * without, only `device_only` (never `platform_signed` / `dkim_pass` unless granted here).
    */
   evidence: Type.Optional(Type.Array(Evidence)),
 };
@@ -172,7 +173,7 @@ type ChannelCommonFields = Static<TObject<typeof ChannelCommon>>;
  * The ones the built-in types declare (`ChannelModule.ids`), then the daemon's own (`CORE_CHANNEL_IDS`).
  */
 export const RESERVED_CHANNEL_IDS: readonly string[] = builtinChannels.reservedIds;
-/** Evidence a bridge or module channel may give without an `evidence` grant. */
+/** Evidence a channel of a type registered `ungranted` (bridge, module) may give without an `evidence` grant. */
 export const UNGRANTED_EVIDENCE: readonly Evidence[] = ['device_only', 'none'];
 
 const channelEntrySchemas = new WeakMap<ChannelRegistry, TSchema>();
@@ -901,6 +902,8 @@ export interface LoadOptions {
   channels?: boolean;
   /** The harness kinds `use` may name (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
   harnessRegistry?: HarnessRegistry;
+  /** The channel types `channels[].type` may name (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
+  channelRegistry?: ChannelRegistry;
 }
 
 export function loadConfig(o: LoadOptions = {}): Config {
@@ -919,7 +922,16 @@ export function loadConfig(o: LoadOptions = {}): Config {
   const envPath = findEnvFile({ envFile: o.envFile, configDir: dirname(path), cwd });
   const fileEnv = envPath ? loadEnvFile(envPath) : {};
   const env: Record<string, string | undefined> = { ...fileEnv, ...procEnv };
-  const c = resolveConfig(raw, { env, fileEnv, baseDir: dirname(path), harness: o.harness, cwd, channels: o.channels, ...(o.harnessRegistry ? { harnessRegistry: o.harnessRegistry } : {}) });
+  const c = resolveConfig(raw, {
+    env,
+    fileEnv,
+    baseDir: dirname(path),
+    harness: o.harness,
+    cwd,
+    channels: o.channels,
+    ...(o.harnessRegistry ? { harnessRegistry: o.harnessRegistry } : {}),
+    ...(o.channelRegistry ? { channelRegistry: o.channelRegistry } : {}),
+  });
   return { ...c, source: { path, ...(envPath ? { envFile: resolve(cwd, envPath) } : {}) } };
 }
 
@@ -933,10 +945,7 @@ export interface ResolveContext {
   channels?: boolean;
   /** The harness kinds `use` may name (default the built-in ones, `bundle.ts`). */
   harnessRegistry?: HarnessRegistry;
-  /**
-   * The channel types `channels[].type` may name (default the built-in ones, `bundle.ts`). The
-   * gateway still builds only the built-in types (core-slimming G2).
-   */
+  /** The channel types `channels[].type` may name (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
   channelRegistry?: ChannelRegistry;
 }
 

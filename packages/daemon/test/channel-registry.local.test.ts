@@ -1,11 +1,17 @@
+import { mkdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { Type } from '@sinclair/typebox';
 import { describe, expect, it } from 'vitest';
-import type { ChannelModule, ChannelResolveContext, ChannelValidateEntry } from '@agents-io/protocol';
+import type { ChannelContext, ChannelInit, ChannelModule, ChannelResolveContext, ChannelValidateEntry } from '@agents-io/protocol';
 import { bridgeChannelModule } from '@agents-io/channel-jsonl-bridge';
-import { FakeChannel } from '@agents-io/testkit';
+import { larkBotChannelModule } from '@agents-io/channel-lark-bot';
+import { FakeChannel, FakeHarness } from '@agents-io/testkit';
 import { builtinChannels, builtinHarnesses } from '../src/bundle.js';
 import { ChannelRegistry, CORE_CHANNEL_IDS } from '../src/channel-registry.js';
-import { ConfigError, ConfigFile, configFileSchema, RESERVED_CHANNEL_IDS, resolveConfig } from '../src/config.js';
+import { ConfigError, ConfigFile, configFileSchema, RESERVED_CHANNEL_IDS, resolveConfig, type HarnessInstance } from '../src/config.js';
+import { isCredential } from '../src/console-config.js';
+import { Gateway, InstanceHarness } from '../src/gateway.js';
+import { cleanups, tmp } from './helpers.js';
 
 /*
  * Channel types come from a registry (`ChannelModule`s; bundle.ts registers lark-bot, mail, bridge
@@ -111,5 +117,108 @@ describe('channel registry', () => {
     expect(() => new ChannelRegistry([{ ...chat, type: '' }])).toThrow('a channel module needs a non-empty type');
     const taken = new ChannelRegistry([{ ...chat, entry: { ...chat.entry, account: Type.String() } }]);
     expect(() => configFileSchema(builtinHarnesses, taken)).toThrow('channel type "chat": every channel entry has "account"; its module cannot declare it');
+  });
+});
+
+describe('the gateway builds configured channels through the registry', () => {
+  class Probe extends FakeChannel {
+    config: unknown;
+    closed = false;
+    override async start(ctx: ChannelContext): Promise<void> {
+      this.config = ctx.config;
+      return super.start(ctx);
+    }
+  }
+
+  it('create gets the resolved entry with its account, its index, its config and a state directory per type and account; the built config reaches start; close runs at stop', async () => {
+    const calls: { entry: unknown; init: ChannelInit }[] = [];
+    const made: Probe[] = [];
+    const probe: ChannelModule<{ type: 'probe'; config?: unknown }> = {
+      type: 'probe',
+      entry: { config: Type.Optional(Type.Unknown()) },
+      resolve: (entry, ctx) => ({ ...entry, ...(entry.config !== undefined ? { config: ctx.substitute(entry.config, `${ctx.where}.config`) } : {}) }),
+      create(entry, init) {
+        calls.push({ entry, init });
+        const adapter = new Probe('probe');
+        made.push(adapter);
+        return { adapter, config: { built: entry.account }, close: async () => void (adapter.closed = true) };
+      },
+    };
+    const registry = new ChannelRegistry([bridgeChannelModule, probe as ChannelModule]);
+    const dir = tmp('aio-creg-');
+    mkdirSync(join(dir, 'work'), { recursive: true });
+    const base = resolveConfig(
+      { dataDir: dir, local: { principal: 'me' }, cwd: join(dir, 'work'), channels: [{ type: 'probe', config: { k: 'env:K' } }, { type: 'probe', account: 'a b', tier: 'final' }] },
+      { env: { K: 'v' }, baseDir: dir, cwd: dir, channelRegistry: registry },
+    );
+    const gw = await Gateway.start({ config: { ...base, socketPath: join(dir, 'run', 'aio.sock') }, buildHarness: (i: HarnessInstance) => new InstanceHarness(i, new FakeHarness()), channelRegistry: registry, logger: () => {}, listen: false });
+    cleanups.push(() => gw.stop());
+    expect(gw.channelRegistry).toBe(registry);
+    expect(calls.map((c) => c.entry)).toEqual([
+      { type: 'probe', config: { k: 'v' }, account: 'default' },
+      { type: 'probe', account: 'a b', tier: 'final' },
+    ]);
+    expect(calls.map((c) => [c.init.index, c.init.account, c.init.config, c.init.stateDir])).toEqual([
+      [0, 'default', { k: 'v' }, join(dir, 'channels', 'probe.default')],
+      [1, 'a b', undefined, join(dir, 'channels', 'probe.a%20b')],
+    ]);
+    expect(made.map((m) => m.config)).toEqual([{ built: 'default' }, { built: 'a b' }]);
+    expect(gw.adminStatus().channels.filter((c) => c.id === 'probe').map((c) => c.account)).toEqual(['default', 'a b']);
+    await gw.stop();
+    expect(made.map((m) => m.closed)).toEqual([true, true]);
+  });
+
+  it('an entry of a type the gateway\'s registry lacks fails the start, naming the entry', async () => {
+    const registry = new ChannelRegistry([{ type: 'probe', entry: {}, resolve: (e) => e, create: () => ({ adapter: new FakeChannel('probe') }) }]);
+    const dir = tmp('aio-creg-');
+    const base = resolveConfig({ dataDir: dir, local: { principal: 'me' }, channels: [{ type: 'probe' }] }, { env: {}, baseDir: dir, cwd: dir, channelRegistry: registry });
+    await expect(Gateway.start({ config: { ...base, socketPath: join(dir, 'run', 'aio.sock') }, buildHarness: (i: HarnessInstance) => new InstanceHarness(i, new FakeHarness()), logger: () => {}, listen: false })).rejects.toThrow(
+      'channels[0]: channel type "probe" is not registered with the gateway; give Gateway.start the channel registry the config was resolved with',
+    );
+  });
+});
+
+describe('what the registry says of an entry', () => {
+  it('owner: `<type>:<owner>`, else the type; idOf: the module\'s, else the one declared id; mayUse: reserved ids only for their type', () => {
+    expect(builtinChannels.owner({ type: 'lark-bot' })).toBe('lark-bot');
+    expect(builtinChannels.owner({ type: 'bridge', command: 'node', args: ['peer.js'] })).toBe('bridge:["node",["peer.js"]]');
+    expect(builtinChannels.owner({ type: 'bridge', command: 'node' })).toBe('bridge:["node",[]]');
+    expect(builtinChannels.owner({ type: 'module', module: '/m.js' })).toBe('module:["/m.js",null]');
+    expect(builtinChannels.owner({ type: 'module', module: '/m.js', export: 'x' })).toBe('module:["/m.js","x"]');
+    expect(['lark-bot', 'mail', 'module'].map((type) => builtinChannels.idOf({ type }))).toEqual(['lark-bot', 'mail', undefined]);
+    expect([builtinChannels.idOf({ type: 'bridge', id: 'web' }), builtinChannels.idOf({ type: 'bridge' })]).toEqual(['web', undefined]);
+    expect(builtinChannels.mayUse('lark-bot', 'lark-bot')).toBe(true);
+    expect(builtinChannels.mayUse('lark-bot', 'mail')).toBe(false);
+    expect(builtinChannels.mayUse('bridge', 'lark-bot')).toBe(false);
+    expect(builtinChannels.mayUse('module', 'local')).toBe(false);
+    expect(builtinChannels.mayUse('module', 'web')).toBe(true);
+  });
+
+  it('defaultEvidence: only for a registered type, only caps or ungranted', () => {
+    expect(() => new ChannelRegistry([chat], { defaultEvidence: { other: 'caps' } })).toThrow('defaultEvidence: channel type "other" is not registered');
+    expect(() => new ChannelRegistry([chat], { defaultEvidence: { chat: 'all' as never } })).toThrow('defaultEvidence: channel type "chat": "all" is neither "caps" nor "ungranted"');
+    expect(new ChannelRegistry([chat]).defaultEvidence('chat')).toBe('ungranted');
+    expect(new ChannelRegistry([chat], { defaultEvidence: { chat: 'caps' } }).defaultEvidence('chat')).toBe('caps');
+  });
+
+  it('credentials of the built-in types: a bridge\'s env (marked) and an argument after a secret flag, mail auth, a Lark app\'s secrets; not in another type\'s entry', () => {
+    const doc = {
+      channels: [
+        { type: 'bridge', command: 'p', args: ['--token', 'a', '--api-key=b', '-v', 'c'], env: { X: 'x' } },
+        { type: 'mail', config: { imap: { auth: { pass: 'p', user: 'u' } }, smtp: { auth: { accessToken: 't' } } } },
+        { type: 'lark-bot', config: { appId: 'i', appSecret: 's', encryptKey: 'e', verificationToken: 'v', look: 'chat' } },
+        { type: 'module', module: 'm', config: { encryptKey: 'e', env: { X: 'x' } } },
+      ],
+    };
+    const at = (...p: (string | number)[]) => isCredential(doc, ['channels', ...p]);
+    expect([at(0, 'args', 1), at(0, 'args', 2), at(0, 'args', 3), at(0, 'args', 4), at(0, 'env', 'X'), at(0, 'env'), at(0, 'command')]).toEqual([true, true, false, false, true, true, false]);
+    expect([at(1, 'config', 'imap', 'auth', 'pass'), at(1, 'config', 'imap', 'auth', 'user'), at(1, 'config', 'smtp', 'auth', 'accessToken')]).toEqual([true, false, true]);
+    expect(['appId', 'appSecret', 'encryptKey', 'verificationToken', 'look'].map((k) => at(2, 'config', k))).toEqual([false, true, true, true, false]);
+    // A module's config is free-form: only secret-looking keys.
+    expect([at(3, 'config', 'encryptKey'), at(3, 'config', 'env', 'X')]).toEqual([false, false]);
+    // Another registry: its types' marks only (a lark-bot entry there is just free-form).
+    const other = new ChannelRegistry([bridgeChannelModule]);
+    expect([isCredential(doc, ['channels', 0, 'env', 'X'], other), isCredential(doc, ['channels', 2, 'config', 'encryptKey'], other)]).toEqual([true, false]);
+    expect(isCredential(doc, ['channels', 2, 'config', 'encryptKey'], new ChannelRegistry([larkBotChannelModule]))).toBe(true);
   });
 });

@@ -84,10 +84,15 @@ see `docs/E2E.md` §0). New:
   fail the start. See `docs/CHANNELS.md` §5. The four are the channel types the
   composition root registers (`src/bundle.ts`): each is a `ChannelModule`
   (`@agents-io/protocol`, `channel-module.ts`) that owns its keys, how they resolve
-  (`env:` substitution, paths, Lark's `LARK_APP_*` fallback) and the rules across its
-  entries (several Lark bots, one bridge program per channel id). `lark-bot`, `mail`
-  and `bridge` are in their packages (`channel/*/src/module.ts`); `module` is the
-  daemon's own (`src/module-channel.ts`). The daemon's config code names no type.
+  (`env:` substitution, paths, Lark's `LARK_APP_*` fallback), the rules across its
+  entries (several Lark bots, one bridge program per channel id), which of its strings
+  are credentials (`x-credential`, `isCredential`), who owns its channel ids and how its
+  adapter is built. `lark-bot`, `mail` and `bridge` are in their packages
+  (`channel/*/src/module.ts`); `module` is the daemon's own (`src/module-channel.ts`).
+  The bundle also says which types' adapters are trusted with their caps' evidence
+  without an `evidence` grant (lark-bot, mail). The daemon's config code, its gateway and
+  the console's config editing name no type (the console's `/api/bots/lark` route still
+  does, until core-slimming G5).
 - **Harness instances** (`harnesses.<name>`, `use`: `claude-code`, `codex` or `module`;
   see `docs/E2E.md` §0). `claude-code` and `codex` are the harness kinds the daemon's
   composition root registers (`src/bundle.ts`): each is a `HarnessModule`
@@ -531,13 +536,32 @@ What changed for embedders with core-slimming G3:
   (`launch_unsupported`, saying why it is unavailable); before, such a launch was accepted and
   pinned. A cwd alone is fine.
 
-What changed for embedders with core-slimming G2 (channel types, the config side):
+What changed for embedders with core-slimming G2 (channel types):
 
 - Channel types come from a `ChannelRegistry` (exported, with `builtinChannels`: lark-bot, mail,
-  bridge, module, and `CORE_CHANNEL_IDS`). `resolveConfig` takes `channelRegistry` (default the
-  built-in one) and `configFileSchema(registry, channels?)` is the file schema over both
-  registries (`ConfigFile` is still the built-in ones'). The gateway still builds only the
-  built-in channel types, so `loadConfig` and `Gateway.start` take no channel registry yet.
-  `ChannelEntry` and `ResolvedChannel` keep their shape; `RESERVED_CHANNEL_IDS` is
-  `builtinChannels.reservedIds` (same value). `LarkChannelConfig` moved to
-  `@agents-io/channel-lark-bot` (still re-exported here, deprecated, one release).
+  bridge, module, and `CORE_CHANNEL_IDS`). `resolveConfig` / `loadConfig` and `Gateway.start`
+  take `channelRegistry` (default the built-in one; give both the same), and
+  `configFileSchema(registry, channels?)` is the file schema over both registries (`ConfigFile`
+  is still the built-in ones'). `ChannelEntry` and `ResolvedChannel` keep their shape;
+  `RESERVED_CHANNEL_IDS` is `builtinChannels.reservedIds` (same value). `LarkChannelConfig` moved
+  to `@agents-io/channel-lark-bot` (still re-exported here, deprecated, one release).
+- The gateway builds every configured channel through its type's `ChannelModule.create`
+  (`GatewayOptions.channelAdapter` still wins when it returns an adapter); `init.stateDir` is
+  `<dataDir>/channels/<type>.<account, URI-encoded>`, so a Lark bot's stays
+  `channels/lark-bot.<account>`. The gateway imports no channel package.
+- The evidence an entry gives without an `evidence` grant is the registration's, never the
+  module's: `new ChannelRegistry(modules, { defaultEvidence: { <type>: 'caps' | 'ungranted' } })`,
+  default `ungranted` (`device_only` only). `builtinChannels` gives lark-bot and mail `caps`,
+  bridge and module nothing, as before. An entry's channel id belongs to
+  `<type>:<ChannelModule.owner>` (the type alone without `owner`): `bridge:[command, args]`,
+  `module:[file, export]`, `lark-bot`, the same strings as before. The registry also has
+  `owner()`, `idOf()` and `mayUse()`.
+- The console's credentials in a channel entry are what its type marks: strings at or under a
+  schema marked `x-credential` (a bridge's `env`) and `ChannelModule.isCredential` (a bridge
+  argument after a secret-looking flag, mail `auth.pass` / `auth.accessToken`, a Lark app's
+  `appSecret` / `encryptKey` / `verificationToken`): the same fields as before. `isCredential`,
+  `redact` and `unredact` take an optional channel registry; `ConfigStoreOptions` takes
+  `harnessRegistry` and `channelRegistry` (the gateway gives its own).
+- `Gateway.larkBots` is gone: the console's Lark bot provisioning is built by `bundle.ts`
+  (`builtinConsoleParts`, only when the registry has the built-in lark-bot type) until G5 makes
+  it a route the lark-bot module contributes. The HTTP API is unchanged.

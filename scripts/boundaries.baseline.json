@@ -2,17 +2,11 @@
   "packages/daemon/src/config.ts": {
     "vendor": 6
   },
-  "packages/daemon/src/console-config.ts": {
-    "vendor": 1
-  },
   "packages/daemon/src/console.ts": {
     "vendor": 2
   },
   "packages/daemon/src/gateway.ts": {
-    "import:@agents-io/channel-jsonl-bridge": 1,
-    "import:@agents-io/channel-lark-bot": 1,
-    "import:@agents-io/channel-mail": 1,
-    "vendor": 35
+    "vendor": 18
   },
   "packages/daemon/src/tui-bridge.ts": {
     "vendor": 2
