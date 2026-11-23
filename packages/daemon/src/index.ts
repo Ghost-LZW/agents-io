@@ -2,6 +2,7 @@ export * from './config.js';
 export * from './harness-registry.js';
 export * from './channel-registry.js';
 export * from './modules.js';
+export * from './core.js';
 export * from './bundle.js';
 export * from './gateway.js';
 export { Gateway as Daemon } from './gateway.js';

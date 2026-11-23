@@ -598,7 +598,10 @@ export interface ModuleLaunch {
 }
 
 export type HarnessInstance = InstanceBase & {
-  /** A registered kind (`HarnessModule.kind`, e.g. `claude-code`, `codex`), or `module`. */
+  /**
+   * A registered kind (`HarnessModule.kind`, e.g. `claude-code`, `codex`), or `module`; with no kind
+   * registered and none configured, `embedded` (`EMBEDDED_HARNESS`: the embedder's adapter).
+   */
   kind: string;
   /**
    * The kind's launch settings, as its module resolved the entry (`HarnessModule.resolve`, e.g.
@@ -933,8 +936,9 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
   const registry = ctx.harnessRegistry ?? builtinHarnesses;
   const channelRegistry = ctx.channelRegistry ?? builtinChannels;
   const moduleRegistry = ctx.moduleRegistry ?? builtinModules;
-  const errs = errors(configFileSchema(registry, channelRegistry, moduleRegistry), raw);
-  if (errs.length) throw new ConfigError(`invalid config: ${errs.slice(0, 5).join('; ')}`);
+  const schema = configFileSchema(registry, channelRegistry, moduleRegistry);
+  const errs = errors(schema, raw);
+  if (errs.length) throw new ConfigError(`invalid config: ${[...errs.slice(0, 5), ...unregistered(raw, schema, registry, channelRegistry)].join('; ')}`);
   const c = raw as ConfigFile;
   const env = ctx.env;
   const path = (p: string) => {
@@ -1024,6 +1028,48 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     ...(moduleRegistry.size ? { modules } : {}),
     ...(warnings.length ? { warnings } : {}),
   };
+}
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/** A name the errors below may quote (a type or kind name, not a value that could be a secret). */
+const quotable = (v: string) => (/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(v) ? ` ${JSON.stringify(v)}` : '');
+
+/**
+ * What a file that fails its schema uses of a module these registries do not have (CF-4): a
+ * channel type, a harness kind, a config section, a console setting. Said after the schema's
+ * errors, so a config written for modules the daemon lacks (one built with `coreRegistries`, an
+ * embedder's own registries) fails naming them, not only the schema path.
+ */
+function unregistered(raw: unknown, schema: TObject, harnesses: HarnessRegistry, channels: ChannelRegistry): string[] {
+  if (!isRecord(raw)) return [];
+  const out: string[] = [];
+  const listed = (names: string[]) => (names.length ? names.join(', ') : 'none');
+  if (Array.isArray(raw.channels)) {
+    raw.channels.forEach((e, i) => {
+      const type = isRecord(e) ? e.type : undefined;
+      if (typeof type === 'string' && !channels.get(type)) out.push(`channels[${i}].type: no channel module${quotable(type)} is registered (registered types: ${listed(channels.types)})`);
+    });
+  }
+  const kinds = `registered kinds: ${listed(harnesses.kinds)}`;
+  if (isRecord(raw.harnesses)) {
+    for (const [name, e] of Object.entries(raw.harnesses)) {
+      const use = isRecord(e) ? e.use : undefined;
+      if (typeof use === 'string' && use !== 'module' && !harnesses.get(use)) out.push(`harnesses.${name}.use: no harness module${quotable(use)} is registered (${kinds}; or "module")`);
+    }
+  }
+  if (isRecord(raw.harness)) {
+    for (const [k, v] of Object.entries(raw.harness)) {
+      const kind = k === 'use' ? v : k;
+      if (typeof kind === 'string' && kind !== 'module' && !harnesses.get(kind)) out.push(`harness.${k}: no harness module${quotable(kind)} is registered (${kinds})`);
+    }
+  }
+  for (const k of Object.keys(raw)) if (!Object.hasOwn(schema.properties, k)) out.push(`${k}: not a key of the config, and no registered module has a section of that name`);
+  if (isRecord(raw.console)) {
+    const settings = (consoleSchema(channels) as unknown as TObject).properties;
+    for (const k of Object.keys(raw.console)) if (!Object.hasOwn(settings, k)) out.push(`console.${k}: not a console setting, and no registered channel module adds one of that name`);
+  }
+  return out;
 }
 
 /** The value at a dotted path of the file (`policy.strangers`), if set. */
@@ -1313,6 +1359,14 @@ export function withDefaultInstance(c: Config, i: HarnessInstance): Config {
 
 type Section = { run?: { model?: string; effort?: string }; profiles?: Record<string, Record<string, unknown>>; options?: Record<string, unknown> };
 
+/**
+ * The name and kind of the one instance of a config resolved with no harness kind registered that
+ * configures no harness (a kernel with no modules, `coreRegistries`): it stands for the adapter the
+ * embedder passes the gateway (`GatewayOptions.harness` or `buildHarness`), which builds nothing
+ * for it. Its run has no model (the embedder's adapter decides); it has no launch, env or profiles.
+ */
+export const EMBEDDED_HARNESS = 'embedded';
+
 function resolveHarnesses(c: ConfigFile, ctx: ResolveContext, path: (p: string) => string, registry: HarnessRegistry): { harnesses: Record<string, HarnessInstance>; defaultHarness: string } {
   const env = ctx.env;
   if (c.harness && c.harnesses) fail('use either `harnesses` (named instances) or the older `harness` block, not both');
@@ -1331,7 +1385,9 @@ function resolveHarnesses(c: ConfigFile, ctx: ResolveContext, path: (p: string) 
     const block = (c.harness ?? {}) as Record<string, unknown> & { use?: string };
     const prefixes = registry.modules.flatMap((m) => m.legacy?.envPrefixes ?? []);
     const legacyEnv = Object.fromEntries(Object.entries(ctx.fileEnv ?? {}).filter(([k]) => PROXY_ENV.test(k) || prefixes.some((x) => k.startsWith(x))));
-    def = block.use ?? registry.defaultKind ?? fail('no harness kind is registered: configure `harnesses`');
+    // With no kind registered (the file schema then admits no `use` and no section), the embedder's adapter.
+    def = block.use ?? registry.defaultKind ?? EMBEDDED_HARNESS;
+    if (registry.defaultKind === undefined) out[def] = { ...base(def, undefined, {}), env: {}, kind: def, launch: undefined };
     for (const m of registry.modules) {
       const sec = block[m.kind] as (Section & Record<string, unknown>) | undefined;
       if (!sec && def !== m.kind) continue;

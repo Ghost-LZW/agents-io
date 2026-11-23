@@ -109,7 +109,7 @@ import {
 import { HostMcpServer, HostTools, ToolError, agentIdentity, agentOrigin, toolCatalog, type TopicHandover } from '@agents-io/host-mcp';
 import { builtinChannels, builtinHarnesses, builtinModules } from './bundle.js';
 import { badChannelAdapter, loadHarnessModule } from './module-loader.js';
-import { ConfigError, UNGRANTED_EVIDENCE, agentSpec, configTable, consoleSettings, resolveModules, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type PresetConfig, type ResolvedChannel } from './config.js';
+import { ConfigError, EMBEDDED_HARNESS, UNGRANTED_EVIDENCE, agentSpec, configTable, consoleSettings, resolveModules, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type PresetConfig, type ResolvedChannel } from './config.js';
 import { ConsoleServer, type ContributedRoute } from './console.js';
 import type { ChannelRegistry, DefaultEvidence } from './channel-registry.js';
 import type { HarnessRegistry } from './harness-registry.js';
@@ -131,7 +131,7 @@ export type LogFn = (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: 
 /** The log without `GatewayOptions.logger`: stderr. */
 const defaultLog: LogFn = (level, msg) => console.error(`[aio] ${level}: ${msg}`);
 
-/** An in-process channel handed to the gateway (tests and e2e scripted ends). */
+/** An in-process channel handed to the gateway (an embedder's adapter, tests and e2e scripted ends). */
 export interface ExtraChannel {
   adapter: ChannelAdapter;
   account?: string;
@@ -140,7 +140,11 @@ export interface ExtraChannel {
 
 export interface GatewayOptions {
   config: Config;
-  /** Use this harness for every instance instead of building them from the config (tests). */
+  /**
+   * Use this harness for every instance instead of building them from the config (tests; the
+   * embedder's adapter of a kernel with no harness kind, `coreRegistries`: the config's one instance
+   * `EMBEDDED_HARNESS` stands for it).
+   */
   harness?: HarnessAdapter;
   /** Build instance adapters with this instead of `buildHarness` (tests). */
   buildHarness?: (instance: HarnessInstance) => HarnessAdapter;
@@ -157,7 +161,7 @@ export interface GatewayOptions {
    * registry the config was resolved with (`Config.modules` names exactly its modules).
    */
   moduleRegistry?: ModuleRegistry;
-  /** In-process channels besides the configured ones. */
+  /** In-process channels besides the configured ones (with `coreRegistries`, the only ones: no channel type is registered). */
   channels?: ExtraChannel[];
   /** Build a configured channel's adapter with this instead of its type's `create` when it returns one (embedding, tests). */
   channelAdapter?: (ch: ResolvedChannel) => ChannelAdapter | undefined;
@@ -1071,6 +1075,7 @@ export class Gateway {
   private build(inst: HarnessInstance): HarnessAdapter {
     const own = this.o.buildHarness?.(inst);
     if (own) return own;
+    if (inst.kind === EMBEDDED_HARNESS && !this.harnessRegistry.get(inst.kind)) throw new ConfigError(`harness instance ${inst.name} stands for the embedder's adapter (no harness kind is registered): pass it to Gateway.start (GatewayOptions.harness or buildHarness)`);
     if (inst.kind !== 'module') return buildHarness(inst, this.harnessBlobs, { registry: this.harnessRegistry, log: this.instanceLog(inst.name), harness: (name) => this.otherInstance(name) });
     const a = this.moduleAdapters.get(inst.name);
     if (!a) throw new Error(inst.unavailable ? `harness instance ${inst.name} is unavailable: ${inst.unavailable}` : `harness instance ${inst.name}: its module was not loaded`);

@@ -737,6 +737,66 @@ marks in a module's schema are not read yet.
 `harness` / `buildHarness` / `channels` to inject fakes); `LocalClient` speaks both
 client and host frames (`hello`, `runStart`, `runEndedOf`, `inboundRead`, `onRequest('inbound' | 'policy', …)`, …).
 
+### The kernel without modules (core-only)
+
+`coreRegistries()` (`src/core.ts`) gives a harness, channel and module registry with nothing
+registered: no harness kind (no Claude Code, no Codex), no channel type (no lark-bot, mail,
+bridge or `module` entry), no feature module (no topic titles, owner commands, stranger approval,
+watch / live / topic tools or external MCP endpoint). `core.ts` imports no module package and not
+the composition root (`bundle.ts`). Give the same registries to the config and the gateway, and
+pass the channel and the harness yourself:
+
+```ts
+import { Gateway, coreRegistries, resolveConfig } from '@agents-io/daemon';
+
+const registries = coreRegistries();
+const config = resolveConfig({ dataDir, policy: { owners: ['chat:alice'] } }, { env: process.env, baseDir, ...registries });
+const gw = await Gateway.start({
+  config,
+  ...registries,
+  harness: myHarness, // a HarnessAdapter: every instance of the config is this one
+  channels: [{ adapter: myChannel }], // ChannelAdapters: with no channel type, the only channels
+});
+```
+
+- A config that configures no harness resolves, with no kind registered, to one instance,
+  `embedded` (`EMBEDDED_HARNESS`; its run has `model: ''`): it stands for the adapter you pass
+  (`GatewayOptions.harness`, or `buildHarness` for one adapter per instance). `Gateway.start`
+  without either fails with a `ConfigError` naming the instance. `harnesses` may still list
+  `use: "module"` instances.
+- A config that uses something only a module has fails the load (`ConfigError`), naming it after
+  the schema errors: a channel type (`channels[0].type: no channel module "lark-bot" is
+  registered (registered types: none)`), a harness kind (`harnesses.cc.use: no harness module
+  "claude-code" is registered (registered kinds: none; or "module")`, and the same for the older
+  `harness` block), a module's config section (`externalMcp: not a key of the config, and no
+  registered module has a section of that name`), a console setting a channel module adds
+  (`console.larkBotCommand: …`). A value that does not look like a name is not repeated.
+- What runs is the kernel's alone: the chat commands `/help`, `/status`, `/stop`, `/steer`,
+  `/answer`, `/new`, `/topics`, `/switch`, `/tui` (`/model`, `/plan`, … are ordinary messages);
+  the six kernel model tools (`KERNEL_TOOL_NAMES`) for an agent with `tools`; the kernel's
+  `host.hello` features (`FEATURES`); the console's core endpoints (`/api/bots/lark` is an
+  unknown route, 404). The session log, lanes, outbox, requests, host inbound queue, explain and
+  the host protocol are the same as in the bundled `aio`: `test/core-only.test.ts` runs the
+  kernel's promises (IN-1, IN-5, LN-1, LN-2, LN-10, DL-1, DL-2, EX-2, RQ-1, HQ-1) on it with
+  testkit's `FakeChannel` and `FakeHarness`.
+- Not yet a build without the module packages: `gateway.ts`, `config.ts` and
+  `console-config.ts` still import `bundle.ts` for their defaults (the built-in registries when
+  none is given, `ConfigFile`, `RESERVED_CHANNEL_IDS`, `CONFIG_DIR_KEYS`), so
+  `@agents-io/daemon` still depends on them and loads them; with `coreRegistries()` none of
+  their code runs.
+
+What changed for embedders with core-slimming §4 P2 item 5 (the kernel without modules):
+
+- New: `coreRegistries()`, `Registries`, `EMBEDDED_HARNESS`.
+- With an empty harness registry, a config that configures no harness no longer fails
+  (`no harness kind is registered: configure \`harnesses\``): it has the `embedded` instance
+  above.
+- An `invalid config: …` error whose file uses a channel type, harness kind, top-level key or
+  console setting the registries lack has one more clause per such use after the schema's errors
+  (above). The schema's errors and their order are as before; a file the schema accepts gets no
+  new error. With the built-in registries this adds the clause to a misspelt type, kind or
+  top-level key (`fooBar: not a key of the config, …`).
+
 What changed for embedders with core-slimming G3:
 
 - Harness kinds come from a `HarnessRegistry` (exported, with `builtinHarnesses`: Claude Code,
