@@ -10,6 +10,8 @@ import {
   WatchDraft,
   errors,
   type BindingTable,
+  type ChannelResolveContext,
+  type ChannelValidateContext,
   type HarnessChildSecrets,
   type HarnessModule,
   type HarnessResolveContext,
@@ -18,10 +20,12 @@ import {
   type WatchSource,
 } from '@agents-io/protocol';
 import { DEFAULT_BLOB_MAX_BYTES, OWNER_LABEL, Router, RouterError, checkIdentities, ownerIdentities, ownersTable, type AgentContactRule, type AgentSpec, type LoopGuardOptions } from '@agents-io/session';
-import { builtinHarnesses } from './bundle.js';
-import { resolveChannelModule } from './channel-module.js';
+import { builtinChannels, builtinHarnesses, type BuiltinChannelEntry, type BuiltinChannelSettings } from './bundle.js';
+import type { ChannelRegistry } from './channel-registry.js';
+import { ConfigError } from './config-error.js';
 import { loadEnvFile } from './env-file.js';
 import type { HarnessRegistry } from './harness-registry.js';
+import { resolveModuleFile } from './module-loader.js';
 import { TOOL_NAMES, parseScope, type ExternalScopes } from '@agents-io/host-mcp';
 
 /*
@@ -160,61 +164,36 @@ const ChannelCommon = {
   evidence: Type.Optional(Type.Array(Evidence)),
 };
 
+type ChannelCommonFields = Static<TObject<typeof ChannelCommon>>;
+
 /**
  * Channel ids of the built-in adapters, local ends and agent addresses (`agent:<agent>:<sessionKey>`
  * routes, the `agent` identity namespace the daemon stamps, ID-7): no bridge or module channel may use them.
+ * The ones the built-in types declare (`ChannelModule.ids`), then the daemon's own (`CORE_CHANNEL_IDS`).
  */
-export const RESERVED_CHANNEL_IDS: readonly string[] = ['lark-bot', 'mail', 'local', 'agent'];
+export const RESERVED_CHANNEL_IDS: readonly string[] = builtinChannels.reservedIds;
 /** Evidence a bridge or module channel may give without an `evidence` grant. */
 export const UNGRANTED_EVIDENCE: readonly Evidence[] = ['device_only', 'none'];
 
-const ChannelEntry = Type.Union([
-  /**
-   * Feishu/Lark bot, one app per entry. `config.appId` / `config.appSecret` / `config.domain`
-   * (values or "env:NAME"; the whole config is env-substituted) name the app; an entry
-   * without them reads LARK_APP_ID / LARK_APP_SECRET / LARK_DOMAIN (at most one such entry).
-   */
-  Type.Object({ type: Type.Literal('lark-bot'), ...ChannelCommon, config: Type.Optional(Type.Record(Type.String(), Type.Unknown())) }, Closed),
-  /** IMAP/SMTP mail: a MailChannelConfig (use "env:NAME" for passwords). */
-  Type.Object({ type: Type.Literal('mail'), ...ChannelCommon, config: Type.Record(Type.String(), Type.Unknown()) }, Closed),
-  /** Out-of-process channel spoken to over JSONL stdio (jsonl-bridge `spawnChannel`); how private channels attach. */
-  Type.Object(
-    {
-      type: Type.Literal('bridge'),
-      ...ChannelCommon,
-      /**
-       * The channel id: every `hello` must declare it as `adapterId`, else the peer is refused
-       * (`bad_hello`) and restarted with backoff. Not a built-in id (`lark-bot`, `mail`, `local`);
-       * bridge entries sharing an id must run the same `command` / `args` (one program, several
-       * accounts). Without it the first hello's id is pinned (and checked the same way).
-       */
-      id: Type.Optional(Type.String({ minLength: 1 })),
-      command: Type.String(),
-      args: Type.Optional(Type.Array(Type.String())),
-      env: Type.Optional(Type.Record(Type.String(), Type.String())),
-      cwd: Type.Optional(Type.String()),
-      config: Type.Optional(Type.Unknown()),
-    },
-    Closed,
-  ),
-  /**
-   * In-process channel plugin: an ES module exporting a ChannelFactory (`@agents-io/protocol`).
-   * `module` is a path (relative to the config file) to a package directory or a .js/.mjs file,
-   * or a bare package specifier resolved from the config file's directory.
-   */
-  Type.Object(
-    {
-      type: Type.Literal('module'),
-      ...ChannelCommon,
-      module: Type.String(),
-      /** Export holding the factory (default `createChannel`, else `default`). */
-      export: Type.Optional(Type.String()),
-      config: Type.Optional(Type.Unknown()),
-    },
-    Closed,
-  ),
-]);
-export type ChannelEntry = Static<typeof ChannelEntry>;
+const channelEntrySchemas = new WeakMap<ChannelRegistry, TSchema>();
+
+/** A `channels[]` entry: for each registered type (in order), `type`, the keys every entry has, then the type's own (`ChannelModule.entry`), closed. */
+function channelEntrySchema(registry: ChannelRegistry): TSchema {
+  let s = channelEntrySchemas.get(registry);
+  if (!s) {
+    const members = registry.modules.map((m) => {
+      const taken = Object.keys(m.entry).find((k) => k === 'type' || Object.hasOwn(ChannelCommon, k));
+      if (taken !== undefined) throw new Error(`channel type ${JSON.stringify(m.type)}: every channel entry has ${JSON.stringify(taken)}; its module cannot declare it`);
+      return Type.Object({ type: Type.Literal(m.type), ...ChannelCommon, ...m.entry }, Closed);
+    });
+    channelEntrySchemas.set(registry, (s = Type.Union(members)));
+  }
+  return s;
+}
+
+/** A `channels[]` entry of a built-in type, as written. */
+export type ChannelEntry = ChannelCommonFields & BuiltinChannelEntry;
+const ChannelEntry = channelEntrySchema(builtinChannels) as TSchema & { static: ChannelEntry };
 
 /** A named run preset: one harness instance with its model and effort (`presets.<name>`). */
 const PresetEntry = Type.Object(
@@ -284,7 +263,7 @@ const AgentEntry = Type.Object(
   Closed,
 );
 
-/** The config file's schema over the built-in harness kinds (`configFileSchema` gives it over another registry's). */
+/** The config file's schema over the built-in harness kinds and channel types (`configFileSchema` gives it over other registries'). */
 export const ConfigFile = Type.Object(
   {
     /** State directory (default ~/.agents-io/aio). Relative paths are relative to the config file. */
@@ -555,13 +534,22 @@ export const ConfigFile = Type.Object(
 );
 export type ConfigFile = Static<typeof ConfigFile>;
 
-const fileSchemas = new WeakMap<HarnessRegistry, TObject>();
+const fileSchemas = new WeakMap<HarnessRegistry, WeakMap<ChannelRegistry, TObject>>();
 
-/** The config file's schema over a registry's harness kinds (`harnesses.<name>.use`, the older `harness` block); the rest is `ConfigFile`'s. */
-export function configFileSchema(registry: HarnessRegistry): TObject {
-  if (registry === builtinHarnesses) return ConfigFile;
-  let s = fileSchemas.get(registry);
-  if (!s) fileSchemas.set(registry, (s = Type.Object({ ...ConfigFile.properties, harnesses: harnessesSchema(registry), harness: legacyBlockSchema(registry) }, Closed)));
+/**
+ * The config file's schema over a registry's harness kinds (`harnesses.<name>.use`, the older
+ * `harness` block) and a registry's channel types (`channels[].type`; default the built-in ones);
+ * the rest is `ConfigFile`'s.
+ */
+export function configFileSchema(registry: HarnessRegistry, channels: ChannelRegistry = builtinChannels): TObject {
+  if (registry === builtinHarnesses && channels === builtinChannels) return ConfigFile;
+  let byChannels = fileSchemas.get(registry);
+  if (!byChannels) fileSchemas.set(registry, (byChannels = new WeakMap()));
+  let s = byChannels.get(channels);
+  if (!s) {
+    s = Type.Object({ ...ConfigFile.properties, harnesses: harnessesSchema(registry), harness: legacyBlockSchema(registry), channels: Type.Optional(Type.Array(channelEntrySchema(channels))) }, Closed);
+    byChannels.set(channels, s);
+  }
   return s;
 }
 
@@ -856,22 +844,17 @@ function resolveExternalMcp(c: NonNullable<ConfigFile['externalMcp']>, env: Reco
   };
 }
 
-/** A lark-bot entry's config after env substitution, with its app resolved. */
-export type LarkChannelConfig = Record<string, unknown> & { appId: string; appSecret: string; domain: 'feishu' | 'lark' };
-
-export type ResolvedChannel =
-  | (Omit<Extract<ChannelEntry, { type: 'lark-bot' }>, 'config'> & { account: string; config: LarkChannelConfig })
-  | (Extract<ChannelEntry, { type: 'mail' }> & { account: string })
-  | (Extract<ChannelEntry, { type: 'bridge' }> & { account: string })
-  /** `module` is the resolved file to import. */
-  | (Extract<ChannelEntry, { type: 'module' }> & { account: string });
+/**
+ * A `channels[]` entry as resolved: `type`, the keys every entry has, `account` (default `default`)
+ * and what the type's module made of the rest (`ChannelModule.resolve`; a `module` entry's `module`
+ * is the resolved file to import). Typed for the built-in types; another registry's resolve the same way.
+ */
+export type ResolvedChannel = ChannelCommonFields & { account: string } & BuiltinChannelSettings;
 
 /** `topics.parkedIdleMs` default: a parked topic's lane closes after 30 idle minutes. */
 export const DEFAULT_PARKED_IDLE_MS = 30 * 60_000;
 
-export class ConfigError extends Error {
-  override name = 'ConfigError';
-}
+export { ConfigError };
 
 /**
  * `.env.live` keys the older block's instances get besides their kinds' own (`legacy.envPrefixes`);
@@ -950,12 +933,18 @@ export interface ResolveContext {
   channels?: boolean;
   /** The harness kinds `use` may name (default the built-in ones, `bundle.ts`). */
   harnessRegistry?: HarnessRegistry;
+  /**
+   * The channel types `channels[].type` may name (default the built-in ones, `bundle.ts`). The
+   * gateway still builds only the built-in types (core-slimming G2).
+   */
+  channelRegistry?: ChannelRegistry;
 }
 
 /** Validate a parsed config file and fill defaults. Error messages name keys, never values. */
 export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
   const registry = ctx.harnessRegistry ?? builtinHarnesses;
-  const errs = errors(configFileSchema(registry), raw);
+  const channelRegistry = ctx.channelRegistry ?? builtinChannels;
+  const errs = errors(configFileSchema(registry, channelRegistry), raw);
   if (errs.length) throw new ConfigError(`invalid config: ${errs.slice(0, 5).join('; ')}`);
   const c = raw as ConfigFile;
   const env = ctx.env;
@@ -992,7 +981,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     defaultAgent,
     ...(table ? { table } : {}),
     identities,
-    channels: ctx.channels === false ? [] : resolveChannels(c.channels ?? [], env, path, warnings),
+    channels: ctx.channels === false ? [] : resolveChannels(c.channels ?? [], env, path, warnings, channelRegistry),
     outputTools,
     topics: { parkedIdleMs: c.topics?.parkedIdleMs ?? DEFAULT_PARKED_IDLE_MS },
     hostCallouts: {
@@ -1330,7 +1319,7 @@ function resolveInstance(name: string, raw: unknown, env: Record<string, string 
     const x = raw as Static<typeof ModuleInstance>;
     const spec = x.module;
     const rel = spec.startsWith('.') || spec.startsWith('~') || isAbsolute(spec);
-    const r = resolveChannelModule(spec, rel ? path(spec) : undefined, path('.'));
+    const r = resolveModuleFile(spec, rel ? path(spec) : undefined, path('.'));
     if ('error' in r) fail(`${where}.module: ${r.error}`);
     const module: ModuleLaunch = { file: r.file, ...(x.export ? { export: x.export } : {}), ...(x.config !== undefined ? { config: sub(x.config, 'config') } : {}) };
     return { ...common, kind: 'module', launch: module, ...(unavailable ? { unavailable } : {}) };
@@ -1344,94 +1333,24 @@ function resolveInstance(name: string, raw: unknown, env: Record<string, string 
 export const VAR_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /**
- * Every channel entry, plus the rules across lark-bot entries (decision 8): one
- * app per entry (two entries of one app would split its events), at most one entry
- * reading LARK_APP_*, accounts unique and, with several bots, plain names (they
- * go into route and session keys, separated by ':').
+ * Every channel entry, resolved by its type's module (`ChannelModule.resolve`, in config order),
+ * then each type's rules across its entries (`validateAll`, in registration order): e.g. the
+ * lark-bot rules of decision 8, and one bridge program per channel id.
  */
-function resolveChannels(entries: ChannelEntry[], env: Record<string, string | undefined>, path: (p: string) => string, warnings: string[]): ResolvedChannel[] {
-  const out = entries.map((ch, i) => resolveChannel(ch, env, path, i));
-  const lark = out.map((ch, i) => ({ ch, i })).filter((x): x is { ch: Extract<ResolvedChannel, { type: 'lark-bot' }>; i: number } => x.ch.type === 'lark-bot');
-  const name = (x: { ch: { account: string }; i: number }) => `channels[${x.i}] (account ${JSON.stringify(x.ch.account)})`;
-  const fallback = lark.filter((x) => !hasExplicitApp(entries[x.i]!));
-  if (fallback.length > 1) fail(`lark-bot channels ${fallback.map(name).join(' and ')} both read LARK_APP_ID; give each its own config.appId / config.appSecret`);
-  const seen = new Map<string, (typeof lark)[number]>();
-  const apps = new Map<string, (typeof lark)[number]>();
-  for (const x of lark) {
-    const prior = seen.get(x.ch.account);
-    if (prior) fail(`lark-bot channels ${name(prior)} and channels[${x.i}] have the same account; accounts must differ`);
-    seen.set(x.ch.account, x);
-    const app = `${x.ch.config.domain}:${x.ch.config.appId}`;
-    const same = apps.get(app);
-    // One long connection per app: a second one would get some of its events (Feishu delivers each to one connection).
-    if (same) fail(`lark-bot channels ${name(same)} and ${name(x)} are the same app ${x.ch.config.appId}; run each app in one entry only (two connections split its events)`);
-    apps.set(app, x);
-  }
-  if (lark.length > 1) {
-    for (const x of lark) if (!INSTANCE_NAME.test(x.ch.account)) fail(`${name(x)}: with several lark-bot channels, accounts are letters, digits, '.', '_' and '-' (at most 64, not starting with '.', '_' or '-')`);
-  } else if (lark[0]?.ch.account.includes(':')) warnings.push(`${name(lark[0])}: an account with ':' makes route and session keys ambiguous; use letters, digits, '.', '_' and '-'`);
-  // One channel id belongs to one adapter, only accounts differ (channel-stamping F4). Module ids and
-  // a bridge's id without `id` are only known once loaded / connected; the gateway checks those.
-  const bridges = new Map<string, { program: string; i: number }>();
-  out.forEach((ch, i) => {
-    if (ch.type !== 'bridge' || ch.id === undefined) return;
-    if (RESERVED_CHANNEL_IDS.includes(ch.id)) fail(`channels[${i}]: bridge id ${JSON.stringify(ch.id)} is a built-in channel id; a bridge cannot use it`);
-    const program = JSON.stringify([ch.command, ch.args ?? []]);
-    const prior = bridges.get(ch.id);
-    if (prior && prior.program !== program) fail(`channels[${prior.i}] and channels[${i}] run different programs under one channel id ${JSON.stringify(ch.id)}; one channel id belongs to one adapter (entries sharing it differ only in account)`);
-    bridges.set(ch.id, { program, i });
+function resolveChannels(entries: readonly ChannelEntry[], env: Record<string, string | undefined>, path: (p: string) => string, warnings: string[], registry: ChannelRegistry): ResolvedChannel[] {
+  const substitute = (v: unknown, where: string) => substituteEnv(v, env, where);
+  const out = entries.map((ch, index): ResolvedChannel => {
+    // The file schema admits only registered types.
+    const m = registry.get(ch.type)!;
+    const ctx: ChannelResolveContext = { index, where: `channels[${index}]`, env, substitute, path, fail };
+    return { ...ch, ...m.resolve(ch, ctx), account: ch.account ?? 'default' } as ResolvedChannel;
   });
-  return out;
-}
-
-/** The entry names its app itself (`config.appId` or `config.appSecret`), instead of reading LARK_APP_*. */
-function hasExplicitApp(ch: ChannelEntry): boolean {
-  const c = ch.type === 'lark-bot' ? ch.config : undefined;
-  return c?.appId !== undefined || c?.appSecret !== undefined;
-}
-
-function resolveChannel(ch: ChannelEntry, env: Record<string, string | undefined>, path: (p: string) => string, i: number): ResolvedChannel {
-  const account = ch.account ?? 'default';
-  switch (ch.type) {
-    case 'lark-bot': {
-      const where = `channels[${i}].config`;
-      const config = substituteEnv(ch.config ?? {}, env, where) as Record<string, unknown>;
-      let appId: unknown;
-      let appSecret: unknown;
-      let domain: unknown;
-      if (hasExplicitApp(ch)) {
-        if (config.appId === undefined || config.appSecret === undefined) fail(`${where}: give both appId and appSecret (or neither, to read LARK_APP_ID / LARK_APP_SECRET)`);
-        ({ appId, appSecret } = config);
-        domain = config.domain ?? 'feishu';
-      } else {
-        const need = (k: string) => env[k] || fail(`channel lark-bot needs ${k} (environment or .env.live), or config.appId / config.appSecret`);
-        appId = need('LARK_APP_ID');
-        appSecret = need('LARK_APP_SECRET');
-        domain = config.domain ?? (env.LARK_DOMAIN || 'feishu');
-      }
-      if (typeof appId !== 'string' || !appId) fail(`${where}.appId must be a non-empty string`);
-      if (typeof appSecret !== 'string' || !appSecret) fail(`${where}.appSecret must be a non-empty string`);
-      if (domain !== 'feishu' && domain !== 'lark') fail(`${where}.domain (or LARK_DOMAIN) must be 'feishu' or 'lark'`);
-      return { ...ch, account, config: { ...config, appId, appSecret, domain } };
-    }
-    case 'mail':
-      return { ...ch, account, config: substituteEnv(ch.config, env, 'mail.config') as Record<string, unknown> };
-    case 'bridge':
-      return {
-        ...ch,
-        account,
-        ...(ch.cwd ? { cwd: path(ch.cwd) } : {}),
-        ...(ch.env ? { env: substituteEnv(ch.env, env, 'bridge.env') as Record<string, string> } : {}),
-        ...(ch.config !== undefined ? { config: substituteEnv(ch.config, env, 'bridge.config') } : {}),
-      };
-    case 'module': {
-      const spec = ch.module;
-      const rel = spec.startsWith('.') || spec.startsWith('~') || isAbsolute(spec);
-      const r = resolveChannelModule(spec, rel ? path(spec) : undefined, path('.'));
-      if ('error' in r) fail(`channels[${i}].module: ${r.error}`);
-      return { ...ch, account, module: r.file, ...(ch.config !== undefined ? { config: substituteEnv(ch.config, env, `channels[${i}].config`) } : {}) };
-    }
+  const vctx: ChannelValidateContext = { reservedIds: registry.reservedIds, fail, warn: (msg) => void warnings.push(msg) };
+  for (const m of registry.modules) {
+    if (!m.validateAll) continue;
+    m.validateAll(entries.flatMap((entry, index) => (entry.type === m.type ? [{ index, entry, resolved: out[index]! }] : [])), vctx);
   }
+  return out;
 }
 
 /** Replace every string `"env:NAME"` with the variable's value; a missing variable is an error naming it. */

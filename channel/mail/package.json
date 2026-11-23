@@ -7,6 +7,7 @@
   "files": ["dist"],
   "dependencies": {
     "@agents-io/protocol": "workspace:*",
+    "@sinclair/typebox": "^0.34.0",
     "imapflow": "^1.0.0",
     "mailauth": "^4.0.0",
     "mailparser": "^3.7.0",

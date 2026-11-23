@@ -2,12 +2,10 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, rmSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { dirname, join, resolve as resolvePath } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { Type, type TSchema } from '@sinclair/typebox';
+import { fileURLToPath } from 'node:url';
 import { generateTopicTitle, topicTitlePrompt } from './topic-title.js';
 import {
   PROTOCOL_VERSION,
-  errors,
   formatAddress,
   routeKey,
   type AdminQueue,
@@ -36,9 +34,7 @@ import {
   type LiveStartArgs,
   type LoopGuardTrip,
   type HarnessDeclarations,
-  type HarnessFactory,
   type HarnessFactoryInit,
-  type HarnessModule,
   type Origin,
   type Policy,
   type NativeClient,
@@ -103,7 +99,7 @@ import {
 } from '@agents-io/session';
 import { HostMcpServer, HostTools, ToolError, agentIdentity, type TopicHandover } from '@agents-io/host-mcp';
 import { builtinHarnesses } from './bundle.js';
-import { loadChannelModule } from './channel-module.js';
+import { loadChannelModule, loadHarnessModule } from './module-loader.js';
 import { LarkBotAdapter, LarkBotJobs } from '@agents-io/channel-lark-bot';
 import { MailChannel, type MailChannelConfig } from '@agents-io/channel-mail';
 import { spawnChannel, type BridgedChannel, type BridgeState } from '@agents-io/channel-jsonl-bridge';
@@ -3323,91 +3319,6 @@ export function buildHarness(
 function definedEnv(env: Record<string, string | undefined>): Record<string, string> | undefined {
   const out = Object.fromEntries(Object.entries(env).filter((e): e is [string, string] => e[1] !== undefined));
   return Object.keys(out).length ? out : undefined;
-}
-
-/**
- * Import a harness module, run its factory (or its descriptor's `create`, `HarnessModule`), and check
- * the adapter's shape.
- */
-async function loadHarnessModule(o: {
-  name: string;
-  module: ModuleLaunch;
-  log: (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
-  harness: (name: string) => HarnessAdapter;
-  blobs: BlobAccess;
-  env: Record<string, string | undefined>;
-  profiles: Record<string, Record<string, unknown>>;
-}): Promise<HarnessAdapter> {
-  const where = `harnesses.${o.name} (module ${o.module.file})`;
-  const name = o.module.export ?? 'createHarness';
-  const mod = (await import(pathToFileURL(o.module.file).href).catch((e: Error) => {
-    throw new Error(`${where}: cannot import: ${e.message}`);
-  })) as Record<string, unknown>;
-  const factory = o.module.export !== undefined ? mod[name] : (mod[name] ?? mod.default);
-  const descriptor = harnessDescriptor(factory);
-  if (typeof factory !== 'function' && !descriptor) throw new Error(`${where}: export ${JSON.stringify(name)}${o.module.export !== undefined ? '' : ' (or default)'} is not a function`);
-  const init: HarnessFactoryInit = { name: o.name, config: o.module.config, log: o.log, harness: o.harness, blobs: o.blobs };
-  let adapter: HarnessAdapter;
-  if (descriptor) {
-    // A descriptor: its `schema` checks the entry's `config` (closed; an absent one is `{}`), which is its `launch`.
-    const launch = o.module.config ?? {};
-    const schema: unknown = descriptor.schema;
-    if (schema !== undefined) {
-      let errs: string[];
-      try {
-        const properties = (schema as { properties?: unknown } | null)?.properties;
-        if (typeof properties !== 'object' || properties === null) throw new Error('not a TypeBox object schema');
-        errs = errors(Type.Object(properties as Record<string, TSchema>, { additionalProperties: false }), launch);
-      } catch (e) {
-        throw new Error(`${where}: the descriptor's schema cannot be checked: ${(e as Error).message}`);
-      }
-      if (errs.length) throw new Error(`${where}: invalid config: ${errs.slice(0, 5).map((e) => `config${e}`).join('; ')}`);
-    }
-    try {
-      adapter = await descriptor.create({ ...init, launch, env: o.env, profiles: o.profiles });
-    } catch (e) {
-      throw new Error(`${where}: create failed: ${(e as Error).message}`);
-    }
-  } else {
-    try {
-      adapter = await (factory as HarnessFactory)(init);
-    } catch (e) {
-      throw new Error(`${where}: factory failed: ${(e as Error).message}`);
-    }
-  }
-  const bad = badHarnessAdapter(adapter as unknown as Partial<Record<string, unknown>> | null);
-  if (bad) throw new Error(`${where}: ${descriptor ? 'create' : 'the factory'} did not return a HarnessAdapter (bad ${bad})`);
-  return adapter;
-}
-
-/** A module's export as a harness kind descriptor (`HarnessModule`: an object with a `create` function), if it is one. */
-function harnessDescriptor(v: unknown): Pick<HarnessModule, 'create'> & { schema?: unknown } | undefined {
-  return typeof v === 'object' && v !== null && typeof (v as { create?: unknown }).create === 'function' ? (v as Pick<HarnessModule, 'create'>) : undefined;
-}
-
-/**
- * The first member of a module's adapter that is not what `HarnessAdapter` says, described; none when
- * all are. A module is untyped code: what the host reads later (the static declarations, the
- * lifecycle calls) is checked once here, so a wrong shape fails the start (CF-4) instead of a
- * command or a stop.
- */
-function badHarnessAdapter(a: Partial<Record<string, unknown>> | null): string | undefined {
-  if (!a || typeof a.id !== 'string' || !a.id) return 'id (a non-empty string)';
-  const required = (['probe', 'open'] as const).find((k) => typeof a[k] !== 'function');
-  if (required) return required;
-  const method = (['detach', 'dispose', 'ownProcess'] as const).find((k) => a[k] !== undefined && typeof a[k] !== 'function');
-  if (method) return `${method} (a function when present)`;
-  const flag = (['adopts', 'ownerProfileSwitch', 'ephemeralOpen'] as const).find((k) => a[k] !== undefined && typeof a[k] !== 'boolean');
-  if (flag) return `${flag} (true or false when present)`;
-  const nonEmpty = (v: unknown) => typeof v === 'string' && v.length > 0;
-  const record = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null;
-  if (a.displayName !== undefined && !nonEmpty(a.displayName)) return 'displayName (a non-empty string when present)';
-  if (a.compact !== undefined && !(record(a.compact) && nonEmpty(a.compact.command))) return 'compact ({ command } with a non-empty string, when present)';
-  if (a.modes !== undefined && !(Array.isArray(a.modes) && a.modes.every((m) => m === 'plan'))) return "modes (an array of 'plan' when present)";
-  const env = a.sessionEnv;
-  if (env !== undefined && env !== 'open' && env !== 'own-process' && !(record(env) && nonEmpty(env.refused))) return "sessionEnv ('open', 'own-process' or { refused } with a non-empty string, when present)";
-  if (env === 'own-process' && typeof a.ownProcess !== 'function') return "sessionEnv ('own-process' needs ownProcess)";
-  return undefined;
 }
 
 /** `store` as `BlobAccess` and nothing more: no writes, and each method works detached from the object. */

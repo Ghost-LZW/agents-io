@@ -1,6 +1,6 @@
 {
   "packages/daemon/src/config.ts": {
-    "vendor": 30
+    "vendor": 6
   },
   "packages/daemon/src/console-config.ts": {
     "vendor": 1

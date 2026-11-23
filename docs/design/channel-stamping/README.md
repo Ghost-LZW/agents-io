@@ -251,7 +251,7 @@ allowed = (entry.evidence ?? 默认) ∩ caps.evidence ∪ {'none'}
 
 ## 12. 实现记录（2026-10-10）
 
-按决定 13 采纳 C + F4 + E3。代码：`packages/session/src/ingress.ts`（`EmitSource`、`SOURCE_MISMATCH`、`sourceMismatch`、`capEnvelope`）、`packages/daemon/src/gateway.ts`（`emitSource`、`stamped`、`channelOwner`、`idConflict`）、`packages/daemon/src/config.ts`（`evidence` 字段、`RESERVED_CHANNEL_IDS`、`UNGRANTED_EVIDENCE`、bridge `id` 的 F4 检查）、`channel/jsonl-bridge/src/host.ts`（`expectId`、`acceptId`、hello id 固定）、`packages/protocol`（`claimedEvidence`、`rejected`、`evidenceCapped`）、`packages/testkit`（`inbound.evidence_in_caps`）。测试名见 `docs/INVARIANTS.md` ID-3。
+按决定 13 采纳 C + F4 + E3。代码：`packages/session/src/ingress.ts`（`EmitSource`、`SOURCE_MISMATCH`、`sourceMismatch`、`capEnvelope`）、`packages/daemon/src/gateway.ts`（`emitSource`、`stamped`、`channelOwner`、`idConflict`）、`packages/daemon/src/config.ts`（`evidence` 字段、`RESERVED_CHANNEL_IDS`、`UNGRANTED_EVIDENCE`）、`channel/jsonl-bridge/src/module.ts`（bridge `id` 的 F4 检查，core-slimming G2 时从 `config.ts` 移来）、`channel/jsonl-bridge/src/host.ts`（`expectId`、`acceptId`、hello id 固定）、`packages/protocol`（`claimedEvidence`、`rejected`、`evidenceCapped`）、`packages/testkit`（`inbound.evidence_in_caps`）。测试名见 `docs/INVARIANTS.md` ID-3。
 
 ### 12.1 与提案的出入
 

@@ -1,6 +1,7 @@
 export * from './config.js';
 export * from './harness-registry.js';
-export { builtinHarnesses } from './bundle.js';
+export * from './channel-registry.js';
+export * from './bundle.js';
 export * from './gateway.js';
 export { Gateway as Daemon } from './gateway.js';
 export * from './client.js';

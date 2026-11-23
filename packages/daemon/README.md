@@ -81,7 +81,13 @@ see `docs/E2E.md` §0). New:
   specifier; the module exports a `ChannelFactory` (`@agents-io/protocol`) as
   `createChannel` (or `default`). It runs in the daemon's process with the blob
   store, so load only code you trust. Two channels with the same (id, account)
-  fail the start. See `docs/CHANNELS.md` §5.
+  fail the start. See `docs/CHANNELS.md` §5. The four are the channel types the
+  composition root registers (`src/bundle.ts`): each is a `ChannelModule`
+  (`@agents-io/protocol`, `channel-module.ts`) that owns its keys, how they resolve
+  (`env:` substitution, paths, Lark's `LARK_APP_*` fallback) and the rules across its
+  entries (several Lark bots, one bridge program per channel id). `lark-bot`, `mail`
+  and `bridge` are in their packages (`channel/*/src/module.ts`); `module` is the
+  daemon's own (`src/module-channel.ts`). The daemon's config code names no type.
 - **Harness instances** (`harnesses.<name>`, `use`: `claude-code`, `codex` or `module`;
   see `docs/E2E.md` §0). `claude-code` and `codex` are the harness kinds the daemon's
   composition root registers (`src/bundle.ts`): each is a `HarnessModule`
@@ -524,3 +530,14 @@ What changed for embedders with core-slimming G3:
   `env:` reference in its config is not set, so its factory never ran) refuses a launch with env
   (`launch_unsupported`, saying why it is unavailable); before, such a launch was accepted and
   pinned. A cwd alone is fine.
+
+What changed for embedders with core-slimming G2 (channel types, the config side):
+
+- Channel types come from a `ChannelRegistry` (exported, with `builtinChannels`: lark-bot, mail,
+  bridge, module, and `CORE_CHANNEL_IDS`). `resolveConfig` takes `channelRegistry` (default the
+  built-in one) and `configFileSchema(registry, channels?)` is the file schema over both
+  registries (`ConfigFile` is still the built-in ones'). The gateway still builds only the
+  built-in channel types, so `loadConfig` and `Gateway.start` take no channel registry yet.
+  `ChannelEntry` and `ResolvedChannel` keep their shape; `RESERVED_CHANNEL_IDS` is
+  `builtinChannels.reservedIds` (same value). `LarkChannelConfig` moved to
+  `@agents-io/channel-lark-bot` (still re-exported here, deprecated, one release).
