@@ -82,6 +82,32 @@ export interface HarnessAdapter {
    * the app-server). Undefined when it cannot, or no server is running yet.
    */
   nativeClient?(nativeId: string): NativeClient | undefined;
+  /**
+   * The host is stopping and this harness outlives it (e.g. Codex: its app-server keeps a
+   * turn running for the next host, or dies with the host but must not be told to stop it).
+   * End every session of this adapter without interrupting or unsubscribing anything and
+   * without emitting more events, keep what a later `open({ resume })` needs, and close the
+   * connections. With it the host detaches the sessions' lanes instead of closing them: a
+   * running turn stays open in the session log, for the next host to adopt (`adopts`) or to
+   * settle as ambiguous (`host_restarted`). Called once per adapter, bounded by the host's
+   * stop timeout. Without it the host closes each session (`HarnessSession.close`).
+   */
+  detach?(): Promise<void>;
+  /**
+   * Shut this adapter's own processes down now, failing whatever session still runs on
+   * them. The host calls it on an adapter it built for one launched session or task run
+   * alone when that ends, and at stop on an adapter without `detach`, after its sessions
+   * closed. Never on an adapter that `detach` was called on.
+   */
+  dispose?(): Promise<void>;
+  /**
+   * Static, answered without starting anything: after a host restart `open({ resume })` may
+   * adopt (`turn.adopted`) a turn the previous host left running, because the harness
+   * outlived it (Codex over a Unix socket). A restarted host reopens such sessions at start;
+   * others' leftover turns are settled ambiguous (`host_restarted`) without opening the
+   * harness. Only meaningful with `detach`.
+   */
+  readonly adopts?: boolean;
 }
 
 /** A command that starts a harness's terminal UI attached to a running session. */
@@ -131,6 +157,9 @@ export interface HarnessFactoryInit {
 /**
  * What a harness plugin module exports (as `createHarness`, or as default), for a
  * `{ "use": "module" }` harness entry. Runs in the daemon's process; a rejection or
- * a throw fails the daemon's start.
+ * a throw fails the daemon's start. The adapter it returns serves every session of the
+ * instance, task runs included, so the daemon never disposes it when one ends; it gets the
+ * same lifecycle calls as a built-in adapter: at stop `detach` when it has one, else its
+ * sessions are closed and then `dispose` is called; `adopts` is read at start.
  */
 export type HarnessFactory = (init: HarnessFactoryInit) => HarnessAdapter | Promise<HarnessAdapter>;

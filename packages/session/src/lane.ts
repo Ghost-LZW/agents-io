@@ -749,9 +749,9 @@ export class Lane {
 
   /**
    * Stop without touching the harness session (no interrupt, no close) and without
-   * recording anything when its stream ends. For harnesses that outlive the host
-   * (Codex over a Unix socket): call the adapter's own detach afterwards, and the
-   * running turn stays open in the log for the next host to adopt.
+   * recording anything when its stream ends. For adapters with `HarnessAdapter.detach`
+   * (Codex): call the adapter's own detach afterwards, and the running turn stays open
+   * in the log for the next host to adopt (`adopts`) or settle (`settleLeftover`).
    */
   detach(reason = 'detached'): void {
     this.detached = true;

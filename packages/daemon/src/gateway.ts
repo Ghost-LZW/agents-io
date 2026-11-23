@@ -978,6 +978,31 @@ export class Gateway {
   }
 
   /**
+   * Whether a session left mid-turn on this instance is reopened at start so that its harness
+   * adopts the turn (`HarnessAdapter.adopts`). Builds the adapter without starting anything.
+   */
+  private adopts(harnessId: string | undefined): boolean {
+    if (harnessId === undefined || (!this.o.harness && !this.o.config.harnesses[harnessId])) return false;
+    try {
+      return this.harness(harnessId).adopts === true;
+    } catch {
+      return false; // an instance that cannot be built (unavailable) adopts nothing
+    }
+  }
+
+  /** A module instance's adapter (its factory's, wrapped): every session of the instance shares it. */
+  private sharedAdapter(a: HarnessAdapter): boolean {
+    return a instanceof InstanceHarness && this.moduleAdapters.get(a.instance.name) === a.inner;
+  }
+
+  /** A harness lifecycle call (`detach` / `dispose`) when the adapter has it; a failure is logged, never thrown. */
+  private harnessCall(a: HarnessAdapter, call: 'detach' | 'dispose'): Promise<void> | undefined {
+    const f = a[call];
+    if (typeof f !== 'function') return undefined;
+    return (async () => f.call(a))().catch((e: unknown) => this.log('warn', `harness ${a.id}: ${call} failed: ${e instanceof Error ? e.message : String(e)}`));
+  }
+
+  /**
    * The lane of a session, created on first use with the session's agent (the
    * one recorded for it, else `agent`, else the agent whose prefix the key has,
    * else the default agent). Its harness session opens with the first turn.
@@ -1314,7 +1339,7 @@ export class Gateway {
       adapter,
       owns: () => owned.length > 0,
       dispose: async () => {
-        await Promise.all(owned.map((a) => within(codexOf(a)?.dispose(), 3000)));
+        await Promise.all(owned.map((a) => within(this.harnessCall(a, 'dispose'), 3000)));
       },
     };
   }
@@ -1418,8 +1443,10 @@ export class Gateway {
         env: { ...inst.env, ...env },
         ...(inst.kind === 'codex' ? { codex: { ...inst.codex, transport: { kind: 'stdio' as const } } } : {}),
       } as HarnessInstance;
-      own = this.build(runInst);
-      adapter = withAgent(own, r.agent, r.cwd);
+      const built = this.build(runInst);
+      // Disposed when the run ends, unless it is a module instance's adapter, which every session of the instance shares.
+      if (!this.sharedAdapter(built)) own = built;
+      adapter = withAgent(built, r.agent, r.cwd);
     }
     const spec = r.spec;
     let firstTurn = true;
@@ -1456,7 +1483,7 @@ export class Gateway {
         for (const x of comps) this.compositors.splice(this.compositors.indexOf(x), 1);
         this.lanes.delete(r.sessionKey);
         this.laneInfo.delete(r.sessionKey);
-        await within(codexOf(own)?.dispose(), 3000);
+        if (own) await within(this.harnessCall(own, 'dispose'), 3000);
       },
     };
   }
@@ -2003,7 +2030,8 @@ ${a.summary}` }],
     // The turn's own instance: a session's preset may have moved it off the agent's.
     const name = started.body.run?.harness ?? info.agent.harness;
     const adapter = this.launched.get(sessionKey)?.adapter(name) ?? this.agentHarness(info.agent, name);
-    if (!codexOf(adapter)) return;
+    // Titles come from an ephemeral Codex thread (topic-title.ts); a harness capability for it is G4.
+    if (!(innerAdapter(adapter) instanceof CodexHarness)) return;
     const eligible = new Set(events.filter((e) => e.body.t === 'turn.started' && e.body.inputIds.length > 0).map((e) => e.body.t === 'turn.started' ? e.body.turnId : ''));
     const completed = events.filter((e) => e.body.t === 'turn.completed' && e.body.status === 'completed' && eligible.has(e.body.turnId)).length;
     if (completed !== 1 && completed % 3 !== 1) return;
@@ -2488,23 +2516,23 @@ ${a.summary}` }],
   }
 
   /**
-   * Sessions the log shows mid-turn were left by a previous process. A Codex
-   * app-server on a Unix socket may still be running that turn: open the session
-   * now so the harness adopts it (turn.adopted; if it does not, the lane settles it).
-   * Any other harness died with the previous process (Codex over stdio, Claude Code
-   * killed mid-turn): the turn is settled now (ambiguous, host_restarted; RS-4, RS-5)
-   * through its lane, so the compositor takes over the old card and finalizes it,
-   * without opening a harness session and without waiting for a new input.
+   * Sessions the log shows mid-turn were left by a previous process. A harness that
+   * outlives the daemon (`HarnessAdapter.adopts`: Codex on a Unix socket) may still be
+   * running that turn: open the session now so the harness adopts it (turn.adopted; if
+   * it does not, the lane settles it). Any other harness died with the previous process
+   * (Codex over stdio, Claude Code killed mid-turn): the turn is settled now (ambiguous,
+   * host_restarted; RS-4, RS-5) through its lane, so the compositor takes over the old
+   * card and finalizes it, without opening a harness session and without waiting for a
+   * new input.
    */
   private async adoptRunningTurns(): Promise<void> {
     for (const key of this.hub.log.sessions()) {
       if (key.startsWith('run:')) continue; // runs are settled at start (Runs.settleAllDangling)
       const snap = this.hub.snapshot(key);
       if (!snap.turn) continue;
-      const inst = this.instanceOf(snap.harness);
-      const adoptable = inst?.kind === 'codex' && inst.codex.transport.kind === 'unix';
+      const reopen = this.adopts(snap.harness);
       try {
-        if (adoptable) {
+        if (reopen) {
           await this.lane(key).open();
           this.log('info', `${key}: reopened to adopt turn ${snap.turn.turnId}`);
         } else {
@@ -2512,7 +2540,7 @@ ${a.summary}` }],
           this.log('warn', `${key}: turn ${snap.turn.turnId} was running when the previous daemon stopped and its harness cannot resume it; settled ambiguous (host_restarted)`);
         }
       } catch (e) {
-        this.log('warn', `${key}: could not ${adoptable ? 'reopen' : 'settle the turn it left'}: ${(e as Error).message}`);
+        this.log('warn', `${key}: could not ${reopen ? 'reopen' : 'settle the turn it left'}: ${(e as Error).message}`);
       }
     }
   }
@@ -2889,9 +2917,11 @@ ${a.summary}` }],
   }
 
   /**
-   * Shut down. Codex is detached, not closed: over a Unix socket its turns keep
-   * running and the next gateway adopts them. Other harnesses are closed (their
-   * running turn is interrupted and recorded).
+   * Shut down. Lanes on an adapter that declares `detach` (Codex) are detached, not
+   * closed, and the adapter detaches itself: its running turns stay open, for the next
+   * gateway to adopt (`adopts`: Codex over a Unix socket) or settle. Other lanes are
+   * closed (their running turn is interrupted and recorded), then their adapter is
+   * disposed.
    */
   /** Set by stop(): no new inbound while the last sends go out. */
   private refusingInbound = false;
@@ -2923,22 +2953,27 @@ ${a.summary}` }],
     this.refusingInbound = true;
     // A launched session's own app-server (stdio) ends with it: its lane is closed, not detached.
     const own = new Set([...this.launched].filter(([, x]) => x.owns()).map(([k]) => k));
-    const codex = (l: Lane) => !own.has(l.sessionKey) && codexOf(this.o.harness ?? this.instances.get(l.harnessId));
-    const detached = [...this.lanes.values()].filter(codex);
-    const closed = [...this.lanes.values()].filter((l) => !codex(l));
+    const detaches = (a: HarnessAdapter | undefined) => typeof a?.detach === 'function';
+    const detaching = (l: Lane) => !own.has(l.sessionKey) && detaches(this.o.harness ?? this.instances.get(l.harnessId));
+    const detached = [...this.lanes.values()].filter(detaching);
+    const closed = [...this.lanes.values()].filter((l) => !detaching(l));
     for (const l of detached) l.detach('gateway stopping');
     const adapters = this.o.harness ? [this.o.harness] : [...this.instances.values()];
     // Bounded by a timer that holds the event loop: harness close() may wait on unref'd timers only.
     await within(
       Promise.all([
-        ...adapters.map((a) => codexOf(a)?.detach()),
+        ...adapters.map((a) => this.harnessCall(a, 'detach')),
         ...closed.map((l) => l.close('gateway stopping').catch(() => undefined)),
       ]),
       8000,
     );
     // Let the last events (interrupted turn, consumed inputs) reach the log before it closes.
     await within(Promise.all(closed.map((l) => l.whenIdle())), 3000);
-    await within(Promise.all([...this.launched.values()].map((x) => x.dispose())), 3000);
+    // Then the processes of launched sessions, and of adapters that do not detach, end.
+    await within(
+      Promise.all([...[...this.launched.values()].map((x) => x.dispose()), ...adapters.filter((a) => !detaches(a)).map((a) => this.harnessCall(a, 'dispose'))]),
+      3000,
+    );
     await within(Promise.all(this.compositors.map((c) => c.stop())), 5000);
     // Sends still running settle while their channel and the records are open; no more retries.
     await this.outbox.drain(5000);
@@ -3065,10 +3100,9 @@ class LaunchEnvHarness implements HarnessAdapter {
   }
 }
 
-/** The Codex adapter behind an instance adapter, if it is one (Codex is detached at shutdown, not closed). */
-function codexOf(a: HarnessAdapter | undefined): CodexHarness | undefined {
-  if (a instanceof InstanceHarness || a instanceof LaunchEnvHarness) return codexOf(a.inner);
-  return a instanceof CodexHarness ? a : undefined;
+/** The kind's adapter under the gateway's wrappers (an instance's, a launched session's env). */
+function innerAdapter(a: HarnessAdapter): HarnessAdapter {
+  return a instanceof InstanceHarness || a instanceof LaunchEnvHarness ? innerAdapter(a.inner) : a;
 }
 
 /**
@@ -3078,6 +3112,9 @@ function codexOf(a: HarnessAdapter | undefined): CodexHarness | undefined {
  */
 export class InstanceHarness implements HarnessAdapter {
   readonly id: string;
+  /** The kind's lifecycle calls, present only when its adapter has them (the gateway reads their presence). */
+  readonly detach?: () => Promise<void>;
+  readonly dispose?: () => Promise<void>;
   constructor(
     readonly instance: HarnessInstance,
     readonly inner: HarnessAdapter,
@@ -3085,6 +3122,12 @@ export class InstanceHarness implements HarnessAdapter {
     readonly env?: Record<string, string>,
   ) {
     this.id = instance.name;
+    if (typeof inner.detach === 'function') this.detach = () => inner.detach!();
+    if (typeof inner.dispose === 'function') this.dispose = () => inner.dispose!();
+  }
+
+  get adopts(): boolean {
+    return this.inner.adopts === true;
   }
 
   probe(): Promise<{ version: string; caps: HarnessCaps }> {

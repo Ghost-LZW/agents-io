@@ -82,6 +82,17 @@ see `docs/E2E.md` §0). New:
   `createChannel` (or `default`). It runs in the daemon's process with the blob
   store, so load only code you trust. Two channels with the same (id, account)
   fail the start. See `docs/CHANNELS.md` §5.
+- **Harness instances** (`harnesses.<name>`, `use`: `claude-code`, `codex` or `module`;
+  see `docs/E2E.md` §0). A `module` entry's module exports a `HarnessFactory`
+  (`@agents-io/protocol`); the adapter it returns serves every session of the instance.
+  Stop and restart follow what the adapter declares, built-in or module alike
+  (`HarnessAdapter` in `packages/protocol/src/harness.ts`): with `detach()` its lanes are
+  detached at stop (a running turn stays open in the log) and `detach()` is called once;
+  without it its sessions are closed and then `dispose()` is called, when it has one.
+  With `adopts: true` (static) a restarted daemon reopens the sessions left mid-turn so
+  the harness can adopt the turn; otherwise such a turn is settled ambiguous
+  (`host_restarted`) at start without opening the harness. Codex declares `detach` on
+  both transports and `adopts` on a Unix socket only; Claude Code declares none.
 - **Live (realtime voice, decision 11)**: a Codex instance with `"live": true` opts
   its app-server connection into Codex's experimental realtime API. Agents on it
   (with `tools`) get `live_join { target, channel?, instructions?, voice? }`,

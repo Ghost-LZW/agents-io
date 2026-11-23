@@ -385,12 +385,18 @@ class AppServer implements SessionHost {
  */
 export class CodexHarness implements HarnessAdapter {
   readonly id = 'codex';
+  /**
+   * A restarted host's `open({ resume })` adopts a turn still running: only a Unix socket's
+   * app-server outlives the host (over stdio it dies with it, so the host settles the turn).
+   */
+  readonly adopts: boolean;
   private server: Promise<AppServer> | undefined;
   private opening = 0;
   private readonly connector: Connector;
 
   constructor(private readonly opts: CodexHarnessOptions = {}) {
     this.connector = makeConnector(opts);
+    this.adopts = typeof opts.transport === 'object' && opts.transport.kind === 'unix';
   }
 
   /**
@@ -435,9 +441,10 @@ export class CodexHarness implements HarnessAdapter {
   }
 
   /**
-   * Host shutdown that must not disturb Codex: sessions end without interrupting
-   * or unsubscribing, running turns stay snapshotted, the connection closes. Over
-   * a Unix socket the app-server keeps running; over stdio it dies with us.
+   * Host shutdown that must not disturb Codex (`HarnessAdapter.detach`, both transports):
+   * sessions end without interrupting or unsubscribing, running turns stay snapshotted,
+   * the connection closes. Over a Unix socket the app-server keeps running (`adopts`);
+   * over stdio it dies with us, and the next host settles the turn it left.
    */
   async detach(): Promise<void> {
     const p = this.server;
@@ -449,7 +456,7 @@ export class CodexHarness implements HarnessAdapter {
     s.close();
   }
 
-  /** Closes the connection (and the stdio child) now, failing every session on it. */
+  /** Closes the connection (and the stdio child) now, failing every session on it (`HarnessAdapter.dispose`). */
   async dispose(): Promise<void> {
     const p = this.server;
     this.server = undefined;
