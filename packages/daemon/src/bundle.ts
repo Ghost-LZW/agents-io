@@ -7,5 +7,10 @@ import { HarnessRegistry } from './harness-registry.js';
  * only here does the daemon import a module package (`scripts/boundaries.json` `bundle`).
  */
 
-/** The built-in harness kinds; Claude Code first, the default kind. */
-export const builtinHarnesses = new HarnessRegistry([claudeCodeHarnessModule, codexHarnessModule]);
+/**
+ * The built-in harness kinds; Claude Code first, the default kind. `launchAliases` (deprecated, one
+ * release): the `HarnessInstance` fields their launch settings were under before `launch`.
+ */
+export const builtinHarnesses = new HarnessRegistry([claudeCodeHarnessModule, codexHarnessModule], {
+  launchAliases: { [claudeCodeHarnessModule.kind]: 'claude', [codexHarnessModule.kind]: 'codex' },
+});

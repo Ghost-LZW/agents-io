@@ -503,7 +503,12 @@ What changed for embedders with core-slimming G3:
   (`ConfigFile` is the built-in one's). A `HarnessInstance` is `{ kind: string, launch }`: the
   kind's settings moved from `claude` / `codex` / `module` to `launch` (same values; their types
   are `ClaudeLaunch` from `@agents-io/harness-claude-code`, `CodexLaunch` from
-  `@agents-io/harness-codex`, `ModuleLaunch` here). `codexStateDir` moved to
+  `@agents-io/harness-codex`, `ModuleLaunch` here). Deprecated, kept for one release: an
+  instance `resolveConfig` / `loadConfig` returns still has the old field (`claude`, `codex`,
+  `module`; `HarnessRegistryOptions.launchAliases`, which `builtinHarnesses` sets) as an accessor
+  of `launch`: reading it reads `launch`, writing it (e.g. `inst.claude = { ...inst.claude, claudePath }`
+  before `buildHarness`) writes `launch`. It is not enumerable, so a spread or JSON copy has only
+  `launch`. Move to `launch`. `codexStateDir` moved to
   `@agents-io/harness-codex`; `HarnessKind` is a `string`. `buildHarness(instance, blobs?, { registry, log, harness })`
   builds through the kind's `create`. `InstanceHarness` puts the instance's `profiles` into the
   open options of a `module` instance and of a kind that declares `profilesInOpen` (Claude Code),

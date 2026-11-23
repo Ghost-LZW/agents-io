@@ -597,6 +597,11 @@ export type HarnessInstance = InstanceBase & {
   /**
    * The kind's launch settings, as its module resolved the entry (`HarnessModule.resolve`, e.g.
    * `ClaudeLaunch` / `CodexLaunch` of the harness packages); for `module`, a `ModuleLaunch`.
+   *
+   * Deprecated, kept for one release: an instance `resolveConfig` returns also has it under the
+   * field it had before (`module`; a registered kind's `HarnessRegistry.launchAlias`, the built-in
+   * ones `claude` / `codex`), an accessor of `launch` for reading and writing, not enumerable (a
+   * spread or JSON copy has only `launch`).
    */
   launch: unknown;
 };
@@ -1244,7 +1249,27 @@ function resolveHarnesses(c: ConfigFile, ctx: ResolveContext, path: (p: string) 
     const broken = m.checkAll?.(Object.values(out).filter((i) => i.kind === m.kind).map((i) => ({ name: i.name, launch: i.launch })));
     if (broken) fail(broken);
   }
+  for (const i of Object.values(out)) launchAlias(i, i.kind === 'module' ? 'module' : registry.launchAlias(i.kind));
   return { harnesses: out, defaultHarness: def };
+}
+
+/**
+ * Deprecated, for one release: `i[field]` reads and writes `i.launch` (hosts written before `launch`
+ * read `claude` / `codex` / `module`, and set one before `buildHarness`). Not enumerable, so copies
+ * and JSON show `launch` only.
+ */
+function launchAlias(i: HarnessInstance, field: string | undefined): void {
+  if (!field) return;
+  Object.defineProperty(i, field, {
+    get(this: HarnessInstance) {
+      return this.launch;
+    },
+    set(this: HarnessInstance, v: unknown) {
+      this.launch = v;
+    },
+    enumerable: false,
+    configurable: true,
+  });
 }
 
 /** An instance's name, RunSpec defaults (the kind's default model), profiles and options. */

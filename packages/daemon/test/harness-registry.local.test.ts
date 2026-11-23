@@ -6,9 +6,9 @@ import { describe, expect, it } from 'vitest';
 import type { HarnessModule, HarnessModuleInit } from '@agents-io/protocol';
 import { FakeChannel, FakeHarness } from '@agents-io/testkit';
 import { LocalClient } from '../src/client.js';
-import { ConfigError, configFileSchema, ConfigFile, resolveConfig } from '../src/config.js';
+import { ConfigError, configFileSchema, ConfigFile, resolveConfig, type HarnessInstance } from '../src/config.js';
 import { builtinHarnesses } from '../src/bundle.js';
-import { Gateway } from '../src/gateway.js';
+import { buildHarness, Gateway } from '../src/gateway.js';
 import { HarnessRegistry } from '../src/harness-registry.js';
 import { cleanups, tmp, until } from './helpers.js';
 
@@ -117,5 +117,38 @@ describe('harness registry', () => {
       return until(() => chat.sent.slice(before).map((x) => x.edits.at(-1)?.text ?? x.msg.text).find((t) => t !== undefined));
     };
     expect(await say('/bypass')).toBe('/bypass is not available on any harness configured here (this session runs echo).');
+  });
+
+  it('deprecated, for one release: a resolved instance keeps its launch under the old field (`claude`, `codex`, `module`), read and written through to `launch`, not enumerable', () => {
+    type Aliased = HarnessInstance & Record<string, unknown>;
+    expect([builtinHarnesses.launchAlias('claude-code'), builtinHarnesses.launchAlias('codex')]).toEqual(['claude', 'codex']);
+    const c = resolveConfig(
+      { harnesses: { cc: { use: 'claude-code', executable: '/opt/claude' }, cx: { use: 'codex' }, m: { use: 'module', module: './fixtures/harness-caps.mjs' } } },
+      { env: {}, baseDir: here, cwd: '/work' },
+    );
+    const cc = c.harnesses.cc as Aliased;
+    expect(cc.claude).toBe(cc.launch);
+    expect((c.harnesses.cx as Aliased).codex).toBe(c.harnesses.cx!.launch);
+    expect((c.harnesses.m as Aliased).module).toBe(c.harnesses.m!.launch);
+    expect(Object.keys(cc)).not.toContain('claude');
+    expect(JSON.parse(JSON.stringify(cc))).not.toHaveProperty('claude');
+    expect({ ...cc }).not.toHaveProperty('claude');
+    cc.claude = { ...(cc.claude as object), claudePath: '/x/claude' };
+    expect(cc.launch).toEqual({ claudePath: '/x/claude' });
+    // The older block's instances and one --harness made for its kind have it too.
+    const legacy = resolveConfig({ harness: { 'claude-code': { claudePath: '/opt/c' } } }, { env: {}, baseDir: '/base', cwd: '/work', harness: 'codex' });
+    expect((legacy.harnesses['claude-code'] as Aliased).claude).toEqual({ claudePath: '/opt/c' });
+    expect((legacy.harnesses.codex as Aliased).codex).toBe(legacy.harnesses.codex!.launch);
+    // A write through the alias is what buildHarness builds with.
+    const aliased = new HarnessRegistry([echo], { launchAliases: { echo: 'say' } });
+    const e = resolveConfig({ harnesses: { e: { use: 'echo', greeting: 'hi' } } }, { env: {}, baseDir: '/base', cwd: '/work', harnessRegistry: aliased }).harnesses.e as Aliased;
+    expect(e.say).toEqual({ greeting: 'hi' });
+    e.say = { greeting: 'set' };
+    buildHarness(e, undefined, { registry: aliased });
+    expect(created.at(-1)!.launch).toEqual({ greeting: 'set' });
+    // A kind's alias is never another field, nor for an unregistered kind; other registries have none.
+    expect(registry.launchAlias('echo')).toBeUndefined();
+    expect(() => new HarnessRegistry([echo], { launchAliases: { other: 'x' } })).toThrow('launchAliases: harness kind "other" is not registered');
+    expect(() => new HarnessRegistry([echo], { launchAliases: { echo: 'env' } })).toThrow('launchAliases: "env" is a HarnessInstance field');
   });
 });

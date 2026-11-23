@@ -583,7 +583,7 @@
 ### FC-4 launch 不在允许范围就拒绝
 
 - **承诺**：agent 没有 `sessionParams` 时任何 launch 都是 `launch_not_allowed`；`cwd` / env 超出 `cwdRoots` / `envKeys` / `envPathRoots` 拒绝；`CLAUDE_CONFIG_DIR` / `CODEX_HOME` 列入 `envKeys` 必须配 `envPathRoots`（决定 7）。
-- **实现**：`packages/daemon/src/launch.ts:37`；`packages/daemon/src/config.ts:1112-1129`（`resolveSessionParams`；`:1125` 配置目录变量取自注册的各 harness 种类，`HarnessRegistry.configDirKeys`）；`harness/claude-code/src/module.ts`、`harness/codex/src/module.ts` 的 `defaults.configDirEnv`（`CLAUDE_CONFIG_DIR`、`CODEX_HOME`）。
+- **实现**：`packages/daemon/src/launch.ts:37`；`packages/daemon/src/config.ts:1117-1134`（`resolveSessionParams`；`:1130` 配置目录变量取自注册的各 harness 种类，`HarnessRegistry.configDirKeys`）；`harness/claude-code/src/module.ts`、`harness/codex/src/module.ts` 的 `defaults.configDirEnv`（`CLAUDE_CONFIG_DIR`、`CODEX_HOME`）。
 - **测试**：`session-launch.test.ts` "a callout launch for an agent without sessionParams goes to onFailure; session.prepare says launch_not_allowed #FC-4"；`packages/daemon/test/config.test.ts` "CLAUDE_CONFIG_DIR / CODEX_HOME in envKeys need envPathRoots #FC-4"。
 - **状态**：有测试。
 
@@ -700,7 +700,7 @@
 
 ### RS-9 持久化以 SQLite 日志为前提
 
-- **现状**：宿主队列、`DaemonRecords`（outbox、launch、input.verify）、路由表都和日志共用一个 SQLite 库（`gateway.ts` 构造函数）。嵌入方传入非 SQLite 的日志或 `logPath: ':memory:'` 时，它们全部在内存里。`aio serve` 默认 `dataDir/log.sqlite`（`config.ts:979`），不受影响。
+- **现状**：宿主队列、`DaemonRecords`（outbox、launch、input.verify）、路由表都和日志共用一个 SQLite 库（`gateway.ts` 构造函数）。嵌入方传入非 SQLite 的日志或 `logPath: ':memory:'` 时，它们全部在内存里。`aio serve` 默认 `dataDir/log.sqlite`（`config.ts:984`），不受影响。
 - **承诺**：这种情况下 `Gateway.start` 记一条 warn（"session log is not persistent …"），说明哪些东西只在内存里。
 - **实现**：`gateway.ts` 构造函数（`log instanceof SqliteSessionLog`，或没传日志而 `logPath` 是 `:memory:`）。
 - **测试**：`packages/daemon/test/gateway.test.ts` "Gateway.start with a MemorySessionLog logs a "not persistent" warning"（原 `it.fails`，已修）。
@@ -735,7 +735,7 @@
 ### CF-4 模块 harness 配置错误使启动失败
 
 - **承诺**：`use: 'module'` 的模块不存在、有未知键是配置错误；导出既不是函数也不是描述符（有 `create` 函数的对象，`HarnessModule`）、工厂或描述符的 `create` 抛错、描述符的 `schema` 不接受条目的 `config`、返回的不是 adapter 都使启动失败，错误里有实例名（决定 11 补记；描述符是 2026-11-23 G3 工厂注册时加的）。返回的 adapter 有类型不对的静态声明或生命周期成员（`displayName` 不是非空字符串，`compact` 没有非空的 `command`，`modes` 不是只含 `'plan'` 的数组，`ownerProfileSwitch` / `ephemeralOpen` / `adopts` 不是布尔值，`sessionEnv` 不是 `'open'`、`'own-process'` 或带非空 `refused` 的对象，`'own-process'` 却没有 `ownProcess`，`detach` / `dispose` / `ownProcess` 不是函数）也算不是 adapter，错误里还有成员名；不写的成员不检查（2026-11-23，G3 的后续：原先这些值留到聊天命令、launch 或停止时才出错，`sessionEnv` 是 `null` 或别的字符串时还被静默当成 `'open'`）。
-- **实现**：`config.ts:97-108`（`ModuleInstance`：未知键）、`:1304-1311`（`resolveInstance` 的 module 分支：`resolveChannelModule`，模块不存在）；`gateway.ts:982-1002`（`loadHarnessModules`：工厂的失败转为 `ConfigError`，`Gateway.start` 因此失败）、`:3328-3381`（`loadHarnessModule`：导入；描述符先按它的 `schema` 查 `config`（封闭）再调 `create`，否则调工厂；检查返回的 adapter）、`:3383-3386`（`harnessDescriptor`）、`:3388-3411`（`badHarnessAdapter`：逐个成员检查类型，答第一个不对的）。
+- **实现**：`config.ts:97-108`（`ModuleInstance`：未知键）、`:1329-1336`（`resolveInstance` 的 module 分支：`resolveChannelModule`，模块不存在）；`gateway.ts:982-1002`（`loadHarnessModules`：工厂的失败转为 `ConfigError`，`Gateway.start` 因此失败）、`:3328-3381`（`loadHarnessModule`：导入；描述符先按它的 `schema` 查 `config`（封闭）再调 `create`，否则调工厂；检查返回的 adapter）、`:3383-3386`（`harnessDescriptor`）、`:3388-3411`（`badHarnessAdapter`：逐个成员检查类型，答第一个不对的）。
 - **测试**：`packages/daemon/test/module-channel.test.ts` "a missing module, a non-function export, a throwing factory and a value that is not an adapter each fail the start, naming the instance #CF-4"（模块不存在在解析配置时失败，其余三种让 `Gateway.start` 失败）、"an adapter whose static declarations or lifecycle members are of the wrong type fails the start, naming the instance and the member; right ones start #CF-4"、"a module may export a HarnessModule descriptor: its schema checks the config (a bad one fails the start, naming the instance); create gets the init with launch, env and profiles #CF-4"。
 - **状态**：有测试（决定 14 补上）。
 
