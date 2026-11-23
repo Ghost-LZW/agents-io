@@ -130,7 +130,14 @@ see `docs/E2E.md` §0). New:
   only on Codex"; else the instance name). Without them those commands answer that they are
   unavailable; when no configured instance declares `modes` / `ownerProfileSwitch`, the reply
   names the registered kinds that do (`HarnessModule.declares`), so a deployment with only Claude
-  Code configured still hears "/plan is available only on Codex". `ephemeralOpen: true` (Codex): the
+  Code configured still hears "/plan is available only on Codex". An instance that is unavailable
+  for now (an `env:` reference is not set) answers with what its adapter will declare once it is
+  available (built from the config only to read them), as before. Deprecated, kept for one
+  release: an adapter the embedder passes (`GatewayOptions.harness`, or one `buildHarness`
+  returns) that declares none of these four gets its instance kind's (`HarnessModule.declares`;
+  see "What changed for embedders with core-slimming G3"). `adopts` of an instance unavailable for
+  now is read the same way: its session left mid-turn is reopened, which fails, so the turn stays
+  open in the log for a later start to adopt. `ephemeralOpen: true` (Codex): the
   daemon runs a module's ephemeral turns on it (`KernelLaneHarness.ephemeralTurn`, "Feature
   modules" below; the topic titles module `topic-title` is one); the open options it sends are
   Codex's shape.
@@ -830,6 +837,16 @@ What changed for embedders with core-slimming G3:
   `env:` reference in its config is not set, so its factory never ran) refuses a launch with env
   (`launch_unsupported`, saying why it is unavailable); before, such a launch was accepted and
   pinned. A cwd alone is fine.
+- `/compact`, `/plan`, `/bypass`, the Plan line of `/status` and `session.compact` follow what the
+  session's adapter declares (`HarnessAdapter.compact`, `modes`, `ownerProfileSwitch`,
+  `displayName`), no longer the instance's kind. Deprecated, kept for one release: an adapter you
+  pass (`GatewayOptions.harness`, or one `buildHarness` returns, wrapped in `InstanceHarness` or
+  not) that declares none of the four still gets its instance kind's (`HarnessModule.declares`:
+  `/compact` on a claude-code instance, Plan mode and the owner's profile switch on a codex one),
+  so a test fake standing in for Claude Code still compacts. Make your adapter declare what it
+  stands in for (e.g. `compact = { command: '/compact' }` for Claude Code; `modes = ['plan']` and
+  `ownerProfileSwitch = true` for Codex): once it declares any of the four, only its own
+  declarations count, and the fallback goes away in the next release.
 
 What changed for embedders with core-slimming G2 (channel types):
 

@@ -347,6 +347,8 @@ export class Gateway {
   private readonly instances = new Map<string, HarnessAdapter>();
   /** What the factories of `use: "module"` instances returned, by instance name (loaded at start). */
   private readonly moduleAdapters = new Map<string, HarnessAdapter>();
+  /** What the embedder's `GatewayOptions.buildHarness` returned (`runDeclarations`). */
+  private readonly embedderBuilt = new WeakSet<HarnessAdapter>();
   /** Adapters of configured agents (their cwd and instructions over the instance's). */
   private readonly agentAdapters = new Map<string, HarnessAdapter>();
   private readonly lanes = new Map<string, Lane>();
@@ -1074,7 +1076,10 @@ export class Gateway {
   /** An instance's adapter, built now: a registered kind's by its module, a module instance wraps what its factory returned at start. */
   private build(inst: HarnessInstance): HarnessAdapter {
     const own = this.o.buildHarness?.(inst);
-    if (own) return own;
+    if (own) {
+      this.embedderBuilt.add(own);
+      return own;
+    }
     if (inst.kind === EMBEDDED_HARNESS && !this.harnessRegistry.get(inst.kind)) throw new ConfigError(`harness instance ${inst.name} stands for the embedder's adapter (no harness kind is registered): pass it to Gateway.start (GatewayOptions.harness or buildHarness)`);
     if (inst.kind !== 'module') return buildHarness(inst, this.harnessBlobs, { registry: this.harnessRegistry, log: this.instanceLog(inst.name), harness: (name) => this.otherInstance(name) });
     const a = this.moduleAdapters.get(inst.name);
@@ -1140,9 +1145,33 @@ export class Gateway {
     }
   }
 
-  /** Whether a session left mid-turn on this instance is reopened at start so that its harness adopts the turn (`HarnessAdapter.adopts`). */
+  /**
+   * Whether a session left mid-turn on this instance is reopened at start so that its harness adopts
+   * the turn (`HarnessAdapter.adopts`), also while it is unavailable for now (`declaredUnavailable`):
+   * the reopen then fails and the turn stays open in the log, for a later start to adopt (RS-2).
+   */
   private adopts(harnessId: string | undefined): boolean {
-    return this.declared(harnessId)?.adopts === true;
+    const a = this.declared(harnessId) ?? (harnessId === undefined ? undefined : this.declaredUnavailable(harnessId));
+    return a?.adopts === true;
+  }
+
+  /**
+   * What an instance declares for the run-config commands, `/status` and `session.compact`
+   * (`displayName`, `compact`, `modes`, `ownerProfileSwitch`): its adapter's, also while it is
+   * unavailable for now (`declaredUnavailable`). An adapter the embedder passed
+   * (`GatewayOptions.harness`, or one `buildHarness` returned) that declares none of the four gets
+   * its instance kind's (`HarnessModule.declares`), as these were decided by the instance's kind
+   * before core-slimming G3: deprecated, kept for one release (packages/daemon/README.md).
+   */
+  private runDeclarations(name: string): RunDeclarations | undefined {
+    const a = this.declared(name) ?? this.declaredUnavailable(name);
+    if (a === undefined) return undefined;
+    const embedder = a === this.o.harness || this.embedderBuilt.has(a);
+    // What the embedder's own object declares (the gateway's wrappers read through, `ownerProfileSwitch` as a boolean).
+    const own = innerAdapter(a);
+    if (!embedder || RUN_DECLARATIONS.some((k) => own[k] !== undefined)) return a;
+    const kind = this.o.config.harnesses[name]?.kind;
+    return (kind === undefined ? undefined : this.harnessRegistry.get(kind)?.declares) ?? a;
   }
 
   /**
@@ -3112,8 +3141,8 @@ ${a.summary}` }],
   /**
    * What a session's next turn runs (`KernelContext.runConfig.get`; `/status`, `session.compact`,
    * `tui.attach`): the agent's instance, or the one of the preset set for the session, what its
-   * adapter declares (`HarnessAdapter.compact` / `modes` / `ownerProfileSwitch`, never its kind),
-   * and the run with what is set for the session over the agent's. `preset` is the one set here,
+   * adapter declares (`HarnessAdapter.compact` / `modes` / `ownerProfileSwitch`: `runDeclarations`,
+   * also while it is unavailable for now), and the run with what is set for the session over the agent's. `preset` is the one set here,
    * else the agent's; `stalePreset` one set here that is no longer configured.
    */
   private sessionRun(key: string): KernelSessionRun {
@@ -3126,7 +3155,7 @@ ${a.summary}` }],
     const model = o.model ?? base.model;
     const effort = o.effort ?? base.effort;
     const preset = set?.preset.name ?? agent.preset;
-    const a = this.declared(inst.name);
+    const a = this.runDeclarations(inst.name);
     return {
       harness: inst.name,
       kind: inst.kind,
@@ -3167,9 +3196,9 @@ ${a.summary}` }],
 
   /** The configured harnesses that declare Plan mode, or the owner's profile switch, by display name (each once); with none, the registered kinds that do. */
   private offering(cap: 'plan' | 'ownerProfileSwitch'): string[] {
-    const has = (d: HarnessDeclarations | undefined) => d !== undefined && (cap === 'plan' ? d.modes?.includes('plan') === true : d.ownerProfileSwitch === true);
+    const has = (d: RunDeclarations | undefined) => d !== undefined && (cap === 'plan' ? d.modes?.includes('plan') === true : d.ownerProfileSwitch === true);
     const configured = Object.keys(this.o.config.harnesses).map((name) => {
-      const a = this.declared(name);
+      const a = this.runDeclarations(name);
       return has(a) ? (a!.displayName ?? name) : undefined;
     });
     const names = configured.filter((n) => n !== undefined);
@@ -3500,6 +3529,10 @@ function sessionEnvRefused(name: string, how: SessionEnvSupport | undefined): st
 
 /** An adapter whose terminal UI takes sessions over (`attach: 'takeover'`), with its `takeover`. */
 type TakingOver = HarnessAdapter & Required<Pick<HarnessAdapter, 'takeover'>>;
+
+/** The static declarations the run-config commands, `/status` and `session.compact` read (`Gateway.runDeclarations`). */
+const RUN_DECLARATIONS = ['displayName', 'compact', 'modes', 'ownerProfileSwitch'] as const;
+type RunDeclarations = Pick<HarnessDeclarations, (typeof RUN_DECLARATIONS)[number]>;
 
 /** A gateway wrapper over the kind's adapter (`inner`): what that adapter declares statically reads through. */
 abstract class WrappedHarness {

@@ -21,12 +21,17 @@ function privDir(): string {
   return d;
 }
 
-/** A daemon on `dir`'s log whose one harness instance `cx` is `entry`; `harness` replaces every instance's adapter. */
-async function start(dir: string, entry: Record<string, unknown>, harness?: HarnessAdapter) {
-  const raw = { dataDir: dir, policy: { owners: ['fake:alice'] }, local: { principal: 'me' }, cwd: dir, harnesses: { cx: entry }, defaultHarness: 'cx' };
-  const config = { ...resolveConfig(raw, { env: {}, baseDir: dir, cwd: dir }), socketPath: join(dir, 'run', 'aio.sock') };
+/**
+ * A daemon on `dir`'s log whose one harness instance `cx` is `entry`; `harness` replaces every
+ * instance's adapter. `o.env`: the environment the config is resolved in; `o.raw`: more of the config.
+ */
+async function start(dir: string, entry: Record<string, unknown>, harness?: HarnessAdapter, o: { env?: Record<string, string>; raw?: Record<string, unknown> } = {}) {
+  const raw = { dataDir: dir, policy: { owners: ['fake:alice'] }, local: { principal: 'me' }, cwd: dir, harnesses: { cx: entry }, defaultHarness: 'cx', ...o.raw };
+  const env = o.env ?? {};
+  const config = { ...resolveConfig(raw, { env, baseDir: dir, cwd: dir }), socketPath: join(dir, 'run', 'aio.sock') };
   const chat = new FakeChannel('fake');
-  const gw = await Gateway.start({ config, ...(harness ? { harness } : {}), channels: [{ adapter: chat }], logger: () => {} });
+  const logs: string[] = [];
+  const gw = await Gateway.start({ config, ...(harness ? { harness } : {}), channels: [{ adapter: chat }], logger: (_level, msg) => logs.push(msg) });
   let stopped = false;
   const stop = async () => {
     if (stopped) return;
@@ -34,7 +39,7 @@ async function start(dir: string, entry: Record<string, unknown>, harness?: Harn
     await gw.stop();
   };
   cleanups.push(stop);
-  return { gw, chat, stop };
+  return { gw, chat, stop, logs };
 }
 
 describe('a daemon restart with a turn running (INVARIANTS RS-2, RS-4, RS-5)', () => {
@@ -77,6 +82,47 @@ describe('a daemon restart with a turn running (INVARIANTS RS-2, RS-4, RS-5)', (
     fake.completeTurn('thr-1', codexTurn, 'completed');
     await until(() => !b.gw.hub.snapshot(key).turn);
     expect(of(b.gw.hub.log.read(key, 0), 'turn.completed')).toEqual([expect.objectContaining({ turnId, status: 'completed' })]);
+  });
+
+  it('a Unix-socket Codex instance unavailable at the next start (an env: reference not set) keeps the turn it left open, never settled; a later start where it is available adopts it #RS-2', async () => {
+    const dir = tmp();
+    const sd = privDir();
+    const sock = join(sd, 's.sock');
+    const fake = new FakeAppServer();
+    await fake.listen(sock);
+    chmodSync(sock, 0o600);
+    cleanups.push(() => fake.stopListening());
+    let codexTurn = '';
+    fake.onTurnStart = (p, t) => {
+      codexTurn = t;
+      fake.echoUser(p.threadId, t, p.clientUserMessageId);
+    };
+    const cx = { use: 'codex', env: { AIO_TEST_CX_KEY: 'env:AIO_TEST_CX_KEY' }, transport: { kind: 'unix', spawn: 'none', path: sock, stateDir: sd } };
+    // Not the default instance (one unavailable fails the start): the default agent runs on it.
+    const raw = { harnesses: { other: { use: 'codex', transport: { kind: 'stdio' } }, cx }, defaultHarness: 'other', agents: { helper: { harness: 'cx' } }, defaultAgent: 'helper' };
+    const set = { env: { AIO_TEST_CX_KEY: 'k' }, raw };
+    const a = await start(dir, cx, undefined, set);
+    await a.chat.inject({ sender: alice, text: 'long job' });
+    const key = await until(() => a.gw.hub.log.sessions().find((k) => a.gw.hub.snapshot(k).turn));
+    const turnId = a.gw.hub.snapshot(key).turn!.turnId;
+    await until(() => codexTurn && of(a.gw.hub.log.read(key, 0), 'input.consumed').length === 1);
+    await a.stop();
+
+    // Unavailable now: the reopen fails, and the turn Codex may still be running stays open in the log.
+    const b = await start(dir, cx, undefined, { raw });
+    expect(b.gw.config.harnesses.cx!.unavailable).toContain('AIO_TEST_CX_KEY');
+    await until(() => b.logs.some((m) => m.startsWith(`${key}: could not reopen`)));
+    expect(b.logs.some((m) => m.includes('settled ambiguous'))).toBe(false);
+    expect(of(b.gw.hub.log.read(key, 0), 'turn.completed')).toEqual([]);
+    expect(b.gw.hub.snapshot(key).turn?.turnId).toBe(turnId);
+    await b.stop();
+
+    const c = await start(dir, cx, undefined, set);
+    await until(() => of(c.gw.hub.log.read(key, 0), 'turn.adopted').length === 1);
+    expect(of(c.gw.hub.log.read(key, 0), 'turn.adopted')[0]).toMatchObject({ turnId });
+    fake.completeTurn('thr-1', codexTurn, 'completed');
+    await until(() => !c.gw.hub.snapshot(key).turn);
+    expect(of(c.gw.hub.log.read(key, 0), 'turn.completed')).toEqual([expect.objectContaining({ turnId, status: 'completed' })]);
   });
 
   it('an injected adapter is detached at stop like a built one: Codex over stdio leaves its turn open, and the next start settles it ambiguous (host_restarted) without opening the harness #RS-4 #RS-5', async () => {
