@@ -1,4 +1,4 @@
-import type { InboundEnvelope, InputRecord, Origin } from '@agents-io/protocol';
+import type { InboundEnvelope, InputRecord, ModuleCommandDef, ModuleCommandHandler, Origin } from '@agents-io/protocol';
 import type { CommandResult, RouteDelivery } from '@agents-io/session';
 
 /**
@@ -8,22 +8,76 @@ import type { CommandResult, RouteDelivery } from '@agents-io/session';
  * keeps topics; here they only say why they do nothing when it does not.
  */
 
-export const COMMAND_HELP = [
-  '/help — this list',
-  '/status — this conversation: session, agent, harness, model, what runs, what waits',
-  '/stop [--clear] — stop the running turn (--clear also drops what is queued)',
-  '/steer <text> — add to the running turn instead of queueing',
-  '/answer <question-code> <answer> — answer a native Codex / Claude Code question',
-  '/new [@agent] [title] — a new topic (with @agent: talk to that agent from now on)',
-  '/topics, /switch <n> — list topics, go back to one',
-  '/agent [name] — which agent this chat talks to; with a name, switch (new turns go to its current topic)',
-  '/preset [name] — list the presets (harness, model, effort), or switch this session to one from the next turn (/preset default to undo)',
-  '/model [name], /effort [level] — show, or set for this session from the next turn (/model default to undo)',
-  '/plan [on|off] — show or set Codex Plan mode from the next turn',
-  '/bypass [on|off|default] — show or set Codex permissions for owner turns',
-  '/compact — compact the harness context (Claude Code)',
-  '/tui — how to open this session in the harness’s own terminal UI',
-].join('\n');
+/** One line of the kernel's `/help` and the command names it covers. */
+export interface KernelCommand {
+  readonly names: readonly string[];
+  readonly help: string;
+}
+
+/** The kernel's chat commands, in `/help` order. */
+export const KERNEL_COMMANDS: readonly KernelCommand[] = [
+  { names: ['help'], help: '/help — this list' },
+  { names: ['status'], help: '/status — this conversation: session, agent, harness, model, what runs, what waits' },
+  { names: ['stop'], help: '/stop [--clear] — stop the running turn (--clear also drops what is queued)' },
+  { names: ['steer'], help: '/steer <text> — add to the running turn instead of queueing' },
+  { names: ['answer'], help: '/answer <question-code> <answer> — answer a native Codex / Claude Code question' },
+  { names: ['new'], help: '/new [@agent] [title] — a new topic (with @agent: talk to that agent from now on)' },
+  { names: ['topics', 'switch'], help: '/topics, /switch <n> — list topics, go back to one' },
+  { names: ['agent'], help: '/agent [name] — which agent this chat talks to; with a name, switch (new turns go to its current topic)' },
+  { names: ['preset'], help: '/preset [name] — list the presets (harness, model, effort), or switch this session to one from the next turn (/preset default to undo)' },
+  { names: ['model', 'effort'], help: '/model [name], /effort [level] — show, or set for this session from the next turn (/model default to undo)' },
+  { names: ['plan'], help: '/plan [on|off] — show or set Codex Plan mode from the next turn' },
+  { names: ['bypass'], help: '/bypass [on|off|default] — show or set Codex permissions for owner turns' },
+  { names: ['compact'], help: '/compact — compact the harness context (Claude Code)' },
+  { names: ['tui'], help: '/tui — how to open this session in the harness’s own terminal UI' },
+];
+
+/** Every name of the kernel's chat commands. */
+export const KERNEL_COMMAND_NAMES: readonly string[] = KERNEL_COMMANDS.flatMap((c) => c.names);
+
+/** A command of an active module (`ModuleManifest.commands`) and its handler (`ModuleInstance.commands`). */
+export interface ModuleCommand {
+  module: string;
+  def: ModuleCommandDef;
+  handler: ModuleCommandHandler;
+}
+
+/**
+ * The chat commands a deployment answers: the kernel's, then the active modules' (core-slimming
+ * G6), in registration order. A module that is off has none here, so its `/name` is an ordinary
+ * message. `help` is `/help`'s text: the kernel's lines, then each module command's.
+ */
+export class CommandTable {
+  readonly help: string;
+  private readonly names: ReadonlySet<string>;
+  private readonly modules = new Map<string, ModuleCommand>();
+
+  constructor(modules: readonly ModuleCommand[] = []) {
+    for (const m of modules) {
+      if (KERNEL_COMMAND_NAMES.includes(m.def.name)) throw new Error(`module ${m.module}: /${m.def.name} is a kernel command`);
+      if (this.modules.has(m.def.name)) throw new Error(`module ${m.module}: /${m.def.name} is also module ${this.modules.get(m.def.name)!.module}'s`);
+      this.modules.set(m.def.name, m);
+    }
+    this.names = new Set([...KERNEL_COMMAND_NAMES, ...this.modules.keys()]);
+    this.help = [...KERNEL_COMMANDS.map((c) => c.help), ...[...this.modules.values()].map((m) => m.def.help)].join('\n');
+  }
+
+  /** `/name` is a command here. */
+  has(name: string): boolean {
+    return this.names.has(name);
+  }
+
+  /** The active module whose command `/name` is, if any. */
+  module(name: string): ModuleCommand | undefined {
+    return this.modules.get(name);
+  }
+}
+
+/** The kernel's commands alone (no module active). */
+export const KERNEL_COMMAND_TABLE = new CommandTable();
+
+/** `/help` with no module active. */
+export const COMMAND_HELP = KERNEL_COMMAND_TABLE.help;
 
 export interface SessionRun {
   harness: string;
@@ -90,12 +144,27 @@ export interface CommandHost {
 export async function runCommand(
   h: CommandHost,
   a: { name: string; args: string; env: InboundEnvelope; origin: Origin; input: InputRecord; delivery: RouteDelivery },
+  table: CommandTable = KERNEL_COMMAND_TABLE,
 ): Promise<{ ok: boolean; reply: string } | undefined> {
   const { name, args, delivery } = a;
   const key = delivery.sessionKey;
   const topicConversation = delivery.topic?.conversation;
-  const known = ['help', 'status', 'stop', 'steer', 'answer', 'preset', 'model', 'effort', 'plan', 'bypass', 'compact', 'agent', 'tui', 'new', 'topics', 'switch'];
-  if (!known.includes(name)) return undefined;
+  if (!table.has(name)) return undefined;
+  const mod = table.module(name);
+  if (mod) {
+    // As the kernel's: only who may operate the session runs it (unless the module says anyone may); anyone else's is a message.
+    if (mod.def.ownerOnly !== false && !(await h.allowed(key, a.origin))) return undefined;
+    return mod.handler({
+      name,
+      args,
+      sessionKey: key,
+      ...(delivery.agent !== undefined ? { agent: delivery.agent } : {}),
+      ...(topicConversation !== undefined ? { conversation: topicConversation } : {}),
+      origin: a.origin,
+      env: a.env,
+      input: a.input,
+    });
+  }
   // The lane checks the question's resolver principal. A guest may answer a question
   // addressed to them even though they cannot operate owner-only chat commands.
   if (name === 'answer') {
@@ -115,7 +184,7 @@ export async function runCommand(
 
   switch (name) {
     case 'help':
-      return ok(COMMAND_HELP);
+      return ok(table.help);
     case 'status':
       return ok(h.status(key, delivery));
     case 'stop': {

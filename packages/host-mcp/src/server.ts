@@ -137,6 +137,40 @@ export const TOOL_DEFS = {
 export type ToolName = keyof typeof TOOL_DEFS;
 export const TOOL_NAMES = Object.keys(TOOL_DEFS) as ToolName[];
 
+/** A tool as the endpoint offers it: one of the kernel's (`TOOL_DEFS`) or an active module's. */
+export interface ToolEntry {
+  name: string;
+  description: string;
+  /** What the MCP SDK registers: the kernel's zod shapes, a module's JSON Schema as zod (`moduleToolInput`). */
+  input: z.ZodRawShape | z.ZodType;
+  readOnly: boolean;
+  /** The module that adds it; absent for the kernel's own. */
+  module?: string;
+}
+
+/**
+ * The tools an endpoint over `tools` offers, in the order it lists them: the kernel's in
+ * `TOOL_DEFS` order (`watch_*`, `session_*`, `live_*` only when the host passed their control),
+ * then the active modules' (`HostToolsOptions.modules`). A token limited to some tools (the
+ * agent's `tools` list) gets those of these it names.
+ */
+export function toolCatalog(tools: HostTools): ToolEntry[] {
+  const kernel: ToolEntry[] = [];
+  for (const name of TOOL_NAMES) {
+    if (name.startsWith('watch_') && !tools.hasWatches) continue;
+    if (name.startsWith('session_') && !tools.hasTopics) continue;
+    if (name.startsWith('live_') && !tools.hasLive) continue;
+    const def = TOOL_DEFS[name];
+    kernel.push({ name, description: def.description, input: def.input, readOnly: 'readOnly' in def && def.readOnly });
+  }
+  const own = new Set<string>(TOOL_NAMES);
+  const modules = tools.moduleCatalog().map((t): ToolEntry => {
+    if (own.has(t.name)) throw new Error(`module ${t.module}: tool ${JSON.stringify(t.name)} is a kernel tool`);
+    return { name: t.name, description: t.description, input: t.input, readOnly: t.readOnly, module: t.module };
+  });
+  return [...kernel, ...modules];
+}
+
 export interface HostMcpServerOptions {
   tools: HostTools;
   /** Listen address (default 127.0.0.1); anything but a loopback address is refused. */
@@ -170,8 +204,11 @@ export class HostMcpServer {
   /** Tokens limited to some tools (the agent's `tools` list). */
   private readonly allowed = new Map<string, ReadonlySet<string>>();
   private readonly endpoint: McpHttpEndpoint<{ b: ToolBinding; allow?: ReadonlySet<string> }>;
+  /** What every token may be offered (`toolCatalog`). */
+  private readonly catalog: readonly ToolEntry[];
 
   constructor(private readonly o: HostMcpServerOptions) {
+    this.catalog = toolCatalog(o.tools);
     // The tokens are bearer credentials sent in clear text: never reachable off this machine.
     this.endpoint = new McpHttpEndpoint({
       ...(o.host !== undefined ? { host: o.host } : {}),
@@ -249,23 +286,20 @@ export class HostMcpServer {
 
   private build(b: ToolBinding, allow?: ReadonlySet<string>): McpServer {
     const server = new McpServer({ name: SERVER_NAME, version: '0.1.0' }, { capabilities: { tools: {} } });
-    for (const name of TOOL_NAMES) {
+    for (const def of this.catalog) {
+      const name = def.name;
       // Per-agent tool list (CF-6): a tool not listed is neither offered nor callable.
       if (allow && !allow.has(name)) continue;
-      if (name.startsWith('watch_') && !this.o.tools.hasWatches) continue;
-      if (name.startsWith('session_') && !this.o.tools.hasTopics) continue;
-      if (name.startsWith('live_') && !this.o.tools.hasLive) continue;
-      const def = TOOL_DEFS[name];
       server.registerTool(
         name,
         {
           description: def.description,
           inputSchema: def.input,
           annotations: {
-            readOnlyHint: 'readOnly' in def && def.readOnly,
+            readOnlyHint: def.readOnly,
             destructiveHint: false,
             idempotentHint: true,
-            openWorldHint: !('readOnly' in def && def.readOnly),
+            openWorldHint: !def.readOnly,
           },
         },
         async (args: Record<string, unknown>, extra: { _meta?: Record<string, unknown>; requestId?: string | number }) => {

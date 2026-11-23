@@ -20,12 +20,13 @@ import {
   type WatchSource,
 } from '@agents-io/protocol';
 import { DEFAULT_BLOB_MAX_BYTES, OWNER_LABEL, Router, RouterError, checkIdentities, ownerIdentities, ownersTable, type AgentContactRule, type AgentSpec, type LoopGuardOptions } from '@agents-io/session';
-import { builtinChannels, builtinHarnesses, type BuiltinChannelEntry, type BuiltinChannelSettings } from './bundle.js';
+import { builtinChannels, builtinHarnesses, builtinModules, type BuiltinChannelEntry, type BuiltinChannelSettings } from './bundle.js';
 import type { ChannelRegistry } from './channel-registry.js';
 import { ConfigError } from './config-error.js';
 import { loadEnvFile } from './env-file.js';
 import type { HarnessRegistry } from './harness-registry.js';
 import { resolveModuleFile } from './module-loader.js';
+import type { ModuleRegistry, ResolvedModule } from './modules.js';
 import { TOOL_NAMES, parseScope, type ExternalScopes } from '@agents-io/host-mcp';
 
 /*
@@ -328,7 +329,11 @@ const AgentEntry = Type.Object(
   Closed,
 );
 
-/** The config file's schema over the built-in harness kinds and channel types (`configFileSchema` gives it over other registries'). */
+/**
+ * The config file's schema over the built-in harness kinds and channel types, without module
+ * sections (`configFileSchema` gives it over other registries', and adds the registered modules'
+ * sections; the built-in module registry has none yet, so its schema is this one).
+ */
 export const ConfigFile = Type.Object(
   {
     /** State directory (default ~/.agents-io/aio). Relative paths are relative to the config file. */
@@ -560,18 +565,36 @@ export const ConfigFile = Type.Object(
 );
 export type ConfigFile = Static<typeof ConfigFile>;
 
-const fileSchemas = new WeakMap<HarnessRegistry, WeakMap<ChannelRegistry, TObject>>();
+const fileSchemas = new WeakMap<HarnessRegistry, WeakMap<ChannelRegistry, WeakMap<ModuleRegistry, TObject>>>();
+
+/**
+ * The registered modules' config sections (`ModuleConfig`): each its `section` key, an object of
+ * `enabled` and the module's own keys, closed. A section may not be one of the file's own keys.
+ */
+function moduleSections(modules: ModuleRegistry): Record<string, TSchema> {
+  const out: Record<string, TSchema> = {};
+  for (const { manifest: m } of modules.modules) {
+    if (!m.config) continue;
+    const key = m.config.section;
+    if (Object.hasOwn(ConfigFile.properties, key)) throw new Error(`module ${m.id}: config section ${JSON.stringify(key)} is one of the config file's own keys`);
+    out[key] = Type.Optional(Type.Object({ enabled: Type.Optional(Type.Boolean()), ...m.config.schema }, Closed));
+  }
+  return out;
+}
 
 /**
  * The config file's schema over a registry's harness kinds (`harnesses.<name>.use`, the older
- * `harness` block) and a registry's channel types (`channels[].type` and the settings they add to
- * `console`; default the built-in ones); the rest is `ConfigFile`'s.
+ * `harness` block), a registry's channel types (`channels[].type` and the settings they add to
+ * `console`; default the built-in ones) and a registry's modules (their config sections; default
+ * the built-in ones); the rest is `ConfigFile`'s.
  */
-export function configFileSchema(registry: HarnessRegistry, channels: ChannelRegistry = builtinChannels): TObject {
-  if (registry === builtinHarnesses && channels === builtinChannels) return ConfigFile;
+export function configFileSchema(registry: HarnessRegistry, channels: ChannelRegistry = builtinChannels, modules: ModuleRegistry = builtinModules): TObject {
+  if (registry === builtinHarnesses && channels === builtinChannels && !modules.size) return ConfigFile;
   let byChannels = fileSchemas.get(registry);
   if (!byChannels) fileSchemas.set(registry, (byChannels = new WeakMap()));
-  let s = byChannels.get(channels);
+  let byModules = byChannels.get(channels);
+  if (!byModules) byChannels.set(channels, (byModules = new WeakMap()));
+  let s = byModules.get(modules);
   if (!s) {
     s = Type.Object(
       {
@@ -580,10 +603,11 @@ export function configFileSchema(registry: HarnessRegistry, channels: ChannelReg
         harness: legacyBlockSchema(registry),
         channels: Type.Optional(Type.Array(channelEntrySchema(channels))),
         console: Type.Optional(consoleSchema(channels)),
+        ...moduleSections(modules),
       },
       Closed,
     );
-    byChannels.set(channels, s);
+    byModules.set(modules, s);
   }
   return s;
 }
@@ -728,6 +752,11 @@ export interface Config {
   host?: { tokenFile?: string };
   /** The external MCP endpoint (`externalMcp`), when on. */
   externalMcp?: ExternalMcpConfig;
+  /**
+   * The registered feature modules, on or off, with their settings (`resolveModules`), in
+   * registration order; absent when the registry has none (the built-in one, for now).
+   */
+  modules?: ResolvedModule[];
   /** Where this config came from (loadConfig): the file (it may not exist) and the env file found for it. */
   source?: { path: string; envFile?: string };
 }
@@ -955,6 +984,8 @@ export interface LoadOptions {
   harnessRegistry?: HarnessRegistry;
   /** The channel types `channels[].type` may name (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
   channelRegistry?: ChannelRegistry;
+  /** The feature modules whose config sections the file may have (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
+  moduleRegistry?: ModuleRegistry;
 }
 
 export function loadConfig(o: LoadOptions = {}): Config {
@@ -982,6 +1013,7 @@ export function loadConfig(o: LoadOptions = {}): Config {
     channels: o.channels,
     ...(o.harnessRegistry ? { harnessRegistry: o.harnessRegistry } : {}),
     ...(o.channelRegistry ? { channelRegistry: o.channelRegistry } : {}),
+    ...(o.moduleRegistry ? { moduleRegistry: o.moduleRegistry } : {}),
   });
   return { ...c, source: { path, ...(envPath ? { envFile: resolve(cwd, envPath) } : {}) } };
 }
@@ -998,13 +1030,16 @@ export interface ResolveContext {
   harnessRegistry?: HarnessRegistry;
   /** The channel types `channels[].type` may name (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
   channelRegistry?: ChannelRegistry;
+  /** The feature modules whose config sections the file may have (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
+  moduleRegistry?: ModuleRegistry;
 }
 
 /** Validate a parsed config file and fill defaults. Error messages name keys, never values. */
 export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
   const registry = ctx.harnessRegistry ?? builtinHarnesses;
   const channelRegistry = ctx.channelRegistry ?? builtinChannels;
-  const errs = errors(configFileSchema(registry, channelRegistry), raw);
+  const moduleRegistry = ctx.moduleRegistry ?? builtinModules;
+  const errs = errors(configFileSchema(registry, channelRegistry, moduleRegistry), raw);
   if (errs.length) throw new ConfigError(`invalid config: ${errs.slice(0, 5).join('; ')}`);
   const c = raw as ConfigFile;
   const env = ctx.env;
@@ -1022,7 +1057,8 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
   // Off unless asked for (principle 2, decision 13: the default was true before 2026-10-11).
   const outputTools = c.outputTools ?? false;
   const presets = resolvePresets(c, harnesses);
-  const { agents, defaultAgent } = resolveAgents(c, harnesses, presets, defaultHarness, outputTools, path, registry.configDirKeys());
+  const modules = resolveModules(raw as Record<string, unknown>, moduleRegistry, env, path);
+  const { agents, defaultAgent } = resolveAgents(c, harnesses, presets, defaultHarness, outputTools, path, registry.configDirKeys(), toolCatalog(moduleRegistry, modules));
   const identities = c.identities ?? [];
   const localSession = c.local?.session ?? ownerSessionKey ?? 'local:main';
   const table: BindingTable | undefined = c.bindings ? { version: 'config', bindings: c.bindings, identities: [] } : undefined;
@@ -1070,8 +1106,91 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     console: resolveConsole(c.console, channelRegistry),
     host: c.host?.tokenFile !== undefined ? { tokenFile: path(c.host.tokenFile) } : {},
     ...(c.externalMcp && c.externalMcp.enabled !== false ? { externalMcp: resolveExternalMcp(c.externalMcp, env, path, c.policy?.owners ?? []) } : {}),
+    ...(moduleRegistry.size ? { modules } : {}),
     ...(warnings.length ? { warnings } : {}),
   };
+}
+
+/** The value at a dotted path of the file (`policy.strangers`), if set. */
+function at(raw: Record<string, unknown>, dotted: string): unknown {
+  let cur: unknown = raw;
+  for (const k of dotted.split('.')) {
+    if (!cur || typeof cur !== 'object' || Array.isArray(cur) || !Object.hasOwn(cur, k)) return undefined;
+    cur = (cur as Record<string, unknown>)[k];
+  }
+  return cur;
+}
+
+/**
+ * Step 1 of the module lifecycle (core-slimming G6): every registered module, on or off, with its
+ * settings. A module without a config section is on. One with a section: the section present is on
+ * unless `enabled: false` (`resolve` gets the rest); absent, the first of its `aliases` that is set
+ * turns it on with that value; with neither, `defaultEnabled` (`resolve` gets `{}`). A module that is
+ * on and needs another (`module:<id>`) that is off fails the config.
+ */
+export function resolveModules(raw: Record<string, unknown>, registry: ModuleRegistry, env: Record<string, string | undefined>, path: (p: string) => string): ResolvedModule[] {
+  const out: ResolvedModule[] = [];
+  for (const { manifest: m } of registry.modules) {
+    const cfg = m.config;
+    if (!cfg) {
+      out.push({ id: m.id, enabled: true });
+      continue;
+    }
+    const section = Object.hasOwn(raw, cfg.section) ? (raw[cfg.section] as Record<string, unknown>) : undefined;
+    let value: unknown;
+    let where = cfg.section;
+    let alias: string | undefined;
+    let enabled: boolean;
+    if (section !== undefined) {
+      const { enabled: on, ...rest } = section;
+      enabled = on !== false;
+      value = rest;
+    } else {
+      alias = cfg.aliases?.find((a) => at(raw, a) !== undefined);
+      if (alias !== undefined) {
+        enabled = true;
+        value = at(raw, alias);
+        where = alias;
+      } else {
+        enabled = cfg.defaultEnabled;
+        value = {};
+      }
+    }
+    if (!enabled) {
+      out.push({ id: m.id, enabled: false });
+      continue;
+    }
+    const config = cfg.resolve(value, {
+      where,
+      ...(alias !== undefined ? { alias } : {}),
+      env,
+      substitute: (v, w) => substituteEnv(v, env, w),
+      path,
+      fail: (msg) => fail(msg),
+    });
+    out.push({ id: m.id, enabled: true, config });
+  }
+  const on = new Set(out.filter((x) => x.enabled).map((x) => x.id));
+  for (const { manifest: m } of registry.modules) {
+    if (!on.has(m.id)) continue;
+    for (const n of m.needs ?? []) if (n.startsWith('module:') && !on.has(n.slice('module:'.length))) fail(`module ${m.id} needs module ${n.slice('module:'.length)}, which is off`);
+  }
+  return out;
+}
+
+/** The model tools agents may list (`agents.<name>.tools`): the kernel's, the modules' that are on; and whose tools are off. */
+interface ToolCatalog {
+  names: readonly string[];
+  /** A tool of a registered module that is off → that module. */
+  off: ReadonlyMap<string, string>;
+}
+
+function toolCatalog(registry: ModuleRegistry, modules: readonly ResolvedModule[]): ToolCatalog {
+  const on = new Set(modules.filter((x) => x.enabled).map((x) => x.id));
+  const names: string[] = [...TOOL_NAMES];
+  const off = new Map<string, string>();
+  for (const { manifest: m } of registry.modules) for (const t of m.mcpTools ?? []) (on.has(m.id) ? names.push(t.name) : off.set(t.name, m.id));
+  return { names, off };
 }
 
 /** The synthesized agent of a config without `agents`: the default instance, bare route-key sessions. */
@@ -1106,6 +1225,7 @@ function resolveAgents(
   outputTools: boolean,
   path: (p: string) => string,
   configDirKeys: readonly string[],
+  catalog: ToolCatalog,
 ): { agents: Record<string, AgentConfig>; defaultAgent: string | undefined } {
   if (!c.agents) {
     if (c.defaultAgent !== undefined && c.defaultAgent !== DEFAULT_AGENT) fail('`defaultAgent` needs `agents`');
@@ -1135,8 +1255,10 @@ function resolveAgents(
     const sessionParams = a.sessionParams && resolveSessionParams(a.sessionParams, `${where}.sessionParams`, a.mode ?? 'interactive', path, configDirKeys);
     let toolNames: string[] | undefined;
     if (Array.isArray(a.tools)) {
-      const unknown = a.tools.filter((t) => !(TOOL_NAMES as readonly string[]).includes(t));
-      if (unknown.length) fail(`${where}.tools: unknown tool ${unknown.map((t) => JSON.stringify(t)).join(', ')} (tools: ${TOOL_NAMES.join(', ')})`);
+      const unknown = a.tools.filter((t) => !catalog.names.includes(t) && !catalog.off.has(t));
+      if (unknown.length) fail(`${where}.tools: unknown tool ${unknown.map((t) => JSON.stringify(t)).join(', ')} (tools: ${catalog.names.join(', ')})`);
+      const off = a.tools.find((t) => catalog.off.has(t));
+      if (off !== undefined) fail(`${where}.tools: ${JSON.stringify(off)} is a tool of module ${catalog.off.get(off)}, which is off`);
       toolNames = [...new Set(a.tools)];
     }
     agents[name] = {

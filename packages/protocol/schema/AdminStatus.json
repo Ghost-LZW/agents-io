@@ -247,6 +247,38 @@
           }
         }
       }
+    },
+    "modules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "origin",
+          "enabled"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "const": "builtin",
+                "type": "string"
+              },
+              {
+                "const": "module",
+                "type": "string"
+              }
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "status": {}
+        }
+      }
     }
   }
 }

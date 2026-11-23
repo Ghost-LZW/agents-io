@@ -29,6 +29,7 @@ import {
   type HarnessOpenArgs,
   type HarnessSession,
   type HostRequestFrame,
+  type IdentityEntry,
   type InboundEnvelope,
   type InputRecord,
   type LiveEndpoint,
@@ -100,7 +101,7 @@ import {
   settleLeftoverInputs,
 } from '@agents-io/session';
 import { HostMcpServer, HostTools, ToolError, agentIdentity, type TopicHandover } from '@agents-io/host-mcp';
-import { builtinChannels, builtinHarnesses } from './bundle.js';
+import { builtinChannels, builtinHarnesses, builtinModules } from './bundle.js';
 import { badChannelAdapter, loadHarnessModule } from './module-loader.js';
 import { ConfigError, UNGRANTED_EVIDENCE, agentSpec, configTable, consoleSettings, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type PresetConfig, type ResolvedChannel } from './config.js';
 import { ConsoleServer, type ContributedRoute } from './console.js';
@@ -108,7 +109,7 @@ import type { ChannelRegistry, DefaultEvidence } from './channel-registry.js';
 import type { HarnessRegistry } from './harness-registry.js';
 import { ConfigStore, canonical } from './console-config.js';
 import type { ClientCommand, SessionInfo } from './frames.js';
-import { HostService, isHostOrigin } from './host.js';
+import { HostService, isHostOrigin, type CalloutHook } from './host.js';
 import { LocalServer } from './local-server.js';
 import { privateDb, privateDir } from './private.js';
 import { DaemonRecords, type CauseRecord, type OutboundRecord } from './records.js';
@@ -116,11 +117,15 @@ import { ExternalMcp } from './external-mcp.js';
 import { checkLaunch, launchView, sameLaunch, type LaunchCheck } from './launch.js';
 import { RUN_RULE, Runs, type RunOverrides } from './runs.js';
 import { Strangers } from './strangers.js';
-import { runCommand, type CommandHost } from './commands.js';
+import { runCommand, type CommandHost, type CommandTable } from './commands.js';
+import { ModuleHost, kernelContext, type KernelBackend, type ModuleRegistry } from './modules.js';
 import { ClaudeTuiService } from './tui-claude.js';
 import { consoleUrlPath, loadOrCreateTokenFile, removeTokenFile, TokenError, tokenPath, writeTokenFile } from './token.js';
 
 export type LogFn = (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
+
+/** The log without `GatewayOptions.logger`: stderr. */
+const defaultLog: LogFn = (level, msg) => console.error(`[aio] ${level}: ${msg}`);
 
 /** An in-process channel handed to the gateway (tests and e2e scripted ends). */
 export interface ExtraChannel {
@@ -143,6 +148,11 @@ export interface GatewayOptions {
    * an entry's channel id and the evidence an entry gives without a grant.
    */
   channelRegistry?: ChannelRegistry;
+  /**
+   * The feature modules (`ModuleManifest`; default the built-in ones, `bundle.ts`, none yet): the
+   * registry the config was resolved with (`Config.modules` names exactly its modules).
+   */
+  moduleRegistry?: ModuleRegistry;
   /** In-process channels besides the configured ones. */
   channels?: ExtraChannel[];
   /** Build a configured channel's adapter with this instead of its type's `create` when it returns one (embedding, tests). */
@@ -292,6 +302,14 @@ export class Gateway {
   readonly harnessRegistry: HarnessRegistry;
   /** The channel types (`GatewayOptions.channelRegistry`): how configured channels are built, who owns their ids, their default evidence. */
   readonly channelRegistry: ChannelRegistry;
+  /** The feature modules (`GatewayOptions.moduleRegistry`). */
+  readonly moduleRegistry: ModuleRegistry;
+  /** The modules of this run: set up before the gateway is built, started after its channels and sockets, stopped first. */
+  readonly modules: ModuleHost;
+  /** The chat commands: the kernel's, then the active modules'. */
+  private readonly commandTable: CommandTable;
+  /** Extra identity map entries by who set them (the stranger guests, each module's), merged into the router's. */
+  private readonly extraIdentities = new Map<string, IdentityEntry[]>();
   /** Host output tools, when some agent has `tools` on; mounted over MCP into those agents' harness bindings only. */
   readonly tools: HostTools | undefined;
   private readonly mcp: HostMcpServer | undefined;
@@ -359,17 +377,23 @@ export class Gateway {
   private readonly parkedTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly titleJobs = new Set<string>();
 
-  private constructor(private readonly o: GatewayOptions) {
+  private constructor(
+    private readonly o: GatewayOptions,
+    modules: ModuleHost,
+  ) {
     const c = o.config;
     // The default harness is built below and captures its media resolvers now.
     this.blobs = new FsBlobStore(c.blobs);
     this.harnessBlobs = readOnlyBlobs(this.blobs);
     this.harnessRegistry = o.harnessRegistry ?? builtinHarnesses;
     this.channelRegistry = o.channelRegistry ?? builtinChannels;
+    this.moduleRegistry = o.moduleRegistry ?? builtinModules;
+    this.modules = modules;
+    this.commandTable = modules.commandTable();
     // The default instance must be usable (e.g. its env refs set); others fail when a turn names them.
     // A module default is checked in `start`, once its module is loaded.
     if (o.harness || o.buildHarness || c.harnesses[c.defaultHarness]?.kind !== 'module') this.harness();
-    this.log = o.logger ?? ((level, msg) => console.error(`[aio] ${level}: ${msg}`));
+    this.log = o.logger ?? defaultLog;
     for (const w of c.warnings ?? []) this.log('warn', `config: ${w}`);
     // Before anything opens: a bad token file fails the start without leaving handles behind.
     this.token = o.token ?? this.hostToken(o.tokenFile ?? c.host?.tokenFile);
@@ -515,6 +539,7 @@ export class Gateway {
       compactSession: (f, origin) => this.compactSession(f, origin),
       calloutTimeouts: { resolve: c.hostCallouts.resolveTimeoutMs, review: c.hostCallouts.reviewTimeoutMs, outbound: c.hostCallouts.outboundTimeoutMs, external: c.hostCallouts.externalTimeoutMs },
       externalMcp: () => this.externalMcp !== undefined,
+      moduleFeatures: () => this.modules.features(),
       explain: (id, chain) => this.explain(id, chain),
       answerOnBehalf: c.policy.answerOnBehalf,
       log: (level, msg, data) => this.log(level, msg, data),
@@ -540,6 +565,7 @@ export class Gateway {
     });
     // Built when some agent has tools (agents.<name>.tools, default `outputTools`, off); only those agents' harnesses mount them.
     if (Object.values(c.agents).some((a) => a.tools)) {
+      const moduleTools = modules.tools();
       this.tools = new HostTools({
         hub: this.hub,
         outbox: this.outbox,
@@ -583,6 +609,8 @@ export class Gateway {
           },
           leave: (key) => this.leaveLive(key, 'left by the agent'),
         },
+        // The active modules' tools, after the kernel's (core-slimming G6).
+        ...(moduleTools.length ? { modules: moduleTools } : {}),
       });
       const tools = this.tools;
       this.mcp = new HostMcpServer({
@@ -646,7 +674,7 @@ export class Gateway {
           if (!r.ok) return { ok: false, message: r.message };
           return r.outcome.result?.ok === false ? { ok: false, message: r.outcome.result.reason } : { ok: true };
         },
-        onGuests: (entries) => this.router.setExtraIdentities(entries),
+        onGuests: (entries) => this.setExtraIdentities('strangers', entries),
         log: (level, msg) => this.log(level, msg),
       });
     }
@@ -658,8 +686,63 @@ export class Gateway {
         // The console validates and redacts the file against the kinds and types this daemon runs.
         harnessRegistry: this.harnessRegistry,
         channelRegistry: this.channelRegistry,
+        moduleRegistry: this.moduleRegistry,
       });
     }
+  }
+
+  /** One owner's extra identity map entries (`strangers`: the guests; `module:<id>`: a module's), replacing its earlier ones. */
+  private setExtraIdentities(owner: string, entries: IdentityEntry[]): void {
+    this.extraIdentities.set(owner, entries);
+    this.router.setExtraIdentities([...this.extraIdentities.values()].flat());
+  }
+
+  /**
+   * What each module's `KernelContext` reaches of the gateway (`kernelContext` namespaces it):
+   * existing capabilities, late-bound through `ref` (set once the gateway is built, after setup).
+   */
+  private static kernelBackend(ref: { gw?: Gateway }, log: LogFn): KernelBackend {
+    const gw = (): Gateway => ref.gw!;
+    return {
+      ready: () => ref.gw !== undefined,
+      log,
+      events: (key, fromSeq) => gw().hub.log.read(key, fromSeq),
+      policy: () => gw().policy,
+      flag: (name) => gw().records.flag(name),
+      setFlag: (name, value) => gw().records.setFlag(name, value),
+      db: () => gw().records.db,
+      topic: (key) => {
+        const t = gw().topics.bySession(key);
+        return t ? topicView(t) : undefined;
+      },
+      siblings: (key) => (gw().topics.bySession(key) ? gw().topics.siblings(key).map(topicView) : []),
+      identify: (a) => gw().router.identify(a),
+      setExtraIdentities: (owner, entries) => gw().setExtraIdentities(owner, entries),
+      newTopic: (agent, conversation, title) => gw().router.newTopic(agent, conversation, title !== undefined ? { title } : {}, 'user').topic.id,
+      conversationAgent: (conversation) => gw().router.conversationAgent(conversation),
+      hasLane: (key) => gw().lanes.has(key),
+      openLane: async (key, agent) => {
+        await gw().laneAfterClose(key, agent);
+      },
+      command: (cmd, origin) => gw().command(cmd, origin),
+      channelFor: (route) => gw().channelFor(route)?.adapter,
+      send: async (route, msg, a) => {
+        const ch = gw().channelFor(route);
+        if (!ch) return undefined;
+        const rec = await gw().outbox.send(ch.adapter, { operationId: a.operationId, sessionKey: a.sessionKey, route, msg, ...(a.turnId !== undefined ? { turnId: a.turnId } : {}) });
+        return { status: rec.status, ...(rec.providerMessageId !== undefined ? { providerMessageId: rec.providerMessageId } : {}), ...(rec.error !== undefined ? { error: rec.error } : {}) };
+      },
+      ownerRoute: () => gw().ownerRoute(),
+      redispatch: async (item, o) => {
+        const r = await gw().ingress.redispatch(item, { by: o.by, ...(o.session !== undefined ? { session: o.session } : {}), ...(o.agent !== undefined ? { agent: o.agent } : {}) });
+        if (!r.ok) return { ok: false, code: r.code, message: r.message };
+        if (r.outcome.result?.ok === false) return { ok: false, code: 'refused', message: r.outcome.result.reason };
+        return { ok: true, sessionKey: r.delivery.sessionKey, inputId: r.inputId };
+      },
+      explain: (id, chain) => gw().explain(id, chain),
+      hostConnected: () => gw().router.hostConnected,
+      hostAnswers: (hook) => gw().host.answers(hook as CalloutHook),
+    };
   }
 
   /** The operator's token file (read, or created), else a fresh token for this start only. */
@@ -673,7 +756,15 @@ export class Gateway {
   }
 
   static async start(o: GatewayOptions): Promise<Gateway> {
-    const gw = new Gateway(o);
+    // Module lifecycle step 2 (step 1 ran in loadConfig): set up before the gateway builds its
+    // ingress, so their tools and commands are assembled with the kernel's. Their kernel context is
+    // late-bound: it works once the gateway exists.
+    const modules = new ModuleHost({ registry: o.moduleRegistry ?? builtinModules, resolved: o.config.modules, log: o.logger ?? defaultLog });
+    const ref: { gw?: Gateway } = {};
+    const backend = Gateway.kernelBackend(ref, o.logger ?? defaultLog);
+    await modules.setup((id) => kernelContext(id, backend));
+    const gw = new Gateway(o, modules);
+    ref.gw = gw;
     try {
       await gw.loadHarnessModules();
       gw.harness();
@@ -697,6 +788,8 @@ export class Gateway {
         writeTokenFile(gw.tokenFile, gw.token);
       }
       if (o.console) await gw.startConsole();
+      // Step 3: after the channels, the local socket and the console.
+      await gw.modules.start();
       if (o.config.externalMcp) await gw.startExternalMcp();
     } catch (e) {
       await gw.stop().catch(() => undefined);
@@ -896,6 +989,7 @@ export class Gateway {
       runs: { running: this.runs.running() },
       queue: { head: this.hostQueue.head() },
       ...(this.externalMcp ? { externalMcp: { url: this.externalMcp.url, clients: (c.externalMcp?.clients ?? []).map((x) => x.name) } } : {}),
+      modules: this.modules.status(),
     };
   }
 
@@ -2818,7 +2912,7 @@ ${a.summary}` }],
   }
 
   private command$(a: Parameters<typeof runCommand>[1]): Promise<{ ok: boolean; reply: string } | undefined> {
-    return runCommand(this.commandHost, a).then(async (r) => {
+    return runCommand(this.commandHost, a, this.commandTable).then(async (r) => {
       const route = a.env.replyRoute;
       const ch = route && this.channelFor(route);
       // Only channels configured to mark the inbound message can skip the text receipt.
@@ -3100,6 +3194,8 @@ ${a.summary}` }],
     this.host.close();
     // No new external writes while stopping (the tools also answer "stopping").
     await within(this.externalMcp?.endpoint.close(), 2000);
+    // Step 4: the modules stop first, in reverse order (each bounded), while what they use still runs.
+    await this.modules.stop();
     await this.claudeTui.close();
     // Lives end first: the voice runs in the harness and the media peer in a channel, both about to go.
     await within(Promise.all([...this.lives.keys()].map((k) => this.leaveLive(k, 'gateway stopping'))), 5000);

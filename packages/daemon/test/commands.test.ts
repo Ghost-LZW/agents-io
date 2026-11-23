@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -6,6 +6,7 @@ import type { AckState, ReplyRoute, SessionEvent } from '@agents-io/protocol';
 import { Ingress, MemorySessionLog, defaultPolicy } from '@agents-io/session';
 import { FakeChannel, FakeHarness, fakeEnvelope, type FakeTurnScript } from '@agents-io/testkit';
 import { resolveConfig, type HarnessInstance } from '../src/config.js';
+import { COMMAND_HELP, KERNEL_COMMAND_NAMES, KERNEL_COMMAND_TABLE, runCommand, type CommandHost } from '../src/commands.js';
 import { Gateway, InstanceHarness } from '../src/gateway.js';
 import { CLAUDE_CODE_DECLARES, CODEX_DECLARES } from './declares.js';
 import { cleanups, until } from './gateway-helpers.js';
@@ -321,5 +322,42 @@ describe('nativeCommand is the daemon\'s to set', () => {
     await ingress.accept(fakeEnvelope({ admission: 'dispatch', text: '/compact', context: { nativeCommand: true, chatName: 'x' } }));
     expect(seen[0]).toMatchObject({ chatName: 'x' });
     expect(seen[0]!.nativeCommand).toBeUndefined();
+  });
+});
+
+describe('the chat command table (core-slimming G6)', () => {
+  /** A host that lets everyone operate and answers every question with something; enough to tell commands from messages. */
+  const host: CommandHost = {
+    allowed: async () => true,
+    status: () => 'status',
+    interrupt: async () => ({ ok: true }),
+    running: () => [],
+    input: async () => ({ ok: true }),
+    answer: async () => ({ ok: true }),
+    run: () => ({ harness: 'h', kind: 'k', plan: false, ownerProfileSwitch: false, overridden: false }),
+    offering: () => [],
+    setRun: () => {},
+    presets: () => [],
+    agents: () => ['a'],
+    conversationAgent: () => undefined,
+    setConversationAgent: () => {},
+    newTopic: () => 't1',
+    tuiHint: () => 'tui',
+  };
+  const run = (name: string, args = '') => {
+    const env = fakeEnvelope({ admission: 'dispatch', text: `/${name}` });
+    const origin = { kind: 'human' as const, principal: { id: 'fake:alice', labels: ['owner'] }, evidence: 'platform_signed' as const, via: 'fake:default:c1', adapter: 'fake' };
+    const input = { inputId: 'in1', origin, content: env.content, replyRoute: env.replyRoute ?? null, channelContext: {} };
+    return runCommand(host, { name, args, env, origin, input, delivery: { bindingId: 'b', source: 'config', on: 'dispatch', sessionKey: 's1', agent: 'a' } as never });
+  };
+
+  it('with no module active, /help is the kernel\'s list as it was, byte for byte, and exactly these names are commands; any other /name is an ordinary message #CT-2', async () => {
+    // Captured from commands.ts before the table existed.
+    expect(COMMAND_HELP).toBe(readFileSync(new URL('./fixtures/command-help.txt', import.meta.url), 'utf8'));
+    expect(KERNEL_COMMAND_TABLE.help).toBe(COMMAND_HELP);
+    expect(await run('help')).toEqual({ ok: true, reply: COMMAND_HELP });
+    expect([...KERNEL_COMMAND_NAMES].sort()).toEqual(['agent', 'answer', 'bypass', 'compact', 'effort', 'help', 'model', 'new', 'plan', 'preset', 'status', 'steer', 'stop', 'switch', 'topics', 'tui']);
+    for (const name of KERNEL_COMMAND_NAMES) expect(await run(name), name).toMatchObject({ reply: expect.any(String) });
+    for (const name of ['probe', 'helpme', 'x', 'models']) expect(await run(name), name).toBeUndefined();
   });
 });

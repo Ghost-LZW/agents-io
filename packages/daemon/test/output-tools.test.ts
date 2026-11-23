@@ -61,4 +61,17 @@ describe('dev-gateway host output tools', () => {
     expect(resolve([]).agents.chat!.toolNames).toBeUndefined();
     expect(resolve(['send_message', 'send_message']).agents.chat).toMatchObject({ tools: true, toolNames: ['send_message'] });
   });
+
+  it('with no module active, an unknown name\'s error names it and lists the kernel\'s 15 tools in catalog order, as before the catalog (core-slimming G6) #CF-6', () => {
+    const resolve = (tools: unknown) => resolveConfig({ agents: { chat: { harness: 'claude-code', tools } }, defaultAgent: 'chat' }, { env: {}, baseDir: '/base', cwd: '/work' });
+    let message: string | undefined;
+    try {
+      resolve(['send_message', 'nope', 'x']);
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    expect(message).toBe(
+      'agents.chat.tools: unknown tool "nope", "x" (tools: get_channel_context, send_file, ask_choice, mention, reply_to, send_message, watch_add, watch_remove, watch_list, live_join, live_say, live_leave, session_rotate, session_list, session_switch)',
+    );
+  });
 });

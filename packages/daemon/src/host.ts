@@ -63,6 +63,8 @@ export interface HostServiceDeps {
   calloutTimeouts?: { resolve?: number; review?: number; outbound?: number; contact?: number; external?: number };
   /** The external MCP endpoint is on: `external.mcp` is advertised. */
   externalMcp?: () => boolean;
+  /** The features of the modules that run (`ModuleManifest.features`), advertised after the kernel's own. */
+  moduleFeatures?: () => readonly string[];
   /** `explain`: a routing record, a side effect by operationId, or (`chain`) an agent input's chain. */
   explain(inputId: string, chain: boolean): Outcome;
   log: LogFn;
@@ -223,7 +225,7 @@ export class HostService implements HostFrames {
       bindings: { version: st?.table.version ?? null, active: st?.active ?? false, ...(st?.suspended ? { suspended: st.suspended } : {}) },
       ...(f.consumer !== undefined ? { inbound: { consumer: f.consumer, acked: this.d.queue.cursor(f.consumer), head: this.d.queue.head() } } : {}),
       ...(replaced !== undefined ? { replaced: { name: replaced } } : {}),
-      features: FEATURES.filter((x) => (x !== 'resolve.onBehalfOf' || this.d.answerOnBehalf) && (x !== 'external.mcp' || this.d.externalMcp?.() === true)),
+      features: [...FEATURES.filter((x) => (x !== 'resolve.onBehalfOf' || this.d.answerOnBehalf) && (x !== 'external.mcp' || this.d.externalMcp?.() === true)), ...(this.d.moduleFeatures?.() ?? [])],
       ...(f.callouts !== undefined ? { callouts: role ? [...hooks] : [] } : {}),
     });
   }
@@ -343,7 +345,8 @@ export class HostService implements HostFrames {
  * `callouts.review`: the `review` hook (a `model` resolver's review); `resolve.native`: `resolve` and `review` callouts carry
  * the harness's `native` request; `resolver.human.extras`: a human resolver's `timeoutMs`, `note` and `allowSessionAs`, and
  * a model resolver's `escalate`, apply. `session.compact`: the `session.compact` request (a quiet live session's harness
- * compacts its context as a turn of its own, CT-3).
+ * compacts its context as a turn of its own, CT-3). These are the kernel's own; `host.hello` adds the features of the modules
+ * that run (`ModuleManifest.features`) after them.
  */
 export const FEATURES = [
   'session.launch',

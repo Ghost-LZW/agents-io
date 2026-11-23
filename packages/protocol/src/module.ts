@@ -1,0 +1,347 @@
+import type { TSchema } from '@sinclair/typebox';
+import type { AdminContribution } from './admin-module.js';
+import type { ChannelAdapter, RenderedMessage } from './channel.js';
+import type { ClientCommand } from './client.js';
+import type { ReplyRoute } from './common.js';
+import type { SessionEvent } from './events.js';
+import type { HarnessAdapter } from './harness.js';
+import type { IdentityEntry, InboundItem, SessionScope } from './host.js';
+import type { InboundEnvelope, InputRecord, Origin } from './inbound.js';
+import type { IdentifyArgs, Identity, Policy, TurnContext, TurnDraft } from './policy.js';
+import type { Resolver } from './requests.js';
+import type { RunSpec } from './run.js';
+import type { Topic } from './topic.js';
+
+/*
+ * A feature of the host as a module (core-slimming G6): what it adds to the deployment (a config
+ * section, `host.hello` features, model tools, chat commands) and what it runs, registered by the
+ * host's composition root (the daemon's `bundle.ts`). The host assembles its chat command table,
+ * its model tool catalog and its `host.hello` features from its own entries and the active
+ * modules' entries; a module that is off is not there at all (no tools, no commands, no
+ * features). Built-in modules and a third party's are the same shape; `ModuleOrigin` tells them
+ * apart in the host's status. Channel types and harness kinds keep their own contracts
+ * (`ChannelModule`, `HarnessModule`).
+ *
+ * In progress: the daemon reads the manifest (`id`, `kind`, `needs`, `config`, `features`,
+ * `mcpTools`, `commands`, `setup`) and, of the instance, `tools`, `commands`, `status`, `start`
+ * and `stop`. `admin`, `hooks` and `localFrames` are the contract the features that move into
+ * modules next need (G6 steps 1-6); until the daemon serves one, a module that sets it fails to
+ * register (`admin`) or to set up (`hooks.<name>`, `localFrames`), naming it, rather than being
+ * silently ignored.
+ */
+
+/** Where a registered module comes from: shipped with the host (`builtin`), or someone else's (`module`). */
+export type ModuleOrigin = 'builtin' | 'module';
+
+/** What a module is. Only `feature` for now; channel types and harness kinds register as `ChannelModule` / `HarnessModule`. */
+export type ModuleKind = 'feature';
+
+/** What `ModuleConfig.resolve` gets besides the value. */
+export interface ModuleResolveContext {
+  /** Where the value is, for messages: the section's key, or the alias path it was read from (`policy.strangers`). */
+  where: string;
+  /** The alias path the value was read from, when it came from one (the section is absent). */
+  alias?: string;
+  /** The deployment's environment (the process's over `.env.live`), read-only. SECRET: never put a value in a message. */
+  env: Readonly<Record<string, string | undefined>>;
+  /**
+   * `v` with every string `"env:NAME"` in it replaced by the variable's value. A variable that is
+   * not set fails the config: `<where>…: environment variable NAME is not set`.
+   */
+  substitute(v: unknown, where: string): unknown;
+  /** A path from the config: `~` is the home directory, a relative one is relative to the config file. */
+  path(p: string): string;
+  /** Fail the config with this message. Messages name keys and variables, never values. */
+  fail(msg: string): never;
+}
+
+/**
+ * A module's section of the host's config file: a top-level key (`section`) holding an object of
+ * the module's own keys (`schema`) and `enabled`, which the host adds and owns; the host closes the
+ * object (an unknown key is a config error). Present, the module is on unless `enabled` is
+ * `false`; absent, the first alias path that is set is read instead (the module is on, `resolve`
+ * gets that value); with neither, the module is on when `defaultEnabled`. A config change to a
+ * section takes effect at the next start (the console answers `applied: "restart"`).
+ */
+export interface ModuleConfig<C = unknown> {
+  /** The top-level key: ASCII letters, digits and `_`, starting with a letter; never one of the host's own keys. */
+  readonly section: string;
+  /** The section's own keys, in the order the schema lists them (not `enabled`: the host's). */
+  readonly schema: Readonly<Record<string, TSchema>>;
+  /**
+   * Where the settings were before they were the module's, as dotted paths of the config file
+   * (`policy.strangers`, `externalMcp`): read when the section is absent, as valued there (the file
+   * schema checks them where they are). A path is no other module's section or alias.
+   */
+  readonly aliases?: readonly string[];
+  /** Whether the module is on when neither its section nor an alias is in the file. */
+  readonly defaultEnabled: boolean;
+  /**
+   * The section's value (valid against `schema`, without `enabled`; `{}` when absent) or an alias's
+   * value, as the module's settings; called only when the module is on. Throwing (`ctx.fail`) fails
+   * the config.
+   */
+  resolve(raw: unknown, ctx: ModuleResolveContext): C;
+}
+
+/**
+ * A model tool a module adds to the host's MCP endpoint, next to the host's own (`send_message`, …),
+ * under the same per-agent switch (`agents.<name>.tools`: `true`, or a list naming it).
+ */
+export interface ModuleToolDef {
+  /** The tool's name: lower-case ASCII letters, digits and `_`, starting with a letter; never one of the host's own tools. */
+  readonly name: string;
+  /** What the model reads: written so that a model uses the tool correctly with no extra prompt. */
+  readonly description: string;
+  /** The tool's arguments, as a JSON Schema object (`Type.Object({ … })`). */
+  readonly input: TSchema;
+  /** Only reads (MCP `readOnlyHint`; default false). */
+  readonly readOnly?: boolean;
+  /** Works only while a turn runs in the caller's session (default true; the host refuses the call otherwise, as for its own tools). */
+  readonly needsTurn?: boolean;
+}
+
+/** A call of a module's tool, as its handler gets it. */
+export interface ModuleToolCall {
+  /** The session of the harness binding that called. */
+  sessionKey: string;
+  /** The running turn; always set for a tool that needs one (`ModuleToolDef.needsTurn`). */
+  turn?: TurnContext;
+  /** The arguments, valid against the tool's `input`. */
+  args: Record<string, unknown>;
+  /** The side effect's id while a turn runs (`tool:<sessionKey>:<the harness's call id>`): the same for a retried call. */
+  operationId?: string;
+}
+
+/**
+ * Runs a module's tool; the result goes to the model as JSON (`null` for undefined). An error the
+ * model should fix is thrown with `name` `ToolError` (the model reads its message); anything else
+ * is answered `internal error: <message>`.
+ */
+export type ModuleToolHandler = (call: ModuleToolCall) => unknown | Promise<unknown>;
+
+/** A chat command a module adds (`/<name> args` from a chat with the deployment), next to the host's own. */
+export interface ModuleCommandDef {
+  /** The name after `/`: lower-case ASCII letters, digits, `_` and `-`, starting with a letter; never one of the host's own commands. */
+  readonly name: string;
+  /** Its line in `/help` (`/name [args] — what it does`), after the host's own lines. */
+  readonly help: string;
+  /** Only who may operate the session (`Policy.control`, the owner) runs it; anyone else's `/name` is an ordinary message (default true). */
+  readonly ownerOnly?: boolean;
+}
+
+/** A chat command of a module, as its handler gets it. */
+export interface ModuleCommandCall {
+  name: string;
+  /** What follows the name, trimmed. */
+  args: string;
+  /** The session the message is addressed to. */
+  sessionKey: string;
+  /** The agent of that session's delivery, when the route names one. */
+  agent?: string;
+  /** The flat conversation the session is a topic of, when it is one. */
+  conversation?: string;
+  origin: Origin;
+  env: InboundEnvelope;
+  input: InputRecord;
+}
+
+/**
+ * Answers a module's command: the reply goes back on the route the command came from, and nothing
+ * reaches the session (no turn). Undefined: not a command after all; the message goes on as usual.
+ */
+export type ModuleCommandHandler = (call: ModuleCommandCall) => Promise<{ ok: boolean; reply: string } | undefined>;
+
+/** What a module's click handler answers (`ModuleHooks.onAction`). */
+export type ModuleActionResult = { ok: true } | { ok: false; reason: string };
+
+/** A topic change, as a module's hook gets it. */
+export interface ModuleTopicChange {
+  conversation: string;
+  from?: Topic;
+  to: Topic;
+  /** `to` was just created. */
+  created: boolean;
+}
+
+/** How a turn ended (`turn.completed.status`). */
+export type ModuleTurnStatus = Extract<SessionEvent['body'], { t: 'turn.completed' }>['status'];
+
+/**
+ * What a module hooks into. Not served yet (see the file comment): a module that sets one fails to
+ * set up, naming it. Each says which feature it is for.
+ */
+export interface ModuleHooks {
+  /** An input no rule dispatched and no host took (a stranger's message to be asked about). */
+  onUndispatched?(a: { env: InboundEnvelope; origin: Origin; input: InputRecord }): void | Promise<void>;
+  /** Clicks on buttons whose action id starts with `prefix` (the stranger cards' `aio:stranger:`). */
+  onAction?: { prefix: string; handle(a: { actionId: string; env: InboundEnvelope; origin: Origin }): ModuleActionResult | undefined | Promise<ModuleActionResult | undefined> };
+  /** A turn ended (topic titles). */
+  onTurnCompleted?(a: { sessionKey: string; turnId: string; status: ModuleTurnStatus }): void;
+  /** A conversation's current topic changed. */
+  onTopicChanged?(c: ModuleTopicChange): void;
+  /** Who answers a turn's requests, before the local policy's resolver (asking the owner about a guest's turn). */
+  resolver?(ctx: TurnContext): Resolver | undefined;
+  /** The run of a session's next turn, over what the agent's policy planned (presets, the owner's overrides). */
+  planRun?(a: { sessionKey: string; run: RunSpec; draft: TurnDraft }): RunSpec;
+  /** The adapter a session's instance runs on instead of its own (a native terminal holding the session). */
+  harnessFor?(a: { sessionKey: string; instance: string }): HarnessAdapter | undefined;
+  /** A line the inputs of a current topic carry for the model (how to move between topics). */
+  inputHint?(agent: string | undefined): string | undefined;
+  /** Lines `/status` adds for a session. */
+  statusLines?(sessionKey: string): string[];
+  /** Identity map entries next to the configured ones (guests). */
+  identities?(): IdentityEntry[];
+}
+
+/** A local socket frame a module answers (`tui.attach`); not served yet. */
+export type ModuleFrameHandler = (frame: Record<string, unknown>, from: { origin: Origin; host: boolean }) => Promise<KernelOutcome>;
+
+/** What a module's `setup` returns: the handlers of what its manifest declares, and what it runs. */
+export interface ModuleInstance {
+  /** A handler for each of the manifest's `mcpTools`, by name (exactly those). */
+  tools?: Readonly<Record<string, ModuleToolHandler>>;
+  /** A handler for each of the manifest's `commands`, by name (exactly those). */
+  commands?: Readonly<Record<string, ModuleCommandHandler>>;
+  hooks?: ModuleHooks;
+  localFrames?: Readonly<Record<string, ModuleFrameHandler>>;
+  /** What the host's status (`GET /api/status` `modules[]`) shows of it; plain JSON. */
+  status?(): unknown;
+  /** After the host's channels and local socket run; throwing fails the start. */
+  start?(): Promise<void>;
+  /** When the host stops, in reverse registration order, before its channels and lanes; bounded by the host. */
+  stop?(): Promise<void>;
+}
+
+/**
+ * A module: the manifest the host reads without running anything, and `setup`, which builds the
+ * instance. `C` is what its config section resolves to.
+ */
+export interface ModuleManifest<C = unknown> {
+  /** Unique among the host's modules: lower-case ASCII letters, digits, `.`, `_` and `-`, starting with a letter or digit (`tools.watch`). */
+  readonly id: string;
+  readonly kind: ModuleKind;
+  /**
+   * What it needs: `module:<id>` (another registered module, on whenever this one is: a config
+   * error otherwise) or `kernel:<capability>` (one of `KernelContext`'s members, e.g.
+   * `kernel:topics`). Anything else fails the registration.
+   */
+  readonly needs?: readonly string[];
+  /** Its config section; without one the module is on whenever it is registered. */
+  readonly config?: ModuleConfig<C>;
+  /** `host.hello` features it adds while it runs (after the host's own); never one of the host's own. */
+  readonly features?: readonly string[];
+  readonly mcpTools?: readonly ModuleToolDef[];
+  readonly commands?: readonly ModuleCommandDef[];
+  /** Admin routes and console settings (G5's `AdminContribution`); not served for feature modules yet. */
+  readonly admin?: AdminContribution;
+  /**
+   * Build the instance, before the host builds its ingress (the host assembles the handlers
+   * first); `config` is what `config.resolve` returned (undefined without a section). The kernel
+   * context is late-bound: only `id` and `log` work during `setup`, the rest from `start` on.
+   * Acquire nothing here that `stop` would have to release: `start` runs it. Throwing fails the
+   * start.
+   */
+  setup(kernel: KernelContext, config: C): ModuleInstance | Promise<ModuleInstance>;
+}
+
+/** The result of a kernel request (the local socket's `result` frame). */
+export type KernelOutcome = { ok: true; value: unknown } | { ok: false; code: string; message: string };
+
+/** How a send through the kernel's outbox ended. */
+export interface KernelSendResult {
+  status: 'delivered' | 'rejected' | 'unknown';
+  /** The platform's message id, when delivered. */
+  providerMessageId?: string;
+  error?: string;
+}
+
+/** A prepared SQL statement (node:sqlite's `StatementSync` is one). */
+export interface KernelStatement {
+  run(...params: unknown[]): unknown;
+  get(...params: unknown[]): unknown;
+  all(...params: unknown[]): unknown[];
+}
+
+/** A SQL database (node:sqlite's `DatabaseSync` is one). */
+export interface KernelDatabase {
+  exec(sql: string): void;
+  prepare(sql: string): KernelStatement;
+}
+
+/**
+ * What a module gets of the kernel: narrow views of the host's core objects, each an existing
+ * capability of the host (nothing a built-in feature could not already do). Late-bound: only `id`
+ * and `log` work during `setup`; every other member throws until `setup` returned.
+ */
+export interface KernelContext {
+  /** The module's id. */
+  readonly id: string;
+  /** The host's log; messages get the prefix `module <id>: `. Messages never carry secrets. */
+  log(level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown): void;
+  /** A session's log from `fromSeq` (default 0), in seq order (the hub). */
+  events(sessionKey: string, fromSeq?: number): SessionEvent[];
+  /** The deployment's policy as lanes see it (a connected host's hooks over the local ones). */
+  readonly policy: Policy;
+  /** Small values of the module's own, kept across restarts (the host's records, under `module:<id>:`). */
+  readonly records: {
+    get(name: string): string | undefined;
+    /** Undefined removes it. */
+    set(name: string, value: string | undefined): void;
+  };
+  /**
+   * The session log's database (the daemon's SQLite file), shared with the host: name tables
+   * `module_<id>_…` (dots and dashes as `_`). In memory, lost at stop, when the log is not a SQLite file.
+   */
+  readonly db: KernelDatabase;
+  /** Topics of flat conversations. */
+  readonly topics: {
+    /** The topic a session is, if it is one. */
+    bySession(sessionKey: string): Topic | undefined;
+    /** The topics of the conversation a session is a topic of (newest activity first); empty when it is not one. */
+    siblings(sessionKey: string): Topic[];
+  };
+  /** The binding tables' router. */
+  readonly router: {
+    /** Who a channel identity is (the identity maps: the config's, a host's, the modules' extra entries). */
+    identify(a: IdentifyArgs): Promise<Identity>;
+    /** This module's extra identity map entries (replacing its earlier ones), below the configured and the host's. */
+    setExtraIdentities(entries: IdentityEntry[]): void;
+    /** A new topic of a flat conversation with an agent (current from now on); its id. */
+    newTopic(agent: string, conversation: string, title?: string): string;
+    /** The agent a flat conversation was switched to (`/agent`), if any. */
+    conversationAgent(conversation: string): string | undefined;
+  };
+  /** Sessions' lanes. */
+  readonly lanes: {
+    /** A lane is open for the session. */
+    has(sessionKey: string): boolean;
+    /** Open the session's lane (with this agent, for a new session). */
+    open(sessionKey: string, agent?: string): Promise<void>;
+    /** A client command (input, interrupt, resolve, …) to a session, as from `origin` (the policy decides as for any client). */
+    command(cmd: ClientCommand, origin: Origin): Promise<KernelOutcome>;
+  };
+  /** The running adapter that sends to a route (its channel and account), if any. */
+  channelFor(route: { channel: string; account: string }): ChannelAdapter | undefined;
+  /**
+   * Send a message on a route through the outbox: once per `operationId` (also across restarts),
+   * settled in `sessionKey`'s log. Undefined when no running channel sends to the route.
+   */
+  send(route: ReplyRoute, msg: RenderedMessage, a: { operationId: string; sessionKey: string; turnId?: string }): Promise<KernelSendResult | undefined>;
+  /** The owner's own chat with the deployment (no reply target), while known. */
+  ownerRoute(): ReplyRoute | null;
+  /**
+   * Deliver a held input to the session the binding table places it in (or `session` scope, or
+   * `agent`), with its original origin, as the host's `inbound.redispatch` does; `by` is recorded.
+   * Refused when it cannot be placed, or by the session's lane (`code: "refused"`, its reason).
+   */
+  redispatch(item: InboundItem, o: { by: string; session?: SessionScope; agent?: string }): Promise<{ ok: true; sessionKey: string; inputId: string } | { ok: false; code: string; message: string }>;
+  /** `aio explain`: a routing record, a side effect by operationId, or (`chain`) an agent input's chain. */
+  explain(inputId: string, chain?: boolean): KernelOutcome;
+  /** The connected host (the local socket's host role). */
+  readonly host: {
+    connected(): boolean;
+    /** It answers this policy callout (`route`, `resolve`, `review`, `outbound`, `contact`, `external`). */
+    answers(hook: string): boolean;
+  };
+}

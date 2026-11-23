@@ -4,11 +4,12 @@ import { dirname, join } from 'node:path';
 import type { TSchema } from '@sinclair/typebox';
 import { Value } from '@sinclair/typebox/value';
 import { ADMIN_REDACTED, type AdminConfigDocument, type AdminConfigPutResult, type AdminConfigValidation, type ChannelModule, type ConfigAccess, type ConfigIssue } from '@agents-io/protocol';
-import { builtinChannels, builtinHarnesses } from './bundle.js';
+import { builtinChannels, builtinHarnesses, builtinModules } from './bundle.js';
 import type { ChannelRegistry } from './channel-registry.js';
 import { ConfigError, configFileSchema, findEnvFile, resolveConfig, type Config } from './config.js';
 import { loadEnvFile } from './env-file.js';
 import type { HarnessRegistry } from './harness-registry.js';
+import type { ModuleRegistry } from './modules.js';
 
 /*
  * The config file as the console sees it (`GET/PUT /api/config`,
@@ -30,8 +31,8 @@ import type { HarnessRegistry } from './harness-registry.js';
  * bridge argument is visible to other local users). Validation is the startup
  * one (`resolveConfig` over the daemon's registries, with the env file read
  * afresh). Writes are atomic (temp file + fsync + rename) and 0600. The
- * daemon does not reload its config: a changed file
- * takes effect at the next start (`applied: "restart"`), except `channels`
+ * daemon does not reload its config: a changed file (a module's config
+ * section too) takes effect at the next start (`applied: "restart"`), except `channels`
  * with `console.liveChannels` (the gateway applies them and calls
  * `channelsApplied`).
  */
@@ -233,6 +234,8 @@ export interface ConfigStoreOptions {
   harnessRegistry?: HarnessRegistry;
   /** The channel types the file may name, and what they mark as credentials (default the built-in ones): the daemon's (`Gateway.channelRegistry`). */
   channelRegistry?: ChannelRegistry;
+  /** The feature modules whose config sections the file may have (default the built-in ones): the daemon's (`Gateway.moduleRegistry`). */
+  moduleRegistry?: ModuleRegistry;
 }
 
 export type PutOutcome =
@@ -249,10 +252,12 @@ export class ConfigStore implements ConfigAccess {
   private running: Record<string, unknown>;
   private readonly harnesses: HarnessRegistry;
   private readonly channels: ChannelRegistry;
+  private readonly modules: ModuleRegistry;
 
   constructor(private readonly o: ConfigStoreOptions) {
     this.harnesses = o.harnessRegistry ?? builtinHarnesses;
     this.channels = o.channelRegistry ?? builtinChannels;
+    this.modules = o.moduleRegistry ?? builtinModules;
     const raw = this.read().raw;
     this.running = raw && typeof raw === 'object' && !Array.isArray(raw) ? structuredClone(raw as Record<string, unknown>) : {};
   }
@@ -271,7 +276,7 @@ export class ConfigStore implements ConfigAccess {
 
   /** The startup resolution of `raw`, with the env file read afresh (throws `ConfigError`). */
   resolve(raw: Json): Config {
-    return resolveConfig(raw, { env: this.env(), baseDir: dirname(this.o.path), ...(this.o.cwd ? { cwd: this.o.cwd } : {}), harnessRegistry: this.harnesses, channelRegistry: this.channels });
+    return resolveConfig(raw, { env: this.env(), baseDir: dirname(this.o.path), ...(this.o.cwd ? { cwd: this.o.cwd } : {}), harnessRegistry: this.harnesses, channelRegistry: this.channels, moduleRegistry: this.modules });
   }
 
   get path(): string {
@@ -350,7 +355,7 @@ export class ConfigStore implements ConfigAccess {
   /** Schema issues (with paths), literal secrets, then the startup checks. */
   private check(raw: Json, kept: Set<string> | 'all'): ConfigIssue[] {
     const issues: ConfigIssue[] = [];
-    const file = configFileSchema(this.harnesses, this.channels);
+    const file = configFileSchema(this.harnesses, this.channels, this.modules);
     for (const e of Value.Errors(file, raw)) {
       issues.push({ path: e.path, code: 'schema', message: e.message, severity: 'error' });
       if (issues.length >= 20) break;

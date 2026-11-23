@@ -6,6 +6,7 @@ import { codexHarnessModule } from '@agents-io/harness-codex';
 import { ChannelRegistry } from './channel-registry.js';
 import { HarnessRegistry } from './harness-registry.js';
 import { moduleChannelModule, type ModuleChannelEntry } from './module-channel.js';
+import { ModuleRegistry } from './modules.js';
 
 /*
  * The composition root (docs/design/core-slimming §6): the built-in modules register here, and
@@ -31,6 +32,14 @@ export const builtinHarnesses = new HarnessRegistry([claudeCodeHarnessModule, co
 export const builtinChannels = new ChannelRegistry([larkBotChannelModule, mailChannelModule, bridgeChannelModule, moduleChannelModule], {
   defaultEvidence: { [larkBotChannelModule.type]: 'caps', [mailChannelModule.type]: 'caps' },
 });
+
+/**
+ * The built-in feature modules (core-slimming G6), in the order their tools, commands, features and
+ * status entries come after the kernel's own. None yet: the features that become modules (external
+ * MCP, topic titles, the watch / topic / live tools, strangers, owner commands and presets, the
+ * Claude Code terminal) still live in the gateway; each moves here as its own step.
+ */
+export const builtinModules = new ModuleRegistry([], { origin: 'builtin' });
 
 /** A built-in channel type's own keys, as written (`ChannelEntry` adds the keys every entry has). */
 export type BuiltinChannelEntry = LarkBotChannelEntry | MailChannelEntry | BridgeChannelEntry | ModuleChannelEntry;

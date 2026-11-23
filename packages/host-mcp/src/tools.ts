@@ -17,9 +17,12 @@ import {
   type Topic,
   type TurnContext,
   type TurnProvenance,
+  type ModuleToolDef,
+  type ModuleToolHandler,
   type Watch,
   type WatchDraft,
 } from '@agents-io/protocol';
+import { z } from 'zod';
 import type { DeliveryRecord, Hub, InboundRewrite, Outbox, Participant } from '@agents-io/session';
 import {
   CHOICE_KEY,
@@ -126,6 +129,43 @@ export interface HostToolsOptions {
   topics?: TopicControl;
   /** Live (realtime voice) control (decision 11); absent = no live_* tools. */
   live?: LiveControl;
+  /**
+   * Tools of the host's active modules (core-slimming G6), offered after the kernel's own, in
+   * this order; a module that is off is not here. Names are unique and none is a kernel tool's.
+   */
+  modules?: readonly ModuleTools[];
+}
+
+/** One module's tools: what the endpoint lists (`ModuleManifest.mcpTools`) and what runs them (`ModuleInstance.tools`). */
+export interface ModuleTools {
+  /** The module's id. */
+  module: string;
+  tools: readonly ModuleToolDef[];
+  /** A handler for each of `tools`, by name. */
+  handlers: Readonly<Record<string, ModuleToolHandler>>;
+}
+
+/** A module's tool as the endpoint lists it: its input schema as zod (what the MCP SDK registers). */
+export interface ModuleToolEntry {
+  module: string;
+  name: string;
+  description: string;
+  input: z.ZodType;
+  readOnly: boolean;
+}
+
+/**
+ * A module tool's input (`ModuleToolDef.input`, a JSON Schema object) as the zod schema the MCP
+ * endpoint registers and checks calls against. Throws when it is not an object schema zod can read.
+ */
+export function moduleToolInput(def: Pick<ModuleToolDef, 'name' | 'input'>): z.ZodType {
+  const t = (def.input as { type?: unknown } | undefined)?.type;
+  if (t !== 'object') throw new Error(`tool ${JSON.stringify(def.name)}: input must be a JSON Schema object (type "object")`);
+  try {
+    return z.fromJSONSchema(def.input as Parameters<typeof z.fromJSONSchema>[0]);
+  } catch (e) {
+    throw new Error(`tool ${JSON.stringify(def.name)}: input is not a JSON Schema the endpoint can read: ${(e as Error).message}`);
+  }
 }
 
 /** What the live_* tools need from the host (decision 11). */
@@ -229,9 +269,25 @@ function currentRoute(turn: TurnContext): ReplyRoute | null {
 export class HostTools {
   private readonly choices = new Map<string, ChoiceRecord>();
   private readonly eventOnly: Set<string>;
+  /** The active modules' tools by name, in catalog order (`HostToolsOptions.modules`). */
+  private readonly moduleTools = new Map<string, { entry: ModuleToolEntry; def: ModuleToolDef; handler: ModuleToolHandler }>();
 
   constructor(private readonly o: HostToolsOptions) {
     this.eventOnly = new Set(o.eventOnlyChannels ?? ['local']);
+    for (const m of o.modules ?? []) {
+      for (const def of m.tools) {
+        if (this.moduleTools.has(def.name)) throw new Error(`module ${m.module}: tool ${JSON.stringify(def.name)} is also module ${this.moduleTools.get(def.name)!.entry.module}'s`);
+        const handler = m.handlers[def.name];
+        if (typeof handler !== 'function') throw new Error(`module ${m.module}: tool ${JSON.stringify(def.name)} has no handler`);
+        const entry: ModuleToolEntry = { module: m.module, name: def.name, description: def.description, input: moduleToolInput(def), readOnly: def.readOnly === true };
+        this.moduleTools.set(def.name, { entry, def, handler });
+      }
+    }
+  }
+
+  /** The active modules' tools, in the order the endpoint lists them (after the kernel's). */
+  moduleCatalog(): ModuleToolEntry[] {
+    return [...this.moduleTools.values()].map((t) => t.entry);
   }
 
   /**
@@ -266,6 +322,8 @@ export class HostTools {
   async call(b: ToolBinding, name: string, args: Record<string, unknown>, meta: CallMeta = {}): Promise<string> {
     if (name === 'watch_add' || name === 'watch_remove' || name === 'watch_list') return json(await this.watchTool(b, name, args));
     if (name === 'session_list') return json(this.sessionList(b));
+    const mod = this.moduleTools.get(name);
+    if (mod && mod.def.needsTurn === false) return json(await this.moduleTool(mod.handler, { sessionKey: b.sessionKey, args }));
     const turn = this.o.turn(b.sessionKey);
     if (!turn) throw new ToolError('no turn is running in this session: output tools only work while you are answering a message');
     const key = meta.toolCallId ?? `g${b.generation}:${turn.turnId}:rpc${meta.requestId ?? Math.random().toString(36).slice(2)}`;
@@ -290,7 +348,20 @@ export class HostTools {
       case 'live_leave':
         return json(await this.liveTool(b, turn, name, args, operationId));
       default:
+        if (mod) return json(await this.moduleTool(mod.handler, { sessionKey: b.sessionKey, turn, args, operationId }));
         throw new ToolError(`unknown tool ${name}`);
+    }
+  }
+
+  /** Run a module's tool (`ModuleToolHandler`): its result as JSON (`null` for undefined); an error named `ToolError` is the model's to read. */
+  private async moduleTool(handler: ModuleToolHandler, c: Parameters<ModuleToolHandler>[0]): Promise<unknown> {
+    try {
+      const r = await handler(c);
+      return r === undefined ? null : r;
+    } catch (e) {
+      if (e instanceof ToolError) throw e;
+      if (e instanceof Error && e.name === 'ToolError') throw new ToolError(e.message);
+      throw e;
     }
   }
 

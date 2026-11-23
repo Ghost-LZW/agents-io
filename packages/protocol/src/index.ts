@@ -17,5 +17,6 @@ export * from './watch.js';
 export * from './topic.js';
 export * from './admin.js';
 export * from './admin-module.js';
+export * from './module.js';
 export * from './validate.js';
 export * from './preface.js';

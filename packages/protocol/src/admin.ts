@@ -117,6 +117,18 @@ export const AdminAgent = Type.Object({
 });
 export type AdminAgent = Static<typeof AdminAgent>;
 
+/** A registered feature module (`ModuleManifest`, core-slimming G6). */
+export const AdminModule = Type.Object({
+  id: Type.String(),
+  /** Shipped with the daemon (`builtin`), or someone else's (`module`). */
+  origin: Type.Union([Type.Literal('builtin'), Type.Literal('module')]),
+  /** On for this run (its config section, an alias, or its default); a module that is off has no tools, commands or features. */
+  enabled: Type.Boolean(),
+  /** What the module shows of itself (`ModuleInstance.status`), while it runs. */
+  status: Type.Optional(Type.Unknown()),
+});
+export type AdminModule = Static<typeof AdminModule>;
+
 /** `GET /api/status`. */
 export const AdminStatus = Type.Object({
   /** Daemon package version. */
@@ -139,6 +151,8 @@ export const AdminStatus = Type.Object({
   queue: Type.Object({ head: Type.Number() }),
   /** The external MCP endpoint (config `externalMcp`), when it is listening: its URL and client names (never tokens). */
   externalMcp: Type.Optional(Type.Object({ url: Type.String(), clients: Type.Array(Type.String()) })),
+  /** The registered feature modules, in registration order (daemons before core-slimming G6 do not send it). */
+  modules: Type.Optional(Type.Array(AdminModule)),
 });
 export type AdminStatus = Static<typeof AdminStatus>;
 
