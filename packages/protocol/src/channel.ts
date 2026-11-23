@@ -49,9 +49,16 @@ export const ChannelCaps = Type.Object({
       previewDelayMs: Type.Optional(Type.Number()),
       /** Answer text does not open the first message before `openDelayMs`. */
       holdAnswerUntilOpen: Type.Optional(Type.Boolean()),
-      /** When the delay is above 0 and expires, wait for answer text instead of opening an empty card. */
+      /**
+       * When the delay is above 0 and expires, wait for answer text instead of opening an empty card
+       * (the preview shows the turn meanwhile). Only for an adapter with `previewProgress`; a JSONL
+       * bridge has none, so its peer's is ignored.
+       */
       requireAnswerToOpen: Type.Optional(Type.Boolean()),
-      /** A Stop control on the streaming reply (default true); off where the preview carries it. */
+      /**
+       * A Stop control on the streaming reply (default true); off where the preview carries it. Only
+       * an adapter with `previewProgress` can turn it off; a JSONL bridge's peer cannot.
+       */
       interruptButton: Type.Optional(Type.Boolean()),
     }),
   ),

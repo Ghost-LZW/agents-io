@@ -2447,6 +2447,9 @@ ${a.summary}` }],
     const { adapter, tier, account } = ch;
     // The channel says how its replies are paced (ChannelCaps.pacing); the entry overrides the delays.
     const pacing = adapter.caps(account).pacing;
+    // What the process preview carries (the Stop control, the working state before answer text) only
+    // where the adapter has one: a JSONL bridge's peer can declare Lark's pacing, but no preview crosses it.
+    const preview = typeof adapter.previewProgress === 'function';
     const openDelayMs = ch.source?.openDelayMs ?? pacing?.openDelayMs;
     const previewDelayMs = ch.source?.previewDelayMs ?? pacing?.previewDelayMs;
     const ack = ch.source?.ack;
@@ -2463,9 +2466,9 @@ ${a.summary}` }],
       ...(openDelayMs !== undefined ? { openDelayMs } : {}),
       ...(previewDelayMs !== undefined ? { previewDelayMs } : {}),
       ...(pacing?.holdAnswerUntilOpen ? { holdAnswerUntilOpen: true } : {}),
-      ...(pacing?.requireAnswerToOpen && (openDelayMs ?? 0) > 0 ? { requireAnswerToOpen: true } : {}),
+      ...(pacing?.requireAnswerToOpen && preview && (openDelayMs ?? 0) > 0 ? { requireAnswerToOpen: true } : {}),
       ...(ack ? { ack: { doneAfterMs: (typeof ack === 'object' ? ack.doneAfterMs : undefined) ?? 60_000 } } : {}),
-      interruptButton: pacing?.interruptButton ?? true,
+      interruptButton: preview ? (pacing?.interruptButton ?? true) : true,
       // Cards of a topic session carry the topic's title (Lark: the card header).
       title: () => this.topics.bySession(sessionKey)?.title,
       onError: (err) => this.log('warn', `render to ${adapter.id} failed: ${(err as Error).message}`),
