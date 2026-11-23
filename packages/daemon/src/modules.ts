@@ -18,7 +18,10 @@ import type {
   KernelInputResult,
   KernelLaneHarness,
   KernelOutcome,
+  KernelPreset,
+  KernelRunOverrides,
   KernelSendResult,
+  KernelSessionRun,
   KernelSettledSend,
   KernelUnwatchResult,
   KernelWatchResult,
@@ -65,8 +68,9 @@ import { TokenError } from './token.js';
  * A module that is off does not exist for the deployment: no tools, no commands, no features.
  * The hooks the daemon serves are called from when the gateway is built: `onTurnCompleted` until
  * step 4; `inputHint`, `resolver` (pure answers for an input being routed, a request being
- * opened), `onUndispatched` and `onAction` (inputs, which come in until late in the daemon's stop)
- * to the end; `identities` once, right after the gateway is built and before its channels run.
+ * opened), `statusLines` (a `/status` being answered), `onUndispatched` and `onAction` (inputs,
+ * which come in until late in the daemon's stop) to the end; `identities` once, right after the
+ * gateway is built and before its channels run.
  */
 
 /** A module as registered: its manifest and where it comes from. */
@@ -122,7 +126,7 @@ export interface ModuleRegistryOptions {
 /** What `kernel:<capability>` may name in `ModuleManifest.needs`: the members of `KernelContext`. */
 export const KERNEL_CAPABILITIES: readonly string[] = [
   'log', 'events', 'head', 'appendNative', 'sessions', 'status', 'stopping', 'policy', 'records', 'db', 'topics', 'watches', 'live', 'agents',
-  'router', 'lanes', 'channelFor', 'resolveRoute', 'send', 'settled', 'outbound', 'owner', 'ownerRoute', 'redispatch', 'explain', 'host',
+  'router', 'lanes', 'runConfig', 'channelFor', 'resolveRoute', 'send', 'settled', 'outbound', 'owner', 'ownerRoute', 'redispatch', 'explain', 'host',
 ];
 
 const MODULE_ID = /^[a-z0-9][a-z0-9._-]*$/;
@@ -186,8 +190,14 @@ function badManifest(m: ModuleManifest<any>): string | undefined {
     if (!Array.isArray(m.commands)) return 'commands must be an array';
     for (const x of m.commands) {
       if (!isObject(x) || typeof x.name !== 'string' || !COMMAND_NAME.test(x.name)) return `commands: ${JSON.stringify(isObject(x) ? x.name : x)} is not a command name (lower-case ASCII letters, digits, _ and -, starting with a letter)`;
-      if (KERNEL_COMMAND_NAMES.includes(x.name)) return `commands: /${x.name} is a kernel command`;
+      if (x.aliases !== undefined && !Array.isArray(x.aliases)) return `commands: /${x.name}: aliases must be an array of command names`;
+      for (const n of [x.name, ...((x.aliases ?? []) as unknown[])]) {
+        if (typeof n !== 'string' || !COMMAND_NAME.test(n)) return `commands: /${x.name}: alias ${JSON.stringify(n)} is not a command name (lower-case ASCII letters, digits, _ and -, starting with a letter)`;
+        if (KERNEL_COMMAND_NAMES.includes(n)) return `commands: /${n} is a kernel command`;
+      }
       if (!nonEmpty(x.help)) return `commands: /${x.name} needs a help line`;
+      if (x.helpBefore !== undefined && (typeof x.helpBefore !== 'string' || !KERNEL_COMMAND_NAMES.includes(x.helpBefore)))
+        return `commands: /${x.name}: helpBefore ${JSON.stringify(x.helpBefore)} is not a kernel command (${KERNEL_COMMAND_NAMES.join(', ')})`;
       if (!optBool(x.ownerOnly)) return `commands: /${x.name}: ownerOnly is a boolean`;
     }
   }
@@ -257,7 +267,7 @@ export class ModuleRegistry {
       }
       for (const f of m.features ?? []) claim(`feature ${f}`, m.id);
       for (const t of m.mcpTools ?? []) claim(`tool ${t.name}`, m.id);
-      for (const c of m.commands ?? []) claim(`command /${c.name}`, m.id);
+      for (const c of m.commands ?? []) for (const n of [c.name, ...(c.aliases ?? [])]) claim(`command /${n}`, m.id);
       this.byId.set(m.id, { manifest: m, origin: r.origin });
     }
     for (const { manifest: m } of this.byId.values()) {
@@ -365,7 +375,7 @@ interface Running {
 }
 
 /** Hook members the daemon serves (functions, but `onAction`: `{ prefix, handle }`): any other a module sets fails its setup. */
-const SERVED_HOOKS: readonly string[] = ['onTurnCompleted', 'inputHint', 'onUndispatched', 'onAction', 'resolver', 'identities'];
+const SERVED_HOOKS: readonly string[] = ['onTurnCompleted', 'inputHint', 'onUndispatched', 'onAction', 'resolver', 'identities', 'statusLines'];
 
 /** What is wrong with what `setup` returned (the first thing), or undefined. */
 function badInstance(m: ModuleManifest<any>, i: ModuleInstance): string | undefined {
@@ -677,6 +687,28 @@ export class ModuleHost {
     return lines.length ? lines.join('\n') : undefined;
   }
 
+  /**
+   * The lines `/status` shows for a session after the line of what it runs
+   * (`ModuleHooks.statusLines`): the set-up modules' lines, in registration order. Asked also
+   * while the daemon stops (commands are answered then). A hook that throws, or answers anything
+   * but an array, is logged and gives no line; entries that are not strings are left out.
+   */
+  statusLines(sessionKey: string): string[] {
+    const lines: string[] = [];
+    for (const m of this.active()) {
+      const hook = m.instance!.hooks?.statusLines;
+      if (!hook) continue;
+      try {
+        const got: unknown = hook(sessionKey);
+        if (!Array.isArray(got)) throw new Error('statusLines must return an array of lines');
+        for (const line of got) if (typeof line === 'string') lines.push(line);
+      } catch (e) {
+        this.o.log('warn', `module ${m.r.manifest.id}: statusLines failed: ${(e as Error)?.message ?? String(e)}`);
+      }
+    }
+    return lines;
+  }
+
   /** Step 4: stop the started modules in reverse order, each bounded (`MODULE_STOP_MS`); failures are logged. Their hooks are no longer called. */
   async stop(): Promise<void> {
     this.stopping = true;
@@ -736,11 +768,15 @@ export interface KernelBackend {
   leaveLive(sessionKey: string): Promise<boolean>;
   /** The tools an agent's sessions are offered (`KernelContext.agents.tools`). */
   agentTools(agent: string | undefined): string[];
+  /** The agents a chat may talk to (`KernelContext.agents.names`). */
+  agentNames(): string[];
   identify(a: IdentifyArgs): Identity;
   /** One owner's extra identity entries (a module's, by id), merged with the others'. */
   setExtraIdentities(owner: string, entries: IdentityEntry[]): void;
   newTopic(agent: string, conversation: string, title: string | undefined): string;
   conversationAgent(conversation: string): string | undefined;
+  /** Throws for an agent a chat may not talk to. */
+  setConversationAgent(conversation: string, agent: string): void;
   record(e: RouteExplanation & { at: number }): void;
   hasLane(sessionKey: string): boolean;
   openLane(sessionKey: string, agent: string | undefined): Promise<void>;
@@ -749,6 +785,12 @@ export interface KernelBackend {
   laneInput(sessionKey: string, input: InputRecord, mode: 'queue' | 'steer' | 'interrupt'): Promise<KernelInputResult>;
   /** What a module (`module`: its id, which names the ephemeral turn's session, profile and input) may run beside the lane (`KernelContext.lanes.harness`). */
   laneHarness(sessionKey: string, module: string): KernelLaneHarness | undefined;
+  /** What a session's next turn runs, and what is set for it (`KernelContext.runConfig`). */
+  sessionRun(sessionKey: string): KernelSessionRun;
+  /** Throws for a preset that is not configured. */
+  setSessionRun(sessionKey: string, o: KernelRunOverrides): void;
+  presets(): KernelPreset[];
+  offering(cap: 'plan' | 'ownerProfileSwitch'): string[];
   channelFor(route: { channel: string; account: string }): ChannelAdapter | undefined;
   resolveRoute(route: ReplyRoute): { ok: true; route: ReplyRoute } | { ok: false; message: string };
   send(route: ReplyRoute, msg: RenderedMessage, a: { operationId: string; sessionKey: string; turnId?: string; external?: ExternalSender }): Promise<KernelSendResult | undefined>;
@@ -824,6 +866,7 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
       leave: async (sessionKey) => live().leaveLive(sessionKey),
     },
     agents: {
+      names: () => [...live().agentNames()],
       tools: (agent) => live().agentTools(agent),
     },
     router: {
@@ -831,6 +874,7 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
       setExtraIdentities: (entries) => live().setExtraIdentities(`module:${id}`, entries),
       newTopic: (agent, conversation, title) => live().newTopic(agent, conversation, title),
       conversationAgent: (conversation) => live().conversationAgent(conversation),
+      setConversationAgent: (conversation, agent) => live().setConversationAgent(text(conversation, 'router.setConversationAgent: conversation'), text(agent, 'router.setConversationAgent: agent')),
       record: (e) => live().record(e),
     },
     lanes: {
@@ -857,6 +901,15 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
         };
       },
     },
+    runConfig: {
+      get: (sessionKey) => live().sessionRun(sessionKey),
+      set: (sessionKey, o) => live().setSessionRun(sessionKey, runOverrides(id, o)),
+      presets: () => live().presets(),
+      offering: (cap) => {
+        if (cap !== 'plan' && cap !== 'ownerProfileSwitch') throw new Error(`module ${id}: runConfig.offering: ${JSON.stringify(cap)} is neither plan nor ownerProfileSwitch`);
+        return live().offering(cap);
+      },
+    },
     channelFor: (route) => live().channelFor(route),
     resolveRoute: (route) => live().resolveRoute(route),
     send: (route, msg, a) => live().send(route, msg, a),
@@ -877,4 +930,21 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
       isToken: (token) => live().isHostToken(token),
     },
   };
+}
+
+/** Only what `KernelContext.runConfig.set` may say: its untyped code passes nothing else on. */
+function runOverrides(id: string, o: KernelRunOverrides): KernelRunOverrides {
+  if (!isObject(o)) throw new Error(`module ${id}: runConfig.set takes an object`);
+  const bad = (k: string, what: string): never => {
+    throw new Error(`module ${id}: runConfig.set: ${k} must be ${what}`);
+  };
+  const out: KernelRunOverrides = {};
+  for (const k of ['preset', 'model', 'effort'] as const) {
+    const v = o[k];
+    if (v === undefined) continue;
+    out[k] = v === null || nonEmpty(v) ? v : bad(k, 'a non-empty string or null');
+  }
+  if (o.mode !== undefined) out.mode = o.mode === 'default' || o.mode === 'plan' ? o.mode : bad('mode', '"default" or "plan"');
+  if (o.profile !== undefined) out.profile = o.profile === null || o.profile === 'bypass' || o.profile === 'restricted' ? o.profile : bad('profile', '"bypass", "restricted" or null');
+  return out;
 }

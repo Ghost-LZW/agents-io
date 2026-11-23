@@ -48,7 +48,10 @@ see `docs/E2E.md` §0). New:
   opens its own harness session (it has not seen what was said on the previous one;
   switching back resumes that one) with the agent's cwd, instructions and tools; the
   permission profile does not change with the preset. `default` is not a preset name.
-  See `docs/E2E.md` (预设).
+  See `docs/E2E.md` (预设). The chat commands that change what a session runs (`/agent`,
+  `/preset`, `/model`, `/effort`, `/plan`, `/bypass`, `/compact`) are the built-in module
+  `owner-commands`, on unless `ownerCommands: { "enabled": false }` (then they are ordinary
+  messages); what they set and the presets themselves are the daemon's.
 - An **agent** is a named run configuration: harness instance (or `preset`), `model`, `effort`,
   `profile`, `cwd`, `tools` (mount the host MCP output tools; default top-level
   `outputTools`, which defaults to **false** since 2026-10-11: turn tools on per
@@ -530,8 +533,9 @@ aio console-link                                              (one-time console 
 A feature of the daemon can be a module: a `ModuleManifest` (`@agents-io/protocol`,
 `module.ts`) registered in a `ModuleRegistry` by the composition root (`bundle.ts`
 `builtinModules`, origin `builtin`; so far the topic titles, `topic-title`, the watch, live and
-topic tools, `tools.watch`, `tools.live`, `tools.topics`, the stranger approval, `strangers`, and
-the external MCP endpoint, `external-mcp`). A third
+topic tools, `tools.watch`, `tools.live`, `tools.topics`, the stranger approval, `strangers`, the
+owner's run-config chat commands, `owner-commands`, and the external MCP endpoint,
+`external-mcp`). A third
 party's module has the same shape (origin `module`). The manifest says, without running anything:
 
 - `id` (`tools.watch`), `kind: 'feature'`, `needs` (`module:<id>`: another registered module,
@@ -549,7 +553,11 @@ party's module has the same shape (origin `module`). The manifest says, without 
   any other; the sections come before `local` in the file schema;
 - `features` (`host.hello` features, advertised after the kernel's while the module runs),
   `mcpTools` (model tools: name, description, a JSON Schema object `input`, `readOnly`,
-  `needsTurn`), `commands` (chat commands: name, `/help` line, `ownerOnly`, default true);
+  `needsTurn`), `commands` (chat commands: name, `aliases` (other names running the same
+  handler under its one `/help` line), `/help` line, `helpBefore` (a kernel command whose line
+  it comes right before; default after the kernel's lines), `ownerOnly`, default true; the
+  handler's call has `compact()`, which queues the session harness's own compaction command as
+  the command's message, the one text the kernel marks `nativeCommand`);
 - `setup(kernel, config)`, which returns the `ModuleInstance`: a handler per tool and per
   command, `features()` (which of its features it advertises now; default all while it runs),
   `status()`, `start()`, `stop()`, and the hooks `onTurnCompleted({ sessionKey, turnId, status })`:
@@ -573,7 +581,11 @@ party's module has the same shape (origin `module`). The manifest says, without 
   so the request is denied); and `identities()`: the module's identity entries, asked once right
   after the gateway is built and before its channels run (a throw or anything but identity entries
   fails the start), below the configured identities and a host's map, replaced later by its
-  `router.setExtraIdentities`. All four are served from when the gateway is built to the end.
+  `router.setExtraIdentities`. All four are served from when the gateway is built to the end;
+  and `statusLines(sessionKey)`: lines `/status` shows right after the line of what the session
+  runs (agent, harness, model), before its working directory, the modules' in registration
+  order (a throw or anything but an array is logged as `module <id>: statusLines failed: …` and
+  gives none; entries that are not strings are left out), served to the end.
 
 The registry checks every manifest and what they claim together (ids; config sections and
 aliases; tools, commands and features are each one module's and never the kernel's). Its option
@@ -612,8 +624,9 @@ not there at all): the model tool catalog (`toolCatalog`: the kernel's six tools
 `KERNEL_TOOL_NAMES`, in `TOOL_DEFS` order, then the modules'; `agents.<name>.tools` may list a
 module's tool while it is on, and naming one of a module that is off is a config error saying
 which module, `"watch_add" is a tool of module tools.watch, which is off`), the chat command
-table (`/help` lists the kernel's commands, then the modules'; the `/name` of a module that is
-off is an ordinary message), the `host.hello` features, and `GET /api/status` `modules`
+table (`/help` lists the kernel's commands, then the modules', a module command with
+`helpBefore` right before that kernel command's line; the `/name` of a module that is off is an
+ordinary message), the `host.hello` features, and `GET /api/status` `modules`
 (`[{ id, origin, enabled, status? }]`, every registered module). With no module the tool list,
 `/help`, the features and the error texts are byte for byte what they were before.
 
@@ -631,9 +644,10 @@ in the session, refused for any other turn, under TP-1 whoever calls: once per t
 never a message just handed here, never to the turn's own topic), `watches` (`add`, `remove`, `list`: as the session's agent,
 `agentOrigin`, a watch always delivering into the session; `Policy.watch` decides), `live`
 (`join(sessionKey, turnId, a)`, `say`, `leave`: the kernel's live mechanism, decision 16; a join
-only for the turn running in the session), `agents` (`tools(agent)`: the tools an agent's
+only for the turn running in the session), `agents` (`names()`: the agents a chat may talk to,
+not task agents; `tools(agent)`: the tools an agent's
 sessions are offered, its list or for `tools: true` the endpoint's whole catalog), `router` (`identify`, its own `setExtraIdentities`, `newTopic`,
-`conversationAgent`, `record`: an input's routing record), `lanes` (`has`, `open`, `command`,
+`conversationAgent`, `setConversationAgent` (`/agent`; an unknown or task agent throws), `record`: an input's routing record), `lanes` (`has`, `open`, `command`,
 `input`: a peer's input the module stamped, any other origin kind is refused; `harness`: what the
 module may run beside a configured agent's open lane, `{ ephemeral(turnId), ephemeralTurn({ turnId,
 prompt, instructions }) }`, undefined for a task run's or the unconfigured default agent's: one
@@ -643,7 +657,14 @@ gets the harness adapter: the kernel sets the turn's session (a throwaway one, i
 working directory, none of the host's tools), its run (that turn's, at low effort in the default
 mode, under a read-only profile named after the module that never asks) and its one input (the
 kernel's, `via` the module's id); the module gives only the prompt and the instructions, and
-anything else it passes is dropped), `channelFor`, `resolveRoute`, `send`
+anything else it passes is dropped), `runConfig` (`get(sessionKey)`: what the session's next
+turn runs, the instance, what its adapter declares (`compact`, Plan mode, the owner's profile
+switch) and the run with what is set for the session over the agent's; `set(sessionKey, o)`:
+set or clear (`null`) the session's preset (a configured one), model, effort, mode and owner
+profile from its next turn, only those keys and values; `presets()`; `offering(cap)`: the
+configured instances declaring Plan mode or the profile switch, by display name, else the
+registered kinds that do. The daemon keeps what is set (its records, `run:<sessionKey>`) and
+applies it over the agent's policy's plan whether or not a module is on), `channelFor`, `resolveRoute`, `send`
 (through the outbox; `external` names the client outside the daemon it sends for, kept in the
 in-flight mark, EX-8), `settled`, `outbound` (the outbound check of a send that is no turn's
 reply, DL-6), `owner` (the owner's principals, `policy.owners` and `AGENTS_IO_OWNERS`, and the
@@ -671,11 +692,22 @@ its identities, and a guest's turn asks the owner (`resolver`). Its tables keep 
 (`daemon_stranger_asks`, `daemon_guests`), so guests and open asks carry over. A channel whose
 adapter declares `ChannelCaps.openInbox` (mail: anyone may write to it) is never asked about.
 
+The owner's run-config chat commands (`src/owner-commands.ts`, `ownerCommandsModule`) are such a
+module over the command table and `statusLines`: `/agent` (`agents.names`,
+`router.setConversationAgent`), `/preset`, `/model` and its alias `/effort`, `/plan`, `/bypass`
+(`runConfig`), `/compact` (the call's `compact()`) and the `/status` line `Plan mode … · bypass …`,
+their `/help` lines before `/tui`'s (`helpBefore`), every reply as when the kernel answered them.
+On unless `ownerCommands: { enabled: false }` (its section, only `enabled`): off, the seven are
+ordinary messages and `/status` has no Plan line, while what was set keeps applying. The presets
+as configured (`presets`, an agent's `preset`, `run.start` `overrides.preset`), the store of what
+is set, `Policy.plan` with it applied (`withRunOverride`) and the IO-control commands (`/help`,
+`/status`, `/stop`, `/steer`, `/answer`, `/new`, `/topics`, `/switch`, `/tui`) stay the kernel's.
+
 Not served yet: `ModuleManifest.admin` (registering a module with it fails), and of the
-instance the other `hooks` (`onTopicChanged`, `planRun`, `harnessFor`, `statusLines`) and
-`localFrames` (setting one fails the setup, naming it; a hook that is not a function too). They
-are the seams the features that move into modules next need (owner commands and presets, the
-Claude Code terminal); each is served with the move that needs it. A module
+instance the other `hooks` (`onTopicChanged`, `planRun`, `harnessFor`) and `localFrames`
+(setting one fails the setup, naming it; a hook that is not a function too). They are the seams
+the feature that moves into a module next needs (the Claude Code terminal); each is served with
+the move that needs it. A module
 section's strings are redacted by the console's general rule (a secret-looking key); `x-credential`
 marks in a module's schema are not read yet.
 
@@ -953,3 +985,25 @@ What changed for embedders with core-slimming G6 step 4 (the stranger approval i
   log lines carry the `module strangers: ` prefix, and a failure while handling a stranger's
   message is logged as `module strangers: onUndispatched failed: …` (it was
   `topic command reply failed: …`).
+
+What changed for embedders with core-slimming G6 step 5 (the owner's run-config commands are a module):
+
+- `builtinModules` registers `owner-commands` (`ownerCommandsModule`, `src/owner-commands.ts`)
+  after `strangers` and before `external-mcp`. Its section is `ownerCommands` (only `enabled`;
+  absent means on, so existing configs have the commands; `{ "enabled": false }` turns them into
+  ordinary messages). `ConfigFile` has it after `strangers`; `GET /api/status` `modules` lists
+  it. `KERNEL_COMMANDS` / `KERNEL_COMMAND_NAMES` / `COMMAND_HELP` are the kernel's alone now
+  (`/help`, `/status`, `/stop`, `/steer`, `/answer`, `/new`, `/topics`, `/switch`, `/tui`): an
+  embedder that gives `Gateway.start` a `ModuleRegistry` of its own has `/agent`, `/preset`,
+  `/model`, `/effort`, `/plan`, `/bypass` and `/compact` only when it registers the module
+  (start from `builtinModules.modules`), and a module of its own may now take one of those names
+  when it does not.
+- New: `ModuleCommandDef.aliases` and `helpBefore`, `ModuleCommandCall.compact()`, the hook
+  `statusLines` (served), `KernelContext.runConfig` (`KernelSessionRun`, `KernelRunOverrides`,
+  `KernelPreset` in `@agents-io/protocol`), `KernelContext.agents.names`,
+  `KernelContext.router.setConversationAgent`, `ModuleHost.statusLines`; `KERNEL_CAPABILITIES`
+  has `runConfig`; `OwnerCommandsSection` from `bundle.ts`. `KernelBackend` gains `agentNames`,
+  `setConversationAgent`, `sessionRun`, `setSessionRun`, `presets` and `offering` (required, so
+  this breaks an embedder that implements it; one that only uses `Gateway` changes nothing).
+- `/help`, `/status` and every reply of these commands are byte for byte as before; what a
+  session has set (`run:<sessionKey>` in the records) is kept and applied as before.

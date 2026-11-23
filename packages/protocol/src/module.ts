@@ -27,12 +27,12 @@ import type { Watch } from './watch.js';
  * In progress: the daemon reads the manifest (`id`, `kind`, `needs`, `config`, `features`,
  * `mcpTools`, `commands`, `setup`) and, of the instance, `tools`, `commands`, `features`,
  * `status`, `start`, `stop` and the hooks `onTurnCompleted`, `inputHint`, `onUndispatched`,
- * `onAction`, `resolver` and `identities`. `admin`, the other `hooks` and `localFrames` are the
- * contract the features that move into modules next need (G6 steps 5-6); until the daemon serves
- * one, a module that sets it fails to register (`admin`) or to set up (`hooks.<name>`,
- * `localFrames`), naming it, rather than being silently ignored. The built-in modules are the
- * topic titles (step 2), the watch, live and topic tools (step 3), the stranger approval (step 4)
- * and the external MCP endpoint (step 1).
+ * `onAction`, `resolver`, `identities` and `statusLines`. `admin`, the other `hooks` and
+ * `localFrames` are the contract the feature that moves into a module next needs (G6 step 6);
+ * until the daemon serves one, a module that sets it fails to register (`admin`) or to set up
+ * (`hooks.<name>`, `localFrames`), naming it, rather than being silently ignored. The built-in
+ * modules are the topic titles (step 2), the watch, live and topic tools (step 3), the stranger
+ * approval (step 4), the owner's run-config commands (step 5) and the external MCP endpoint (step 1).
  */
 
 /** Where a registered module comes from: shipped with the host (`builtin`), or someone else's (`module`). */
@@ -145,8 +145,20 @@ export type ModuleToolHandler = (call: ModuleToolCall) => unknown | Promise<unkn
 export interface ModuleCommandDef {
   /** The name after `/`: lower-case ASCII letters, digits, `_` and `-`, starting with a letter; never one of the host's own commands. */
   readonly name: string;
-  /** Its line in `/help` (`/name [args] — what it does`), after the host's own lines. */
+  /**
+   * Other names that run the same command, with the same handler (`ModuleCommandCall.name` is the
+   * one typed): names as `name` is, one module's each. Its one `/help` line covers them
+   * (`/model [name], /effort [level] — …`).
+   */
+  readonly aliases?: readonly string[];
+  /** Its line in `/help` (`/name [args] — what it does`), after the host's own lines (unless `helpBefore`). */
   readonly help: string;
+  /**
+   * One of the host's own commands (`tui`) whose `/help` line its line comes right before, instead
+   * of after all of the host's own lines; the lines placed before the same command keep the
+   * modules' registration order.
+   */
+  readonly helpBefore?: string;
   /** Only who may operate the session (`Policy.control`, the owner) runs it; anyone else's `/name` is an ordinary message (default true). */
   readonly ownerOnly?: boolean;
 }
@@ -165,6 +177,15 @@ export interface ModuleCommandCall {
   origin: Origin;
   env: InboundEnvelope;
   input: InputRecord;
+  /**
+   * Queue the compaction command of the harness the session's next turn runs on
+   * (`KernelSessionRun.compact`, `HarnessAdapter.compact`: Claude Code `/compact`) as this
+   * command's message (its id, origin and reply route), behind anything running: the one text
+   * the kernel hands a harness as it is (`channelContext.nativeCommand`, which only the kernel
+   * sets), a turn of its own (CT-2). The lane's answer; `unsupported` when that harness declares
+   * none, `forbidden` when the sender may not operate the session (for a command anyone may run).
+   */
+  compact(): Promise<KernelInputResult>;
 }
 
 /**
@@ -206,8 +227,8 @@ export type ModuleTurnStatus = Extract<SessionEvent['body'], { t: 'turn.complete
 
 /**
  * What a module hooks into. The daemon serves `onTurnCompleted`, `inputHint`, `onUndispatched`,
- * `onAction`, `resolver` and `identities`; a module that sets any other fails to set up, naming it
- * (see the file comment). Each says which feature it is for.
+ * `onAction`, `resolver`, `identities` and `statusLines`; a module that sets any other fails to set
+ * up, naming it (see the file comment). Each says which feature it is for.
  */
 export interface ModuleHooks {
   /**
@@ -250,7 +271,10 @@ export interface ModuleHooks {
    * from when the daemon runs to the end. The stranger approval: a guest's turn asks the owner.
    */
   resolver?(ctx: TurnContext): Resolver | undefined;
-  /** The run of a session's next turn, over what the agent's policy planned (presets, the owner's overrides). */
+  /**
+   * The run of a session's next turn, over what the agent's policy planned. (What the owner set
+   * for a session, a preset too, is the kernel's to apply: `KernelContext.runConfig`.)
+   */
   planRun?(a: { sessionKey: string; run: RunSpec; draft: TurnDraft }): RunSpec;
   /** The adapter a session's instance runs on instead of its own (a native terminal holding the session). */
   harnessFor?(a: { sessionKey: string; instance: string }): HarnessAdapter | undefined;
@@ -263,7 +287,13 @@ export interface ModuleHooks {
    * The topic tools.
    */
   inputHint?(agent: string | undefined): string | undefined;
-  /** Lines `/status` adds for a session. */
+  /**
+   * Lines `/status` shows for a session, right after the line of what it runs (agent, harness,
+   * model) and before its working directory: of every module in registration order, from when
+   * the daemon runs to the end. Synchronous and quick; a throw is logged and gives no line, and so
+   * is anything but an array (entries that are not strings are left out). The owner's run-config
+   * commands: its Plan mode and the owner's profile switch.
+   */
   statusLines?(sessionKey: string): string[];
   /**
    * The module's identity map entries when the daemon starts (`KernelContext.router.setExtraIdentities`
@@ -282,7 +312,7 @@ export type ModuleFrameHandler = (frame: Record<string, unknown>, from: { origin
 export interface ModuleInstance {
   /** A handler for each of the manifest's `mcpTools`, by name (exactly those). */
   tools?: Readonly<Record<string, ModuleToolHandler>>;
-  /** A handler for each of the manifest's `commands`, by name (exactly those). */
+  /** A handler for each of the manifest's `commands`, by name (exactly those; its `aliases` run the same handler). */
   commands?: Readonly<Record<string, ModuleCommandHandler>>;
   hooks?: ModuleHooks;
   localFrames?: Readonly<Record<string, ModuleFrameHandler>>;
@@ -380,6 +410,61 @@ export interface KernelLaneHarness {
    * `ephemeral(turnId)` is false.
    */
   ephemeralTurn(a: { turnId: string; prompt: string; instructions: string }): Promise<string | undefined>;
+}
+
+/**
+ * What a session's next turn runs (`KernelContext.runConfig.get`): the harness instance, what its
+ * adapter declares, and the run over the agent's own with what is set for the session
+ * (`KernelRunOverrides`) applied.
+ */
+export interface KernelSessionRun {
+  /** The harness instance: the agent's, or the one of the preset set for the session. */
+  harness: string;
+  /** Its kind (`claude-code`). */
+  kind: string;
+  /** The command that compacts its context (`HarnessAdapter.compact`); absent: none. */
+  compact?: string;
+  /** It has Plan mode (`HarnessAdapter.modes`). */
+  plan: boolean;
+  /** It lets the owner switch the profile of their turns (`HarnessAdapter.ownerProfileSwitch`). */
+  ownerProfileSwitch: boolean;
+  /** The preset: the one set for the session, else the agent's. */
+  preset?: string;
+  /** A preset set for the session that is no longer configured (the agent's own runs). */
+  stalePreset?: string;
+  model?: string;
+  effort?: string;
+  mode?: 'default' | 'plan';
+  /** The profile of the owner's turns set for the session (other turns keep the policy's). */
+  profile?: 'bypass' | 'restricted';
+  /** Something is set for the session (a preset, a model, an effort, a mode or a profile). */
+  overridden: boolean;
+}
+
+/**
+ * What `KernelContext.runConfig.set` changes of a session's next turns: a value sets it, `null`
+ * clears it, a key not given stays as it is. A preset replaces the instance, model and effort of
+ * the agent's run; `model` and `effort` go over that; `mode` too; `profile` applies only to turns
+ * whose inputs are all the owner's.
+ */
+export interface KernelRunOverrides {
+  /** A configured preset (another throws). */
+  preset?: string | null;
+  model?: string | null;
+  effort?: string | null;
+  mode?: 'default' | 'plan';
+  profile?: 'bypass' | 'restricted' | null;
+}
+
+/** A configured preset (`presets`), with the model and effort its instance gives when it sets none. */
+export interface KernelPreset {
+  name: string;
+  /** Its harness instance and that instance's kind. */
+  harness: string;
+  kind: string;
+  model?: string;
+  effort?: string;
+  description?: string;
 }
 
 /** What the host's `external` hook is asked (`ExternalCallout.args`). */
@@ -520,6 +605,11 @@ export interface KernelContext {
   /** The deployment's agents. */
   readonly agents: {
     /**
+     * The agents a chat may talk to (`/agent`, `/new @agent`): the configured ones but task
+     * agents, in config order; the default agent's name alone when there are none.
+     */
+    names(): string[];
+    /**
      * The model tools an agent's sessions are offered: its `agents.<name>.tools` list, or for
      * `tools: true` every tool the host's endpoint offers (the kernel's, then the active modules',
      * in that order); empty when it has none or no such agent runs. `undefined`: the default agent.
@@ -536,6 +626,8 @@ export interface KernelContext {
     newTopic(agent: string, conversation: string, title?: string): string;
     /** The agent a flat conversation was switched to (`/agent`), if any. */
     conversationAgent(conversation: string): string | undefined;
+    /** Switch a flat conversation to an agent (one of `agents.names()`; another throws): its inputs go to that agent's current topic from now on. */
+    setConversationAgent(conversation: string, agent: string): void;
     /** Record how an input the module gives a lane itself (`lanes.input`) was placed: its routing record, what `explain <inputId>` shows. */
     record(e: RouteExplanation & { at: number }): void;
   };
@@ -561,6 +653,25 @@ export interface KernelContext {
      * default agent of a deployment without `agents`).
      */
     harness(sessionKey: string): KernelLaneHarness | undefined;
+  };
+  /**
+   * What a session's next turn runs, and what is set for the session over the agent's run (the
+   * owner's run-config commands: `/preset`, `/model`, `/effort`, `/plan`, `/bypass`). The kernel
+   * keeps what is set (its records, across restarts) and applies it over what the agent's policy
+   * plans (`Policy.plan`), so it holds also while no module sets it.
+   */
+  readonly runConfig: {
+    get(sessionKey: string): KernelSessionRun;
+    /** From the session's next turn. */
+    set(sessionKey: string, o: KernelRunOverrides): void;
+    /** The configured presets, in config order. */
+    presets(): KernelPreset[];
+    /**
+     * The configured harness instances that declare Plan mode (`plan`) or the owner's profile
+     * switch, by display name (else instance name; each once); with none, the registered kinds
+     * that declare it (`HarnessModule.declares`).
+     */
+    offering(cap: 'plan' | 'ownerProfileSwitch'): string[];
   };
   /** The running adapter that sends to a route (its channel and account), if any. */
   channelFor(route: { channel: string; account: string }): ChannelAdapter | undefined;

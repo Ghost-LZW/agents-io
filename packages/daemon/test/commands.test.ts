@@ -2,12 +2,13 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import type { AckState, ReplyRoute, SessionEvent } from '@agents-io/protocol';
+import type { AckState, KernelContext, ReplyRoute, SessionEvent } from '@agents-io/protocol';
 import { Ingress, MemorySessionLog, defaultPolicy } from '@agents-io/session';
 import { FakeChannel, FakeHarness, fakeEnvelope, type FakeTurnScript } from '@agents-io/testkit';
 import { resolveConfig, type HarnessInstance } from '../src/config.js';
-import { COMMAND_HELP, KERNEL_COMMAND_NAMES, KERNEL_COMMAND_TABLE, runCommand, type CommandHost } from '../src/commands.js';
+import { COMMAND_HELP, CommandTable, KERNEL_COMMAND_NAMES, KERNEL_COMMAND_TABLE, runCommand, type CommandHost } from '../src/commands.js';
 import { Gateway, InstanceHarness } from '../src/gateway.js';
+import { ownerCommandsModule } from '../src/owner-commands.js';
 import { CLAUDE_CODE_DECLARES, CODEX_DECLARES } from './declares.js';
 import { cleanups, until } from './gateway-helpers.js';
 
@@ -334,30 +335,68 @@ describe('the chat command table (core-slimming G6)', () => {
     running: () => [],
     input: async () => ({ ok: true }),
     answer: async () => ({ ok: true }),
-    run: () => ({ harness: 'h', kind: 'k', plan: false, ownerProfileSwitch: false, overridden: false }),
-    offering: () => [],
-    setRun: () => {},
-    presets: () => [],
+    compactCommand: () => undefined,
     agents: () => ['a'],
     conversationAgent: () => undefined,
     setConversationAgent: () => {},
     newTopic: () => 't1',
     tuiHint: () => 'tui',
   };
-  const run = (name: string, args = '') => {
+  /** The bundled aio's table: the kernel's commands and the owner-commands module's, over a kernel that answers what they read in the same way. */
+  const bundled = async () => {
+    const kernel = {
+      runConfig: { get: () => ({ harness: 'h', kind: 'k', plan: false, ownerProfileSwitch: false, overridden: false }), set: () => {}, presets: () => [], offering: () => [] },
+      agents: { names: () => ['a'] },
+      router: { setConversationAgent: () => {} },
+    } as unknown as KernelContext;
+    const instance = await ownerCommandsModule.setup(kernel, {});
+    return new CommandTable(ownerCommandsModule.commands!.map((def) => ({ module: ownerCommandsModule.id, def, handler: instance.commands![def.name]! })));
+  };
+  const run = (name: string, args = '', table?: CommandTable, h: CommandHost = host) => {
     const env = fakeEnvelope({ admission: 'dispatch', text: `/${name}` });
     const origin = { kind: 'human' as const, principal: { id: 'fake:alice', labels: ['owner'] }, evidence: 'platform_signed' as const, via: 'fake:default:c1', adapter: 'fake' };
-    const input = { inputId: 'in1', origin, content: env.content, replyRoute: env.replyRoute ?? null, channelContext: {} };
-    return runCommand(host, { name, args, env, origin, input, delivery: { bindingId: 'b', source: 'config', on: 'dispatch', sessionKey: 's1', agent: 'a' } as never });
+    const input = { inputId: 'in1', origin, content: env.content, replyRoute: env.replyRoute ?? null, channelContext: { chatName: 'x' } };
+    return runCommand(h, { name, args, env, origin, input, delivery: { bindingId: 'b', source: 'config', on: 'dispatch', sessionKey: 's1', agent: 'a' } as never }, table);
   };
+  const HELP = readFileSync(new URL('./fixtures/command-help.txt', import.meta.url), 'utf8');
 
-  it('with no module active, /help is the kernel\'s list as it was, byte for byte, and exactly these names are commands; any other /name is an ordinary message #CT-2', async () => {
+  it('in the bundled aio (the owner commands on), /help is the list as it was, byte for byte, and exactly these names are commands; any other /name is an ordinary message #CT-2', async () => {
     // Captured from commands.ts before the table existed.
-    expect(COMMAND_HELP).toBe(readFileSync(new URL('./fixtures/command-help.txt', import.meta.url), 'utf8'));
+    const table = await bundled();
+    expect(table.help).toBe(HELP);
+    expect(await run('help', '', table)).toEqual({ ok: true, reply: HELP });
+    const names = [...KERNEL_COMMAND_NAMES, ...ownerCommandsModule.commands!.flatMap((d) => [d.name, ...(d.aliases ?? [])])];
+    expect([...names].sort()).toEqual(['agent', 'answer', 'bypass', 'compact', 'effort', 'help', 'model', 'new', 'plan', 'preset', 'status', 'steer', 'stop', 'switch', 'topics', 'tui']);
+    for (const name of names) expect(await run(name, '', table), name).toMatchObject({ reply: expect.any(String) });
+    for (const name of ['probe', 'helpme', 'x', 'models']) expect(await run(name, '', table), name).toBeUndefined();
+  });
+
+  it('with no module active, /help is the kernel\'s lines of that list, in its order, and the owner commands are ordinary messages #CT-2', async () => {
+    const owners = /^\/(agent|preset|model|plan|bypass|compact) /;
+    expect(COMMAND_HELP).toBe(HELP.split('\n').filter((l) => !owners.test(l)).join('\n'));
     expect(KERNEL_COMMAND_TABLE.help).toBe(COMMAND_HELP);
     expect(await run('help')).toEqual({ ok: true, reply: COMMAND_HELP });
-    expect([...KERNEL_COMMAND_NAMES].sort()).toEqual(['agent', 'answer', 'bypass', 'compact', 'effort', 'help', 'model', 'new', 'plan', 'preset', 'status', 'steer', 'stop', 'switch', 'topics', 'tui']);
+    expect([...KERNEL_COMMAND_NAMES].sort()).toEqual(['answer', 'help', 'new', 'status', 'steer', 'stop', 'switch', 'topics', 'tui']);
     for (const name of KERNEL_COMMAND_NAMES) expect(await run(name), name).toMatchObject({ reply: expect.any(String) });
-    for (const name of ['probe', 'helpme', 'x', 'models']) expect(await run(name), name).toBeUndefined();
+    for (const name of ['agent', 'preset', 'model', 'effort', 'plan', 'bypass', 'compact', 'probe', 'helpme', 'x', 'models']) expect(await run(name), name).toBeUndefined();
+  });
+
+  it('a module command\'s compact() queues the compaction command of the session\'s harness as the command\'s message, marked native by the kernel; unsupported without one; forbidden for a sender who may not operate the session (a command anyone may run) #CT-2', async () => {
+    const answers: unknown[] = [];
+    const given: { delivery: unknown; input: unknown; mode: string }[] = [];
+    const table = new CommandTable([{ module: 'm', def: { name: 'squash', help: '/squash', ownerOnly: false }, handler: async (c) => (answers.push(await c.compact()), { ok: true, reply: 'done' }) }]);
+    const h = (o: Partial<CommandHost>): CommandHost => ({ ...host, input: async (delivery, input, mode) => (given.push({ delivery, input, mode }), { ok: true, disposition: 'queued' }), ...o });
+    expect(await run('squash', '', table, h({ compactCommand: () => '/compact' }))).toEqual({ ok: true, reply: 'done' });
+    expect(given).toEqual([
+      {
+        delivery: expect.objectContaining({ sessionKey: 's1' }),
+        input: expect.objectContaining({ inputId: 'in1', content: [{ type: 'text', text: '/compact' }], channelContext: { chatName: 'x', nativeCommand: true } }),
+        mode: 'queue',
+      },
+    ]);
+    await run('squash', '', table, h({ compactCommand: () => undefined }));
+    await run('squash', '', table, h({ allowed: async () => false, compactCommand: () => '/compact' }));
+    expect(answers).toEqual([{ ok: true, disposition: 'queued' }, { ok: false, reason: 'unsupported' }, { ok: false, reason: 'forbidden' }]);
+    expect(given).toHaveLength(1);
   });
 });

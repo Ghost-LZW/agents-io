@@ -8,6 +8,7 @@ import { externalMcpModule, type ExternalMcpSection } from './external-mcp.js';
 import { HarnessRegistry } from './harness-registry.js';
 import { moduleChannelModule, type ModuleChannelEntry } from './module-channel.js';
 import { ModuleRegistry } from './modules.js';
+import { ownerCommandsModule, type OwnerCommandsSection } from './owner-commands.js';
 import { strangersModule, type StrangersSection } from './strangers.js';
 import { liveToolsModule, topicToolsModule, watchToolsModule, type ToolModuleSection } from './tool-modules.js';
 import { topicTitleModule, type TopicTitleSection } from './topic-title.js';
@@ -46,15 +47,18 @@ export const builtinChannels = new ChannelRegistry([larkBotChannelModule, mailCh
  * tools (`watchTools`), the live tools (`liveTools`), the topic tools (`topicTools`). Then the
  * stranger approval (a host-level feature, decision 16): off unless `policy.strangers: "ask"`,
  * where it always was (or its section `strangers`); `Config.policy.strangers` still says, and
- * written before the start still decides, whether it is on (deprecated, one release). The external
- * MCP endpoint (off unless its section `externalMcp` is in the file) is the last: it starts after
- * everything else and stops first, so no external write comes in while the rest stops; a module
- * added later goes before it. Its settings and status stay where they were before it was a
- * module: `Config.externalMcp` (deprecated, one release) and `GET /api/status` `externalMcp`. The
- * features still to move (owner commands and presets, the Claude Code terminal) live in the
- * gateway; each moves here as its own step.
+ * written before the start still decides, whether it is on (deprecated, one release). Then the
+ * owner's run-config chat commands (`/agent`, `/preset`, `/model`, `/effort`, `/plan`, `/bypass`,
+ * `/compact` and their `/status` line; a host-level feature, decision 16): on unless
+ * `ownerCommands: { enabled: false }`; what they set, the presets and `Policy.plan` stay the
+ * kernel's. The external MCP endpoint (off unless its section `externalMcp` is in the file) is the
+ * last: it starts after everything else and stops first, so no external write comes in while the
+ * rest stops; a module added later goes before it. Its settings and status stay where they were
+ * before it was a module: `Config.externalMcp` (deprecated, one release) and `GET /api/status`
+ * `externalMcp`. The feature still to move (the Claude Code terminal) lives in the gateway; it
+ * moves here as its own step.
  */
-export const builtinModules = new ModuleRegistry([topicTitleModule, watchToolsModule, liveToolsModule, topicToolsModule, strangersModule, externalMcpModule], {
+export const builtinModules = new ModuleRegistry([topicTitleModule, watchToolsModule, liveToolsModule, topicToolsModule, strangersModule, ownerCommandsModule, externalMcpModule], {
   origin: 'builtin',
   fields: {
     [strangersModule.id]: { switch: { path: 'policy.strangers', on: 'ask', off: 'drop' } },
@@ -69,6 +73,7 @@ export interface BuiltinModuleSections {
   liveTools?: ToolModuleSection;
   topicTools?: ToolModuleSection;
   strangers?: StrangersSection;
+  ownerCommands?: OwnerCommandsSection;
   externalMcp?: ExternalMcpSection;
 }
 
@@ -80,6 +85,9 @@ export type { ToolModuleSection } from './tool-modules.js';
 
 /** The stranger approval's section (`strangers`: only `enabled`; `policy.strangers` is its older place). */
 export type { StrangersSection } from './strangers.js';
+
+/** The owner's run-config commands' section (`ownerCommands`: only `enabled`). */
+export type { OwnerCommandsSection } from './owner-commands.js';
 
 /** The external MCP endpoint's settings and their parts (`Config.externalMcp`, deprecated: `Config.modules`). */
 export { DEFAULT_EXTERNAL_MCP_PORT, type ExternalMcpClient, type ExternalMcpConfig, type ExternalMcpSection } from './external-mcp.js';

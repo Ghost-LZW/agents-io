@@ -85,6 +85,9 @@ const TOOL_MODULES = [{ id: 'tools.watch', origin: 'builtin', enabled: true }, {
 /** The stranger approval as a file without `policy.strangers` (or its section) resolves it, and in `GET /api/status` `modules`: off. */
 const STRANGERS_RESOLVED = { id: 'strangers', enabled: false };
 const STRANGERS = { id: 'strangers', origin: 'builtin', enabled: false };
+/** The owner's run-config commands as a file without their section resolves them, and in `GET /api/status` `modules`: on. */
+const OWNER_COMMANDS_RESOLVED = { id: 'owner-commands', enabled: true, config: {} };
+const OWNER_COMMANDS = { id: 'owner-commands', origin: 'builtin', enabled: true };
 
 const resolve = (raw: Record<string, unknown>, moduleRegistry?: ModuleRegistry) => resolveConfig(raw, { env: {}, baseDir: '/base', cwd: '/work', ...(moduleRegistry ? { moduleRegistry } : {}) });
 
@@ -98,11 +101,11 @@ const thrown = (f: () => unknown): string => {
 };
 
 describe('the module registry', () => {
-  it('the built-in ones are the topic titles and the watch, live and topic tools, on by default, the stranger approval and the external MCP endpoint, off by default: their sections are in ConfigFile where externalMcp always was; an empty registry has no modules', () => {
-    expect(builtinModules.modules.map((m) => [m.manifest.id, m.origin])).toEqual([['topic-title', 'builtin'], ['tools.watch', 'builtin'], ['tools.live', 'builtin'], ['tools.topics', 'builtin'], ['strangers', 'builtin'], ['external-mcp', 'builtin']]);
+  it('the built-in ones are the topic titles and the watch, live and topic tools, on by default, the stranger approval, off by default, the owner\'s run-config commands, on, and the external MCP endpoint, off: their sections are in ConfigFile where externalMcp always was; an empty registry has no modules', () => {
+    expect(builtinModules.modules.map((m) => [m.manifest.id, m.origin])).toEqual([['topic-title', 'builtin'], ['tools.watch', 'builtin'], ['tools.live', 'builtin'], ['tools.topics', 'builtin'], ['strangers', 'builtin'], ['owner-commands', 'builtin'], ['external-mcp', 'builtin']]);
     expect(configFileSchema(builtinHarnesses)).toBe(ConfigFile);
-    expect(Object.keys(ConfigFile.properties).slice(-8)).toEqual(['host', 'topicTitles', 'watchTools', 'liveTools', 'topicTools', 'strangers', 'externalMcp', 'local']);
-    expect(resolve({}).modules).toEqual([{ id: 'topic-title', enabled: true, config: {} }, ...TOOL_MODULES_RESOLVED, STRANGERS_RESOLVED, { id: 'external-mcp', enabled: false }]);
+    expect(Object.keys(ConfigFile.properties).slice(-9)).toEqual(['host', 'topicTitles', 'watchTools', 'liveTools', 'topicTools', 'strangers', 'ownerCommands', 'externalMcp', 'local']);
+    expect(resolve({}).modules).toEqual([{ id: 'topic-title', enabled: true, config: {} }, ...TOOL_MODULES_RESOLVED, STRANGERS_RESOLVED, OWNER_COMMANDS_RESOLVED, { id: 'external-mcp', enabled: false }]);
     expect(resolve({}).externalMcp).toBeUndefined();
     // On: its settings are the module's, and (deprecated) Config.externalMcp is the same object.
     const on = resolve({ externalMcp: { clients: {} } });
@@ -110,9 +113,10 @@ describe('the module registry', () => {
       { id: 'topic-title', enabled: true, config: {} },
       ...TOOL_MODULES_RESOLVED,
       STRANGERS_RESOLVED,
+      OWNER_COMMANDS_RESOLVED,
       { id: 'external-mcp', enabled: true, config: { host: '127.0.0.1', port: 7465, clients: [], limits: { maxBodyBytes: 262144, maxTextChars: 16000, requestsPerMinute: 120, writesPerMinute: 20 } } },
     ]);
-    expect(on.externalMcp).toBe(on.modules![5]!.config);
+    expect(on.externalMcp).toBe(on.modules![6]!.config);
     // Without the module, the section is an unknown key (as any other); an empty registry gives no modules.
     const none = new ModuleRegistry([]);
     expect(resolve({}, none).modules).toBeUndefined();
@@ -133,6 +137,12 @@ describe('the module registry', () => {
     expect(bad({ mcpTools: [{ name: 'send_message', description: 'x', input: Type.Object({}) }] })).toThrow('module probe: mcpTools: send_message is a kernel tool');
     expect(bad({ mcpTools: [{ name: 'probe_x', description: 'x', input: Type.String() }] })).toThrow('module probe: mcpTools: tool "probe_x": input must be a JSON Schema object (type "object")');
     expect(bad({ commands: [{ name: 'help', help: '/help' }] })).toThrow('module probe: commands: /help is a kernel command');
+    // A command's aliases are names as its name is; helpBefore names a kernel command.
+    expect(bad({ commands: [{ name: 'probe', aliases: ['status'], help: '/probe' }] })).toThrow('module probe: commands: /status is a kernel command');
+    expect(bad({ commands: [{ name: 'probe', aliases: ['Probe'], help: '/probe' }] })).toThrow('module probe: commands: /probe: alias "Probe" is not a command name');
+    expect(bad({ commands: [{ name: 'probe', aliases: 'p' as never, help: '/probe' }] })).toThrow('module probe: commands: /probe: aliases must be an array of command names');
+    expect(bad({ commands: [{ name: 'probe', aliases: ['probe'], help: '/probe' }] })).toThrow("module probe: command /probe is also module probe's");
+    expect(bad({ commands: [{ name: 'probe', help: '/probe', helpBefore: 'model' }] })).toThrow('module probe: commands: /probe: helpBefore "model" is not a kernel command (help, status, stop, steer, answer, new, topics, switch, tui)');
     expect(bad({ features: ['session.launch'] })).toThrow('module probe: feature "session.launch" is the kernel\'s');
     expect(bad({ needs: ['module:nope'] })).toThrow('module probe: needs module nope, which is not registered');
     expect(bad({ needs: ['kernel:nope'] })).toThrow('module probe: needs: "kernel:nope" is neither module:<id> nor kernel:<capability>');
@@ -144,6 +154,7 @@ describe('the module registry', () => {
     const other = probe('other', seen);
     expect(bad({ mcpTools: other.mcpTools! }, other)).toThrow("module probe: tool other_echo is also module other's");
     expect(bad({ commands: other.commands! }, other)).toThrow("module probe: command /other is also module other's");
+    expect(bad({ commands: [{ name: 'probe', aliases: ['other'], help: '/probe' }] }, other)).toThrow("module probe: command /other is also module other's");
     expect(bad({ features: other.features! }, other)).toThrow("module probe: feature other.v1 is also module other's");
     expect(bad({ config: { ...p.config!, section: 'other' } }, other)).toThrow("module probe: config key other is also module other's");
     expect(bad({ config: { ...p.config!, aliases: ['other'] } }, other)).toThrow("module probe: config key other is also module other's");
@@ -327,7 +338,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     expect(w.gw.adminStatus().modules).toEqual([]);
     const b = await daemon(builtinModules);
     expect(await features(b.socketPath)).toEqual(KERNEL_HELLO);
-    expect(b.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, { id: 'external-mcp', origin: 'builtin', enabled: false }]);
+    expect(b.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, OWNER_COMMANDS, { id: 'external-mcp', origin: 'builtin', enabled: false }]);
     expect(b.gw.adminStatus()).not.toHaveProperty('externalMcp');
   });
 
@@ -337,7 +348,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     const st = w.gw.adminStatus();
     expect(st.externalMcp).toEqual({ url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\//), clients: [] });
     expect(Object.keys(st).slice(-2)).toEqual(['externalMcp', 'modules']);
-    expect(st.modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, { id: 'external-mcp', origin: 'builtin', enabled: true, status: st.externalMcp }]);
+    expect(st.modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, OWNER_COMMANDS, { id: 'external-mcp', origin: 'builtin', enabled: true, status: st.externalMcp }]);
     // Stopping closes it first: nothing listens there afterwards.
     await w.gw.stop();
     await expect(fetch(st.externalMcp!.url, { method: 'POST' })).rejects.toThrow();
@@ -350,7 +361,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     const busy = await daemon(builtinModules, { externalMcp: { listen: `127.0.0.1:${port}`, clients: {} } }, undefined, undefined, (level, msg) => logs.push(`${level}: ${msg}`));
     expect(await features(busy.socketPath)).toEqual(KERNEL_HELLO);
     expect(busy.gw.adminStatus()).not.toHaveProperty('externalMcp');
-    expect(busy.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, { id: 'external-mcp', origin: 'builtin', enabled: true }]);
+    expect(busy.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, OWNER_COMMANDS, { id: 'external-mcp', origin: 'builtin', enabled: true }]);
     expect(logs).toContainEqual(expect.stringMatching(new RegExp(`^error: module external-mcp: external MCP endpoint not started: cannot listen on 127\\.0\\.0\\.1:${port}: `)));
   });
 
@@ -358,10 +369,10 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     const settings = resolveConfig({ externalMcp: { listen: '127.0.0.1:0', clients: {} } }, { env: {}, baseDir: '/base', cwd: '/work' }).externalMcp!;
     const on = await daemon(builtinModules, {}, undefined, undefined, undefined, (c) => ({ ...c, externalMcp: settings }));
     expect(await features(on.socketPath)).toEqual([...KERNEL_HELLO, 'external.mcp']);
-    expect(on.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, { id: 'external-mcp', origin: 'builtin', enabled: true, status: { url: expect.any(String), clients: [] } }]);
+    expect(on.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, OWNER_COMMANDS, { id: 'external-mcp', origin: 'builtin', enabled: true, status: { url: expect.any(String), clients: [] } }]);
     const off = await daemon(builtinModules, { externalMcp: { listen: '127.0.0.1:0', clients: {} } }, undefined, undefined, undefined, ({ externalMcp: _, ...c }) => c);
     expect(await features(off.socketPath)).toEqual(KERNEL_HELLO);
-    expect(off.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, { id: 'external-mcp', origin: 'builtin', enabled: false }]);
+    expect(off.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, OWNER_COMMANDS, { id: 'external-mcp', origin: 'builtin', enabled: false }]);
     // A config without modules at all (built by hand, as before modules): the field still decides; a built-in module
     // without one is as a file without its section makes it (the topic titles, on as before); any other module is still an error.
     const dir = mkdtempSync(join(tmpdir(), 'aio-mod-'));
@@ -371,7 +382,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     const gw = await Gateway.start({ config: bare, harness: new FakeHarness(), log: new MemorySessionLog(), logger: () => {} });
     cleanups.push(() => gw.stop());
     expect(await features(bare.socketPath)).toEqual([...KERNEL_HELLO, 'external.mcp']);
-    expect(gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, { id: 'external-mcp', origin: 'builtin', enabled: true, status: { url: expect.any(String), clients: [] } }]);
+    expect(gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, OWNER_COMMANDS, { id: 'external-mcp', origin: 'builtin', enabled: true, status: { url: expect.any(String), clients: [] } }]);
     await gw.stop();
     const withProbe = new ModuleRegistry([...builtinModules.modules, { manifest: probe('probe', []), origin: 'module' as const }], { fields: { 'external-mcp': { config: 'externalMcp' } } });
     await expect(Gateway.start({ config: bare, harness: new FakeHarness(), log: new MemorySessionLog(), listen: false, moduleRegistry: withProbe, logger: () => {} })).rejects.toThrow('module probe is registered but the config was resolved without it');
@@ -617,6 +628,102 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     await until(() => none.length === 1);
     expect(none[0]!.channelContext.topic).toBeDefined();
     expect(none[0]!.channelContext).not.toHaveProperty('topicTools');
+  });
+
+  it('statusLines: /status shows every set-up module\'s lines right after the line of what the session runs, in registration order; a hook that throws or answers no array is logged and gives none. A command\'s aliases run its handler (named as typed); helpBefore puts its /help line before that kernel command\'s', async () => {
+    const logs: string[] = [];
+    const asked: string[] = [];
+    const registry = new ModuleRegistry([
+      probe('first', [], { instance: () => ({ hooks: { statusLines: (key) => (asked.push(key), [`first for ${key}`, 7 as never, 'first again']) } }) }),
+      probe('second', [], { instance: () => ({ hooks: { statusLines: () => { throw new Error('boom'); } } }) }),
+      probe('third', [], { instance: () => ({ hooks: { statusLines: () => 'third' as never } }) }),
+      {
+        ...probe('fourth', [], { instance: () => ({ commands: { fourth: async (c) => ({ ok: true, reply: `fourth as /${c.name} ${c.args}` }) } }) }),
+        commands: [{ name: 'fourth', aliases: ['iv'], help: '/fourth, /iv — say it', helpBefore: 'tui' }],
+      },
+    ]);
+    const w = await daemon(registry, {}, undefined, undefined, (level, msg) => logs.push(`${level}: ${msg}`));
+    await w.chat.inject({ sender: alice, text: '/status' });
+    const status = (await until(() => replies(w.chat).find((t) => t.startsWith('session ')))).split('\n');
+    expect(status.slice(2, 4)).toEqual([`first for ${asked[0]}`, 'first again']);
+    expect(status[1]).toMatch(/^agent /);
+    expect(status[4]).toMatch(/^cwd /);
+    expect(status).toHaveLength(6);
+    expect(asked).toHaveLength(1);
+    expect(status[0]!.startsWith(`session ${asked[0]} · topic `)).toBe(true);
+    expect(logs).toContain('warn: module second: statusLines failed: boom');
+    expect(logs).toContain('warn: module third: statusLines failed: statusLines must return an array of lines');
+
+    await w.chat.inject({ sender: alice, text: '/help' });
+    const help = (await until(() => replies(w.chat).find((t) => t.startsWith('/help — this list')))).split('\n');
+    expect(help.slice(-5)).toEqual(['/fourth, /iv — say it', '/tui — how to open this session in the harness’s own terminal UI', "/first — say first's greeting", "/second — say second's greeting", "/third — say third's greeting"]);
+    await w.chat.inject({ sender: alice, text: '/iv now' });
+    await until(() => replies(w.chat).includes('fourth as /iv now'));
+    await w.chat.inject({ sender: alice, text: '/fourth' });
+    await until(() => replies(w.chat).includes('fourth as /fourth '));
+  });
+
+  it("runConfig, agents.names and router.setConversationAgent: what a session's next turns run is the kernel's (kept in its records, applied over the agent's plan) whoever sets it; a preset that is not configured or a value of the wrong type is refused; a command's compact() queues the harness's own compaction command as the command's message", async () => {
+    const kernels: KernelContext[] = [];
+    const answers: unknown[] = [];
+    const registry = new ModuleRegistry([
+      probe('probe', [], { instance: (k) => (kernels.push(k), { commands: { probe: async (c) => { const r = await c.compact(); answers.push(r); return { ok: r.ok, reply: 'compacted?' }; } } }) }),
+    ]);
+    const inputs: InputRecord[][] = [];
+    const w = await daemon(
+      registry,
+      { presets: { quick: { harness: 'claude-code', model: 'q', effort: 'low', description: 'Quick' } }, agents: { helper: { harness: 'claude-code' }, runner: { harness: 'claude-code', mode: 'task' } } },
+      async (t) => {
+        inputs.push(t.inputs);
+        t.emit({ t: 'text.snapshot', text: 'ok', final: true }, { audience: 'answer' });
+      },
+      undefined,
+      undefined,
+      undefined,
+      { compact: { command: '/squash' } },
+    );
+    const k = kernels[0]!;
+    expect(k.agents.names()).toEqual(['helper']);
+    await w.chat.inject({ sender: alice, text: 'hi' });
+    await until(() => inputs.length === 1);
+    const key = w.harness.sessions[0]!.args.sessionKey;
+    expect(k.runConfig.get(key)).toEqual({ harness: 'claude-code', kind: 'claude-code', compact: '/squash', plan: false, ownerProfileSwitch: false, model: 'haiku', overridden: false });
+    expect(k.runConfig.presets()).toEqual([{ name: 'quick', harness: 'claude-code', kind: 'claude-code', model: 'q', effort: 'low', description: 'Quick' }]);
+    // No configured instance has them: the registered kinds that declare them.
+    expect(k.runConfig.offering('plan')).toEqual(['Codex']);
+    expect(k.runConfig.offering('ownerProfileSwitch')).toEqual(['Codex']);
+    expect(() => k.runConfig.offering('compact' as never)).toThrow('module probe: runConfig.offering: "compact" is neither plan nor ownerProfileSwitch');
+    expect(() => k.runConfig.set(key, { preset: 'nope' })).toThrow('no preset nope (configured: quick)');
+    expect(() => k.runConfig.set(key, { model: 3 as never })).toThrow('module probe: runConfig.set: model must be a non-empty string or null');
+    expect(() => k.runConfig.set(key, { effort: '' })).toThrow('module probe: runConfig.set: effort must be a non-empty string or null');
+    expect(() => k.runConfig.set(key, { mode: 'fast' as never })).toThrow('module probe: runConfig.set: mode must be "default" or "plan"');
+    expect(() => k.runConfig.set(key, { profile: 'root' as never })).toThrow('module probe: runConfig.set: profile must be "bypass", "restricted" or null');
+    expect(k.runConfig.get(key).overridden).toBe(false);
+
+    // Set by a module: the next turn runs it (the owner's turn takes the profile); only the keys it knows are kept.
+    k.runConfig.set(key, { preset: 'quick', model: 'm2', mode: 'plan', profile: 'bypass', harness: 'other' } as never);
+    expect(k.runConfig.get(key)).toEqual({ harness: 'claude-code', kind: 'claude-code', compact: '/squash', plan: false, ownerProfileSwitch: false, preset: 'quick', model: 'm2', effort: 'low', mode: 'plan', profile: 'bypass', overridden: true });
+    await w.chat.inject({ sender: alice, text: 'again' });
+    const runs = () => w.gw.hub.log.read(key, 0).flatMap((e) => (e.body.t === 'turn.started' ? [e.body.run] : []));
+    await until(() => runs().length === 2);
+    expect(runs()[1]).toMatchObject({ harness: 'claude-code', model: 'm2', effort: 'low', mode: 'plan', profile: 'bypass' });
+    k.runConfig.set(key, { preset: null, model: null, profile: null });
+    expect(k.runConfig.get(key)).toEqual({ harness: 'claude-code', kind: 'claude-code', compact: '/squash', plan: false, ownerProfileSwitch: false, model: 'haiku', mode: 'plan', overridden: true });
+
+    // The conversation's agent: one a chat may talk to (not a task agent).
+    const conversation = k.topics.bySession(key)!.conversation;
+    expect(() => k.router.setConversationAgent(conversation, 'runner')).toThrow('agent "runner" is a task agent');
+    expect(() => k.router.setConversationAgent(conversation, 'nobody')).toThrow('unknown agent "nobody"');
+    expect(() => k.router.setConversationAgent(conversation, 3 as never)).toThrow('module probe: router.setConversationAgent: agent must be a string');
+    k.router.setConversationAgent(conversation, 'helper');
+    expect(k.router.conversationAgent(conversation)).toBe('helper');
+
+    // compact(): the declared command, marked native by the kernel, as the owner's message (a turn of its own).
+    await w.chat.inject({ sender: alice, text: '/probe' });
+    await until(() => inputs.length === 3);
+    expect(answers).toEqual([{ ok: true, disposition: 'new_turn' }]);
+    expect(inputs[2]).toHaveLength(1);
+    expect(inputs[2]![0]).toMatchObject({ content: [{ type: 'text', text: '/squash' }], channelContext: { nativeCommand: true }, origin: { principal: { id: 'fake:alice' } } });
   });
 
   it('identities and onUndispatched: each module\'s entries at the start, below the configured identities (router.setExtraIdentities replaces them); every module hears an input nothing dispatched, in registration order, with addressed; a hook that throws is logged, the next still hears it', async () => {
