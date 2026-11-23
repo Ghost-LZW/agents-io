@@ -390,6 +390,13 @@ export class CodexHarness implements HarnessAdapter {
    * app-server outlives the host (over stdio it dies with it, so the host settles the turn).
    */
   readonly adopts: boolean;
+  readonly displayName = 'Codex';
+  /** Plan is a collaboration mode of the turn (`RunSpec.mode`). */
+  readonly modes = ['plan'] as const;
+  /** `bypass` and `restricted` map to Codex approval policies and sandboxes per turn. */
+  readonly ownerProfileSwitch = true;
+  /** `thread/start { ephemeral }` (topic titles until G4). */
+  readonly ephemeralOpen = true;
   private server: Promise<AppServer> | undefined;
   private opening = 0;
   private readonly connector: Connector;

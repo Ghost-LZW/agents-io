@@ -1,6 +1,6 @@
 # 瘦身：定义核心流程，给每个功能分级，其余移成模块或交还宿主
 
-> 状态：已采纳（2026-11-23，决定 16）。§9 各项 owner 全部按推荐拍板。第 0 阶段已全部落地：守卫（§6）、第一条接缝 G1（`ChannelCaps.pacing`）、生产代码不再用 testkit、`aio e2e` 移出 daemon、飞书机器人开通连同它的 admin 类型移进 lark-bot。G10（outbox 结算一个事务、游标超前给快照、LN-10）也已落地。G3 的第一块（停止与重启：`HarnessAdapter.detach` / `dispose` / `adopts`）已落地。其余按 §4 推进。
+> 状态：已采纳（2026-11-23，决定 16）。§9 各项 owner 全部按推荐拍板。第 0 阶段已全部落地：守卫（§6）、第一条接缝 G1（`ChannelCaps.pacing`）、生产代码不再用 testkit、`aio e2e` 移出 daemon、飞书机器人开通连同它的 admin 类型移进 lark-bot。G10（outbox 结算一个事务、游标超前给快照、LN-10）也已落地。G3 的第一块（停止与重启：`HarnessAdapter.detach` / `dispose` / `adopts`）和第二块（压缩、Plan 模式、主人切换权限档：`compact` / `modes` / `ownerProfileSwitch`，回复里的名字取 `displayName`）已落地。其余按 §4 推进。
 >
 > 参照：persona 的 [#13411](https://github.com/nwverse/persona/issues/13411)（功能瘦身：定义核心流程、给每个功能分级）、#13430（Persona Core 与模块、只降不升的守卫）、#13438 / #13551 / #13555（内建领域按第三方同一契约做成扩展；`interactive_sessions`、`work_executor` 契约）。persona 在 agent IO 上的做法见 §7。
 
@@ -82,7 +82,7 @@ flowchart LR
 |---|---|---|---|---|
 | 飞书回复节奏（5 秒开卡、2 秒预览、回复卡不带停止按钮） | `gateway.ts` `compose` 里的 `instanceof LarkBotAdapter` | core 机制，数值归适配器 | G1 `ChannelCaps.pacing` | **已完成** |
 | 飞书 / 邮件 / 桥的构造与配置校验 | `gateway.ts` `new LarkBotAdapter`、`channelOwner`、`grantedByDefault`；`config.ts`（115 处） | module | G2 | P1–P2 |
-| Claude Code / Codex 的构造，以及按 `kind` 的分支：压缩、TUI 接入、停止时 detach、重启接管、Plan 模式、bypass、会话 env 改走 stdio | `gateway.ts`、`launch.ts`、`commands.ts`、`media.ts` | module | G3 | P1–P2；**停止时 detach、重启接管、dispose 已完成**（适配器声明 `detach` / `dispose` / `adopts`，gateway 不再有 `codexOf`） |
+| Claude Code / Codex 的构造，以及按 `kind` 的分支：压缩、TUI 接入、停止时 detach、重启接管、Plan 模式、bypass、会话 env 改走 stdio | `gateway.ts`、`launch.ts`、`commands.ts`、`media.ts` | module | G3 | P1–P2；**停止时 detach、重启接管、dispose 已完成**（适配器声明 `detach` / `dispose` / `adopts`，gateway 不再有 `codexOf`）；**压缩、Plan 模式、bypass 已完成**（适配器声明 `compact` / `modes` / `ownerProfileSwitch`，聊天命令、`/status` 和 `session.compact` 只读声明） |
 | 话题机制（一个对话多个会话、当前指针、`topic.changed`） | `session/src/topics.ts` | core | – | – |
 | 话题标题由模型生成（临时起一个 Codex thread） | `daemon/src/topic-title.ts` | host | G4 | P2 |
 | 控制 IO 的聊天命令：`/help` `/status` `/stop` `/steer` `/answer` `/new` `/topics` `/switch` | `commands.ts` | core（每个通道可关） | – | – |
@@ -111,7 +111,7 @@ flowchart LR
 |---|---|---|
 | G1 | 通道声明自己的回复节奏（`ChannelCaps.pacing`）。**已完成**：飞书适配器声明，gateway 不再判断类型，通道条目照旧可以覆盖延迟 | 飞书节奏 |
 | G2 | 通道模块契约带上配置 schema、校验和默认证据授予。内建类型也按模块注册，`channelOwner` / `grantedByDefault` 不再列具体类型 | 通道构造与校验、`config.ts` 里飞书多机器人的冲突检查 |
-| G3 | harness 的可选能力由 caps 声明、由适配器方法实现，gateway 里不再出现 `kind ===`。具体包括：`compact()`、跨重启的 `detach()` / 是否可接管、`attach`（原生终端加入，`nativeClient` 已有）、`modes`（Plan）、权限 profile、会话 env 的运行方式、媒体解析。**跨重启这一块已完成**：`HarnessAdapter` 加了三个可选成员：`detach?()`（停止时不打断、不退订；有它的 lane 改 detach，否则 close）、`dispose?()`（立刻关掉自己的进程：为一个 launch 或任务 run 单独建的适配器结束时调；停止时调不 detach 的实例，在它的会话关完之后）、`adopts?`（静态声明，不起进程就能读：重启后 `open({ resume })` 可能接管上个进程留下的 turn；有它的会话启动时重开，其余走 `settleLeftover`）。Codex 两种传输都 `detach`，只有 unix 声明 `adopts`；Claude Code 都不声明。gateway 删掉 `codexOf` 和按 `kind === 'codex'`、传输做的接管判断；模块 harness 同样拿到这三项，每个加载了的 module 实例都拿到，不论有没有会话或任务 run 用过它，几个实例共用的适配器对象每种调用只调一次（见 `packages/protocol/src/harness.ts`、`packages/daemon/README.md`）。守护进程层补了测试：`restart.test.ts`（RS-2 的启动重开、RS-4 的实例级 detach） | Claude Code / Codex 分支、外部持有会话、`/plan` `/bypass` `/compact` |
+| G3 | harness 的可选能力由 caps 声明、由适配器方法实现，gateway 里不再出现 `kind ===`。具体包括：`compact()`、跨重启的 `detach()` / 是否可接管、`attach`（原生终端加入，`nativeClient` 已有）、`modes`（Plan）、权限 profile、会话 env 的运行方式、媒体解析。**跨重启这一块已完成**：`HarnessAdapter` 加了三个可选成员：`detach?()`（停止时不打断、不退订；有它的 lane 改 detach，否则 close）、`dispose?()`（立刻关掉自己的进程：为一个 launch 或任务 run 单独建的适配器结束时调；停止时调不 detach 的实例，在它的会话关完之后）、`adopts?`（静态声明，不起进程就能读：重启后 `open({ resume })` 可能接管上个进程留下的 turn；有它的会话启动时重开，其余走 `settleLeftover`）。Codex 两种传输都 `detach`，只有 unix 声明 `adopts`；Claude Code 都不声明。gateway 删掉 `codexOf` 和按 `kind === 'codex'`、传输做的接管判断；模块 harness 同样拿到这三项，每个加载了的 module 实例都拿到，不论有没有会话或任务 run 用过它，几个实例共用的适配器对象每种调用只调一次（见 `packages/protocol/src/harness.ts`、`packages/daemon/README.md`）。守护进程层补了测试：`restart.test.ts`（RS-2 的启动重开、RS-4 的实例级 detach）。**压缩、模式与权限档这一块也已完成**：`HarnessAdapter` 再加五个可选的静态声明，与 `adopts` 一样不起进程就能读：`compact?: { command }`（一轮只有这条命令、作为原生命令原样交给 harness，就压缩上下文；Claude Code 声明 `/compact`，`session.compact` 和 `/compact` 发的就是它，lane 的 CT-3 路径不变）、`modes?`（Codex：`['plan']`，`/plan` 与 `/status` 的 Plan 一行读它）、`ownerProfileSwitch?`（`/bypass`，只有 Codex 声明。Claude Code 原生也认 `bypass`，但不能从 profiles 推出这一项，否则 Claude 上会多出 `/bypass`，行为就变了）、`displayName?`（回复里的名字：`/plan is available only on Codex (this session runs claude-code).` 里的 Codex 取自声明了该能力的已配置实例，没有 `displayName` 的用实例名；一个都没有时改说 `is not available on any harness configured here`）、`ephemeralOpen?`（G4 之前的过渡：`open` 认 `options.ephemeral` 等 Codex 形状的选项，话题标题只在声明了它的 harness 上生成，只有 Codex 声明）。`commands.ts` 和 gateway 里这几处不再按 `kind` 判断；module harness 声明了就能用，不声明的照旧答不可用（`harness-caps.local.test.ts`）。没动的：`BUILTIN_PROFILES`（`run.overrides.profile` 在任何实例上都可以写 `bypass` / `restricted`，RN-2）仍假定每个 harness 都映射这两档，对 module harness 没有核实；话题标题的 options 仍是 Codex 形状（G4） | Claude Code / Codex 分支、外部持有会话、`/plan` `/bypass` `/compact` |
 | G4 | 内核不再自己发起模型调用：话题标题改为宿主钩子（`Policy.title?`）或一个默认关的模块 | 话题标题 |
 | G5 | 模块可以贡献 admin 路由和配置界面所需的 schema（相当于 persona 的 `settings_section`）；protocol 的核心类型里不再出现飞书 | 控制台、飞书开通 |
 | G6 | 一份模块清单，内建和第三方同一形状：`{ id, kind, config schema, features, mcpTools, commands, admin }`，带 `origin: builtin \| module`（对应 persona #13430 的 `Origin = builtin \| extension`）。关掉的模块即不存在：工具不挂、命令不列、feature 不报 | 所有 P2 搬家 |
@@ -134,7 +134,8 @@ flowchart LR
 **P1：补接缝。** 依次做 G3（harness caps）、G2（通道模块契约）、G6（模块清单）、G5（admin 贡献）。每一步都是"抽接口、不改行为"的 PR；守卫的计数只降。
 
 - [x] G3 停止与重启：`HarnessAdapter.detach?()` / `dispose?()` / `adopts?`，gateway 不再认 Codex 来决定 detach、dispose 和启动时重开。基线从 233 降到 220。
-- [ ] G3 其余：压缩、模式与权限档、会话 env 的运行方式、指令注入、媒体、原生终端接管（话题标题归 G4，暂时仍按 Codex 判断）。
+- [x] G3 压缩、模式与权限档：`HarnessAdapter.compact` / `modes` / `ownerProfileSwitch` / `displayName`，与 `adopts` 一样是静态声明；`commands.ts` 和 gateway 不再按 `kind` 判断 `/compact`、`/plan`、`/bypass`、`/status` 的 Plan 一行和 `session.compact`。话题标题（G4）改按过渡声明 `ephemeralOpen` 判断，只有 Codex 声明，效果不变。基线从 220 降到 215。
+- [ ] G3 其余：会话 env 的运行方式、指令注入、媒体、原生终端接管。
 
 **P2：搬家。** 按收益与风险排序：
 
@@ -163,7 +164,7 @@ flowchart LR
   - `import:<包>`：生产代码（`src/`）引用了不在许可列表里的工作区包。
   - `vendor`：core 文件（组合根除外）的代码里出现具体模块的名字，包括含 lark、feishu、codex、claude、imap、smtp 的标识符，以及等于模块 id 的字符串字面量。注释不算；`mail` 不算，它同时是一种会话类型。
 - **基线**：`scripts/boundaries.baseline.json`。计数超过基线就报错；修掉违例后跑 `shrink` 把新计数写进基线，`shrink` 在有计数超标时拒绝执行。
-- **现状**：初始基线 318 处，做完 G1 后是 311 处，P0 去掉 testkit 和 e2e 之后是 295 处，飞书机器人开通移进 lark-bot 之后是 233 处，G3 的停止与重启接缝之后是 220 处，全部在 `packages/daemon`。`protocol`、`session` 和 `host-mcp` 已经是 0。
+- **现状**：初始基线 318 处，做完 G1 后是 311 处，P0 去掉 testkit 和 e2e 之后是 295 处，飞书机器人开通移进 lark-bot 之后是 233 处，G3 的停止与重启接缝之后是 220 处，G3 的压缩、模式与权限档之后是 215 处，全部在 `packages/daemon`。`protocol`、`session` 和 `host-mcp` 已经是 0。
 - **已知盲区**：模板字符串 `${…}` 里的代码不检查。
 
 ## 7. 从 persona 学到的

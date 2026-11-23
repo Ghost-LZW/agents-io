@@ -108,6 +108,38 @@ export interface HarnessAdapter {
    * harness. Only meaningful with `detach`.
    */
   readonly adopts?: boolean;
+  /**
+   * Static, like `adopts`: the harness's name in user-facing texts (chat command replies),
+   * e.g. "Codex". Without it the host names it by its instance.
+   */
+  readonly displayName?: string;
+  /**
+   * Static: the session compacts its context when a turn's one input is this command, handed
+   * to the harness as it is (`channelContext.nativeCommand`), e.g. Claude Code `/compact`.
+   * The host's `session.compact` and the owner's `/compact` start such a turn; without it both
+   * answer `unsupported`.
+   */
+  readonly compact?: { readonly command: string };
+  /**
+   * Static: the collaboration modes `RunSpec.mode` selects on this harness besides `default`
+   * (Codex: `['plan']`). The owner's `/plan` and the Plan line of `/status` need `plan` here;
+   * without it `/plan` answers that it is unavailable.
+   */
+  readonly modes?: readonly 'plan'[];
+  /**
+   * Static: the owner may switch the permission profile of their own turns in a session
+   * between `bypass` and `restricted` (`/bypass`). Without it `/bypass` answers that it is
+   * unavailable, whatever profiles the harness maps (Codex declares it; Claude Code does not).
+   */
+  readonly ownerProfileSwitch?: boolean;
+  /**
+   * Static, transitional (core-slimming G4 replaces it with a host hook): `open` takes
+   * `options.ephemeral` (a throwaway session kept out of the harness's history),
+   * `options.preface: false`, `options.developerInstructions` and a read-only `options.profiles`
+   * entry (`approvalPolicy`, `sandbox`), so the host may generate topic titles on it. Codex
+   * declares it.
+   */
+  readonly ephemeralOpen?: boolean;
 }
 
 /** A command that starts a harness's terminal UI attached to a running session. */
@@ -162,6 +194,7 @@ export interface HarnessFactoryInit {
  * same lifecycle calls as a built-in adapter: at stop `detach` when it has one, else its
  * sessions are closed and then `dispose` is called; `adopts` is read at start. Every loaded
  * instance gets them, whether or not a session used it; an adapter returned for several
- * instances gets each call once.
+ * instances gets each call once. Its other static declarations (`displayName`, `compact`,
+ * `modes`, `ownerProfileSwitch`, `ephemeralOpen`) are read as a built-in adapter's.
  */
 export type HarnessFactory = (init: HarnessFactoryInit) => HarnessAdapter | Promise<HarnessAdapter>;

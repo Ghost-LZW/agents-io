@@ -130,7 +130,7 @@
 ### DL-1 每次投递以一条 delivery.settled 结束
 
 - **承诺**：经 outbox 的每次投递恰好写一条 `delivery.settled`（`delivered` / `rejected` / `unknown`）；不可重试的错误是 `rejected`，重试用尽是 `unknown`，`unknown` 不再重放。单次尝试有上限（`attemptTimeoutMs`，默认 60 s），超时即 `unknown`、不重试（平台可能已收到）。外发检查抛错即 `rejected`（fail closed）。守护进程停止时最多等 5 s 让正在发的投递结算（通道与库都还开着），等待重试的立刻结算为 `unknown`；5 s 后仍在发的保留进行中记录，由下次启动结算（DL-2）。
-- **实现**：`packages/session/src/outbox.ts` `Outbox.run`（政策检查、重试循环、`withTimeout`；结算在尝试的 `try` 之外，结算抛错不算一次失败的尝试，记进 `unrecorded`）、`settle`（结算记录、`onSettled`、`delivery.settled`；`OutboxOptions.atomic` 时经 `Hub.batch` 在一个事务里，三者任一抛错（`onSettled` 也算）都回滚整个结算；不设 `atomic` 时 `onSettled` 尽力而为、错误被忽略）、`settleStale`（补结算为 `unknown`，错误文字分本进程结算失败的与上个进程留下的）、`drain` / `close`；`packages/session/src/hub.ts` `Hub.batch`（提交之后才按 seq 扇出，回滚的谁也看不到）；`packages/session/src/sqlite-log.ts:90-114` `transaction`（`BEGIN IMMEDIATE`，已在事务里时用 savepoint；事务已被失败的语句结束时不再回滚、报第一个错误；回滚连同 `packages/session/src/log.ts:224-248` `BaseSessionLog` 内存里的 head、fold 与易失环）；`packages/daemon/src/gateway.ts:478` 构造函数（`atomic`：records 与日志是同一个 SQLite 连接时）、`indexOutbound`（`onSettled`，错误交回结算）；`packages/daemon/src/records.ts` `put`、`putOutbound`（各一个 savepoint，在结算事务里；写失败已结束整个事务（SQLITE_FULL、IOERR）时，`rollbackTo` 不让回滚的错误盖住原错误）；`Gateway.stop()`（`gateway.ts:2982` 在 compositor 停止之后、通道关闭之前 `outbox.drain(5000)`，`:2992` 在关库之前 `outbox.close()`）。
+- **实现**：`packages/session/src/outbox.ts` `Outbox.run`（政策检查、重试循环、`withTimeout`；结算在尝试的 `try` 之外，结算抛错不算一次失败的尝试，记进 `unrecorded`）、`settle`（结算记录、`onSettled`、`delivery.settled`；`OutboxOptions.atomic` 时经 `Hub.batch` 在一个事务里，三者任一抛错（`onSettled` 也算）都回滚整个结算；不设 `atomic` 时 `onSettled` 尽力而为、错误被忽略）、`settleStale`（补结算为 `unknown`，错误文字分本进程结算失败的与上个进程留下的）、`drain` / `close`；`packages/session/src/hub.ts` `Hub.batch`（提交之后才按 seq 扇出，回滚的谁也看不到）；`packages/session/src/sqlite-log.ts:90-114` `transaction`（`BEGIN IMMEDIATE`，已在事务里时用 savepoint；事务已被失败的语句结束时不再回滚、报第一个错误；回滚连同 `packages/session/src/log.ts:224-248` `BaseSessionLog` 内存里的 head、fold 与易失环）；`packages/daemon/src/gateway.ts:478` 构造函数（`atomic`：records 与日志是同一个 SQLite 连接时）、`indexOutbound`（`onSettled`，错误交回结算）；`packages/daemon/src/records.ts` `put`、`putOutbound`（各一个 savepoint，在结算事务里；写失败已结束整个事务（SQLITE_FULL、IOERR）时，`rollbackTo` 不让回滚的错误盖住原错误）；`Gateway.stop()`（`gateway.ts:2999` 在 compositor 停止之后、通道关闭之前 `outbox.drain(5000)`，`:3009` 在关库之前 `outbox.close()`）。
 - **测试**：`packages/session/test/outbox.test.ts` "delivers each operationId once, even when called again or concurrently #DL-1 #DL-2"、"retries with backoff, then settles #DL-1"、"settles as rejected on a non-retryable error and unknown when retries run out #DL-1"、"an attempt that times out settles unknown and is not retried (the platform may have it) #DL-1"、"an outbound check that throws rejects (fail closed) and is settled #DL-1 #DL-5"、"drain waits for running attempts, stops retries; close leaves what still runs in flight for the next recover #DL-1"、"a settlement that throws is not a failed attempt: the adapter is not called again and the caller gets the error #DL-1 #DL-2"、"atomic: the outcome, what onSettled writes and delivery.settled commit together; refused, nothing is kept but the in-flight mark, nobody saw it, and recover settles it unknown #DL-1 #DL-2"、"atomic: an onSettled that throws fails the settlement, even when its error ended the whole transaction; nothing commits on its own and recover settles it unknown #DL-1 #DL-2"、"a mark whose settlement failed in this process is settled unknown saying so; a mark an earlier process left says that #DL-1 #DL-2"；`packages/session/test/hub.test.ts` "a batch commits its appends together and publishes them after the commit, in seq order; a throw rolls back the store and the memory view, and nobody sees them #LN-1 #DL-1"；`packages/daemon/test/host.test.ts` "stop waits for a send in flight: it settles before the records close #DL-1 #RS-8"、"a settlement that fails after its record and before delivery.settled leaves nothing settled: the next start settles it unknown in its session, indexed, and does not send again #DL-1 #DL-2 #EX-2"（原 `it.fails`，已修）、"a settlement whose outbound index cannot be written fails whole: the host gets internal, explain knows nothing; the same operationId again is unknown, says why, and is not sent again #DL-1 #DL-2 #EX-2"；`packages/host-mcp/test/host-mcp.test.ts` "send_file on the local route is event-only (no adapter), still settled #DL-1"。
 - **状态**：有测试。
 - **已修**（2026-11-23，core-slimming G10，先以 `it.fails` 复现）：
@@ -143,12 +143,12 @@
   3. `close()` 之后新投递答 `rejected`（`outbox closed`，确实没发，不写库），之后的结算不写库也不写日志，进行中记录留给下次启动。
   4. 结算失败的投递补结算为 `unknown`，即使平台已收到：结果没记下来，按崩溃同样处理（平台消息 id 也没记下，ID-8 认不出它）。不设 `atomic` 的嵌入方（内存 store、store 在别的连接上）结算仍分三步各自提交。
   5. 补结算的 `error` 说明原因：本进程里结算失败的是 `recording its outcome failed in this process (<原错误>); not resent`，上个进程留下的是 `in flight when the previous process stopped; not resent`（守护进程启动时 `recover` 的 warn 也这样说：启动时本进程还没有失败的结算）。宿主看到的：那次 `deliver` 答 `internal`（消息是原错误，例如 `database or disk is full`），消息可能已经发出；这时什么都没结算，`explain <operationId>` 答 `unknown_input`。同一 operationId 再 `deliver`：同一进程里答 `status: "unknown"`、`duplicate: false`、`error` 为上面的本进程文字，不再发送；重启之后（启动时已补结算）答 `duplicate: true`。补结算之后 `explain` 答 `result: "unknown"`、没有平台消息 id。宿主不应换一个 operationId 重发（可能重复），按 `unknown` 处理（DL-2 细节 3）。
-- **不在承诺范围内（按设计）**：卡片流式编辑不经 outbox（`packages/session/src/compositor.ts:789-812` `edit`，RECOMMENDATION §3.1"progress 可以丢中间帧"）；宿主 `deliver` 找不到通道直接答 `unknown_channel`（`gateway.ts:1727`）。
+- **不在承诺范围内（按设计）**：卡片流式编辑不经 outbox（`packages/session/src/compositor.ts:789-812` `edit`，RECOMMENDATION §3.1"progress 可以丢中间帧"）；宿主 `deliver` 找不到通道直接答 `unknown_channel`（`gateway.ts:1733`）。
 
 ### DL-2 operationId 幂等，跨重启
 
 - **承诺**：同一 operationId 至多一次平台发送，重复调用返回第一次的结果；每次尝试在调用适配器**之前**写进行中记录，结算时在同一 savepoint 里写结果并删掉进行中记录。进程在两者之间死掉，下次启动把留下的进行中记录结算为 `unknown`（会话日志写 `delivery.settled`，守护进程日志一条 warn），**不自动重发**；同一 operationId 再来（还没恢复时也一样）直接得到这个 `unknown`。通道再各自做一层（飞书请求 uuid、邮件 Message-ID）。
-- **实现**：`outbox.ts` `Outbox.deliver`（已结算 / 本进程在发 / 上个进程留下的进行中记录，三种都不再发）、`run` 里的 `store.begin`（结算抛错不重试、不再调用适配器，DL-1）、`recover`；`OutboxStore` 接口加 `begin` / `inFlight` / `allInFlight`，内存实现 `MemoryOutboxStore`；SQLite 表 `daemon_outbox` 与 `daemon_outbox_inflight`（`packages/daemon/src/records.ts:77-78`、`DaemonRecords.put` / `begin`，接线 `gateway.ts:476`；`put` 的 savepoint 在结算事务里，DL-1），启动时 `gw.outbox.recover()`（`gateway.ts:680`，在通道启动之前）；宿主 `deliver` 用 `host:` 命名空间（`gateway.ts:1722-1724`）；飞书 `adapter.ts:503-521`；邮件 `channel/mail/src/outbound.ts:17-21`、`channel/mail/src/adapter.ts:106-138`。输出工具的 operationId 是 `tool:<sessionKey>:<调用 id>`（CHANNELS.md §输出工具）。
+- **实现**：`outbox.ts` `Outbox.deliver`（已结算 / 本进程在发 / 上个进程留下的进行中记录，三种都不再发）、`run` 里的 `store.begin`（结算抛错不重试、不再调用适配器，DL-1）、`recover`；`OutboxStore` 接口加 `begin` / `inFlight` / `allInFlight`，内存实现 `MemoryOutboxStore`；SQLite 表 `daemon_outbox` 与 `daemon_outbox_inflight`（`packages/daemon/src/records.ts:77-78`、`DaemonRecords.put` / `begin`，接线 `gateway.ts:476`；`put` 的 savepoint 在结算事务里，DL-1），启动时 `gw.outbox.recover()`（`gateway.ts:680`，在通道启动之前）；宿主 `deliver` 用 `host:` 命名空间（`gateway.ts:1728-1730`）；飞书 `adapter.ts:503-521`；邮件 `channel/mail/src/outbound.ts:17-21`、`channel/mail/src/adapter.ts:106-138`。输出工具的 operationId 是 `tool:<sessionKey>:<调用 id>`（CHANNELS.md §输出工具）。
 - **测试**：`outbox.test.ts` "delivers each operationId once, even when called again or concurrently #DL-1 #DL-2"、"a crash between the in-flight mark and the settlement: the next process settles it unknown and never resends #DL-2"、"the same operationId is not sent again while an earlier process has it in flight, even before recover #DL-2"、"marks each attempt in flight before calling the adapter, and settling clears the mark #DL-2"、"a settlement that throws is not a failed attempt: the adapter is not called again and the caller gets the error #DL-1 #DL-2"、"atomic: an onSettled that throws fails the settlement, even when its error ended the whole transaction; nothing commits on its own and recover settles it unknown #DL-1 #DL-2"、"a mark whose settlement failed in this process is settled unknown saying so; a mark an earlier process left says that #DL-1 #DL-2"；`packages/daemon/test/host.test.ts` "deliver is idempotent per operationId, across a restart too; an unknown channel is an error #DL-2 #RS-1"、"a send in flight when the daemon died is settled unknown on the next start (logged in its session) and not sent again #DL-2 #RS-1"、"a settlement that fails after its record and before delivery.settled leaves nothing settled: the next start settles it unknown in its session, indexed, and does not send again #DL-1 #DL-2 #EX-2"、"a settlement whose outbound index cannot be written fails whole: the host gets internal, explain knows nothing; the same operationId again is unknown, says why, and is not sent again #DL-1 #DL-2 #EX-2"；`packages/daemon/test/agent-messaging.test.ts` "a system reply indexes the input it answers with its settlement: one whose settlement failed still names it when the next start settles it #EX-2 #DL-2"；`channel/lark-bot/test/outbound.test.ts` "is idempotent: same operationId gives one platform message and a stable uuid #DL-2"、"retries a failed operation under the same uuid #DL-2 #DL-1"；`channel/mail/test/mail.test.ts` "is idempotent: same operationId, same Message-ID, one transport call #DL-2"、"retries a pending send with the same Message-ID #DL-2"；`host-mcp.test.ts` "is idempotent per tool call id #DL-2"。
 - **状态**：有测试。
 - **细节（按原则自决，决定 13）**：
@@ -268,7 +268,7 @@
 ### ID-1 每条输入带来源
 
 - **承诺**：每条 `InputRecord` 都有 `Origin`（kind、principal、evidence、via、adapter，可选 declared、self）；合成的输入（略去行、live 委托、话题摘要、digest）用 system 来源，`principal: null`。
-- **实现**：`packages/protocol/src/inbound.ts:74-92`（必填字段）；`ingress.ts:253-271`；`packages/session/src/watch.ts:423`（被监听的保留原发送者）；`lane.ts:685`、`:928-934`；`gateway.ts:1255`。
+- **实现**：`packages/protocol/src/inbound.ts:74-92`（必填字段）；`ingress.ts:253-271`；`packages/session/src/watch.ts:423`（被监听的保留原发送者）；`lane.ts:685`、`:928-934`；`gateway.ts:1261`。
 - **测试**：`ingress.test.ts` "stamps origin from Policy.identify and dispatches owner input to a lane #ID-1 #ID-3"；`watch.test.ts` "records a watched group message as context in the target, keeping the original origin #ID-1"；`packages/session/test/live.test.ts` "a delegation becomes an input from the far side and the harness-started turn runs as the lane turn #LN-6 #LN-2 #ID-1 #LN-4"。
 - **状态**：有测试。
 
@@ -457,7 +457,7 @@
 ### LN-5 live 传输不符时在 start 之前拒绝；frames 的视频只给声明了 video 的 live
 
 - **承诺**：`live_join` 在 `start` 之前拒绝 harness 不支持的传输（错误里有传输名），关闭端点、不留登记；frames 端点在 live 没声明 `video` 时滤掉视频帧；只对 webrtc 调 `endpoint.answer`（决定 11 补记）。
-- **实现**：`lane.ts:389-391`（`LiveTransportError`）、`lane.ts:396`、`:1313-1316`（`audioOnly`）；`gateway.ts:1176-1199`。
+- **实现**：`lane.ts:389-391`（`LiveTransportError`）、`lane.ts:396`、`:1313-1316`（`audioOnly`）；`gateway.ts:1182-1205`。
 - **测试**：`packages/session/test/live.test.ts` "a transport the harness live does not take is refused before start, naming the transport; nothing is registered #LN-5"、"a frames live without video gets no video frames; one that declares video gets them #LN-5"；`packages/daemon/test/live.test.ts` "a frames endpoint for a harness whose live takes webrtc only: refused before start, naming the transport; the endpoint is closed and no live is registered #LN-5"。
 - **状态**：有测试（决定 14 补上）。
 
@@ -558,7 +558,7 @@
 ### FC-1 会话的 agent 不在了就拒绝，不退回默认 agent
 
 - **承诺**：会话记录的 agent 被删或变成任务 agent 时，输入以 `agent_unavailable` 拒绝，在原路由回一条说明，explain 记下；绝不改用默认 agent。
-- **实现**：`gateway.ts:762-771`（`pickAgent` 抛 `LaneUnavailableError`）；`ingress.ts:451-460`、`:362-370`；`gateway.ts:1088-1101`。
+- **实现**：`gateway.ts:762-771`（`pickAgent` 抛 `LaneUnavailableError`）；`ingress.ts:451-460`、`:362-370`；`gateway.ts:1094-1107`。
 - **测试**：`runs.test.ts` "a session whose recorded agent is gone refuses input with agent_unavailable, never falling back to the default agent #FC-1 #IN-1"、"a session whose recorded agent is a task agent now refuses input with agent_unavailable #FC-1"、"a channel message to a session whose agent is gone: refused (no harness), a notice on the route, and explain says agent_unavailable #FC-1 #EX-1"；`packages/daemon/test/session-launch.test.ts` "a launched session whose agent was removed refuses input instead of falling back to the default agent #FC-1"。
 - **状态**：有测试。
 
@@ -626,7 +626,7 @@
 | 状态 | 位置 | 测试 |
 |---|---|---|
 | 会话日志与快照 | `sqlite-log.ts:31-44` | `log.test.ts` "survives reopen: head, events and fold are restored #LN-1 #RS-1" |
-| 原生会话 id（续接） | `gateway.ts:1360-1366`、`lane.ts:784-792` | `gateway.test.ts` "lanes open the instance the plan names (its cwd, options, id); a restart resumes per instance #RS-1"；`codex.test.ts` "resumes an existing thread #RS-1" |
+| 原生会话 id（续接） | `gateway.ts:1366-1372`、`lane.ts:784-792` | `gateway.test.ts` "lanes open the instance the plan names (its cwd, options, id); a restart resumes per instance #RS-1"；`codex.test.ts` "resumes an existing thread #RS-1" |
 | 话题表 | `packages/session/src/topics.ts:135` | `packages/session/test/topics.test.ts` "switches back, persists across reopen (same database as the log), and keeps native ids #TP-1 #RS-1"；`daemon/test/topics.test.ts` "chat commands answer with a system reply; switching back after a restart resumes the native session #RS-1 #TP-1" |
 | 宿主入站队列与游标 | `host-queue.ts:76-87` | `host-queue.test.ts` "push: unacked items are redelivered after a reconnect (at least once), also across a restart #HQ-1 #RS-1" |
 | launch 记录 | `records.ts:36` | `session-launch.test.ts` "a restart reopens the session with its launch and resumes it #LA-1 #RS-1" |
@@ -642,7 +642,7 @@
 ### RS-2 Codex（unix socket）正在跑的 turn 由新进程接管
 
 - **承诺**：停止时 Codex unix 实例的 lane detach，turn 留在日志里不结束；启动后重开会话，harness 发 `turn.adopted`，新 lane 把它当作当前 turn，排在它后面的输入继续排队；停机期间重放的审批照常处理。
-- **实现**：`lane.ts:756`（`detach`）；`packages/protocol/src/harness.ts` `HarnessAdapter.detach` / `adopts`；`gateway.ts:2956-2972`（`stop`：适配器有 `detach` 的 lane 改为 detach，再调每个已建实例自己的 `detach`，同一个适配器只调一次，网关不认具体 harness）、`:2530-2548`（`adoptRunningTurns`：适配器声明 `adopts` 的会话在启动时重开）、`:986-993`（`adopts`：只建适配器、不起进程；建不出来的实例不接管）；`harness/codex/src/harness.ts:392`（`CodexHarness.adopts`：unix 传输为真）、`:449`（`detach`）；`harness/codex/src/session.ts:214-226`（接管）、`:394`（`detachFromServer`）。
+- **实现**：`lane.ts:756`（`detach`）；`packages/protocol/src/harness.ts` `HarnessAdapter.detach` / `adopts`；`gateway.ts:2973-2989`（`stop`：适配器有 `detach` 的 lane 改为 detach，再调每个已建实例自己的 `detach`，同一个适配器只调一次，网关不认具体 harness）、`:2536-2554`（`adoptRunningTurns`：适配器声明 `adopts` 的会话在启动时重开）、`:987-999`（`declared` / `adopts`：只建适配器、不起进程；建不出来的实例不接管）；`harness/codex/src/harness.ts:392`（`CodexHarness.adopts`：unix 传输为真）、`:456`（`detach`）；`harness/codex/src/session.ts:214-226`（接管）、`:394`（`detachFromServer`）。
 - **测试**：`packages/daemon/test/restart.test.ts` "Codex over a Unix socket mid-turn at stop: the lane and the instance detach (no interrupt, no unsubscribe, the connection closes); the next start reopens the session with no new input and Codex adopts the turn, which completes once #RS-2"（守护进程层：按配置建的适配器连 Unix socket 上的假 app-server，两次启动之间不发新输入）；`unix.test.ts` "a restarted host adopts a running turn and its replayed approval #RS-2 #RQ-1"、"settles an adopted turn that finished while no host was attached #RS-2"、"keeps the adopted turn when Codex still runs it #RS-2"；`lane.test.ts` "detach leaves the running turn open in the log #RS-2"、"a new lane adopts the turn (turn.adopted), keeps it as the active turn and queues behind it #RS-2"、"an input that arrives before the harness reports its adoption waits for it instead of settling the turn as ambiguous #RS-2"；`harness/codex/test/codex.live.test.ts` "survives a host restart mid-turn over a unix socket (spawn: own) #RS-2"（需真 Codex，默认跳过）。
 - **状态**：有测试。
 
@@ -691,7 +691,7 @@
 ### RS-8 守护进程停止时有界
 
 - **承诺**：`stop()` 每一步都有上限（通道 3 s、lane 关闭 8 s、`whenIdle` 3 s、compositor 5 s 等），不会因为某个 harness 或通道卡住而挂住。
-- **实现**：`gateway.ts:2931-2997`（`within(...)`；适配器的 `detach` / `dispose` 经 `harnessCall`（`:1001-1005`），出错只记日志，不让 `stop` 中途抛出）。
+- **实现**：`gateway.ts:2948-3014`（`within(...)`；适配器的 `detach` / `dispose` 经 `harnessCall`（`:1007-1011`），出错只记日志，不让 `stop` 中途抛出）。
 - **测试**：`gateway.test.ts` "socket is private, rejects bad frames, and tells subscribers when the gateway stops #RS-8 #SE-2"；`daemon/test/live.test.ts` "live_leave ends the live; the gateway stopping ends a running one #LN-4 #RS-8"；`packages/daemon/test/gateway.e2e.test.ts` "returns within its bounds when a harness close() and a channel close() never return #RS-8"（约 17 s，所以在 e2e 层）。
 - **状态**：有测试（有界本身在 e2e 层；有界的代价是 LN-4；outbox 在关库前最多等 5 s，超出的留进行中记录，见 DL-1；超时没报完的 turn 留到下次启动按 RS-5 结算）。
 
@@ -711,14 +711,14 @@
 ### CF-1 bridge 首次连接失败不阻止启动
 
 - **承诺**：bridge 通道首次 hello 失败时标 `failed` 并按退避重试，不让守护进程启动失败；命令本身无法执行（`ENOENT` / `EACCES`）仍让启动失败（决定 10）。
-- **实现**：`gateway.ts:2040-2041`；`channel/jsonl-bridge/src/host.ts:222-227`。
+- **实现**：`gateway.ts:2046-2047`；`channel/jsonl-bridge/src/host.ts:222-227`。
 - **测试**：`packages/daemon/test/bridge-startup.test.ts` "does not stop the daemon: status shows it failed with the reason, and it connects once the peer works #CF-1"、"a bridge whose command cannot be run still fails the start #CF-1"；`packages/daemon/test/live-channels.test.ts` "a bridge whose first connect fails is reported failed (not started) and the file not applied, until it connects #CF-1 #CF-2"。
 - **状态**：有测试。
 
 ### CF-2 通道热生效只启停变化的通道
 
 - **承诺**：`console.liveChannels: true` 时，经 `PUT /api/config` 的通道增删改只启停变化的那些；默认关闭时等重启（决定 10 原文没提这个开关，以设计文档为准）。
-- **实现**：`gateway.ts:1499-1531`。
+- **实现**：`gateway.ts:1505-1537`。
 - **测试**：`live-channels.test.ts` "starts added channels, restarts changed ones, keeps unchanged ones, stops removed ones #CF-2"、"off (default): a channel added by PUT waits for a restart, as before #CF-2"、"a channel whose start rejects is reported failed, forgotten, and started again by the next apply #CF-2"、"a rotated secret in the env file counts as a change: the channel restarts with the same config document #CF-2"。
 - **状态**：有测试。
 
@@ -732,7 +732,7 @@
 ### CF-4 模块 harness 配置错误使启动失败
 
 - **承诺**：`use: 'module'` 的模块不存在、有未知键是配置错误；导出不是函数、工厂抛错、返回的不是 adapter 都使启动失败，错误里有实例名（决定 11 补记）。
-- **实现**：`config.ts:1038-1039`、`:134-143`、`:997-998`；`gateway.ts:956-976`（`loadHarnessModules`：工厂的失败转为 `ConfigError`，`Gateway.start` 因此失败）、`:3205-3228`（`loadHarnessModule`：导入、调工厂、检查返回的 adapter）。
+- **实现**：`config.ts:1038-1039`、`:134-143`、`:997-998`；`gateway.ts:956-976`（`loadHarnessModules`：工厂的失败转为 `ConfigError`，`Gateway.start` 因此失败）、`:3249-3272`（`loadHarnessModule`：导入、调工厂、检查返回的 adapter）。
 - **测试**：`packages/daemon/test/module-channel.test.ts` "a missing module, a non-function export, a throwing factory and a value that is not an adapter each fail the start, naming the instance #CF-4"（模块不存在在解析配置时失败，其余三种让 `Gateway.start` 失败）。
 - **状态**：有测试（决定 14 补上）。
 
@@ -881,15 +881,15 @@
 ### CT-2 对话里的命令只有主人能用，命令本身不开轮
 
 - **承诺**：发给本部署、整条消息是 `/名字 参数` 的文字，若名字是守护进程的命令（`/help`、`/status`、`/stop`、`/steer`、`/preset`、`/model`、`/effort`、`/compact`、`/agent`、`/new @agent`、`/tui`），只在 `Policy.control` 放行（主人）时执行，在原路由回一条短文本，不进 lane、不开轮；别人发的同样文字是普通消息。`/preset`、`/model`、`/effort` 只改这个会话、从下一轮起生效（存在日志库里）；`/preset` 换掉 harness 实例、model 和 effort，并清掉本会话 `/model`、`/effort` 设过的值，换到的实例仍以该会话 agent 的 cwd、指令和工具运行，权限 profile 不变。`/agent`、`/new @agent` 让这个平铺对话之后交给所选 agent（存在路由表库里），固定会话（`ownerSessionKey`）下说明做不到。`/compact` 是唯一原样交给 harness 的文字：只能由守护进程标记（`channelContext.nativeCommand`），适配器的 `context`、本地与宿主客户端的输入都去掉这个键。带这个标记的输入自成一轮：不与前后同一发送者的输入合批，也不带上之前记下的 context（留给下一轮），harness 只读到这条命令（2026-10-22 起；之前会与同一人排在它前后的消息合成一轮）。
-- **实现**：`packages/daemon/src/commands.ts`；`packages/session/src/ingress.ts` `onCommand`、`slashCommand`、`channelContext`（去掉 `nativeCommand`）；`packages/session/src/router.ts` `conversationAgent`、`setConversationAgent`、`place`；`packages/daemon/src/gateway.ts` `commandHost`、`withRunOverride`；`packages/session/src/lane.ts` `isNativeCommand`、`takeBatch`、`pump`；`harness/claude-code/src/content.ts` `toUserMessage`。
-- **测试**：标签 `#CT-2`；`packages/daemon/test/commands.test.ts`；`packages/session/test/lane.test.ts` "a harness command is a turn of its own: never batched with the same sender's inputs around it, handed no context"。
+- **实现**：`packages/daemon/src/commands.ts`；`packages/session/src/ingress.ts` `onCommand`、`slashCommand`、`channelContext`（去掉 `nativeCommand`）；`packages/session/src/router.ts` `conversationAgent`、`setConversationAgent`、`place`；`packages/daemon/src/gateway.ts` `commandHost`（`run` 读这一轮所在实例的适配器声明的 `HarnessAdapter.compact` / `modes` / `ownerProfileSwitch`，`offering` 列出声明了的实例的 `displayName`；`/compact`、`/plan`、`/bypass` 和 `/status` 的 Plan 一行只看这些声明，不看实例种类）、`declared`、`withRunOverride`；`packages/session/src/lane.ts` `isNativeCommand`、`takeBatch`、`pump`；`harness/claude-code/src/content.ts` `toUserMessage`。
+- **测试**：标签 `#CT-2`；`packages/daemon/test/commands.test.ts`；`packages/daemon/test/harness-caps.local.test.ts`（module harness 声明了压缩命令、Plan 模式和权限档切换就能用，什么都不声明时这几个命令答不可用）；`packages/session/test/lane.test.ts` "a harness command is a turn of its own: never batched with the same sender's inputs around it, handed no context"。
 - **状态**：有测试（假通道）。Codex 没有 `/compact`（生成的协议类型里没有压缩请求）。
 
 ### CT-3 宿主压缩会话：只在安静时，一轮只有压缩命令，不回任何渠道，期间来的输入排在后面
 
 - **承诺**：宿主的 `session.compact { sessionKey, inputId? }`（feature `session.compact`）让一个有打开的 lane 的会话的 harness 立刻压缩上下文：开一轮，唯一的输入是 harness 自己的命令（Claude Code `/compact`，`nativeCommand`），来源是宿主连接（`kind: "system"`、`adapter: "host"`），`replyRoute` 为空：没有回复、进度卡片或通知到任何渠道；之前记下的 context 不交给这一轮，留给下一轮。只在会话安静时做：有一轮在跑或正在开始、有排队的输入、有未答的请求、有 live 或有待结算的遗留轮时答 `busy`，什么都不记。没有打开的 lane 答 `not_live`（不为压缩拉起 harness）；harness 没有压缩命令（Codex）答 `unsupported`；`run:` 键答 `invalid_frame`；`inputId` 同 `run.start` 的规则（`bad_input_id`），同一个 id 再来答 `duplicate: true`、不开轮。这一轮在跑时到达的输入照常排队（只有本轮发起者能插话，这一轮的发起者是宿主），结束后开自己的一轮。不经 `Policy.control`：宿主连接凭 token。
-- **实现**：`packages/daemon/src/gateway.ts` `compactSession`；`packages/daemon/src/host.ts`（`session.compact`、`FEATURES`）；`packages/session/src/lane.ts` `compact`、`isNativeCommand`；`packages/protocol/src/host.ts` `SessionCompact`、`SessionCompactResult`。
-- **测试**：标签 `#CT-3`；`packages/daemon/test/compact.test.ts`；`packages/session/test/lane.test.ts` "compact: starts the command as a turn when the session is quiet; busy (nothing recorded) while a turn runs or inputs are queued"。
+- **实现**：`packages/daemon/src/gateway.ts` `compactSession`（命令取自适配器声明的 `HarnessAdapter.compact`，不声明的答 `unsupported`）；`harness/claude-code/src/adapter.ts` `ClaudeCodeHarness.compact`（`/compact`）；`packages/daemon/src/host.ts`（`session.compact`、`FEATURES`）；`packages/session/src/lane.ts` `compact`、`isNativeCommand`；`packages/protocol/src/host.ts` `SessionCompact`、`SessionCompactResult`。
+- **测试**：标签 `#CT-3`；`packages/daemon/test/compact.test.ts`（假 harness 按它代替的适配器声明 `compact`）；`packages/daemon/test/harness-caps.local.test.ts`（module harness 声明自己的命令）；`packages/session/test/lane.test.ts` "compact: starts the command as a turn when the session is quiet; busy (nothing recorded) while a turn runs or inputs are queued"。
 - **状态**：有测试（假 harness）。真实 Claude Code 2.1.291 与 2.1.303 实测（2026-10-22）：`/compact` 作为用户消息时依次出 `system/status compacting`、`compact_boundary`（`trigger: "manual"`、`pre_tokens`、`post_tokens`）、两条 user 消息（摘要与 `<local-command-stdout>Compacted </local-command-stdout>`，适配器作 `native`）和 `result`（`local_command: "compact"`、`result` 为空、`num_turns: 0`），所以这一轮没有回答文字；适配器把前两者记成 `compacting` 通知。
 ### OB-1 "卡住了"可观察
 
@@ -964,7 +964,7 @@
 6. **多机器人退回仍会发生（DL-4，不成立）。** 机器人 b 停掉或启动失败后，`channelFor` 只看到 a，发给 b 的 `deliver` / `systemReply` / `live_join` 改写成 a 发出。决定 8 的本意是"不以别的机器人发出"。
 7. ~~**宿主 `lease` 未实现（HQ-5，不成立）。**~~ 已删（决定 13）：只拉取的宿主用 `onHostDown: "keep"` + 定期重推刷新 `expiresAt`，HOSTS §4、§6 写明。
 8. ~~**宿主 outbound 在宿主离线时退回本地策略（DL-5，不成立于"fail closed"）；`live_join` 目标不过 outbound 检查。**~~ 已修（2026-10-11）：离线期间只放行本轮回复路由；`live_join` 过 `Policy.outbound`。
-9. **并发 `live_join` 停掉已有 live 并泄漏端点（LN-3，不成立）。** 需要在 `gateway.ts:1168` 检查后同步占位。
+9. **并发 `live_join` 停掉已有 live 并泄漏端点（LN-3，不成立）。** 需要在 `gateway.ts:1174` 检查后同步占位。
 10. ~~**入站去重只在内存，部分失败重试会重复进会话（IN-5，不成立）。**~~ 已修（2026-10-11）：input id 由消息键派生，lane 从 session 日志重建已接纳的 id，见 IN-5。
 11. ~~**没有可用交互 agent 时 `accept` 直接抛错（FC-3，不成立）**~~ 已修（2026-10-11）。（harness 起不来时只在日志里拒绝的 FC-2 已修。）
 12. ~~**`closeLane` 窗口出现同一键两个 lane（LN-2）**；**监听回复会回到被监听的群（CF-5）**~~：已修（2026-10-11）。另：~~路由表迟到的旧版本覆盖新表（HQ-5）~~、~~逐个工具的开关（CF-6）~~、~~结算记录 30 天后清理即可重发（DL-2）~~ 同日已修。

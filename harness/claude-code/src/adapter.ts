@@ -113,6 +113,9 @@ export function assertSupported(sdk: string, cli: string): void {
  */
 export class ClaudeCodeHarness implements HarnessAdapter {
   readonly id = 'claude-code';
+  readonly displayName = 'Claude Code';
+  /** `/compact` sent as the turn's user message compacts the session (`compact_boundary`, no answer text). */
+  readonly compact = { command: '/compact' } as const;
   private probed: Promise<{ version: string; caps: HarnessCaps }> | undefined;
 
   constructor(private readonly config: ClaudeCodeHarnessConfig = {}) {}

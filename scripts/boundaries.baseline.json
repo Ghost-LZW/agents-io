@@ -1,7 +1,4 @@
 {
-  "packages/daemon/src/commands.ts": {
-    "vendor": 3
-  },
   "packages/daemon/src/config.ts": {
     "import:@agents-io/harness-codex": 1,
     "vendor": 115
@@ -18,7 +15,7 @@
     "import:@agents-io/channel-mail": 1,
     "import:@agents-io/harness-claude-code": 1,
     "import:@agents-io/harness-codex": 1,
-    "vendor": 77
+    "vendor": 75
   },
   "packages/daemon/src/launch.ts": {
     "vendor": 2

@@ -50,6 +50,8 @@ alias aio-e2e="node $PWD/packages/daemon-e2e/dist/cli.js"   # §1.1 的自动场
   - `adopts: true`：静态声明，不起进程就能读：重启后 `open({ resume })` 能接管上个进程留下的 turn（发 `turn.adopted`）。守护进程启动时重开这些会话，harness 没接管的，在打开之后结算。不声明时，遗留 turn 在启动时直接结算为 ambiguous `host_restarted`，不打开 harness。
   - `dispose()`：立刻关掉自己的进程。没有 `detach` 的适配器在停止中、会话都关完之后调一次。因为适配器是共用的，一个任务 run 结束时不调。
   - 内建的对照：Codex 两种传输都有 `detach`，只有 unix 声明 `adopts`；Claude Code 三者都没有。
+  - 同样是静态声明、聊天命令和 `session.compact` 只读它们而不看实例种类的还有：`compact: { command }`（一轮只有这条命令、作为原生命令原样交给 harness，就压缩上下文；`/compact` 和宿主的 `session.compact` 发的就是它，不声明时答不可用 / `unsupported`）、`modes: ['plan']`（`/plan` 和 `/status` 的 Plan 一行）、`ownerProfileSwitch: true`（`/bypass`：主人切换自己那几轮的权限档）、`displayName`（回复里怎么称呼它，例如 "/plan is available only on Codex"；不声明时用实例名）。内建的对照：Claude Code 声明 `compact: { command: '/compact' }`；Codex 声明 `modes: ['plan']` 和 `ownerProfileSwitch`（Claude Code 原生也认 `bypass`，但不声明，`/bypass` 在它上面照旧不可用）。
+  - `ephemeralOpen: true` 是 G4 之前的过渡：`open` 认 `options.ephemeral`、`preface: false`、`developerInstructions` 和只读的 `profiles`（Codex 形状），守护进程在声明了它的 harness 上另开临时会话生成话题标题。只有 Codex 声明。
 - 每个 codex 实例有自己的 app-server：unix 状态目录默认 `~/.agents-io/codex.<实例名>`（socket、`server.json`、`turns/` 快照），两个实例写同一个 `stateDir` 是配置错误，重启接管不会跨实例。`server.json` 里记一个启动指纹（二进制、`CODEX_HOME`、`-c/--enable/--disable` 的哈希，不含值）：设置变了再连旧服务会被拒绝，提示先停掉旧进程。旧 `harness` 块的 codex 仍用 `~/.agents-io/codex`，正在跑的部署照常接管。
 - 路径支持 `~`，相对路径按配置文件目录解析；`executable` 写裸名（`claude`、`codex`）时走 PATH。实例名限字母、数字、`.`、`_`、`-`。`env`、`settings`（对象）、`mcpServers`、`config` 里的 `"env:NAME"` 都会替换；变量缺失只让该实例不可用（用到时报错并给出变量名），不影响其他实例。校验错误只给键名、不给值。
 - 主人：`policy.owners` 加上 `AGENTS_IO_OWNERS`（逗号分隔），键是 `<channel>:<channelUserId>`。

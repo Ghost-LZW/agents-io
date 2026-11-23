@@ -28,6 +28,12 @@ export const COMMAND_HELP = [
 export interface SessionRun {
   harness: string;
   kind: string;
+  /** The command that compacts its harness's context (`HarnessAdapter.compact`); absent: none. */
+  compact?: string;
+  /** Its harness has Plan mode (`HarnessAdapter.modes`). */
+  plan: boolean;
+  /** Its harness lets the owner switch the profile of their turns (`HarnessAdapter.ownerProfileSwitch`). */
+  ownerProfileSwitch: boolean;
   preset?: string;
   stalePreset?: string;
   model?: string;
@@ -50,6 +56,10 @@ export interface PresetView {
 const runLine = (r: { harness: string; kind: string; model?: string; effort?: string }) =>
   `${r.harness} (${r.kind}) · model ${r.model ?? 'default'}${r.effort ? ` · effort ${r.effort}` : ''}`;
 
+/** `/plan is available only on Codex (this session runs claude-code).`: the harnesses that declare it. */
+const onlyOn = (command: string, names: string[], kind: string) =>
+  names.length ? `${command} is available only on ${names.join(' or ')} (this session runs ${kind}).` : `${command} is not available on any harness configured here (this session runs ${kind}).`;
+
 const FIXED_SESSION = 'This chat goes to one fixed session (policy.ownerSessionKey), so it has no topics or agents to switch; remove ownerSessionKey to use them.';
 
 export interface CommandHost {
@@ -65,6 +75,8 @@ export interface CommandHost {
   answer(code: string, text: string, origin: Origin): Promise<CommandResult>;
   /** What the session's next turn runs: `preset` is the one set here, else the agent's; `stalePreset` one set here that is no longer configured. */
   run(sessionKey: string): SessionRun;
+  /** The configured harnesses that declare Plan mode, or the owner's profile switch, by display name (each once). */
+  offering(cap: 'plan' | 'ownerProfileSwitch'): string[];
   setRun(sessionKey: string, o: { preset?: string | null; model?: string | null; effort?: string | null; mode?: 'default' | 'plan'; profile?: 'bypass' | 'restricted' | null }): void;
   /** The configured presets, with the model and effort their instance gives when they set none. */
   presets(): PresetView[];
@@ -157,7 +169,7 @@ export async function runCommand(
     }
     case 'plan': {
       const cur = h.run(key);
-      if (cur.kind !== 'codex') return no(`/plan is available only on Codex (this session runs ${cur.kind}).`);
+      if (!cur.plan) return no(onlyOn('/plan', h.offering('plan'), cur.kind));
       if (!args) return ok(`Plan mode ${cur.mode === 'plan' ? 'on' : 'off'} for this session.`);
       if (args !== 'on' && args !== 'off') return no('Usage: /plan [on|off]');
       h.setRun(key, { mode: args === 'on' ? 'plan' : 'default' });
@@ -165,7 +177,7 @@ export async function runCommand(
     }
     case 'bypass': {
       const cur = h.run(key);
-      if (cur.kind !== 'codex') return no(`/bypass is available only on Codex (this session runs ${cur.kind}).`);
+      if (!cur.ownerProfileSwitch) return no(onlyOn('/bypass', h.offering('ownerProfileSwitch'), cur.kind));
       if (!args) return ok(`Bypass ${cur.profile ?? 'default'} for owner turns in this session.`);
       if (args !== 'on' && args !== 'off' && args !== 'default') return no('Usage: /bypass [on|off|default]');
       h.setRun(key, { profile: args === 'default' ? null : args === 'on' ? 'bypass' : 'restricted' });
@@ -173,8 +185,8 @@ export async function runCommand(
     }
     case 'compact': {
       const cur = h.run(key);
-      if (cur.kind !== 'claude-code') return no(`/compact is not available on ${cur.kind} yet.`);
-      const r = await h.input(delivery, { ...a.input, content: [{ type: 'text', text: '/compact' }], channelContext: { ...a.input.channelContext, nativeCommand: true } }, 'queue');
+      if (cur.compact === undefined) return no(`/compact is not available on ${cur.kind} yet.`);
+      const r = await h.input(delivery, { ...a.input, content: [{ type: 'text', text: cur.compact }], channelContext: { ...a.input.channelContext, nativeCommand: true } }, 'queue');
       return r.ok ? ok('Compacting (queued behind anything running).') : no(`Not done: ${r.reason ?? 'refused'}.`);
     }
     case 'agent':

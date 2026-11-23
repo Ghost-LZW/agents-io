@@ -8,6 +8,7 @@ import { LocalClient } from '../src/client.js';
 import { resolveConfig, type Config, type HarnessInstance } from '../src/config.js';
 import { Gateway, InstanceHarness, type GatewayOptions } from '../src/gateway.js';
 import { readTokenFile, tokenPath } from '../src/token.js';
+import type { HarnessDeclares } from './declares.js';
 
 export const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
@@ -46,7 +47,7 @@ export interface World {
 
 /**
  * A daemon over a SQLite log in `dir` (reuse `dir` to restart it), a FakeChannel `fake`
- * (owner fake:alice) and a FakeHarness behind every instance.
+ * (owner fake:alice) and a FakeHarness behind every instance (declaring `declares`).
  */
 export async function daemon(
   o: {
@@ -63,6 +64,8 @@ export async function daemon(
     channelAdapter?: GatewayOptions['channelAdapter'];
     /** GatewayOptions.channelStartGraceMs. */
     channelStartGraceMs?: number;
+    /** What the FakeHarness declares (as the adapter it stands in for would). */
+    declares?: HarnessDeclares;
   } = {},
 ): Promise<World> {
   const dir = o.dir ?? tmp();
@@ -77,7 +80,7 @@ export async function daemon(
   if (o.console && !o.dir) writeFileSync(configPath, JSON.stringify(raw, null, 2) + '\n', { mode: 0o600 });
   const config = { ...base, socketPath: join(dir, 'run', 'aio.sock'), ...(o.console ? { source: { path: configPath, envFile: join(dir, '.env.live') } } : {}) };
   const chat = new FakeChannel('fake');
-  const harness = new FakeHarness(o.script);
+  const harness = Object.assign(new FakeHarness(o.script), o.declares);
   const built: HarnessInstance[] = [];
   const gw = await Gateway.start({
     config,

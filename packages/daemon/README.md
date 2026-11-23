@@ -95,6 +95,15 @@ see `docs/E2E.md` §0). New:
   gets these calls at stop, whether or not a session or task run used it; an adapter
   object that several instances share gets each call once. Codex declares `detach` on
   both transports and `adopts` on a Unix socket only; Claude Code declares none.
+  Chat commands, `/status` and `session.compact` read the adapter's other static
+  declarations, never the instance's kind: `compact: { command }` (a turn whose one input
+  is that native command compacts the context: `/compact` and `session.compact` send it;
+  Claude Code declares `/compact`), `modes: ['plan']` (`/plan`, the Plan line of `/status`;
+  Codex), `ownerProfileSwitch: true` (`/bypass`; Codex only, although Claude Code maps
+  `bypass` too) and `displayName` (how replies name the harness, e.g. "/plan is available
+  only on Codex"; else the instance name). Without them those commands answer that they are
+  unavailable. `ephemeralOpen: true` (Codex) is transitional: topic titles are generated in an
+  ephemeral session of a harness that declares it, until a host hook replaces them (G4).
 - **Live (realtime voice, decision 11)**: a Codex instance with `"live": true` opts
   its app-server connection into Codex's experimental realtime API. Agents on it
   (with `tools`) get `live_join { target, channel?, instructions?, voice? }`,

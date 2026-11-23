@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { HOST_RESULT_VALUES, errors, type BodyOf, type InputRecord, type SessionEvent } from '@agents-io/protocol';
 import type { FakeTurnScript } from '@agents-io/testkit';
 import { FEATURES } from '../src/host.js';
+import { CLAUDE_CODE_DECLARES, CODEX_DECLARES } from './declares.js';
 import { daemon, until, type World } from './helpers.js';
 
 /*
@@ -58,7 +59,7 @@ async function liveSession(w: World): Promise<string> {
 describe('session.compact', () => {
   it('starts a turn whose one input is the command, from the host, with no reply route; nothing reaches the channel #CT-3', async () => {
     const s = scripted();
-    const w = await daemon({ raw: { harnesses: { claude: { use: 'claude-code' } }, defaultHarness: 'claude' }, script: s.script });
+    const w = await daemon({ raw: { harnesses: { claude: { use: 'claude-code' } }, defaultHarness: 'claude' }, script: s.script, declares: CLAUDE_CODE_DECLARES });
     const key = await liveSession(w);
     const h = await w.host({ name: 'lb' });
     const sentBefore = w.chat.sent.length;
@@ -83,7 +84,7 @@ describe('session.compact', () => {
 
   it('context recorded before it waits for the next turn: the compaction is handed none #CT-3 #IN-6', async () => {
     const s = scripted();
-    const w = await daemon({ raw: { harnesses: { claude: { use: 'claude-code' } }, defaultHarness: 'claude' }, script: s.script });
+    const w = await daemon({ raw: { harnesses: { claude: { use: 'claude-code' } }, defaultHarness: 'claude' }, script: s.script, declares: CLAUDE_CODE_DECLARES });
     const key = await liveSession(w);
     const h = await w.host({ name: 'lb' });
     await h.command({ type: 'input', sessionKey: key, mode: 'observe', input: { inputId: 'note-1', content: [{ type: 'text', text: 'a note for later' }] } });
@@ -100,7 +101,7 @@ describe('session.compact', () => {
 
   it('a person\'s message while it runs queues behind it and is answered on the channel afterwards #CT-3 #IN-1', async () => {
     const s = scripted();
-    const w = await daemon({ raw: { harnesses: { claude: { use: 'claude-code' } }, defaultHarness: 'claude' }, script: s.script });
+    const w = await daemon({ raw: { harnesses: { claude: { use: 'claude-code' } }, defaultHarness: 'claude' }, script: s.script, declares: CLAUDE_CODE_DECLARES });
     const key = await liveSession(w);
     const h = await w.host({ name: 'lb' });
     const hold = s.hold();
@@ -122,7 +123,7 @@ describe('session.compact', () => {
 
   it('refused while a turn runs or inputs are queued (busy); never opens a session (not_live); bad ids and task runs refused #CT-3', async () => {
     const s = scripted();
-    const w = await daemon({ raw: { harnesses: { claude: { use: 'claude-code' } }, defaultHarness: 'claude' }, script: s.script });
+    const w = await daemon({ raw: { harnesses: { claude: { use: 'claude-code' } }, defaultHarness: 'claude' }, script: s.script, declares: CLAUDE_CODE_DECLARES });
     const key = await liveSession(w);
     const h = await w.host({ name: 'lb' });
     const hold = s.hold();
@@ -140,7 +141,7 @@ describe('session.compact', () => {
   });
 
   it('a session whose harness has no compaction command is refused (unsupported) #CT-3', async () => {
-    const w = await daemon({ raw: { harnesses: { cx: { use: 'codex' } }, defaultHarness: 'cx' } });
+    const w = await daemon({ raw: { harnesses: { cx: { use: 'codex' } }, defaultHarness: 'cx' }, declares: CODEX_DECLARES });
     const key = await liveSession(w);
     const h = await w.host({ name: 'lb' });
     await expect(h.sessionCompact({ sessionKey: key })).rejects.toMatchObject({ code: 'unsupported' });

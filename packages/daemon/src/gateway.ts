@@ -980,16 +980,22 @@ export class Gateway {
   }
 
   /**
-   * Whether a session left mid-turn on this instance is reopened at start so that its harness
-   * adopts the turn (`HarnessAdapter.adopts`). Builds the adapter without starting anything.
+   * An instance's adapter, for what it declares statically (`HarnessAdapter.adopts`, `compact`,
+   * `modes`, …): built without starting anything. An instance that cannot be built (unknown,
+   * unavailable) declares nothing.
    */
-  private adopts(harnessId: string | undefined): boolean {
-    if (harnessId === undefined || (!this.o.harness && !this.o.config.harnesses[harnessId])) return false;
+  private declared(harnessId: string | undefined): HarnessAdapter | undefined {
+    if (harnessId === undefined || (!this.o.harness && !this.o.config.harnesses[harnessId])) return undefined;
     try {
-      return this.harness(harnessId).adopts === true;
+      return this.harness(harnessId);
     } catch {
-      return false; // an instance that cannot be built (unavailable) adopts nothing
+      return undefined;
     }
+  }
+
+  /** Whether a session left mid-turn on this instance is reopened at start so that its harness adopts the turn (`HarnessAdapter.adopts`). */
+  private adopts(harnessId: string | undefined): boolean {
+    return this.declared(harnessId)?.adopts === true;
   }
 
   /** A module instance's adapter (its factory's, wrapped): every session of the instance shares it. */
@@ -1177,7 +1183,7 @@ export class Gateway {
   /**
    * `session.compact` (CT-3): the harness compacts a quiet live session's context as a turn of its
    * own, from the host (`origin`), with no reply route and no context handed. Never opens a lane or
-   * a harness to do it; only harnesses with a compaction command (Claude Code `/compact`).
+   * a harness to do it; only harnesses that declare a compaction command (`HarnessAdapter.compact`: Claude Code `/compact`).
    */
   async compactSession(f: SessionCompact, origin: Origin): Promise<Outcome> {
     if (this.stopped) return fail('stopped', 'daemon is stopping');
@@ -1189,12 +1195,12 @@ export class Gateway {
     if (!lane) return fail('not_live', `${f.sessionKey} has no open lane (session.compact never opens a harness to compact)`);
     // What its next turn runs on (the agent's instance, or one a preset set here moved it to).
     const run = this.commandHost.run(f.sessionKey);
-    if (run.kind !== 'claude-code') return fail('unsupported', `${run.harness} (${run.kind}) has no compaction command`);
+    if (run.compact === undefined) return fail('unsupported', `${run.harness} (${run.kind}) has no compaction command`);
     const inputId = f.inputId ?? `cmp_${randomUUID()}`;
     const input: InputRecord = {
       inputId,
       origin,
-      content: [{ type: 'text', text: '/compact' }],
+      content: [{ type: 'text', text: run.compact }],
       replyRoute: null,
       channelContext: { channel: 'host', nativeCommand: true },
     };
@@ -2032,8 +2038,8 @@ ${a.summary}` }],
     // The turn's own instance: a session's preset may have moved it off the agent's.
     const name = started.body.run?.harness ?? info.agent.harness;
     const adapter = this.launched.get(sessionKey)?.adapter(name) ?? this.agentHarness(info.agent, name);
-    // Titles come from an ephemeral Codex thread (topic-title.ts); a harness capability for it is G4.
-    if (!(innerAdapter(adapter) instanceof CodexHarness)) return;
+    // Titles come from an ephemeral session (topic-title.ts) on a harness that declares one (Codex); G4 makes this a host hook.
+    if (adapter.ephemeralOpen !== true) return;
     const eligible = new Set(events.filter((e) => e.body.t === 'turn.started' && e.body.inputIds.length > 0).map((e) => e.body.t === 'turn.started' ? e.body.turnId : ''));
     const completed = events.filter((e) => e.body.t === 'turn.completed' && e.body.status === 'completed' && eligible.has(e.body.turnId)).length;
     if (completed !== 1 && completed % 3 !== 1) return;
@@ -2697,7 +2703,7 @@ ${a.summary}` }],
         return [
           `session ${key}${topic ? ` · topic ${topic.title ?? topic.id}` : ''}`,
           `agent ${d.agent ?? agentOf(key).name}${run.preset ? ` · preset ${run.preset}` : ''} · ${run.harness} (${run.kind}) · model ${run.model ?? 'default'}${run.effort ? ` · effort ${run.effort}` : ''}${run.overridden ? ' (set here)' : ''}`,
-          `Plan mode ${run.kind === 'codex' ? run.mode === 'plan' ? 'on' : 'off' : 'unavailable'} · bypass ${run.profile ?? 'default (agent policy)'}`,
+          `Plan mode ${run.plan ? run.mode === 'plan' ? 'on' : 'off' : 'unavailable'} · bypass ${run.profile ?? 'default (agent policy)'}`,
           `cwd ${this.laneInfo.get(key)?.cwd ?? agentOf(key).cwd ?? c.cwd}`,
           `state ${info?.state ?? 'not open'}${info?.turnId ? ` · turn ${info.turnId}` : ''}${info?.queued ? ` · ${info.queued} queued` : ''}${info?.pendingRequests.length ? ` · waiting on ${info.pendingRequests.length} approval(s)` : ''}`,
           ...(native ? [`native session ${native}`] : []),
@@ -2736,9 +2742,13 @@ ${a.summary}` }],
         const model = o.model ?? base.model;
         const effort = o.effort ?? base.effort;
         const preset = set?.preset.name ?? agent.preset;
+        const a = this.declared(inst.name);
         return {
           harness: inst.name,
           kind: inst.kind,
+          ...(a?.compact ? { compact: a.compact.command } : {}),
+          plan: a?.modes?.includes('plan') === true,
+          ownerProfileSwitch: a?.ownerProfileSwitch === true,
           ...(preset ? { preset } : {}),
           ...(model ? { model } : {}),
           ...(effort ? { effort } : {}),
@@ -2747,6 +2757,13 @@ ${a.summary}` }],
           ...(o.preset !== undefined && !set ? { stalePreset: o.preset } : {}),
           overridden: !!(set || o.model || o.effort || o.mode || o.profile),
         };
+      },
+      offering: (cap) => {
+        const names = Object.keys(c.harnesses).map((name) => {
+          const a = this.declared(name);
+          return a && (cap === 'plan' ? a.modes?.includes('plan') : a.ownerProfileSwitch) ? (a.displayName ?? name) : undefined;
+        });
+        return [...new Set(names.filter((n) => n !== undefined))];
       },
       setRun: (key, o) => {
         const cur = this.runOverride(key);
@@ -3081,12 +3098,42 @@ export function withLaunch(a: HarnessAdapter, cwd: string | undefined, env: Reco
   return env ? new LaunchEnvHarness(a, env) : a;
 }
 
-class LaunchEnvHarness implements HarnessAdapter {
+/** A gateway wrapper over the kind's adapter (`inner`): what that adapter declares statically reads through. */
+abstract class WrappedHarness {
+  abstract readonly inner: HarnessAdapter;
+
+  get adopts(): boolean {
+    return this.inner.adopts === true;
+  }
+
+  get displayName(): string | undefined {
+    return this.inner.displayName;
+  }
+
+  get compact(): { readonly command: string } | undefined {
+    return this.inner.compact;
+  }
+
+  get modes(): readonly 'plan'[] | undefined {
+    return this.inner.modes;
+  }
+
+  get ownerProfileSwitch(): boolean {
+    return this.inner.ownerProfileSwitch === true;
+  }
+
+  get ephemeralOpen(): boolean {
+    return this.inner.ephemeralOpen === true;
+  }
+}
+
+class LaunchEnvHarness extends WrappedHarness implements HarnessAdapter {
   readonly id: string;
   constructor(
     readonly inner: HarnessAdapter,
     private readonly env: Record<string, string>,
   ) {
+    super();
     this.id = inner.id;
   }
 
@@ -3113,7 +3160,7 @@ function innerAdapter(a: HarnessAdapter): HarnessAdapter {
  * instance's environment and config dirs, under the instance name, opening its
  * sessions in the instance's cwd with its options.
  */
-export class InstanceHarness implements HarnessAdapter {
+export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
   readonly id: string;
   /** The kind's lifecycle calls, present only when its adapter has them (the gateway reads their presence). */
   readonly detach?: () => Promise<void>;
@@ -3124,13 +3171,10 @@ export class InstanceHarness implements HarnessAdapter {
     /** A launched session's env (decision 7), over the child's environment at open. */
     readonly env?: Record<string, string>,
   ) {
+    super();
     this.id = instance.name;
     if (typeof inner.detach === 'function') this.detach = () => inner.detach!();
     if (typeof inner.dispose === 'function') this.dispose = () => inner.dispose!();
-  }
-
-  get adopts(): boolean {
-    return this.inner.adopts === true;
   }
 
   probe(): Promise<{ version: string; caps: HarnessCaps }> {
