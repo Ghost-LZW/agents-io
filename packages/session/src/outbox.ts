@@ -101,8 +101,12 @@ export interface OutboxOptions {
    * `delivery.settled` — then commits as one transaction (`Hub.batch`) or not at all. One
    * that fails (any of the three throws, `onSettled` included, or a crash in the middle)
    * leaves the in-flight mark, which `recover` (or the next `deliver` of that id) settles as
-   * `unknown`. Unset, each of the three commits on its own and `onSettled` is best effort.
-   * Leave it unset for a store on another connection: it would wait for the log's lock.
+   * `unknown`. A refusal of the outbound check (`policy`) is settled before any attempt, with no
+   * mark: when that settlement fails nothing is recorded, the caller gets the error, and the
+   * next `deliver` of that id checks again (nothing was sent). Unset, or on a hub whose log has
+   * no transactions (`SessionLog.transaction`), each of the three commits on its own and
+   * `onSettled` is best effort. Leave it unset for a store on another connection: it would wait
+   * for the log's lock.
    */
   atomic?: boolean;
   /** Checked when a delivery names the turn it comes from (agent-initiated sends). */
@@ -162,7 +166,9 @@ export interface Delivery {
  * outcome that stays unclear (retries run out, an attempt times out) is `unknown`.
  * A settlement that throws is not a failed attempt: the error reaches the caller,
  * nothing is sent again, and with `atomic` nothing of it is kept but the in-flight
- * mark (settled `unknown` like a crash's, with an error that says what happened).
+ * mark (settled `unknown` like a crash's, with an error that says what happened). An
+ * outbound refusal has no mark (nothing was attempted): its failed settlement leaves
+ * nothing, and the next `deliver` of that id checks again.
  */
 export class Outbox {
   private readonly store: OutboxStore;
@@ -279,8 +285,15 @@ export class Outbox {
       try {
         return this.settle(d, rec, atSend);
       } catch (err) {
-        // Its in-flight mark (if one is left) is settled later as unknown, saying so.
-        this.unrecorded.set(d.operationId, err instanceof Error ? err.message : String(err));
+        // Its in-flight mark is settled later as unknown, saying so. Without one (the outbound
+        // check refused it before any attempt) nothing is recorded: the next deliver checks again.
+        let marked = true;
+        try {
+          marked = this.store.inFlight(d.operationId) !== undefined;
+        } catch {
+          // keep the reason, in case
+        }
+        if (marked) this.unrecorded.set(d.operationId, err instanceof Error ? err.message : String(err));
         throw err;
       }
     };
@@ -345,7 +358,8 @@ export class Outbox {
     // Closed: the in-flight mark stays, and the next process settles it as unknown.
     if (this.closed) return rec;
     const hub = this.o.hub;
-    const atomic = this.o.atomic === true && hub !== undefined;
+    // Only a log with transactions can take the three back together; on another, each commits on its own.
+    const atomic = this.o.atomic === true && hub?.log.transaction !== undefined;
     const write = () => {
       this.store.put(rec);
       if (atomic) {

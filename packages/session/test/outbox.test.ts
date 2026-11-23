@@ -270,6 +270,36 @@ describe('Outbox', () => {
     expect(ch.calls).toBe(2);
   });
 
+  it('atomic on a log without transactions (in memory) is not atomic: onSettled stays best effort and the outcome and delivery.settled are kept #DL-1', async () => {
+    const hub = new Hub(new MemorySessionLog());
+    const store = new MemoryOutboxStore();
+    const ob = new Outbox({ hub, store, atomic: true, onSettled: () => { throw new Error('index down'); }, sleep: noSleep });
+    const ch = new FlakyChannel(0);
+    expect(await ob.send(ch, d('op'))).toMatchObject({ status: 'delivered' });
+    expect(store.get('op')).toMatchObject({ status: 'delivered' });
+    expect(store.inFlight('op')).toBeUndefined();
+    expect(bodies(hub.log.read('s', 0))).toMatchObject([{ t: 'delivery.settled', operationId: 'op', result: 'delivered' }]);
+  });
+
+  it('atomic: a refusal of the outbound check whose settlement fails leaves nothing (it never had an in-flight mark): the caller gets the error, and the next deliver checks again #DL-1 #DL-5', async () => {
+    const log = new SqliteSessionLog();
+    const store = sqlStore(log.db);
+    const hub = new Hub(log);
+    let verdict: 'allow' | 'deny' = 'deny';
+    const ob = new Outbox({ hub, store, atomic: true, policy: { outbound: async () => verdict }, sleep: noSleep });
+    const from = { sessionKey: 's', turnId: 't', run: { harness: 'h', model: 'm', profile: 'p' }, inputs: [], replyRoute: route() };
+    const ch = new FlakyChannel(0);
+    const disk = refuseSettled(log);
+    await expect(ob.send(ch, { ...d('op'), from })).rejects.toThrow('disk I/O error');
+    expect([store.get('op'), store.inFlight('op'), ob.recover(), log.head('s'), ch.calls]).toEqual([undefined, undefined, [], 0, 0]);
+    disk.heal();
+    verdict = 'allow';
+    // Not an unknown left from a failed settlement: nothing was sent, so it is checked and sent now.
+    expect(await ob.send(ch, { ...d('op'), from })).toMatchObject({ status: 'delivered', attempts: 1 });
+    expect(ch.calls).toBe(1);
+    expect(bodies(log.read('s', 0))).toMatchObject([{ t: 'delivery.settled', operationId: 'op', result: 'delivered' }]);
+  });
+
   it('drain waits for running attempts, stops retries; close leaves what still runs in flight for the next recover #DL-1', async () => {
     const store = new MemoryOutboxStore();
     const ob = new Outbox({ store, baseDelayMs: 60_000, maxDelayMs: 60_000 });

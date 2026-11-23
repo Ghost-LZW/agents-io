@@ -75,6 +75,8 @@ export class Hub {
   private where = new Map<string, string>();
   /** Appended inside the outermost `batch` in progress, published when it commits. */
   private pending: SessionEvent[] | undefined;
+  /** Subscribers made inside the outermost `batch` in progress: they start reading once it has ended (`subscribe`). */
+  private deferred: Sub[] = [];
 
   constructor(
     readonly log: SessionLog,
@@ -95,6 +97,8 @@ export class Hub {
    * back, the log's memory view included; nobody sees those events, and the error is
    * rethrown. A batch inside a batch is a savepoint, published with the outer one. On a log
    * without transactions (in memory) `fn` just runs and each append is published at once.
+   * A subscriber made inside a batch starts once the outermost one has ended (after its events
+   * are published, or rolled back): it never reads what has not committed.
    */
   batch<T>(fn: () => T): T {
     if (!this.log.transaction) return fn();
@@ -104,12 +108,30 @@ export class Hub {
     let r: T;
     try {
       r = this.log.transaction(fn);
+    } catch (e) {
+      if (!outer) this.startDeferred();
+      throw e;
     } finally {
       this.pending = outer;
     }
     if (outer) outer.push(...mine);
-    else for (const e of mine) this.publish(e);
+    else {
+      for (const e of mine) this.publish(e);
+      this.startDeferred();
+    }
     return r;
+  }
+
+  private startDeferred(): void {
+    for (const sub of this.deferred.splice(0)) this.start(sub);
+  }
+
+  /** A subscriber starts: it reads what it missed from the log, then gets what is appended. */
+  private start(sub: Sub): void {
+    if (!sub.begin()) return;
+    let set = this.subs.get(sub.sessionKey);
+    if (!set) this.subs.set(sub.sessionKey, (set = new Set()));
+    set.add(sub);
   }
 
   private publish(e: SessionEvent): void {
@@ -142,10 +164,14 @@ export class Hub {
   }
 
   subscribe(o: SubscribeOptions): Subscription {
-    const sub = new Sub(this.log, o, o.bufferSize ?? this.opts.bufferSize ?? 1024, () => this.subs.get(o.sessionKey)?.delete(sub));
-    let set = this.subs.get(o.sessionKey);
-    if (!set) this.subs.set(o.sessionKey, (set = new Set()));
-    set.add(sub);
+    const sub = new Sub(this.log, o, o.bufferSize ?? this.opts.bufferSize ?? 1024, () => {
+      this.subs.get(o.sessionKey)?.delete(sub);
+      const i = this.deferred.indexOf(sub);
+      if (i >= 0) this.deferred.splice(i, 1);
+    });
+    // Inside a batch the log shows appends that may still roll back: start once it has ended.
+    if (this.pending) this.deferred.push(sub);
+    else this.start(sub);
     return sub;
   }
 
@@ -169,6 +195,19 @@ class Sub implements Subscription {
     private readonly cap: number,
     private readonly detach: () => void,
   ) {
+    this.cursor = o.fromSeq ?? 0;
+    o.signal?.addEventListener('abort', () => this.close(), { once: true });
+  }
+
+  get sessionKey(): string {
+    return this.o.sessionKey;
+  }
+
+  /** Read what it missed (`Hub.start`); false once closed. */
+  begin(): boolean {
+    if (this.closed) return false;
+    const o = this.o;
+    const log = this.log;
     // Ahead of the head is not "nothing missed": the log this cursor came from is not this one.
     if (o.fromSeq === undefined || o.fromSeq < log.floor(o.sessionKey) || o.fromSeq > log.head(o.sessionKey)) {
       const snap = log.snapshot(o.sessionKey);
@@ -179,7 +218,7 @@ class Sub implements Subscription {
     }
     // Replay synchronously: appends are synchronous too, so nothing slips in between.
     this.catchUp();
-    o.signal?.addEventListener('abort', () => this.close(), { once: true });
+    return true;
   }
 
   /** Called by the hub for every appended event, in seq order. */
@@ -191,7 +230,7 @@ class Sub implements Subscription {
       return;
     }
     if (this.lagging) return;
-    // Already read from the log: it subscribed inside a batch that had not committed yet.
+    // Already read from the log (never expected: a subscriber made inside a batch starts after it).
     if (e.seq <= this.cursor) return;
     if (this.queue.length >= this.cap) {
       // Never drop a durable event: stop buffering and re-read from the log later.

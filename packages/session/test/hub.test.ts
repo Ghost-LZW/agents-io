@@ -198,6 +198,74 @@ describe('Hub', () => {
     again.close();
   });
 
+  it('a subscriber made inside a batch reads nothing uncommitted: after a rollback it gets the events that reuse those seqs; after a commit the batch\'s, once #LN-1 #LN-10', async () => {
+    const log = new SqliteSessionLog({ path: join(dir, 'batch-sub.sqlite') });
+    const hub = new Hub(log);
+    hub.append('s', draft({ t: 'headline', text: 'one' }));
+    let rolled: ReturnType<Hub['subscribe']> | undefined;
+    expect(() =>
+      hub.batch(() => {
+        hub.append('s', draft({ t: 'headline', text: 'ghost2' }));
+        hub.append('s', draft({ t: 'headline', text: 'ghost3' }));
+        rolled = hub.subscribe({ sessionKey: 's', fromSeq: 1, tier: 'full' });
+        throw new Error('refused');
+      }),
+    ).toThrow('refused');
+    expect(log.head('s')).toBe(1);
+    for (const text of ['real2', 'real3', 'real4']) hub.append('s', draft({ t: 'headline', text }));
+    const texts = (evs: SessionEvent[]) => evs.map((e) => [e.seq, e.body.t === 'headline' ? e.body.text : e.body.t]);
+    expect(texts(await take(rolled!, 3))).toEqual([[2, 'real2'], [3, 'real3'], [4, 'real4']]);
+    rolled!.close();
+
+    let committed: ReturnType<Hub['subscribe']> | undefined;
+    hub.batch(() => {
+      hub.append('s', draft({ t: 'headline', text: 'five' }));
+      committed = hub.subscribe({ sessionKey: 's', fromSeq: 4, tier: 'full' });
+      hub.append('s', draft({ t: 'headline', text: 'six' }));
+    });
+    hub.append('s', draft({ t: 'headline', text: 'seven' }));
+    expect(texts(await take(committed!, 3))).toEqual([[5, 'five'], [6, 'six'], [7, 'seven']]);
+    // Closed before its batch ended: it never starts.
+    hub.batch(() => hub.subscribe({ sessionKey: 's', tier: 'full' }).close());
+    expect(hub.subscriberCount('s')).toBe(1);
+    committed!.close();
+    log.close();
+  });
+
+  it('a nested batch whose failure ended the whole transaction (SQLITE_FULL, IOERR): appends the outer one goes on with throw instead of autocommitting, so nothing of it is stored or published and the seq stays gapless #LN-1 #DL-1', async () => {
+    const path = join(dir, 'batch-ended.sqlite');
+    const log = new SqliteSessionLog({ path });
+    const hub = new Hub(log);
+    hub.append('s', draft({ t: 'headline', text: 'one' }));
+    const sub = hub.subscribe({ sessionKey: 's', fromSeq: 1, tier: 'full' });
+    expect(() =>
+      hub.batch(() => {
+        hub.append('s', draft({ t: 'headline', text: 'outer1' }));
+        try {
+          hub.batch(() => {
+            hub.append('s', draft({ t: 'headline', text: 'inner' }));
+            // What SQLite does on such an error: the whole transaction is gone.
+            log.db.exec('ROLLBACK');
+            throw new Error('disk full');
+          });
+        } catch {
+          // The outer batch carries on.
+        }
+        hub.append('s', draft({ t: 'headline', text: 'outer2' }));
+      }),
+    ).toThrow('the transaction this append belongs to has ended');
+    expect(log.db.isTransaction).toBe(false);
+    expect(log.head('s')).toBe(1);
+    expect(log.read('s', 0).map((e) => e.seq)).toEqual([1]);
+    hub.append('s', draft({ t: 'headline', text: 'two' }));
+    expect(await take(sub, 1)).toMatchObject([{ seq: 2, body: { text: 'two' } }]);
+    sub.close();
+    log.close();
+    const again = new SqliteSessionLog({ path });
+    expect(again.read('s', 0).map((e) => (e.body.t === 'headline' ? e.body.text : e.body.t))).toEqual(['one', 'two']);
+    again.close();
+  });
+
   it('filters by tier and never filters out human approvals #RQ-5', async () => {
     const hub = new Hub(new MemorySessionLog());
     const subs = {

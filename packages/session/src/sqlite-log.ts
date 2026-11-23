@@ -58,6 +58,9 @@ export class SqliteSessionLog extends BaseSessionLog {
   }
 
   protected persist(e: SessionEvent): void {
+    // Inside a batch whose transaction has ended (a failed statement can end all of it: SQLITE_FULL,
+    // IOERR, a nested batch's), a write would autocommit on its own, ahead of what the batch rolls back.
+    if (this.savepoints > 0 && !this.db.isTransaction) throw new Error('session log: the transaction this append belongs to has ended (an earlier statement failed); nothing more is written in it');
     // The primary key makes a duplicate seq (two writers) fail loudly instead of forking the log.
     this.q.insert.run(e.sessionKey, e.seq, JSON.stringify(e));
   }
@@ -86,6 +89,11 @@ export class SqliteSessionLog extends BaseSessionLog {
    * One transaction on this database (`SessionLog.transaction`): `BEGIN IMMEDIATE`, or a
    * savepoint when one is already open (by this log or by another writer of the same
    * connection, e.g. the daemon's records). A throw rolls the store and the memory view back.
+   * The memory view follows only this log's own transactions: under another writer's, its
+   * appends are in memory once the savepoint is released, so that writer must not roll back
+   * after it (as for a plain `append` inside its transaction). Once the transaction has ended
+   * underneath (a failed statement can end all of it), further appends in it throw instead of
+   * autocommitting (`persist`).
    */
   transaction<T>(fn: () => T): T {
     const nested = this.db.isTransaction;
