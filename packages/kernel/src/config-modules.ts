@@ -1,8 +1,10 @@
 import { dirname } from 'node:path';
 import type { AdminContribution } from '@agents-io/protocol';
+import { adminContributions } from './admin-contributions.js';
 import { NO_REGISTRIES } from './core.js';
 import { badChannelModule, type ChannelAdminContribution, type ChannelRegistry } from './channel-registry.js';
 import { ConfigError, configPath, readConfigFile, resolveModuleEntry, type LoadOptions, type ModuleFileEntry } from './config.js';
+import type { HarnessRegistry } from './harness-registry.js';
 import { ChannelModuleFiles, isModuleChannelType, isModulePath, moduleChannelType, moduleSpec } from './module-channel.js';
 import { loadChannelFile, loadFeatureModule, resolveModuleFile } from './module-loader.js';
 import type { ModuleRegistry, RegisteredModule } from './modules.js';
@@ -14,7 +16,8 @@ import type { ModuleRegistry, RegisteredModule } from './modules.js';
  *   - `modules` entries: feature modules (`ModuleManifest`, origin `module`), registered after the
  *     registry's own, in file order; each one's settings are its entry's `config`;
  *   - `type: "module"` channel entries: their files, so a `ChannelModule` descriptor one exports
- *     checks, resolves and builds its entries (`moduleChannelType`), and its admin routes are served.
+ *     checks, resolves and builds its entries (`moduleChannelType`), and its admin routes are served
+ *     (claimed against the channel types' and the harness kinds' as theirs are against one another).
  * Their code is in-process code the deployment's config names, as trusted as the daemon's own
  * (INVARIANTS ID-3 boundary 2), and gets what a built-in module gets; what it may stamp or grant
  * stays the kernel's to say (ID-3, ID-10). A `use: "module"` harness module is imported at the
@@ -35,8 +38,13 @@ export interface ConfigModules {
   importModules: ImportConfigModules;
 }
 
-/** `importConfigModules` of a parsed config file in `baseDir`, over registries fixed beforehand (`ConfigModules.importModules`). */
-export type ImportConfigModules = (raw: unknown, o: { baseDir: string }) => Promise<ConfigModules>;
+/**
+ * `importConfigModules` of a parsed config file in `baseDir`, over registries fixed beforehand
+ * (`ConfigModules.importModules`); `o.harnessRegistry`, the harness kinds the daemon runs (the
+ * console's), replaces the one given beforehand, whose admin contributions a descriptor's are
+ * claimed against.
+ */
+export type ImportConfigModules = (raw: unknown, o: { baseDir: string; harnessRegistry?: HarnessRegistry }) => Promise<ConfigModules>;
 
 /**
  * `importConfigModules` of the file `loadConfig` would read (`o.path`, `$AIO_CONFIG`,
@@ -44,7 +52,12 @@ export type ImportConfigModules = (raw: unknown, o: { baseDir: string }) => Prom
  */
 export async function loadConfigModules(o: LoadOptions = {}): Promise<ConfigModules> {
   const { path, raw } = readConfigFile(o);
-  return importConfigModules(raw, { baseDir: dirname(path), ...(o.moduleRegistry ? { moduleRegistry: o.moduleRegistry } : {}), ...(o.channelRegistry ? { channelRegistry: o.channelRegistry } : {}) });
+  return importConfigModules(raw, {
+    baseDir: dirname(path),
+    ...(o.moduleRegistry ? { moduleRegistry: o.moduleRegistry } : {}),
+    ...(o.channelRegistry ? { channelRegistry: o.channelRegistry } : {}),
+    ...(o.harnessRegistry ? { harnessRegistry: o.harnessRegistry } : {}),
+  });
 }
 
 /**
@@ -55,14 +68,19 @@ export async function loadConfigModules(o: LoadOptions = {}): Promise<ConfigModu
  * missing, cannot be imported, exports no manifest, or whose manifest its registry refuses (its
  * shape; an id, config section, tool, command or feature another module has) fails with a
  * `ConfigError` naming the entry (`modules[<i>] (module <file>): …`); so does a module channel file
- * that cannot be imported or exports a descriptor of the wrong shape (`channels[<i>] (module <file>): …`).
+ * that cannot be imported or exports a descriptor of the wrong shape (`channels[<i>] (module <file>): …`),
+ * or whose descriptor's admin contribution has a route or schema name that is the console's own
+ * or that a channel type, an earlier descriptor or a harness kind of `o.harnessRegistry` (default
+ * none; `@agents-io/daemon`'s: the built-in ones) contributes too. The answer has no harness
+ * registry: the one given is only claimed against (give `loadConfig` and `Gateway.start` the same).
  * A file naming no module files gives the registries back as they are. `importModules` in the
  * answer imports another version of the file over the same given registries.
  */
-export async function importConfigModules(raw: unknown, o: { baseDir: string; moduleRegistry?: ModuleRegistry; channelRegistry?: ChannelRegistry }): Promise<ConfigModules> {
-  const base = { moduleRegistry: o.moduleRegistry ?? NO_REGISTRIES.moduleRegistry, channelRegistry: o.channelRegistry ?? NO_REGISTRIES.channelRegistry };
-  const importModules: ImportConfigModules = (next, at) => importConfigModules(next, { baseDir: at.baseDir, ...base });
+export async function importConfigModules(raw: unknown, o: { baseDir: string; moduleRegistry?: ModuleRegistry; channelRegistry?: ChannelRegistry; harnessRegistry?: HarnessRegistry }): Promise<ConfigModules> {
+  const base = { moduleRegistry: o.moduleRegistry ?? NO_REGISTRIES.moduleRegistry, channelRegistry: o.channelRegistry ?? NO_REGISTRIES.channelRegistry, harnessRegistry: o.harnessRegistry ?? NO_REGISTRIES.harnessRegistry };
+  const importModules: ImportConfigModules = (next, at) => importConfigModules(next, { ...base, baseDir: at.baseDir, ...(at.harnessRegistry ? { harnessRegistry: at.harnessRegistry } : {}) });
   let { moduleRegistry, channelRegistry } = base;
+  const { harnessRegistry } = base;
   const file = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
   const path = configPath(o.baseDir);
   // A module channel entry's file, as the config's resolution finds it (`moduleChannelType` `resolve`).
@@ -117,8 +135,11 @@ export async function importConfigModules(raw: unknown, o: { baseDir: string; mo
       if (d.admin && !seen.has(d.admin)) {
         const admin: AdminContribution = d.admin;
         seen.add(admin);
+        // The given registries against one another first: a clash of theirs is not the entry's (a plain Error, as at the gateway's start).
+        adminContributions(harnessRegistry, channelRegistry);
         try {
-          channelRegistry.with({ admins: [...admins, { type: 'module', admin }] });
+          // After the channel types' and the descriptors' before it, before the harness kinds': in the order the daemon serves them (`adminContributions`).
+          adminContributions(harnessRegistry, channelRegistry.with({ admins: [...admins, { type: 'module', admin }] }));
         } catch (err) {
           throw new ConfigError(`${where}: ${(err as Error).message}`);
         }

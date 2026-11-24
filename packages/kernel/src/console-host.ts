@@ -88,7 +88,8 @@ export interface ConfigStoreOptions {
   /**
    * How the daemon imports the module files a config file names (`ConfigModules.importModules`):
    * a document is then validated, listed and applied live with the registries this gives for it
-   * (what the next start would read it with), not with the ones above; its credentials are what
+   * (what the next start would read it with; given `harnessRegistry`, whose admin contributions a
+   * descriptor's are claimed against), not with the ones above; its credentials are what
    * either these or `channelRegistry` mark (a descriptor the daemon's start imported still marks its
    * entries when its file is gone or resolves elsewhere now). A file that does not import is an
    * issue of the document. Without it (a daemon that imports no module files), a `modules` entry

@@ -970,7 +970,8 @@ kernel's and the console's with these defaults: `instanceof` either one holds fo
 A config naming module files (`modules` entries, module channel files exporting a descriptor) is
 loaded as `aio serve` does: `const r = await loadConfigModules({ path })` (or
 `importConfigModules(raw, { baseDir })`; both take a `moduleRegistry` / `channelRegistry` to
-extend, default the built-in ones), then `loadConfig({ path, ...r })` and
+extend and the `harnessRegistry` the daemon runs, whose admin contributions a descriptor's must
+not repeat, default the built-in ones), then `loadConfig({ path, ...r })` and
 `Gateway.start({ config, ...r })`, the same registries to both (`r.importModules`, the same import
 over the registries given, lets the console read a document it validates, shows or applies as the
 next start would). The feature modules are registered
@@ -1621,3 +1622,13 @@ G5, 2026-11-25):
   The `console` section has the harness kinds' keys after the channel types' (before
   `liveChannels`), the console serves their routes after the channel types', and
   `adminEndpoints(channels, harnesses?)` lists them last. The built-in kinds contribute none.
+- Review fixes (2026-11-25): a module channel file's descriptor contributing an admin route or
+  schema a registered harness kind contributes too failed only where the registries met, as a
+  plain `Error`: the console's `PUT /api/config` and `POST /api/config/validate` answered 500
+  `internal`, and the start's error did not name the entry. `importConfigModules` now claims a
+  descriptor's contribution against the harness kinds' too, failing with a `ConfigError` naming
+  the entry (`channels[<i>] (module <file>): channel type "module" and harness kind "<kind>" both
+  contribute admin route …`), so the console answers 422 as for a clash with a channel type. It
+  and `loadConfigModules` take an optional `harnessRegistry` (`LoadOptions.harnessRegistry`; this
+  package's default to the built-in kinds), and `ImportConfigModules` an optional
+  `harnessRegistry` in its options (the console's `ConfigStore` gives the daemon's).

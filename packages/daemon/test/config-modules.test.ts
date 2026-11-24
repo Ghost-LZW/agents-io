@@ -3,10 +3,11 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { ADMIN_REDACTED, type InputRecord, type KernelContext, type Origin } from '@agents-io/protocol';
+import { Type } from '@sinclair/typebox';
+import { ADMIN_REDACTED, type HarnessModule, type InputRecord, type KernelContext, type Origin } from '@agents-io/protocol';
 import { FakeChannel, FakeHarness, type FakeTurnScript } from '@agents-io/testkit';
-import { builtinChannels, builtinModules } from '../src/bundle.js';
-import { type HarnessInstance, LocalClient, readTokenFile, tokenPath } from '@agents-io/kernel';
+import { builtinChannels, builtinHarnesses, builtinModules } from '../src/bundle.js';
+import { ConfigError, type HarnessInstance, HarnessRegistry, LocalClient, readTokenFile, tokenPath } from '@agents-io/kernel';
 import { ConfigStore, Gateway, implicitEnv, importConfigModules, InstanceHarness, redact, resolveConfig } from '../src/defaults.js';
 import { cleanups, tmp, until } from './helpers.js';
 import { mcpCall, mcpTools } from './output-tools-helpers.js';
@@ -45,11 +46,13 @@ function file(raw: Record<string, unknown>) {
  * What `aio serve` does with a file: import its module files, resolve it with the registries that
  * gives, start a gateway on them (a FakeHarness behind every instance, a FakeChannel `fake` with
  * owner fake:alice, unless `loadHarnesses`: the gateway loads `use: "module"` instances itself).
- * `console` serves the console on the file (an object: more keys of its `console` section).
+ * `console` serves the console on the file (an object: more keys of its `console` section);
+ * `harnessRegistry` is the daemon's harness kinds (default the built-in ones), to all three.
  */
-async function serve(raw: Record<string, unknown>, o: { env?: Record<string, string>; script?: FakeTurnScript; loadHarnesses?: boolean; console?: boolean | Record<string, unknown> } = {}) {
+async function serve(raw: Record<string, unknown>, o: { env?: Record<string, string>; script?: FakeTurnScript; loadHarnesses?: boolean; console?: boolean | Record<string, unknown>; harnessRegistry?: HarnessRegistry } = {}) {
   const f = file(o.console ? { ...raw, console: { port: 0, ...(typeof o.console === 'object' ? o.console : {}) } } : raw);
-  const registries = await importConfigModules(f.raw, { baseDir: here });
+  const harnessRegistry = o.harnessRegistry ?? builtinHarnesses;
+  const registries = { ...(await importConfigModules(f.raw, { baseDir: here, harnessRegistry })), harnessRegistry };
   const configPath = join(f.dir, 'aio.config.json');
   if (o.console) writeFileSync(configPath, JSON.stringify(f.raw, null, 2) + '\n', { mode: 0o600 });
   const config = { ...resolveConfig(f.raw, { env: o.env ?? {}, baseDir: here, cwd: f.dir, ...registries }), socketPath: join(f.dir, 'run', 'aio.sock'), ...(o.console ? { source: { path: configPath } } : {}) };
@@ -386,8 +389,8 @@ describe('the console reads a document as the next start would: the module files
   const feature = join(fx, 'feature-module.mjs');
   const acmeAt = (config: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({ type: 'module', module: desc, config, ...extra });
   /** A console on a daemon started with `raw`, and a PUT of its file with `more` over it. */
-  async function consoleOn(raw: Record<string, unknown>, o: { env?: Record<string, string>; live?: boolean } = {}) {
-    const w = await serve(raw, { console: o.live ? { liveChannels: true } : true, env: o.env ?? {} });
+  async function consoleOn(raw: Record<string, unknown>, o: { env?: Record<string, string>; live?: boolean; harnessRegistry?: HarnessRegistry } = {}) {
+    const w = await serve(raw, { console: o.live ? { liveChannels: true } : true, env: o.env ?? {}, ...(o.harnessRegistry ? { harnessRegistry: o.harnessRegistry } : {}) });
     const put = async (more: Record<string, unknown>) => w.api('/api/config', { method: 'PUT', json: { config: { ...JSON.parse(readFileSync(w.configPath, 'utf8')), ...more } } });
     return { ...w, put };
   }
@@ -469,6 +472,37 @@ describe('the console reads a document as the next start would: the module files
       severity: 'error',
       message: expect.stringMatching(/^modules\[0\] \(module .*feature-module\.mjs\) is not loaded: this daemon imports no module files of its config, so it would not start on this file$/),
     });
+  });
+
+  it("PUT and validate refuse a descriptor whose admin route a harness kind of the daemon contributes too, naming the entry (422, the file left), as the next start's import would (a ConfigError); one adding no admin route is written #CF-4", async () => {
+    // A harness kind of the daemon's contributing the descriptor's route (GET /api/acme/ping): the console serves the routes of both.
+    const ping: HarnessModule = {
+      kind: 'pinger',
+      schema: Type.Object({}),
+      create: () => new FakeHarness(),
+      admin: { routes: [{ method: 'GET', path: '/api/acme/ping', status: 200, response: Type.Object({ pong: Type.Boolean() }), handle: () => ({ status: 200, body: { pong: false } }) }] },
+    };
+    const harnessRegistry = new HarnessRegistry([...builtinHarnesses.modules, ping]);
+    const w = await consoleOn({}, { env: { ACME_SECRET: 's' }, harnessRegistry });
+    const before = readFileSync(w.configPath, 'utf8');
+    const clash = /^channels\[0\] \(module .*chan-descriptor\.mjs\): channel type "module" and harness kind "pinger" both contribute admin route GET \/api\/acme\/ping$/;
+    const issue = { path: '/channels/0', code: 'invalid', severity: 'error', message: expect.stringMatching(clash) };
+    const doc = { ...JSON.parse(before), channels: [acmeAt({ id: 'acme1', token: 'env:ACME_SECRET' })] };
+    const r = await w.put({ channels: doc.channels });
+    expect(r.status).toBe(422);
+    expect(r.body).toEqual({ valid: false, issues: [issue] });
+    expect(await w.api('/api/config/validate', { method: 'POST', json: { config: doc } })).toEqual({ status: 200, body: { valid: false, issues: [issue] } });
+    expect(readFileSync(w.configPath, 'utf8')).toBe(before);
+    // Against the harness kinds the store reads the file with, whichever ones its import was made over.
+    const store = new ConfigStore({ path: w.configPath, env: { ACME_SECRET: 's' }, cwd: w.file.dir, harnessRegistry, importModules: (await importConfigModules({}, { baseDir: here })).importModules });
+    expect(await store.validate(doc)).toEqual({ valid: false, issues: [issue] });
+    // The next start's import refuses it the same way: a config error naming the entry (aio serve: exit 2).
+    const failed = await importConfigModules(doc, { baseDir: here, harnessRegistry }).catch((e: Error) => e);
+    expect(failed).toBeInstanceOf(ConfigError);
+    expect((failed as Error).message).toMatch(clash);
+    // The same descriptor without its admin route (export `second`) is fine.
+    const ok = await w.put({ channels: [acmeAt({ id: 'acme1', token: 'env:ACME_SECRET' }, { export: 'second' })] });
+    expect([ok.status, ok.body.applied]).toEqual([200, 'restart']);
   });
 
   it("with liveChannels, descriptor channels added through the console are imported and started at once; one whose descriptor adds admin routes the console did not mount at the start fails until a restart, and the file does not count as applied #CF-2", async () => {

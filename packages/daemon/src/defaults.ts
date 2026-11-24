@@ -113,14 +113,14 @@ export function loadConfig(o: LoadOptions = {}): Config {
   return kernelLoadConfig(builtin(o));
 }
 
-/** The kernel's `importConfigModules`, over the built-in feature modules and channel types where `o` gives none. */
-export function importConfigModules(raw: unknown, o: { baseDir: string; moduleRegistry?: ModuleRegistry; channelRegistry?: ChannelRegistry }): Promise<ConfigModules> {
-  return kernelImportConfigModules(raw, { ...o, moduleRegistry: o.moduleRegistry ?? builtinModules, channelRegistry: o.channelRegistry ?? builtinChannels });
+/** The kernel's `importConfigModules`, over the built-in feature modules, channel types and harness kinds where `o` gives none. */
+export function importConfigModules(raw: unknown, o: { baseDir: string; moduleRegistry?: ModuleRegistry; channelRegistry?: ChannelRegistry; harnessRegistry?: HarnessRegistry }): Promise<ConfigModules> {
+  return kernelImportConfigModules(raw, builtin(o));
 }
 
-/** The kernel's `loadConfigModules`, over the built-in feature modules and channel types where `o` gives none. */
+/** The kernel's `loadConfigModules`, over the built-in feature modules, channel types and harness kinds where `o` gives none. */
 export function loadConfigModules(o: LoadOptions = {}): Promise<ConfigModules> {
-  return kernelLoadConfigModules({ ...o, moduleRegistry: o.moduleRegistry ?? builtinModules, channelRegistry: o.channelRegistry ?? builtinChannels });
+  return kernelLoadConfigModules(builtin(o));
 }
 
 /** The console's `isCredential`, by the built-in channel types' marks unless `channels` says. */

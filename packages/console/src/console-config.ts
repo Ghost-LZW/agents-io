@@ -300,15 +300,16 @@ export class ConfigStore implements ConsoleConfigStore {
 
   /**
    * The registries `raw` is read with: with `importModules`, the module files it names imported
-   * (cached by the module loader: a file imported before is not run again); a file that does not
-   * import is an issue, and `raw` is then read with the daemon's. Without it, the daemon's. Its
+   * (cached by the module loader: a file imported before is not run again), a descriptor's admin
+   * contribution claimed against the daemon's harness kinds' too; a file that does not import is
+   * an issue, and `raw` is then read with the daemon's. Without it, the daemon's. Its
    * credentials are what these and the daemon's mark (`Registries.marks`): a module channel file
    * that cannot be found now is the resolution's issue, never a reason to show what it marked.
    */
   private async registriesOf(raw: Json): Promise<{ regs: Registries; issues: ConfigIssue[] }> {
     if (!this.o.importModules) return { regs: this.daemon, issues: [] };
     try {
-      const r = await this.o.importModules(raw, { baseDir: dirname(this.o.path) });
+      const r = await this.o.importModules(raw, { baseDir: dirname(this.o.path), harnessRegistry: this.daemon.harnesses });
       const marks = r.channelRegistry === this.daemon.channels ? this.daemon.marks : [r.channelRegistry, this.daemon.channels];
       return { regs: { harnesses: this.daemon.harnesses, channels: r.channelRegistry, modules: r.moduleRegistry, marks }, issues: [] };
     } catch (e) {
