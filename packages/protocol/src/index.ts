@@ -4,6 +4,7 @@ export * from './inbound.js';
 export * from './run.js';
 export * from './requests.js';
 export * from './events.js';
+export * from './attention.js';
 export * from './commands.js';
 export * from './channel.js';
 export * from './harness.js';

@@ -48,10 +48,19 @@ export interface TopicRegistryOptions {
   db?: DatabaseSync;
   /** SQLite file or `:memory:` (default) when no `db` is given. */
   path?: string;
-  /** When given, every change appends `topic.changed` to the session left and the one now current. */
-  hub?: Pick<Hub, 'append' | 'log'>;
+  /**
+   * When given, every change appends `topic.changed` to the session left and the one now current.
+   * A change made inside its `batch` on the database the registry shares (a client's `topic.switch`
+   * with an op id) is undone in memory too when that batch rolls back (`onRollback`).
+   */
+  hub?: Pick<Hub, 'append' | 'log'> & Partial<Pick<Hub, 'onRollback'>>;
   now?: () => number;
   newId?: () => string;
+  /**
+   * After each change, synchronously. Inside a transaction (`Hub.batch`) it is called before the
+   * commit: its own writes to the database commit or roll back with the change; what it does
+   * outside the database (timers, lanes) waits for the commit (`Hub.afterCommit`).
+   */
   onChange?: (c: TopicChange) => void;
 }
 
@@ -260,20 +269,27 @@ export class TopicRegistry {
       lastActiveAt: at,
     };
     const summary = previous ? opts.summaryOfPrevious?.trim() : undefined;
-    this.db.exec('BEGIN');
-    try {
+    const nested = this.atomically(() => {
       if (previous) this.q.state.run('parked', previous.lastActiveAt, previous.id);
       if (previous && summary) this.q.summary.run(summary, previous.id);
       this.q.insert.run(t.id, conversation, agent, key, t.title ?? null, draft.titleSource ?? (t.title ? 'explicit' : 'auto'), null, null, 'current', at, at);
-      this.db.exec('COMMIT');
-    } catch (e) {
-      this.db.exec('ROLLBACK');
-      throw e;
-    }
+    });
+    const was = previous && { state: previous.state, summary: previous.summary };
     if (previous) previous.state = 'parked';
     if (previous && summary) previous.summary = summary;
     this.remember(t);
     this.sources.set(t.id, draft.titleSource ?? (t.title ? 'explicit' : 'auto'));
+    if (nested)
+      this.o.hub?.onRollback?.(() => {
+        if (previous && was) {
+          previous.state = was.state;
+          if (was.summary === undefined) delete previous.summary;
+          else previous.summary = was.summary;
+        }
+        this.byId.delete(t.id);
+        this.bySessionKey.delete(t.sessionKey);
+        this.sources.delete(t.id);
+      });
     this.changed({ conversation, agent, ...(previous ? { from: previous } : {}), to: t, reason, ...(opts.turn ? { turn: opts.turn } : {}), created: true, ...(opts.check ? { check: opts.check } : {}) });
     return { topic: t, ...(previous ? { previous } : {}), created: true };
   }
@@ -285,18 +301,20 @@ export class TopicRegistry {
     const previous = this.current(t.conversation, t.agent);
     if (previous === t) return { topic: t, created: false };
     const at = this.now();
-    this.db.exec('BEGIN');
-    try {
+    const nested = this.atomically(() => {
       if (previous) this.q.state.run('parked', previous.lastActiveAt, previous.id);
       this.q.state.run('current', at, t.id);
-      this.db.exec('COMMIT');
-    } catch (e) {
-      this.db.exec('ROLLBACK');
-      throw e;
-    }
+    });
+    const was = { state: t.state, lastActiveAt: t.lastActiveAt };
     if (previous) previous.state = 'parked';
     t.state = 'current';
     t.lastActiveAt = at;
+    if (nested)
+      this.o.hub?.onRollback?.(() => {
+        if (previous) previous.state = 'current';
+        t.state = was.state;
+        t.lastActiveAt = was.lastActiveAt;
+      });
     this.changed({ conversation: t.conversation, agent: t.agent, ...(previous ? { from: previous } : {}), to: t, reason, ...(opts.turn ? { turn: opts.turn } : {}) });
     return { topic: t, ...(previous ? { previous } : {}), created: false };
   }
@@ -340,6 +358,33 @@ export class TopicRegistry {
 
   close(): void {
     if (this.ownsDb) this.db.close();
+  }
+
+  /**
+   * `fn`'s writes as one transaction: its own, or a savepoint of one already open on this database
+   * (a `Hub.batch` of the session log it shares: a client's `topic.switch` with an op id commits
+   * its receipt with the change). True when nested: the writes still roll back with that one, and
+   * the caller's changes in memory with them (`Hub.onRollback`).
+   */
+  private atomically(fn: () => void): boolean {
+    const nested = this.db.isTransaction;
+    this.db.exec(nested ? 'SAVEPOINT topics_write' : 'BEGIN');
+    try {
+      fn();
+      this.db.exec(nested ? 'RELEASE topics_write' : 'COMMIT');
+      return nested;
+    } catch (e) {
+      if (!nested) {
+        this.db.exec('ROLLBACK');
+        throw e;
+      }
+      try {
+        this.db.exec('ROLLBACK TO topics_write; RELEASE topics_write');
+      } catch {
+        // a failed statement may have ended the enclosing transaction already: its error is the one to report
+      }
+      throw e;
+    }
   }
 
   private changed(c: TopicChange): void {

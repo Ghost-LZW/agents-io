@@ -288,6 +288,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 - **档位**：由配置决定。
 - **对端起不来**：首次 `hello` 失败不会让守护进程启动失败。通道显示为 `failed`（`GET /api/status` 给出原因，后缀 `; retrying`），按 `backoff` 重试，连上后变回 `running`（之后对端离开、重连期间同样显示 `failed`）；命令本身无法执行（`ENOENT` / `EACCES`）仍让启动失败。未连接时请求以 `unavailable`（可重试）失败。见 `docs/design/bridge-first-connect`。
 - **通道 id**：可选的 `id` 是这个通道的 id，每次 `hello` 声明的 `adapterId` 都必须等于它，否则按 `bad_hello` 拒绝、杀掉子进程并按 `backoff` 重启（状态 `failed`，原因写明）；未连接时也用它显示与路由。不写 `id` 时第一次成功 `hello` 的 id 被固定，之后的 hello 不许换。见下文"通道盖章"。
+- **harness 也可以这样接**：任何语言写的 harness 程序同样经 JSONL stdio 接进来（harness 种类 `bridge`，`harness/jsonl-bridge`），它在 `probe` 的回答里声明的与进程内的 harness 一样起作用，见 HOSTS §4.8。
 
 ### 通道盖章（channel-stamping，决定 13）
 
@@ -426,7 +427,7 @@ aio-dev watch remove team-digest
 - 每个 harness 绑定（一个 session 的一次 open，即一个 generation）发一个随机 bearer token，token 对应 `(sessionKey, generation)`。每次调用时再取这个 session **当前正在跑的那一轮**，没有在跑的轮次就拒绝（监听工具除外）。没有 token 或 token 不对：HTTP 401。
 - **Claude Code**：通过 SDK `mcpServers` 挂成 `agents_io`（`type: 'http'`，`headers.Authorization`），设 `alwaysLoad: true`（工具总在提示里，不藏在 tool search 后面），并加一条 `allowedTools: mcp__agents_io` 允许规则：这些工具自己按 `Policy.outbound` 检查目的地，不再弹审批。
 - **Codex**：在 `thread/start`（或 `thread/resume`）的 `config` 里按线程覆盖 `mcp_servers.agents_io = { url, http_headers: { Authorization }, default_tools_approval_mode: "approve" }`。已实测（codex-cli 0.160.1；0.171.0 上 aio-e2e 的 m、p 走同一条路，2026-11-24）：按线程的配置会启动这个服务（`mcpServer/startupStatus/updated` 显示 `ready`）；不设 `default_tools_approval_mode` 时，非只读的 MCP 工具在 `approvalPolicy: never` 下会被直接拒掉（模型回答"需要审批但无法审批"）。
-- **默认关闭，按 agent 开启**（原则 2，决定 13）：在 agent 上写 `"tools": true` 才挂，例如 `"agents": { "assistant": { "harness": "claude", "tools": true } }`；顶层 `"outputTools": true` 把所有没写 `tools` 的 agent 一起打开（它只是各 agent `tools` 的缺省值），agent 自己的 `tools: false` 仍优先。没有任何 agent 开启时网关不起 MCP 服务。`tools` 也可以写成工具名的列表，只挂这几个，例如 `"tools": ["send_message", "send_file"]`：MCP 只列出它们，别的工具既看不到也调不了；列表里有未知的名字是配置错误，空列表等于 `false`；没有 `session_*` 工具的 agent 不出话题提示行。`watch_*`、`schedule_*`、`live_*`、`session_*` 四组是内建功能模块（`tools.watch`、`tools.schedules`、`tools.live`、`tools.topics`，core-slimming G6），缺省开着；配置段 `watchTools`、`scheduleTools`、`liveTools`、`topicTools` 写 `{ "enabled": false }` 就整组关掉（不挂、不出提示行；关掉 `scheduleTools` 只是 agent 没有这三个工具，主人、宿主和外部客户端的定时任务照旧），这时列表里写了那组的工具是配置错误，错误里说出是哪个模块。`packages/daemon/aio.config.example.json`（dev-gateway / e2e 用的示例配置）给 `assistant` 开了。
+- **默认关闭，按 agent 开启**（原则 2，决定 13）：在 agent 上写 `"tools": true` 才挂，例如 `"agents": { "assistant": { "harness": "claude", "tools": true } }`；顶层 `"outputTools": true` 把所有没写 `tools` 的 agent 一起打开（它只是各 agent `tools` 的缺省值），agent 自己的 `tools: false` 仍优先。没有任何 agent 开启时网关不起 MCP 服务。`tools` 也可以写成工具名的列表，只挂这几个，例如 `"tools": ["send_message", "send_file"]`：MCP 只列出它们，别的工具既看不到也调不了；列表里有未知的名字是配置错误，空列表等于 `false`；没有 `session_*` 工具的 agent 不出话题提示行。`watch_*`、`schedule_*`、`live_*`、`session_*` 四组是内建功能模块（`tools.watch`、`tools.schedules`、`tools.live`、`tools.topics`，core-slimming G6），缺省开着；配置段 `watchTools`、`scheduleTools`、`liveTools`、`topicTools` 写 `{ "enabled": false }` 就整组关掉（不挂、不出提示行；关掉 `scheduleTools` 只是 agent 没有这三个工具，主人、宿主和外部客户端的定时任务照旧），这时列表里写了那组的工具是配置错误，错误里说出是哪个模块。用不了的工具不挂：`live_*` 只在至少一个运行中的通道能开 live（实现了 `openLive`，见 §7a）时列出（`live_say`、`live_leave` 在有 live 在跑时也列出），每次 `tools/list` 时判断，后来起来的通道让它们出现在下一次 `tools/list` 里；没有这样的通道时 `tools: true` 的 agent 是 15 个工具，列表里写了 `live_*` 的 agent 这时也不列出它们（不算配置错误）。`packages/daemon/aio.config.example.json`（dev-gateway / e2e 用的示例配置）给 `assistant` 开了。
 - **行为变化（2026-10-11）**：此前 `outputTools` 缺省为 `true`，什么都不写的部署所有 agent 都有工具。升级后这样的部署**不再挂任何输出工具**：`ask_choice` 按钮、`send_file`、`mention`、`send_message`、`watch_*`、`session_*`（模型自己切话题；`/new`、`/switch` 聊天命令不受影响）、`live_*` 都没有，话题提示行也不再出现。要保持原样，在配置顶层加 `"outputTools": true`，或给需要的 agent 加 `"tools": true`。
 - **幂等**：每次调用的 operationId 是 `tool:<sessionKey>:<harness 的工具调用 id>`。Claude Code 在 `_meta["claudecode/toolUseId"]` 里给出调用 id，Codex 在 `_meta.callId` 里给出（同时还有 `x-codex-turn-metadata`、`threadId`、`itemId` 等）。都没有时退回 JSON-RPC 请求 id。同一个调用重试不会发出两条消息。
 - **记录**：每条工具发出的消息在 session 日志里记一条 `native` 事件 `agents-io.output`（内容是工具名、operationId、路由、`RenderedMessage`，ask_choice 还有问题和选项），随后 Outbox 写 `delivery.settled`。工具调用本身的 `item.*` 事件照常来自 harness。
@@ -443,7 +444,7 @@ aio-dev watch remove team-digest
 | `send_message(route, text)` | 另发一条独立消息（不是回复） | `"current"` 或允许的路由键 |
 | `watch_add / watch_remove / watch_list` | 见下面"agent 自己建监听" | 永远是自己的 session |
 | `schedule_add / schedule_remove / schedule_list` | 给自己约时间：到点收到一条 `[schedule <id>] <text>` 输入、开一轮（或只往允许的路由发一条消息）；`when` 写 `{ at }`、`{ cron, tz? }` 或 `{ every_minutes }`。每个会话至多 `policy.scheduleLimit` 条、间隔不短于 `policy.scheduleMinMinutes` 分钟（`docs/design/schedules`，SC-3） | 永远是自己的 session |
-| `live_join / live_say / live_leave` | 以语音进出会议或通话，见 §7a | 通道的媒体对端 |
+| `live_join / live_say / live_leave` | 以语音进出会议或通话，见 §7a；只在有运行中的通道能开 live 时挂上 | 通道的媒体对端 |
 
 **参与者**（`participants`，`mention` 可以 @ 其中任何人）：先是本轮输入的发送者，再是这个 session 在**当前对话**（同一通道、同一会话 id）里见过的其他人，按最近说话排序，合计至多 50 个。"见过"指这个 session 收到过他们的消息：开轮的、只记录的上下文、§1c 取来的历史都算；本部署自己的回流不算。每项 `{ userId, name?, principal?, channel, isBot? }`，`userId` 是通道里的用户 id（飞书是 union_id 或 open_id），机器人标 `isBot: true`。session 记最近 50 个不同的发送者，重启后从日志里的输入记录重建。只在消息里被 @ 过、自己没说过话的人不在其中。`mention` 照旧接受任何 id（也接受 `lark-bot:on_x` 这样的主体），对参与者补上名字；适配器认不出的 id 写成 `@名字` 文字（下表）。
 
@@ -503,7 +504,7 @@ aio-dev watch remove team-digest
 
 agent 自己以语音进一个会议或通话：听得到所有人，用自己的声音说话。语音由 harness 出（目前只有 Codex realtime v3，WebRTC），媒体对端由通道出（`ChannelAdapter.openLive`，例如某个通道的"加入会议"），网关只在两者之间转交 SDP，**音频不经过 agents-io**。
 
-- **开启**：Codex 实例配 `"live": true`（连接改用 Codex 的实验接口）；agent 挂了输出工具（`tools`）。
+- **开启**：Codex 实例配 `"live": true`（连接改用 Codex 的实验接口）；agent 挂了输出工具（`tools`）；至少一个运行中的通道能开 live（适配器实现了 `openLive`）。三个 `live_*` 工具只在有这样的通道时挂上（INVARIANTS CF-6）：每次 harness 请求宿主 MCP 端点时判断，通道后来才起来（`console.liveChannels`、模块通道）就出现在下一次 `tools/list` 里，通道停了或删掉就从下一次里消失（重连中的照旧算）。例外是已经开着的 live：端点是通道自己的，开它的通道被删、`start` 结束（例如凭据失效）时网关不结束它，端点不自己结束的话 live 照旧在跑，所以只要还有某个会话的 live 在跑，`live_say`、`live_leave` 就照旧列出、可调，agent 能接着说话、能离开（INVARIANTS LN-4；没有 live 的会话调用照旧答没有 live）；`live_join` 不在。Claude Code、Codex 在会话开始时列一次工具，所以要等下一个会话。仓库里的公开 lark-bot、mail、bridge 都不能开 live：只配了它们的部署没有这三个工具（2026-11-24 起；此前总是挂上，调用时才报 `cannot open a live session`）。`agents.<name>.tools` 里列了它们照旧合法；只列了它们的 agent 这时 `tools/list` 答空列表（端点照旧挂着，不是错误）。
 - **工具**：`live_join { target, channel?, instructions?, voice? }`：在当前对话的通道（或 `channel` 指定的通道）上打开对端，`target` 由通道解释（如会议号、`new`），挂到本 session 的 Codex thread 上；`live_say { text }`：让语音说一段话；`live_leave`：离开。一个 session 同时至多一个 live。live 的地点（端点的 `route`）和其他外发目的地一样过 `Policy.outbound`（INVARIANTS DL-5）：缺省策略放行输入全部来自主人的一轮去任何会议（委托出来的一轮只有认出说话人是主人时才算主人的输入），其他轮只放行本轮的回复路由和 `policy.routes` 里预登记的路由，宿主声明了 `outbound` 回调时由宿主决定。通道实现 `liveRoute(account, target)` 时网关在打开之前检查；没有实现的，打开后检查端点的路由，被拒就立即关闭端点。
 - **带着上下文进会**：语音挂在这个 session 的 thread 上，知道之前文字里聊过什么；会后在同一个对话里用文字接着问，它也知道会上说了什么。
 - **会里说的话怎么到 agent**：语音端自己能答的直接答；需要查资料、跑工具的，委托给 Codex：每次委托是一条输入（`transcript` 块，`channelContext` 带 `live=true`、`liveId`、`liveTitle`，回复路由是发起 live 的那个对话；发送者是通道给出的说话人，给不出时 `from=unknown`，见下面"权限"），Codex 随即在 thread 上开一轮，lane 把它当作本 session 的当前轮（排队、工具、来源标记照常）。这一轮**没有回复路由**：答案由语音说出，不自动发到 IM；要落成文字用 `send_message` 发到 `current`。委托时已有一轮在跑，就并进那一轮。
@@ -514,7 +515,7 @@ agent 自己以语音进一个会议或通话：听得到所有人，用自己�
   - **在哪里强制**：harness 的沙箱与它自己的审批策略在 live 期间设成"没有任何输入时的档"（默认 `restricted`；Codex 用 `thread/settings/update`，每个文字轮次结束后再设回），委托轮次就从这一档开始；"主人才放行审批"由 lane 按计划的档决定；harness 报告某个委托轮次开始时的档比计划和这个底档都宽（例如陌生人的委托被 Codex 并进了主人正在跑的 `bypass` 轮），lane 立即打断它。所以默认配置下主人的委托是"底档沙箱 + 审批自动放行"（内置的 `bypass` 和默认的 `restricted` 沙箱相同，只差要不要问）。
   - 来源标记仍是 `external`（决定 4、5）。飞书会议目前给不出说话人，实际效果是"受限 + 审批找发起人"。
 - **日志**：`live.started`（标题、对端路由、发起路由）、`live.transcript`（双方，每句一条）、`live.handoff`、`live.ended`。
-- **结束**：对端离会/会议结束、`live_leave`、harness 关闭、守护进程停止，任一发生都关闭另一端并记 `live.ended`。守护进程重启不恢复 live。
+- **结束**：对端离会/会议结束、`live_leave`、harness 关闭、守护进程停止，任一发生都关闭另一端并记 `live.ended`。网关不因开它的通道被删或 `start` 结束而结束 live（端点自己随之结束的，照常两端都结束；没结束的，`live_leave` 照旧可用，见上面"开启"）。守护进程重启不恢复 live。
 - **已知限制**：语音转述可能出错（实测把"目录是空的"说成"有个文件"），要紧的结果另发文字；几乎每句实质性的话都委托，回答延迟约 10–20 秒；`appendText` 注入的文字不会触发委托，只有真实语音会。
 
 **frames 端点**（决定 11 补记）：`openLive` 也可以返回 `offer: { type: 'frames', audio: { encoding: 'pcm16', rate }, video?: { encodings: ['image/jpeg' | 'image/png' | 'image/webp'] } }` 的端点，并带上 `media: LiveMedia`：`media.frames` 是对端采集到的帧（`{ kind: 'audio', pcm }` 为单声道 PCM16LE、采样率为 `audio.rate`；`{ kind: 'video', data, mimeType }` 为一张静态图），`media.send(frame)` 把 harness 的音频放给对端。frames 端点不需要 `answer`。harness 的 live 不支持该传输（`HarnessLive.transports`，缺省只有 `webrtc`）时，网关在调用 `start` 之前拒绝并关闭端点；live 未声明 `video` 时，网关滤掉视频帧。要声明能收发视频，在 `caps.media` 里写 `video`。

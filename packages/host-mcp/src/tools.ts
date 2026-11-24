@@ -185,7 +185,8 @@ export interface HostToolsOptions {
    * Tools of the host's active modules (core-slimming G6), offered after the kernel's own, in
    * this order; a module that is off is not here. Names are unique and none is a kernel tool's
    * (the kernel's six, `KERNEL_TOOL_NAMES`, and a group's whose control the host passed). A tool
-   * that is one of `TOOL_GROUP_DEFS` is listed and checked as `TOOL_DEFS` has it.
+   * that is one of `TOOL_GROUP_DEFS` is listed and checked as `TOOL_DEFS` has it. A module may
+   * offer some of its tools only at times (`ModuleTools.offered`).
    */
   modules?: readonly ModuleTools[];
 }
@@ -197,6 +198,13 @@ export interface ModuleTools {
   tools: readonly ModuleToolDef[];
   /** A handler for each of `tools`, by name. */
   handlers: Readonly<Record<string, ModuleToolHandler>>;
+  /**
+   * Which of `tools` the endpoint offers now (default: all of them), asked at every request to it
+   * (`HostTools.withheld`): one it leaves out is neither listed nor callable in that request (the
+   * daemon's `tools.live`: only while a running channel can open a live, `live_say` / `live_leave`
+   * also while a live runs). A throw offers none.
+   */
+  offered?(): Iterable<string>;
 }
 
 /**
@@ -358,6 +366,8 @@ export class HostTools {
   private readonly eventOnly: Set<string>;
   /** The active modules' tools by name, in catalog order (`HostToolsOptions.modules`). */
   private readonly moduleTools = new Map<string, { entry: ModuleToolEntry; def: ModuleToolDef; handler: ModuleToolHandler }>();
+  /** The modules that say which of their tools they offer now (`ModuleTools.offered`). */
+  private readonly offering: { names: readonly string[]; offered: () => Iterable<string> }[] = [];
   /**
    * The tool groups of `TOOL_DEFS` (`TOOL_GROUPS`) by tool name: over the host's control when it
    * passed one (`offered`), else over none (a direct `call` answers that the group is not available,
@@ -386,7 +396,26 @@ export class HostTools {
         const entry: ModuleToolEntry = { module: m.module, name: def.name, description: def.description, input: GROUP_SHAPES.get(def) ?? moduleToolInput(def), readOnly: def.readOnly === true };
         this.moduleTools.set(def.name, { entry, def, handler });
       }
+      if (m.offered) this.offering.push({ names: m.tools.map((t) => t.name), offered: m.offered.bind(m) });
     }
+  }
+
+  /**
+   * The active modules' tools the endpoint does not offer now (`ModuleTools.offered`): asked of
+   * each module that says, at every call, so they come and go with what they need.
+   */
+  withheld(): Set<string> {
+    const out = new Set<string>();
+    for (const m of this.offering) {
+      let now: Set<string>;
+      try {
+        now = new Set(m.offered());
+      } catch {
+        now = new Set();
+      }
+      for (const n of m.names) if (!now.has(n)) out.add(n);
+    }
+    return out;
   }
 
   /** The active modules' tools, in the order the endpoint lists them (after the kernel's). */
@@ -548,9 +577,9 @@ export class HostTools {
     };
   }
 
-  /** The endpoint offers this group tool: over the host's control, or a module's. */
+  /** The endpoint offers this group tool now: over the host's control, or a module's (unless it withholds it now). */
   private offers(name: string): boolean {
-    return this.groupTools.get(name)?.offered === true || this.moduleTools.has(name);
+    return this.groupTools.get(name)?.offered === true || (this.moduleTools.has(name) && !this.withheld().has(name));
   }
 
   // ---- destinations -----------------------------------------------------------------------

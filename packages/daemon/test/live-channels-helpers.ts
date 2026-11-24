@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { expect } from 'vitest';
 import { AdminLarkBotJob } from '@agents-io/channel-lark-bot';
 import { AdminConfigPutResult, check, type AdminConfigDocument } from '@agents-io/protocol';
-import { FakeChannel } from '@agents-io/testkit';
+import { FakeChannel, type FakeTurnScript } from '@agents-io/testkit';
 import type { ResolvedChannel } from '../src/config.js';
 import { SOURCE_LOADER, daemon, until } from './helpers.js';
 
@@ -12,9 +12,10 @@ export const FAKE_BOT = fileURLToPath(new URL('./fixtures/fake-create-lark-bot.m
 
 export type Api = (path: string, init?: { method?: string; json?: unknown }) => Promise<{ status: number; body: any }>;
 
-export async function live(o: { liveChannels?: boolean; raw?: Record<string, unknown>; consoleEnv?: NodeJS.ProcessEnv; channelAdapter?: (ch: ResolvedChannel) => FakeChannel | undefined; channelStartGraceMs?: number } = {}) {
+export async function live(o: { liveChannels?: boolean; raw?: Record<string, unknown>; consoleEnv?: NodeJS.ProcessEnv; channelAdapter?: (ch: ResolvedChannel) => FakeChannel | undefined; channelStartGraceMs?: number; script?: FakeTurnScript } = {}) {
   const raw = o.raw ?? {};
   const w = await daemon({
+    ...(o.script ? { script: o.script } : {}),
     console: true,
     raw: { ...raw, console: { port: 0, ...(o.liveChannels !== false ? { liveChannels: true } : {}), ...((raw.console as object) ?? {}) } },
     ...(o.consoleEnv ? { consoleEnv: o.consoleEnv } : {}),

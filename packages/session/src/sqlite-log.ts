@@ -1,5 +1,6 @@
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import type { SessionEvent } from '@agents-io/protocol';
+import { attentionFromSnapshot } from './attention.js';
 import { BaseSessionLog, emptySnapshot, foldSnapshot, type LogOptions, type SessionSnapshot } from './log.js';
 
 export interface SqliteLogOptions extends LogOptions {
@@ -72,7 +73,11 @@ export class SqliteSessionLog extends BaseSessionLog {
 
   private storedSnapshot(sessionKey: string): SessionSnapshot | undefined {
     const row = this.q.snapGet.get(sessionKey) as { seq: number; json: string } | undefined;
-    return row ? (JSON.parse(row.json) as SessionSnapshot) : undefined;
+    if (!row) return undefined;
+    const snap = JSON.parse(row.json) as SessionSnapshot;
+    // Stored before snapshots had an attention (LN-11): from what the snapshot shows.
+    snap.attention ??= attentionFromSnapshot(snap);
+    return snap;
   }
 
   protected restore(sessionKey: string) {

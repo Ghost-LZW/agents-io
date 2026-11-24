@@ -512,6 +512,11 @@
               }
             }
           ]
+        },
+        "opId": {
+          "minLength": 1,
+          "maxLength": 256,
+          "type": "string"
         }
       }
     },
@@ -686,6 +691,11 @@
               "type": "string"
             }
           }
+        },
+        "opId": {
+          "minLength": 1,
+          "maxLength": 256,
+          "type": "string"
         }
       }
     },
@@ -791,6 +801,11 @@
             "conversation": {
               "type": "string"
             },
+            "opId": {
+              "minLength": 1,
+              "maxLength": 256,
+              "type": "string"
+            },
             "topicId": {
               "type": "string"
             }
@@ -818,6 +833,11 @@
               "type": "string"
             },
             "conversation": {
+              "type": "string"
+            },
+            "opId": {
+              "minLength": 1,
+              "maxLength": 256,
               "type": "string"
             },
             "new": {

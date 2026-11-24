@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { FrameDecoder, HOST_REQUEST_FRAME_TYPES, HostRequestFrame, PROTOCOL_VERSION, check, encodeFrame, errors, type Origin, type ResultFrame, type Topic, type TopicSwitchFrame, type Watch, type WatchDraft } from '@agents-io/protocol';
 import type { AddWatchResult, RemoveWatchResult } from '@agents-io/session';
 import type { Hub, Subscription } from '@agents-io/session';
+import type { OpFrame, OpOutcome } from './client-ops.js';
 import { parseClientFrame, type ClientCommand, type ClientFrame, type ServerFrame, type SessionInfo } from './frames.js';
 import type { Outcome } from './gateway.js';
 
@@ -47,6 +48,11 @@ export interface LocalHost {
     topicList(f: { conversation?: string; sessionKey?: string }): Topic[];
     topicSwitch(f: TopicSwitchFrame, origin: Origin): Promise<Outcome>;
   };
+  /**
+   * A frame with `opId` (feature `client.opId`, INVARIANTS PR-3): acts once per (principal, opId),
+   * a retry gets the first answer. Without it `opId` is ignored like any unknown field.
+   */
+  clientOp?(f: OpFrame, origin: Origin): Promise<OpOutcome>;
 }
 
 const HOST_TYPES = new Set<string>(HOST_REQUEST_FRAME_TYPES);
@@ -253,8 +259,27 @@ export class FrameConn implements Peer {
     });
   }
 
-  private result(id: string, o: Outcome): void {
-    this.send(o.ok ? { v: PROTOCOL_VERSION, type: 'result', id, ok: true, value: o.value } : { v: PROTOCOL_VERSION, type: 'result', id, ok: false, error: { code: o.code, message: o.message } });
+  private result(id: string, o: Outcome & { opId?: string; seq?: number; replayed?: true }): void {
+    // Only an answer to a frame whose opId was honoured says more than a plain result (client.opId).
+    const op = { ...(o.opId !== undefined ? { opId: o.opId } : {}), ...(o.seq !== undefined ? { seq: o.seq } : {}), ...(o.replayed ? { replayed: true } : {}) };
+    this.send(o.ok ? { v: PROTOCOL_VERSION, type: 'result', id, ok: true, value: o.value, ...op } : { v: PROTOCOL_VERSION, type: 'result', id, ok: false, error: { code: o.code, message: o.message }, ...op });
+  }
+
+  /** The frame, when its `opId` is one the server honours (input and interrupt commands, topic.switch, watch.add). */
+  private opFrame(f: ClientFrame): OpFrame | undefined {
+    if (!this.host.clientOp || !('opId' in f) || f.opId === undefined) return undefined;
+    if (f.type === 'watch.add' || f.type === 'topic.switch') return f as OpFrame;
+    if (f.type === 'command' && (f.command.type === 'input' || f.command.type === 'interrupt')) return f as OpFrame;
+    return undefined;
+  }
+
+  private async onOp(f: OpFrame): Promise<void> {
+    const key = f.type === 'command' ? f.command.sessionKey : f.type === 'watch.add' ? f.watch.target.sessionKey : f.conversation;
+    try {
+      this.result(f.id, { ...(await this.host.clientOp!(f, this.origin(key))), opId: f.opId });
+    } catch (e) {
+      this.result(f.id, { ok: false, code: 'internal', message: (e as Error).message, opId: f.opId });
+    }
   }
 
   private async onFrame(raw: unknown): Promise<void> {
@@ -274,6 +299,8 @@ export class FrameConn implements Peer {
     }
     const f: ClientFrame = p.frame;
     if (f.type === 'sessions') return this.result(f.id, { ok: true, value: this.host.sessions() });
+    const op = this.opFrame(f);
+    if (op) return this.onOp(op);
     try {
       // The local client is the owner: its origin goes to Policy.watch like any other creator's.
       if (f.type === 'watch.list') return this.result(f.id, { ok: true, value: this.host.listWatches(f.sessionKey) });

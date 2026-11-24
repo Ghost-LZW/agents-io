@@ -104,6 +104,9 @@ export interface HarnessLive {
 
 export type SteerResult = 'steered' | 'stale' | 'not_steerable' | 'no_active_turn' | 'unsupported';
 
+/** Every `SteerResult` (what a bridged harness's `steer` may answer). */
+export const STEER_RESULTS: readonly SteerResult[] = ['steered', 'stale', 'not_steerable', 'no_active_turn', 'unsupported'];
+
 /**
  * Wraps a harness (Claude Code, Codex, …) itself. Adapters translate, they never
  * run their own agent loop.

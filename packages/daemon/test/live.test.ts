@@ -2,7 +2,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { HarnessOpenArgs, HarnessSession, LiveEndpoint, LiveFrame, LiveSpeaker, LiveStartArgs, LiveTransport, Policy, SessionEvent } from '@agents-io/protocol';
+import { TOOL_NAMES } from '@agents-io/host-mcp';
+import type { ChannelContext, HarnessOpenArgs, HarnessSession, LiveEndpoint, LiveFrame, LiveSpeaker, LiveStartArgs, LiveTransport, Policy, SessionEvent } from '@agents-io/protocol';
 import { MemorySessionLog, SqliteSessionLog, type SessionLog } from '@agents-io/session';
 import { FakeChannel, FakeHarness, type FakeHarnessSession, type FakeTurnScript } from '@agents-io/testkit';
 import { LocalClient } from '../src/client.js';
@@ -33,6 +34,17 @@ async function mcpCall(mcp: { url: string; token: string } | undefined, name: st
   });
   const body = (await res.json()) as { result: { isError?: boolean; content: { text: string }[] } };
   return { isError: !!body.result.isError, text: body.result.content[0]!.text };
+}
+
+/** The names a binding's `tools/list` answers, in order. */
+async function toolNames(mcp: { url: string; token: string } | undefined): Promise<string[]> {
+  if (!mcp) throw new Error('no mcp mounted');
+  const res = await fetch(mcp.url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${mcp.token}` },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+  });
+  return ((await res.json()) as { result: { tools: { name: string }[] } }).result.tools.map((t) => t.name);
 }
 
 /** FakeHarness whose sessions have realtime voice. */
@@ -118,6 +130,23 @@ class MeetingChannel extends FakeChannel {
     };
     this.endpoints.push(ep);
     return ep;
+  }
+}
+
+/**
+ * A MeetingChannel whose `start` fails when told (`fail`), as a channel the platform stops accepting
+ * (401/403, an identity mismatch): the endpoints it opened are their own and run on.
+ */
+class FailingMeetingChannel extends MeetingChannel {
+  private failStart: ((e: Error) => void) | undefined;
+  override async start(ctx: ChannelContext): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      this.failStart = reject;
+      ctx.signal.addEventListener('abort', () => resolve(), { once: true });
+    });
+  }
+  fail(message: string): void {
+    this.failStart?.(new Error(message));
   }
 }
 
@@ -372,6 +401,46 @@ describe('live: ends, transports and destinations', () => {
     await w.gw.stop();
     expect(w.chat.endpoints[0]!.closes).toEqual(['gateway stopping']);
     expect(w.log.read(KEY, 0).filter((e) => e.body.t === 'live.ended').map(liveIdOf)).toEqual([liveId]);
+  });
+
+  it('a live outlives its channel: once no running channel can open a live, live_say and live_leave are still offered while it runs, and live_leave ends both sides #LN-4 #CF-6', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'aio-live-'));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const base = resolveConfig({ policy: { owners: ['fake:alice'], routes: ['meet:default:meeting:42'] }, local: { principal: 'me' }, outputTools: true }, { env: {}, baseDir: dir, cwd: dir });
+    const config = { ...base, socketPath: join(dir, 'run', 'aio.sock'), blobs: { ...base.blobs, dir: join(dir, 'blobs') } };
+    const t = toolTurns({ join: ['live_join', { target: '42', channel: 'meet' }], say: ['live_say', { text: 'still here' }], leave: ['live_leave', {}], again: ['live_leave', {}] });
+    // The chat cannot open a live; lives open on `meet`, whose start fails later (the platform refuses it).
+    const chat = new FakeChannel('fake');
+    const meet = new FailingMeetingChannel('meet');
+    const harness = new LiveFakeHarness(t.script);
+    t.holder.h = harness;
+    const log = new MemorySessionLog();
+    const gw = await Gateway.start({ config, harness, log, channels: [{ adapter: chat }, { adapter: meet }], logger: () => {} });
+    cleanups.push(() => gw.stop());
+    const listed = () => toolNames(harness.sessions.at(-1)!.args.mcp);
+    const liveNames = TOOL_NAMES.filter((n) => n.startsWith('live_'));
+
+    await from(chat, 'join');
+    expect((await until(() => t.results['join'])).isError).toBe(false);
+    expect(await listed()).toEqual(TOOL_NAMES);
+    const ep = meet.endpoints[0]!;
+
+    // The channel's start ends; its endpoint is its own and runs on, and so does the live.
+    meet.fail('401 Unauthorized');
+    await until(() => gw.adminStatus().channels.find((c) => c.id === 'meet')?.state === 'failed');
+    expect(await listed()).toEqual(TOOL_NAMES.filter((n) => n !== 'live_join'));
+    await from(chat, 'say');
+    expect((await until(() => t.results['say'])).isError).toBe(false);
+    expect(harness.said).toEqual(['still here']);
+    await from(chat, 'leave');
+    expect(JSON.parse((await until(() => t.results['leave'])).text)).toEqual({ ok: true, left: true });
+    expect(ep.closes).toEqual(['left by the agent']);
+    await until(() => log.read(KEY, 0).some((e) => e.body.t === 'live.ended'));
+
+    // No live, no channel that can open one: none of them.
+    expect(await listed()).toEqual(TOOL_NAMES.filter((n) => !liveNames.includes(n)));
+    await from(chat, 'again');
+    expect(await until(() => t.results['again'])).toEqual({ isError: true, text: 'MCP error -32602: Tool live_leave not found' });
   });
 
   it('a live does not survive a restart: no live after it, live_say says there is none, and the log ended it #RS-7', async () => {

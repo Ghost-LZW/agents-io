@@ -1,4 +1,4 @@
-import { PROTOCOL_VERSION, type SessionEvent, type Tier } from '@agents-io/protocol';
+import { PROTOCOL_VERSION, type Attention, type SessionEvent, type Tier } from '@agents-io/protocol';
 import { isEphemeral, type EventDraft, type SessionLog, type SessionSnapshot, type Visibility } from './log.js';
 import { passes, project, type TierFilter } from './tier.js';
 
@@ -64,6 +64,15 @@ export interface Subscription extends AsyncIterable<SessionEvent> {
 /** How many turn/request ids `Hub.locate` remembers. */
 const LOCATE_WINDOW = 10_000;
 
+/** A `Hub.batch` in progress. */
+interface Frame {
+  events: SessionEvent[];
+  /** `Hub.onRollback`, in the order given (run in reverse). */
+  undo: (() => void)[];
+  /** `Hub.afterCommit`, in the order given. */
+  after: (() => void)[];
+}
+
 /**
  * Fan-out over a `SessionLog`. All writes to a session go through `append`. Subscribers get
  * events in seq order; a slow one loses only ephemeral events (`Subscription.dropped`) and
@@ -73,10 +82,14 @@ export class Hub {
   private subs = new Map<string, Set<Sub>>();
   /** `turn:<id>` / `req:<id>` → session key, from what was appended in this process. */
   private where = new Map<string, string>();
-  /** Appended inside the outermost `batch` in progress, published when it commits. */
-  private pending: SessionEvent[] | undefined;
+  /** The innermost `batch` in progress: what it appended (published when the outermost commits) and what waits on its outcome. */
+  private frame: Frame | undefined;
   /** Subscribers made inside the outermost `batch` in progress: they start reading once it has ended (`subscribe`). */
   private deferred: Sub[] = [];
+  /** `onAttention` listeners. */
+  private readonly attentionListeners = new Set<(sessionKey: string, attention: Attention) => void>();
+  /** Per session, the `seq` of the last attention told to them. */
+  private readonly toldAttention = new Map<string, number>();
 
   constructor(
     readonly log: SessionLog,
@@ -85,7 +98,7 @@ export class Hub {
 
   append(sessionKey: string, draft: EventDraft): SessionEvent {
     const e = this.log.append(sessionKey, draft);
-    if (this.pending) this.pending.push(e);
+    if (this.frame) this.frame.events.push(e);
     else this.publish(e);
     return e;
   }
@@ -98,28 +111,69 @@ export class Hub {
    * rethrown. A batch inside a batch is a savepoint, published with the outer one. On a log
    * without transactions (in memory) `fn` just runs and each append is published at once.
    * A subscriber made inside a batch starts once the outermost one has ended (after its events
-   * are published, or rolled back): it never reads what has not committed.
+   * are published, or rolled back): it never reads what has not committed. What `fn` changes
+   * outside the database follows the outcome: `onRollback` undoes it, `afterCommit` waits for it.
    */
   batch<T>(fn: () => T): T {
     if (!this.log.transaction) return fn();
-    const outer = this.pending;
-    const mine: SessionEvent[] = [];
-    this.pending = mine;
+    const outer = this.frame;
+    const mine: Frame = { events: [], undo: [], after: [] };
+    this.frame = mine;
     let r: T;
     try {
       r = this.log.transaction(fn);
     } catch (e) {
+      this.frame = outer;
+      for (const undo of mine.undo.reverse()) {
+        try {
+          undo();
+        } catch {
+          // memory put back as far as it goes: the write's error is the one to report
+        }
+      }
       if (!outer) this.startDeferred();
       throw e;
     } finally {
-      this.pending = outer;
+      this.frame = outer;
     }
-    if (outer) outer.push(...mine);
-    else {
-      for (const e of mine) this.publish(e);
-      this.startDeferred();
+    if (outer) {
+      outer.events.push(...mine.events);
+      outer.undo.push(...mine.undo);
+      outer.after.push(...mine.after);
+      return r;
     }
+    for (const e of mine.events) this.publish(e);
+    this.startDeferred();
+    let failed: { err: unknown } | undefined;
+    for (const after of mine.after) {
+      try {
+        after();
+      } catch (err) {
+        failed ??= { err };
+      }
+    }
+    if (failed) throw failed.err;
     return r;
+  }
+
+  /**
+   * Inside a `batch`: `undo` runs if the batch in progress rolls back (an outer one too, once this
+   * one has committed into it), to put back what memory the caller changed with its writes; it is
+   * dropped once the outermost batch commits. Outside a batch (nothing to roll back) it never runs.
+   */
+  onRollback(undo: () => void): void {
+    this.frame?.undo.push(undo);
+  }
+
+  /**
+   * `fn` runs once what is being written has committed: at once outside a `batch` (or on a log
+   * without transactions); inside one, after the outermost batch commits and its events are
+   * published, never if it rolls back. For what cannot be taken back (timers, closing a lane). A
+   * throw is rethrown from that `batch`, after the rest have run.
+   */
+  afterCommit(fn: () => void): void {
+    if (this.frame) this.frame.after.push(fn);
+    else fn();
   }
 
   private startDeferred(): void {
@@ -137,6 +191,41 @@ export class Hub {
   private publish(e: SessionEvent): void {
     this.index(e);
     for (const s of this.subs.get(e.sessionKey) ?? []) s.offer(e);
+    if (this.attentionListeners.size && !isEphemeral(e)) this.tellAttention(e);
+  }
+
+  /**
+   * After `e` is published: its session's attention as the log has it now, when an event from `e`
+   * on changed it and it has not been told. Published after a commit, the log is already past the
+   * whole batch: the first of its events tells the value after all of them, the rest nothing.
+   */
+  private tellAttention(e: SessionEvent): void {
+    const a = this.attention(e.sessionKey);
+    if (!a || a.seq < e.seq || a.seq <= (this.toldAttention.get(e.sessionKey) ?? 0)) return;
+    this.toldAttention.set(e.sessionKey, a.seq);
+    for (const fn of this.attentionListeners) {
+      try {
+        fn(e.sessionKey, a);
+      } catch {
+        // a listener's failure is its own: the append has happened
+      }
+    }
+  }
+
+  /** What is pending in a session now (the snapshot's `attention`, LN-11). */
+  attention(sessionKey: string): Attention | undefined {
+    return this.log.attention ? this.log.attention(sessionKey) : this.log.snapshot(sessionKey).attention;
+  }
+
+  /**
+   * `fn` hears each change of a session's attention (LN-11), once the events that changed it are
+   * committed and published (never what a batch rolled back), in `seq` order per session; the events
+   * of one batch are told once, with the value after them all. Changes from before `fn` was added
+   * are not told. Returns the function that removes it.
+   */
+  onAttention(fn: (sessionKey: string, attention: Attention) => void): () => void {
+    this.attentionListeners.add(fn);
+    return () => this.attentionListeners.delete(fn);
   }
 
   /**
@@ -170,7 +259,7 @@ export class Hub {
       if (i >= 0) this.deferred.splice(i, 1);
     });
     // Inside a batch the log shows appends that may still roll back: start once it has ended.
-    if (this.pending) this.deferred.push(sub);
+    if (this.frame) this.deferred.push(sub);
     else this.start(sub);
     return sub;
   }

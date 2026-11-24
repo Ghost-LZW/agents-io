@@ -2691,6 +2691,111 @@
         },
         "nativeId": {
           "type": "string"
+        },
+        "client": {
+          "type": "object",
+          "required": [
+            "command",
+            "args"
+          ],
+          "properties": {
+            "command": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "env": {
+              "type": "object",
+              "patternProperties": {
+                "^(.*)$": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "sessionKey",
+        "generation"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "closed",
+          "type": "string"
+        },
+        "sessionKey": {
+          "type": "string"
+        },
+        "generation": {
+          "type": "number"
+        },
+        "reason": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "ref"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "blob.stat",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ref": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "ref"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "blob.get",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ref": {
+          "type": "string"
         }
       }
     },

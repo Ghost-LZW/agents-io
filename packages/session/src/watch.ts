@@ -187,8 +187,17 @@ export class WatchRegistry {
 
   /** Validate and store (replacing a watch with the same id). Throws `WatchError('invalid')`. */
   put(w: Watch): Watch {
+    return this.putWithin(w, (write) => write());
+  }
+
+  /**
+   * `put`, its write run by `commit` inside a transaction that keeps something else with it (a
+   * client's `watch.add` with an op id: its receipt). The watches in memory (`list`, `bySource`,
+   * what is routed) take it once `commit` has returned; a throw (rolled back) leaves them as they were.
+   */
+  putWithin(w: Watch, commit: (write: () => void) => void): Watch {
     validateWatch(w);
-    this.q.put.run(w.id, JSON.stringify(w));
+    commit(() => this.q.put.run(w.id, JSON.stringify(w)));
     this.watches.set(w.id, structuredClone(w));
     return w;
   }
@@ -481,9 +490,11 @@ export class WatchDispatcher {
   /**
    * Create or replace a watch on behalf of `by`, checked by `Policy.watch`. The
    * hook the host MCP tools use for agents (`by.kind === 'agent'`), and the local
-   * client / config path for the owner.
+   * client / config path for the owner. `store`: runs the checked watch's write (`put`) in a
+   * transaction of its own (a client's `watch.add` with an op id commits its receipt with it); the
+   * watch is live once `store` has returned, never when it threw (`WatchRegistry.putWithin`).
    */
-  async add(by: Origin, draft: WatchDraft): Promise<AddWatchResult> {
+  async add(by: Origin, draft: WatchDraft, store?: (put: () => void, watch: Watch) => void): Promise<AddWatchResult> {
     const watch: Watch = {
       ...draft,
       id: draft.id?.trim() || this.newId('w'),
@@ -512,7 +523,8 @@ export class WatchDispatcher {
       await this.flush(existing.id);
       this.cancelTimer(existing.id);
     }
-    this.registry.put(watch);
+    if (store) this.registry.putWithin(watch, (write) => store(write, watch));
+    else this.registry.put(watch);
     if (watch.mode === 'digest' && this.registry.bufferedCount(watch.id)) this.schedule(watch.id);
     return { ok: true, watch };
   }

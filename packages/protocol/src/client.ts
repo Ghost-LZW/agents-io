@@ -1,4 +1,5 @@
 import { Type, type Static } from '@sinclair/typebox';
+import { Attention } from './attention.js';
 import { ContentBlock, V } from './common.js';
 import { InputMode } from './commands.js';
 import { Level, SessionEvent, Tier } from './events.js';
@@ -80,12 +81,25 @@ export const WatchDraft = Type.Object({
 });
 export type WatchDraft = Static<typeof WatchDraft>;
 
+/**
+ * The client's id for one command (feature `client.opId`, INVARIANTS PR-3), unique per principal
+ * (a UUID): on an `input` or `interrupt` command frame, `topic.switch` and `watch.add`. The daemon
+ * keeps what the frame answered, in the same transaction as the event that decided it, and
+ * answers the same `opId` again (also after a restart) with that answer and `replayed: true`,
+ * without acting again; a rejection is kept too. The same `opId` on another frame type or another
+ * session (a `topic.switch`'s conversation, a watch's target) is refused `op_id_conflict`. An
+ * interrupt without `turnId` acts on the turn it resolved the first time, never on a later one.
+ * On any other frame or command it is an unknown field (none of those act twice).
+ */
+export const OpId = Type.String({ minLength: 1, maxLength: 256 });
+
 const TopicSwitchBase = {
   v: V,
   type: Type.Literal('topic.switch'),
   id: Type.String(),
   /** Route key of the conversation. */
   conversation: Type.String(),
+  opId: Type.Optional(OpId),
 };
 
 /**
@@ -102,11 +116,12 @@ export type TopicSwitchFrame = Static<typeof TopicSwitchFrame>;
 
 /** Client → server. Every request carries `id`; the server answers with a `result` frame of the same id. */
 export const ClientFrame = Type.Union([
-  Type.Object({ v: V, type: Type.Literal('command'), id: Type.String(), command: ClientCommand }),
+  /** `opId`: honoured on `input` and `interrupt` commands (`OpId`). */
+  Type.Object({ v: V, type: Type.Literal('command'), id: Type.String(), command: ClientCommand, opId: Type.Optional(OpId) }),
   /** Value: `SessionInfo[]`. */
   Type.Object({ v: V, type: Type.Literal('sessions'), id: Type.String() }),
   /** Create (or replace) a watch; checked by `Policy.watch` against the connection's origin. Value: the stored `Watch`. */
-  Type.Object({ v: V, type: Type.Literal('watch.add'), id: Type.String(), watch: WatchDraft }),
+  Type.Object({ v: V, type: Type.Literal('watch.add'), id: Type.String(), watch: WatchDraft, opId: Type.Optional(OpId) }),
   /** Value: `{ removed: boolean }`. */
   Type.Object({ v: V, type: Type.Literal('watch.remove'), id: Type.String(), watchId: Type.String() }),
   /** Value: `Watch[]` (only those targeting `sessionKey` when given). */
@@ -157,18 +172,34 @@ export const SessionInfo = Type.Object({
   live: Type.Boolean(),
   /** The session's pinned launch (decision 7): its cwd and env keys, never values. */
   launch: Type.Optional(Type.Object({ cwd: Type.Optional(Type.String()), envKeys: Type.Array(Type.String()) })),
+  /** Feature `attention`: what is pending in the session now (`Attention`, INVARIANTS LN-11); a daemon without it leaves it out. */
+  attention: Type.Optional(Attention),
 });
 export type SessionInfo = Static<typeof SessionInfo>;
+
+/**
+ * Answer to a client request: a `ResultFrame`. To a frame whose `opId` the daemon honoured
+ * (feature `client.opId`) it adds `opId`; `seq`: the event the command wrote with its kept answer
+ * (an input's `input.admitted` / `input.rejected`, an interrupt's `input.cancelled` in the frame's
+ * session; a `topic.switch`'s `topic.changed` in the session of `value.topic`), absent when it
+ * wrote none: a subscription that has passed it shows the command's effect; `replayed: true`: the
+ * answer kept from the first time, nothing was done again.
+ */
+export const ClientResultFrame = Type.Composite([
+  ResultFrame,
+  Type.Object({ opId: Type.Optional(OpId), seq: Type.Optional(Type.Number()), replayed: Type.Optional(Type.Literal(true)) }),
+]);
+export type ClientResultFrame = Static<typeof ClientResultFrame>;
 
 /** Server → client. */
 export const ServerFrame = Type.Union([
   /**
-   * Answer to a request. Values: input → `{ inputId, disposition }`; subscribe →
+   * Answer to a request (`ClientResultFrame`). Values: input → `{ inputId, disposition }`; subscribe →
    * `{ head }`; sessions → `SessionInfo[]`; topic.list → `Topic[]`; topic.switch →
    * `TopicSwitchResult`; tui.attach → `TuiAttach`; others → `{}`. Errors carry the lane's
-   * reason as `code` (`forbidden`, `not_eligible`, `no_active_turn`, …).
+   * reason as `code` (`forbidden`, `not_eligible`, `no_active_turn`, …; `op_id_conflict`).
    */
-  ResultFrame,
+  ClientResultFrame,
   /** One event of a subscription; `event.sessionKey` says which. */
   Type.Object({ v: V, type: Type.Literal('event'), event: SessionEvent }),
   /** A subscription ended without the client asking (server shutting down). */

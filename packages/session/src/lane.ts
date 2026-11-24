@@ -166,6 +166,30 @@ export type CommandResult =
   | { ok: true; disposition?: BodyOf<'input.admitted'>['disposition'] | 'duplicate' }
   | { ok: false; reason: string };
 
+/**
+ * What a caller learns while a command runs (`Lane.command`, `Lane.observe`): the daemon keeps a
+ * client's answer to a command that carries an op id (`client.opId`) with the event that decided it.
+ */
+export interface CommandHooks {
+  /**
+   * Called once, inside the transaction (`Hub.batch`) of the event that decides the command, with
+   * what the command then answers: an input's `input.admitted` (or its `input.rejected` when a
+   * policy hook threw), an interrupt's `input.cancelled`. A throw rolls the event back and fails the
+   * command, and the lane forgets an input it did not admit (the same one again is admitted then,
+   * `admitting`); but a steered input, which the harness already has, is admitted all the same
+   * (without the answer) before the command fails. Not called when the command writes no such event
+   * (a duplicate, a refusal).
+   */
+  decided?(r: CommandResult, e: SessionEvent): void;
+  /**
+   * An interrupt without `turnId`: the turn it resolved (null: none ran), reported before it does
+   * anything, so a retry can act on that turn and never on one that starts later (`pinned`).
+   */
+  resolved?(turnId: string | null): void;
+  /** An interrupt: the turn resolved the first time (`resolved`; null: none ran). Acts on it only, like `turnId`. */
+  pinned?: string | null;
+}
+
 interface Queued {
   input: InputRecord;
   attempts: number;
@@ -368,8 +392,8 @@ export class Lane {
   // ---- public API ---------------------------------------------------------
 
   /** Apply a command. Commands and harness events are processed one at a time. */
-  command(cmd: Command): Promise<CommandResult> {
-    return this.serial(() => this.handle(cmd));
+  command(cmd: Command, hooks?: CommandHooks): Promise<CommandResult> {
+    return this.serial(() => this.handle(cmd, hooks));
   }
 
   /**
@@ -378,13 +402,13 @@ export class Lane {
    * own inputs. Same inputId = revision, latest wins. Digest items are not handed: their
    * digest turn carries them.
    */
-  observe(input: InputRecord): Promise<CommandResult> {
+  observe(input: InputRecord, hooks?: Pick<CommandHooks, 'decided'>): Promise<CommandResult> {
     return this.serial(async () => {
       // The same message again (a redelivery, also after a restart): not a revision. A message this
       // session first got from the conversation's history is the same message, whatever its rendering.
       const prior = this.observedInputs.get(input.inputId);
       if (prior && (sameContent(prior, input) || prior.channelContext.history !== undefined)) return { ok: true, disposition: 'duplicate' } as const;
-      this.recordContext(input);
+      this.recordContext(input, hooks?.decided);
       this.indexCause(input);
       return { ok: true, disposition: 'observe_only' } as const;
     });
@@ -474,10 +498,12 @@ export class Lane {
     }
   }
 
-  private recordContext(input: InputRecord): void {
-    this.observedInputs.set(input.inputId, input);
+  /** `decided`: the command this records answers `observe_only` (`observe`, a loop-guard stop). */
+  private recordContext(input: InputRecord, decided?: CommandHooks['decided']): void {
     this.notePerson(input);
-    const e = this.emit({ body: { t: 'input.admitted', inputId: input.inputId, disposition: 'observe_only', ...pid(input), input } });
+    const e = this.decide({ body: { t: 'input.admitted', inputId: input.inputId, disposition: 'observe_only', ...pid(input), input } }, { ok: true, disposition: 'observe_only' }, decided);
+    // Known once written (with `decided`, it may roll back): the same message again is not a duplicate then.
+    this.observedInputs.set(input.inputId, input);
     this.addContext(input, e.seq);
   }
 
@@ -495,10 +521,10 @@ export class Lane {
    * handed to the next turn like any context), with a `loop_guard` notice for operators.
    * Never a turn, never anything on a channel.
    */
-  private guarded(input: InputRecord, trip: LoopGuardTrip): CommandResult {
+  private guarded(input: InputRecord, trip: LoopGuardTrip, decided?: CommandHooks['decided']): CommandResult {
     const t = { ...trip, sessionKey: this.sessionKey };
     const record: InputRecord = { ...input, replyRoute: input.replyRoute, channelContext: { ...input.channelContext, loopGuard: trip.tripped } };
-    this.recordContext(record);
+    this.admitting(input, () => this.recordContext(record, decided));
     this.emit({ level: 'primary', visibility: 'operators', body: { t: 'notice', code: 'loop_guard', message: loopGuardMessage(trip, input.inputId) } });
     this.indexCause(record);
     try {
@@ -947,6 +973,16 @@ export class Lane {
     });
   }
 
+  /** `d` is the event that decides a command answering `r`: with `decided` (`CommandHooks`), both commit as one transaction. */
+  private decide(d: Partial<EventDraft> & Pick<EventDraft, 'body'>, r: CommandResult, decided: CommandHooks['decided'] | undefined): SessionEvent {
+    if (!decided) return this.emit(d);
+    return this.o.hub.batch(() => {
+      const e = this.emit(d);
+      decided(r, e);
+      return e;
+    });
+  }
+
   private emitHarness(e: HarnessEvent, gen: number, override: Partial<HarnessEvent> = {}): SessionEvent {
     const merged = withoutTool({ ...e, ...override }, this.o.itemTool?.() === true);
     return this.o.hub.append(this.sessionKey, {
@@ -985,18 +1021,18 @@ export class Lane {
 
   // ---- commands -----------------------------------------------------------
 
-  private async handle(cmd: Command): Promise<CommandResult> {
+  private async handle(cmd: Command, hooks: CommandHooks | undefined): Promise<CommandResult> {
     if (this.closed) return { ok: false, reason: 'closed' };
     if (cmd.sessionKey !== this.sessionKey) return { ok: false, reason: 'wrong_session' };
     switch (cmd.type) {
       case 'input': {
-        const r = await this.input(cmd.input, cmd.mode, cmd.expectedTurnId);
+        const r = await this.input(cmd.input, cmd.mode, cmd.expectedTurnId, hooks?.decided);
         // Closed while its admission awaited a policy hook: it queued behind a lane that never runs again.
         if (this.closed) this.rejectQueue();
         return r;
       }
       case 'interrupt':
-        return this.interrupt(cmd.origin, cmd.turnId, cmd.cancelQueue ?? false);
+        return this.interrupt(cmd.origin, cmd.turnId, cmd.cancelQueue ?? false, hooks);
       case 'resolve':
         return this.resolveCommand(cmd.requestId, cmd.decision, cmd.origin, cmd.onBehalfOf);
       case 'control':
@@ -1007,22 +1043,18 @@ export class Lane {
     }
   }
 
-  private async input(input: InputRecord, mode: InputMode, expectedTurnId?: string): Promise<CommandResult> {
+  /** `decided` (`CommandHooks`): with its admission, or its rejection when a policy hook threw. */
+  private async input(input: InputRecord, mode: InputMode, expectedTurnId?: string, decided?: CommandHooks['decided']): Promise<CommandResult> {
     if (this.known.has(input.inputId)) return { ok: true, disposition: 'duplicate' };
     this.known.add(input.inputId);
     this.notePerson(input);
     // The single loop checkpoint: every path that starts or joins a turn (queue, steer, interrupt) comes here.
     const trip = this.guard?.check(input);
-    if (trip) return this.guarded(input, trip);
+    if (trip) return this.guarded(input, trip, decided);
     this.indexCause(input);
 
     if (mode === 'steer') {
-      let r: CommandResult | undefined;
-      try {
-        r = await this.trySteer(input, expectedTurnId);
-      } catch (err) {
-        return this.hookFailed(input, err);
-      }
+      const r = await this.trySteer(input, expectedTurnId, decided);
       if (r) return r;
     } else if (mode === 'interrupt' && this.turn) {
       const t = this.turn;
@@ -1030,16 +1062,17 @@ export class Lane {
       try {
         allowed = (await this.policy.control({ sessionKey: this.sessionKey, op: 'interrupt', origin: input.origin, turn: this.context() })) === 'allow';
       } catch (err) {
-        return this.hookFailed(input, err);
+        return this.hookFailed(input, err, decided);
       }
       if (allowed) {
+        // Queued once its admission is written (with `decided`, it may roll back).
+        this.admitting(input, () => this.decide({ body: { t: 'input.admitted', inputId: input.inputId, disposition: 'queued', ...pid(input), input } }, { ok: true, disposition: 'queued' }, decided));
         this.queue.unshift({ input, attempts: 0 });
-        this.emit({ body: { t: 'input.admitted', inputId: input.inputId, disposition: 'queued', ...pid(input), input } });
         await this.interruptTurn(t);
         return { ok: true, disposition: 'queued' };
       }
     }
-    return this.enqueue(input);
+    return this.enqueue(input, decided);
   }
 
   /**
@@ -1047,23 +1080,44 @@ export class Lane {
    * settled at once (`input.rejected policy_error`, with its route so the sender is told,
    * like a turn that fails to start), and its id is forgotten so a retry is not a duplicate.
    */
-  private hookFailed(input: InputRecord, err: unknown): CommandResult {
+  private hookFailed(input: InputRecord, err: unknown, decided?: CommandHooks['decided']): CommandResult {
     this.known.delete(input.inputId);
-    this.emit({ body: { t: 'input.rejected', inputIds: [input.inputId], reason: `policy_error: ${errMsg(err)}`, ...(input.replyRoute ? { replyRoute: input.replyRoute } : {}) } });
-    return { ok: false, reason: 'policy_error' };
+    const r = { ok: false, reason: 'policy_error' } as const;
+    this.decide({ body: { t: 'input.rejected', inputIds: [input.inputId], reason: `policy_error: ${errMsg(err)}`, ...(input.replyRoute ? { replyRoute: input.replyRoute } : {}) } }, r, decided);
+    return r;
   }
 
-  private async enqueue(input: InputRecord): Promise<CommandResult> {
+  /**
+   * Write the admission of `input`, which `input` / `compact` remembered (`known`) beforehand: when
+   * the write rolls back (with `decided`, its answer could not be kept, PR-3) the input is forgotten
+   * too, so the same input again is admitted then, never answered `duplicate`. Not a steer: the
+   * harness has that input whatever becomes of its answer (`trySteer`).
+   */
+  private admitting<T>(input: InputRecord, write: () => T): T {
+    try {
+      return write();
+    } catch (err) {
+      this.known.delete(input.inputId);
+      throw err;
+    }
+  }
+
+  private async enqueue(input: InputRecord, decided?: CommandHooks['decided']): Promise<CommandResult> {
     const idle = !this.turn && this.queue.length === 0;
-    this.queue.push({ input, attempts: 0 });
     const disposition = idle ? 'new_turn' : 'queued';
-    this.emit({ body: { t: 'input.admitted', inputId: input.inputId, disposition, ...pid(input), input } });
+    // Queued once its admission is written (with `decided`, it may roll back).
+    this.admitting(input, () => this.decide({ body: { t: 'input.admitted', inputId: input.inputId, disposition, ...pid(input), input } }, { ok: true, disposition }, decided));
+    this.queue.push({ input, attempts: 0 });
     if (idle) await this.pump();
     return { ok: true, disposition };
   }
 
-  /** Returns a result when steered; undefined to fall back to queue. */
-  private async trySteer(input: InputRecord, expectedTurnId?: string): Promise<CommandResult | undefined> {
+  /**
+   * Returns a result when steered (or rejected: `policy.plan` threw, `hookFailed`); undefined to fall
+   * back to queue. Only the policy hook's throw is a rejection: once the harness has the input, a
+   * failure to keep its answer (`decided`) does not make it one.
+   */
+  private async trySteer(input: InputRecord, expectedTurnId?: string, decided?: CommandHooks['decided']): Promise<CommandResult | undefined> {
     const t = this.turn;
     const degrade = (why: string) => {
       if (t) this.emit({ turnId: t.turnId, level: 'detail', body: { t: 'notice', code: 'other', message: `steer degraded to queue: ${why}` } });
@@ -1076,7 +1130,12 @@ export class Lane {
     if (p === undefined || p !== t.owner) return degrade('not_turn_owner');
     if (expectedTurnId && expectedTurnId !== t.turnId) return degrade('stale');
     // Steering must not change the turn's profile (permissions are never borrowed).
-    const replan = await this.policy.plan({ sessionKey: this.sessionKey, inputs: [...t.inputs, input], previous: t.run });
+    let replan: RunSpec;
+    try {
+      replan = await this.policy.plan({ sessionKey: this.sessionKey, inputs: [...t.inputs, input], previous: t.run });
+    } catch (err) {
+      return this.hookFailed(input, err, decided);
+    }
     if (replan.profile !== t.run.profile) return degrade('profile_change');
     let res: Awaited<ReturnType<HarnessSession['steer']>>;
     try {
@@ -1088,22 +1147,39 @@ export class Lane {
     t.inputs.push(input);
     this.track(t.turnId, t.inputs, t.context);
     t.attempts.set(input.inputId, 0);
-    this.emit({ turnId: t.turnId, body: { t: 'input.admitted', inputId: input.inputId, disposition: 'steer', ...pid(input), input } });
+    const admitted: Partial<EventDraft> & Pick<EventDraft, 'body'> = { turnId: t.turnId, body: { t: 'input.admitted', inputId: input.inputId, disposition: 'steer', ...pid(input), input } };
+    let unkept: { err: unknown } | undefined;
+    try {
+      this.decide(admitted, { ok: true, disposition: 'steer' }, decided);
+    } catch (err) {
+      if (!decided) throw err;
+      // Its answer could not be kept and rolled back with the admission, but the harness has the
+      // input and a steer is not taken back: admitted all the same (its turn settles it), and the
+      // command fails once the rest is recorded.
+      this.emit(admitted);
+      unkept = { err };
+    }
     const extra = input.replyRoute;
     if (extra && !sameRoute(extra, t.replyRoute) && !t.deliveries.some((d) => sameRoute(d, extra))) {
       t.deliveries.push(extra);
       this.emit({ turnId: t.turnId, body: { t: 'turn.delivery_added', turnId: t.turnId, route: extra, reason: 'steer', ...this.addedChecked(t, extra) } });
     }
+    if (unkept) throw unkept.err;
     return { ok: true, disposition: 'steer' };
   }
 
-  private async interrupt(origin: Origin, turnId: string | undefined, cancelQueue: boolean): Promise<CommandResult> {
-    const t = this.turn;
-    if (turnId && t?.turnId !== turnId) return { ok: false, reason: 'stale_turn' };
+  /** `hooks.pinned`: the turn a first attempt resolved acts as `turnId` (null: as if none ran); else `hooks.resolved` hears the one resolved now. */
+  private async interrupt(origin: Origin, turnId: string | undefined, cancelQueue: boolean, hooks?: CommandHooks): Promise<CommandResult> {
+    const pinned = turnId === undefined ? hooks?.pinned : undefined;
+    const t = pinned === null ? undefined : this.turn;
+    const want = turnId ?? pinned ?? undefined;
+    if (want && t?.turnId !== want) return { ok: false, reason: 'stale_turn' };
     if (!t && !cancelQueue) return { ok: false, reason: 'no_active_turn' };
     const allowed = async (op: 'interrupt' | 'cancel_queue', turn?: TurnContext) =>
       (await this.policy.control({ sessionKey: this.sessionKey, op, origin, ...(turn ? { turn } : {}) })) === 'allow';
     if (t && !(await allowed('interrupt', this.context()))) return { ok: false, reason: 'forbidden' };
+    // Before anything is done: a retry acts on this turn (or on none), never on one that starts later.
+    if (turnId === undefined && pinned === undefined) hooks?.resolved?.(t?.turnId ?? null);
     if (cancelQueue) {
       // Its own op: owning the running turn says nothing about other principals' queued inputs.
       // Without it, a caller still cancels the inputs it queued itself.
@@ -1112,8 +1188,9 @@ export class Lane {
       const cancel = all ? this.queue : this.queue.filter((q) => me !== undefined && principalId(q.input) === me);
       if (!t && !all && cancel.length === 0) return { ok: false, reason: 'forbidden' };
       if (cancel.length) {
+        // Taken off the queue once the cancellation is written (with `decided`, it may roll back).
+        this.decide({ body: { t: 'input.cancelled', inputIds: cancel.map((q) => q.input.inputId), reason: 'interrupt' } }, { ok: true }, hooks?.decided);
         this.queue = this.queue.filter((q) => !cancel.includes(q));
-        this.emit({ body: { t: 'input.cancelled', inputIds: cancel.map((q) => q.input.inputId), reason: 'interrupt' } });
       }
     }
     if (t) await this.interruptTurn(t);

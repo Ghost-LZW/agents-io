@@ -99,9 +99,9 @@ see `docs/E2E.md` §0). New:
   without an `evidence` grant (lark-bot, mail). The daemon's config code, its gateway and
   its console name no type: what a type adds to the console (lark-bot's `/api/bots/lark`
   and `console.larkBotCommand`) is its own `ChannelModule.admin` contribution.
-- **Harness instances** (`harnesses.<name>`, `use`: `claude-code`, `codex` or `module`;
-  see `docs/E2E.md` §0). `claude-code` and `codex` are the harness kinds the daemon's
-  composition root registers (`src/bundle.ts`): each is a `HarnessModule`
+- **Harness instances** (`harnesses.<name>`, `use`: `claude-code`, `codex`, `bridge` or
+  `module`; see `docs/E2E.md` §0). `claude-code`, `codex` and `bridge` are the harness kinds the
+  daemon's composition root registers (`src/bundle.ts`): each is a `HarnessModule`
   (`@agents-io/protocol`, `harness-module.ts`) in its own package (`harness/*/src/module.ts`)
   that owns its keys, its section of the older `harness` block, its default model and
   `AGENTS_IO_LIVE_*_MODEL` variable, its config-dir variable (`sessionParams.envPathRoots`),
@@ -180,11 +180,28 @@ see `docs/E2E.md` §0). New:
   takeover gets a directory for its files (`<dataDir>/tui`), the CLI's path for helpers its
   terminal starts (`aio <command>` runs a command a built-in kind adds, `HarnessModule.cli`:
   Claude Code's `tui-bridge`) and local paths of stored files.
+  A `bridge` instance (`command`, `args`, `config`; `@agents-io/harness-jsonl-bridge`) is a
+  harness in another process, any language, spoken to over JSONL stdio (`docs/HOSTS.md` §4.8).
+  Its program says what it declares in its answer to `probe` (`declares`: the static members
+  above; `methods`: `detach`), so the daemon starts it and probes it at start, before it reads any
+  declaration (`HarnessModule.probeAtStart`); a hello of the wrong shape, one declaring
+  `attach: 'takeover'` (the bridge carries no takeover) or a program that cannot be run fails the
+  start, naming the instance and the member. From then on it is treated as any adapter: its
+  declarations reach the commands, `detach` / `adopts` decide stop and restart (without `detach`
+  its sessions are closed and the program shut down), its program reads the blob store
+  (`blob.stat` / `blob.get`, the same read-only view), `sessionEnv: 'own-process'` gives a
+  launched session a copy of the program of its own, and a task run always runs on one. An
+  instance unavailable for now is not started and declares nothing.
 - **Live (realtime voice, decision 11)**: a Codex instance with `"live": true` opts
   its app-server connection into Codex's experimental realtime API. Agents on it
   (with `tools`) get `live_join { target, channel?, instructions?, voice? }`,
-  `live_say { text }` and `live_leave`: a channel that implements
-  `ChannelAdapter.openLive` (e.g. a meeting) provides the media peer, the session's
+  `live_say { text }` and `live_leave` while some running channel implements
+  `ChannelAdapter.openLive` (none of the public lark-bot, mail and bridge does: a deployment
+  with only those has no `live_*`; checked at every request to the tool endpoint, so a channel
+  that comes up later brings them on the harness's next `tools/list`), and `live_say` /
+  `live_leave` also while a live runs (one outlives its channel when that is removed or its
+  `start` ends, and is still spoken in and left). That channel
+  (e.g. a meeting) provides the media peer, the session's
   Codex thread answers it with realtime v3 over WebRTC, and the audio flows between
   them, never through the daemon. What people say there is delegated by the voice
   into turns of the same session (same permissions as its text turns; inputs carry
@@ -293,6 +310,55 @@ before any host frame; after it, the connection's client frames carry the origin
   `not_interactive_agent`, `invalid_frame`, launch codes (`launch_conflict`, …),
   `agent_unavailable`.
 - `explain { inputId }`: the persisted routing record.
+
+## Client op ids (`client.opId`)
+
+A client frame whose retry would act twice (a `command` frame with an `input` or `interrupt`
+command, `topic.switch`, `watch.add`) may carry `opId` next to `id`: the client's id for that one
+command, unique per principal (a UUID; 1-256 characters). The first time the command acts as
+without it, and its answer, a refusal too, is kept in the `client_ops` table of the log's database
+in the same transaction as the event that decided it (an input's `input.admitted` / `input.rejected`,
+an interrupt's `input.cancelled`, the topic change and its `topic.changed`, the stored watch), or on
+its own when it wrote none. The same `(principal, opId)` again (another connection, after a restart,
+after the log was compacted; a retry while the first still acts waits for it) is answered with that
+answer verbatim plus `replayed: true`, and nothing acts; the same `opId` on another frame type or
+another session (a `topic.switch`'s conversation, a watch's target) is `op_id_conflict`. Answers to
+such frames carry `opId`, and `seq` when the command wrote an event with its answer (for
+`topic.switch`, in the session of `value.topic`): a subscription past it shows the command's effect.
+An `interrupt` without `turnId` keeps the turn it resolved the first time before it acts; a retry
+acts on that turn only (`stale_turn` once it ended), never on a later one. `stopped` and `internal`
+answers are not kept. When the receipt itself cannot be written, the command answers `internal` and
+the events kept with it roll back (the input is not admitted, the queue not cleared, no topic or
+watch made, in the daemon's memory either), and a retry acts once (an input with its own `inputId`
+is admitted then, not answered `duplicate`); a `steer` input is the exception: the harness has it
+already, so it stays admitted (its turn settles it) and the retry, with no answer to get back, acts
+again (a duplicate when the input carries its own `inputId`). Receipts are never deleted. Frames
+without `opId` are unchanged; on other frames and commands `opId` is an unknown field. `host.hello`
+lists the feature; `LocalClient.exchange` sends a frame and returns its whole result frame. Spec:
+`docs/HOSTS.md` §4.7, INVARIANTS PR-3.
+
+## Attention (`attention`)
+
+What is pending in a session now, folded from its log (core-slimming G7): `Attention { state,
+reasons, since, seq, turnId? }`. `state` is `needs_you` while a request whose resolver is `human`
+is open, else `working` while a turn runs, inputs wait or the harness says it is `stalled`, else
+`failed` when the last turn failed, else `idle`; `reasons` lists, in this order, the open human
+requests (`requestId`, `requestKind`, `title`, `since`), the last turn's failure (`turnId`, its
+`error.code`), `stalled`, the waiting inputs (`inputIds`, `since`). `since` is when the session
+entered `state`; `seq` is the seq of the event that last changed the value (events that change
+nothing leave it). It says what waits, never who to tell: badges and pushes are the host's. It is
+on `SessionInfo` (the `sessions` frame, `GET /api/sessions`; the external MCP endpoint's
+`sessions_list` leaves the requests' titles out), in the snapshot a subscription starts with, and
+in the last column of `aio sessions`. A host whose role-taking `host.hello` has
+`optIn: ["attention"]` (granted in the result's `optIn`) gets an `attention.changed { sessionKey,
+attention }` frame for each change, once the events that changed it commit, in `seq` order per
+session; nothing is kept while it is away (list `sessions` on reconnect). `host.hello` lists the
+feature. The rules are pinned by language-neutral fixtures in
+`packages/session/test/fixtures/attention/` (format: `docs/design/core-slimming/` §3 G8). For
+embedders: `Hub.onAttention(fn)` / `Hub.attention(key)`, `foldAttention` and `emptyAttention` from
+`@agents-io/session`; a `SessionLog` of your own may implement `attention(key)` and fill
+`SessionSnapshot.attention` (both optional: without them there is no attention and no frame).
+Spec: `docs/HOSTS.md` §4.9, INVARIANTS LN-11.
 
 ## Console API (for web UIs)
 
@@ -550,6 +616,9 @@ aio console-link                                              (one-time console 
   line per tool call / request / notice to stderr, prints the final answer to
   stdout, and exits with the run's exit code. Ctrl-C cancels the run (twice:
   stop waiting).
+- `aio sessions` prints one line per session, tab-separated: key, state, `seq <head>`, then
+  `turn`, `requests`, `cwd`, `env` when there are any, and last `attention <state>` with what is
+  pending in parentheses (e.g. `attention needs_you (request r1, 2 queued)`; LN-11).
 - `aio tail` prints one JSON `InboundItem` per line (with its `cursor`) and keeps
   long-polling; it never acks. `--once` prints what is pending and exits.
 - Exit codes besides a run's: 1 failed, 2 usage / config error (also an unknown
@@ -587,7 +656,11 @@ party's module has the same shape (origin `module`). The manifest says, without 
   handler's call has `compact()`, which queues the session harness's own compaction command as
   the command's message, the one text the kernel marks `nativeCommand`);
 - `setup(kernel, config)`, which returns the `ModuleInstance`: a handler per tool and per
-  command, `features()` (which of its features it advertises now; default all while it runs),
+  command, `offeredTools()` (which of its tools the endpoint offers now; default all; asked at
+  every request a harness sends it, a tool left out being neither listed nor callable in that
+  request; a throw is logged as `module <id>: offeredTools failed: …` and offers none; the live
+  tools offer theirs only while `KernelContext.live.channels()` is not empty),
+  `features()` (which of its features it advertises now; default all while it runs),
   `status()`, `start()`, `stop()`, and the hooks `onTurnCompleted({ sessionKey, turnId, status })`:
   called for every turn of a session (not a task run's) right after its `turn.completed` is
   logged, whatever its status (a turn an `outbound.scoped` host checks, U20: once its checked
@@ -1238,3 +1311,44 @@ After the review of the merge, a peer's schedules (2026-11-24; INVARIANTS SC-3, 
   `ScheduleDispatcherOptions.onFailed` gets a fourth argument, `kept` (the gateway's notice then
   says `not tried again until the next start`). A route out of the client's scope, held, denied or
   no channel still delete a one-shot.
+
+What changed for embedders with the harness bridge (core-slimming G9's gap, 2026-11-24):
+
+- A third built-in harness kind, `bridge` (`bridgeHarnessModule` from the new package
+  `@agents-io/harness-jsonl-bridge`, which also has `spawnHarness`, `serveHarness` and
+  `HarnessBridgeError`): `builtinHarnesses.kinds` is `claude-code`, `codex`, `bridge`, and the
+  config file's `harnesses.<name>.use` admits `"bridge"`.
+- New in `@agents-io/protocol`: `HarnessModule.probeAtStart` (`Gateway.start` builds and probes
+  each available instance of such a kind after loading the module harnesses, a failure being a
+  `ConfigError`; such an instance unavailable for now declares nothing), and the harness bridge's
+  wire additions (`HarnessDeclares`, `NativeClientSpec`, `OpenResult`, `BlobStat`, `BlobBytes`,
+  `BLOB_GET_MAX_BYTES`, `HARNESS_BRIDGE_FEATURES`; new optional fields and frames in
+  `HarnessHostFrame` / `HarnessAdapterFrame` / `ProbeResult`, `v` still 1). New in
+  `@agents-io/testkit`: `runHarnessConformance` (`HarnessSuiteDriver`) and `conformanceInput`.
+- `InstanceHarness.detach` / `dispose` / `ownProcess` / `takeover` are accessors that look at the
+  kind's adapter when read (they were taken once, when the wrapper was built), so an adapter that
+  learns them from its harness has them once it has: the same values for every other adapter.
+
+What changed for embedders with the live tools offered only where a live can be opened (2026-11-24):
+
+- A behaviour change (ROADMAP §1 principle 2): `tools.live` offers `live_join`, `live_say` and
+  `live_leave` only while some running channel can open a live (its adapter has
+  `ChannelAdapter.openLive`; a channel counts until its `start` ends or it is removed, also while
+  it reconnects). Without one an agent with `tools: true` lists 15 tools (the fixture
+  `packages/host-mcp/test/fixtures/tools-list-no-live.json`), one whose `tools` list names a live
+  tool does not list it then (still no config error; one naming only live tools gets an empty
+  `tools/list`, not an error), a call answers MCP's `Tool live_join not found`, and
+  `get_channel_context`'s `abilities.tools` leaves them out. It is
+  asked at every request to the host MCP endpoint, so a channel started later (`console.liveChannels`,
+  a module channel) brings them on the next `tools/list`, and one stopped or removed takes them
+  away; but `live_say` and `live_leave` stay while some session's live runs (a live outlives the
+  channel it opened on when that is removed or its `start` ends, unless its endpoint ends too, and
+  is still spoken in and left: LN-4). When they are offered they are listed byte for byte as before.
+- New: `ModuleInstance.offeredTools?()` (`@agents-io/protocol`; not a function fails the setup as
+  for `features`), `KernelContext.live.channels()` and `running()` (the sessions with a live
+  running), `KernelBackend.liveChannels` and `liveSessions` (required, so this breaks an embedder
+  that implements it); in `@agents-io/host-mcp`, `ModuleTools.offered?()` and
+  `HostTools.withheld()` (`HostMcpServer` asks it at every request; `toolCatalog` is still all the
+  endpoint may offer). `KernelContext.agents.tools` is what an agent's sessions are offered now
+  (without what a module withholds at the moment). An embedder that passes
+  `HostToolsOptions.live` itself keeps the kernel's `live_*` listed always.

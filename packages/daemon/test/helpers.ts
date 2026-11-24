@@ -74,6 +74,8 @@ export async function daemon(
     moduleRegistry?: ModuleRegistry;
     /** GatewayOptions.testHooks, outboxAttemptTimeoutMs and logger. */
     gateway?: Pick<GatewayOptions, 'testHooks' | 'outboxAttemptTimeoutMs' | 'logger'>;
+    /** The channel `fake` (default a plain FakeChannel): a subclass adds what a test needs (`openLive`). */
+    chat?: FakeChannel;
   } = {},
 ): Promise<World> {
   const dir = o.dir ?? tmp();
@@ -87,7 +89,7 @@ export async function daemon(
   const configPath = join(dir, 'aio.config.json');
   if (o.console && !o.dir) writeFileSync(configPath, JSON.stringify(raw, null, 2) + '\n', { mode: 0o600 });
   const config = { ...base, socketPath: join(dir, 'run', 'aio.sock'), ...(o.console ? { source: { path: configPath, envFile: join(dir, '.env.live') } } : {}) };
-  const chat = new FakeChannel('fake');
+  const chat = o.chat ?? new FakeChannel('fake');
   const harness = Object.assign(new FakeHarness(o.script), o.declares);
   const built: HarnessInstance[] = [];
   const gw = await Gateway.start({

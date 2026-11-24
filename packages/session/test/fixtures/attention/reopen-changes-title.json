@@ -1,0 +1,12 @@
+{
+  "description": "A request opened again with a new title keeps its place and since; the value changes (seq) because the title did.",
+  "input": [
+    {"ts": 1000, "body": {"t": "input.admitted", "inputId": "i1", "disposition": "new_turn"}},
+    {"ts": 1001, "body": {"t": "turn.started", "turnId": "t1", "inputIds": ["i1"], "replyRoute": null}},
+    {"ts": 1002, "body": {"t": "session.state", "state": "running"}},
+    {"ts": 1100, "turnId": "t1", "audience": "approval", "body": {"t": "request.opened", "requestId": "r1", "kind": "file_change", "title": "Edit a.ts", "risk": {}, "allowedDecisions": ["allow_once", "deny"], "allowAlways": false, "defaultDeny": true, "resolver": {"kind": "human", "principals": ["owner"], "routes": ["fake:default:c1"]}}},
+    {"ts": 1200, "turnId": "t1", "audience": "approval", "body": {"t": "request.opened", "requestId": "r2", "kind": "question", "title": "Which plan?", "risk": {}, "allowedDecisions": ["allow_once", "deny"], "allowAlways": false, "defaultDeny": true, "resolver": {"kind": "human", "principals": ["owner"], "routes": ["fake:default:c1"]}}},
+    {"ts": 1300, "turnId": "t1", "audience": "approval", "body": {"t": "request.opened", "requestId": "r1", "kind": "file_change", "title": "Edit a.ts and b.ts", "risk": {}, "allowedDecisions": ["allow_once", "deny"], "allowAlways": false, "defaultDeny": true, "resolver": {"kind": "human", "principals": ["owner"], "routes": ["fake:default:c1"]}}}
+  ],
+  "expected": {"state": "needs_you", "reasons": [{"kind": "request", "requestId": "r1", "requestKind": "file_change", "title": "Edit a.ts and b.ts", "since": 1100}, {"kind": "request", "requestId": "r2", "requestKind": "question", "title": "Which plan?", "since": 1200}], "since": 1100, "seq": 6, "turnId": "t1"}
+}

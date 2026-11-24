@@ -8,6 +8,7 @@
     { "path": "../host-mcp" },
     { "path": "../../harness/claude-code" },
     { "path": "../../harness/codex" },
+    { "path": "../../harness/jsonl-bridge" },
     { "path": "../../channel/lark-bot" },
     { "path": "../../channel/mail" },
     { "path": "../../channel/jsonl-bridge" }

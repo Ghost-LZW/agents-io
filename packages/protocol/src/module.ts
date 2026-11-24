@@ -26,8 +26,8 @@ import type { Watch } from './watch.js';
  * (`ChannelModule`, `HarnessModule`).
  *
  * In progress: the daemon reads the manifest (`id`, `kind`, `needs`, `config`, `features`,
- * `mcpTools`, `commands`, `setup`) and, of the instance, `tools`, `commands`, `features`,
- * `status`, `start`, `stop` and the hooks `onTurnCompleted`, `inputHint`, `onUndispatched`,
+ * `mcpTools`, `commands`, `setup`) and, of the instance, `tools`, `offeredTools`, `commands`,
+ * `features`, `status`, `start`, `stop` and the hooks `onTurnCompleted`, `inputHint`, `onUndispatched`,
  * `onAction`, `resolver`, `identities`, `statusLines`, `scheduledMessage` and `scheduledWake`. `admin`, the other `hooks` and
  * `localFrames` were sketched for the Claude Code terminal (G6 step 6), which became a harness
  * capability instead (`HarnessAdapter.takeover`); they are served when a module needs them. Until
@@ -352,6 +352,16 @@ export type ModuleFrameHandler = (frame: Record<string, unknown>, from: { origin
 export interface ModuleInstance {
   /** A handler for each of the manifest's `mcpTools`, by name (exactly those). */
   tools?: Readonly<Record<string, ModuleToolHandler>>;
+  /**
+   * Which of the manifest's `mcpTools` the host's endpoint offers now (default: all of them): for a
+   * tool the model cannot use without something that comes and goes (the live tools: a running
+   * channel that can open a live, or for `live_say` / `live_leave` a live that runs). Asked at
+   * every request a harness sends the endpoint, so a tool appears on the harness's next
+   * `tools/list` once it can be used, and is gone from the next one after; one not offered at a
+   * request is not callable in it either. Names that are not the manifest's are ignored; a throw
+   * offers none of its tools (logged).
+   */
+  offeredTools?(): readonly string[];
   /** A handler for each of the manifest's `commands`, by name (exactly those; its `aliases` run the same handler). */
   commands?: Readonly<Record<string, ModuleCommandHandler>>;
   hooks?: ModuleHooks;
@@ -695,6 +705,18 @@ export interface KernelContext {
     say(sessionKey: string, text: string, a: { operationId: string; turnId: string }): Promise<void>;
     /** Leave the session's live; false when none runs. */
     leave(sessionKey: string): Promise<boolean>;
+    /**
+     * The running channels that can open a live now (`ChannelAdapter.openLive`), as `id:account`,
+     * in the order they started: a channel counts from its start until its `start` ends or it is
+     * removed (also while it reconnects).
+     */
+    channels(): string[];
+    /**
+     * The sessions with a live running now, by key, in the order they joined. A live may outlive
+     * the channel it opened on (the channel removed, its `start` ended): it runs, and is spoken in
+     * and left, until one of its ends ends it (LN-4).
+     */
+    running(): string[];
   };
   /** The deployment's agents. */
   readonly agents: {
@@ -704,9 +726,10 @@ export interface KernelContext {
      */
     names(): string[];
     /**
-     * The model tools an agent's sessions are offered: its `agents.<name>.tools` list, or for
+     * The model tools an agent's sessions are offered now: its `agents.<name>.tools` list, or for
      * `tools: true` every tool the host's endpoint offers (the kernel's, then the active modules',
-     * in that order); empty when it has none or no such agent runs. `undefined`: the default agent.
+     * in that order), without those a module does not offer at the moment (`ModuleInstance.offeredTools`);
+     * empty when it has none or no such agent runs. `undefined`: the default agent.
      */
     tools(agent: string | undefined): string[];
   };

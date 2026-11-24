@@ -13,6 +13,7 @@ const dirs = {
   'channel-mail': 'channel/mail',
   'harness-claude-code': 'harness/claude-code',
   'harness-codex': 'harness/codex',
+  'harness-jsonl-bridge': 'harness/jsonl-bridge',
 };
 let root = '';
 

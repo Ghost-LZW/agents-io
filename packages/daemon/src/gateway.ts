@@ -104,6 +104,8 @@ import {
   parseQuestionActionId,
   questionTextAnswer,
   type AddWatchResult,
+  type CommandHooks,
+  type CommandResult,
   type Delivery,
   type DeliveryRecord,
   type ExitVerdict,
@@ -134,6 +136,7 @@ import type { ChannelRegistry, DefaultEvidence } from './channel-registry.js';
 import type { HarnessRegistry } from './harness-registry.js';
 import { ConfigStore, canonical } from './console-config.js';
 import type { ClientCommand, SessionInfo } from './frames.js';
+import { ClientOps, type Op, type OpFrame, type OpOutcome } from './client-ops.js';
 import { HostService, isHostOrigin, type CalloutHook } from './host.js';
 import { LocalServer } from './local-server.js';
 import { privateDb, privateDir } from './private.js';
@@ -385,8 +388,10 @@ export class Gateway {
   readonly hostQueue: HostQueue;
   /** Sessions a harness's own terminal UI holds (`HarnessAdapter.takeover`, decision 15): the instance it stands in for. */
   private readonly takeovers = new Map<string, { instance: string; takeover: HarnessTakeover }>();
-  /** Who sent each channel message (`input.verify`), settled deliveries, session → agent. */
+  /** Who sent each channel message (`input.verify`), settled deliveries, session → agent, client op receipts. */
   readonly records: DaemonRecords;
+  /** Client frames with an op id (feature `client.opId`, INVARIANTS PR-3): their receipts are in `records`. */
+  private readonly clientOps: ClientOps;
   /** The host protocol on the local socket. */
   readonly host: HostService;
   /** Test hooks (`GatewayOptions.testHooks`), when on. */
@@ -478,6 +483,8 @@ export class Gateway {
     }
     this.hub = new Hub(log);
     this.records = new DaemonRecords(db);
+    // PR-3: a receipt commits with the event that decided it (records share the log's connection).
+    this.clientOps = new ClientOps({ store: this.records, hub: this.hub, log: (msg) => this.log('warn', msg) });
     this.hostQueue = new HostQueue(db);
     // Every topic change is recorded (topic.changed) in the session left and the one now current.
     this.topics = new TopicRegistry({ ...db, hub: this.hub, onChange: (ch) => this.topicChanged(ch) });
@@ -642,6 +649,8 @@ export class Gateway {
       ...(o.hostPush?.timeoutMs !== undefined ? { pushTimeoutMs: o.hostPush.timeoutMs } : {}),
       ...(o.hostPush?.retryMs !== undefined ? { pushRetryMs: o.hostPush.retryMs } : {}),
     });
+    // LN-11: each change of a session's attention, once committed, to a host that asked for it.
+    this.hub.onAttention((key, attention) => this.host.attentionChanged(key, attention));
     // Watches live next to the log (same SQLite file), so they and their digest buffers survive a restart.
     const registry = o.watches ?? new WatchRegistry(log instanceof SqliteSessionLog ? { db: log.db } : {});
     this.watches = new WatchDispatcher({
@@ -819,6 +828,8 @@ export class Gateway {
       joinLive: (key, turnId, a) => gw().joinLive(key, gw().runningTurn(key, turnId), a),
       sayLive: (key, text, a) => gw().sayLive(key, text, a),
       leaveLive: (key) => gw().leaveLive(key, 'left by the agent'),
+      liveChannels: () => gw().liveChannels(),
+      liveSessions: () => [...gw().lives.keys()],
       agentTools: (agent) => gw().agentTools(agent),
       agentNames: () => gw().chatAgents(),
       identify: (a) => gw().router.identify(a),
@@ -931,6 +942,7 @@ export class Gateway {
       // The modules' identities (the stranger approval's guests) before any input is identified.
       modules.identities((id, entries) => gw.setExtraIdentities(`module:${id}`, entries));
       await gw.loadHarnessModules();
+      await gw.probeHarnesses();
       gw.harness();
       if (gw.mcp) {
         const url = await gw.mcp.listen();
@@ -1271,6 +1283,25 @@ export class Gateway {
     }
   }
 
+  /**
+   * Probe the instances of kinds whose adapters learn what they declare from their harness
+   * (`HarnessModule.probeAtStart`: the bridge, whose program says it in its hello), in config order,
+   * before anything reads a declaration (`adopts` below, commands, launches). A failure fails the
+   * start, a config error naming the instance (CF-4), as a `use: "module"` factory's does. Kept from
+   * now on: stop gives each its lifecycle calls (its program is shut down).
+   */
+  private async probeHarnesses(): Promise<void> {
+    if (this.o.harness || this.o.buildHarness) return;
+    for (const inst of Object.values(this.o.config.harnesses)) {
+      if (inst.unavailable || inst.kind === 'module' || this.harnessRegistry.get(inst.kind)?.probeAtStart !== true) continue;
+      await this.harness(inst.name)
+        .probe()
+        .catch((e: Error) => {
+          throw new ConfigError(`harnesses.${inst.name} (${inst.kind}): ${e.message}`);
+        });
+    }
+  }
+
   private instanceOf(harnessId: string | undefined): HarnessInstance | undefined {
     return this.o.harness || harnessId === undefined ? undefined : this.o.config.harnesses[harnessId];
   }
@@ -1321,9 +1352,10 @@ export class Gateway {
   /**
    * Why a launched session's env cannot reach the instance `name`, if it cannot: what its adapter
    * declares (`HarnessAdapter.sessionEnv`; built when asked, nothing started), also while it is
-   * unavailable for now (`declaredUnavailable`). One whose adapter cannot be built even so (a module
-   * whose factory never ran) cannot say, so it takes no session env: pinned, the launch might never
-   * run there. The answer then is why the instance cannot run (which names variables, never values).
+   * unavailable for now (`declaredUnavailable`). One whose adapter cannot say even so (a module
+   * whose factory never ran, a bridge whose program was never asked) takes no session env: pinned,
+   * the launch might never run there. The answer then is why the instance cannot run (which names
+   * variables, never values).
    */
   private sessionEnvRefusal(name: string): string | undefined {
     try {
@@ -1338,12 +1370,13 @@ export class Gateway {
    * The adapter of an instance that is unavailable for now (an `env:` reference is not set), for
    * what it declares as it will once it is available: its kind's adapter built from the config as
    * it stands, only to read the declarations or take a session over (never opened, not kept).
-   * Nothing for one that is available, or whose adapter cannot be built even so (a module whose
-   * factory never ran).
+   * Nothing for one that is available, or whose adapter cannot say even so: a module whose factory
+   * never ran, a kind whose adapters learn it from their harness, which was never asked
+   * (`HarnessModule.probeAtStart`: the bridge).
    */
   private declaredUnavailable(name: string): HarnessAdapter | undefined {
     const inst = this.instanceOf(name);
-    if (inst?.unavailable === undefined) return undefined;
+    if (inst?.unavailable === undefined || this.harnessRegistry.get(inst.kind)?.probeAtStart === true) return undefined;
     try {
       return this.build({ ...inst, unavailable: undefined });
     } catch {
@@ -2249,12 +2282,15 @@ export class Gateway {
    * A session refused an input because its agent is gone (`agent_unavailable`): a
    * notice and `input.rejected` in its log, a warning, and — given a route (a
    * dispatched channel message) — one short message there (local ends read their stream).
+   * `decided`: a client's op id (PR-3) keeps its answer with the `input.rejected`, in one transaction.
    */
-  private async refuseUnavailable(sessionKey: string, code: string, message: string, inputId: string, route: ReplyRoute | null): Promise<void> {
+  private async refuseUnavailable(sessionKey: string, code: string, message: string, inputId: string, route: ReplyRoute | null, decided?: (e: SessionEvent) => void): Promise<void> {
     this.log('warn', `${code}: ${message}`);
     const ev = { ts: Date.now(), level: 'primary' as const, audience: 'status' as const, durability: 'durable' as const, visibility: 'participants' as const };
     this.hub.append(sessionKey, { ...ev, body: { t: 'notice', code: 'other', message: `${code}: ${message}` } });
-    this.hub.append(sessionKey, { ...ev, body: { t: 'input.rejected', inputIds: [inputId], reason: code } });
+    const rejected = { ...ev, body: { t: 'input.rejected' as const, inputIds: [inputId], reason: code } };
+    if (decided) this.hub.batch(() => decided(this.hub.append(sessionKey, rejected)));
+    else this.hub.append(sessionKey, rejected);
     if (route && route.channel !== 'local') {
       const text =
         code === 'agent_unavailable'
@@ -2372,16 +2408,18 @@ export class Gateway {
   }
 
   /**
-   * The model tools an agent's sessions are offered (`KernelContext.agents.tools`): its tools list,
-   * or the endpoint's whole catalog for `tools: true`; none without tools.
+   * The model tools an agent's sessions are offered now (`KernelContext.agents.tools`): its tools
+   * list, or the endpoint's whole catalog for `tools: true`, but those a module withholds at the
+   * moment (`HostTools.withheld`: the live tools while no running channel can open a live, but
+   * `live_say` / `live_leave` while a live runs); none without tools.
    */
   private agentTools(agent: string | undefined): string[] {
     const c = this.o.config;
     const a = c.agents[agent ?? c.defaultAgent ?? ''];
     if (!a?.tools) return [];
-    if (a.toolNames) return [...a.toolNames];
-    this.catalogNames ??= this.tools ? toolCatalog(this.tools).map((t) => t.name) : [];
-    return [...this.catalogNames];
+    const names = a.toolNames ?? (this.catalogNames ??= this.tools ? toolCatalog(this.tools).map((t) => t.name) : []);
+    const withheld = this.tools?.withheld();
+    return names.filter((n) => !withheld?.has(n));
   }
 
   // ---- live (decision 11) ----------------------------------------------------
@@ -2496,6 +2534,16 @@ export class Gateway {
     if (v !== 'allow') throw new ToolError(`live_join: ${routeKey(to)} is not an allowed destination (Policy.outbound; preregister it in policy.routes)`);
   }
 
+  /**
+   * The running channels that can open a live (`KernelContext.live.channels`; `live_join` is
+   * offered only while there is one, `live_say` / `live_leave` also while a live runs, `lives`):
+   * `id:account`, in the order they started. One counts until its `start` ends or it is removed,
+   * also while it reconnects; a live it opened is not ended with it.
+   */
+  private liveChannels(): string[] {
+    return this.channels.filter((c) => !c.ended && typeof c.adapter.openLive === 'function').map((c) => `${c.adapter.id}:${c.account}`);
+  }
+
   /** The channel a live opens on: `spec` (id or id:account), else the turn's reply channel. */
   private liveChannel(turn: TurnContext, spec: string | undefined): RunningChannel {
     const able = this.channels.filter((c) => typeof c.adapter.openLive === 'function');
@@ -2608,8 +2656,9 @@ ${a.summary}` }],
   /** A topic was parked: its lane idles out; the one now current keeps its lane. */
   private topicChanged(c: TopicChange): void {
     // A new topic of a launched conversation keeps its launch. Synchronous on purpose:
-    // TopicRegistry.create calls this after its commit and before it returns, so the
-    // launch is pinned before the caller (handOver, `/new`) opens the new topic's lane.
+    // TopicRegistry.create calls this after its write and before it returns, so the
+    // launch is pinned before the caller (handOver, `/new`) opens the new topic's lane;
+    // inside a batch (a topic.switch with an op id) the pin commits or rolls back with it.
     if (c.created && c.from) {
       const launch = this.records.launchOf(c.from.sessionKey);
       if (launch && this.records.agentOf(c.to.sessionKey) === undefined && !this.records.launchOf(c.to.sessionKey)) {
@@ -2620,10 +2669,14 @@ ${a.summary}` }],
         }
       }
     }
-    const t = this.parkedTimers.get(c.to.sessionKey);
-    if (t) clearTimeout(t);
-    this.parkedTimers.delete(c.to.sessionKey);
-    if (c.from && c.from.sessionKey !== c.to.sessionKey && this.lanes.has(c.from.sessionKey)) this.idleOut(c.from.sessionKey);
+    // The lanes follow the change once it has committed: a topic.switch with an op id whose answer
+    // cannot be kept rolls the change back (its batch), and the topic current before keeps its lane.
+    this.hub.afterCommit(() => {
+      const t = this.parkedTimers.get(c.to.sessionKey);
+      if (t) clearTimeout(t);
+      this.parkedTimers.delete(c.to.sessionKey);
+      if (c.from && c.from.sessionKey !== c.to.sessionKey && this.lanes.has(c.from.sessionKey)) this.idleOut(c.from.sessionKey);
+    });
   }
 
   /**
@@ -2751,8 +2804,11 @@ ${a.summary}` }],
     return this.topics.list({ ...(f.conversation !== undefined ? { conversation: f.conversation } : {}), ...(f.sessionKey !== undefined ? { sessionKey: f.sessionKey } : {}) }).map(topicView);
   }
 
-  /** `topic.switch` from a client or the host, checked by `Policy.control` as a `reset` of the conversation's current topic session. */
-  async topicSwitch(f: TopicSwitchFrame, origin: Origin): Promise<Outcome> {
+  /**
+   * `topic.switch` from a client or the host, checked by `Policy.control` as a `reset` of the conversation's current topic session.
+   * `op` (an op id, PR-3): the change and its kept answer commit together, `seq` the `topic.changed` in the now-current topic's session.
+   */
+  async topicSwitch(f: TopicSwitchFrame, origin: Origin, op?: Op): Promise<Outcome> {
     if (this.stopped) return fail('stopped', 'daemon is stopping');
     const hasId = 'topicId' in f && f.topicId !== undefined;
     const hasNew = 'new' in f && f.new !== undefined;
@@ -2766,9 +2822,13 @@ ${a.summary}` }],
     const verdict = await this.policy.control({ sessionKey: cur?.sessionKey ?? all[0]!.sessionKey, op: 'reset', origin });
     if (verdict !== 'allow') return fail('forbidden', 'not allowed to change the topics of this conversation');
     const reason = isHostOrigin(origin) ? 'system' : 'user';
+    // Switching to the current topic changes nothing and writes no event.
+    const changes = target?.state !== 'current';
+    const change = () => (target ? this.topics.switchTo(target.id, reason) : this.router.newTopic(agent, f.conversation, (f as { new: { title?: string } }).new, reason));
+    const answer = (r: ReturnType<typeof change>): Outcome => ({ ok: true, value: { topic: topicView(r.topic), ...(r.previous ? { previous: topicView(r.previous) } : {}), created: r.created } });
     try {
-      const r = target ? this.topics.switchTo(target.id, reason) : this.router.newTopic(agent, f.conversation, (f as { new: { title?: string } }).new, reason);
-      return { ok: true, value: { topic: topicView(r.topic), ...(r.previous ? { previous: topicView(r.previous) } : {}), created: r.created } };
+      const r = op ? op.commit(change, (r) => ({ outcome: answer(r), ...(changes ? { seq: this.hub.log.head(r.topic.sessionKey) } : {}) })) : change();
+      return answer(r);
     } catch (e) {
       if (e instanceof TopicError) return fail(e.code, e.message);
       throw e;
@@ -4000,6 +4060,23 @@ ${a.summary}` }],
     return this.watches.add(by, watch);
   }
 
+  /** A client's `watch.add` with an op id (PR-3): the stored watch and its kept answer commit together. */
+  private async addWatchOp(by: Origin, draft: WatchDraft, op: Op): Promise<Outcome> {
+    const r = await this.watches.add(by, draft, (put, watch) => op.commit(put, () => ({ outcome: { ok: true, value: watch } })));
+    return r.ok ? { ok: true, value: r.watch } : fail(r.code, r.message);
+  }
+
+  /**
+   * A client frame with an op id (feature `client.opId`, INVARIANTS PR-3): it acts once per
+   * (principal, opId); a retry, also after a restart, gets the first answer back (`replayed`).
+   */
+  clientOp(f: OpFrame, origin: Origin): Promise<OpOutcome> {
+    const principal = origin.principal?.id ?? `${origin.kind}:${origin.adapter}`;
+    if (f.type === 'command') return this.clientOps.run({ principal, opId: f.opId, frameType: f.command.type, sessionKey: f.command.sessionKey }, (op) => this.command(f.command, origin, op));
+    if (f.type === 'watch.add') return this.clientOps.run({ principal, opId: f.opId, frameType: 'watch.add', sessionKey: f.watch.target.sessionKey }, (op) => this.addWatchOp(origin, f.watch, op));
+    return this.clientOps.run({ principal, opId: f.opId, frameType: 'topic.switch', sessionKey: f.conversation }, (op) => this.topicSwitch(f, origin, op));
+  }
+
   removeWatch(by: Origin, id: string): Promise<RemoveWatchResult> {
     return this.watches.remove(by, id);
   }
@@ -4019,8 +4096,11 @@ ${a.summary}` }],
     };
   }
 
-  /** Apply a command from a local client (subscriptions are the server's business). */
-  async command(cmd: ClientCommand, origin: Origin): Promise<Outcome> {
+  /**
+   * Apply a command from a local client (subscriptions are the server's business). `op` (an input or
+   * interrupt with an op id, PR-3): its answer is kept with the event that decides it.
+   */
+  async command(cmd: ClientCommand, origin: Origin, op?: Op): Promise<Outcome> {
     if (this.stopped) return fail('stopped', 'gateway is stopping');
     // An input's id is fixed before the lane: a refused input is recorded under it.
     const inputId = cmd.type === 'input' ? (cmd.input.inputId ?? `in_${randomUUID()}`) : undefined;
@@ -4032,7 +4112,7 @@ ${a.summary}` }],
     } catch (e) {
       if (e instanceof LaneUnavailableError) {
         // Only a refused input is written to the session log; other commands just fail.
-        if (inputId !== undefined) await this.refuseUnavailable(cmd.sessionKey, e.code, e.message, inputId, null);
+        if (inputId !== undefined) await this.refuseUnavailable(cmd.sessionKey, e.code, e.message, inputId, null, op && ((ev) => op.settle(fail(e.code, e.message), ev.seq)));
         return fail(e.code, e.message);
       }
       return fail('no_agent', (e as Error).message);
@@ -4056,11 +4136,14 @@ ${a.summary}` }],
           // Field by field: a client never sets origin, cause or channelRef; `loopGuard` is the lane's label.
           channelContext: { channel: 'local', ...withoutKey(withoutKey(cmd.input.channelContext, 'loopGuard'), 'nativeCommand') },
         };
+        const answer = (r: CommandResult): Outcome => (r.ok ? { ok: true, value: { inputId: input.inputId, disposition: r.disposition } } : fail(r.reason));
+        // PR-3: the answer is kept with the admission (or rejection) that decides it.
+        const hooks = op && { decided: (r: CommandResult, e: SessionEvent) => op.settle(answer(r), e.seq) };
         const r =
           cmd.mode === 'observe'
-            ? await lane.observe(input)
-            : await lane.command({ type: 'input', sessionKey: cmd.sessionKey, input, mode: cmd.mode, ...(cmd.expectedTurnId ? { expectedTurnId: cmd.expectedTurnId } : {}) });
-        return r.ok ? { ok: true, value: { inputId: input.inputId, disposition: r.disposition } } : fail(r.reason);
+            ? await lane.observe(input, hooks)
+            : await lane.command({ type: 'input', sessionKey: cmd.sessionKey, input, mode: cmd.mode, ...(cmd.expectedTurnId ? { expectedTurnId: cmd.expectedTurnId } : {}) }, hooks);
+        return answer(r);
       }
       case 'resolve':
         // Answering on someone's behalf is the host's (its connection is authenticated with the token).
@@ -4070,8 +4153,9 @@ ${a.summary}` }],
       // falls through
       case 'interrupt':
       case 'control': {
-        const r = await lane.command({ ...cmd, origin });
-        return r.ok ? { ok: true, value: {} } : fail(r.reason);
+        const answer = (r: CommandResult): Outcome => (r.ok ? { ok: true, value: {} } : fail(r.reason));
+        const r = await lane.command({ ...cmd, origin }, cmd.type === 'interrupt' && op ? interruptHooks(op, answer) : undefined);
+        return answer(r);
       }
       case 'subscribe':
       case 'unsubscribe':
@@ -4100,6 +4184,7 @@ ${a.summary}` }],
         pendingRequests: s.pendingRequests.map((r) => r.requestId),
         live: this.lanes.has(sessionKey),
         ...(launch ? { launch: launchView(launch) } : {}),
+        ...(s.attention ? { attention: s.attention } : {}),
       };
     });
   }
@@ -4186,6 +4271,18 @@ ${a.summary}` }],
     this.topics.close();
     this.hub.log.close?.();
   }
+}
+
+/**
+ * PR-3: an interrupt with an op id. Without `turnId` it acts on the turn it resolves the first time
+ * (kept `pending` before it acts), a retry on that one (or on none) only; an `input.cancelled` it
+ * writes commits with its kept answer.
+ */
+function interruptHooks(op: Op, answer: (r: CommandResult) => Outcome): CommandHooks {
+  return {
+    ...(op.pinned !== undefined ? { pinned: op.pinned } : { resolved: (turnId: string | null) => op.pin(turnId) }),
+    decided: (r, e) => op.settle(answer(r), e.seq),
+  };
 }
 
 /** `topicTools` of an input handed to a topic by session_rotate / session_switch. */
@@ -4384,13 +4481,6 @@ export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
    * the built-in registry says of the instance's kind.
    */
   readonly profilesInOpen: boolean;
-  /** The kind's lifecycle calls, present only when its adapter has them (the gateway reads their presence). */
-  readonly detach?: () => Promise<void>;
-  readonly dispose?: () => Promise<void>;
-  /** The same instance on the kind's adapter's own process (`HarnessAdapter.ownProcess`), present only when it has one. */
-  readonly ownProcess?: (o: { env: Record<string, string>; cwd?: string }) => InstanceHarness;
-  /** The kind's takeover by its terminal UI (`HarnessAdapter.takeover`), present only when its adapter has one. */
-  readonly takeover?: (a: HarnessTakeoverArgs) => Promise<HarnessTakeover>;
   constructor(
     readonly instance: HarnessInstance,
     readonly inner: HarnessAdapter,
@@ -4403,10 +4493,31 @@ export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
     super();
     this.id = instance.name;
     this.profilesInOpen = profilesInOpen ?? (instance.kind === 'module' || builtinHarnesses.get(instance.kind)?.profilesInOpen === true);
-    if (typeof inner.detach === 'function') this.detach = () => inner.detach!();
-    if (typeof inner.dispose === 'function') this.dispose = () => inner.dispose!();
-    if (typeof inner.ownProcess === 'function') this.ownProcess = (o) => new InstanceHarness(instance, inner.ownProcess!(o), undefined, instructions, this.profilesInOpen);
-    if (typeof inner.takeover === 'function') this.takeover = (a) => inner.takeover!(a);
+  }
+
+  // Read through when asked: an adapter that learns them from its harness (`HarnessModule.probeAtStart`, a bridge) has them only after its first probe.
+
+  /** The kind's lifecycle calls, present only when its adapter has them (the gateway reads their presence). */
+  get detach(): (() => Promise<void>) | undefined {
+    const inner = this.inner;
+    return typeof inner.detach === 'function' ? () => inner.detach!() : undefined;
+  }
+
+  get dispose(): (() => Promise<void>) | undefined {
+    const inner = this.inner;
+    return typeof inner.dispose === 'function' ? () => inner.dispose!() : undefined;
+  }
+
+  /** The same instance on the kind's adapter's own process (`HarnessAdapter.ownProcess`), present only when it has one. */
+  get ownProcess(): ((o: { env: Record<string, string>; cwd?: string }) => InstanceHarness) | undefined {
+    const inner = this.inner;
+    return typeof inner.ownProcess === 'function' ? (o) => new InstanceHarness(this.instance, inner.ownProcess!(o), undefined, this.instructions, this.profilesInOpen) : undefined;
+  }
+
+  /** The kind's takeover by its terminal UI (`HarnessAdapter.takeover`), present only when its adapter has one. */
+  get takeover(): ((a: HarnessTakeoverArgs) => Promise<HarnessTakeover>) | undefined {
+    const inner = this.inner;
+    return typeof inner.takeover === 'function' ? (a) => inner.takeover!(a) : undefined;
   }
 
   probe(): Promise<{ version: string; caps: HarnessCaps }> {

@@ -1,5 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import {
+  type Attention,
+  type AttentionChanged,
   ContactCalloutAnswer,
   ExternalCalloutAnswer,
   OutboundCalloutAnswer,
@@ -107,7 +109,7 @@ export const isHostOrigin = (o: Origin) => o.kind === 'system' && o.adapter === 
 const TAKEOVER_FLAP_MS = 60_000;
 
 export class HostService implements HostFrames {
-  private host: { peer: Peer; name: string; consumer?: string; hooks: Set<CalloutHook>; push?: PushSubscription } | undefined;
+  private host: { peer: Peer; name: string; consumer?: string; hooks: Set<CalloutHook>; push?: PushSubscription; attention?: true } | undefined;
   private scopeCache: { raw: string; scope: StoredScope } | undefined;
   /** When the last host takeover happened (repeated ones within TAKEOVER_FLAP_MS are logged as errors). */
   private lastTakeover: number | undefined;
@@ -330,7 +332,7 @@ export class HostService implements HostFrames {
     }
     peer.auth = { name, origin: () => hostOrigin(name) };
     if (role) {
-      this.host = { peer, name, hooks, ...(f.consumer !== undefined ? { consumer: f.consumer } : {}) };
+      this.host = { peer, name, hooks, ...(f.consumer !== undefined ? { consumer: f.consumer } : {}), ...(optIn.has('attention') ? { attention: true as const } : {}) };
       this.d.records.setFlag(OUTBOUND_FLAG, hooks.has('outbound') ? name : undefined);
       this.d.records.setFlag(CONTENT_FLAG, hooks.has('outbound') && hooks.has('outbound.content') ? name : undefined);
       this.d.records.setFlag(EXTERNAL_FLAG, hooks.has('external') ? name : undefined);
@@ -355,6 +357,16 @@ export class HostService implements HostFrames {
       ...(role && hooks.has('outbound.scoped') ? { outboundScope: { revision: this.outboundScope()!.revision, routes: this.outboundScope()!.routes.length } } : {}),
       ...(f.optIn !== undefined ? { optIn: role ? [...optIn] : [] } : {}),
     });
+  }
+
+  /**
+   * A session's attention changed (`Hub.onAttention`, LN-11): an `attention.changed` frame to the
+   * host, when its hello asked `optIn: ["attention"]`. No answer; nothing kept while no host listens.
+   */
+  attentionChanged(sessionKey: string, attention: Attention): void {
+    const h = this.host;
+    if (!h?.attention || h.peer.signal.aborted) return;
+    h.peer.send({ v: PROTOCOL_VERSION, type: 'attention.changed', sessionKey, attention } satisfies AttentionChanged);
   }
 
   /** Push-consume: one `inbound` at a time; the cursor moves when the host answers `{ accepted: true }`. */
@@ -502,8 +514,12 @@ export class HostService implements HostFrames {
  * MCP tool items carry `tool { server, name }` while the host declared `outbound.scoped`, `outbound` + `outbound.content`,
  * or asked `optIn: ["item.tool"]` (granted in the result's `optIn`). `host-mcp.send_file.blob_scoped` (SE-7): `send_file`
  * sends a `blob` ref only when it appeared in the calling session (an input's content block, an attachment it sent);
- * any other ref is refused like a missing one. These are the kernel's own; `host.hello` adds the features of the modules
- * that run (`ModuleManifest.features`) after them.
+ * any other ref is refused like a missing one. `client.opId` (PR-3): client frames (input and interrupt commands,
+ * `topic.switch`, `watch.add`) may carry `opId`; the answer is kept with the event that decided it and a retry gets it
+ * back (`replayed: true`, `seq`), an op id reused for another frame type or session is `op_id_conflict`. `attention` (LN-11):
+ * `SessionInfo` (the `sessions` answer, the console's sessions) and the snapshot carry `attention`, what is pending in the
+ * session now; a host asking `optIn: ["attention"]` gets an `attention.changed` frame on each change. These are the
+ * kernel's own; `host.hello` adds the features of the modules that run (`ModuleManifest.features`) after them.
  */
 export const FEATURES = [
   'session.launch',
@@ -535,6 +551,8 @@ export const FEATURES = [
   'schedules',
   'history',
   'host-mcp.send_file.blob_scoped',
+  'client.opId',
+  'attention',
 ];
 
 /** `DaemonRecords` flag: the name of the host that declared the `outbound` hook. */
@@ -552,7 +570,7 @@ const CONTENT_FLAG = 'host.outbound.content';
 const ITEM_TOOL_FLAG = 'host.item.tool';
 
 /** `host.hello.optIn` names a host may ask for. */
-const OPT_INS = ['item.tool'] as const;
+const OPT_INS = ['item.tool', 'attention'] as const;
 
 /** The stored scope of an `outbound.scoped` host. */
 export interface StoredScope {

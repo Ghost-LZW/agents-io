@@ -62,8 +62,8 @@ const message = (f: () => unknown) => {
 };
 
 describe('harness registry', () => {
-  it('the built-in registry is Claude Code then Codex, and ConfigFile is its schema', () => {
-    expect(builtinHarnesses.kinds).toEqual(['claude-code', 'codex']);
+  it('the built-in registry is Claude Code then Codex and the bridge, and ConfigFile is its schema', () => {
+    expect(builtinHarnesses.kinds).toEqual(['claude-code', 'codex', 'bridge']);
     expect(builtinHarnesses.defaultKind).toBe('claude-code');
     expect(builtinHarnesses.configDirKeys()).toEqual(['CLAUDE_CONFIG_DIR', 'CODEX_HOME']);
     expect(configFileSchema(builtinHarnesses)).toBe(ConfigFile);
