@@ -622,8 +622,10 @@ party's module has the same shape (origin `module`). The manifest says, without 
   while the modules stop every firing fails that way. A peer's schedule (set through
   `KernelContext.schedules.addAs`, `schedule.module` the module's id) is asked of that module
   alone: `false`, no hook, or the module off or not registered ends the firing, and nothing goes
-  out (SC-3); `scheduledWake({ schedule, operationId })` is asked the same way for a peer's wake
-  (`action: "host"`): `true` and the kernel hands it to the host, anything else ends the firing.
+  out (SC-3), but the schedule is kept (a one-shot stays at that time and fires at the next start
+  as a missed one, SC-2); `scheduledWake({ schedule, operationId })` is asked the same way for a
+  peer's wake (`action: "host"`): `true` and the kernel hands it to the host, anything else ends
+  the firing.
 
 The registry checks every manifest and what they claim together (ids; config sections and
 aliases; tools, commands and features are each one module's and never the kernel's). Its option
@@ -1226,3 +1228,13 @@ After the review of the merge, a peer's schedules (2026-11-24; INVARIANTS SC-3, 
   `ScheduleRegistry.put` takes an optional fourth argument, `module`.
 - The external MCP endpoint's `scheduledWake` answers true only for a configured client whose
   `schedule:` scope still has the route (a route out of it ends the firing, as for its messages).
+- Such a firing keeps its schedule even when it has no next time (a one-shot, or past `until`):
+  `FinalFiringError` takes an optional `{ keep: true }` (`keepsSchedule(e)`; any error with
+  `final: true` and `keep: true` counts the same), which `ModuleHost.peerSchedule` throws for a
+  module off, not registered, or not acting for the peer. `ScheduleRegistry.fail` takes an optional
+  fifth argument, `keep`, and returns whether the schedule stayed at the firing's time (`nextAt`
+  that past time, with `lastFailure`); the dispatcher does not fire such a one again in that
+  process, and the next start fires it as a missed one (SC-2: `once` fires it, `skip` drops it).
+  `ScheduleDispatcherOptions.onFailed` gets a fourth argument, `kept` (the gateway's notice then
+  says `not tried again until the next start`). A route out of the client's scope, held, denied or
+  no channel still delete a one-shot.

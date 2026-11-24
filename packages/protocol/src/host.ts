@@ -872,7 +872,11 @@ export const DeliverUpdateResult = Type.Object({
 });
 export type DeliverUpdateResult = Static<typeof DeliverUpdateResult>;
 
-/** A schedule as the daemon keeps it: the draft, who set it, and when it fires next (Unix ms; null: never again). */
+/**
+ * A schedule as the daemon keeps it: the draft, who set it, and when it fires next (Unix ms; null:
+ * never again; a time already past with `lastFailure` at it: a peer's that could not go out then,
+ * kept for the next start, SC-3).
+ */
 export const ScheduleView = Type.Object({
   ...ScheduleDraft.properties,
   id: Type.String(),

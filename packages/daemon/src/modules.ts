@@ -767,14 +767,16 @@ export class ModuleHost {
    * message: its `ModuleHooks.scheduledMessage` sends it; a wake (`action: "host"`): its
    * `ModuleHooks.scheduledWake` says it still acts for it, and the caller hands it to the host. The
    * module not registered, off, without the hook, or answering anything but true: the firing is over
-   * (`FinalFiringError`, SC-1) and nothing goes out, never as the daemon's. A hook's throw or
-   * rejection is the firing's failure, as it is. While the modules stop it throws (redone at the next start).
+   * (`FinalFiringError`, SC-1) and nothing goes out, never as the daemon's; the schedule is kept
+   * (`keep`: a one-shot stays at its time for the next start, when the module may act for the peer
+   * again, SC-2). A hook's throw or rejection is the firing's failure, as it is. While the modules
+   * stop it throws (redone at the next start).
    */
   async peerSchedule(a: { schedule: ScheduleView; operationId: string }, module: string): Promise<void> {
     if (this.stopping) throw new Error('the daemon is stopping: the firing is redone at the next start');
     const by = a.schedule.createdBy;
     const wake = a.schedule.action === 'host';
-    const not = (why: string) => new FinalFiringError(`set by ${by} through module ${module}, which ${why}; ${wake ? 'not handed to the host' : 'not sent'}`);
+    const not = (why: string) => new FinalFiringError(`set by ${by} through module ${module}, which ${why}; ${wake ? 'not handed to the host' : 'not sent'}`, { keep: true });
     const m = this.all.find((x) => x.r.manifest.id === module);
     if (!m) throw not('this daemon does not have');
     if (!m.instance) throw not('is off');

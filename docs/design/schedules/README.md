@@ -56,7 +56,7 @@
 - 触发分两步，同监听 digest 的 flush：先写一条待定记录 `firing(id, scheduledAt)`，再投递，投递后删记录、推进 `nextAt`。进程死在中间：下次启动按待定记录重做，输入 id 固定为 `schedule:<id>:<scheduledAt>`，会话里已经有这个 id 就是重复（`duplicate`），不会投两次。
 - 启动时：`nextAt` 已过的，`missed: "once"` 补一次（`channelContext.missed=true`，`scheduledAt` 是错过的那个最近时刻），`skip` 直接排下一次。不论错过几次，最多补一次。
 - 一个定时器：总是只等最近的那个 `nextAt`（上限 2^31-1 ms），到点处理所有到期的，再等下一个。
-- 投递失败（2026-11-24 补）：再试也发不出去的（没有通道、被扣下或拒绝、拒收、外部客户端的 scope 已不含这个路由；错误带 `final: true`）这一次就此结束，记在 `schedule:<id>` 的日志里，排下一次；别的失败留着待定记录，隔 10 s 起逐次加倍（至多 15 min）以同一个 id 再试，不立刻重试。守护进程停止时定时器先停，启动时最后才开始（通道与模块都已在跑）。agent 设的 `message` 到点时是 agent 的消息（`kind: "tool"`），宿主的出口检查照它这时的 `send_message` 那样看（INVARIANTS DL-7）。外部客户端设的（`message` 和 `wake`）只经设它的模块（对外 MCP，`ScheduleView.module`）以客户端的身份触发：客户端从配置里删掉了、模块关掉了，这次到点什么都不发、不以守护进程的身份发、不交给宿主，算最终失败，定时任务留着，加回来以后照常（INVARIANTS SC-3）。最终失败的那一次记在定时任务的 `lastFailure` 里（为什么没发出去），`schedule.list` 看得到，下一次投递成功时清掉。
+- 投递失败（2026-11-24 补）：再试也发不出去的（没有通道、被扣下或拒绝、拒收、外部客户端的 scope 已不含这个路由；错误带 `final: true`）这一次就此结束，记在 `schedule:<id>` 的日志里，排下一次；别的失败留着待定记录，隔 10 s 起逐次加倍（至多 15 min）以同一个 id 再试，不立刻重试。守护进程停止时定时器先停，启动时最后才开始（通道与模块都已在跑）。agent 设的 `message` 到点时是 agent 的消息（`kind: "tool"`），宿主的出口检查照它这时的 `send_message` 那样看（INVARIANTS DL-7）。外部客户端设的（`message` 和 `wake`）只经设它的模块（对外 MCP，`ScheduleView.module`）以客户端的身份触发：客户端从配置里删掉了、模块关掉了，这次到点什么都不发、不以守护进程的身份发、不交给宿主，算最终失败，定时任务留着（一次性的也不删：停在没发出去的那个到点，这次运行里不再触发，下次启动时按错过的处理，`once` 补一次、`skip` 丢掉），加回来以后照常（INVARIANTS SC-3、SC-2）。最终失败的那一次记在定时任务的 `lastFailure` 里（为什么没发出去），`schedule.list` 看得到，下一次投递成功时清掉。
 
 ### 4.3 谁能建
 

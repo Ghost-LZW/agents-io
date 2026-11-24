@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { FakeHarness } from '@agents-io/testkit';
-import { Hub, Lane, ScheduleDispatcher, ScheduleRegistry, SqliteSessionLog, nextCron, parseCron } from '../src/index.js';
+import { FinalFiringError, Hub, Lane, ScheduleDispatcher, ScheduleRegistry, SqliteSessionLog, nextCron, parseCron } from '../src/index.js';
 import { until } from './helpers.js';
 
 const T0 = Date.parse('2026-10-27T00:30:00Z'); // 08:30 in Shanghai, a Tuesday
@@ -255,6 +255,79 @@ describe('schedules', () => {
     expect(w.registry.get('hourly')).toMatchObject({ module: 'peers', lastFiredAt: at + 3600_000, nextAt: at + 2 * 3600_000 });
     expect(w.registry.get('hourly')!.lastFailure).toBeUndefined();
     d.stop();
+    w.log.close();
+  });
+
+  // INVARIANTS SC-3 不成立 (2026-11-24, review of the fix; 已修): a peer's one-shot whose firing failed because its module did not act for the peer was deleted, why and all: its client back restored nothing.
+  it("a firing that fails for good keeping its schedule (keep: true: who set it cannot send now, SC-3) leaves a one-shot at that time, saying why, not fired again in this process; the next start fires it once as missed, skip drops it; one replaced meanwhile fires at its new time #SC-1 #SC-2 #SC-3", async () => {
+    const now = { t: T0 };
+    const w = world(now);
+    let away = true;
+    const tried: string[] = [];
+    const failed: string[] = [];
+    const off = (what: string) => new FinalFiringError(`set by peer:x through module peers, which is off; ${what}`, { keep: true });
+    const make = () =>
+      new ScheduleDispatcher({
+        registry: w.registry,
+        now: () => now.t,
+        lanes: () => {
+          throw new Error('no turns here');
+        },
+        send: async (s, op) => {
+          tried.push(op);
+          if (away) throw off('not sent');
+        },
+        toHost: async (_s, input) => {
+          tried.push(`${input.inputId}${input.channelContext.missed ? ' (missed)' : ''}`);
+          if (away) throw off('not handed to the host');
+        },
+        onFailed: (s, scheduledAt, _e, kept) => failed.push(`${s.id}@${scheduledAt}${kept ? ' kept' : ''}`),
+      });
+    const route = { channel: 'fake', account: 'default', conversationId: 'c1' };
+    const at = T0 + 60_000;
+    const peer = (d: Parameters<ScheduleRegistry['put']>[0]) => w.registry.put(d, 'peer:x', undefined, 'peers');
+    peer({ id: 'once', when: { at }, action: 'message', route, text: 'just once' });
+    peer({ id: 'wake', when: { at }, action: 'host', route, text: 'wake up', meta: { wake: 'resume' } });
+    peer({ id: 'quiet', when: { at }, action: 'message', route, text: 'not late', missed: 'skip' });
+    peer({ id: 'moved', when: { at }, action: 'message', route, text: 'later' });
+    const d = make();
+    d.start();
+    await d.idle();
+    now.t = at;
+    await d.tick();
+    expect(tried.sort()).toEqual([`schedule:moved:${at}`, `schedule:once:${at}`, `schedule:quiet:${at}`, `schedule:wake:${at}`]);
+    expect(failed.sort()).toEqual([`moved@${at} kept`, `once@${at} kept`, `quiet@${at} kept`, `wake@${at} kept`]);
+    expect(w.registry.pending()).toEqual([]);
+    // Kept, at the time that did not go out, saying why.
+    for (const id of ['once', 'wake', 'quiet', 'moved'])
+      expect(w.registry.get(id)).toMatchObject({ module: 'peers', nextAt: at, lastFailure: { scheduledAt: at, at, reason: expect.stringMatching(/^set by peer:x through module peers, which is off; not (sent|handed to the host)$/) } });
+    // Not fired again in this process: not by a tick, and the timer does not spin on them.
+    const due = vi.spyOn(w.registry, 'due');
+    now.t = at + 10 * 60_000;
+    await d.tick();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(due).toHaveBeenCalledTimes(1);
+    due.mockRestore();
+    expect(tried).toHaveLength(4);
+    // One replaced meanwhile is a new schedule: it fires at its new time (and fails again, kept at that one).
+    peer({ id: 'moved', when: { at: at + 20 * 60_000 }, action: 'message', route, text: 'later' });
+    d.changed();
+    now.t = at + 20 * 60_000;
+    await d.tick();
+    expect(tried.slice(4)).toEqual([`schedule:moved:${at + 20 * 60_000}`]);
+    expect(w.registry.get('moved')).toMatchObject({ nextAt: at + 20 * 60_000, lastFailure: { scheduledAt: at + 20 * 60_000 } });
+    d.stop();
+    // The next start, an hour on, with who set them back: each is a missed firing; "once" fires it once, "skip" drops it.
+    away = false;
+    now.t = at + 3600_000;
+    const again = make();
+    again.start();
+    await again.idle();
+    expect(tried.slice(5).sort()).toEqual([`schedule:moved:${at + 20 * 60_000}`, `schedule:once:${at}`, `schedule:wake:${at} (missed)`]);
+    // Delivered one-shots are done; the skipped one is gone.
+    expect(w.registry.list()).toEqual([]);
+    expect(w.registry.pending()).toEqual([]);
+    again.stop();
     w.log.close();
   });
 

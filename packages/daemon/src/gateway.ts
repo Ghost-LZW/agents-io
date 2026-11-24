@@ -659,7 +659,7 @@ export class Gateway {
       send: (s, operationId) => this.sendScheduled(s, operationId),
       toHost: (s, input) => this.scheduledToHost(s, input),
       onError: (err, id, retryInMs) => this.log('warn', `schedule ${id}: ${(err as Error).message}${retryInMs !== undefined ? `; tried again in ${Math.round(retryInMs / 1000)} s` : ''}`),
-      onFailed: (s, scheduledAt, err) => this.scheduleFailed(s, scheduledAt, err),
+      onFailed: (s, scheduledAt, err, kept) => this.scheduleFailed(s, scheduledAt, err, kept),
     });
     // Built when some agent has tools (agents.<name>.tools, default `outputTools`, off); only those agents' harnesses mount them.
     if (Object.values(c.agents).some((a) => a.tools)) {
@@ -3474,11 +3474,11 @@ ${a.summary}` }],
   }
 
   /**
-   * A firing that failed for good (SC-1): over, not tried again. Logged, and recorded in the schedule's
-   * log (`schedule:<id>`, where its sends settle) as a notice; recording it is best effort.
+   * A firing that failed for good (SC-1): over, not tried again (`kept`: until the next start, SC-3).
+   * Logged, and recorded in the schedule's log (`schedule:<id>`, where its sends settle) as a notice (best effort).
    */
-  private scheduleFailed(s: Schedule, scheduledAt: number, err: unknown): void {
-    const message = `schedule ${s.id}: the firing due ${new Date(scheduledAt).toISOString()} was not delivered, not tried again: ${(err as Error)?.message ?? String(err)}`;
+  private scheduleFailed(s: Schedule, scheduledAt: number, err: unknown, kept = false): void {
+    const message = `schedule ${s.id}: the firing due ${new Date(scheduledAt).toISOString()} was not delivered, not tried again${kept ? ' until the next start' : ''}: ${(err as Error)?.message ?? String(err)}`;
     this.log('warn', message);
     try {
       this.hub.append(`schedule:${s.id}`, { ts: Date.now(), level: 'detail', audience: 'status', durability: 'durable', visibility: 'operators', body: { t: 'notice', code: 'other', message } });

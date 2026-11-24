@@ -556,6 +556,60 @@ describe('external schedules', () => {
       await x.stop();
     }
   });
+
+  // INVARIANTS SC-3 不成立 (2026-11-24, review of the fix; 已修): a client's one-shot due while it was removed, or while the module was off, was deleted, why and all: listed nowhere, and the client back restored nothing.
+  it("a client's one-shots (a message, a wake) due while it is removed, or the module is off, send nothing and are kept at their time, listed with why, not fired again in that run; the next start with the client back fires each once, as the client #SC-3 #SC-1 #SC-2", async () => {
+    const dir = tmp();
+    const f = tokenFiles(dir);
+    const timer = { tokenFile: f.ops, scopes: ['schedule:fake:default:*'] };
+    const reader = { tokenFile: f.reader, scopes: ['read'] };
+    const ext = (clients: Record<string, unknown>, more: Record<string, unknown> = {}) => ({ externalMcp: { listen: '127.0.0.1:0', clients, ...more } });
+    const w = await daemon({ dir, raw: ext({ timer, reader }) });
+    const c = await mcp(w.gw.adminStatus().externalMcp!.url, TOKENS.ops);
+    const at = Date.now() + 1500;
+    for (const [id, action] of [['once', 'message'], ['nudge', 'wake']] as const) {
+      const r = await call(c, 'schedule_add', { id, action, when: { at }, route: 'fake:default:dm-alice', text: `${id} from timer` });
+      expect(r.isError).toBe(false);
+    }
+    await c.close();
+    await w.stop();
+    const ids = ['timer:once', 'timer:nudge'];
+    const tail: Record<string, string> = { 'timer:once': 'not sent', 'timer:nudge': 'not handed to the host' };
+    // The owner removes the client (another one stays), then turns the module off; each time the daemon runs while they are due.
+    for (const [raw, which] of [
+      [ext({ reader }), 'does not act for external:timer now'],
+      [ext({ timer, reader }, { enabled: false }), 'is off'],
+    ] as const) {
+      const logs: string[] = [];
+      const x = await daemon({ dir, raw, gateway: { logger: (_level, msg) => logs.push(msg) } });
+      const queued = x.gw.hostQueue.head();
+      const failed = () => logs.filter((m) => /^schedule timer:(once|nudge):/.test(m));
+      await until(() => failed().length === 2, 5000);
+      await new Promise((r) => setTimeout(r, 200));
+      // Once each in this run, and nothing went out: no message as the daemon's, no item for the host.
+      expect(failed()).toHaveLength(2);
+      expect(x.chat.sent).toEqual([]);
+      expect(x.gw.hostQueue.head()).toBe(queued);
+      for (const id of ids) {
+        const why = new RegExp(`set by external:timer through module external-mcp, which ${which}; ${tail[id]}$`);
+        expect(failed().filter((m) => m.startsWith(`schedule ${id}:`))).toEqual([expect.stringMatching(why)]);
+        const notes = x.gw.hub.log.read(`schedule:${id}`, 0).filter((e) => e.body.t === 'notice');
+        expect((notes.at(-1)!.body as { message: string }).message).toMatch(/not delivered, not tried again until the next start: set by external:timer/);
+        // Kept at the time that did not go out, saying why.
+        expect(x.gw.listSchedules().find((s) => s.id === id)).toMatchObject({ module: 'external-mcp', nextAt: at, lastFailure: { scheduledAt: at, reason: expect.stringMatching(why) } });
+      }
+      expect(x.gw.schedules.registry.pending()).toEqual([]);
+      await x.stop();
+    }
+    // The client is back: each fires once, as it (its message through its send_message: kind tool, its principal); then they are done.
+    const back = await daemon({ dir, raw: ext({ timer, reader }) });
+    const queued = back.gw.hostQueue.head();
+    await until(() => back.chat.sent.length === 1 && back.gw.hostQueue.head() === queued + 1 && back.gw.listSchedules().length === 0, 5000);
+    expect(back.chat.sent.map((s) => s.msg.text)).toEqual(['once from timer']);
+    expect(back.gw.explain(`external:timer:schedule:timer:once:${at}`)).toMatchObject({ ok: true, value: { result: 'delivered', external: { client: 'timer', principal: 'external:timer' } } });
+    expect(back.gw.hostQueue.get(queued + 1)!.input.channelContext).toMatchObject({ schedule: 'timer:nudge', 'schedule.client': 'timer', createdBy: 'external:timer' });
+    expect(back.gw.schedules.registry.pending()).toEqual([]);
+  });
 });
 
 describe('external wake schedules', () => {
