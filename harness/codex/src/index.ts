@@ -14,12 +14,14 @@ export {
   type CodexProfile,
   type MediaResolver,
 } from './map.js';
-export { openedFor, responseFor, UnsupportedDecisionError, type CodexPermissionUpdate } from './approvals.js';
+export { declineFor, openedFor, responseFor, UnsupportedDecisionError, type CodexPermissionUpdate } from './approvals.js';
 export { RpcClient, RpcError, RpcClosedError, spawnTransport, type Transport } from './rpc.js';
 export {
   CODEX_GENERATED_VERSION,
   SUPPORTED_CODEX_LINES,
   UnsupportedCodexVersionError,
   assertSupportedVersion,
+  checkCodexVersion,
   versionFromUserAgent,
+  type CodexVersionPolicy,
 } from './version.js';

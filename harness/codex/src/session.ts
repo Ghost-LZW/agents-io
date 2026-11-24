@@ -47,7 +47,7 @@ import type { ItemGuardianApprovalReviewStartedNotification } from './generated/
 import type { ItemGuardianApprovalReviewCompletedNotification } from './generated/v2/ItemGuardianApprovalReviewCompletedNotification.js';
 import type { GuardianApprovalReviewAction } from './generated/v2/GuardianApprovalReviewAction.js';
 import type { ThreadInjectItemsParams } from './generated/v2/ThreadInjectItemsParams.js';
-import { isApprovalMethod, openedFor, responseFor, type ApprovalMethod } from './approvals.js';
+import { declineFor, isApprovalMethod, openedFor, responseFor, UnsupportedDecisionError, type ApprovalMethod } from './approvals.js';
 import {
   asCompleted,
   displayCommand,
@@ -359,12 +359,24 @@ export class CodexSession implements HarnessSession {
   }
 
   private async sendAnswer(requestId: string, r: PendingRequest, decision: Decision): Promise<void> {
-    const { result, interrupt } = responseFor(r.method, r.params, decision);
+    let answer: { result: unknown; interrupt: boolean };
+    let unreadable: Error | undefined;
+    try {
+      answer = responseFor(r.method, r.params, decision);
+    } catch (e) {
+      const decline = declineFor(r.method);
+      if (e instanceof UnsupportedDecisionError || decline === undefined) throw e;
+      // Params the answer cannot be built from (HC-9): decline, so Codex is answered and the turn goes on.
+      answer = { result: decline, interrupt: false };
+      unreadable = new Error(`codex ${r.method}: could not answer ${decision.kind} (${(e as Error)?.message ?? String(e)}); declined instead`);
+    }
     this.requests.delete(requestId);
-    this.host.rpc.respond(r.rpcId, result);
+    this.host.rpc.respond(r.rpcId, answer.result);
     // The adapter cannot know who decided; the session layer, which called respond, can rewrite `by`.
-    this.emit({ t: 'request.resolved', requestId, decision, by: { kind: 'host' } }, { turnId: this.liveTurnId(r.turnId), audience: 'approval' });
-    if (interrupt && r.turnId) await this.interrupt(r.turnId);
+    const sent: Decision = unreadable ? { kind: 'deny', message: unreadable.message } : decision;
+    this.emit({ t: 'request.resolved', requestId, decision: sent, by: { kind: 'host' } }, { turnId: this.liveTurnId(r.turnId), audience: 'approval' });
+    if (unreadable) throw unreadable;
+    if (answer.interrupt && r.turnId) await this.interrupt(r.turnId);
   }
 
   async close(reason: string): Promise<void> {
@@ -452,7 +464,33 @@ export class CodexSession implements HarnessSession {
 
   // ---- inbound from app-server --------------------------------------------------
 
+  /**
+   * A notification never throws out of the mapping (HC-9): one whose shape this adapter does not
+   * expect (a newer codex) is recorded as `native` with a detail-level notice, and the session goes on.
+   */
   onNotification(method: string, params: unknown): void {
+    try {
+      this.mapNotification(method, params);
+    } catch (e) {
+      this.native(method, params, this.liveTurnId(this.active?.turnId));
+      this.emit(
+        { t: 'notice', code: 'other', message: `codex ${method} has a shape this adapter does not map (${(e as Error)?.message ?? String(e)}); recorded as native` },
+        { turnId: this.liveTurnId(this.active?.turnId), level: 'detail' },
+      );
+    }
+  }
+
+  /** Something on this connection that concerns every session on it (a server request without a thread), as `native`. */
+  recordNative(method: string, params: unknown): void {
+    this.native(method, params);
+  }
+
+  /** A notice from the adapter outside any turn (an unverified codex version, decision 17). */
+  notice(message: string): void {
+    this.emit({ t: 'notice', code: 'other', message }, { level: 'detail' });
+  }
+
+  private mapNotification(method: string, params: unknown): void {
     switch (method) {
       case 'turn/started': {
         const p = params as TurnStartedNotification;
@@ -580,6 +618,12 @@ export class CodexSession implements HarnessSession {
     }
   }
 
+  /**
+   * Every server request gets an answer (HC-9): one this adapter does not implement gets an error
+   * now; an approval becomes a request the session layer resolves, offering the decisions that map
+   * back (a newer field or variant is left out); one whose params cannot be read at all gets its
+   * decline, so the turn goes on.
+   */
   onServerRequest(id: RequestId, method: string, params: unknown): void {
     if (!isApprovalMethod(method)) {
       // Dynamic tools, auth refresh, attestation: this adapter registers none of them.
@@ -587,7 +631,13 @@ export class CodexSession implements HarnessSession {
       this.native(method, params);
       return;
     }
-    const p = params as { turnId?: string | null; itemId?: string };
+    if (this.closed) {
+      // Between close() and leaving the server: nothing would ever resolve it here.
+      this.host.rpc.respondError(id, -32603, `@agents-io/harness-codex cannot answer ${method}: the session is closed`);
+      return;
+    }
+    const raw = (params && typeof params === 'object' ? params : {}) as { turnId?: unknown; itemId?: unknown };
+    const p = { turnId: typeof raw.turnId === 'string' ? raw.turnId : undefined, itemId: typeof raw.itemId === 'string' ? raw.itemId : undefined };
     const requestId = String(id);
     const known = this.requests.get(requestId);
     if (known) {
@@ -603,10 +653,28 @@ export class CodexSession implements HarnessSession {
       return;
     }
     const t = p.turnId ? this.turnFor(p.turnId) : this.active;
+    let opened: ReturnType<typeof openedFor>;
+    try {
+      opened = openedFor(method, params, p.itemId ? this.fileItems.get(p.itemId) : undefined);
+    } catch (e) {
+      return this.declineUnreadable(id, method, params, t?.turnId, e);
+    }
     this.requests.set(requestId, { rpcId: id, method, params, turnId: t?.turnId });
     this.emit(
-      { t: 'request.opened', requestId, ...openedFor(method, params, p.itemId ? this.fileItems.get(p.itemId) : undefined) },
+      { t: 'request.opened', requestId, ...opened },
       { turnId: t?.turnId, itemId: p.itemId, audience: 'approval', native: { method, params } },
+    );
+  }
+
+  /** An approval whose params cannot be read: its decline (or an error where it has none), recorded as native with a notice. */
+  private declineUnreadable(id: RequestId, method: ApprovalMethod, params: unknown, turnId: string | undefined, e: unknown): void {
+    const decline = declineFor(method);
+    if (decline !== undefined) this.host.rpc.respond(id, decline);
+    else this.host.rpc.respondError(id, -32602, `@agents-io/harness-codex cannot read ${method}`);
+    this.native(method, params, turnId);
+    this.emit(
+      { t: 'notice', code: 'other', message: `codex ${method} could not be read (${(e as Error)?.message ?? String(e)}); ${decline !== undefined ? 'declined' : 'answered with an error'} so the turn goes on` },
+      { turnId, level: 'detail' },
     );
   }
 

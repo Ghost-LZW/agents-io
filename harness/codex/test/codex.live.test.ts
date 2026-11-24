@@ -12,11 +12,14 @@ const live = process.env.AGENTS_IO_LIVE_CODEX === '1';
 describe.skipIf(!live)('live codex app-server', () => {
   it('runs one turn with a no-approval profile and emits a conforming stream #HC-1', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'agents-io-codex-'));
-    const harness = new CodexHarness({ bin: process.env.CODEX_BIN ?? 'codex' });
+    const warnings: string[] = [];
+    const harness = new CodexHarness({ bin: process.env.CODEX_BIN ?? 'codex', log: (_level, msg) => warnings.push(msg) });
     try {
       const { version, caps } = await harness.probe();
-      // Whichever supported line CODEX_BIN is (0.160 or 0.171).
-      expect(SUPPORTED_CODEX_LINES).toContain(version.split('.').slice(0, 2).join('.'));
+      // A verified line (0.160 or 0.171) runs silently; a newer codex runs with one warning (decision 17).
+      const verified = (SUPPORTED_CODEX_LINES as readonly string[]).includes(version.split('.').slice(0, 2).join('.'));
+      console.log(`live codex ${version} (${verified ? 'verified' : 'unverified'})${warnings.length ? `: ${warnings.join(' | ')}` : ''}`);
+      expect(warnings).toHaveLength(verified ? 0 : 1);
       expect(caps.steer).toBe('native');
 
       const s = await harness.open({
@@ -46,6 +49,9 @@ describe.skipIf(!live)('live codex app-server', () => {
       await s.close('test done');
 
       assertConformingStream(events, { turnInputs: { LT1: ['live-1'] } });
+      const versionNotices = events.filter((e) => e.body.t === 'notice' && /has not been verified/.test(e.body.message));
+      expect(versionNotices).toHaveLength(verified ? 0 : 1);
+      expect(warnings).toHaveLength(verified ? 0 : 1); // not again for the session's connection
       const completed = events.find((e) => e.body.t === 'turn.completed')!.body;
       expect(completed).toMatchObject({ status: 'completed' });
       expect(events.some((e) => e.body.t === 'input.consumed')).toBe(true);
