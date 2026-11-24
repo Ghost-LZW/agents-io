@@ -2618,8 +2618,9 @@ ${a.summary}` }],
   /** A topic was parked: its lane idles out; the one now current keeps its lane. */
   private topicChanged(c: TopicChange): void {
     // A new topic of a launched conversation keeps its launch. Synchronous on purpose:
-    // TopicRegistry.create calls this after its commit and before it returns, so the
-    // launch is pinned before the caller (handOver, `/new`) opens the new topic's lane.
+    // TopicRegistry.create calls this after its write and before it returns, so the
+    // launch is pinned before the caller (handOver, `/new`) opens the new topic's lane;
+    // inside a batch (a topic.switch with an op id) the pin commits or rolls back with it.
     if (c.created && c.from) {
       const launch = this.records.launchOf(c.from.sessionKey);
       if (launch && this.records.agentOf(c.to.sessionKey) === undefined && !this.records.launchOf(c.to.sessionKey)) {
@@ -2630,10 +2631,14 @@ ${a.summary}` }],
         }
       }
     }
-    const t = this.parkedTimers.get(c.to.sessionKey);
-    if (t) clearTimeout(t);
-    this.parkedTimers.delete(c.to.sessionKey);
-    if (c.from && c.from.sessionKey !== c.to.sessionKey && this.lanes.has(c.from.sessionKey)) this.idleOut(c.from.sessionKey);
+    // The lanes follow the change once it has committed: a topic.switch with an op id whose answer
+    // cannot be kept rolls the change back (its batch), and the topic current before keeps its lane.
+    this.hub.afterCommit(() => {
+      const t = this.parkedTimers.get(c.to.sessionKey);
+      if (t) clearTimeout(t);
+      this.parkedTimers.delete(c.to.sessionKey);
+      if (c.from && c.from.sessionKey !== c.to.sessionKey && this.lanes.has(c.from.sessionKey)) this.idleOut(c.from.sessionKey);
+    });
   }
 
   /**

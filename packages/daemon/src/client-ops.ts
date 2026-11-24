@@ -19,8 +19,10 @@ import type { Outcome } from './gateway.js';
  * acts, so a retry after a crash in between acts on that turn (or on none), never on the next one.
  *
  * A receipt that cannot be written rolls back the event it was kept with (the command did not act
- * then), and the command fails (`internal`); a steered input is the one exception: the harness has
- * it already, so the lane admits it all the same (`Lane.trySteer`) and only the answer is lost.
+ * then), what memory went with it too (the lane forgets the input, `Lane.admitting`; no topic or
+ * watch is live: `Hub.onRollback` / `afterCommit`, `WatchRegistry.putWithin`), and the command fails
+ * (`internal`); a steered input is the one exception: the harness has it already, so the lane admits
+ * it all the same (`Lane.trySteer`) and only the answer is lost.
  */
 
 /** What the receipt names: the command type for a `command` frame, else the frame type. */
@@ -92,7 +94,11 @@ export class Op {
     this.wrote = true;
   }
 
-  /** `fn`'s writes and the answer to what it returned commit together (`Hub.batch`). */
+  /**
+   * `fn`'s writes and the answer to what it returned commit together (`Hub.batch`); what `fn`
+   * changes in memory is put back when they roll back (`Hub.onRollback`), or waits for the commit
+   * (`Hub.afterCommit`).
+   */
   commit<T>(fn: () => T, answer: (v: T) => { outcome: Outcome; seq?: number }): T {
     return this.o.hub.batch(() => {
       const v = fn();

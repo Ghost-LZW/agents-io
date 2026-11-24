@@ -312,12 +312,13 @@ An `interrupt` without `turnId` keeps the turn it resolved the first time before
 acts on that turn only (`stale_turn` once it ended), never on a later one. `stopped` and `internal`
 answers are not kept. When the receipt itself cannot be written, the command answers `internal` and
 the events kept with it roll back (the input is not admitted, the queue not cleared, no topic or
-watch made); a `steer` input is the exception: the harness has it already, so it stays admitted
-(its turn settles it) and the retry, with no answer to get back, acts again (a duplicate when the
-input carries its own `inputId`). Receipts are never deleted. Frames without `opId` are unchanged;
-on other frames and commands `opId` is an unknown field. `host.hello` lists the feature;
-`LocalClient.exchange` sends a frame and returns its whole result frame. Spec: `docs/HOSTS.md` §4.7,
-INVARIANTS PR-3.
+watch made, in the daemon's memory either), and a retry acts once (an input with its own `inputId`
+is admitted then, not answered `duplicate`); a `steer` input is the exception: the harness has it
+already, so it stays admitted (its turn settles it) and the retry, with no answer to get back, acts
+again (a duplicate when the input carries its own `inputId`). Receipts are never deleted. Frames
+without `opId` are unchanged; on other frames and commands `opId` is an unknown field. `host.hello`
+lists the feature; `LocalClient.exchange` sends a frame and returns its whole result frame. Spec:
+`docs/HOSTS.md` §4.7, INVARIANTS PR-3.
 
 ## Console API (for web UIs)
 

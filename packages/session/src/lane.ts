@@ -175,9 +175,10 @@ export interface CommandHooks {
    * Called once, inside the transaction (`Hub.batch`) of the event that decides the command, with
    * what the command then answers: an input's `input.admitted` (or its `input.rejected` when a
    * policy hook threw), an interrupt's `input.cancelled`. A throw rolls the event back and fails the
-   * command; but a steered input, which the harness already has, is admitted all the same (without
-   * the answer) before the command fails. Not called when the command writes no such event (a
-   * duplicate, a refusal).
+   * command, and the lane forgets an input it did not admit (the same one again is admitted then,
+   * `admitting`); but a steered input, which the harness already has, is admitted all the same
+   * (without the answer) before the command fails. Not called when the command writes no such event
+   * (a duplicate, a refusal).
    */
   decided?(r: CommandResult, e: SessionEvent): void;
   /**
@@ -523,7 +524,7 @@ export class Lane {
   private guarded(input: InputRecord, trip: LoopGuardTrip, decided?: CommandHooks['decided']): CommandResult {
     const t = { ...trip, sessionKey: this.sessionKey };
     const record: InputRecord = { ...input, replyRoute: input.replyRoute, channelContext: { ...input.channelContext, loopGuard: trip.tripped } };
-    this.recordContext(record, decided);
+    this.admitting(input, () => this.recordContext(record, decided));
     this.emit({ level: 'primary', visibility: 'operators', body: { t: 'notice', code: 'loop_guard', message: loopGuardMessage(trip, input.inputId) } });
     this.indexCause(record);
     try {
@@ -1065,7 +1066,7 @@ export class Lane {
       }
       if (allowed) {
         // Queued once its admission is written (with `decided`, it may roll back).
-        this.decide({ body: { t: 'input.admitted', inputId: input.inputId, disposition: 'queued', ...pid(input), input } }, { ok: true, disposition: 'queued' }, decided);
+        this.admitting(input, () => this.decide({ body: { t: 'input.admitted', inputId: input.inputId, disposition: 'queued', ...pid(input), input } }, { ok: true, disposition: 'queued' }, decided));
         this.queue.unshift({ input, attempts: 0 });
         await this.interruptTurn(t);
         return { ok: true, disposition: 'queued' };
@@ -1086,11 +1087,26 @@ export class Lane {
     return r;
   }
 
+  /**
+   * Write the admission of `input`, which `input` / `compact` remembered (`known`) beforehand: when
+   * the write rolls back (with `decided`, its answer could not be kept, PR-3) the input is forgotten
+   * too, so the same input again is admitted then, never answered `duplicate`. Not a steer: the
+   * harness has that input whatever becomes of its answer (`trySteer`).
+   */
+  private admitting<T>(input: InputRecord, write: () => T): T {
+    try {
+      return write();
+    } catch (err) {
+      this.known.delete(input.inputId);
+      throw err;
+    }
+  }
+
   private async enqueue(input: InputRecord, decided?: CommandHooks['decided']): Promise<CommandResult> {
     const idle = !this.turn && this.queue.length === 0;
     const disposition = idle ? 'new_turn' : 'queued';
     // Queued once its admission is written (with `decided`, it may roll back).
-    this.decide({ body: { t: 'input.admitted', inputId: input.inputId, disposition, ...pid(input), input } }, { ok: true, disposition }, decided);
+    this.admitting(input, () => this.decide({ body: { t: 'input.admitted', inputId: input.inputId, disposition, ...pid(input), input } }, { ok: true, disposition }, decided));
     this.queue.push({ input, attempts: 0 });
     if (idle) await this.pump();
     return { ok: true, disposition };

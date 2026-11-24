@@ -1129,4 +1129,68 @@ describe('Lane: command hooks (op ids)', () => {
     expect(bodies(events(), 'notice')).toMatchObject([{ code: 'loop_guard' }]);
     expect(bodies(events(), 'turn.started')).toEqual([]);
   });
+
+  it('a queued input whose answer cannot be kept is neither admitted nor remembered: the same input again is admitted once and runs once, never answered duplicate #PR-3 #IN-1', async () => {
+    const { lane, events, calls, hooks } = hooked();
+    const q = input('hi', { id: 'q' });
+    await expect(lane.command({ type: 'input', sessionKey: 's1', input: q, mode: 'queue' }, hooks)).rejects.toThrow('disk I/O error');
+    expect(bodies(events())).toEqual([]);
+    expect(lane.queued()).toEqual([]);
+    expect(lane.dispatched()).toBe(false);
+    expect(await lane.command({ type: 'input', sessionKey: 's1', input: q, mode: 'queue' }, hooks)).toEqual({ ok: true, disposition: 'new_turn' });
+    expect(calls).toEqual([{ ok: true, disposition: 'new_turn' }, { ok: true, disposition: 'new_turn' }]);
+    await until(() => bodies(events(), 'turn.completed').length === 1);
+    await lane.whenIdle();
+    expect(admittedOf(events(), 'q')).toEqual(['new_turn']);
+    expect(turnsOf(events())).toEqual([['q']]);
+    expect(terminalOf(events(), 'q').map((b) => b.t)).toEqual(['input.consumed']);
+    // Admitted now: the same input again is a duplicate.
+    expect(await lane.command({ type: 'input', sessionKey: 's1', input: q, mode: 'queue' }, hooks)).toEqual({ ok: true, disposition: 'duplicate' });
+    expect(turnsOf(events())).toEqual([['q']]);
+  });
+
+  it('an interrupt-mode input whose answer cannot be kept stops nothing and is not remembered: the same input again stops the turn once and runs next #PR-3 #IN-1', async () => {
+    let first = true;
+    const { lane, events, calls, hooks } = hooked({
+      harness: new FakeHarness(async (t) => {
+        if (!first) return;
+        first = false;
+        await new Promise((_, reject) => t.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
+      }),
+    });
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('a', { id: 'a' }), mode: 'queue' });
+    await until(() => bodies(events(), 'turn.started').length === 1);
+    const stop = input('stop', { id: 'i' });
+    await expect(lane.command({ type: 'input', sessionKey: 's1', input: stop, mode: 'interrupt' }, hooks)).rejects.toThrow('disk I/O error');
+    expect(admittedOf(events(), 'i')).toEqual([]);
+    expect(lane.queued()).toEqual([]);
+    expect(bodies(events(), 'turn.completed')).toEqual([]);
+    expect(await lane.command({ type: 'input', sessionKey: 's1', input: stop, mode: 'interrupt' }, hooks)).toEqual({ ok: true, disposition: 'queued' });
+    expect(calls).toEqual([{ ok: true, disposition: 'queued' }, { ok: true, disposition: 'queued' }]);
+    await until(() => bodies(events(), 'turn.completed').length === 2);
+    await lane.whenIdle();
+    expect(turnsOf(events())).toEqual([['a'], ['i']]);
+    expect(bodies(events(), 'turn.completed').map((b) => (b as BodyOf<'turn.completed'>).status)).toEqual(['interrupted', 'completed']);
+    expect(admittedOf(events(), 'i')).toEqual(['queued']);
+    expect(terminalOf(events(), 'i').map((b) => b.t)).toEqual(['input.consumed']);
+  });
+
+  it('an input the loop guard stops whose answer cannot be kept is not remembered either: the same input again is recorded once with its notice, never answered duplicate #PR-3', async () => {
+    const { lane, events, calls, hooks } = hooked({ loopGuard: { maxHops: 3 } });
+    const g: InputRecord = {
+      ...input('ping', { id: 'g1' }),
+      origin: { ...origin('agent:writer', ['agent'], 'agent'), evidence: 'daemon', via: 'agent:writer:writer:main', adapter: 'agent' },
+      cause: { peer: 'writer/writer:main', basis: 'internal', hop: 9, chain: 'in_root' },
+    };
+    await expect(lane.command({ type: 'input', sessionKey: 's1', input: g, mode: 'queue' }, hooks)).rejects.toThrow('disk I/O error');
+    expect(bodies(events())).toEqual([]);
+    expect(await lane.command({ type: 'input', sessionKey: 's1', input: g, mode: 'queue' }, hooks)).toEqual({ ok: true, disposition: 'observe_only' });
+    expect(calls).toEqual([{ ok: true, disposition: 'observe_only' }, { ok: true, disposition: 'observe_only' }]);
+    expect(admittedOf(events(), 'g1')).toEqual(['observe_only']);
+    expect(bodies(events(), 'notice')).toMatchObject([{ code: 'loop_guard' }]);
+    expect(lane.pendingContext().map((i) => i.inputId)).toEqual(['g1']);
+    expect(await lane.command({ type: 'input', sessionKey: 's1', input: g, mode: 'queue' }, hooks)).toEqual({ ok: true, disposition: 'duplicate' });
+    expect(bodies(events(), 'notice')).toHaveLength(1);
+    expect(bodies(events(), 'turn.started')).toEqual([]);
+  });
 });

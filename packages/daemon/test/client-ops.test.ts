@@ -25,6 +25,21 @@ const bodies = (evs: SessionEvent[], t: string) => evs.filter((e) => e.body.t ==
 /** The answer without its frame id (a retry has its own). */
 const answer = ({ id: _id, ...rest }: ClientResultFrame) => rest;
 const turnOf = (w: World, key: string) => w.gw.sessions().find((s) => s.sessionKey === key)?.turnId;
+/** `records.putOp` fails (a write error) on its next call; `again()` makes the one after that fail too. */
+const failingReceipts = (w: World) => {
+  const records = w.gw.records;
+  const put = records.putOp.bind(records);
+  let failing = true;
+  records.putOp = (r: OpReceipt) => {
+    if (failing) {
+      failing = false;
+      throw new Error('disk I/O error');
+    }
+    put(r);
+  };
+  return { again: () => void (failing = true) };
+};
+const lost = { ok: false, error: { code: 'internal', message: 'disk I/O error' } };
 const completed = (w: World, key: string, turnId: string) => bodies(log(w, key), 'turn.completed').find((b) => b.turnId === turnId);
 
 describe('client op ids (client.opId)', () => {
@@ -348,5 +363,99 @@ describe('client op ids (client.opId)', () => {
     expect(added.seq).toBeUndefined();
     expect(answer(await c.exchange({ type: 'watch.add', opId: 'op-w', watch: draft }))).toEqual({ ...answer(added), replayed: true });
     expect(await c.watchList('s')).toEqual([added.value]);
+  });
+  it('a queued input with its own inputId whose answer cannot be kept is not admitted, and not remembered either: the retry with the same op id admits it once, never answered duplicate #PR-3 #IN-1', async () => {
+    const w = await daemon({ script });
+    const c = await w.client();
+    failingReceipts(w);
+    const frame = { type: 'command', opId: 'op-q', command: { type: 'input', sessionKey: 's', mode: 'queue', input: { inputId: 'in-q', content: [{ type: 'text', text: 'hi' }] } } };
+    expect(await c.exchange(frame)).toMatchObject({ ...lost, opId: 'op-q' });
+    expect(bodies(log(w, 's'), 'input.admitted')).toEqual([]);
+    expect(w.gw.records.getOp('me', 'op-q')).toBeUndefined();
+
+    const again = await c.exchange(frame);
+    expect(again).toMatchObject({ ok: true, opId: 'op-q', value: { inputId: 'in-q', disposition: 'new_turn' } });
+    expect(again.replayed).toBeUndefined();
+    await until(() => bodies(log(w, 's'), 'turn.completed').length === 1);
+    expect(bodies(log(w, 's'), 'input.admitted').map((b) => b.inputId)).toEqual(['in-q']);
+    expect(bodies(log(w, 's'), 'turn.started').map((b) => b.inputIds)).toEqual([['in-q']]);
+    const settled = log(w, 's').filter((e) => ['input.consumed', 'input.rejected', 'input.cancelled'].includes(e.body.t));
+    expect(settled.map((e) => e.body.t)).toEqual(['input.consumed']);
+    expect(answer(await c.exchange(frame))).toEqual({ ...answer(again), replayed: true });
+    expect(w.gw.records.getOp('me', 'op-q')).toMatchObject({ status: 'ok', result: { value: { inputId: 'in-q', disposition: 'new_turn' } } });
+  });
+
+  it('a watch.add whose answer cannot be kept makes no watch, in memory either: nothing is routed by it, and the retry adds one watch that routes each message once #PR-3', async () => {
+    const w = await daemon({ script });
+    const c = await w.client();
+    failingReceipts(w);
+    const add = { type: 'watch.add', opId: 'op-w', watch: { source: { channel: 'fake', conversation: 'g1' }, target: { sessionKey: 's' }, mode: 'context' } };
+    expect(await c.exchange(add)).toMatchObject({ ...lost, opId: 'op-w' });
+    expect(await c.watchList()).toEqual([]);
+    expect(w.gw.listWatches()).toEqual([]);
+    const eve = { channelUserId: 'eve', evidence: 'platform_signed' as const };
+    const group = { id: 'g1', kind: 'group' as const };
+    await w.chat.inject({ sender: eve, conversation: group, text: 'before' });
+
+    const added = await c.exchange(add);
+    expect(added).toMatchObject({ ok: true, opId: 'op-w', value: { id: expect.any(String), createdBy: 'me' } });
+    expect(added.replayed).toBeUndefined();
+    expect(await c.watchList()).toEqual([added.value]);
+    await w.chat.inject({ sender: eve, conversation: group, text: 'after' });
+    const seen = () => bodies(log(w, 's'), 'input.admitted').map((b) => textOf([b.input as never]));
+    await until(() => seen().length === 1);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(seen()).toEqual(['after']);
+    expect(answer(await c.exchange(add))).toEqual({ ...answer(added), replayed: true });
+    await w.stop();
+    // The database agrees: one watch after a restart.
+    const w2 = await daemon({ dir: w.dir, script });
+    expect(await (await w2.client()).watchList()).toEqual([added.value]);
+  });
+
+  it('a topic.switch whose answer cannot be kept changes no topic, in memory either: the topic current before stays current and keeps its lane, and the retry switches once #PR-3', async () => {
+    const w = await daemon({ script, raw: { topics: { parkedIdleMs: 20 } } });
+    const conv = 'fake:default:c1';
+    await w.chat.inject({ sender: { channelUserId: 'alice', evidence: 'platform_signed' }, text: 'hello' });
+    await until(() => bodies(log(w, conv), 'turn.completed').length === 1);
+    const live = (key: string) => w.gw.sessions().find((s) => s.sessionKey === key)?.live;
+    const c = await w.client();
+    const before = await c.topicList({ conversation: conv });
+    expect(before).toMatchObject([{ sessionKey: conv, state: 'current' }]);
+    const changes = bodies(log(w, conv), 'topic.changed');
+    const fail = failingReceipts(w);
+    const plans = { type: 'topic.switch', opId: 'op-new', conversation: conv, new: { title: 'Plans' } };
+    expect(await c.exchange(plans)).toMatchObject({ ...lost, opId: 'op-new' });
+    expect(await c.topicList({ conversation: conv })).toEqual(before);
+    expect(bodies(log(w, conv), 'topic.changed')).toEqual(changes);
+    // Not parked, so its lane does not idle out.
+    await new Promise((r) => setTimeout(r, 60));
+    expect(live(conv)).toBe(true);
+
+    const made = await c.exchange(plans);
+    expect(made).toMatchObject({ ok: true, opId: 'op-new', value: { created: true, topic: { title: 'Plans', state: 'current' }, previous: { sessionKey: conv, state: 'parked' } } });
+    expect(made.replayed).toBeUndefined();
+    const parked = await c.topicList({ conversation: conv });
+    expect(parked).toHaveLength(2);
+    await until(() => live(conv) === false);
+
+    // Back to the first topic, an existing one: Plans stays current when the answer cannot be kept.
+    fail.again();
+    const back = { type: 'topic.switch', opId: 'op-back', conversation: conv, topicId: before[0]!.id };
+    expect(await c.exchange(back)).toMatchObject({ ...lost, opId: 'op-back' });
+    expect(await c.topicList({ conversation: conv })).toEqual(parked);
+    const switched = await c.exchange(back);
+    expect(switched).toMatchObject({ ok: true, opId: 'op-back', value: { created: false, topic: { id: before[0]!.id, state: 'current' } } });
+    expect(answer(await c.exchange(back))).toEqual({ ...answer(switched), replayed: true });
+    expect(answer(await c.exchange(plans))).toEqual({ ...answer(made), replayed: true });
+    const after = await c.topicList({ conversation: conv });
+    expect(after.map((t) => [t.title ?? null, t.state])).toEqual([
+      [before[0]!.title ?? null, 'current'],
+      ['Plans', 'parked'],
+    ]);
+    await w.stop();
+    // The database agrees with what memory showed.
+    const w2 = await daemon({ dir: w.dir, script });
+    expect(await (await w2.client()).topicList({ conversation: conv })).toEqual(after);
   });
 });
