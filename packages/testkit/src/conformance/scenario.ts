@@ -374,6 +374,13 @@ class Run {
     private readonly o: RunScenarioOptions,
   ) {
     this.timeoutMs = s.header.timeoutMs ?? o.timeoutMs ?? 5000;
+    // Every log a line names is read from the first item any end observes on (`poll`), not from the
+    // first line that names it: an event is stamped before what was observed after it, so `after` and
+    // `until` see the log's events in the order they were written, whatever lines come earlier.
+    for (const { step } of s.steps) {
+      if ('expect' in step && step.expect.end === 'log') this.stream(`log:${step.expect.session ?? 's'}`);
+      else if ('emit' in step && step.emit.end === 'log') this.stream(`log:${step.emit.session ?? 's'}`);
+    }
   }
 
   private fail(msg: string): never {
@@ -393,7 +400,7 @@ class Run {
     this.o.trace?.(name, value);
   }
 
-  /** Reads the logs of every session an expectation named so far. */
+  /** Reads the logs of every session a line names (`log` end), stamping what is new in them. */
   private poll(): void {
     if (!this.kernel) return;
     for (const [name, st] of this.streams) {
@@ -478,6 +485,8 @@ class Run {
       const k = await this.ensureKernel();
       if (!k.append) this.fail('the kernel does not take log events (emit end log)');
       k.append(e.session ?? 's', frame);
+      // Stamped now, before what another session's log gets next.
+      this.poll();
       return;
     }
     if (e.end === 'channel') {

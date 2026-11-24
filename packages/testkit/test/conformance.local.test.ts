@@ -231,6 +231,37 @@ describe('scenarios', () => {
     await expect(runScenario(next, logDriver(), { settleMs: 0 })).rejects.toThrow('x:4: expected at log:s (next)');
   });
 
+  /** A kernel with a log and the reference channel: a message emitted at the channel end is in the log (`admitted`) before its answer. */
+  const channelDriver = (): ScenarioDriver => ({
+    start: async ({ channel }) => {
+      const logs = new Map<string, unknown[]>();
+      const ac = new AbortController();
+      const emit = async (env: { id: string }) => {
+        const log = logs.get('s') ?? [];
+        logs.set('s', [...log, { ts: 1, body: { t: 'admitted', id: env.id }, seq: log.length + 1 }]);
+        return { accepted: true, inputId: env.id };
+      };
+      void channel.start({ account: 'default', config: {}, signal: ac.signal, emit, log: () => {} });
+      return { log: (k) => logs.get(k) ?? [], stop: async () => ac.abort() };
+    },
+  });
+
+  it('run: after orders items across ends, the log end too: every log a line names is read whenever any end observes an item, from the start', async () => {
+    const msg = (id: string) => ({ emit: { end: 'channel', frame: { type: 'inbound', envelope: { id, text: id } } } });
+    const answer = (id: string, more: Record<string, unknown> = {}) => ({ expect: { end: 'channel', ...more, match: { type: 'result', ok: true, value: { inputId: id } } } });
+    const o = { settleMs: 0, timeoutMs: 1000 };
+    // m1 is in the log before r1 (its answer), m2 after it: the first admission after r1 is m2's, though no line named the log before.
+    const logAfter = S([h, msg('m1'), answer('m1', { label: 'r1' }), msg('m2'), answer('m2'), { expect: { end: 'log', after: 'r1', match: { body: { t: 'admitted', id: '<$which>' } } } }]);
+    expect((await runScenario(logAfter, channelDriver(), o)).bindings.get('which')).toBe('m2');
+    // Both admissions were before `later` (m2's answer): none is after it, with or without an earlier line naming the log.
+    const lines = [msg('m1'), answer('m1'), msg('m2'), answer('m2', { label: 'later' }), { expect: { end: 'log', after: 'later', timeoutMs: 50, match: { body: { t: 'admitted' } } } }];
+    await expect(runScenario(S([h, ...lines]), channelDriver(), o)).rejects.toThrow('x:6: expected at log:s after later: {"body":{"t":"admitted"}}');
+    await expect(runScenario(S([h, { expect: { end: 'log', none: { body: { t: 'no-such-event' } } } }, ...lines]), channelDriver(), o)).rejects.toThrow('x:7: expected at log:s after later');
+    // And the other way: the answer observed after m2's admission is m2's.
+    const channelAfter = S([h, msg('m1'), msg('m2'), { expect: { end: 'log', label: 'a2', match: { body: { id: 'm2' } } } }, { expect: { end: 'channel', after: 'a2', match: { type: 'result', value: { inputId: '<$answered>' } } } }]);
+    expect((await runScenario(channelAfter, channelDriver(), o)).bindings.get('answered')).toBe('m2');
+  });
+
   it('the conformance data: every scenario and transcript parses; every transcript a scenario plays is there; the kernel and attention directories have scenarios', () => {
     const walk = (d: string): string[] => readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(join(d, e.name)) : e.name.endsWith('.ndjson') ? [join(d, e.name)] : []));
     const scenarios = walk(join(CONFORMANCE, 'scenarios'));
