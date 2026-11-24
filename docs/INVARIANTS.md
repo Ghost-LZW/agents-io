@@ -1068,10 +1068,13 @@
 
 ### SC-1 每个到点只触发一次，跨重启
 
-- **承诺**：一条定时任务的每个到点 `(id, scheduledAt)` 至多产生一次投递：`turn` 是一条输入 id 为 `schedule:<id>:<scheduledAt>` 的输入，`message` 是一次 operationId 相同的发送（DL-2），`host` 是宿主入站队列里一条 `channelRef` 相同的条目（HQ-2）。投递前先记待定标记，投递后在同一个 savepoint 里删标记、推进下次时刻；进程死在中间，下次启动按标记以同一个 id 重做，会话（`duplicate`）、outbox、队列各自去重。一次性的（`at`）触发后删除，过了 `until` 的不再触发。
+- **承诺**：一条定时任务的每个到点 `(id, scheduledAt)` 至多产生一次投递：`turn` 是一条输入 id 为 `schedule:<id>:<scheduledAt>` 的输入，`message` 是一次 operationId 相同的发送（DL-2），`host` 是宿主入站队列里一条 `channelRef` 相同的条目（HQ-2）。投递前先记待定标记，投递后在同一个 savepoint 里删标记、推进下次时刻；进程死在中间，下次启动按标记以同一个 id 重做，会话（`duplicate`）、outbox、队列各自去重。一次性的（`at`）触发后删除，过了 `until` 的不再触发。投递失败的到点：失败是最终的（抛出的错误带 `final: true`：宿主扣下或拒绝、路由已不在外部客户端的 scope 里、没有运行中的通道、通道拒收）时这个到点就此结束，记为失败（定时任务的日志 `schedule:<id>` 里一条 `notice`），排到下一个到点（一次性的删除），不再尝试；别的失败留着标记，本进程里隔一段逐次加倍的时间（10 s 起，至多 15 min）以同一个 id 再试，下次启动照样重做，从不立刻重试。守护进程停止时定时任务先于功能模块停下，停止期间不再触发。
 - **实现**：`packages/session/src/schedule.ts` `ScheduleRegistry`（`schedules`、`schedule_firing` 两张表，与会话日志同一个 SQLite 文件）`begin` / `end` / `pending`，`ScheduleDispatcher` `fireOnce` / `deliver` / `start`；`packages/daemon/src/gateway.ts` `sendScheduled`（功能模块的客户端设的先交给模块：`packages/daemon/src/modules.ts` `ModuleHost.scheduledMessage`，模块停止期间抛错、这次到点下次启动重做）、`scheduledToHost`。定时任务的机制在内核（与监听同形），给 agent 的 `schedule_*` 工具是内建工具模块 `tools.schedules`（SC-3）。
 - **测试**：标签 `#SC-1`；`packages/session/test/schedule.test.ts` "fires a turn into the session at its time, once, then moves to the next time #SC-1"、"a firing cut off before it was settled is redone with the same input id, and the session keeps one #SC-1"；`packages/daemon/test/schedules.test.ts` "fire a turn in their session at their time; their next time survives a restart #SC-1"。
-- **状态**：有测试。
+- **状态**：部分覆盖（失败的到点两条不成立）。
+- **不成立**（2026-11-24，core-slimming 合并评审发现；第 1 条 origin/main `b9b35ed` 上同样）：
+  1. 投递失败的到点留着标记和下次时刻，计时器立刻（0 ms）再排（`ScheduleDispatcher.fireOnce` / `arm`）：同一个到点忙着重试，每次一条 warn（约每秒 500 次）。永远不会成功的（宿主扣下或拒绝的发送，重做时拿到已结算的 `held` / `rejected` 又抛错；外部客户端的 scope 收窄了；通道没了；通道拒收）一直转到守护进程停止。`packages/session/test/schedule.test.ts` "a firing that fails is tried again later, after a delay that grows, never at once …"、"a firing that fails for good (an error with final: true) is over …"，`packages/daemon/test/external-mcp.test.ts` "a client's message schedule whose route its scope no longer has fails once as it fires and is over …"（都是 `it.fails`）。
+  2. 守护进程停止时先停模块（`modules.stop()`）、后停定时任务（`schedules.stop()`）：其间 `ModuleHost.scheduledMessage` 对每个 `message` 定时任务抛错，这时到点的按第 1 条忙转（合并带来的）。`packages/daemon/test/schedules.test.ts` "a schedule due while the daemon stops is not fired then (the schedules stop before the modules) …"（`it.fails`）。
 
 ### SC-2 停机期间错过的按 `missed` 处理，至多补一次
 

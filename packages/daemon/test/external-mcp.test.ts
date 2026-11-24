@@ -440,6 +440,30 @@ describe('external schedules', () => {
     expect(sent.route.conversationId).toBe('dm-alice');
     expect(w.gw.schedules.registry.get('timer:hello')).toBeUndefined();
   });
+
+  // INVARIANTS SC-1 不成立 (2026-11-24): the firing throws, keeps its time, and is redone at once: about 500 tries a second, each logged.
+  it.fails("a client's message schedule whose route its scope no longer has fails once as it fires and is over: recorded in the schedule's log, not tried again, nothing sent #SC-1 #SC-3", async () => {
+    const dir = tmp();
+    const f = tokenFiles(dir);
+    const raw = (scope: string) => ({ externalMcp: { listen: '127.0.0.1:0', clients: { timer: { tokenFile: f.ops, scopes: [scope] } } } });
+    const w = await daemon({ dir, raw: raw('schedule:fake:default:*') });
+    const timer = await mcp(w.gw.adminStatus().externalMcp!.url, TOKENS.ops);
+    const added = await call(timer, 'schedule_add', { id: 'hello', when: { at: Date.now() + 600 }, route: 'fake:default:dm-alice', text: 'good morning' });
+    expect(added.isError).toBe(false);
+    await timer.close();
+    await w.stop();
+    // The owner narrows the client's scope; the daemon starts again before the time.
+    const logs: string[] = [];
+    const again = await daemon({ dir, raw: raw('schedule:fake:default:other'), gateway: { logger: (_level, msg) => logs.push(msg) } });
+    await until(() => again.gw.schedules.registry.get('timer:hello') === undefined, 3000);
+    await new Promise((r) => setTimeout(r, 500));
+    const failures = logs.filter((m) => m.includes('schedule timer:hello'));
+    expect(failures).toEqual([expect.stringMatching(/no longer in timer's schedule scope/)]);
+    const notes = again.gw.hub.log.read('schedule:timer:hello', 0).filter((e) => e.body.t === 'notice');
+    expect(notes.map((e) => (e.body as { message: string }).message)).toEqual([expect.stringMatching(/not delivered, not tried again: route fake:default:dm-alice is no longer in timer's schedule scope/)]);
+    expect(again.gw.schedules.registry.pending()).toEqual([]);
+    expect(again.chat.sent).toEqual([]);
+  });
 });
 
 describe('external wake schedules', () => {

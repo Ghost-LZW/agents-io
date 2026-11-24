@@ -131,6 +131,96 @@ describe('schedules', () => {
     w.log.close();
   });
 
+  // INVARIANTS SC-1 不成立 (2026-11-24): a failed firing keeps its time, and the timer re-arms at once: it is retried in a busy loop.
+  it.fails('a firing that fails is tried again later, after a delay that grows, never at once; each try is the same firing (its operation id) #SC-1', async () => {
+    const now = { t: T0 };
+    const w = world(now);
+    const tried: string[] = [];
+    const errors: string[] = [];
+    let failing = 3;
+    const d = new ScheduleDispatcher({
+      registry: w.registry,
+      now: () => now.t,
+      lanes: () => {
+        throw new Error('no turns here');
+      },
+      send: async (_s, op) => {
+        tried.push(op);
+        if (failing-- > 0) throw new Error('not now');
+      },
+      retry: { minMs: 10_000, maxMs: 30_000 },
+      onError: (e) => errors.push((e as Error).message),
+    });
+    w.registry.put({ id: 'ping', when: { everyMinutes: 30 }, action: 'message', route: { channel: 'fake', account: 'default', conversationId: 'c1' }, text: 'still here' }, 'config');
+    d.start();
+    await d.idle();
+    const at = T0 + 30 * 60_000;
+    const after = async (ms: number) => {
+      now.t = at + ms;
+      await d.tick();
+      return tried.length;
+    };
+    expect(await after(0)).toBe(1);
+    expect(await after(0)).toBe(1); // not again at once
+    expect(await after(9_999)).toBe(1);
+    expect(await after(10_000)).toBe(2); // the first wait: 10 s
+    expect(await after(29_999)).toBe(2);
+    expect(await after(30_000)).toBe(3); // then 20 s
+    expect(await after(59_999)).toBe(3);
+    expect(await after(60_000)).toBe(4); // then 30 s (the cap), and it went out
+    expect(await after(600_000)).toBe(4);
+    expect(tried).toEqual(Array(4).fill(`schedule:ping:${at}`));
+    expect(errors).toEqual(['not now', 'not now', 'not now']);
+    // Delivered: the marker is gone, the schedule moved on from the time it was due.
+    expect(w.registry.pending()).toEqual([]);
+    expect(w.registry.get('ping')?.nextAt).toBe(at + 30 * 60_000);
+    d.stop();
+    w.log.close();
+  });
+
+  // INVARIANTS SC-1 不成立 (2026-11-24): a firing that can never succeed (held, denied, out of scope, no channel) is retried forever.
+  it.fails('a firing that fails for good (an error with final: true) is over: recorded as failed, not tried again; the schedule moves to its next time, a one-shot is gone #SC-1', async () => {
+    const now = { t: T0 };
+    const w = world(now);
+    const tried: string[] = [];
+    const failed: string[] = [];
+    const errors: unknown[] = [];
+    const d = new ScheduleDispatcher({
+      registry: w.registry,
+      now: () => now.t,
+      lanes: () => {
+        throw new Error('no turns here');
+      },
+      send: async (_s, op) => {
+        tried.push(op);
+        throw Object.assign(new Error('held by the host'), { final: true });
+      },
+      onFailed: (s, scheduledAt, e) => failed.push(`${s.id}@${scheduledAt}: ${(e as Error).message}`),
+      onError: (e) => errors.push(e),
+    });
+    const route = { channel: 'fake', account: 'default', conversationId: 'c1' };
+    w.registry.put({ id: 'hourly', when: { cron: '0 * * * *' }, action: 'message', route, text: 'tick' }, 'config');
+    w.registry.put({ id: 'once', when: { at: T0 + 60_000 }, action: 'message', route, text: 'just once' }, 'config');
+    d.start();
+    await d.idle();
+    const at = Date.parse('2026-10-27T01:00:00Z');
+    now.t = at;
+    await d.tick();
+    await d.tick();
+    now.t = at + 30 * 60_000;
+    await d.tick();
+    expect(tried.sort()).toEqual([`schedule:hourly:${at}`, `schedule:once:${T0 + 60_000}`]);
+    expect(failed.sort()).toEqual([`hourly@${at}: held by the host`, `once@${T0 + 60_000}: held by the host`]);
+    expect(errors).toEqual([]);
+    expect(w.registry.pending()).toEqual([]);
+    expect(w.registry.get('once')).toBeUndefined();
+    // The recurring one waits for its next time; it did not fire, so it has no last firing.
+    expect(w.registry.get('hourly')).toMatchObject({ nextAt: at + 3600_000 });
+    expect(w.registry.get('hourly')?.lastFiredAt).toBeUndefined();
+    d.stop();
+    w.log.close();
+  });
+
   it('rejects malformed schedules #SC-1', () => {
     const r = new ScheduleRegistry({ timeZone: SH });
     expect(() => r.put({ when: { cron: '0 9 * * *' }, text: 'x' }, 'config')).toThrow(/target\.sessionKey/);

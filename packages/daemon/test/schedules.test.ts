@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import type { ModuleManifest } from '@agents-io/protocol';
 import type { FakeTurnScript } from '@agents-io/testkit';
 import { FEATURES } from '../src/host.js';
+import { ModuleRegistry } from '../src/modules.js';
 import { daemon, until } from './helpers.js';
 
 // Config schedules reach their session as a turn, survive a restart, and a host schedule lands in the host queue.
@@ -40,6 +42,27 @@ describe('config schedules', () => {
     expect(items).toHaveLength(1);
     expect(items[0]).toMatchObject({ bindingId: 'schedule:nudge', channelRef: expect.stringMatching(/^schedule:schedule:nudge:\d+$/) });
     expect(text(items[0]!.input)).toBe('[schedule nudge] time to sync');
+  });
+
+  // INVARIANTS SC-1 不成立 (2026-11-24): the schedules stop after the modules; a firing due meanwhile fails (the modules are stopping) and is redone at once, again and again.
+  it.fails('a schedule due while the daemon stops is not fired then (the schedules stop before the modules); the next start fires it, once #SC-1', async () => {
+    // A module that takes a while to stop: the daemon stops its modules for 800 ms.
+    const slow: ModuleManifest<undefined> = { id: 'slow', kind: 'feature', setup: () => ({ stop: () => new Promise<void>((r) => setTimeout(r, 800)) }) };
+    const moduleRegistry = new ModuleRegistry([slow]);
+    const logs: string[] = [];
+    const w = await daemon({ moduleRegistry, gateway: { logger: (_level, msg) => logs.push(msg) } });
+    const route = { channel: 'fake', account: 'default', conversationId: 'dm-alice' };
+    w.gw.schedules.registry.put({ id: 'note', when: { at: Date.now() + 200 }, action: 'message', route, text: 'a note' }, 'config');
+    w.gw.schedules.changed();
+    await w.stop();
+    expect(logs.filter((m) => m.includes('schedule note'))).toEqual([]);
+    expect(w.chat.sent).toEqual([]);
+    // Due 600 ms ago at the next start (not missed): fired then, once.
+    const again = await daemon({ dir: w.dir, moduleRegistry });
+    await until(() => again.chat.sent.length > 0, 5000);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(again.chat.sent.map((s) => [s.route.conversationId, s.msg.text])).toEqual([['dm-alice', 'a note']]);
+    expect(again.gw.schedules.registry.get('note')).toBeUndefined();
   });
 
   it('a malformed config schedule is logged and skipped, the others load #SC-1', async () => {
