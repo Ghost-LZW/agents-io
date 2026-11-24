@@ -131,12 +131,13 @@ import { HostMcpServer, HostTools, ToolError, agentIdentity, agentOrigin, schedu
 import { builtinChannels, builtinHarnesses, builtinModules } from './bundle.js';
 import { badChannelAdapter, declaredInner, loadHarnessModule } from './module-loader.js';
 import { descriptorAdmin } from './module-channel.js';
-import { ConfigError, EMBEDDED_HARNESS, UNGRANTED_EVIDENCE, agentSpec, configTable, consoleSettings, resolveModules, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type PresetConfig, type ResolvedChannel } from './config.js';
+import { ConfigError, EMBEDDED_HARNESS, UNGRANTED_EVIDENCE, agentSpec, configTable, consoleSettings, resolveModules, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type ResolvedChannel } from './config.js';
 import { ConsoleServer, type ContributedRoute } from './console.js';
 import type { ChannelRegistry, DefaultEvidence } from './channel-registry.js';
 import type { HarnessRegistry } from './harness-registry.js';
 import type { ImportConfigModules } from './config-modules.js';
 import { ConfigStore, canonical } from './console-config.js';
+import { NamedRuns, type NamedRun } from './run-defaults.js';
 import type { ClientCommand, SessionInfo } from './frames.js';
 import { ClientOps, type Op, type OpFrame, type OpOutcome } from './client-ops.js';
 import { HostService, isHostOrigin, type CalloutHook } from './host.js';
@@ -375,6 +376,12 @@ export class Gateway {
   readonly moduleRegistry: ModuleRegistry;
   /** The modules of this run: set up before the gateway is built, started after its channels and sockets, stopped first. */
   readonly modules: ModuleHost;
+  /**
+   * The presets: the named run defaults the module providing them gives (`ModuleManifest.runDefaults`,
+   * `ModuleHost.runDefaults`; none without one that is on). A turn's plan, a task run's
+   * `overrides.preset` and `KernelContext.runConfig` ask them.
+   */
+  readonly namedRuns: NamedRuns;
   /** The chat commands: the kernel's, then the active modules'. */
   private readonly commandTable: CommandTable;
   /** Extra identity map entries by who set them (each module's: the stranger approval's guests), merged into the router's. */
@@ -472,6 +479,9 @@ export class Gateway {
     this.moduleRegistry = o.moduleRegistry ?? builtinModules;
     this.modules = modules;
     this.commandTable = modules.commandTable();
+    // What each preset gives names a configured instance (the config checked it; a value written since, or a config built by hand, is checked here).
+    this.namedRuns = new NamedRuns(modules.runDefaults(), (n) => Object.hasOwn(c.harnesses, n));
+    this.namedRuns.check();
     // The default instance must be usable (e.g. its env refs set); others fail when a turn names them.
     // A module default is checked in `start`, once its module is loaded.
     if (o.harness || o.buildHarness || c.harnesses[c.defaultHarness]?.kind !== 'module') this.harness();
@@ -1861,10 +1871,11 @@ export class Gateway {
 
   /**
    * A task run's RunSpec (feature `run.overrides`): the agent's instance, model and effort, or
-   * those of `overrides.preset`; `overrides.model` / `effort` over them (passed through); the
-   * profile `overrides.profile`, else the agent's, else `restricted`. `bad_override` when a preset
-   * is not configured, a value is not a plain token, or (with a `profile` or `preset` override) the
-   * profile is neither one the run's instance defines nor built in: never a silent fallback.
+   * those `overrides.preset` gives (`namedRuns`); `overrides.model` / `effort` over them (passed
+   * through); the profile `overrides.profile`, else the agent's, else `restricted`. `bad_override`
+   * when no preset of that name is given (none configured, or no module provides presets), a value
+   * is not a plain token, or (with a `profile` or `preset` override) the profile is neither one the
+   * run's instance defines nor built in: never a silent fallback.
    */
   private runSpec(agent: AgentConfig, o: RunOverrides | undefined): { ok: true; spec: RunSpec } | { ok: false; code: string; message: string } {
     const c = this.o.config;
@@ -1877,8 +1888,9 @@ export class Gateway {
     if (!inst) return { ok: false, code: 'harness_unavailable', message: `agent ${agent.name}: unknown harness instance ${agent.harness}` };
     let base = agentRun(agent, inst);
     if (o?.preset !== undefined) {
-      const preset = c.presets[o.preset];
-      if (!preset) return bad(`unknown preset ${JSON.stringify(o.preset)} (${Object.keys(c.presets).length ? `configured: ${Object.keys(c.presets).join(', ')}` : 'no `presets` configured'})`);
+      // What the module providing the presets gives for the name (none: `unknown preset …`, saying why).
+      const preset = this.namedRuns.get(o.preset);
+      if (!preset) return bad(this.namedRuns.unknown(o.preset));
       inst = c.harnesses[preset.harness]!;
       base = agentRun(preset, inst);
     }
@@ -3769,15 +3781,16 @@ ${a.summary}` }],
     return v ? (JSON.parse(v) as RunOverride) : {};
   }
 
-  /** The configured preset a session override names, with its instance (one no longer configured is ignored). */
-  private overridePreset(o: RunOverride): { preset: PresetConfig; inst: HarnessInstance } | undefined {
-    const preset = o.preset !== undefined ? this.o.config.presets[o.preset] : undefined;
+  /** The preset a session override names, as its provider gives it, with its instance (one no longer given is ignored). */
+  private overridePreset(o: RunOverride): { preset: NamedRun; inst: HarnessInstance } | undefined {
+    const preset = o.preset !== undefined ? this.namedRuns.get(o.preset) : undefined;
     return preset && { preset, inst: this.o.config.harnesses[preset.harness]! };
   }
 
   /**
    * Apply owner chat overrides after the agent's policy: a preset replaces the harness, model and
-   * effort, `/model` and `/effort` go over that; guests retain their policy profile.
+   * effort (what its provider gives for it at this turn, `namedRuns`), `/model` and `/effort` go
+   * over that; guests retain their policy profile.
    */
   private withRunOverride(p: FullPolicy, sessionKey: string): FullPolicy {
     return {
@@ -3870,7 +3883,7 @@ ${a.summary}` }],
    * `tui.attach`): the agent's instance, or the one of the preset set for the session, what its
    * adapter declares (`HarnessAdapter.compact` / `modes` / `ownerProfileSwitch`: `runDeclarations`,
    * also while it is unavailable for now), and the run with what is set for the session over the agent's. `preset` is the one set here,
-   * else the agent's; `stalePreset` one set here that is no longer configured.
+   * else the agent's; `stalePreset` one set here that is no longer given (not configured, or no module provides presets now).
    */
   private sessionRun(key: string): KernelSessionRun {
     const c = this.o.config;
@@ -3899,9 +3912,9 @@ ${a.summary}` }],
     };
   }
 
-  /** Set (a value) or clear (`null`) what is set for a session's next turns (`KernelContext.runConfig.set`); a preset must be configured. */
+  /** Set (a value) or clear (`null`) what is set for a session's next turns (`KernelContext.runConfig.set`); a preset must be one its provider gives. */
   private setRunOverride(key: string, o: KernelRunOverrides): void {
-    if (typeof o.preset === 'string' && !this.o.config.presets[o.preset]) throw new Error(`no preset ${o.preset} (configured: ${Object.keys(this.o.config.presets).join(', ') || 'none'})`);
+    if (typeof o.preset === 'string' && !this.namedRuns.get(o.preset)) throw new Error(`no preset ${o.preset} (${this.namedRuns.missing() ?? `configured: ${this.namedRuns.names().join(', ') || 'none'}`})`);
     const next = { ...this.runOverride(key) };
     if (o.preset !== undefined) o.preset === null ? delete next.preset : (next.preset = o.preset);
     if (o.model !== undefined) o.model === null ? delete next.model : (next.model = o.model);
@@ -3911,13 +3924,15 @@ ${a.summary}` }],
     this.records.setFlag(`run:${key}`, Object.keys(next).length ? JSON.stringify(next) : undefined);
   }
 
-  /** The configured presets, with the model and effort their instance gives when they set none (`KernelContext.runConfig.presets`). */
+  /** The presets their provider gives, in its order, with the model and effort their instance gives when they set none (`KernelContext.runConfig.presets`). */
   private presetViews(): KernelPreset[] {
     const c = this.o.config;
-    return Object.values(c.presets).map((p) => {
+    return this.namedRuns.names().flatMap((name) => {
+      const p = this.namedRuns.get(name);
+      if (!p) return [];
       const inst = c.harnesses[p.harness]!;
       const run = agentRun(p, inst);
-      return { name: p.name, harness: inst.name, kind: inst.kind, ...(run.model ? { model: run.model } : {}), ...(run.effort ? { effort: run.effort } : {}), ...(p.description ? { description: p.description } : {}) };
+      return [{ name: p.name, harness: inst.name, kind: inst.kind, ...(run.model ? { model: run.model } : {}), ...(run.effort ? { effort: run.effort } : {}), ...(p.description ? { description: p.description } : {}) }];
     });
   }
 

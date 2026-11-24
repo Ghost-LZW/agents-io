@@ -91,6 +91,7 @@ alias aio-e2e="node $PWD/packages/daemon-e2e/dist/cli.js"   # §1.1 的自动场
 - 对话里，主人发 `/preset` 列出全部预设和本会话当前用的；`/preset <名字>` 让本会话从下一轮起换成该预设，并清掉本会话 `/model`、`/effort` 设过的值；`/preset default` 回到 agent 自己的。只改这一个会话（话题），存在日志库里，重启后还在；新话题仍用 agent 的默认。
 - 换到另一个实例时，lane 关掉旧绑定、在新实例上开会话（`notice runtime_restart`）。新实例看不到在旧实例上聊过的内容（回复里会提示，`/new` 开干净的话题）；以后换回来时，续接那个实例在本会话里的原生会话。cwd、`instructionsFile`、工具仍是 agent 的。权限不跟着预设走，仍由 agent 的 `profile`、策略（只有主人时是 `bypass`）和 `/bypass` 决定。
 - 预设名的规则同实例名，`default` 保留。配置里删掉某个会话正在用的预设后，这个会话回到 agent 自己的设置（`/preset` 会说明）。
+- 预设由内建功能模块 `presets` 提供（core-slimming，2026-11-25；`packages/daemon/src/presets.ts`），打包的 `aio` 里总是开着，上面的写法与行为都不变；不带这个模块的嵌入方没有预设，配置写了 `agents.<n>.preset` 加载即失败（`no registered module provides presets`）。
 
 ## Tier 1：本地（不需要任何外部账号）
 

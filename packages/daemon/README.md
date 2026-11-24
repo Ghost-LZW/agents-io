@@ -51,7 +51,9 @@ see `docs/E2E.md` §0). New:
   See `docs/E2E.md` (预设). The chat commands that change what a session runs (`/agent`,
   `/preset`, `/model`, `/effort`, `/plan`, `/bypass`, `/compact`) are the built-in module
   `owner-commands`, on unless `ownerCommands: { "enabled": false }` (then they are ordinary
-  messages); what they set and the presets themselves are the daemon's.
+  messages); what they set is the daemon's. The presets themselves are the built-in module
+  `presets` (its section is `presets`, as always), which the daemon asks what a preset gives
+  ("Feature modules" below); a build without it has no presets.
 - An **agent** is a named run configuration: harness instance (or `preset`), `model`, `effort`,
   `profile`, `cwd`, `tools` (mount the host MCP output tools; default top-level
   `outputTools`, which defaults to **false** since 2026-10-11: turn tools on per
@@ -683,8 +685,8 @@ A feature of the daemon can be a module: a `ModuleManifest` (`@agents-io/protoco
 `module.ts`) registered in a `ModuleRegistry` by the composition root (`bundle.ts`
 `builtinModules`, origin `builtin`; so far the topic titles, `topic-title`, the watch, schedule,
 live and topic tools, `tools.watch`, `tools.schedules`, `tools.live`, `tools.topics`, the stranger approval, `strangers`, the
-owner's run-config chat commands, `owner-commands`, and the external MCP endpoint,
-`external-mcp`). A third
+presets, `presets`, the owner's run-config chat commands, `owner-commands`, and the external MCP
+endpoint, `external-mcp`). A third
 party's module has the same shape (origin `module`): an embedder registers it in its own
 registry, and the bundled `aio` loads one from the config file's `modules` entries (each imported
 at `aio serve`'s start, before the config is resolved: `loadConfigModules`; registered after the
@@ -699,11 +701,25 @@ not read, see "Configuration"). The manifest says, without running anything:
   `policy.strangers`) that is set decides: the module's `aliasEnabled(value, alias)` says on or
   off (`policy.strangers: "drop"` is off), or, without one, an object with `enabled: false` is
   off (as a section) and any other value is on; with neither, `defaultEnabled`. (The external MCP
-  endpoint kept its key: its section is `externalMcp`.) `resolve(raw, ctx)` turns the value (an alias's as it is
-  there) into the module's settings (`ctx` gives `where`, `alias`, `env`, `substitute`, `path`,
-  `valueAt` (a copy of another value of the file, `policy.owners`), `fail`). The settings resolve
-  after the rest of the config. Without the module registered its section is an unknown key, as
-  any other; the sections come before `local` in the file schema;
+  endpoint kept its key: its section is `externalMcp`.) A section may instead be a map of names
+  the deployment chooses (`entries`: the schema of each entry; `schema` is then empty and there is
+  no `enabled`, so present it is on: the presets' `presets: { <name>: { … } }`). `resolve(raw, ctx)`
+  turns the value (an alias's as it is there) into the module's settings (`ctx` gives `where`,
+  `alias`, `env`, `substitute`, `path`, `valueAt` (a copy of another value of the file,
+  `policy.owners`), `harnesses` (the configured instances, by name), `fail`). The settings resolve
+  after the rest of the config, but those of the module providing named run defaults (below),
+  which resolve before the agents. Without the module registered its section is an unknown key, as
+  any other; the sections come before `local` in the file schema, unless the registry places one
+  after a key of the file's own (`ModuleFields.sectionAfter`);
+- `runDefaults` (named run defaults, the presets: `names(config)` and `resolve(config, name)`,
+  which answers a `NamedRunDefaults`, `{ harness, model?, effort?, description? }`, or undefined):
+  asked without running the module, from what its section resolved to, by the daemon (an agent's
+  `preset` while the config resolves, a task run's `overrides.preset`, a session's preset at each
+  turn, `KernelContext.runConfig.presets` / `set`); the daemon checks each answer (a configured
+  instance, strings) and every name `names` lists when the config resolves and when the gateway
+  starts, a provider's mistake failing with a `ConfigError` naming the module. One registered
+  module's at most (the registry refuses a second); with none, or with it off, there are no
+  presets (`agents.<name>.preset: unknown preset "p" (no registered module provides presets)`);
 - `features` (`host.hello` features, advertised after the kernel's while the module runs),
   `mcpTools` (model tools: name, description, a JSON Schema object `input`, `readOnly`,
   `needsTurn`), `commands` (chat commands: name, `aliases` (other names running the same
@@ -759,9 +775,12 @@ not read, see "Configuration"). The manifest says, without running anything:
 The registry checks every manifest and what they claim together (ids; config sections and
 aliases; tools, commands and features are each one module's and never the kernel's). Its option
 `fields` keeps a module's settings and status where they were before it was a module
-(`bundle.ts`: `{ 'external-mcp': { config: 'externalMcp', status: 'externalMcp' } }`):
-`Config.<config>` is the same object as its settings in `Config.modules` (deprecated, one
-release; given another value or removed before `Gateway.start`, it still decides), and
+(`bundle.ts`: `{ 'external-mcp': { config: 'externalMcp', status: 'externalMcp' } }`, `{ presets:
+{ config: 'presets', sectionAfter: 'harness' } }`): `Config.<config>` is the same object as its
+settings in `Config.modules` (deprecated, one release; given another value or removed before
+`Gateway.start`, it still decides), `sectionAfter` is the file's own key its section comes right
+after in the file schema (where it was before it was a module's, so the errors of a file with
+several mistakes come in the order they did), and
 `GET /api/status` has `<status>` holding what its `status()` returns while it runs. `schedules`
 (`bundle.ts`: `{ 'external-mcp': { schedules: 'external:' } }`) is the start of the `createdBy` of
 the schedules its peers set before a schedule recorded its module: those are its peers' too (SC-3;
@@ -844,8 +863,9 @@ kernel's, `via` the module's id); the module gives only the prompt and the instr
 anything else it passes is dropped), `runConfig` (`get(sessionKey)`: what the session's next
 turn runs, the instance, what its adapter declares (`compact`, Plan mode, the owner's profile
 switch) and the run with what is set for the session over the agent's; `set(sessionKey, o)`:
-set or clear (`null`) the session's preset (a configured one), model, effort, mode and owner
-profile from its next turn, only those keys and values; `presets()`; `offering(cap)`: the
+set or clear (`null`) the session's preset (one the module providing named run defaults gives),
+model, effort, mode and owner profile from its next turn, only those keys and values; `presets()`:
+what that module gives, in its order; `offering(cap)`: the
 configured instances declaring Plan mode or the profile switch, by display name, else the
 registered kinds that do. The daemon keeps what is set (its records, `run:<sessionKey>`) and
 applies it over the agent's policy's plan whether or not a module is on), `channelFor`, `resolveRoute`, `send`
@@ -886,10 +906,23 @@ module over the command table and `statusLines`: `/agent` (`agents.names`,
 (`runConfig`), `/compact` (the call's `compact()`) and the `/status` line `Plan mode … · bypass …`,
 their `/help` lines before `/tui`'s (`helpBefore`), every reply as when the kernel answered them.
 On unless `ownerCommands: { enabled: false }` (its section, only `enabled`): off, the seven are
-ordinary messages and `/status` has no Plan line, while what was set keeps applying. The presets
-as configured (`presets`, an agent's `preset`, `run.start` `overrides.preset`), the store of what
-is set, `Policy.plan` with it applied (`withRunOverride`) and the IO-control commands (`/help`,
-`/status`, `/stop`, `/steer`, `/answer`, `/new`, `/topics`, `/switch`, `/tui`) stay the kernel's.
+ordinary messages and `/status` has no Plan line, while what was set keeps applying. The store of
+what is set, `Policy.plan` with it applied (`withRunOverride`) and the IO-control commands
+(`/help`, `/status`, `/stop`, `/steer`, `/answer`, `/new`, `/topics`, `/switch`, `/tui`) stay the
+kernel's; the presets `/preset` lists and sets are the presets module's, asked through
+`runConfig`.
+
+The presets (`src/presets.ts`, `presetsModule`) are such a module over `runDefaults`: its section
+`presets` (a map of names, `entries`: `{ harness, model?, effort?, description? }`, closed) is
+where it always was in the file schema, after `harness`; its `resolve` checks the names (letters,
+digits, `.`, `_`, `-`, at most 64; `default` is reserved) and that each `harness` is a configured
+instance (`ctx.harnesses`), with the errors as before. On whenever registered (there is no
+`enabled`); nothing runs (its `setup` returns an empty instance). The daemon asks it what a preset
+gives through `NamedRuns` (`src/run-defaults.ts`; `Gateway.namedRuns`), for an agent's `preset`,
+`run.start` `overrides.preset`, the preset set for a session (each turn: one no longer given is
+`stalePreset`, the agent's own runs) and `/preset`'s list. `Config.presets` (deprecated, one
+release) is its settings. A registry without it (`coreRegistries()`, an embedder's own) has no
+presets; one of someone else's providing `runDefaults` takes its place.
 
 Not served yet: `ModuleManifest.admin` (registering a module with it fails), and of the
 instance the other `hooks` (`onTopicChanged`, `planRun`, `harnessFor`) and `localFrames`
@@ -922,8 +955,8 @@ names none gives the registries back unchanged.
 
 `coreRegistries()` (`src/core.ts`) gives a harness, channel and module registry with nothing
 registered: no harness kind (no Claude Code, no Codex), no channel type (no lark-bot, mail,
-bridge or `module` entry), no feature module (no topic titles, owner commands, stranger approval,
-watch / live / topic tools or external MCP endpoint). `core.ts` imports no module package and not
+bridge or `module` entry), no feature module (no topic titles, owner commands, presets, stranger
+approval, watch / live / topic tools or external MCP endpoint). `core.ts` imports no module package and not
 the composition root (`bundle.ts`). Give the same registries to the config and the gateway, and
 pass the channel and the harness yourself:
 
@@ -951,7 +984,9 @@ const gw = await Gateway.start({
   "claude-code" is registered (registered kinds: none; or "module")`, and the same for the older
   `harness` block), a module's config section (`externalMcp: not a key of the config, and no
   registered module has a section of that name`), a console setting a channel module adds
-  (`console.larkBotCommand: …`). A value that does not look like a name is not repeated.
+  (`console.larkBotCommand: …`). A value that does not look like a name is not repeated. An
+  agent's `preset` fails too (`agents.a.preset: unknown preset "fast" (no registered module
+  provides presets)`), and a task run's `overrides.preset` is answered `bad_override`.
 - What runs is the kernel's alone: the chat commands `/help`, `/status`, `/stop`, `/steer`,
   `/answer`, `/new`, `/topics`, `/switch`, `/tui` (`/model`, `/plan`, … are ordinary messages);
   the six kernel model tools (`KERNEL_TOOL_NAMES`) for an agent with `tools`; the kernel's
@@ -1466,3 +1501,27 @@ What changed for embedders with third parties' modules from the config (core-sli
   export (the resolved entry keeps it as `spec`, `ModuleChannelSettings`), not by the file it
   resolves to: a bare specifier resolves to pnpm's real path, which carries the version, so an
   upgrade moved the channel to a new, empty directory. Path entries naming a file keep their directory.
+
+What changed for embedders with the presets module (core-slimming §4, 2026-11-25):
+
+- `builtinModules` registers `presets` (`presetsModule`, `src/presets.ts`) after `strangers` and
+  before `owner-commands`. The config file, its `presets` section (where it was in `ConfigFile`,
+  after `harness`), the presets an agent, a task run's `overrides.preset` and `/preset` take, and
+  every error text are as before; `GET /api/status` `modules` lists `presets` (on).
+- The daemon no longer reads the section: it asks the module that provides named run defaults
+  (`ModuleManifest.runDefaults`, new in `@agents-io/protocol` with `ModuleRunDefaults` and
+  `NamedRunDefaults`; at most one registered module's). New: `ModuleConfig.entries` (a section that
+  is a map of names), `ModuleResolveContext.harnesses` (required: an embedder building such a
+  context gives it), `ModuleFields.sectionAfter`, `ModuleHost.runDefaults`, `NamedRuns` /
+  `NamedRun` / `RunDefaultsProvider` (`src/run-defaults.ts`) and `Gateway.namedRuns`; `resolveModules`
+  takes an optional fifth argument, the configured instance names. `PresetConfig`, `PresetsConfig`,
+  `PresetsSection` and `DEFAULT_PRESET` come from `bundle.ts` (the same names from the package).
+- `Config.presets` is optional and deprecated (one release): the same object as the presets
+  module's settings in `Config.modules`; given another value or removed before `Gateway.start`, it
+  still decides (as `Config.externalMcp` does), and `Gateway.start` checks it as the config was
+  checked. A config built by hand without `modules` and without `presets` has the module off, so no
+  presets (it was a required field before).
+- An embedder with a `ModuleRegistry` of its own has presets only when it registers the module
+  (start from `builtinModules.modules`) or a module of its own with `runDefaults`: without one, a config naming
+  `agents.<name>.preset` fails to load (`unknown preset "p" (no registered module provides
+  presets)`), `overrides.preset` is answered `bad_override` and `/preset` says there are none.

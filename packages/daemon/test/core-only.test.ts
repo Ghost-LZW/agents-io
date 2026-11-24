@@ -335,4 +335,28 @@ describe('the kernel with no modules (coreRegistries, the embedder\'s channel an
     await expect(started).rejects.toBeInstanceOf(ConfigError);
     await expect(started).rejects.toThrow(`harness instance ${EMBEDDED_HARNESS} stands for the embedder's adapter (no harness kind is registered): pass it to Gateway.start (GatewayOptions.harness or buildHarness)`);
   });
+
+  it('presets are a module\'s (named run defaults): with none registered, a config naming one fails the load, saying no registered module provides presets (their section is an unknown key); a task run naming one is refused with bad_override and nothing runs #CF-4 #RN-2', async () => {
+    const dir = tmp('aio-core-');
+    const load = (raw: Record<string, unknown>) => {
+      try {
+        resolveConfig(raw, { env: {}, baseDir: dir, cwd: dir, ...coreRegistries() });
+      } catch (e) {
+        expect(e).toBeInstanceOf(ConfigError);
+        return (e as Error).message;
+      }
+      throw new Error('loaded');
+    };
+    expect(load({ presets: { fast: { harness: EMBEDDED_HARNESS } } })).toBe('invalid config: /presets: Unexpected property; presets: not a key of the config, and no registered module has a section of that name');
+    expect(load({ agents: { a: { preset: 'fast' } } })).toBe('agents.a.preset: unknown preset "fast" (no registered module provides presets)');
+
+    const w = await core({ raw: { agents: { exec: { harness: EMBEDDED_HARNESS, mode: 'task' } } } });
+    const h = await w.host();
+    const input = [{ type: 'text' as const, text: 'go' }];
+    await expect(h.runStart({ runId: 'p', agent: 'exec', input, overrides: { preset: 'fast' } })).rejects.toMatchObject({ code: 'bad_override', message: expect.stringMatching(/unknown preset "fast" \(no registered module provides presets\)$/) });
+    expect(w.gw.hub.log.head('run:p')).toBe(0);
+    expect(w.harness.sessions).toHaveLength(0);
+    // Without it the run runs on the agent's own.
+    expect((await h.runStart({ runId: 'q', agent: 'exec', input })).run).toMatchObject({ harness: EMBEDDED_HARNESS });
+  });
 });

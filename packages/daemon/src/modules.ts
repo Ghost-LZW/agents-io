@@ -57,6 +57,7 @@ import { FinalFiringError, OWNER_LABEL } from '@agents-io/session';
 import { CommandTable, KERNEL_COMMAND_NAMES, type ModuleCommand } from './commands.js';
 import { ConfigError } from './config-error.js';
 import { FEATURES } from './host.js';
+import type { RunDefaultsProvider } from './run-defaults.js';
 import { TokenError } from './token.js';
 
 /*
@@ -76,7 +77,11 @@ import { TokenError } from './token.js';
  * step 4; `inputHint`, `resolver` (pure answers for an input being routed, a request being
  * opened), `statusLines` (a `/status` being answered), `onUndispatched` and `onAction` (inputs,
  * which come in until late in the daemon's stop) to the end; `identities` once, right after the
- * gateway is built and before its channels run.
+ * gateway is built and before its channels run. Named run defaults (`ModuleManifest.runDefaults`,
+ * the presets) are no hook: they are asked without running the module, from what its section
+ * resolved to, by step 1 (an agent's `preset`, right after that section resolved) and by the
+ * gateway while it runs (`ModuleHost.runDefaults`, `run-defaults.ts`); a module that is off gives
+ * none.
  */
 
 /** A module as registered: its manifest and where it comes from. */
@@ -135,6 +140,13 @@ export interface ModuleFields {
    * `bundle.ts`: the external MCP endpoint's clients, `external:`. No two modules' overlap.
    */
   schedules?: string;
+  /**
+   * The config file's own key its section comes right after in the file's schema, where the
+   * section was before it was a module's (`bundle.ts`: the presets' `presets`, after `harness`), so a
+   * file with several mistakes lists them in the order it always did. Without it, a section comes
+   * with the other modules' sections, before `local`. Only for a module with a config section.
+   */
+  sectionAfter?: string;
 }
 
 /** `ModuleFields.switch`: where the old on/off field is and its two values. */
@@ -189,6 +201,10 @@ function badManifest(m: ModuleManifest<any>): string | undefined {
     if (typeof c.section !== 'string' || !SECTION.test(c.section)) return `config.section ${JSON.stringify(c.section)} is not a config key (ASCII letters, digits and _, starting with a letter)`;
     if (!isObject(c.schema) || Object.values(c.schema).some((s) => !isObject(s))) return 'config.schema must map each key of the section to a JSON Schema';
     if (Object.hasOwn(c.schema, 'enabled')) return 'config.schema: every section has "enabled"; its module cannot declare it';
+    if (c.entries !== undefined) {
+      if (!isObject(c.entries)) return 'config.entries must be a JSON Schema (of each named entry)';
+      if (Object.keys(c.schema).length) return 'config.entries: a section of named entries has no keys of its own (config.schema must be empty)';
+    }
     if (c.aliases !== undefined && (!Array.isArray(c.aliases) || c.aliases.some((a) => typeof a !== 'string' || !ALIAS.test(a)))) return 'config.aliases must be dotted paths of the config file (policy.strangers)';
     if (c.aliasEnabled !== undefined) {
       if (!isFn(c.aliasEnabled)) return 'config.aliasEnabled must be a function';
@@ -231,6 +247,7 @@ function badManifest(m: ModuleManifest<any>): string | undefined {
       if (!optBool(x.ownerOnly)) return `commands: /${x.name}: ownerOnly is a boolean`;
     }
   }
+  if (m.runDefaults !== undefined && (!isObject(m.runDefaults) || !isFn(m.runDefaults.names) || !isFn(m.runDefaults.resolve))) return 'runDefaults must be { names, resolve }, both functions';
   if (m.admin !== undefined) return 'admin (an AdminContribution) is not served for feature modules yet';
   return undefined;
 }
@@ -304,6 +321,8 @@ export class ModuleRegistry {
         for (const a of m.config.aliases ?? []) claim(`config key ${a}`, m.id);
       }
       for (const f of m.features ?? []) claim(`feature ${f}`, m.id);
+      // One module's: a preset name means one thing.
+      if (m.runDefaults) claim('the named run defaults (runDefaults)', m.id);
       for (const t of m.mcpTools ?? []) claim(`tool ${t.name}`, m.id);
       for (const c of m.commands ?? []) for (const n of [c.name, ...(c.aliases ?? [])]) claim(`command /${n}`, m.id);
       const reg: RegisteredModule = { manifest: m, origin: r.origin, ...(r.entry ? { entry: { module: r.entry.module, ...(r.entry.export !== undefined ? { export: r.entry.export } : {}) } } : {}) };
@@ -346,6 +365,12 @@ export class ModuleRegistry {
           if (g.schedules !== undefined && (g.schedules.startsWith(prefix) || prefix.startsWith(g.schedules)))
             throw new Error(`fields.${id}.schedules: ${JSON.stringify(prefix)} overlaps module ${other}'s ${JSON.stringify(g.schedules)}`);
         out.schedules = prefix;
+      }
+      if (f.sectionAfter !== undefined) {
+        const r = this.byId.get(id)!;
+        if (typeof f.sectionAfter !== 'string' || !SECTION.test(f.sectionAfter)) throw new Error(`fields.${id}.sectionAfter: ${JSON.stringify(f.sectionAfter)} is not a config key`);
+        if (!r.manifest.config || r.entry) throw new Error(`fields.${id}.sectionAfter: the module has no section in the config file`);
+        out.sectionAfter = f.sectionAfter;
       }
       fields.set(id, out);
     }
@@ -545,6 +570,18 @@ export class ModuleHost {
       }
       m.instance = instance;
     }
+  }
+
+  /**
+   * The module that provides named run defaults (`ModuleManifest.runDefaults`, at most one), as
+   * this run has it: on or off, with its settings (a deprecated field written since the config
+   * resolved included, `ModuleFields.config`). The gateway asks it for presets (`NamedRuns`).
+   */
+  runDefaults(): RunDefaultsProvider | undefined {
+    const m = this.all.find((x) => x.r.manifest.runDefaults);
+    if (!m) return undefined;
+    const section = !m.r.entry ? m.r.manifest.config?.section : undefined;
+    return { id: m.r.manifest.id, ...(section !== undefined ? { section } : {}), enabled: m.enabled, runDefaults: m.r.manifest.runDefaults!, config: m.config };
   }
 
   /** Whether a set-up module has the hook (the gateway hands its ingress `onUndispatched` / `onAction` only then). */
@@ -928,7 +965,7 @@ export interface KernelBackend {
   laneHarness(sessionKey: string, module: string): KernelLaneHarness | undefined;
   /** What a session's next turn runs, and what is set for it (`KernelContext.runConfig`). */
   sessionRun(sessionKey: string): KernelSessionRun;
-  /** Throws for a preset that is not configured. */
+  /** Throws for a preset the module providing named run defaults does not give. */
   setSessionRun(sessionKey: string, o: KernelRunOverrides): void;
   presets(): KernelPreset[];
   offering(cap: 'plan' | 'ownerProfileSwitch'): string[];

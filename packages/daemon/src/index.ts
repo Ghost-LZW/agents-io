@@ -3,6 +3,7 @@ export * from './config-modules.js';
 export * from './harness-registry.js';
 export * from './channel-registry.js';
 export * from './modules.js';
+export * from './run-defaults.js';
 export { ChannelModuleFiles, moduleChannelType, moduleSpec, type ModuleChannelEntry, type ModuleChannelSettings } from './module-channel.js';
 export * from './core.js';
 export * from './bundle.js';

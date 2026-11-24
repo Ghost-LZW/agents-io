@@ -249,7 +249,8 @@ async function serve(a: CliArgs): Promise<number> {
   console.error(`[aio] harnesses: ${instances.join(', ')}; log ${c.logPath}; local principal ${c.local.principal.id}; default session ${c.local.session}`);
   const agents = Object.values(c.agents).map((x) => `${x.name} (${x.mode}, ${x.preset ? `preset ${x.preset} on ` : ''}${x.harness}${x.name === c.defaultAgent ? ', default' : ''})`);
   console.error(`[aio] agents: ${agents.join(', ') || 'none'}; bindings: ${c.table ? `${c.table.bindings.length} from config` : 'owners default table'}`);
-  const presets = Object.values(c.presets).map((p) => `${p.name} (${p.harness}${p.model ? ` ${p.model}` : ''}${p.effort ? ` ${p.effort}` : ''})`);
+  // The presets the module providing them gives (named run defaults; none in a build without it).
+  const presets = gw.namedRuns.names().flatMap((name) => gw.namedRuns.get(name) ?? []).map((p) => `${p.name} (${p.harness}${p.model ? ` ${p.model}` : ''}${p.effort ? ` ${p.effort}` : ''})`);
   if (presets.length) console.error(`[aio] presets: ${presets.join(', ')} (/preset <name> in a chat switches its session)`);
   console.error(`[aio] channels: ${c.channels.map((ch) => ch.type).join(', ') || 'none'}; owners: ${c.policy.owners.length}`);
   if (gw.console) console.error(`[aio] console API on ${gw.console.url} (login link: aio console-link)`);

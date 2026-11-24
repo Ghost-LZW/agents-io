@@ -10,6 +10,7 @@ import { HarnessRegistry } from './harness-registry.js';
 import { moduleChannelModule, type ModuleChannelEntry, type ModuleChannelSettings } from './module-channel.js';
 import { ModuleRegistry } from './modules.js';
 import { ownerCommandsModule, type OwnerCommandsSection } from './owner-commands.js';
+import { presetsModule, type PresetsSection } from './presets.js';
 import { strangersModule, type StrangersSection } from './strangers.js';
 import { liveToolsModule, scheduleToolsModule, topicToolsModule, watchToolsModule, type ToolModuleSection } from './tool-modules.js';
 import { topicTitleModule, type TopicTitleSection } from './topic-title.js';
@@ -53,10 +54,14 @@ export const builtinChannels = new ChannelRegistry([larkBotChannelModule, mailCh
  * stranger approval (a host-level feature, decision 16): off unless `policy.strangers: "ask"`,
  * where it always was (or its section `strangers`); `Config.policy.strangers` still says, and
  * written before the start still decides, whether it is on (deprecated, one release). Then the
- * owner's run-config chat commands (`/agent`, `/preset`, `/model`, `/effort`, `/plan`, `/bypass`,
- * `/compact` and their `/status` line; a host-level feature, decision 16): on unless
- * `ownerCommands: { enabled: false }`; what they set, the presets and `Policy.plan` stay the
- * kernel's. The external MCP endpoint (off unless its section `externalMcp` is in the file) is the
+ * presets (named run defaults, `runDefaults`: a host-level feature, decision 16), on whenever
+ * registered: their section `presets` (a map of names) is where it always was in the file's schema,
+ * after `harness`, and `Config.presets` (deprecated, one release) is the same object as their
+ * settings. Then the owner's run-config chat commands (`/agent`, `/preset`, `/model`, `/effort`,
+ * `/plan`, `/bypass`, `/compact` and their `/status` line; a host-level feature, decision 16): on
+ * unless `ownerCommands: { enabled: false }`; what they set and `Policy.plan` stay the kernel's,
+ * which asks the presets module what a preset gives. The external MCP endpoint (off unless its
+ * section `externalMcp` is in the file) is the
  * last: it starts after everything else and stops first, so no external write comes in while the
  * rest stops; a module added later goes before it. Its settings and status stay where they were
  * before it was a module: `Config.externalMcp` (deprecated, one release) and `GET /api/status`
@@ -64,10 +69,11 @@ export const builtinChannels = new ChannelRegistry([larkBotChannelModule, mailCh
  * kind's adapter does (`HarnessAdapter.takeover`, with the `tui-bridge` command its kind adds to the
  * CLI), and the gateway's part of it names no harness.
  */
-export const builtinModules = new ModuleRegistry([topicTitleModule, watchToolsModule, scheduleToolsModule, liveToolsModule, topicToolsModule, strangersModule, ownerCommandsModule, externalMcpModule], {
+export const builtinModules = new ModuleRegistry([topicTitleModule, watchToolsModule, scheduleToolsModule, liveToolsModule, topicToolsModule, strangersModule, presetsModule, ownerCommandsModule, externalMcpModule], {
   origin: 'builtin',
   fields: {
     [strangersModule.id]: { switch: { path: 'policy.strangers', on: 'ask', off: 'drop' } },
+    [presetsModule.id]: { config: 'presets', sectionAfter: 'harness' },
     // Its clients' schedules set before a schedule recorded its module (their principals are always `external:…`).
     [externalMcpModule.id]: { config: 'externalMcp', status: 'externalMcp', schedules: 'external:' },
   },
@@ -81,6 +87,7 @@ export interface BuiltinModuleSections {
   liveTools?: ToolModuleSection;
   topicTools?: ToolModuleSection;
   strangers?: StrangersSection;
+  presets?: PresetsSection;
   ownerCommands?: OwnerCommandsSection;
   externalMcp?: ExternalMcpSection;
 }
@@ -93,6 +100,9 @@ export type { ToolModuleSection } from './tool-modules.js';
 
 /** The stranger approval's section (`strangers`: only `enabled`; `policy.strangers` is its older place). */
 export type { StrangersSection } from './strangers.js';
+
+/** The presets' section (`presets`: harness instance + model + effort, by name), a preset as resolved (`Config.presets`, deprecated: `Config.modules`), and the reserved name. */
+export { DEFAULT_PRESET, type PresetConfig, type PresetsConfig, type PresetsSection } from './presets.js';
 
 /** The owner's run-config commands' section (`ownerCommands`: only `enabled`). */
 export type { OwnerCommandsSection } from './owner-commands.js';
