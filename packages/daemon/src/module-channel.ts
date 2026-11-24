@@ -25,18 +25,40 @@ import { credentialMark } from './schema-marks.js';
  */
 export type ModuleChannelEntry = { type: 'module'; module: string; export?: string; config?: unknown };
 
+/**
+ * A resolved `module` entry: `module` is the file to import. An entry whose file exports a
+ * descriptor also keeps `spec`, its `module` as written (`moduleSpec`: a path made absolute
+ * against the config file's directory, a bare specifier as is), which names its state directory
+ * (`descriptorStateDir`); the file schema has no such key.
+ */
+export type ModuleChannelSettings = ModuleChannelEntry & { spec?: string };
+
+/** Whether a `module` as written is a path (relative to the config file's directory, under `~`, or absolute), not a bare specifier. */
+export const isModulePath = (spec: string): boolean => spec.startsWith('.') || spec.startsWith('~') || isAbsolute(spec);
+
+/**
+ * A `module` as written, normalized: a path made absolute against the config file's directory
+ * (`path`: the config's `ctx.path`) and normalized (`a/../b` is `b`), a bare specifier as written.
+ * Not the file it resolves to, which a package upgrade moves (pnpm's real path carries the version).
+ */
+export const moduleSpec = (spec: string, path: (p: string) => string): string => (isModulePath(spec) ? resolvePath(path(spec)) : spec);
+
 /** A module file and export, as one key (a resolved entry's: its owner, channel-stamping F4). */
 const fileKey = (module: string, exp: string | undefined) => JSON.stringify([module, exp ?? null]);
 
 /**
  * The state directory of a channel a descriptor builds: the host's for the `module` type and the
  * account (`<dataDir>/channels/module.<account>`, which every module file's channels on that
- * account would share), divided by the file and export (the first 16 hex digits of the SHA-256 of
- * the owner). The same after a restart while the file stays where it is; one descriptor's entries
- * on one account share it (its `validateAll` can refuse two such).
+ * account would share), divided by the entry's `module` as written and its export (the first 16
+ * hex digits of the SHA-256 of `["<spec>", <export or null>]`, `spec` as `moduleSpec` normalizes
+ * it). Not by the file it resolves to (the owner's): a package upgrade moves that, and the channel
+ * keeps its state across it, as across a restart. Another `module` (another spelling of it too,
+ * such as a path into `node_modules` for a bare specifier) or another export names another
+ * directory. An entry without `spec` (not resolved by this type) is divided by its file. One
+ * descriptor's entries on one account with the same spec share it (its `validateAll` can refuse two such).
  */
-function descriptorStateDir(typeDir: string, entry: { module: string; export?: string }): string {
-  return join(typeDir, createHash('sha256').update(fileKey(entry.module, entry.export)).digest('hex').slice(0, 16));
+function descriptorStateDir(typeDir: string, entry: ModuleChannelSettings): string {
+  return join(typeDir, createHash('sha256').update(fileKey(entry.spec ?? entry.module, entry.export)).digest('hex').slice(0, 16));
 }
 
 /** A module file and export as the descriptors are kept by: the file normalized (`a/../b` is `b`), as the module loader imports it. */
@@ -46,28 +68,36 @@ const descriptorKey = (file: string, exp: string | undefined) => fileKey(resolve
  * What the module files of a config's `type: "module"` entries export (`loadConfigModules`): their
  * descriptors, by the file an entry's `module` resolves to (`fileOf`: from the config file's
  * directory, as the config's resolution does), so another spelling of the same file finds the same.
+ * An entry's `module` as written (`specOf` normalizes it: `moduleSpec` against the config file's
+ * directory) keeps the file it resolved to when it was imported, so a descriptor these files were
+ * made with still answers for its entries after the file is gone or resolves elsewhere (the
+ * console's marks of the daemon's start, `ConfigStore`).
  */
 export class ChannelModuleFiles {
   private readonly resolved = new Map<string, ChannelModule>();
-  /** `module` as entries write it → the file it resolved to (only ones that resolved). */
+  /** `module` as entries write it (`specOf`) → the file it resolved to (only ones that resolved). */
   private readonly files = new Map<string, string>();
 
-  constructor(private readonly fileOf: (spec: string) => string | undefined) {}
+  constructor(
+    private readonly fileOf: (spec: string) => string | undefined,
+    private readonly specOf: (spec: string) => string = (spec) => spec,
+  ) {}
 
   /** A descriptor an entry's file exports: `spec` as the entry writes `module`, `file` as it resolved. */
   addDescriptor(spec: string, file: string, exp: string | undefined, d: ChannelModule): void {
-    this.files.set(spec, file);
+    this.files.set(this.specOf(spec), file);
     this.resolved.set(descriptorKey(file, exp), d);
   }
 
-  /** The descriptor of an entry as the document has it (`module` as written, resolved to its file). */
+  /** The descriptor of an entry as the document has it (`module` as written: the file it resolved to when imported, else now). */
   ofWritten(entry: { module?: unknown; export?: unknown }): ChannelModule | undefined {
     if (typeof entry.module !== 'string') return undefined;
-    let file = this.files.get(entry.module);
+    const spec = this.specOf(entry.module);
+    let file = this.files.get(spec);
     if (file === undefined) {
       file = this.fileOf(entry.module);
       if (file === undefined) return undefined;
-      this.files.set(entry.module, file);
+      this.files.set(spec, file);
     }
     return this.resolved.get(descriptorKey(file, typeof entry.export === 'string' ? entry.export : undefined));
   }
@@ -99,7 +129,7 @@ export function isModuleChannelType(m: ChannelModule | undefined): boolean {
 export function descriptorAdmin(registry: ChannelRegistry, entry: { type: string }): AdminContribution | undefined {
   const m = registry.get(entry.type);
   const files = m ? moduleTypes.get(m) : undefined;
-  return files?.ofFile(entry as ModuleChannelEntry & { module: string })?.admin;
+  return files?.ofFile(entry as ModuleChannelSettings)?.admin;
 }
 
 const entrySchemas = new WeakMap<ChannelModule, TObject>();
@@ -119,12 +149,12 @@ const asObject = (v: unknown): Record<string, unknown> => (v && typeof v === 'ob
  * entry's `config` (closed; absent is `{}`), its `resolve` resolves that `config` (`ctx.where` is
  * `channels[<i>].config`), its `validateAll` gets the entries naming the same file and export, its
  * `isCredential`, `credentialHint` and `implicitEnv` answer under `config`, and its `create` gets the
- * resolved `config` with the entry's `account`, and a `stateDir` of its file and export's
- * (`descriptorStateDir`). The entry's own keys (`type`, `account`, `evidence`, …) stay the host's
- * whatever it returns (`config.ts` `resolveChannels`).
+ * resolved `config` with the entry's `account`, and a `stateDir` of its `module` as written and
+ * export (`descriptorStateDir`; the resolved entry keeps that as `spec`). The entry's own keys
+ * (`type`, `account`, `evidence`, …) stay the host's whatever it returns (`config.ts` `resolveChannels`).
  */
-export function moduleChannelType(files?: ChannelModuleFiles): ChannelModule<ModuleChannelEntry> {
-  const m: ChannelModule<ModuleChannelEntry> = {
+export function moduleChannelType(files?: ChannelModuleFiles): ChannelModule<ModuleChannelEntry, ModuleChannelSettings> {
+  const m: ChannelModule<ModuleChannelEntry, ModuleChannelSettings> = {
     type: 'module',
     entry: {
       module: Type.String(),
@@ -156,8 +186,7 @@ export function moduleChannelType(files?: ChannelModuleFiles): ChannelModule<Mod
 
     resolve(entry, ctx) {
       const spec = entry.module;
-      const rel = spec.startsWith('.') || spec.startsWith('~') || isAbsolute(spec);
-      const r = resolveModuleFile(spec, rel ? ctx.path(spec) : undefined, ctx.path('.'));
+      const r = resolveModuleFile(spec, isModulePath(spec) ? ctx.path(spec) : undefined, ctx.path('.'));
       if ('error' in r) return ctx.fail(`${ctx.where}.module: ${r.error}`);
       const d = files?.ofFile({ module: r.file, ...(entry.export !== undefined ? { export: entry.export } : {}) });
       if (!d) return { ...entry, module: r.file, ...(entry.config !== undefined ? { config: ctx.substitute(entry.config, `${ctx.where}.config`) } : {}) };
@@ -166,7 +195,7 @@ export function moduleChannelType(files?: ChannelModuleFiles): ChannelModule<Mod
       const errs = errors(configSchema(d), config);
       if (errs.length) return ctx.fail(`invalid config: ${errs.slice(0, 5).map((e) => `${where}${e}`).join('; ')}`);
       const dctx: ChannelResolveContext = { ...ctx, where };
-      return { ...entry, module: r.file, config: d.resolve(config as Record<string, unknown>, dctx) };
+      return { ...entry, module: r.file, spec: moduleSpec(spec, ctx.path), config: d.resolve(config as Record<string, unknown>, dctx) };
     },
 
     validateAll(entries, ctx) {
@@ -188,7 +217,7 @@ export function moduleChannelType(files?: ChannelModuleFiles): ChannelModule<Mod
       if (d) {
         const where = `channels[${init.index}] (module ${entry.module})`;
         const built = await Promise.resolve()
-          // The host's stateDir is the `module` type's on this account (every module file's): its own is below it.
+          // The host's stateDir is the `module` type's on this account (every module file's): its own is below it, named by its `module` as written.
           .then(() => d.create({ ...asObject(entry.config), account: entry.account }, { ...init, log, stateDir: descriptorStateDir(init.stateDir, entry) }))
           .catch((e: Error) => {
             throw new ConfigError(`${where}: create failed: ${e.message}`);
@@ -216,4 +245,4 @@ export function moduleChannelType(files?: ChannelModuleFiles): ChannelModule<Mod
 }
 
 /** The bundle's `module` type: a factory, imported when the channel is built (no module files read before the config). */
-export const moduleChannelModule: ChannelModule<ModuleChannelEntry> = moduleChannelType();
+export const moduleChannelModule: ChannelModule<ModuleChannelEntry, ModuleChannelSettings> = moduleChannelType();

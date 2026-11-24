@@ -1,9 +1,9 @@
-import { dirname, isAbsolute } from 'node:path';
+import { dirname } from 'node:path';
 import type { AdminContribution } from '@agents-io/protocol';
 import { builtinChannels, builtinModules } from './bundle.js';
 import { badChannelModule, type ChannelAdminContribution, type ChannelRegistry } from './channel-registry.js';
 import { ConfigError, configPath, readConfigFile, resolveModuleEntry, type LoadOptions, type ModuleFileEntry } from './config.js';
-import { ChannelModuleFiles, isModuleChannelType, moduleChannelType } from './module-channel.js';
+import { ChannelModuleFiles, isModuleChannelType, isModulePath, moduleChannelType, moduleSpec } from './module-channel.js';
 import { loadChannelFile, loadFeatureModule, resolveModuleFile } from './module-loader.js';
 import type { ModuleRegistry, RegisteredModule } from './modules.js';
 
@@ -66,10 +66,7 @@ export async function importConfigModules(raw: unknown, o: { baseDir: string; mo
   const file = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
   const path = configPath(o.baseDir);
   // A module channel entry's file, as the config's resolution finds it (`moduleChannelType` `resolve`).
-  const fileOf = (spec: string): { file: string } | { error: string } => {
-    const rel = spec.startsWith('.') || spec.startsWith('~') || isAbsolute(spec);
-    return resolveModuleFile(spec, rel ? path(spec) : undefined, path('.'));
-  };
+  const fileOf = (spec: string): { file: string } | { error: string } => resolveModuleFile(spec, isModulePath(spec) ? path(spec) : undefined, path('.'));
 
   const entries = Array.isArray(file.modules) ? file.modules : [];
   for (const [index, e] of entries.entries()) {
@@ -90,10 +87,13 @@ export async function importConfigModules(raw: unknown, o: { baseDir: string; mo
   const moduleType = channelRegistry.get('module');
   const channels = Array.isArray(file.channels) ? file.channels : [];
   if (isModuleChannelType(moduleType)) {
-    const files = new ChannelModuleFiles((spec) => {
-      const r = fileOf(spec);
-      return 'file' in r ? r.file : undefined;
-    });
+    const files = new ChannelModuleFiles(
+      (spec) => {
+        const r = fileOf(spec);
+        return 'file' in r ? r.file : undefined;
+      },
+      (spec) => moduleSpec(spec, path),
+    );
     const admins: ChannelAdminContribution[] = [];
     // Each descriptor's contribution once, whichever entries (and spellings of its file) name it.
     const seen = new Set<AdminContribution>();

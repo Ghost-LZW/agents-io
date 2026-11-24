@@ -89,10 +89,14 @@ see `docs/E2E.md` §0). New:
   `entry` checks the entry's `config` (closed), its `resolve` resolves it (what it returns is the
   `config`, never the entry's own keys such as `evidence`), its `validateAll` gets the entries
   naming its file and export, its `isCredential` / `credentialHint` / `implicitEnv` answer for
-  paths under `config`, its `create` gets the resolved `config` with the entry's `account` and a
-  `stateDir` of its file and export's (`<dataDir>/channels/module.<account>/<the first 16 hex
-  digits of the SHA-256 of the file and export>`, the same after a restart while the file stays
-  where it is; its entries on one account share it, which its `validateAll` can refuse), and
+  paths under `config` (the console keeps the marks of the descriptor the daemon's start imported
+  for an entry whose file is gone or resolves elsewhere now), its `create` gets the resolved
+  `config` with the entry's `account` and a `stateDir` named by the entry's `module` as written
+  and its export (`<dataDir>/channels/module.<account>/<the first 16 hex digits of the SHA-256 of
+  the JSON ["<module>", <export or null>]>`, a path `module` made absolute against the config
+  file's directory and normalized, a bare specifier as written: the same after a restart and an
+  upgrade of the package, which moves the file it resolves to; another `module` or export names
+  another; its entries on one account written alike share it, which its `validateAll` can refuse), and
   its `admin` routes, schemas and `mount` are served (an `admin.console` fails the load: the
   console section is checked before module files are imported; its `type`, `ids`, `owner`,
   `idOf` are not read). A config resolved without importing them first builds a factory as
@@ -1451,3 +1455,14 @@ What changed for embedders with third parties' modules from the config (core-sli
   (`src/module-channel.ts`) is new. Two `use: "module"` instances of two descriptors with
   `declares` whose `create`s return the same adapter object get each lifecycle call once
   (`declaredInner`, `src/module-loader.ts`).
+- Third review round fixes (2026-11-25): which strings of a document the console treats as
+  credentials (redacted by `GET`, kept for `ADMIN_REDACTED` and refused as literals by `PUT`) is
+  what either the document's imported registries or the daemon's mark: a module channel file gone
+  or resolving to another file since the start no longer shows what its descriptor marked.
+  `isCredential`, `redact` and `unredact` take several registries too (`CredentialMarks`);
+  `ChannelModuleFiles` takes an optional second argument normalizing an entry's `module` as written
+  (`moduleSpec`, which `importConfigModules` gives), and keeps the file each one resolved to when
+  imported. A descriptor channel's `stateDir` is named by its entry's `module` as written and its
+  export (the resolved entry keeps it as `spec`, `ModuleChannelSettings`), not by the file it
+  resolves to: a bare specifier resolves to pnpm's real path, which carries the version, so an
+  upgrade moved the channel to a new, empty directory. Path entries naming a file keep their directory.

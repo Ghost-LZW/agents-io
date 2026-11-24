@@ -1,6 +1,7 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { ADMIN_REDACTED, type InputRecord, type KernelContext, type Origin } from '@agents-io/protocol';
 import { FakeChannel, FakeHarness, type FakeTurnScript } from '@agents-io/testkit';
@@ -20,7 +21,8 @@ import { mcpCall, mcpTools } from './output-tools-helpers.js';
  * `aio serve` does), so a feature module of someone else's (`modules` entries, origin `module`), a
  * `type: "module"` channel file exporting a `ChannelModule` descriptor and a `use: "module"`
  * harness descriptor's `declares` and `cli` count as a built-in module's do.
- * Fixtures: fixtures/feature-module.mjs, chan-descriptor.mjs, harness-descriptor-full.mjs.
+ * Fixtures: fixtures/feature-module.mjs, chan-descriptor.mjs (chan-versioned.mjs: as a package's
+ * version exports it), harness-descriptor-full.mjs.
  */
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -239,7 +241,7 @@ describe('a type: "module" channel file exporting a ChannelModule descriptor', (
     await expect(Gateway.start({ config, harness: new FakeHarness(), logger: () => {}, listen: false })).rejects.toThrow(/^channels\[0\] \(module .*chan-descriptor\.mjs\): export "createChannel" \(or default\) is a ChannelModule descriptor, which is read when the config's module files are imported before it is resolved/);
   });
 
-  it("the channels it builds get a state directory of their file and export's, under the module type's for their account, the same after a restart #RS-1", async () => {
+  it("the channels it builds get a state directory of their entry's module and export, under the module type's for their account, the same after a restart #RS-1", async () => {
     // Two descriptors (one file, two exports) on the default account; the first on a second account too.
     const f = file({ channels: [acme({ id: 'sd1', token: 'x' }), acme({ id: 'sd2', token: 'x' }, { export: 'second' }), acme({ id: 'sd1', token: 'x' }, { account: 'lan' })] });
     const start = async () => {
@@ -259,6 +261,37 @@ describe('a type: "module" channel file exporting a ChannelModule descriptor', (
     expect(lan).toBe(join(typeDir('lan'), basename(d1)));
     await first.gw.stop();
     expect((await start()).dirs).toEqual(first.dirs);
+  });
+
+  it("a package's channel keeps its state directory when an upgrade moves the file its entry resolves to: the directory is named by the entry's module as written and export, not by that file #RS-1", async () => {
+    const f = file({ channels: [{ type: 'module', module: 'acme-chan', config: { id: 'up1', token: 'x' } }] });
+    const pkg = join(f.dir, 'node_modules', 'acme-chan');
+    const versioned = pathToFileURL(join(here, 'fixtures', 'chan-versioned.mjs')).href;
+    // Each version's file is in a directory named by it, as pnpm's real path is (config-modules.e2e.test.ts installs one so);
+    // an import-only exports map, read afresh at each start (require would answer this process's first resolution again).
+    const install = (version: string) => {
+      mkdirSync(join(pkg, version), { recursive: true });
+      writeFileSync(join(pkg, version, 'index.mjs'), `import { versioned } from ${JSON.stringify(versioned)};\nexport const createChannel = versioned(${JSON.stringify(version)});\n`);
+      writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'acme-chan', version, type: 'module', exports: { '.': { import: `./${version}/index.mjs` } } }));
+    };
+    const start = async () => {
+      ((globalThis as { __chanDescriptor?: DescriptorSeen }).__chanDescriptor ??= {}).stateDirs = {};
+      const registries = await importConfigModules(f.raw, { baseDir: f.dir });
+      const config = { ...resolveConfig(f.raw, { env: {}, baseDir: f.dir, cwd: f.dir, ...registries }), socketPath: join(f.dir, 'run', 'aio.sock') };
+      const gw = await Gateway.start({ config, ...registries, buildHarness: (i: HarnessInstance) => new InstanceHarness(i, new FakeHarness()), logger: () => {}, listen: false });
+      cleanups.push(() => gw.stop());
+      return { gw, file: (config.channels[0] as { module: string }).module, dir: descriptorSeen().stateDirs!['up1:default']! };
+    };
+    install('1.0.0');
+    const first = await start();
+    await first.gw.stop();
+    install('1.1.0');
+    const second = await start();
+    expect([first.file, second.file]).toEqual([join(pkg, '1.0.0', 'index.mjs'), join(pkg, '1.1.0', 'index.mjs')]);
+    expect(second.dir).toBe(first.dir);
+    expect(first.dir).toBe(join(f.dir, 'channels', 'module.default', createHash('sha256').update(JSON.stringify(['acme-chan', null])).digest('hex').slice(0, 16)));
+    // What the first version left there is the second's.
+    expect(readFileSync(join(first.dir, 'starts'), 'utf8')).toBe('1.0.0\n1.1.0\n');
   });
 
   it("its resolve cannot grant evidence: what it returns is the entry's config, the entry's own keys stay as written, and without a grant its platform_signed is capped to none #ID-3 #ID-4", async () => {
@@ -379,6 +412,37 @@ describe('the console reads a document as the next start would: the module files
     const other = { channels: [acmeAt({ id: 'acme3', pin: 'p-secret' }, { module: `${fx}/../fixtures/chan-descriptor.mjs` })] };
     expect((redact(other, started.registries.channelRegistry) as typeof other).channels[0]!.config).toEqual({ id: 'acme3', pin: ADMIN_REDACTED });
     expect(implicitEnv(other, started.registries.channelRegistry)).toEqual(['ACME_TOKEN']);
+  });
+
+  it("a descriptor file gone or resolving to another file since the start: GET still redacts what the start's descriptor marks in its entries (and what the new file's marks), and PUT of what GET shows keeps the stored values #SE-1", async () => {
+    const d = tmp('aio-cm-marks-');
+    const url = JSON.stringify(pathToFileURL(desc).href);
+    // A file re-exporting the acme descriptor, removed after the start.
+    const gone = join(d, 'gone.mjs');
+    writeFileSync(gone, `export { createChannel } from ${url};\n`);
+    // A package directory whose entry file becomes, after the start, one whose descriptor marks no pin.
+    const pkg = join(d, 'acme-pkg');
+    mkdirSync(pkg);
+    writeFileSync(join(pkg, 'v1.mjs'), `export { createChannel } from ${url};\n`);
+    writeFileSync(join(pkg, 'v2.mjs'), `import { createChannel as c } from ${url};\nexport const createChannel = { ...c, isCredential: undefined, credentialHint: undefined };\n`);
+    const main = (v: string) => writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'acme-pkg', type: 'module', main: `${v}.mjs` }));
+    main('v1');
+    const w = await consoleOn({ channels: [acmeAt({ id: 'gone1', token: 'x', pin: 'p-gone' }, { module: gone }), acmeAt({ id: 'up1', token: 'x', pin: 'p-up' }, { module: pkg })] });
+    rmSync(gone);
+    main('v2');
+    const shown = (await w.api('/api/config')).body;
+    expect(shown.config.channels.map((c: { config: unknown }) => c.config)).toEqual([
+      { id: 'gone1', token: ADMIN_REDACTED, pin: ADMIN_REDACTED },
+      { id: 'up1', token: ADMIN_REDACTED, pin: ADMIN_REDACTED },
+    ]);
+    expect(JSON.stringify(shown)).not.toMatch(/p-gone|p-up/);
+    // The next start would not find the first file: that is an issue of the document, not a reason to show what it marked.
+    expect(shown.issues).toContainEqual(expect.objectContaining({ path: '/channels/0/module', severity: 'error' }));
+    // The document as GET shows it written back, the missing file's entry pointed at a file that is there: the stored values stay.
+    const [first, second] = shown.config.channels;
+    const r = await w.api('/api/config', { method: 'PUT', json: { config: { ...shown.config, channels: [{ ...first, module: desc }, second] } } });
+    expect(r.status).toBe(200);
+    expect(JSON.parse(readFileSync(w.configPath, 'utf8')).channels).toEqual([acmeAt({ id: 'gone1', token: 'x', pin: 'p-gone' }), acmeAt({ id: 'up1', token: 'x', pin: 'p-up' }, { module: pkg })]);
   });
 
   it("PUT and validate refuse what the next start would refuse in module files the daemon did not import (a config a descriptor's or a manifest's schema refuses, an export that is no manifest), leaving the file; a right one is written, applied at the restart; a daemon importing no module files refuses a modules entry it lacks #CF-4", async () => {

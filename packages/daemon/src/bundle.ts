@@ -7,7 +7,7 @@ import { bridgeHarnessModule } from '@agents-io/harness-jsonl-bridge';
 import { ChannelRegistry } from './channel-registry.js';
 import { externalMcpModule, type ExternalMcpSection } from './external-mcp.js';
 import { HarnessRegistry } from './harness-registry.js';
-import { moduleChannelModule, type ModuleChannelEntry } from './module-channel.js';
+import { moduleChannelModule, type ModuleChannelEntry, type ModuleChannelSettings } from './module-channel.js';
 import { ModuleRegistry } from './modules.js';
 import { ownerCommandsModule, type OwnerCommandsSection } from './owner-commands.js';
 import { strangersModule, type StrangersSection } from './strangers.js';
@@ -104,7 +104,7 @@ export { DEFAULT_EXTERNAL_MCP_PORT, type ExternalMcpClient, type ExternalMcpConf
 export type BuiltinChannelEntry = LarkBotChannelEntry | MailChannelEntry | BridgeChannelEntry | ModuleChannelEntry;
 
 /** A built-in channel type's own keys, resolved (`ResolvedChannel` adds the keys every entry has and `account`). */
-export type BuiltinChannelSettings = LarkBotChannelSettings | MailChannelEntry | BridgeChannelEntry | ModuleChannelEntry;
+export type BuiltinChannelSettings = LarkBotChannelSettings | MailChannelEntry | BridgeChannelEntry | ModuleChannelSettings;
 
 /** Deprecated, kept for one release: moved to `@agents-io/channel-lark-bot`. */
 export type { LarkChannelConfig } from '@agents-io/channel-lark-bot';
