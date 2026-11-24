@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -40,6 +40,8 @@ const tmp = () => {
   dirs.push(d);
   return d;
 };
+/** Every `.ndjson` under `d`, at any depth. */
+const ndjsonUnder = (d: string): string[] => readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? ndjsonUnder(join(d, e.name)) : e.name.endsWith('.ndjson') ? [join(d, e.name)] : []));
 
 describe('match', () => {
   const m = (p: unknown, a: unknown, b: Bindings = new Map(), exact = false) => match(p, a, b, { exact });
@@ -263,9 +265,8 @@ describe('scenarios', () => {
   });
 
   it('the conformance data: every scenario and transcript parses; every transcript a scenario plays is there; the kernel and attention directories have scenarios', () => {
-    const walk = (d: string): string[] => readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(join(d, e.name)) : e.name.endsWith('.ndjson') ? [join(d, e.name)] : []));
-    const scenarios = walk(join(CONFORMANCE, 'scenarios'));
-    const transcripts = walk(join(CONFORMANCE, 'transcripts'));
+    const scenarios = ndjsonUnder(join(CONFORMANCE, 'scenarios'));
+    const transcripts = ndjsonUnder(join(CONFORMANCE, 'transcripts'));
     expect(scenarioFiles(join(CONFORMANCE, 'scenarios', 'kernel')).length).toBeGreaterThanOrEqual(5);
     expect(scenarioFiles(join(CONFORMANCE, 'scenarios', 'attention')).length).toBeGreaterThanOrEqual(20);
     for (const f of scenarios) {
@@ -277,5 +278,13 @@ describe('scenarios', () => {
       expect(t.header.protocol, f).toBe(f.includes('/codex/') ? 'codex.app-server' : 'aio.jsonl-harness');
     }
     expect(transcripts.filter((f) => f.includes('/codex/')).map((f) => f.split('/').pop()).sort()).toEqual(['approval.ndjson', 'interrupt.ndjson', 'plain-turn.ndjson', 'steer.ndjson']);
+  });
+
+  it('every scenario under conformance/scenarios is one a core runner plays (the top level of kernel/ or attention/), and those are exactly the scenarios invariants.mjs counts', () => {
+    // The runners: packages/kernel/test/scenarios.test.ts plays scenarioFiles(scenarios/kernel), packages/session/test/attention.test.ts scenarioFiles(scenarios/attention).
+    const played = ['kernel', 'attention'].flatMap((d) => scenarioFiles(join(CONFORMANCE, 'scenarios', d))).sort();
+    expect(ndjsonUnder(join(CONFORMANCE, 'scenarios')).sort()).toEqual(played);
+    const listed = JSON.parse(execFileSync(process.execPath, [join(root, 'scripts', 'invariants.mjs'), 'list', '--json'], { encoding: 'utf8', maxBuffer: 64 << 20 })) as { file: string; scenario?: boolean }[];
+    expect(listed.filter((t) => t.scenario).map((t) => join(root, t.file)).sort()).toEqual(played);
   });
 });

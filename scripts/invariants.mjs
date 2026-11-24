@@ -9,16 +9,25 @@
 // A test's tier is its file suffix: *.test.ts core, *.local.test.ts, *.e2e.test.ts, *.live.test.ts.
 // A conformance scenario (an .ndjson file whose first line is a header `{ "scenario", "description",
 // "invariants": [ids] }`, docs/design/conformance-fixtures §3) is a core test of the ids its header
-// names: a core runner plays every scenario file (packages/kernel/test/scenarios.test.ts,
-// packages/session/test/attention.test.ts).
+// names, if a core runner plays it: only the top-level *.ndjson of a directory in SCENARIO_DIRS count
+// (what testkit's scenarioFiles gives its runner). A scenario anywhere else is drift.
 import { execFileSync } from 'node:child_process';
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { basename, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const TIERS = ['core', 'local', 'e2e', 'live'];
 const TAG = /#([A-Z]{2}-\d+[a-z]?)(?![\w-])/g;
+const ROOTS = ['packages', 'harness', 'channel', 'examples'];
+// The scenario directories and the core test that plays each: it plays the directory's top-level
+// *.ndjson (scenarioFiles(dir), not below it). A new directory is played and counted once it is here
+// with its runner; packages/testkit/test/conformance.local.test.ts checks that this list counts
+// exactly the scenarios under packages/testkit/conformance/scenarios.
+const SCENARIO_DIRS = [
+  { dir: 'packages/testkit/conformance/scenarios/kernel', runner: 'packages/kernel/test/scenarios.test.ts' },
+  { dir: 'packages/testkit/conformance/scenarios/attention', runner: 'packages/session/test/attention.test.ts' },
+];
 
 // ---------- docs/INVARIANTS.md ----------
 
@@ -194,39 +203,61 @@ function walkNdjson(dir, out = []) {
   return out;
 }
 
-/** The conformance scenarios: one core test each, tagged with the ids of its header. */
-function parseScenario(file) {
+/** The scenario header on a file's first line, or null when it has none. */
+function scenarioHeader(file) {
   const first = readFileSync(file, 'utf8').split('\n').find((l) => l.trim());
   let h;
   try {
     h = JSON.parse(first ?? '');
   } catch {
-    return [];
+    return null;
   }
-  if (!h || typeof h !== 'object' || typeof h.scenario !== 'string' || !Array.isArray(h.invariants)) return [];
+  return h && typeof h === 'object' && typeof h.scenario === 'string' && Array.isArray(h.invariants) ? h : null;
+}
+
+/** The conformance scenarios: one core test each, tagged with the ids of its header. */
+function parseScenario(file) {
+  const h = scenarioHeader(file);
+  if (!h) return [];
   const tags = h.invariants.filter((i) => typeof i === 'string' && /^[A-Z]{2}-\d+[a-z]?$/.test(i));
   return [{ file: relative(root, file), line: 1, name: `${h.scenario}: ${h.description ?? ''} ${tags.map((t) => `#${t}`).join(' ')}`.trim(), kind: 'it', tags, tier: 'core', scenario: true }];
 }
 
+/** The files the scenario runners play: the top-level *.ndjson of each SCENARIO_DIRS directory, as scenarioFiles reads them. */
+function playedScenarioFiles() {
+  return SCENARIO_DIRS.flatMap(({ dir }) => {
+    const d = join(root, ...dir.split('/'));
+    try {
+      return readdirSync(d).filter((f) => f.endsWith('.ndjson')).map((f) => join(d, f));
+    } catch {
+      return [];
+    }
+  }).sort();
+}
+
+/** Every .ndjson with a scenario header that no runner plays (below a scenario directory, or anywhere else). */
+function strayScenarioFiles() {
+  const played = new Set(playedScenarioFiles());
+  return ROOTS.flatMap((d) => {
+    try {
+      return walkNdjson(join(root, d));
+    } catch {
+      return [];
+    }
+  }).filter((f) => !played.has(f) && scenarioHeader(f)).sort();
+}
+
 function readTests() {
-  const dirs = ['packages', 'harness', 'channel', 'examples'];
-  const files = dirs.flatMap((d) => {
+  const files = ROOTS.flatMap((d) => {
     try {
       return walk(join(root, d));
     } catch {
       return [];
     }
   });
-  const scenarios = dirs.flatMap((d) => {
-    try {
-      return walkNdjson(join(root, d));
-    } catch {
-      return [];
-    }
-  });
   return [
     ...files.sort().flatMap((f) => parseTests(f).map((t) => ({ ...t, tier: tierOf(f) }))),
-    ...scenarios.sort().flatMap(parseScenario),
+    ...playedScenarioFiles().flatMap(parseScenario),
   ];
 }
 
@@ -270,6 +301,21 @@ function check() {
   section(
     'core tests without an #ID tag (a promise-less test belongs in *.local.test.ts)',
     tests.filter((t) => t.tier === 'core' && t.tags.length === 0).map((t) => `${t.file}:${t.line}  ${t.name}`),
+  );
+  section(
+    'scenario files no core runner plays (a runner plays only the top-level *.ndjson of a directory in SCENARIO_DIRS, scripts/invariants.mjs)',
+    strayScenarioFiles().map((f) => relative(root, f)),
+  );
+  section(
+    'files a scenario runner plays that have no scenario header on their first line',
+    playedScenarioFiles().filter((f) => !scenarioHeader(f)).map((f) => relative(root, f)),
+  );
+  section(
+    'scenario directories whose runner is missing or does not call scenarioFiles',
+    SCENARIO_DIRS.filter(({ runner }) => {
+      const p = join(root, ...runner.split('/'));
+      return tierOf(p) !== 'core' || !existsSync(p) || !readFileSync(p, 'utf8').includes('scenarioFiles(');
+    }).map(({ dir, runner }) => `${dir}  (runner ${runner})`),
   );
   const has = (e, kind) => (tagged.get(e.id) ?? []).some((t) => t.kind === kind);
   section(

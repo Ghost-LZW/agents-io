@@ -26,7 +26,7 @@
 
 与语言无关的 fixture（`packages/testkit/conformance/`，格式见 `docs/design/conformance-fixtures/`）：录下的 harness transcript 和内核场景，都是 NDJSON。
 
-- 一个场景文件（`.ndjson`，第一行是头 `{ "scenario", "description", "invariants": [编号] }`）就是这些编号的一条 core 测试：`scripts/invariants.mjs` 读头部，`check`、`list`、`affected` 都算它。跑它们的是 core 测试 `packages/kernel/test/scenarios.test.ts`（`scenarios/kernel/`，没有模块的内核）和 `packages/session/test/attention.test.ts`（`scenarios/attention/`）；测试名带头部的编号，`-t '#IN-1\b'` 照样选得到。加一个新的场景目录，先加跑它的测试。
+- 一个场景文件（`.ndjson`，第一行是头 `{ "scenario", "description", "invariants": [编号] }`）就是这些编号的一条 core 测试：`scripts/invariants.mjs` 读头部，`check`、`list`、`affected` 都算它。跑它们的是 core 测试 `packages/kernel/test/scenarios.test.ts`（`scenarios/kernel/`，没有模块的内核）和 `packages/session/test/attention.test.ts`（`scenarios/attention/`），各跑自己目录顶层的 `*.ndjson`（不含子目录）；测试名带头部的编号，`-t '#IN-1\b'` 照样选得到。只有这些文件算数：别处（子目录里、别的目录里）带场景头的 `.ndjson` 没有运行器跑，`check` 把它报为漂移。加一个新的场景目录，先加跑它的测试，再把目录和运行器写进 `scripts/invariants.mjs` 的 `SCENARIO_DIRS`（`packages/testkit/test/conformance.local.test.ts` 查 `scenarios/` 下的每个场景都在运行器跑的目录顶层，且正是 `invariants.mjs` 算的那些）。
 - 写场景时用 `AIO_SCENARIO_TRACE=1 npx vitest run packages/kernel/test/scenarios.test.ts` 看各端实际有什么；只写承诺说的，不写时机决定的先后（端与端之间本来就不排序）。
 - 录下的 transcript 不手改去迁就代码：适配器写出的帧有意变了，就重新录（Codex：`harness/codex/scripts/record-transcripts.ts`，真模型，手动跑，`harness/codex/README.md`）。
 
@@ -34,7 +34,7 @@
 
 `scripts/invariants.mjs` 只读文本，不跑测试：
 
-- `pnpm invariants:check`（一致性场景的头部也算标签，见上一节）：标签指向不存在的编号；没有任何测试的编号；core 里没有标签的测试；标了"不成立"却没有 `it.fails` 的编号；INVARIANTS 里引用了、但已经不存在的测试名。任何一项都是错误，退出码 1（决定 14；2026-10-11 积压清完后由警告改为报错）。
+- `pnpm invariants:check`（一致性场景的头部也算标签，见上一节）：标签指向不存在的编号；没有任何测试的编号；core 里没有标签的测试；标了"不成立"却没有 `it.fails` 的编号；INVARIANTS 里引用了、但已经不存在的测试名；没有运行器跑的场景文件（上一节）。任何一项都是错误，退出码 1（决定 14；2026-10-11 积压清完后由警告改为报错）。
 - `pnpm invariants:affected [文件…]`：不给文件时取相对 `main` 的改动。按 INVARIANTS 各条"实现"里写的文件找出受影响的编号，列出每个编号在各层的测试数，打印要跑的 vitest 命令；没有任何编号提到的源文件也列出来（要么它不承担承诺，要么清单漏了一条）。
 - `node scripts/invariants.mjs list [编号…]`：每个编号下的测试。
 

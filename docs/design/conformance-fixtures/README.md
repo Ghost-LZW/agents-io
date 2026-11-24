@@ -165,7 +165,9 @@ G7 的 fixture 用的是同一格式：每行一条 `emit` 到 `log` 端（`even
 
 ## 4. 与不变量的对接
 
-`scripts/invariants.mjs` 读 `packages`、`harness`、`channel`、`examples` 下每个 `.ndjson` 的第一行：是场景的头（有 `scenario` 和 `invariants`）就算一条 core 测试，标签是 `invariants` 里的编号，名字是 `<scenario>: <description> #编号…`（INVARIANTS 里可以引用它）。`check` 因此把它算作这些编号的测试（编号不存在同样报错），`list` 列出它，`affected` 给一个改动的场景文件找出它的编号。transcript 的第一行是 `transcript_start`，不算。每个场景都由一个 core 运行器跑：`scenarios/kernel/` 由 `packages/kernel/test/scenarios.test.ts`，`scenarios/attention/` 由 `packages/session/test/attention.test.ts`；新的目录要先有跑它的测试。`packages/testkit/test/conformance.local.test.ts` 查每个场景和 transcript 都读得通、场景指名的 transcript 都在。
+`scripts/invariants.mjs` 只算运行器跑的场景：它的 `SCENARIO_DIRS` 列出场景目录和跑它的 core 测试（`scenarios/kernel/` 由 `packages/kernel/test/scenarios.test.ts`，`scenarios/attention/` 由 `packages/session/test/attention.test.ts`），运行器用 `scenarioFiles(dir)` 跑目录顶层的 `*.ndjson`（不含子目录），脚本读的也正是这些文件的第一行：是场景的头（有 `scenario` 和 `invariants`）就算一条 core 测试，标签是 `invariants` 里的编号，名字是 `<scenario>: <description> #编号…`（INVARIANTS 里可以引用它）。`check` 因此把它算作这些编号的测试（编号不存在同样报错），`list` 列出它，`affected` 给一个改动的场景文件找出它的编号。transcript 的第一行是 `transcript_start`，不算。
+
+别的都是漂移，`check` 报错（退出码 1）：`packages`、`harness`、`channel`、`examples` 下任何别处（场景目录的子目录、别的目录）带场景头的 `.ndjson`，因为没有运行器跑它；运行器要跑、第一行却不是场景头的文件；`SCENARIO_DIRS` 里运行器不存在、不是 core 测试或不调 `scenarioFiles` 的目录。所以新的目录要先有跑它的测试，再写进 `SCENARIO_DIRS`。`packages/testkit/test/conformance.local.test.ts` 查每个场景和 transcript 都读得通、场景指名的 transcript 都在，并查 `scenarios/` 下（任意深度）的每个场景都在 `kernel/` 或 `attention/` 的顶层，且 `invariants.mjs list --json` 算的场景正是这些。
 
 ## 5. 给别的语言的实现
 
