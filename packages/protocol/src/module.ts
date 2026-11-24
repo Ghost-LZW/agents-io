@@ -312,7 +312,8 @@ export interface ModuleHooks {
    * its checks); `false` for a schedule that is not its own. Asked of every module in registration
    * order until one answers `true`; when none does, the kernel sends it as the daemon's message. A
    * throw or a rejected promise is the firing's failure: it is redone with the same operationId
-   * (SC-1). Served from when the daemon runs (also before the module's `start`) until it stops.
+   * (SC-1). Served from when the daemon runs (also before the module's `start`) until it stops its
+   * modules; from then on a firing fails (redone at the next start), never sent as the daemon's.
    */
   scheduledMessage?(a: { schedule: ScheduleView; operationId: string }): Promise<boolean> | boolean;
   /**

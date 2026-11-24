@@ -720,10 +720,11 @@ export class ModuleHost {
    * A `message` schedule fires (`ModuleHooks.scheduledMessage`): the first set-up module, in
    * registration order, whose hook answers true sent it (as its client); false when none did (the
    * kernel sends it). A hook's throw or rejection is the firing's failure (redone, SC-1). Served from
-   * when the daemon runs; while it stops, none is asked (the kernel's own send refuses then too).
+   * when the daemon runs; while the modules stop it throws: a module's client's schedule never goes
+   * out as the daemon's message, and the firing is redone at the next start.
    */
   async scheduledMessage(a: { schedule: ScheduleView; operationId: string }): Promise<boolean> {
-    if (this.stopping) return false;
+    if (this.stopping) throw new Error('the daemon is stopping: the firing is redone at the next start');
     for (const m of this.active()) {
       const hook = m.instance!.hooks?.scheduledMessage;
       if (!hook) continue;
