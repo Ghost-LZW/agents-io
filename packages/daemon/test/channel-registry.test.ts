@@ -174,7 +174,7 @@ describe('an entry\'s channel id belongs to its type (channel-stamping F4)', () 
 });
 
 describe('credentials in a channel entry are the ones its type marks', () => {
-  it('x-credential marks (a string, a map, under a union) and isCredential: GET redacts them, PUT refuses literals there and keeps the rest readable #SE-1', () => {
+  it('x-credential marks (a string, a map, under a union) and isCredential: GET redacts them, PUT refuses literals there and keeps the rest readable #SE-1', async () => {
     const vault: ChannelModule = {
       type: 'vault',
       entry: {
@@ -196,7 +196,7 @@ describe('credentials in a channel entry are the ones its type marks', () => {
     const entry = { type: 'vault', code: 'tok-1', host: 'vault.lan', secrets: { A: 'sa-2' }, login: { user: 'me', pin: 'pw-3' }, argv: ['--key', 'k-4', '--verbose'] };
     writeFileSync(path, JSON.stringify({ channels: [entry] }), { mode: 0o600 });
     const s = new ConfigStore({ path, env: {}, channelRegistry: registry });
-    const doc = s.document();
+    const doc = await s.document();
     expect(JSON.stringify(doc)).not.toMatch(/tok-1|sa-2|pw-3|k-4/);
     expect(doc.config.channels).toEqual([{ type: 'vault', code: ADMIN_REDACTED, host: 'vault.lan', secrets: { A: ADMIN_REDACTED }, login: { user: 'me', pin: ADMIN_REDACTED }, argv: ['--key', ADMIN_REDACTED, '--verbose'] }]);
     expect(doc.issues.filter((i) => i.code === 'inline_secret').map((i) => [i.path, i.severity])).toEqual([
@@ -214,7 +214,7 @@ describe('credentials in a channel entry are the ones its type marks', () => {
     ] as const) {
       const next = structuredClone(doc.config) as any;
       set(next);
-      const r = s.put(next, doc.revision);
+      const r = await s.put(next, doc.revision);
       expect(r.status, where).toBe(422);
       expect(r.status === 422 && r.body.issues, where).toContainEqual(expect.objectContaining({ path: where, code: 'inline_secret', severity: 'error' }));
     }
@@ -222,9 +222,9 @@ describe('credentials in a channel entry are the ones its type marks', () => {
     // Not marked: a literal is fine, and the marker cannot copy a stored secret there.
     const moved = structuredClone(doc.config) as any;
     moved.channels[0].host = ADMIN_REDACTED;
-    expect(s.validate(moved).issues).toContainEqual(expect.objectContaining({ path: '/channels/0/host', code: 'redacted_without_value' }));
+    expect((await s.validate(moved)).issues).toContainEqual(expect.objectContaining({ path: '/channels/0/host', code: 'redacted_without_value' }));
     // Sent back as GET showed it, every stored value is kept.
-    expect(s.put(structuredClone(doc.config) as any, doc.revision).status).toBe(200);
+    expect((await s.put(structuredClone(doc.config) as any, doc.revision)).status).toBe(200);
     expect(JSON.parse(readFileSync(path, 'utf8')).channels[0]).toEqual(entry);
   });
 });

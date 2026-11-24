@@ -318,6 +318,8 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 
 模块也可以导出一个 `ChannelModule` 描述符（与内建类型同一个契约，`@agents-io/protocol` 的 `channel-module.ts`）代替工厂。`aio serve` 启动时在解析配置之前就导入 `module` 条目的文件（`loadConfigModules`），所以描述符说的都按内建类型那样起作用，只是对象是条目的 `config`：它的 `entry` 检查 `config`（封闭，不写按 `{}`），它的 `resolve` 解析 `config`（返回的就是新的 `config`，碰不到条目自己的键，`evidence` 照写），它的 `validateAll` 拿到同一文件、同一导出的全部条目，它的 `x-credential` 标记、`isCredential`、`credentialHint` 管 `config` 下的凭据（控制台遮挡、拒收字面值），它的 `implicitEnv` 说出不经 `env:` 引用直接读的变量（控制台 `GET /api/config` 的 `env` 里标 `implicit`），它的 `create` 拿到解析后的 `config` 加上条目的 `account`，`init.stateDir` 是这个文件加导出自己的目录（`<dataDir>/channels/module.<账号>/<文件与导出的 SHA-256 的前 16 个十六进制位>`，文件不挪就跨重启不变；同一描述符在同一账号上的几个条目共用它，不许共用就在 `validateAll` 里拒绝），它的 `admin` 路由、schema 和 `mount` 由控制台挂上。它不能贡献控制台设置（`admin.console`：控制台段在导入之前就按 schema 查过，写了就启动失败）；`type`、`ids`、`owner`、`idOf` 不读（一个文件加导出照旧是一种适配器）。没有先导入就解析的配置（嵌入方自己 `resolveConfig`）里，导出描述符的文件在启动时失败，说明要先导入。
 
+控制台按下一次启动的读法看一份文档：`aio serve` 下，`GET`、`PUT`、`POST /api/config/validate` 和 `console.liveChannels` 的热生效都先导入文档指名的 `module` 条目文件（和 `modules` 条目），所以经控制台新加的、启动时没导入过的描述符同样检查 `config`、管凭据（遮挡、拒收字面值、给它的建议）、列出 `implicitEnv`；按条目的 `module` 解析到的文件认描述符，同一文件换一种写法也认得。导入一个新文件会在守护进程里运行它的顶层代码（与下一次启动一样，每个进程一次）。热生效时，描述符贡献了控制台启动时没挂上的 admin 路由的条目不启动，记在 `failed`（"… restart the daemon to run it"），重启后才跑；其余的描述符通道当场启动。
+
 ```jsonc
 {
   "type": "module",

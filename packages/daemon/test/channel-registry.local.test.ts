@@ -279,7 +279,7 @@ describe('what the registry says of an entry', () => {
     expect(isCredential(doc, ['channels', 2, 'config', 'encryptKey'], new ChannelRegistry([larkBotChannelModule]))).toBe(true);
   });
 
-  it('a literal credential is answered with its type\'s advice where it has one (credentialHint: a bridge argument), else the host\'s', () => {
+  it('a literal credential is answered with its type\'s advice where it has one (credentialHint: a bridge argument), else the host\'s', async () => {
     const vault: ChannelModule = {
       type: 'vault',
       entry: { code: Type.String({ 'x-credential': true }), pin: Type.Optional(Type.String({ 'x-credential': true })) },
@@ -298,13 +298,13 @@ describe('what the registry says of an entry', () => {
     const inline = (issues: { code: string; path: string; message: string; severity: string }[]) => issues.filter((i) => i.code === 'inline_secret').map((i) => [i.path, i.severity, i.message]);
     const bridgeArg = 'a secret on the bridge command line is visible to other local users (ps); pass it in the bridge env ("env": { "NAME": "env:NAME" })';
     // Stored in the file: warnings.
-    expect(inline(s.document().issues)).toEqual([
+    expect(inline((await s.document()).issues)).toEqual([
       ['/channels/0/args/1', 'warning', bridgeArg],
       ['/channels/1/code', 'warning', 'vault codes come from the vault agent'],
       ['/channels/1/pin', 'warning', 'a literal secret is stored in the config file; move it to the env file and reference it as "env:NAME"'],
     ]);
     // New ones: errors, the same advice.
-    expect(inline(s.validate({ channels }).issues)).toEqual([
+    expect(inline((await s.validate({ channels })).issues)).toEqual([
       ['/channels/0/args/1', 'error', bridgeArg],
       ['/channels/1/code', 'error', 'vault codes come from the vault agent'],
       ['/channels/1/pin', 'error', 'secrets do not go into the config file: put the value in the env file (or the environment) and write "env:NAME"'],

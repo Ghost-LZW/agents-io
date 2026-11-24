@@ -472,7 +472,16 @@ private package `@agents-io/daemon-e2e` (`packages/daemon-e2e`) now, which expor
   variable a channel entry's type says it reads without a reference (`ChannelModule.implicitEnv`,
   e.g. a module file's descriptor's), marked `implicit: true`.
   `PUT` (and `validate`) run the startup validation (`resolveConfig`, with the
-  env file read afresh), keep stored values where a credential field says
+  env file read afresh) as the next start would read the document: under `aio serve` the module
+  files it names (`modules` entries, `type: "module"` channel files) are imported first, over the
+  registries the daemon started from, so their schemas, `resolve`, `validateAll` and credential
+  marks count for a file the daemon did not import at its start too (a file that does not import,
+  or exports no manifest, is an issue naming the entry; importing a new file runs its top-level
+  code in the daemon, as the next start would, and once per process); `GET` redacts and lists
+  implicit variables with the same registries. A daemon that imports no module files of its config
+  (an embedder giving only registries, no `importModules`) reads every document with its own
+  registries, and a `modules` entry they lack is an error (its start would refuse it). `PUT`
+  and `validate` keep stored values where a credential field says
   `<redacted>` (elsewhere the marker is an error), refuse new literals in
   credential fields (`inline_secret`, 422),
   honor `ifRevision` (409), and write atomically (temp + fsync + rename, 0600).
@@ -486,7 +495,11 @@ private package `@agents-io/daemon-e2e` (`packages/daemon-e2e`) now, which expor
   short grace (1 s); a bridge not connected, or a start that failed at once, is in
   `failed` (and `applied` stays `"restart"`); a failure an adapter only logs while
   retrying (lark-bot with bad credentials) shows in `GET /api/status` / the log
-  only. Off by default (docs/design/live-channels).
+  only. The applied file is resolved, and new channels built, the same way (module files
+  imported first): a `type: "module"` channel whose file the daemon did not import at its start
+  starts live too, except when its descriptor adds admin routes the console did not mount at the
+  start: that one is `failed` ("… restart the daemon to run it") until a restart. Off by default
+  (docs/design/live-channels).
 - **`/ws`**: exactly the local socket's frames. The server pings every
   `heartbeat.intervalMs`; a connection that answers neither with a pong nor any
   message within `heartbeat.timeoutMs` is terminated (logged), which frees the host
@@ -893,7 +906,9 @@ A config naming module files (`modules` entries, module channel files exporting 
 loaded as `aio serve` does: `const r = await loadConfigModules({ path })` (or
 `importConfigModules(raw, { baseDir })`; both take a `moduleRegistry` / `channelRegistry` to
 extend, default the built-in ones), then `loadConfig({ path, ...r })` and
-`Gateway.start({ config, ...r })`, the same registries to both. The feature modules are registered
+`Gateway.start({ config, ...r })`, the same registries to both (`r.importModules`, the same import
+over the registries given, lets the console read a document it validates, shows or applies as the
+next start would). The feature modules are registered
 after the given ones (`RegisteredModule.entry` names their file and export, `ModuleRegistry.fromEntry`
 finds one); the channel registry's `module` type is one bound to what the files export
 (`moduleChannelType(files)`, with their admin contributions after the types'). A config file that
@@ -1424,3 +1439,15 @@ What changed for embedders with third parties' modules from the config (core-sli
 - `moduleChannelModule` (the bundle's `module` type) is `moduleChannelType()`; a module file
   exporting a `ChannelModule` descriptor fails the start, saying to import the config's module
   files first, where it failed as an export that is not a function before.
+- Review fixes (2026-11-25): `ConfigModules.importModules` (what `loadConfigModules` /
+  `importConfigModules` answer besides the registries), `GatewayOptions.importModules` and
+  `ConfigStoreOptions.importModules`: the console imports the module files of a document before it
+  validates, writes, shows or applies it live (`ConfigStore.resolveImported`), so `...r` into
+  `Gateway.start` is all an embedder does. `ConfigStore.document()`, `validate()` and `put()`
+  return promises now (they may import); `resolve()` and `updateValidated()` (`ConfigAccess`) stay
+  synchronous, with the daemon's registries. A `ChannelModuleFiles` is made with the function that
+  resolves an entry's `module` (`new ChannelModuleFiles(fileOf)`) and finds a descriptor by the
+  resolved, normalized file, so another spelling of one file finds the same; `descriptorAdmin`
+  (`src/module-channel.ts`) is new. Two `use: "module"` instances of two descriptors with
+  `declares` whose `create`s return the same adapter object get each lifecycle call once
+  (`declaredInner`, `src/module-loader.ts`).

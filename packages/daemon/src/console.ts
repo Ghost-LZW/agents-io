@@ -384,11 +384,11 @@ export class ConsoleServer {
     if (p === '/api/config' || p === '/api/config/validate') {
       const store = h.configStore;
       if (!store) throw new HttpError(404, 'not_found', 'this daemon was started without a config file');
-      if (m === 'GET' && p === '/api/config') return { status: 200, body: store.document() };
-      if (m === 'POST' && p === '/api/config/validate') return { status: 200, body: store.validate((await readJson(req, AdminConfigValidateRequest)).config) };
+      if (m === 'GET' && p === '/api/config') return { status: 200, body: await store.document() };
+      if (m === 'POST' && p === '/api/config/validate') return { status: 200, body: await store.validate((await readJson(req, AdminConfigValidateRequest)).config) };
       if (m === 'PUT' && p === '/api/config') {
         const body = await readJson(req, AdminConfigPut);
-        const r = store.put(body.config, body.ifRevision);
+        const r = await store.put(body.config, body.ifRevision);
         if (r.status === 409) throw new HttpError(409, r.code, r.message);
         if (r.status !== 200) return { status: r.status, body: r.body };
         const live = await h.applyChannels?.();

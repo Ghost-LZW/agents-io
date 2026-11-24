@@ -129,11 +129,13 @@ import {
 } from '@agents-io/session';
 import { HostMcpServer, HostTools, ToolError, agentIdentity, agentOrigin, scheduleRouteRefusal, toolCatalog, type TopicHandover } from '@agents-io/host-mcp';
 import { builtinChannels, builtinHarnesses, builtinModules } from './bundle.js';
-import { badChannelAdapter, loadHarnessModule } from './module-loader.js';
+import { badChannelAdapter, declaredInner, loadHarnessModule } from './module-loader.js';
+import { descriptorAdmin } from './module-channel.js';
 import { ConfigError, EMBEDDED_HARNESS, UNGRANTED_EVIDENCE, agentSpec, configTable, consoleSettings, resolveModules, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type PresetConfig, type ResolvedChannel } from './config.js';
 import { ConsoleServer, type ContributedRoute } from './console.js';
 import type { ChannelRegistry, DefaultEvidence } from './channel-registry.js';
 import type { HarnessRegistry } from './harness-registry.js';
+import type { ImportConfigModules } from './config-modules.js';
 import { ConfigStore, canonical } from './console-config.js';
 import type { ClientCommand, SessionInfo } from './frames.js';
 import { ClientOps, type Op, type OpFrame, type OpOutcome } from './client-ops.js';
@@ -184,6 +186,14 @@ export interface GatewayOptions {
    * registry the config was resolved with (`Config.modules` names exactly its modules).
    */
   moduleRegistry?: ModuleRegistry;
+  /**
+   * How the config's module files were imported (`ConfigModules.importModules`: what
+   * `loadConfigModules` answers with the registries, so `...registries` passes it): the console
+   * then reads a document it shows, validates, writes or applies live as the next start would, its
+   * module files imported (`ConfigStoreOptions.importModules`). Without it the console reads every
+   * document with the registries above, and a `modules` entry they lack is an error there.
+   */
+  importModules?: ImportConfigModules;
   /** In-process channels besides the configured ones (with `coreRegistries`, the only ones: no channel type is registered). */
   channels?: ExtraChannel[];
   /** Build a configured channel's adapter with this instead of its type's `create` when it returns one (embedding, tests). */
@@ -762,10 +772,12 @@ export class Gateway {
         path: c.source.path,
         ...(c.source.envFile ? { envFile: c.source.envFile } : {}),
         ...(o.consoleEnv ? { env: o.consoleEnv } : {}),
-        // The console validates and redacts the file against the kinds and types this daemon runs.
+        // The console validates and redacts the file against the kinds and types this daemon runs,
+        // with the module files a document names imported as the next start would (`importModules`).
         harnessRegistry: this.harnessRegistry,
         channelRegistry: this.channelRegistry,
         moduleRegistry: this.moduleRegistry,
+        ...(o.importModules ? { importModules: o.importModules } : {}),
       });
     }
   }
@@ -3098,22 +3110,22 @@ ${a.summary}` }],
    * own error. Only the shape is checked: what the adapter does once started is not (a `start`
    * that returns no promise, a `caps` that throws fail as their own error, e.g. a `TypeError`).
    */
-  private async buildConfigChannel(cfg: ResolvedChannel, index: number): Promise<BuiltChannel> {
+  private async buildConfigChannel(cfg: ResolvedChannel, index: number, registry: ChannelRegistry = this.channelRegistry): Promise<BuiltChannel> {
     let entry: RunningChannel | undefined;
     let early: ChannelState | undefined;
     const onState = (st: ChannelState) => {
       if (!entry) return void (early = st);
       this.channelState(entry, st);
     };
-    const owner = this.channelRegistry.owner(cfg);
-    const defaultEvidence = this.channelRegistry.defaultEvidence(cfg.type);
+    const owner = registry.owner(cfg);
+    const defaultEvidence = registry.defaultEvidence(cfg.type);
     // Each hello's id is checked against the running channels (a bridge without `id` learns its id there).
     const acceptId = (id: string) => this.idConflict(id, { owner, account: cfg.account, source: cfg }, this.channels.filter((e) => e !== entry));
     const own = this.o.channelAdapter?.(cfg);
     let built: CreatedChannel;
     if (own) built = { adapter: own };
     else {
-      const m = this.channelRegistry.get(cfg.type);
+      const m = registry.get(cfg.type);
       if (!m) throw new ConfigError(`channels[${index}]: channel type ${JSON.stringify(cfg.type)} is not registered with the gateway; give Gateway.start the channel registry the config was resolved with`);
       const config = (cfg as { config?: unknown }).config;
       // A copy: what `create` (or its adapter later) does to the entry never reaches the host's keys read from `source` (`evidence`, `ack`, …).
@@ -3201,9 +3213,9 @@ ${a.summary}` }],
     }
   }
 
-  /** Build and start one configured channel next to the running ones (live apply). */
-  private async startConfigChannel(cfg: ResolvedChannel, index: number): Promise<RunningChannel> {
-    const b = await this.buildConfigChannel(cfg, index);
+  /** Build and start one configured channel next to the running ones (live apply), through `registry` (the one the file resolved with). */
+  private async startConfigChannel(cfg: ResolvedChannel, index: number, registry: ChannelRegistry): Promise<RunningChannel> {
+    const b = await this.buildConfigChannel(cfg, index, registry);
     // stop() may have run while it was built: close it rather than start it into closed stores.
     if (this.stopped) {
       await b.close?.().catch(() => undefined);
@@ -3264,8 +3276,11 @@ ${a.summary}` }],
    * rejects within `channelStartGraceMs`, is listed in `failed` instead, and so is an
    * unchanged one still failing; the file then does not count as applied. A failure
    * an adapter only logs (it retries internally, as lark-bot does with bad credentials)
-   * or one after the grace shows in `GET /api/status` only. Returns
-   * undefined when it is off, there is no config file, or the file does not resolve.
+   * or one after the grace shows in `GET /api/status` only. The file is resolved, and new
+   * channels built, as the next start would (its module files imported, `ConfigStore.resolveImported`);
+   * one whose module file's descriptor adds admin routes the console did not mount at the start
+   * is `failed` (it runs from the next start). Returns undefined when it is off, there is no
+   * config file, or the file does not resolve.
    */
   applyChannels(): Promise<{ applied: 'live' | 'restart'; channels: AdminChannelsApplied } | undefined> {
     const p = this.applying.then(() => this.applyChannelsNow());
@@ -3279,8 +3294,12 @@ ${a.summary}` }],
     const cur = store.read();
     if (cur.parseError) return undefined;
     let next: ResolvedChannel[];
+    let registry: ChannelRegistry;
     try {
-      next = store.resolve(cur.raw).channels;
+      ({
+        config: { channels: next },
+        channelRegistry: registry,
+      } = await store.resolveImported(cur.raw));
     } catch (e) {
       this.log('warn', `config channels not applied: ${(e as Error).message}`);
       return undefined;
@@ -3306,18 +3325,23 @@ ${a.summary}` }],
     }
     const failed: NonNullable<AdminChannelsApplied['failed']> = [];
     const launched: RunningChannel[] = [];
+    // The admin routes the console serves: the ones it mounted at the start.
+    const mounted = new Set(this.channelRegistry.adminContributions.map((c) => c.admin));
     for (const w of want) {
       if (w.kept) continue;
       if (this.stopped) break;
       try {
-        const e = await this.startConfigChannel(w.c, w.index);
+        const admin = descriptorAdmin(registry, w.c);
+        if (admin && !mounted.has(admin))
+          throw new ConfigError(`channels[${w.index}]: its module file's descriptor adds admin routes, which the console mounts when the daemon starts: restart the daemon to run it`);
+        const e = await this.startConfigChannel(w.c, w.index, registry);
         // Sessions already open render to it too, as if it had been there at their start.
         for (const key of this.lanes.keys()) this.compose(key, e);
         launched.push(e);
       } catch (err) {
         failed.push({ ...ref(w.c), error: (err as Error).message });
         // Under its channel id when known before it is built (`ChannelModule.idOf`: lark-bot, mail, a bridge's `id`); a module's only once loaded.
-        const id = this.channelRegistry.idOf(w.c) ?? w.c.type;
+        const id = registry.idOf(w.c) ?? w.c.type;
         this.configured.set(`${id}\0${w.c.account}`, { id, account: w.c.account });
         this.log('error', `channel ${w.c.type} (${w.c.account}) not started: ${(err as Error).message}`);
       }
@@ -4255,7 +4279,7 @@ ${a.summary}` }],
     const detached = [...this.lanes.values()].filter(detaching);
     const closed = [...this.lanes.values()].filter((l) => !detaching(l));
     for (const l of detached) l.detach('gateway stopping');
-    // Every built instance (every module instance from start), each adapter once: two module instances may share one.
+    // Every built instance (every module instance from start), each adapter once: two module instances may share one (under two descriptors' declarations too).
     const adapters = this.o.harness ? [this.o.harness] : [...new Map([...this.instances.values()].map((a) => [innerAdapter(a), a])).values()];
     // Bounded by a timer that holds the event loop: harness close() may wait on unref'd timers only.
     await within(
@@ -4482,9 +4506,12 @@ class LaunchEnvHarness extends WrappedHarness implements HarnessAdapter {
   }
 }
 
-/** The kind's adapter under the gateway's wrappers (an instance's, a launched session's env). */
+/**
+ * The kind's adapter under the gateway's wrappers (an instance's, a launched session's env) and a
+ * module descriptor's declarations (`declaredInner`): the object a factory or `create` returned.
+ */
 function innerAdapter(a: HarnessAdapter): HarnessAdapter {
-  return a instanceof InstanceHarness || a instanceof LaunchEnvHarness ? innerAdapter(a.inner) : a;
+  return a instanceof InstanceHarness || a instanceof LaunchEnvHarness ? innerAdapter(a.inner) : declaredInner(a);
 }
 
 /**

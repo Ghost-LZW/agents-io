@@ -271,8 +271,9 @@ const declaredHarnesses = new WeakMap<object, WeakMap<HarnessAdapter, HarnessAda
 
 /**
  * `adapter` with what `declares` says where it says nothing itself (`HarnessModule.declares` of a
- * module's descriptor): one wrapper per adapter object, so instances whose `create` returns the
- * same adapter still share one (each lifecycle call once).
+ * module's descriptor): one wrapper per descriptor and adapter object, so instances of one
+ * descriptor whose `create` returns the same adapter share one; under two descriptors the adapter
+ * has two, and `declaredInner` gives it back (each lifecycle call once).
  */
 function declaredHarness(descriptor: object, adapter: HarnessAdapter, declares: HarnessDeclarations): HarnessAdapter {
   let byAdapter = declaredHarnesses.get(descriptor);
@@ -280,6 +281,15 @@ function declaredHarness(descriptor: object, adapter: HarnessAdapter, declares: 
   let a = byAdapter.get(adapter);
   if (!a) byAdapter.set(adapter, (a = new DeclaredHarness(adapter, declares)));
   return a;
+}
+
+/**
+ * The adapter a module's `create` returned, under the `declares` of its descriptor (`a` itself when
+ * it is not wrapped so). Two descriptors declaring differently wrap one adapter twice: whoever gives
+ * an adapter its lifecycle calls once (the gateway's stop) counts it by this.
+ */
+export function declaredInner(a: HarnessAdapter): HarnessAdapter {
+  return a instanceof DeclaredHarness ? a.inner : a;
 }
 
 /** A module's adapter under its descriptor's `declares`: its own members first; methods present only when it has them. */

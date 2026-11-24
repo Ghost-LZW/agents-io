@@ -277,16 +277,16 @@ describe('module config sections (lifecycle step 1)', () => {
     expect(thrown(() => tools(['probe2_echo'], { probe2: { enabled: false } }))).toBe('agents.chat.tools: "probe2_echo" is a tool of module probe2, which is off');
   });
 
-  it('a change to a module section takes effect at the next start: the console answers applied: restart', () => {
+  it('a change to a module section takes effect at the next start: the console answers applied: restart', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'aio-mod-'));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
     const path = join(dir, 'aio.config.json');
     writeFileSync(path, '{}');
     const store = new ConfigStore({ path, env: {}, moduleRegistry: new ModuleRegistry([probe('probe', [])]) });
-    expect(store.put({ probe: { greeting: 'hi' } })).toMatchObject({ status: 200, body: { applied: 'restart' } });
-    expect(store.put({ probe: { nope: 1 } })).toMatchObject({ status: 422, body: { valid: false, issues: [expect.objectContaining({ code: 'schema', path: '/probe/nope' })] } });
+    expect(await store.put({ probe: { greeting: 'hi' } })).toMatchObject({ status: 200, body: { applied: 'restart' } });
+    expect(await store.put({ probe: { nope: 1 } })).toMatchObject({ status: 422, body: { valid: false, issues: [expect.objectContaining({ code: 'schema', path: '/probe/nope' })] } });
     // Without the module, the section is an unknown key.
-    expect(new ConfigStore({ path, env: {} }).put({ probe: {} })).toMatchObject({ status: 422 });
+    expect(await new ConfigStore({ path, env: {} }).put({ probe: {} })).toMatchObject({ status: 422 });
   });
 });
 

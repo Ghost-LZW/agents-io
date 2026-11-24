@@ -27,7 +27,16 @@ export interface ConfigModules {
   moduleRegistry: ModuleRegistry;
   /** The given channel types (default the built-in ones); their `module` type reads the descriptors the file's module channel entries export. */
   channelRegistry: ChannelRegistry;
+  /**
+   * The same import of another version of the file, over the registries this one was given (not
+   * the ones it answered): what the next start would read it with. For the console
+   * (`GatewayOptions.importModules`), which validates, shows and applies a document so.
+   */
+  importModules: ImportConfigModules;
 }
+
+/** `importConfigModules` of a parsed config file in `baseDir`, over registries fixed beforehand (`ConfigModules.importModules`). */
+export type ImportConfigModules = (raw: unknown, o: { baseDir: string }) => Promise<ConfigModules>;
 
 /**
  * `importConfigModules` of the file `loadConfig` would read (`o.path`, `$AIO_CONFIG`,
@@ -47,13 +56,20 @@ export async function loadConfigModules(o: LoadOptions = {}): Promise<ConfigModu
  * shape; an id, config section, tool, command or feature another module has) fails with a
  * `ConfigError` naming the entry (`modules[<i>] (module <file>): …`); so does a module channel file
  * that cannot be imported or exports a descriptor of the wrong shape (`channels[<i>] (module <file>): …`).
- * A file naming no module files gives the registries back as they are.
+ * A file naming no module files gives the registries back as they are. `importModules` in the
+ * answer imports another version of the file over the same given registries.
  */
 export async function importConfigModules(raw: unknown, o: { baseDir: string; moduleRegistry?: ModuleRegistry; channelRegistry?: ChannelRegistry }): Promise<ConfigModules> {
-  let moduleRegistry = o.moduleRegistry ?? builtinModules;
-  let channelRegistry = o.channelRegistry ?? builtinChannels;
+  const base = { moduleRegistry: o.moduleRegistry ?? builtinModules, channelRegistry: o.channelRegistry ?? builtinChannels };
+  const importModules: ImportConfigModules = (next, at) => importConfigModules(next, { baseDir: at.baseDir, ...base });
+  let { moduleRegistry, channelRegistry } = base;
   const file = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
   const path = configPath(o.baseDir);
+  // A module channel entry's file, as the config's resolution finds it (`moduleChannelType` `resolve`).
+  const fileOf = (spec: string): { file: string } | { error: string } => {
+    const rel = spec.startsWith('.') || spec.startsWith('~') || isAbsolute(spec);
+    return resolveModuleFile(spec, rel ? path(spec) : undefined, path('.'));
+  };
 
   const entries = Array.isArray(file.modules) ? file.modules : [];
   for (const [index, e] of entries.entries()) {
@@ -74,14 +90,17 @@ export async function importConfigModules(raw: unknown, o: { baseDir: string; mo
   const moduleType = channelRegistry.get('module');
   const channels = Array.isArray(file.channels) ? file.channels : [];
   if (isModuleChannelType(moduleType)) {
-    const files = new ChannelModuleFiles();
+    const files = new ChannelModuleFiles((spec) => {
+      const r = fileOf(spec);
+      return 'file' in r ? r.file : undefined;
+    });
     const admins: ChannelAdminContribution[] = [];
-    const seen = new Set<string>();
+    // Each descriptor's contribution once, whichever entries (and spellings of its file) name it.
+    const seen = new Set<AdminContribution>();
     for (const [index, e] of channels.entries()) {
       if (!isModuleChannel(e)) continue;
       const spec = e.module;
-      const rel = spec.startsWith('.') || spec.startsWith('~') || isAbsolute(spec);
-      const r = resolveModuleFile(spec, rel ? path(spec) : undefined, path('.'));
+      const r = fileOf(spec);
       // A missing file is the config's resolution's to report (`channels[<i>].module: …`).
       if ('error' in r) continue;
       const where = `channels[${index}] (module ${r.file})`;
@@ -95,10 +114,9 @@ export async function importConfigModules(raw: unknown, o: { baseDir: string; mo
       if (d.admin?.console !== undefined)
         throw new ConfigError(`${where}: bad admin.console (a module file's descriptor adds no console settings: the config's console section is checked before its module files are imported)`);
       files.addDescriptor(spec, r.file, e.export, d);
-      const key = JSON.stringify([r.file, e.export ?? null]);
-      if (d.admin && !seen.has(key)) {
-        seen.add(key);
+      if (d.admin && !seen.has(d.admin)) {
         const admin: AdminContribution = d.admin;
+        seen.add(admin);
         try {
           channelRegistry.with({ admins: [...admins, { type: 'module', admin }] });
         } catch (err) {
@@ -109,7 +127,7 @@ export async function importConfigModules(raw: unknown, o: { baseDir: string; mo
     }
     if (files.size) channelRegistry = channelRegistry.with({ replace: moduleChannelType(files), admins });
   }
-  return { moduleRegistry, channelRegistry };
+  return { moduleRegistry, channelRegistry, importModules };
 }
 
 /** A `modules` entry of the file schema's shape (anything else is the resolution's to report). */

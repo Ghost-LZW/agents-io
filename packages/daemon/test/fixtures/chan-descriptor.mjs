@@ -11,7 +11,7 @@ import { makeAdapter } from './chan-impl.mjs';
  * fixture adapter (globalThis.__chan[<id>:<account>], via "descriptor") and records its
  * init.stateDir at globalThis.__chanDescriptor.stateDirs[<id>:<account>]. Its admin route
  * GET /api/acme/ping answers { pong: true }. `second` is the same descriptor under another export
- * (without the admin route); the other exports are wrong in one way each.
+ * (without the admin route), `otherAdmin` with another one; the other exports are wrong in one way each.
  */
 export const createChannel = {
   type: 'acme',
@@ -50,6 +50,12 @@ export const createChannel = {
 
 /** The same descriptor under another export: another adapter (its own owner and state directory). */
 export const second = { ...createChannel, admin: undefined };
+
+/** The same descriptor with another admin route (GET /api/acme/pong). */
+export const otherAdmin = {
+  ...createChannel,
+  admin: { routes: [{ method: 'GET', path: '/api/acme/pong', status: 200, response: Type.Object({ ping: Type.Boolean() }), handle: () => ({ status: 200, body: { ping: true } }) }] },
+};
 
 /** A descriptor without its entry schema. */
 export const noEntry = { type: 'acme', resolve: (c) => c, create: () => ({}) };

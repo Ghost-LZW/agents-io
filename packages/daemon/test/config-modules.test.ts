@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -7,7 +7,7 @@ import { FakeChannel, FakeHarness, type FakeTurnScript } from '@agents-io/testki
 import { builtinChannels, builtinModules } from '../src/bundle.js';
 import { resolveConfig, type HarnessInstance } from '../src/config.js';
 import { importConfigModules } from '../src/config-modules.js';
-import { ConfigStore, redact } from '../src/console-config.js';
+import { ConfigStore, implicitEnv, redact } from '../src/console-config.js';
 import { LocalClient } from '../src/client.js';
 import { Gateway, InstanceHarness } from '../src/gateway.js';
 import { readTokenFile, tokenPath } from '../src/token.js';
@@ -47,9 +47,10 @@ function file(raw: Record<string, unknown>) {
  * What `aio serve` does with a file: import its module files, resolve it with the registries that
  * gives, start a gateway on them (a FakeHarness behind every instance, a FakeChannel `fake` with
  * owner fake:alice, unless `loadHarnesses`: the gateway loads `use: "module"` instances itself).
+ * `console` serves the console on the file (an object: more keys of its `console` section).
  */
-async function serve(raw: Record<string, unknown>, o: { env?: Record<string, string>; script?: FakeTurnScript; loadHarnesses?: boolean; console?: boolean } = {}) {
-  const f = file(o.console ? { ...raw, console: { port: 0 } } : raw);
+async function serve(raw: Record<string, unknown>, o: { env?: Record<string, string>; script?: FakeTurnScript; loadHarnesses?: boolean; console?: boolean | Record<string, unknown> } = {}) {
+  const f = file(o.console ? { ...raw, console: { port: 0, ...(typeof o.console === 'object' ? o.console : {}) } } : raw);
   const registries = await importConfigModules(f.raw, { baseDir: here });
   const configPath = join(f.dir, 'aio.config.json');
   if (o.console) writeFileSync(configPath, JSON.stringify(f.raw, null, 2) + '\n', { mode: 0o600 });
@@ -62,7 +63,7 @@ async function serve(raw: Record<string, unknown>, o: { env?: Record<string, str
     ...(o.loadHarnesses ? {} : { buildHarness: (i: HarnessInstance) => new InstanceHarness(i, harness) }),
     channels: [{ adapter: chat }],
     logger: () => {},
-    ...(o.console ? { console: true, consoleEnv: {} } : {}),
+    ...(o.console ? { console: true, consoleEnv: o.env ?? {}, channelStartGraceMs: 100 } : {}),
   });
   cleanups.push(() => gw.stop());
   const replies = () => chat.sent.map((s) => s.edits.at(-1)?.text ?? s.msg.text);
@@ -77,7 +78,17 @@ async function serve(raw: Record<string, unknown>, o: { env?: Record<string, str
     cleanups.push(() => c.close());
     return (await c.hello({ token: readTokenFile(tokenPath(config.socketPath)), name: 'probe' })).features;
   };
-  return { gw, chat, harness, config, registries, say, replies, features };
+  /** A console request with the host token. */
+  const api = async (path: string, init: { method?: string; json?: unknown } = {}) => {
+    const r = await fetch(gw.console!.url + path, {
+      method: init.method ?? 'GET',
+      headers: { Authorization: `Bearer ${gw.token}`, ...(init.json !== undefined ? { 'Content-Type': 'application/json' } : {}) },
+      ...(init.json !== undefined ? { body: JSON.stringify(init.json) } : {}),
+    });
+    const text = await r.text();
+    return { status: r.status, body: text ? JSON.parse(text) : undefined };
+  };
+  return { gw, chat, harness, config, registries, say, replies, features, api, file: f, configPath };
 }
 
 /** What the config's resolution with its modules imported first throws (or the import itself). */
@@ -271,11 +282,11 @@ describe('a type: "module" channel file exporting a ChannelModule descriptor', (
     const path = join(f.dir, 'aio.config.json');
     writeFileSync(path, JSON.stringify({ ...f.raw, channels: [acme({ id: 'b', pin: 'env:ACME_PIN' })] }), { mode: 0o600 });
     const store = new ConfigStore({ path, env: { ACME_PIN: '9' }, cwd: f.dir, channelRegistry });
-    expect(store.document().env).toEqual([
+    expect((await store.document()).env).toEqual([
       { name: 'ACME_PIN', set: true },
       { name: 'ACME_TOKEN', set: false, implicit: true },
     ]);
-    const v = store.validate({ ...f.raw, channels: [acme({ id: 'b', token: 'env:ACME_TOKEN', pin: '5678' })] });
+    const v = await store.validate({ ...f.raw, channels: [acme({ id: 'b', token: 'env:ACME_TOKEN', pin: '5678' })] });
     expect(v.issues).toContainEqual({ path: '/channels/0/config/pin', code: 'inline_secret', severity: 'error', message: 'an acme pin goes into the env file: write "env:ACME_PIN"' });
   });
 
@@ -317,5 +328,105 @@ describe('a use: "module" harness descriptor\'s declares and cli', () => {
     await expect(start({ plug: full(), other: full('otherHello') })).rejects.toThrow(/^harnesses\.other \(module .*\): cli "acme-hello": harnesses\.plug adds it too$/);
     // Two instances of one descriptor add one command.
     await start({ plug: full(), again: full() });
+  });
+
+  it("two descriptors declaring differently whose create returns one adapter: each instance reads as its own descriptor declares, and at stop that adapter gets each lifecycle call once #RS-2", async () => {
+    const calls = (share: string) => (globalThis as { __sharedCalls?: Record<string, string[]> }).__sharedCalls?.[share];
+    const w = await serve(
+      {
+        harnesses: {
+          a: full('sharedPlan', { share: 'detaching', detach: true }),
+          b: full('sharedCompact', { share: 'detaching', detach: true }),
+          c: full('sharedPlan', { share: 'disposing' }),
+          d: full('sharedCompact', { share: 'disposing' }),
+        },
+      },
+      { loadHarnesses: true },
+    );
+    expect([w.gw.harness('a').modes, w.gw.harness('a').compact]).toEqual([['plan'], undefined]);
+    expect([w.gw.harness('b').modes, w.gw.harness('b').compact]).toEqual([undefined, { command: '/squash' }]);
+    await w.gw.stop();
+    expect(calls('detaching')).toEqual(['detach']);
+    expect(calls('disposing')).toEqual(['dispose']);
+  });
+});
+
+describe('the console reads a document as the next start would: the module files it names imported first', () => {
+  const fx = join(here, 'fixtures');
+  const desc = join(fx, 'chan-descriptor.mjs');
+  const feature = join(fx, 'feature-module.mjs');
+  const acmeAt = (config: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({ type: 'module', module: desc, config, ...extra });
+  /** A console on a daemon started with `raw`, and a PUT of its file with `more` over it. */
+  async function consoleOn(raw: Record<string, unknown>, o: { env?: Record<string, string>; live?: boolean } = {}) {
+    const w = await serve(raw, { console: o.live ? { liveChannels: true } : true, env: o.env ?? {} });
+    const put = async (more: Record<string, unknown>) => w.api('/api/config', { method: 'PUT', json: { config: { ...JSON.parse(readFileSync(w.configPath, 'utf8')), ...more } } });
+    return { ...w, put };
+  }
+
+  it("a descriptor channel the daemon did not import at its start: PUT refuses a literal its descriptor marks (with its advice), GET redacts one in the file and lists the variables its implicitEnv names; a file the daemon did import, spelled another way, has the same marks #SE-1", async () => {
+    const w = await consoleOn({});
+    const r = await w.put({ channels: [acmeAt({ id: 'acme1', pin: 'p-secret' })] });
+    expect(r.status).toBe(422);
+    expect(r.body.issues).toContainEqual({ path: '/channels/0/config/pin', code: 'inline_secret', severity: 'error', message: 'an acme pin goes into the env file: write "env:ACME_PIN"' });
+    // In the file (written by hand): GET shows its marks redacted, and what it reads without a reference.
+    writeFileSync(w.configPath, JSON.stringify({ ...w.file.raw, console: { port: 0 }, channels: [acmeAt({ id: 'acme1', pin: 'p-secret' })] }), { mode: 0o600 });
+    const shown = (await w.api('/api/config')).body;
+    expect(shown.config.channels).toEqual([acmeAt({ id: 'acme1', pin: ADMIN_REDACTED })]);
+    expect(JSON.stringify(shown)).not.toContain('p-secret');
+    expect(shown.env).toContainEqual({ name: 'ACME_TOKEN', set: false, implicit: true });
+    // The registries of a start that imported it: another spelling of its file is the same file.
+    const started = await serve({ channels: [acmeAt({ id: 'acme2', token: 'x' })] });
+    const other = { channels: [acmeAt({ id: 'acme3', pin: 'p-secret' }, { module: `${fx}/../fixtures/chan-descriptor.mjs` })] };
+    expect((redact(other, started.registries.channelRegistry) as typeof other).channels[0]!.config).toEqual({ id: 'acme3', pin: ADMIN_REDACTED });
+    expect(implicitEnv(other, started.registries.channelRegistry)).toEqual(['ACME_TOKEN']);
+  });
+
+  it("PUT and validate refuse what the next start would refuse in module files the daemon did not import (a config a descriptor's or a manifest's schema refuses, an export that is no manifest), leaving the file; a right one is written, applied at the restart; a daemon importing no module files refuses a modules entry it lacks #CF-4", async () => {
+    const w = await consoleOn({}, { env: { ACME_SECRET: 's' } });
+    const before = readFileSync(w.configPath, 'utf8');
+    const refused = async (more: Record<string, unknown>) => {
+      const r = await w.put(more);
+      expect(r.status).toBe(422);
+      return r.body.issues as { path: string; code: string; message: string }[];
+    };
+    expect(await refused({ channels: [acmeAt({ id: 'acme1', token: 'env:ACME_SECRET', regoin: 'us' })] })).toContainEqual(
+      expect.objectContaining({ code: 'invalid', message: expect.stringMatching(/^invalid config: channels\[0\]\.config\/regoin: Unexpected property/) }),
+    );
+    expect(await refused({ modules: [{ use: 'module', module: feature, config: { key: 'k', greting: 'typo' } }] })).toContainEqual(
+      expect.objectContaining({ code: 'invalid', message: expect.stringMatching(/^invalid config: modules\[0\]\.config\/greting: Unexpected property/) }),
+    );
+    expect(await refused({ modules: [{ use: 'module', module: feature, export: 'notManifest' }] })).toContainEqual(
+      expect.objectContaining({ path: '/modules/0', code: 'invalid', message: expect.stringMatching(/^modules\[0\] \(module .*feature-module\.mjs\): export "notManifest" is not a module manifest/) }),
+    );
+    expect(readFileSync(w.configPath, 'utf8')).toBe(before);
+    const ok = await w.put({ modules: [{ use: 'module', module: feature, config: { key: 'k' } }], channels: [acmeAt({ id: 'acme1', token: 'env:ACME_SECRET' })] });
+    expect([ok.status, ok.body.applied]).toEqual([200, 'restart']);
+    // Without the import (a daemon given registries only): the start would refuse the entry, so does the console.
+    const store = new ConfigStore({ path: w.configPath, env: { ACME_SECRET: 's' }, cwd: w.file.dir });
+    expect((await store.validate(JSON.parse(readFileSync(w.configPath, 'utf8')))).issues).toContainEqual({
+      path: '/modules/0',
+      code: 'invalid',
+      severity: 'error',
+      message: expect.stringMatching(/^modules\[0\] \(module .*feature-module\.mjs\) is not loaded: this daemon imports no module files of its config, so it would not start on this file$/),
+    });
+  });
+
+  it("with liveChannels, descriptor channels added through the console are imported and started at once; one whose descriptor adds admin routes the console did not mount at the start fails until a restart, and the file does not count as applied #CF-2", async () => {
+    const acme0 = acmeAt({ id: 'acme0', token: 'env:ACME_SECRET' });
+    const w = await consoleOn({ channels: [acme0] }, { env: { ACME_SECRET: 's' }, live: true });
+    const added = [acmeAt({ id: 'live1', token: 'env:ACME_SECRET' }, { export: 'second' }), acmeAt({ id: 'live2', token: 'env:ACME_SECRET' }, { account: 'lan' })];
+    const r = await w.put({ channels: [acme0, ...added] });
+    expect([r.status, r.body.applied, r.body.channels]).toEqual([200, 'live', { started: [{ type: 'module', account: 'default' }, { type: 'module', account: 'lan' }], stopped: [] }]);
+    expect((await until(() => chanRec('live1:default')?.inject && chanRec('live1:default'))).via).toBe('descriptor');
+    expect((await until(() => chanRec('live2:lan')?.inject && chanRec('live2:lan'))).via).toBe('descriptor');
+    // Another admin route than the start's: not served until a restart, so not started.
+    const r2 = await w.put({ channels: [acme0, ...added, acmeAt({ id: 'live3', token: 'env:ACME_SECRET' }, { export: 'otherAdmin' })] });
+    expect([r2.status, r2.body.applied, r2.body.channels]).toEqual([
+      200,
+      'restart',
+      { started: [], stopped: [], failed: [{ type: 'module', account: 'default', error: "channels[3]: its module file's descriptor adds admin routes, which the console mounts when the daemon starts: restart the daemon to run it" }] },
+    ]);
+    expect(chanRec('live3:default')).toBeUndefined();
+    expect((await w.api('/api/acme/pong')).status).toBe(404);
   });
 });

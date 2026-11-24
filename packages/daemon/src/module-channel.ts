@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
-import { isAbsolute, join } from 'node:path';
+import { isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { Type, type TObject, type TSchema } from '@sinclair/typebox';
-import { errors, type ChannelModule, type ChannelResolveContext } from '@agents-io/protocol';
+import { errors, type AdminContribution, type ChannelModule, type ChannelResolveContext } from '@agents-io/protocol';
+import type { ChannelRegistry } from './channel-registry.js';
 import { ConfigError } from './config-error.js';
 import { badChannelAdapter, loadChannelModule, resolveModuleFile } from './module-loader.js';
 import { credentialMark } from './schema-marks.js';
@@ -38,39 +39,67 @@ function descriptorStateDir(typeDir: string, entry: { module: string; export?: s
   return join(typeDir, createHash('sha256').update(fileKey(entry.module, entry.export)).digest('hex').slice(0, 16));
 }
 
-/** What the module files of a config's `type: "module"` entries export (`loadConfigModules`): their descriptors, by the entry's `module` as written and as resolved. */
+/** A module file and export as the descriptors are kept by: the file normalized (`a/../b` is `b`), as the module loader imports it. */
+const descriptorKey = (file: string, exp: string | undefined) => fileKey(resolvePath(file), exp);
+
+/**
+ * What the module files of a config's `type: "module"` entries export (`loadConfigModules`): their
+ * descriptors, by the file an entry's `module` resolves to (`fileOf`: from the config file's
+ * directory, as the config's resolution does), so another spelling of the same file finds the same.
+ */
 export class ChannelModuleFiles {
-  private readonly written = new Map<string, ChannelModule>();
   private readonly resolved = new Map<string, ChannelModule>();
+  /** `module` as entries write it → the file it resolved to (only ones that resolved). */
+  private readonly files = new Map<string, string>();
+
+  constructor(private readonly fileOf: (spec: string) => string | undefined) {}
 
   /** A descriptor an entry's file exports: `spec` as the entry writes `module`, `file` as it resolved. */
   addDescriptor(spec: string, file: string, exp: string | undefined, d: ChannelModule): void {
-    this.written.set(fileKey(spec, exp), d);
-    this.resolved.set(fileKey(file, exp), d);
+    this.files.set(spec, file);
+    this.resolved.set(descriptorKey(file, exp), d);
   }
 
-  /** The descriptor of an entry as the document has it (`module` as written). */
+  /** The descriptor of an entry as the document has it (`module` as written, resolved to its file). */
   ofWritten(entry: { module?: unknown; export?: unknown }): ChannelModule | undefined {
-    return typeof entry.module === 'string' ? this.written.get(fileKey(entry.module, typeof entry.export === 'string' ? entry.export : undefined)) : undefined;
+    if (typeof entry.module !== 'string') return undefined;
+    let file = this.files.get(entry.module);
+    if (file === undefined) {
+      file = this.fileOf(entry.module);
+      if (file === undefined) return undefined;
+      this.files.set(entry.module, file);
+    }
+    return this.resolved.get(descriptorKey(file, typeof entry.export === 'string' ? entry.export : undefined));
   }
 
   /** The descriptor of a resolved entry (`module` the file). */
   ofFile(entry: { module: string; export?: string }): ChannelModule | undefined {
-    return this.resolved.get(fileKey(entry.module, entry.export));
+    return this.resolved.get(descriptorKey(entry.module, entry.export));
   }
 
-  /** How many entries (as written) name a descriptor. */
+  /** How many files and exports export a descriptor. */
   get size(): number {
-    return this.written.size;
+    return this.resolved.size;
   }
 }
 
-/** The `module` types this file made (the loader replaces only one of these in a registry). */
-const moduleTypes = new WeakSet<ChannelModule>();
+/** The `module` types this file made (the loader replaces only one of these in a registry), with the module files each reads. */
+const moduleTypes = new WeakMap<ChannelModule, ChannelModuleFiles | undefined>();
 
 /** Whether `m` is the daemon's `module` channel type (the bundle's, or one bound to a config's module files). */
 export function isModuleChannelType(m: ChannelModule | undefined): boolean {
   return m !== undefined && moduleTypes.has(m);
+}
+
+/**
+ * The admin contribution (`ChannelModule.admin`) of the descriptor a resolved entry's module file
+ * exports, when `registry` has the daemon's `module` type bound to it; none for any other entry. For
+ * a channel applied live: its routes are served only if the console mounted them at the start.
+ */
+export function descriptorAdmin(registry: ChannelRegistry, entry: { type: string }): AdminContribution | undefined {
+  const m = registry.get(entry.type);
+  const files = m ? moduleTypes.get(m) : undefined;
+  return files?.ofFile(entry as ModuleChannelEntry & { module: string })?.admin;
 }
 
 const entrySchemas = new WeakMap<ChannelModule, TObject>();
@@ -182,7 +211,7 @@ export function moduleChannelType(files?: ChannelModuleFiles): ChannelModule<Mod
       return { adapter, config: entry.config, ...(adapter.close ? { close: () => adapter.close!() } : {}) };
     },
   };
-  moduleTypes.add(m);
+  moduleTypes.set(m, files);
   return m;
 }
 

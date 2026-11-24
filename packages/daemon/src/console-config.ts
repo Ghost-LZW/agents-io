@@ -9,6 +9,7 @@ import { ConfigError, configFileSchema, findEnvFile, resolveConfig, type Config 
 import { loadEnvFile } from './env-file.js';
 import { credentialMark } from './schema-marks.js';
 import type { HarnessRegistry } from './harness-registry.js';
+import type { ImportConfigModules } from './config-modules.js';
 import type { ModuleRegistry } from './modules.js';
 
 /*
@@ -29,8 +30,12 @@ import type { ModuleRegistry } from './modules.js';
  * and any new literal in a credential field is refused (`inline_secret`; in a
  * channel entry with its type's advice when it has one, `credentialHint`: a
  * bridge argument is visible to other local users). Validation is the startup
- * one (`resolveConfig` over the daemon's registries, with the env file read
- * afresh). Writes are atomic (temp file + fsync + rename) and 0600. The
+ * one (`resolveConfig`, with the env file read afresh) over the registries the
+ * next start would read the document with: the module files it names imported
+ * first (`modules` entries, module channel files: `ConfigStoreOptions.importModules`,
+ * as `aio serve` does at its start), else the daemon's. The same registries say
+ * which of its strings `GET` redacts and which variables it reads. Writes are
+ * atomic (temp file + fsync + rename) and 0600. The
  * daemon does not reload its config: a changed file (a module's config
  * section too) takes effect at the next start (`applied: "restart"`), except `channels`
  * with `console.liveChannels` (the gateway applies them and calls
@@ -213,6 +218,17 @@ function secretIssues(raw: Json, kept: Set<string> | 'all', channels: ChannelReg
   return issues;
 }
 
+/** Each issue once (a file that does not import may fail the resolution with the same message). */
+function distinct(issues: ConfigIssue[]): ConfigIssue[] {
+  const seen = new Set<string>();
+  return issues.filter((i) => {
+    const k = JSON.stringify([i.path, i.code, i.message]);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
 /** Map a ConfigError message (`agents.x.harness: …`) to a JSON pointer when it names a key of the file (`file`: its schema). */
 function pathOfMessage(msg: string, file: { properties: Record<string, unknown> }): string {
   const m = /^(?:invalid config: )?`?([A-Za-z_][\w-]*(?:\[\d+\])*(?:\.[\w-]+(?:\[\d+\])*)*)`?(?:[: ]|$)/.exec(msg);
@@ -234,6 +250,21 @@ export interface ConfigStoreOptions {
   channelRegistry?: ChannelRegistry;
   /** The feature modules whose config sections the file may have (default the built-in ones): the daemon's (`Gateway.moduleRegistry`). */
   moduleRegistry?: ModuleRegistry;
+  /**
+   * How the daemon imports the module files a config file names (`ConfigModules.importModules`):
+   * a document is then validated, redacted, listed and applied live with the registries this gives
+   * for it (what the next start would read it with), not with the ones above. A file that does not
+   * import is an issue of the document. Without it (a daemon that imports no module files), a
+   * `modules` entry the registries above lack is an error: the start would refuse it.
+   */
+  importModules?: ImportConfigModules;
+}
+
+/** The registries a document is read with. */
+interface Registries {
+  harnesses: HarnessRegistry;
+  channels: ChannelRegistry;
+  modules: ModuleRegistry;
 }
 
 export type PutOutcome =
@@ -248,16 +279,30 @@ export class ConfigStore implements ConfigAccess {
    * the ones last applied live. To tell whether a change needs a restart.
    */
   private running: Record<string, unknown>;
-  private readonly harnesses: HarnessRegistry;
-  private readonly channels: ChannelRegistry;
-  private readonly modules: ModuleRegistry;
+  /** The daemon's registries (`ConfigStoreOptions`). */
+  private readonly daemon: Registries;
 
   constructor(private readonly o: ConfigStoreOptions) {
-    this.harnesses = o.harnessRegistry ?? builtinHarnesses;
-    this.channels = o.channelRegistry ?? builtinChannels;
-    this.modules = o.moduleRegistry ?? builtinModules;
+    this.daemon = { harnesses: o.harnessRegistry ?? builtinHarnesses, channels: o.channelRegistry ?? builtinChannels, modules: o.moduleRegistry ?? builtinModules };
     const raw = this.read().raw;
     this.running = raw && typeof raw === 'object' && !Array.isArray(raw) ? structuredClone(raw as Record<string, unknown>) : {};
+  }
+
+  /**
+   * The registries `raw` is read with: with `importModules`, the module files it names imported
+   * (cached by the module loader: a file imported before is not run again); a file that does not
+   * import is an issue, and `raw` is then read with the daemon's. Without it, the daemon's.
+   */
+  private async registriesOf(raw: Json): Promise<{ regs: Registries; issues: ConfigIssue[] }> {
+    if (!this.o.importModules) return { regs: this.daemon, issues: [] };
+    try {
+      const r = await this.o.importModules(raw, { baseDir: dirname(this.o.path) });
+      return { regs: { harnesses: this.daemon.harnesses, channels: r.channelRegistry, modules: r.moduleRegistry }, issues: [] };
+    } catch (e) {
+      if (!(e instanceof ConfigError)) throw e;
+      const file = configFileSchema(this.daemon.harnesses, this.daemon.channels, this.daemon.modules);
+      return { regs: this.daemon, issues: [{ path: pathOfMessage(e.message, file), code: 'invalid', message: e.message, severity: 'error' }] };
+    }
   }
 
   /** `live` when the running daemon matches `doc`, else `restart`. */
@@ -272,9 +317,25 @@ export class ConfigStore implements ConfigAccess {
     this.running = ch === undefined ? rest : { ...rest, channels: structuredClone(ch) };
   }
 
-  /** The startup resolution of `raw`, with the env file read afresh (throws `ConfigError`). */
+  /** The startup resolution of `raw` with the daemon's registries, the env file read afresh (throws `ConfigError`). */
   resolve(raw: Json): Config {
-    return resolveConfig(raw, { env: this.env(), baseDir: dirname(this.o.path), ...(this.o.cwd ? { cwd: this.o.cwd } : {}), harnessRegistry: this.harnesses, channelRegistry: this.channels, moduleRegistry: this.modules });
+    return this.resolveWith(raw, this.daemon);
+  }
+
+  /** `resolve` with `regs`. */
+  private resolveWith(raw: Json, regs: Registries): Config {
+    return resolveConfig(raw, { env: this.env(), baseDir: dirname(this.o.path), ...(this.o.cwd ? { cwd: this.o.cwd } : {}), harnessRegistry: regs.harnesses, channelRegistry: regs.channels, moduleRegistry: regs.modules });
+  }
+
+  /**
+   * The startup resolution of `raw` with the registries the next start would read it with (its
+   * module files imported, `importModules`), and the channel registry among them: what a channel
+   * applied live is built with. Throws `ConfigError` (a file that does not import too).
+   */
+  async resolveImported(raw: Json): Promise<{ config: Config; channelRegistry: ChannelRegistry }> {
+    const { regs, issues } = await this.registriesOf(raw);
+    if (issues.length) throw new ConfigError(issues[0]!.message);
+    return { config: this.resolveWith(raw, regs), channelRegistry: regs.channels };
   }
 
   get path(): string {
@@ -326,46 +387,55 @@ export class ConfigStore implements ConfigAccess {
     }
   }
 
-  document(): AdminConfigDocument {
+  /** The file as `GET /api/config` shows it: read with the registries of its module files (`registriesOf`). */
+  async document(): Promise<AdminConfigDocument> {
     const { raw, revision, parseError } = this.read();
     const env = this.env();
-    const issues = parseError ? [{ path: '', code: 'parse', message: `the file is not JSON: ${parseError}`, severity: 'error' as const }] : this.check(raw, 'all');
+    const { regs, issues: unimported } = parseError ? { regs: this.daemon, issues: [] } : await this.registriesOf(raw);
+    const issues = parseError ? [{ path: '', code: 'parse', message: `the file is not JSON: ${parseError}`, severity: 'error' as const }] : distinct([...unimported, ...this.check(raw, 'all', regs)]);
     return {
       path: this.o.path,
       revision,
-      config: redact(raw, this.channels) as Record<string, unknown>,
+      config: redact(raw, regs.channels) as Record<string, unknown>,
       issues,
       env: [
         ...envRefs(raw).map((name) => ({ name, set: env[name] !== undefined })),
         // What a channel entry reads without an `env:` reference: its type says (`ChannelModule.implicitEnv`).
-        ...implicitEnv(raw, this.channels, envRefs(raw)).map((name) => ({ name, set: env[name] !== undefined, implicit: true })),
+        ...implicitEnv(raw, regs.channels, envRefs(raw)).map((name) => ({ name, set: env[name] !== undefined, implicit: true })),
       ],
     };
   }
 
   /** Validate a document as `PUT` would (ADMIN_REDACTED keeps stored values). */
-  validate(next: Record<string, unknown>): AdminConfigValidation {
-    const r = this.prepare(next);
+  async validate(next: Record<string, unknown>): Promise<AdminConfigValidation> {
+    const r = await this.prepare(next, this.read().raw);
     return { valid: !r.issues.some((i) => i.severity === 'error'), issues: r.issues };
   }
 
-  private prepare(next: Record<string, unknown>): { doc: Json; issues: ConfigIssue[] } {
-    const { doc, kept, issues } = unredact(next, this.read().raw, this.channels);
-    return { doc, issues: [...issues, ...this.check(doc, kept)] };
+  /** `next` as it would replace `stored`, and its issues, read with the registries of its module files. */
+  private async prepare(next: Record<string, unknown>, stored: Json): Promise<{ doc: Json; issues: ConfigIssue[] }> {
+    const { regs, issues: unimported } = await this.registriesOf(next);
+    const { doc, kept, issues } = unredact(next, stored, regs.channels);
+    return { doc, issues: distinct([...unimported, ...issues, ...this.check(doc, kept, regs)]) };
   }
 
-  /** Schema issues (with paths), literal secrets, then the startup checks. */
-  private check(raw: Json, kept: Set<string> | 'all'): ConfigIssue[] {
+  /** Schema issues (with paths), literal secrets, then the startup checks (with `regs`). */
+  private check(raw: Json, kept: Set<string> | 'all', regs: Registries): ConfigIssue[] {
     const issues: ConfigIssue[] = [];
-    const file = configFileSchema(this.harnesses, this.channels, this.modules);
+    const file = configFileSchema(regs.harnesses, regs.channels, regs.modules);
     for (const e of Value.Errors(file, raw)) {
       issues.push({ path: e.path, code: 'schema', message: e.message, severity: 'error' });
       if (issues.length >= 20) break;
     }
-    issues.push(...secretIssues(raw, kept, this.channels));
+    issues.push(...secretIssues(raw, kept, regs.channels));
     if (!issues.some((i) => i.code === 'schema')) {
       try {
-        this.resolve(raw);
+        const c = this.resolveWith(raw, regs);
+        // A daemon that imports no module files would not start on a `modules` entry (`Gateway.start`).
+        if (!this.o.importModules) {
+          for (const [i, e] of (c.moduleEntries ?? []).entries())
+            if (!regs.modules.fromEntry(e)) issues.push({ path: `/modules/${i}`, code: 'invalid', message: `modules[${i}] (module ${e.module}) is not loaded: this daemon imports no module files of its config, so it would not start on this file`, severity: 'error' });
+        }
       } catch (e) {
         if (!(e instanceof ConfigError)) throw e;
         issues.push({ path: pathOfMessage(e.message, file), code: 'invalid', message: e.message, severity: 'error' });
@@ -374,13 +444,17 @@ export class ConfigStore implements ConfigAccess {
     return issues;
   }
 
-  put(next: Record<string, unknown>, ifRevision?: string): PutOutcome {
-    const cur = this.read();
-    if (ifRevision !== undefined && ifRevision !== cur.revision) return { status: 409, code: 'conflict', message: `the config file changed (revision ${cur.revision}, not ${ifRevision}); reload it` };
-    const { doc, issues } = this.prepare(next);
-    if (issues.some((i) => i.severity === 'error')) return { status: 422, body: { valid: false, issues } };
-    const revision = this.write(doc);
-    return { status: 200, body: { revision, issues, applied: this.appliedOf(doc) } };
+  async put(next: Record<string, unknown>, ifRevision?: string): Promise<PutOutcome> {
+    for (;;) {
+      const cur = this.read();
+      if (ifRevision !== undefined && ifRevision !== cur.revision) return { status: 409, code: 'conflict', message: `the config file changed (revision ${cur.revision}, not ${ifRevision}); reload it` };
+      const { doc, issues } = await this.prepare(next, cur.raw);
+      // Changed while its module files were imported: again, against the file as it is now.
+      if (this.read().revision !== cur.revision) continue;
+      if (issues.some((i) => i.severity === 'error')) return { status: 422, body: { valid: false, issues } };
+      const revision = this.write(doc);
+      return { status: 200, body: { revision, issues, applied: this.appliedOf(doc) } };
+    }
   }
 
   /** Change the file programmatically (a module's admin route); same atomic 0600 write, no secret checks. */
@@ -400,7 +474,8 @@ export class ConfigStore implements ConfigAccess {
     const cur = this.read();
     if (cur.parseError) throw new ConfigError(`${this.o.path} is not JSON: ${cur.parseError}`);
     const doc = fn(structuredClone(cur.raw) as Record<string, unknown>);
-    const issues = this.check(doc, 'all').filter((i) => i.severity === 'error');
+    // Synchronous (`ConfigAccess`): with the daemon's registries; module files written since its start were checked when written.
+    const issues = this.check(doc, 'all', this.daemon).filter((i) => i.severity === 'error');
     if (issues.length) return { ok: false, issues };
     return { ok: true, revision: this.write(doc) };
   }

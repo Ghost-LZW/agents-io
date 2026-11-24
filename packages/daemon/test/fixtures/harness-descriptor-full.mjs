@@ -46,3 +46,24 @@ export const builtinCli = { ...createHarness, cli: { 'tui-bridge': hello } };
 
 /** The same command name as createHarness, another function. */
 export const otherHello = { ...createHarness, cli: { 'acme-hello': async () => 0 } };
+
+/**
+ * One adapter per `config.share`, whichever of the two descriptors below creates it: it records
+ * each lifecycle call at globalThis.__sharedCalls[share] (`config.detach` gives it a detach).
+ */
+const sharedAdapter = (init) => {
+  const key = init.launch.share;
+  const all = (globalThis.__sharedAdapters ??= {});
+  if (!all[key]) {
+    const calls = ((globalThis.__sharedCalls ??= {})[key] = []);
+    const fake = new FakeHarness(async (t) => t.emit({ t: 'text.snapshot', text: 'ok', final: true }, { audience: 'answer' }));
+    const adapter = { id: 'shared', probe: () => fake.probe(), open: (args) => fake.open(args), dispose: async () => void calls.push('dispose') };
+    if (init.launch.detach) adapter.detach = async () => void calls.push('detach');
+    all[key] = adapter;
+  }
+  return all[key];
+};
+
+/** Two descriptors declaring differently whose `create`s return the same adapter. */
+export const sharedPlan = { declares: { modes: ['plan'] }, create: sharedAdapter };
+export const sharedCompact = { declares: { compact: { command: '/squash' } }, create: sharedAdapter };
