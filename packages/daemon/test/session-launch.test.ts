@@ -1,13 +1,13 @@
 import { mkdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { CodexHarness } from '@agents-io/harness-codex';
+import { CodexHarness, type CodexHarnessOptions } from '@agents-io/harness-codex';
 import type { Binding, BindingTable, HarnessAdapter, Policy, SessionLaunch } from '@agents-io/protocol';
 import { LaneUnavailableError } from '@agents-io/session';
 import { FakeChannel, FakeHarness } from '@agents-io/testkit';
 import { LocalClient } from '../src/client.js';
 import { resolveConfig, type HarnessInstance } from '../src/config.js';
-import { Gateway, InstanceHarness } from '../src/gateway.js';
+import { Gateway, InstanceHarness, buildHarness } from '../src/gateway.js';
 import { readTokenFile, tokenPath } from '../src/token.js';
 import { cleanups, tmp, until } from './helpers.js';
 
@@ -368,32 +368,35 @@ describe('session launch: Codex (§8.10)', () => {
   it('stdio: a session with env gets its own app-server (env merged, CODEX_HOME as its home), disposed with the lane; cwd only shares the instance #LA-3', async () => {
     const fx = fixture();
     const dispose = vi.spyOn(CodexHarness.prototype, 'dispose').mockResolvedValue();
-    cleanups.push(() => dispose.mockRestore());
+    const ownProcess = vi.spyOn(CodexHarness.prototype, 'ownProcess');
+    cleanups.push(() => {
+      dispose.mockRestore();
+      ownProcess.mockRestore();
+    });
     const w = await world({
       fx,
       raw: {
         harnesses: { claude: { use: 'claude-code' }, cx: { use: 'codex', env: { BASE: '1' }, transport: { kind: 'stdio' } } },
         agents: agents(fx, { cdx: { harness: 'cx', sessionParams: { cwdRoots: [fx.ws], envKeys: ['CODEX_HOME', 'FOO'], envPathRoots: { CODEX_HOME: [fx.homes] } } } }),
       },
-      // Each launched Codex instance (it has FOO) is a real CodexHarness, never started: only dispose is watched.
-      build: (i, fake) => new InstanceHarness(i, i.env.FOO ? new CodexHarness({ bin: '/nonexistent', env: i.env, transport: { kind: 'stdio' } }) : fake),
+      // The Codex instance is the real adapter, never started: the app-server it sets up for a session (ownProcess) and its dispose are watched.
+      build: (i, fake) => (i.name === 'cx' ? buildHarness(i) : new InstanceHarness(i, fake)),
     });
     const prep = (key: string, launch: SessionLaunch) => w.gw.prepareSession({ v: 1, type: 'session.prepare', id: 'x', sessionKey: key, agent: 'cdx', launch } as never);
     expect(prep('C1', { cwd: fx.a, env: { FOO: 'bar', CODEX_HOME: fx.h2 } })).toMatchObject({ ok: true });
-    const before = w.built.length;
     const lane = w.gw.lane('C1');
-    const own = w.built.slice(before);
-    expect(own).toHaveLength(1);
-    expect(own[0]).toMatchObject({ name: 'cx', kind: 'codex', env: { BASE: '1', FOO: 'bar', CODEX_HOME: fx.h2 }, codex: { transport: { kind: 'stdio' }, codexHome: fx.h2 } });
+    expect(ownProcess).toHaveBeenCalledTimes(1);
+    expect(ownProcess.mock.contexts[0]).toBe((w.gw.harness('cx') as InstanceHarness).inner);
+    const own = ownProcess.mock.results[0]!.value as unknown as { opts: CodexHarnessOptions };
+    expect(own.opts).toMatchObject({ env: { BASE: '1', FOO: 'bar', CODEX_HOME: fx.h2 }, transport: { kind: 'stdio' }, codexHome: fx.h2 });
     // Closed with its lane (a parked topic idling out, or the daemon stopping).
     await (w.gw as unknown as { closeLane(k: string, l: unknown, r: string): Promise<void> }).closeLane('C1', lane, 'test');
     expect(dispose).toHaveBeenCalledTimes(1);
 
     // cwd only: no own process.
     expect(prep('C2', { cwd: fx.b })).toMatchObject({ ok: true });
-    const n = w.built.length;
     w.gw.lane('C2');
-    expect(w.built.slice(n).filter((i) => i.name === 'cx' && i.env.FOO)).toHaveLength(0);
+    expect(ownProcess).toHaveBeenCalledTimes(1);
   });
 
   it('unix: a launch with env is launch_unsupported; cwd only is fine #LA-3', async () => {
@@ -404,10 +407,47 @@ describe('session launch: Codex (§8.10)', () => {
         harnesses: { claude: { use: 'claude-code' }, cx: { use: 'codex', transport: { kind: 'unix', spawn: 'own', stateDir: join(fx.d, 'cx') } } },
         agents: agents(fx, { cdx: { harness: 'cx', sessionParams: { cwdRoots: [fx.ws], envKeys: ['FOO'] } } }),
       },
+      // The real Codex adapter (never started) declares that its shared server takes no session env.
+      build: (i, fake) => (i.name === 'cx' ? buildHarness(i) : new InstanceHarness(i, fake)),
     });
     const prep = (key: string, launch: SessionLaunch) => w.gw.prepareSession({ v: 1, type: 'session.prepare', id: 'x', sessionKey: key, agent: 'cdx', launch } as never);
-    expect(prep('U1', { cwd: fx.a, env: { FOO: 'bar' } })).toMatchObject({ ok: false, code: 'launch_unsupported' });
+    expect(prep('U1', { cwd: fx.a, env: { FOO: 'bar' } })).toMatchObject({
+      ok: false,
+      code: 'launch_unsupported',
+      message: 'harness instance cx is a shared Codex app-server (unix transport); a session env cannot apply there (a cwd alone can)',
+    });
     expect(prep('U2', { cwd: fx.a })).toMatchObject({ ok: true });
+  });
+
+  it('unix, unavailable for now (an env: reference not set): a launch with env is still launch_unsupported and pins nothing; cwd only is fine; unavailable stdio and Claude Code instances take the env as before #LA-3', async () => {
+    const fx = fixture();
+    const missing = { K: 'env:AIO_TEST_UNSET_VAR' };
+    const params = { cwdRoots: [fx.ws], envKeys: ['FOO'] };
+    const w = await world({
+      fx,
+      raw: {
+        harnesses: {
+          claude: { use: 'claude-code' },
+          cx: { use: 'codex', env: missing, transport: { kind: 'unix', spawn: 'own', stateDir: join(fx.d, 'cx') } },
+          cs: { use: 'codex', env: missing, transport: { kind: 'stdio' } },
+          cc: { use: 'claude-code', env: missing },
+        },
+        agents: agents(fx, { cdx: { harness: 'cx', sessionParams: params }, sto: { harness: 'cs', sessionParams: params }, cla: { harness: 'cc', sessionParams: params } }),
+      },
+      // The real adapters (never started), which an unavailable instance cannot build.
+      build: (i, fake) => (i.name === 'claude' ? new InstanceHarness(i, fake) : buildHarness(i)),
+    });
+    expect(() => w.gw.harness('cx')).toThrow('harness instance cx is unavailable: harnesses.cx.env.K: environment variable AIO_TEST_UNSET_VAR is not set');
+    const prep = (key: string, agent: string, launch: SessionLaunch) => w.gw.prepareSession({ v: 1, type: 'session.prepare', id: 'x', sessionKey: key, agent, launch } as never);
+    expect(prep('U1', 'cdx', { cwd: fx.a, env: { FOO: 'bar' } })).toMatchObject({
+      ok: false,
+      code: 'launch_unsupported',
+      message: 'harness instance cx is a shared Codex app-server (unix transport); a session env cannot apply there (a cwd alone can)',
+    });
+    // Nothing was pinned: the key takes another launch.
+    expect(prep('U1', 'cdx', { cwd: fx.a })).toMatchObject({ ok: true, value: { created: true } });
+    expect(prep('S1', 'sto', { cwd: fx.a, env: { FOO: 'bar' } })).toMatchObject({ ok: true });
+    expect(prep('C1', 'cla', { cwd: fx.a, env: { FOO: 'bar' } })).toMatchObject({ ok: true });
   });
 });
 

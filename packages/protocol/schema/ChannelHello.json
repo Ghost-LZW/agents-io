@@ -213,6 +213,32 @@
         },
         "declaresSender": {
           "type": "boolean"
+        },
+        "openInbox": {
+          "type": "boolean"
+        },
+        "pacing": {
+          "type": "object",
+          "properties": {
+            "openDelayMs": {
+              "type": "number"
+            },
+            "previewDelayMs": {
+              "type": "number"
+            },
+            "holdAnswerUntilOpen": {
+              "type": "boolean"
+            },
+            "requireAnswerToOpen": {
+              "type": "boolean"
+            },
+            "openOnProcess": {
+              "type": "boolean"
+            },
+            "interruptButton": {
+              "type": "boolean"
+            }
+          }
         }
       }
     },

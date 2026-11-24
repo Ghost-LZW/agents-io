@@ -34,7 +34,7 @@ import {
   type Watch,
   type WatchDraft,
 } from '@agents-io/protocol';
-import { AsyncQueue } from '@agents-io/testkit';
+import { AsyncQueue } from '@agents-io/session';
 import type { ClientCommand, ServerFrame, SessionInfo } from './frames.js';
 import type { HelloResult } from './host.js';
 import type { VerifyResult } from './records.js';

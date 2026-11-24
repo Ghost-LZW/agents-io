@@ -27,6 +27,48 @@ export const ChannelCaps = Type.Object({
   evidence: Type.Array(Evidence),
   /** Can attach a sender identity (`SendOp.as`) to outbound messages and recover it on echo. */
   declaresSender: Type.Boolean(),
+  /**
+   * Anyone may write to the deployment here, with nothing in between deciding who can reach it
+   * (mail: any address on the internet), so a message from someone the deployment does not know
+   * is routine there, not a stranger to ask the owner about: the stranger approval module
+   * (`policy.strangers: "ask"`) leaves this channel's messages as routed. Default false.
+   */
+  openInbox: Type.Optional(Type.Boolean()),
+  /**
+   * How replies on this channel are best paced, as the adapter recommends (core-slimming G1:
+   * the gateway reads this instead of knowing the adapter). A channel entry's `openDelayMs` /
+   * `previewDelayMs` override the delays. Read when a session's compositor is made, so a
+   * bridge's pacing applies once its hello has arrived. Absent: the first message opens at
+   * once and carries a Stop control.
+   */
+  pacing: Type.Optional(
+    Type.Object({
+      /** Hold a turn's first message this long (ms); a quick answer then arrives whole. */
+      openDelayMs: Type.Optional(Type.Number()),
+      /** Show the process preview (`previewProgress`) after this delay, before the first message. */
+      previewDelayMs: Type.Optional(Type.Number()),
+      /** Answer text does not open the first message before `openDelayMs`. */
+      holdAnswerUntilOpen: Type.Optional(Type.Boolean()),
+      /**
+       * When the delay is above 0 and expires, wait for answer text instead of opening an empty card
+       * (the preview shows the turn meanwhile). Only for an adapter with `previewProgress`; a JSONL
+       * bridge has none, so its peer's is ignored.
+       */
+      requireAnswerToOpen: Type.Optional(Type.Boolean()),
+      /**
+       * With a delay above 0: the first message opens at the turn's first tool call, or once the
+       * delay expired with something to show (a tool, thinking or answer text), and lists the steps
+       * until the answer streams in; wins over `requireAnswerToOpen`. A channel entry's
+       * `openOnProcess` overrides it (a module channel that edits its message into the answer sets it there).
+       */
+      openOnProcess: Type.Optional(Type.Boolean()),
+      /**
+       * A Stop control on the streaming reply (default true); off where the preview carries it. Only
+       * an adapter with `previewProgress` can turn it off; a JSONL bridge's peer cannot.
+       */
+      interruptButton: Type.Optional(Type.Boolean()),
+    }),
+  ),
 });
 export type ChannelCaps = Static<typeof ChannelCaps>;
 
@@ -84,7 +126,7 @@ export const ProgressView = Type.Object({
    * the compositor's own, e.g. where a moved turn went). Absent: there is none — they are text so
    * far, which can be what the model said before a tool call; a turn that failed, was interrupted
    * or has an unknown outcome has none, even with a final snapshot (an idle-deadline stop's is what
-   * it said so far and a notice, HC-3b). An end that shows only answers says how the turn ended.
+   * it said so far and a notice, HC-8). An end that shows only answers says how the turn ended.
    */
   finalAnswer: Type.Optional(Type.Boolean()),
   startedAt: Type.Optional(Type.Number()),

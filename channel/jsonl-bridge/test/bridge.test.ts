@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { FakeChannel, runChannelConformance } from '@agents-io/testkit';
+import { FakeChannel, defaultChannelCaps, runChannelConformance } from '@agents-io/testkit';
 import { ChannelBridgeError, serveChannel, spawnChannel } from '../src/index.js';
 import { closeAll, fakeChild, pidLog, rawChild, route, run, waitFor } from './bridge-helpers.js';
 
@@ -195,6 +195,35 @@ describe('channel id pinning (channel-stamping)', () => {
     });
     const ok = await rawChild('', { acceptId: () => undefined });
     expect(ok.id).toBe('raw');
+  });
+
+  it("an inbound in one chunk with the hello's answer is stamped with that hello: emitted once the hello's id and caps are the bridge's, also after a failed first connect #ID-3", async () => {
+    const gate = join(mkdtempSync(join(tmpdir(), 'bridge-')), 'gate');
+    const ch = await rawChild('gated', { retryFirstConnect: true, backoff: { minMs: 20, maxMs: 40 } }, { GATE_FILE: gate, INBOUND: JSON.stringify({}), ONE_WRITE: '1' });
+    // Offline until a peer says hello: the bridge's own id, plain final text only.
+    expect([ch.id, ch.caps().defaultTier]).toEqual(['bridge', 'final']);
+    const seen: { id: string; connected: boolean; caps: unknown; envelope: string }[] = [];
+    const ctl = new AbortController();
+    const started = ch.start({
+      account: 'default', config: undefined, signal: ctl.signal, log: () => {},
+      emit: async (env) => (seen.push({ id: ch.id, connected: ch.state().connected, caps: ch.caps(), envelope: env.id }), { accepted: true }),
+    });
+    writeFileSync(gate, 'open');
+    await waitFor(() => seen.length === 1);
+    expect(seen).toEqual([{ id: 'raw', connected: true, caps: defaultChannelCaps, envelope: 'forged-1' }]);
+    ctl.abort();
+    await started;
+  });
+
+  it("an inbound in one chunk with a refused hello's answer is never emitted #ID-3", async () => {
+    const { file, pids } = pidLog();
+    const ch = await rawChild('', { acceptId: () => 'taken by another channel', retryFirstConnect: true, backoff: { minMs: 20, maxMs: 40 } }, { PIDS_FILE: file, INBOUND: JSON.stringify({}), ONE_WRITE: '1' });
+    expect(ch.state()).toMatchObject({ connected: false, error: expect.stringMatching(/refused: taken by another channel/) });
+    const r = run(ch);
+    // Every launch is refused: the first (before start) and those after.
+    await waitFor(() => pids().length >= 3);
+    expect(r.inbound).toEqual([]);
+    await r.stop();
   });
 
   it('a refused inbound is answered ok:true with {accepted:false} #ID-3', async () => {

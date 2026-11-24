@@ -38,6 +38,14 @@ import { Topic } from './topic.js';
  * message, exactly the local socket's frames — client frames (`client.ts`)
  * with the connection's console principal as origin, and after `host.hello`
  * (with the daemon's host token) the host frames (`host.ts`). Nothing else.
+ *
+ * Modules add endpoints of their own under the same rules, with their schemas in
+ * their package, not here: the routes of their `AdminContribution`
+ * (`admin-module.ts`). Lark bot provisioning (`POST /api/bots/lark`,
+ * `GET /api/bots/lark/:job`, the `unknown_job` and job `conflict` answers above) is
+ * the lark-bot module's (`LARK_BOT_ADMIN_ENDPOINTS` in `channel/lark-bot/src/admin.ts`,
+ * its JSON Schemas in `channel/lark-bot/schema/`). `ADMIN_ENDPOINTS` lists the core
+ * ones; the daemon's `adminEndpoints(registry)` lists them with its modules'.
  */
 
 export const ADMIN_WS_PATH = '/ws';
@@ -109,6 +117,18 @@ export const AdminAgent = Type.Object({
 });
 export type AdminAgent = Static<typeof AdminAgent>;
 
+/** A registered feature module (`ModuleManifest`, core-slimming G6). */
+export const AdminModule = Type.Object({
+  id: Type.String(),
+  /** Shipped with the daemon (`builtin`), or someone else's (`module`). */
+  origin: Type.Union([Type.Literal('builtin'), Type.Literal('module')]),
+  /** On for this run (its config section, an alias, or its default); a module that is off has no tools, commands or features. */
+  enabled: Type.Boolean(),
+  /** What the module shows of itself (`ModuleInstance.status`), while it runs. */
+  status: Type.Optional(Type.Unknown()),
+});
+export type AdminModule = Static<typeof AdminModule>;
+
 /** `GET /api/status`. */
 export const AdminStatus = Type.Object({
   /** Daemon package version. */
@@ -131,6 +151,8 @@ export const AdminStatus = Type.Object({
   queue: Type.Object({ head: Type.Number() }),
   /** The external MCP endpoint (config `externalMcp`), when it is listening: its URL and client names (never tokens). */
   externalMcp: Type.Optional(Type.Object({ url: Type.String(), clients: Type.Array(Type.String()) })),
+  /** The registered feature modules, in registration order (daemons before core-slimming G6 do not send it). */
+  modules: Type.Optional(Type.Array(AdminModule)),
 });
 export type AdminStatus = Static<typeof AdminStatus>;
 
@@ -268,94 +290,6 @@ export type AdminSession = Static<typeof AdminSession>;
 export const AdminSessions = Type.Object({ sessions: Type.Array(AdminSession) });
 export type AdminSessions = Static<typeof AdminSessions>;
 
-// ---- Lark bot provisioning -------------------------------------------------
-
-/**
- * `POST /api/bots/lark`: start creating a Feishu / Lark app the way
- * create-lark-bot does (the user scans a QR code to authorize; the app gets the
- * scopes, events and callbacks channel/lark-bot needs). Answer 202
- * `AdminLarkBotStarted`; 409 `conflict` while another job waits for a scan, when
- * the account already has a lark-bot channel, or when the variables its
- * credentials go to are set or read by another channel; 400 for a bad account.
- */
-export const AdminLarkBotRequest = Type.Object({
-  /** App / bot display name. */
-  name: Type.String(),
-  /** `data:` URI of the avatar image. */
-  avatar: Type.Optional(Type.String()),
-  /** Default `feishu`. */
-  domain: Type.Optional(Type.Union([Type.Literal('feishu'), Type.Literal('lark')])),
-  /** create-lark-bot presets; default `messaging`, `contact`. */
-  presets: Type.Optional(Type.Array(Type.String())),
-  /**
-   * Channel account name to add the bot as (default `default`): letters, digits,
-   * `.`, `_`, `-`, starting with a letter or digit, at most 64. One daemon runs one
-   * bot per account. Its credentials go to LARK_APP_ID / LARK_APP_SECRET /
-   * LARK_DOMAIN for `default`, else LARK_<ACCOUNT>_APP_ID / … (upper case, other
-   * characters as `_`; `proj-a` → LARK_PROJ_A_APP_ID).
-   */
-  account: Type.Optional(Type.String()),
-  /** Add a `lark-bot` channel for it to the config (default true). */
-  addChannel: Type.Optional(Type.Boolean()),
-  /** Make the authorizing user an owner (default true). */
-  owner: Type.Optional(Type.Boolean()),
-});
-export type AdminLarkBotRequest = Static<typeof AdminLarkBotRequest>;
-
-export const AdminLarkBotStarted = Type.Object({ job: Type.String() });
-export type AdminLarkBotStarted = Static<typeof AdminLarkBotStarted>;
-
-export const AdminLarkBotJobState = Type.Union([
-  Type.Literal('starting'),
-  /** Show `qr`; the user scans it with the Feishu / Lark app. */
-  Type.Literal('waiting_scan'),
-  /** Scanned; creating and configuring the app. */
-  Type.Literal('configuring'),
-  Type.Literal('succeeded'),
-  Type.Literal('failed'),
-  /** The QR code expired before a scan. */
-  Type.Literal('expired'),
-]);
-export type AdminLarkBotJobState = Static<typeof AdminLarkBotJobState>;
-
-/** `GET /api/bots/lark/:job` (404 `unknown_job`). Poll until a final state. */
-export const AdminLarkBotJob = Type.Object({
-  job: Type.String(),
-  state: AdminLarkBotJobState,
-  /** While `waiting_scan`: the payload to render as a QR code (a URL), and when it stops working (Unix ms). */
-  qr: Type.Optional(Type.Object({ payload: Type.String(), expiresAt: Type.Optional(Type.Number()) })),
-  /** Progress line for the UI. */
-  message: Type.Optional(Type.String()),
-  /** On `succeeded`. Credentials went to the daemon's env file; only their `env:NAME` references are here. */
-  result: Type.Optional(
-    Type.Object({
-      appId: Type.String(),
-      domain: Type.Union([Type.Literal('feishu'), Type.Literal('lark')]),
-      botName: Type.Optional(Type.String()),
-      account: Type.String(),
-      /** The `env:NAME` references of this account's credentials, as the channel entry uses them: `{ appId: "env:LARK_PROJ_A_APP_ID", … }`. */
-      env: Type.Record(Type.String(), Type.String()),
-      /** The owner key added (`lark-bot:<union_id>`), when `owner`. */
-      owner: Type.Optional(Type.String()),
-      /** A channel was added to the config (the daemon starts it when the config applies live). */
-      channelAdded: Type.Boolean(),
-      /**
-       * The added channel was started at once and had not failed (`console.liveChannels`, as
-       * `AdminChannelsApplied.started`); false when it failed to start (the message says why);
-       * absent when it starts at the next start.
-       */
-      channelStarted: Type.Optional(Type.Boolean()),
-      /** Console URL to finish what could not be automated (e.g. publishing the app version). */
-      consoleUrl: Type.Optional(Type.String()),
-    }),
-  ),
-  error: Type.Optional(Type.Object({ code: Type.String(), message: Type.String() })),
-  /** Unix ms. */
-  createdAt: Type.Number(),
-  updatedAt: Type.Number(),
-});
-export type AdminLarkBotJob = Static<typeof AdminLarkBotJob>;
-
 // ---- endpoint table --------------------------------------------------------
 
 export interface AdminEndpoint {
@@ -371,7 +305,7 @@ export interface AdminEndpoint {
   public?: boolean;
 }
 
-/** Every admin HTTP endpoint, for clients and route tables. */
+/** Every core admin HTTP endpoint, for clients and route tables (modules list theirs, see the header). */
 export const ADMIN_ENDPOINTS = [
   { method: 'POST', path: '/api/login', body: AdminLoginRequest, status: 200, response: AdminLoginResult, public: true },
   { method: 'GET', path: '/api/status', status: 200, response: AdminStatus },
@@ -381,6 +315,4 @@ export const ADMIN_ENDPOINTS = [
   { method: 'GET', path: '/api/explain/:inputId', status: 200, response: AdminExplain },
   { method: 'GET', path: '/api/queue', status: 200, response: AdminQueue },
   { method: 'GET', path: '/api/sessions', status: 200, response: AdminSessions },
-  { method: 'POST', path: '/api/bots/lark', body: AdminLarkBotRequest, status: 202, response: AdminLarkBotStarted },
-  { method: 'GET', path: '/api/bots/lark/:job', status: 200, response: AdminLarkBotJob },
 ] as const satisfies readonly AdminEndpoint[];

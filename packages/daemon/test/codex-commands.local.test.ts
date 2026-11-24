@@ -7,6 +7,7 @@ import { Ingress, MemorySessionLog, defaultPolicy } from '@agents-io/session';
 import { FakeChannel, FakeHarness, fakeEnvelope, type FakeTurnScript } from '@agents-io/testkit';
 import { resolveConfig, type HarnessInstance } from '../src/config.js';
 import { Gateway, InstanceHarness } from '../src/gateway.js';
+import { CODEX_DECLARES } from './declares.js';
 import { cleanups, until } from './gateway-helpers.js';
 
 /* `/commands` in a chat with the deployment: the owner operates the session and its harness. */
@@ -21,13 +22,13 @@ class MarkedChannel extends FakeChannel {
   }
 }
 
-async function setup(o: { fixed?: boolean; script?: FakeTurnScript; marked?: boolean; codex?: boolean } = {}) {
+async function setup(o: { fixed?: boolean; script?: FakeTurnScript; marked?: boolean; codex?: boolean; helper?: 'codex' | 'claude-code' } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'aio-cmd-'));
   const channelId = o.marked ? 'lark-bot' : 'fake';
   const base = resolveConfig(
     {
       ...(o.codex ? { harnesses: { codex: { use: 'codex' as const }, 'claude-code': { use: 'claude-code' as const } }, defaultHarness: 'codex' } : {}),
-      agents: { helper: { harness: o.codex ? 'codex' : 'claude-code' }, coder: { harness: 'claude-code', model: 'sonnet' } },
+      agents: { helper: { harness: o.helper ?? (o.codex ? 'codex' : 'claude-code') }, coder: { harness: 'claude-code', model: 'sonnet' } },
       defaultAgent: 'helper',
       policy: { owners: [`${channelId}:alice`], ...(o.fixed ? { ownerSessionKey: 'main' } : {}), strangers: 'ask' },
       local: { principal: `${channelId}:alice` },
@@ -38,7 +39,10 @@ async function setup(o: { fixed?: boolean; script?: FakeTurnScript; marked?: boo
   const config = { ...base, socketPath: join(dir, 'run', 'aio.sock') };
   const chat = o.marked ? new MarkedChannel(channelId) : new FakeChannel(channelId);
   const harness = new FakeHarness(o.script);
-  const gw = await Gateway.start({ config, harness, log: new MemorySessionLog(), ...(o.marked ? { channelAdapter: () => chat } : { channels: [{ adapter: chat }] }), logger: () => {} });
+  // With Codex configured, its instance is a fake declaring what the Codex adapter declares (Plan mode, the owner's profile switch).
+  const codex = Object.assign(new FakeHarness(o.script), CODEX_DECLARES);
+  const harnesses = o.codex ? { buildHarness: (i: HarnessInstance) => new InstanceHarness(i, i.kind === 'codex' ? codex : harness) } : { harness };
+  const gw = await Gateway.start({ config, ...harnesses, log: new MemorySessionLog(), ...(o.marked ? { channelAdapter: () => chat } : { channels: [{ adapter: chat }] }), logger: () => {} });
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   cleanups.push(() => gw.stop());
   let nextMessage = 0;
@@ -77,7 +81,7 @@ describe('codex-commands', () => {
   });
 
   it('rejects Plan and bypass commands on a non-Codex agent', async () => {
-    const w = await setup();
+    const w = await setup({ codex: true, helper: 'claude-code' });
     await w.say('/plan on');
     await w.say('/bypass off');
     await until(() => w.replies().length === 2);

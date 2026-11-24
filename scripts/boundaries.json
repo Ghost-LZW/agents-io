@@ -1,0 +1,29 @@
+{
+  "$comment": "Classification for scripts/boundaries.mjs (docs/design/core-slimming §6). role: core = the kernel every host gets; module = an adapter the kernel reaches only through protocol interfaces; test = test support, never imported by production code; example = may import anything. `may` lists the workspace packages (by directory) a package's src may import. `bundle` names the files of a core package allowed to import modules: the composition root that registers the built-in modules.",
+  "packages": {
+    "packages/protocol": { "role": "core", "may": [] },
+    "packages/session": { "role": "core", "may": ["packages/protocol"] },
+    "packages/host-mcp": { "role": "core", "may": ["packages/protocol", "packages/session"] },
+    "packages/daemon": {
+      "role": "core",
+      "may": ["packages/protocol", "packages/session", "packages/host-mcp"],
+      "bundle": ["src/bundle.ts"]
+    },
+    "packages/testkit": { "role": "test", "may": ["packages/protocol"] },
+    "packages/daemon-e2e": {
+      "role": "test",
+      "may": ["packages/protocol", "packages/session", "packages/host-mcp", "packages/daemon", "packages/testkit", "harness/codex"]
+    },
+    "harness/claude-code": { "role": "module", "may": ["packages/protocol"] },
+    "harness/codex": { "role": "module", "may": ["packages/protocol"] },
+    "channel/lark-bot": { "role": "module", "may": ["packages/protocol"] },
+    "channel/mail": { "role": "module", "may": ["packages/protocol"] },
+    "channel/jsonl-bridge": { "role": "module", "may": ["packages/protocol"] },
+    "examples/dev-gateway": { "role": "example", "may": ["*"] }
+  },
+  "vendor": {
+    "$comment": "Names that mean a core file knows a concrete module: identifiers containing these words (case-insensitive) in code, and string literals equal to a module id (not `mail`: it is also a conversation kind).",
+    "identifierWords": ["lark", "feishu", "codex", "claude", "imap", "smtp"],
+    "literals": ["lark-bot", "lark", "feishu", "codex", "claude-code"]
+  }
+}

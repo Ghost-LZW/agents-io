@@ -91,7 +91,7 @@ export interface ClaudeCodeOptions {
    */
   firstByteFallbackModel?: string;
   /**
-   * Idle deadline (ms; default 90000, `0` = off; HC-3b). Once a turn has had output, this long with
+   * Idle deadline (ms; default 90000, `0` = off; HC-8). Once a turn has had output, this long with
    * no CLI message while it waits on the model (no tool running, no open permission request, not
    * compacting, not a harness command) ends the wait. When no tool that may change something ran in
    * the turn (only {@link READ_ONLY_TOOLS}), the CLI is interrupted and goes on on the next fallback
@@ -107,7 +107,7 @@ export interface ClaudeCodeOptions {
    * How long the idle deadline's interrupt waits for the CLI to give back a follow-up it has not
    * started (ms; default 2000). One it does not give back in time is carried, not consumed: never
    * written again while the CLI may hold it, and the CLI's run of it belongs to the next turn that is
-   * given its inputs (HC-3b).
+   * given its inputs (HC-8).
    */
   idleWithdrawWaitMs?: number;
 }

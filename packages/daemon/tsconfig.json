@@ -6,7 +6,6 @@
     { "path": "../protocol" },
     { "path": "../session" },
     { "path": "../host-mcp" },
-    { "path": "../testkit" },
     { "path": "../../harness/claude-code" },
     { "path": "../../harness/codex" },
     { "path": "../../channel/lark-bot" },

@@ -1,9 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, rmSync } from 'node:fs';
-import { DatabaseSync } from 'node:sqlite';
 import { dirname, join, resolve as resolvePath } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { generateTopicTitle, topicTitlePrompt } from './topic-title.js';
+import { fileURLToPath } from 'node:url';
 import {
   PROTOCOL_VERSION,
   formatAddress,
@@ -12,7 +10,10 @@ import {
   type AdminSession,
   type AdminSessions,
   type AdminChannelsApplied,
+  type AdminContext,
   type AdminStatus,
+  type BlobAccess,
+  type BuiltChannel as CreatedChannel,
   type ChainExplanation,
   type ChainLink,
   type ChannelAdapter,
@@ -26,6 +27,7 @@ import {
   type HarnessOpenArgs,
   type HarnessSession,
   type HostRequestFrame,
+  type IdentityEntry,
   type InboundEnvelope,
   type InputRecord,
   type ScheduleDraft,
@@ -33,7 +35,10 @@ import {
   type LiveSpeaker,
   type LiveStartArgs,
   type LoopGuardTrip,
-  type HarnessFactory,
+  type HarnessDeclarations,
+  type HarnessFactoryInit,
+  type HarnessTakeover,
+  type HarnessTakeoverArgs,
   type Origin,
   type Policy,
   type NativeClient,
@@ -41,11 +46,16 @@ import {
   type ReplyRoute,
   type SessionEvent,
   type ExternalSender,
-  type Resolver,
+  type KernelLaneHarness,
+  type KernelPreset,
+  type KernelRunOverrides,
+  type KernelSendResult,
+  type KernelSessionRun,
   type RunSpec,
   type SessionLaunch,
   type SessionPrepare,
   type SessionPrepareResult,
+  type SessionEnvSupport,
   type SessionCompact,
   type SessionCompactResult,
   type SessionPrewarm,
@@ -76,9 +86,11 @@ import {
   Router,
   SqliteSessionLog,
   SOURCE_MISMATCH,
-  TOPIC_TOOLS_HINT,
+  TOPIC_ALREADY_HERE,
+  TOPIC_HANDED_ALREADY,
   TopicError,
   TopicRegistry,
+  FinalFiringError,
   ScheduleDispatcher,
   ScheduleError,
   ScheduleRegistry,
@@ -109,38 +121,37 @@ import {
   type TopicRecord,
   topicContext,
   topicView,
+  handoverRefusal,
   settleLeftoverInputs,
   withholding,
 } from '@agents-io/session';
-import { HostMcpServer, HostTools, TOOL_NAMES, ToolError, agentIdentity, type TopicHandover } from '@agents-io/host-mcp';
-import { ClaudeCodeHarness, findOnPath, type ClaudeCodeHarnessConfig } from '@agents-io/harness-claude-code';
-import { CodexHarness, type CodexProfile } from '@agents-io/harness-codex';
-import { loadChannelModule } from './channel-module.js';
-import { LarkBotAdapter } from '@agents-io/channel-lark-bot';
-import { MailChannel, type MailChannelConfig } from '@agents-io/channel-mail';
-import { spawnChannel, type BridgedChannel, type BridgeState } from '@agents-io/channel-jsonl-bridge';
-import { ConfigError, RESERVED_CHANNEL_IDS, UNGRANTED_EVIDENCE, agentSpec, configTable, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type PresetConfig, type ResolvedChannel } from './config.js';
-import { ConsoleServer } from './console.js';
+import { HostMcpServer, HostTools, ToolError, agentIdentity, agentOrigin, scheduleRouteRefusal, toolCatalog, type TopicHandover } from '@agents-io/host-mcp';
+import { builtinChannels, builtinHarnesses, builtinModules } from './bundle.js';
+import { badChannelAdapter, loadHarnessModule } from './module-loader.js';
+import { ConfigError, EMBEDDED_HARNESS, UNGRANTED_EVIDENCE, agentSpec, configTable, consoleSettings, resolveModules, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type PresetConfig, type ResolvedChannel } from './config.js';
+import { ConsoleServer, type ContributedRoute } from './console.js';
+import type { ChannelRegistry, DefaultEvidence } from './channel-registry.js';
+import type { HarnessRegistry } from './harness-registry.js';
 import { ConfigStore, canonical } from './console-config.js';
-import { LarkBotJobs } from './provision.js';
 import type { ClientCommand, SessionInfo } from './frames.js';
-import { HostService, isHostOrigin } from './host.js';
+import { HostService, isHostOrigin, type CalloutHook } from './host.js';
 import { LocalServer } from './local-server.js';
 import { privateDb, privateDir } from './private.js';
-import { blobResolvers, type MediaResolvers } from './media.js';
 import { DaemonRecords, type CauseRecord, type OutboundRecord } from './records.js';
-import { ExternalMcp } from './external-mcp.js';
 import { checkLaunch, launchView, sameLaunch, type LaunchCheck } from './launch.js';
 import { RUN_RULE, Runs, type RunOverrides } from './runs.js';
-import { Strangers } from './strangers.js';
-import { runCommand, type CommandHost } from './commands.js';
-import { ClaudeTuiService } from './tui-claude.js';
+import { runCommand, type CommandHost, type CommandTable } from './commands.js';
+import { ModuleHost, ModuleRegistry, kernelContext, type KernelBackend, type ResolvedModule } from './modules.js';
+import { ephemeralTurn } from './ephemeral-turn.js';
 import { MAX_REPLAY_TIMES, TEST_HOOKS_ENV, TestHooks } from './test-hooks.js';
 import { consoleUrlPath, loadOrCreateTokenFile, removeTokenFile, TokenError, tokenPath, writeTokenFile } from './token.js';
 
 export type LogFn = (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
 
-/** An in-process channel handed to the gateway (tests and e2e scripted ends). */
+/** The log without `GatewayOptions.logger`: stderr. */
+const defaultLog: LogFn = (level, msg) => console.error(`[aio] ${level}: ${msg}`);
+
+/** An in-process channel handed to the gateway (an embedder's adapter, tests and e2e scripted ends). */
 export interface ExtraChannel {
   adapter: ChannelAdapter;
   account?: string;
@@ -149,13 +160,30 @@ export interface ExtraChannel {
 
 export interface GatewayOptions {
   config: Config;
-  /** Use this harness for every instance instead of building them from the config (tests). */
+  /**
+   * Use this harness for every instance instead of building them from the config (tests; the
+   * embedder's adapter of a kernel with no harness kind, `coreRegistries`: the config's one instance
+   * `EMBEDDED_HARNESS` stands for it).
+   */
   harness?: HarnessAdapter;
   /** Build instance adapters with this instead of `buildHarness` (tests). */
   buildHarness?: (instance: HarnessInstance) => HarnessAdapter;
-  /** In-process channels besides the configured ones. */
+  /** The harness kinds instances are built from (default the built-in ones, `bundle.ts`): the registry the config was resolved with. */
+  harnessRegistry?: HarnessRegistry;
+  /**
+   * The channel types configured channels are built from (`ChannelModule.create`; default the
+   * built-in ones, `bundle.ts`): the registry the config was resolved with. It also says who owns
+   * an entry's channel id and the evidence an entry gives without a grant.
+   */
+  channelRegistry?: ChannelRegistry;
+  /**
+   * The feature modules (`ModuleManifest`; default the built-in ones, `bundle.ts`, none yet): the
+   * registry the config was resolved with (`Config.modules` names exactly its modules).
+   */
+  moduleRegistry?: ModuleRegistry;
+  /** In-process channels besides the configured ones (with `coreRegistries`, the only ones: no channel type is registered). */
   channels?: ExtraChannel[];
-  /** Build a configured channel's adapter with this instead of the built-in one when it returns one (embedding, tests). */
+  /** Build a configured channel's adapter with this instead of its type's `create` when it returns one (embedding, tests). */
   channelAdapter?: (ch: ResolvedChannel) => ChannelAdapter | undefined;
   /**
    * Hooks that replace defaultPolicy's. A `Policy.admit` here is legacy: it then
@@ -204,7 +232,11 @@ export interface GatewayOptions {
 /** Outcome of a local command, mapped 1:1 onto a `result` frame. */
 export type Outcome = { ok: true; value: unknown } | { ok: false; code: string; message: string };
 
-/** Owner chat overrides of one session's future turns (`/preset`, `/model`, `/effort`, `/plan`, `/bypass`), kept in the records. */
+/**
+ * What is set for one session's future turns (`KernelContext.runConfig.set`: the owner-commands
+ * module's `/preset`, `/model`, `/effort`, `/plan`, `/bypass`), kept in the records (flag
+ * `run:<sessionKey>`) and applied over the agent's policy's plan (`withRunOverride`).
+ */
 interface RunOverride {
   preset?: string;
   model?: string;
@@ -226,10 +258,12 @@ interface RunningChannel {
   source?: ResolvedChannel;
   /** `start` returned or rejected: the channel no longer runs and is not retried. */
   ended?: boolean;
-  /** A bridge reported its connection state (it has connected or failed a first connect). */
+  /** It reported its connection state (`ChannelInit.onState`: a bridge has connected or failed a first connect). */
   reported?: boolean;
-  /** Which adapter its channel id belongs to (channel-stamping F4, {@link channelOwner}). */
+  /** Which adapter its channel id belongs to (channel-stamping F4, {@link ChannelOwner}). */
   owner: ChannelOwner;
+  /** What it gives without an `evidence` grant on its entry (E3): its type's registration, `caps` for an embedder's adapter. */
+  defaultEvidence: DefaultEvidence;
   /** Envelopes refused for claiming another (channel, account) or reply route. */
   rejected: number;
   /** Envelopes whose evidence was capped to `none`. */
@@ -239,30 +273,18 @@ interface RunningChannel {
 }
 
 /**
- * Who a channel id belongs to: the built-in type (`lark-bot`, `mail`), one bridge
- * program (`bridge:` command and args), one module (`module:` file and export), or, for
- * an adapter the embedder passes (`GatewayOptions.channels`), its class (several bots
- * of one adapter class are several objects). Channels sharing an id must share an
- * owner; only their accounts differ.
+ * Who a channel id belongs to: for a configured channel, its type's say
+ * (`ChannelRegistry.owner`: the type, e.g. `lark-bot`; one bridge program, `bridge:` command
+ * and args; one module, `module:` file and export), or, for an adapter the embedder passes
+ * (`GatewayOptions.channels`), its class (several bots of one adapter class are several
+ * objects). Channels sharing an id must share an owner; only their accounts differ.
  */
 type ChannelOwner = string | Function;
 
-function channelOwner(cfg: ResolvedChannel): string {
-  switch (cfg.type) {
-    case 'lark-bot':
-    case 'mail':
-      return cfg.type;
-    case 'bridge':
-      return `bridge:${JSON.stringify([cfg.command, cfg.args ?? []])}`;
-    case 'module':
-      return `module:${JSON.stringify([cfg.module, cfg.export ?? null])}`;
-  }
-}
-
 const ownerName = (o: ChannelOwner) => (typeof o === 'string' ? o : `embedded adapter ${o.name || '(anonymous class)'}`);
 
-/** Bridge and module channels give strong evidence only when the entry grants it. */
-const grantedByDefault = (o: ChannelOwner) => typeof o !== 'string' || o === 'lark-bot' || o === 'mail';
+/** A connection state a channel reports (`ChannelInit.onState`). */
+type ChannelState = { connected: boolean; error?: string };
 
 const DAEMON_VERSION: string = (() => {
   try {
@@ -273,13 +295,12 @@ const DAEMON_VERSION: string = (() => {
 })();
 
 /** Local ends post to this route; no adapter renders it, they read the stream instead. */
-/** The agent has the session_* tools (all tools, or a list naming one). */
-const hasTopicTools = (a: AgentConfig | undefined): boolean => !!a?.tools && (!a.toolNames || a.toolNames.some((n) => n.startsWith('session_')));
-
 /** `Gateway.accept`'s refusal while stopping: "not now", never `permanent` (IN-7). */
 const GATEWAY_STOPPING = 'gateway stopping';
 /** U20: why a scoped send was held when the host could not answer. */
 const HOST_UNAVAILABLE = 'host_unavailable';
+/** `Schedule.createdBy` of a schedule a session's agent set: `session:<key>` (`agentIdentity`). */
+const AGENT_CREATOR = agentIdentity('');
 /** U20: the largest text-like attachment whose text the exit check gets. */
 const MAX_ATTACHMENT_TEXT = 64 * 1024;
 /** U20: attachments whose text the exit check gets (`text/*`, JSON, Markdown, CSV). */
@@ -331,19 +352,39 @@ export class Gateway {
   readonly schedules: ScheduleDispatcher;
   /** Inbound media (channels put, harnesses read). */
   readonly blobs: FsBlobStore;
+  /** The blob store as harness adapters get it (`HarnessFactoryInit.blobs`, the built-in ones too): read-only, bound. */
+  readonly harnessBlobs: BlobAccess;
+  /** The harness kinds (`GatewayOptions.harnessRegistry`): how instances are built, and what each kind declares. */
+  readonly harnessRegistry: HarnessRegistry;
+  /** The channel types (`GatewayOptions.channelRegistry`): how configured channels are built, who owns their ids, their default evidence. */
+  readonly channelRegistry: ChannelRegistry;
+  /** The feature modules (`GatewayOptions.moduleRegistry`). */
+  readonly moduleRegistry: ModuleRegistry;
+  /** The modules of this run: set up before the gateway is built, started after its channels and sockets, stopped first. */
+  readonly modules: ModuleHost;
+  /** The chat commands: the kernel's, then the active modules'. */
+  private readonly commandTable: CommandTable;
+  /** Extra identity map entries by who set them (each module's: the stranger approval's guests), merged into the router's. */
+  private readonly extraIdentities = new Map<string, IdentityEntry[]>();
   /** Host output tools, when some agent has `tools` on; mounted over MCP into those agents' harness bindings only. */
   readonly tools: HostTools | undefined;
   private readonly mcp: HostMcpServer | undefined;
-  /** The external MCP endpoint (config `externalMcp`), once listening. */
-  private externalMcp: { endpoint: ExternalMcp; url: string } | undefined;
-  /** Sends of external clients in flight: who, for the outbound record when they settle. */
+  /** The names of the tools the endpoint offers, in order (`agentTools` for `tools: true`), once asked. */
+  private catalogNames: string[] | undefined;
+  /**
+   * Sends for clients outside the daemon in flight (the external MCP module's, `KernelContext.send`
+   * `external`): who, taken into the in-flight mark (`sendTime`) for the outbound record.
+   */
   private readonly externalSends = new Map<string, ExternalSender>();
+  /**
+   * An agent's scheduled messages while they are sent (`sendScheduled`): the firing as the turn they
+   * come from, for the exit check only (`exitCheck`), as the agent's send_message's turn is for its.
+   */
+  private readonly firings = new Map<string, TurnContext>();
   /** The durable host inbound queue (`on: "host"` rules), in the log's database. */
   readonly hostQueue: HostQueue;
-  /** `policy.strangers: "ask"`: messages from people the deployment does not know are asked about (decision 15). */
-  private readonly strangers: Strangers | undefined;
-  /** Claude Code TUIs attached to sessions (decision 15, S2). */
-  private readonly claudeTui: ClaudeTuiService;
+  /** Sessions a harness's own terminal UI holds (`HarnessAdapter.takeover`, decision 15): the instance it stands in for. */
+  private readonly takeovers = new Map<string, { instance: string; takeover: HarnessTakeover }>();
   /** Who sent each channel message (`input.verify`), settled deliveries, session → agent. */
   readonly records: DaemonRecords;
   /** The host protocol on the local socket. */
@@ -360,6 +401,8 @@ export class Gateway {
   private readonly instances = new Map<string, HarnessAdapter>();
   /** What the factories of `use: "module"` instances returned, by instance name (loaded at start). */
   private readonly moduleAdapters = new Map<string, HarnessAdapter>();
+  /** What the embedder's `GatewayOptions.buildHarness` returned (`runDeclarations`). */
+  private readonly embedderBuilt = new WeakSet<HarnessAdapter>();
   /** Adapters of configured agents (their cwd and instructions over the instance's). */
   private readonly agentAdapters = new Map<string, HarnessAdapter>();
   private readonly lanes = new Map<string, Lane>();
@@ -393,22 +436,31 @@ export class Gateway {
   private consoleFile: string | undefined;
   /** The config file as the console edits it (when the config came from a file). */
   readonly configStore: ConfigStore | undefined;
-  readonly larkBots: LarkBotJobs | undefined;
+  /** What the channel types' admin contributions mounted with the console (`ChannelModule.admin`), ended with it. */
+  private readonly adminMounts: { type: string; close?(): void }[] = [];
   readonly startedAt = Date.now();
   private readonly log: LogFn;
   private stopped = false;
   /** Parked topic sessions whose lane closes when this fires (`topics.parkedIdleMs`). */
   private readonly parkedTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  private readonly titleJobs = new Set<string>();
 
-  private constructor(private readonly o: GatewayOptions) {
+  private constructor(
+    private readonly o: GatewayOptions,
+    modules: ModuleHost,
+  ) {
     const c = o.config;
     // The default harness is built below and captures its media resolvers now.
     this.blobs = new FsBlobStore(c.blobs);
+    this.harnessBlobs = readOnlyBlobs(this.blobs);
+    this.harnessRegistry = o.harnessRegistry ?? builtinHarnesses;
+    this.channelRegistry = o.channelRegistry ?? builtinChannels;
+    this.moduleRegistry = o.moduleRegistry ?? builtinModules;
+    this.modules = modules;
+    this.commandTable = modules.commandTable();
     // The default instance must be usable (e.g. its env refs set); others fail when a turn names them.
     // A module default is checked in `start`, once its module is loaded.
     if (o.harness || o.buildHarness || c.harnesses[c.defaultHarness]?.kind !== 'module') this.harness();
-    this.log = o.logger ?? ((level, msg) => console.error(`[aio] ${level}: ${msg}`));
+    this.log = o.logger ?? defaultLog;
     for (const w of c.warnings ?? []) this.log('warn', `config: ${w}`);
     // Before anything opens: a bad token file fails the start without leaving handles behind.
     this.token = o.token ?? this.hostToken(o.tokenFile ?? c.host?.tokenFile);
@@ -465,8 +517,8 @@ export class Gateway {
       ...base,
       // The router's identity maps (the owners config; a host's map once one is pushed).
       identify: async (a) => router.identify(a),
-      // With `strangers: ask`, what a non-owner's turn asks for is asked of the owner, in their chat (decision 15).
-      resolve: async (req, ctx, extra) => this.askOwner(ctx) ?? base.resolve(req, ctx, extra),
+      // The modules' resolvers first (the stranger approval: a guest's turn asks the owner, in their chat, decision 15).
+      resolve: async (req, ctx, extra) => modules.resolver(ctx) ?? base.resolve(req, ctx, extra),
       // The host (authenticated with the token) may interrupt and cancel what it started and what it watches.
       control: async (a) => (isHostOrigin(a.origin) ? 'allow' : base.control(a)),
       ...o.policy,
@@ -526,9 +578,13 @@ export class Gateway {
       hub: this.hub,
       policy: this.policy,
       store: this.records,
+      // DL-1: the outcome, the outbound index and delivery.settled commit together (records share the log's connection).
+      atomic: log instanceof SqliteSessionLog && this.records.db === log.db,
       // Which turn sent which platform message (the outbound index), and explain of a side effect by operationId.
-      atSend: (d) => this.provenanceAtSend(d),
+      atSend: (d) => this.sendTime(d),
       onSettled: (d, rec, atSend) => {
+        // The index first: part of the settlement's transaction (DL-1), its error fails the settlement before anything else changed.
+        this.indexOutbound(d, rec, atSend as SendTime | undefined);
         // U20: taken by the exit check, held or denied (never sent): the same for the agent.
         const taken = rec.status === 'held' || rec.denied === true;
         // U20: a held answer is told to the agent before its next turn.
@@ -537,7 +593,6 @@ export class Gateway {
         if (taken && (d.kind === 'question' || d.kind === 'request') && d.requestId !== undefined) {
           this.lanes.get(d.sessionKey)?.cancelRequest(d.requestId, heldText(rec.reason, '宿主拿走了这张卡，没有发出'));
         }
-        this.indexOutbound(d, rec, atSend as OutboundRecord['provenance']);
       },
       // Agent-authored sends carry their hop out-of-band where the channel can (mail X-Agents-IO-Hop).
       causeOf: (d) => this.sendCause(d.sessionKey, d.turnId),
@@ -576,7 +631,7 @@ export class Gateway {
       compactSession: (f, origin) => this.compactSession(f, origin),
       prewarmSession: (f) => this.prewarmSession(f),
       calloutTimeouts: { resolve: c.hostCallouts.resolveTimeoutMs, review: c.hostCallouts.reviewTimeoutMs, outbound: c.hostCallouts.outboundTimeoutMs, external: c.hostCallouts.externalTimeoutMs },
-      externalMcp: () => this.externalMcp !== undefined,
+      moduleFeatures: () => this.modules.features(),
       explain: (id, chain) => this.explain(id, chain),
       testHooks: () => this.testHooks !== undefined,
       testReplay: (name, f) => this.testReplay(name, f),
@@ -586,14 +641,6 @@ export class Gateway {
       onScope: () => this.leaveScopedLives(),
       ...(o.hostPush?.timeoutMs !== undefined ? { pushTimeoutMs: o.hostPush.timeoutMs } : {}),
       ...(o.hostPush?.retryMs !== undefined ? { pushRetryMs: o.hostPush.retryMs } : {}),
-    });
-    this.claudeTui = new ClaudeTuiService({
-      dir: join(c.dataDir, 'tui'),
-      // The bridge runs as this CLI (`aio tui-bridge`), next to this module in dist/.
-      cli: fileURLToPath(new URL('./cli.js', import.meta.url)),
-      fileOf: (ref) => this.blobs.stat(ref),
-      onEnd: (h, reason) => this.log('info', `${h.sessionKey}: terminal UI left (${reason}); the session goes on headless`),
-      log: (level, msg) => this.log(level, msg),
     });
     // Watches live next to the log (same SQLite file), so they and their digest buffers survive a restart.
     const registry = o.watches ?? new WatchRegistry(log instanceof SqliteSessionLog ? { db: log.db } : {});
@@ -611,69 +658,42 @@ export class Gateway {
       replyRoute: (key) => this.homeRoute(key),
       send: (s, operationId) => this.sendScheduled(s, operationId),
       toHost: (s, input) => this.scheduledToHost(s, input),
-      onError: (err, id) => this.log('warn', `schedule ${id}: ${(err as Error).message}`),
+      onError: (err, id, retryInMs) => this.log('warn', `schedule ${id}: ${(err as Error).message}${retryInMs !== undefined ? `; tried again in ${Math.round(retryInMs / 1000)} s` : ''}`),
+      onFailed: (s, scheduledAt, err) => this.scheduleFailed(s, scheduledAt, err),
     });
     // Built when some agent has tools (agents.<name>.tools, default `outputTools`, off); only those agents' harnesses mount them.
     if (Object.values(c.agents).some((a) => a.tools)) {
+      const moduleTools = modules.tools();
       this.tools = new HostTools({
         hub: this.hub,
         outbox: this.outbox,
         // U20: an `outbound` + `outbound.content` host is asked once, with the content, as the message
         // goes out (`exit`); here only while it is away (DL-5). Everything else as `policy`.
-        policy: { ...this.policy, outbound: (a) => (this.host.outboundScope() === undefined && this.host.answersContent() ? Promise.resolve('allow' as const) : this.policy.outbound(a)) },
+        policy: { ...this.policy, outbound: (a) => this.toolsOutbound(a) },
         // Only lanes that exist: a tool call always comes from a running harness session.
         turn: (key) => this.lanes.get(key)?.currentTurn(),
         adapter: (r) => this.channelFor(r)?.adapter,
         as: (key) => agentIdentity(key),
-        agentOf: (key) => this.agentOfSession(key),
         blobs: this.blobs,
         // U20: an output tool's message to a route an outbound.scoped host checks is asked with its content first.
         exit: (d) => this.exitCheck(d),
         cwd: (key) => this.laneInfo.get(key)?.cwd ?? this.instanceOf(this.lanes.get(key)?.harnessId)?.cwd ?? c.cwd,
         tier: (r) => this.channelFor(r)?.tier,
         routes: () => c.policy.routes,
-        // Agents add watches as themselves (kind agent); Policy.watch decides, the target is pinned to their session.
-        watches: { add: (by, d) => this.addWatch(by, d), remove: (by, id) => this.removeWatch(by, id), list: (key) => this.listWatches(key) },
-        // Agents keep schedules for their own session, within the owner's limits (SC-3).
-        schedules: { put: (by, d) => this.putSchedule(by, d), remove: (by, id) => this.removeSchedule(by, id), list: (key) => this.listSchedules(key) },
+        // get_channel_context's abilities: the tools the session's agent has, the watches and schedules it keeps.
         toolNames: (key) => {
-          const a = c.agents[this.agentOfSession(key) ?? ''];
-          return a?.tools ? (a.toolNames ?? TOOL_NAMES) : undefined;
+          const agent = this.agentOfSession(key);
+          return c.agents[agent ?? '']?.tools ? this.agentTools(agent) : undefined;
         },
+        kept: (key) => this.kept(key),
         // Decision 4: every write carries where the turn's inputs came from.
         provenance: (key, turnId) => this.lanes.get(key)?.provenance(turnId),
         // People seen in the session's conversations: the agent can @ them, not only this turn's senders.
         participants: (key) => this.lanes.get(key)?.participants() ?? [],
-        // Decision 6: the agent decides when a conversation moves to another topic.
-        topics: {
-          list: (key) => (this.topics.bySession(key) ? this.topics.siblings(key).map(topicView) : undefined),
-          rotate: (key, turn, a) => this.rotateTopic(key, turn, a),
-          switch: (key, turn, a) => this.switchTopicFor(key, turn, a.topicId),
-        },
-        // Decision 9: realtime voice on the session's harness, the media peer from a channel.
-        live: {
-          join: (key, turn, a) => this.joinLive(key, turn, a),
-          say: async (key, text, a) => {
-            const lane = this.lanes.get(key);
-            if (!lane?.liveInfo()) throw new ToolError('no live is running in this session; live_join first');
-            // Same operationId = the same call retried: said once (DL-2), and explainable either way (EX-2).
-            if (this.records.outboundByOperation(a.operationId)) return;
-            let result: 'delivered' | 'unknown' = 'unknown';
-            const route = lane.liveInfo()!.route;
-            // U20: what a live says cannot be checked before it is heard: never where an outbound.scoped host checks.
-            if (this.host.outboundScope() !== undefined && this.host.inScope(route)) {
-              void this.leaveLive(key, 'the route is checked by the host (outbound.scoped)');
-              throw new ToolError(`live_say: ${routeKey(route)} is checked by the host before anything is said there; a live cannot be, so it was left`);
-            }
-            try {
-              // U20: while settlements say what they were, what a live said says so too (never asked).
-              result = (await lane.liveSay(text, { ...a, ...(this.settlementsDetailed() ? { kind: 'live' as const } : {}) })).result;
-            } finally {
-              this.indexOutbound({ sessionKey: key, turnId: a.turnId }, { operationId: a.operationId, sessionKey: key, route, status: result, attempts: 1 });
-            }
-          },
-          leave: (key) => this.leaveLive(key, 'left by the agent'),
-        },
+        // The active modules' tools, after the kernel's (core-slimming G6): the watch, schedule, live and
+        // topic tools are the built-in modules' (`tool-modules.ts`), over the kernel's watches, schedules,
+        // live and topic handover.
+        ...(moduleTools.length ? { modules: moduleTools } : {}),
       });
       const tools = this.tools;
       this.mcp = new HostMcpServer({
@@ -698,8 +718,8 @@ export class Gateway {
       ...(tools ? { rewrite: (a) => tools.rewriteInbound(a) } : {}),
       // `/new`, `/topics`, `/switch` answer with one short message on the route they came from.
       systemReply: (a) => this.systemReply(a),
-      // Inputs of a current topic say how to move between topics, to agents that have the session_* tools.
-      ...(tools ? { topicHint: (agent: string | undefined) => (hasTopicTools(c.agents[agent ?? c.defaultAgent ?? '']) ? TOPIC_TOOLS_HINT : undefined) } : {}),
+      // Inputs of a current topic say how to move between topics: the modules' hint (the topic tools', to agents offered them).
+      topicHint: (agent: string | undefined) => this.modules.inputHint(agent),
       onReplyError: (err) => this.log('warn', `topic command reply failed: ${(err as Error).message}`),
       // A session whose agent is gone refuses the input: its log says so, and the route
       // too when the message was addressed to it (observe-only messages stay silent).
@@ -711,49 +731,170 @@ export class Gateway {
       onHistoryError: (err, a) => this.log('warn', `history (${a.scope}) for ${a.inputId} in ${a.sessionKey} not handed: ${(err as Error).message}`),
       // `/help`, `/status`, `/stop`, `/model`… from the owner, answered on the route they came from.
       onCommand: (a) => this.command$(a),
-      ...(c.policy.strangers === 'ask'
+      // The modules' clicks (the stranger cards' buttons) and inputs nothing dispatched (a stranger's
+      // message), only when a module hooks them.
+      ...(modules.hooked('onAction')
         ? {
-            onAction: (a) => this.strangers?.action(a),
+            onAction: async (a: { actionId: string; env: InboundEnvelope; origin: Origin }) => {
+              const result = await modules.action(a);
+              return result && { accepted: true, action: 'command' as const, origin: a.origin, result };
+            },
+          }
+        : {}),
+      ...(modules.hooked('onUndispatched')
+        ? {
             // Addressed: a DM or an @ of us, unless the adapter says it is not (`observe`: a reaction, RT-2).
-            onUndispatched: (a) => this.strangers?.undispatched(a, addressesSelf(a.env, new Set(c.policy.selfAccounts))),
+            onUndispatched: (a: { env: InboundEnvelope; origin: Origin; input: InputRecord }) => modules.undispatched({ ...a, addressed: addressesSelf(a.env, new Set(c.policy.selfAccounts)) }),
           }
         : {}),
     });
-    if (c.policy.strangers === 'ask') {
-      this.strangers = new Strangers({
-        db: db.db ?? new DatabaseSync(':memory:'),
-        ownerRoute: () => this.ownerRoute(),
-        send: async (route, msg, operationId) => {
-          const ch = this.channelFor(route);
-          if (!ch) return undefined;
-          // A notice of the daemon's own (no agent wrote it): says what it is, not an exit check (U20).
-          const rec = await this.outbox.send(ch.adapter, { operationId, sessionKey: c.policy.ownerSessionKey ?? 'strangers', route, msg, kind: 'notice', exitChecked: true });
-          return rec.status === 'delivered' ? rec.providerMessageId : undefined;
-        },
-        edit: async (route, id, msg) => {
-          await this.channelFor(route)?.adapter.edit?.(route, id, msg, { operationId: `stranger:${id}:answered`, sequence: 1 });
-        },
-        admit: async (item, session) => {
-          const r = await this.ingress.redispatch(item, { session, by: 'owner' });
-          if (!r.ok) return { ok: false, message: r.message };
-          return r.outcome.result?.ok === false ? { ok: false, message: r.outcome.result.reason } : { ok: true };
-        },
-        onGuests: (entries) => this.router.setExtraIdentities(entries),
-        log: (level, msg) => this.log(level, msg),
-      });
-    }
     if (c.source) {
-      this.configStore = new ConfigStore({ path: c.source.path, ...(c.source.envFile ? { envFile: c.source.envFile } : {}), ...(o.consoleEnv ? { env: o.consoleEnv } : {}) });
-      const store = this.configStore;
-      this.larkBots = new LarkBotJobs({
-        command: c.console.larkBotCommand,
-        dir: join(c.dataDir, 'provision'),
-        config: store,
-        ...(c.console.liveChannels ? { applyChannels: () => this.applyChannels() } : {}),
-        log: (level, msg) => this.log(level, msg),
+      this.configStore = new ConfigStore({
+        path: c.source.path,
+        ...(c.source.envFile ? { envFile: c.source.envFile } : {}),
         ...(o.consoleEnv ? { env: o.consoleEnv } : {}),
+        // The console validates and redacts the file against the kinds and types this daemon runs.
+        harnessRegistry: this.harnessRegistry,
+        channelRegistry: this.channelRegistry,
+        moduleRegistry: this.moduleRegistry,
       });
     }
+  }
+
+  /** One owner's extra identity map entries (`module:<id>`: a module's, such as the stranger approval's guests), replacing its earlier ones. */
+  private setExtraIdentities(owner: string, entries: IdentityEntry[]): void {
+    this.extraIdentities.set(owner, entries);
+    this.router.setExtraIdentities([...this.extraIdentities.values()].flat());
+  }
+
+  /**
+   * What each module's `KernelContext` reaches of the gateway (`kernelContext` namespaces it):
+   * existing capabilities, late-bound through `ref` (set once the gateway is built, after setup).
+   */
+  private static kernelBackend(ref: { gw?: Gateway }, log: LogFn): KernelBackend {
+    const gw = (): Gateway => ref.gw!;
+    return {
+      ready: () => ref.gw !== undefined,
+      log,
+      events: (key, fromSeq) => gw().hub.log.read(key, fromSeq),
+      head: (key) => gw().hub.log.head(key),
+      appendNative: (key, e) => {
+        gw().hub.append(key, { ts: Date.now(), level: e.level, audience: e.audience, durability: 'durable', visibility: e.visibility, body: { t: 'native', name: e.name }, native: e.native });
+      },
+      sessions: () => gw().adminSessions().sessions,
+      knownSession: (key) => gw().isOurSession(key),
+      agentOf: (key) => gw().agentOfSession(key),
+      status: () => gw().adminStatus(),
+      stopping: () => gw().stopped,
+      policy: () => gw().policy,
+      flag: (name) => gw().records.flag(name),
+      setFlag: (name, value) => gw().records.setFlag(name, value),
+      db: () => gw().records.db,
+      topic: (key) => {
+        const t = gw().topics.bySession(key);
+        return t ? topicView(t) : undefined;
+      },
+      siblings: (key) => (gw().topics.bySession(key) ? gw().topics.siblings(key).map(topicView) : []),
+      titleSource: (topicId) => gw().topics.titleSource(topicId),
+      setAutoTitle: (topicId, expected, title, turnId) => gw().setAutoTitle(topicId, expected, title, turnId),
+      // Agents add watches as themselves (kind agent); Policy.watch decides, the target is pinned to their session.
+      addWatch: (key, draft) => gw().addWatch(agentOrigin(key, gw().agentOfSession(key)), { ...draft, target: { sessionKey: key } }),
+      removeWatch: (key, id) => gw().removeWatch(agentOrigin(key, gw().agentOfSession(key)), id),
+      listWatches: (key) => gw().listWatches(key),
+      // Agents keep schedules for their own session, within the owner's limits (SC-3); a route only from a turn that may send there.
+      addSchedule: (key, draft, turnId) => gw().agentSchedule(key, draft, turnId),
+      removeSchedule: (key, id) => gw().removeSchedule(agentOrigin(key, gw().agentOfSession(key)), id),
+      listSchedules: (key) => gw().listSchedules(key),
+      // A peer's (an external MCP client's): messages and wakes for the host, its own only (SC-3).
+      addScheduleAs: (origin, draft) => gw().putSchedule(origin, draft),
+      removeScheduleAs: (origin, id) => gw().removeSchedule(origin, id),
+      listSchedulesAs: (origin) => {
+        const who = creatorOf(origin);
+        return gw().listSchedules().filter((s) => s.createdBy === who);
+      },
+      // Decision 6: the agent decides when a conversation moves to another topic (the handover is the kernel's, TP-1).
+      rotateTopic: (key, turnId, a) => gw().handOverTurn(key, turnId, a.operationId, (turn) => gw().rotateTopic(key, turn, a)),
+      switchTopic: (key, turnId, a) => gw().handOverTurn(key, turnId, a.operationId, (turn) => gw().switchTopicFor(key, turn, a.topicId)),
+      // Decision 9: realtime voice on the session's harness, the media peer from a channel.
+      joinLive: (key, turnId, a) => gw().joinLive(key, gw().runningTurn(key, turnId), a),
+      sayLive: (key, text, a) => gw().sayLive(key, text, a),
+      leaveLive: (key) => gw().leaveLive(key, 'left by the agent'),
+      agentTools: (agent) => gw().agentTools(agent),
+      agentNames: () => gw().chatAgents(),
+      identify: (a) => gw().router.identify(a),
+      setExtraIdentities: (owner, entries) => gw().setExtraIdentities(owner, entries),
+      newTopic: (agent, conversation, title) => gw().router.newTopic(agent, conversation, title !== undefined ? { title } : {}, 'user').topic.id,
+      conversationAgent: (conversation) => gw().router.conversationAgent(conversation),
+      // The router refuses an unknown agent and a task agent: what `agents.names()` leaves out.
+      setConversationAgent: (conversation, agent) => gw().router.setConversationAgent(conversation, agent),
+      record: (e) => gw().router.record(e),
+      hasLane: (key) => gw().lanes.has(key),
+      openLane: async (key, agent) => {
+        await gw().laneAfterClose(key, agent);
+      },
+      command: (cmd, origin) => gw().command(cmd, origin),
+      laneInput: async (key, input, mode) => {
+        const lane = gw().lanes.get(key) ?? (await gw().laneAfterClose(key));
+        return lane.command({ type: 'input', sessionKey: key, input, mode });
+      },
+      laneHarness: (key, module) => gw().laneHarness(key, module),
+      sessionRun: (key) => gw().sessionRun(key),
+      setSessionRun: (key, o) => gw().setRunOverride(key, o),
+      presets: () => gw().presetViews(),
+      offering: (cap) => gw().offering(cap),
+      channelFor: (route) => gw().channelFor(route)?.adapter,
+      resolveRoute: (route) => {
+        const ch = gw().channelFor(route);
+        return ch ? { ok: true, route: { ...route, account: ch.account } } : { ok: false, message: gw().noChannelMessage(route) };
+      },
+      send: async (route, msg, a) => {
+        const ch = gw().channelFor(route);
+        if (!ch) return undefined;
+        // Who it is sent for, while it runs: the outbox takes it into the in-flight mark (EX-8).
+        if (a.external) gw().externalSends.set(a.operationId, a.external);
+        // U20: what it is. A client's message (`tool`): an outbound.scoped host checks it where its scope is.
+        // Any other module send is the daemon's own notice (no agent wrote it): never an exit check.
+        const kind = a.external ? { kind: 'tool' as const } : { kind: 'notice' as const, exitChecked: true };
+        let rec: DeliveryRecord;
+        try {
+          rec = await gw().outbox.send(ch.adapter, { operationId: a.operationId, sessionKey: a.sessionKey, route, msg, ...(a.turnId !== undefined ? { turnId: a.turnId } : {}), ...kind });
+        } finally {
+          if (a.external) gw().externalSends.delete(a.operationId);
+        }
+        return sendResult(rec);
+      },
+      settled: (operationId) => {
+        const rec = gw().outbox.get(operationId);
+        return rec ? { ...sendResult(rec), route: rec.route } : undefined;
+      },
+      outbound: (from, to, content) => gw().externalOutbound(from, to, content),
+      hold: (route, a) => {
+        // Who it was for, as for a send (EX-8): the settlement's outbound record names them.
+        if (a.external) gw().externalSends.set(a.operationId, a.external);
+        try {
+          return sendResult(gw().outbox.hold({ operationId: a.operationId, sessionKey: a.sessionKey, route, ...(a.external ? { kind: 'tool' as const } : { kind: 'notice' as const }) }, a.reason));
+        } finally {
+          if (a.external) gw().externalSends.delete(a.operationId);
+        }
+      },
+      owner: () => {
+        const p = gw().config.policy;
+        return { principals: p.owners, ...(p.ownerSessionKey !== undefined ? { sessionKey: p.ownerSessionKey } : {}) };
+      },
+      ownerRoute: () => gw().ownerRoute(),
+      redispatch: async (item, o) => {
+        const r = await gw().ingress.redispatch(item, { by: o.by, ...(o.session !== undefined ? { session: o.session } : {}), ...(o.agent !== undefined ? { agent: o.agent } : {}) });
+        if (!r.ok) return { ok: false, code: r.code, message: r.message };
+        if (r.outcome.result?.ok === false) return { ok: false, code: 'refused', message: r.outcome.result.reason };
+        return { ok: true, sessionKey: r.delivery.sessionKey, inputId: r.inputId };
+      },
+      explain: (id, chain) => gw().explain(id, chain),
+      hostConnected: () => gw().router.hostConnected,
+      hostAnswers: (hook) => gw().host.answers(hook as CalloutHook),
+      hostHeldBy: (hook) => (hook === 'outbound' ? gw().host.outboundHeldBy() : gw().host.externalHeldBy()),
+      hostExternal: (args) => gw().host.externalCallout(args),
+      isHostToken: (token) => token === gw().token,
+    };
   }
 
   /** The operator's token file (read, or created), else a fresh token for this start only. */
@@ -767,8 +908,28 @@ export class Gateway {
   }
 
   static async start(o: GatewayOptions): Promise<Gateway> {
-    const gw = new Gateway(o);
+    // Module lifecycle step 2 (step 1 ran in loadConfig): set up before the gateway builds its
+    // ingress, so their tools and commands are assembled with the kernel's. Their kernel context is
+    // late-bound: it works once the gateway exists.
+    const registry = o.moduleRegistry ?? builtinModules;
+    const defaults = o.config.modules === undefined ? builtinDefaults(registry) : undefined;
+    const modules = new ModuleHost({
+      registry,
+      resolved: o.config.modules,
+      config: o.config,
+      ...(defaults ? { defaults } : {}),
+      // An old on/off field written since the config resolved (`Config.policy.strangers`): the module as that value in a file makes it.
+      switched: (id, file) => resolveModules(file, new ModuleRegistry([registry.get(id)!]), {}, (p) => resolvePath(p))[0]!,
+      log: o.logger ?? defaultLog,
+    });
+    const ref: { gw?: Gateway } = {};
+    const backend = Gateway.kernelBackend(ref, o.logger ?? defaultLog);
+    await modules.setup((id) => kernelContext(id, backend));
+    const gw = new Gateway(o, modules);
+    ref.gw = gw;
     try {
+      // The modules' identities (the stranger approval's guests) before any input is identified.
+      modules.identities((id, entries) => gw.setExtraIdentities(`module:${id}`, entries));
       await gw.loadHarnessModules();
       gw.harness();
       if (gw.mcp) {
@@ -782,7 +943,6 @@ export class Gateway {
       gw.settleLeftoverInputs();
       await gw.loadConfigWatches();
       gw.loadConfigSchedules();
-      gw.schedules.start();
       await gw.startChannels();
       await gw.adoptRunningTurns();
       if (o.listen !== false) {
@@ -793,7 +953,11 @@ export class Gateway {
         writeTokenFile(gw.tokenFile, gw.token);
       }
       if (o.console) await gw.startConsole();
-      if (o.config.externalMcp) await gw.startExternalMcp();
+      // Step 3: after the channels, the local socket and the console (the external MCP endpoint last).
+      await gw.modules.start();
+      // Schedules fire once what they send through runs: the channels, and the modules that send a
+      // client's schedule as that client (SC-1: a firing that found none would be over, failed).
+      gw.schedules.start();
     } catch (e) {
       await gw.stop().catch(() => undefined);
       throw e;
@@ -811,7 +975,7 @@ export class Gateway {
    */
   private async startConsole(): Promise<void> {
     const c = this.o.config;
-    if (this.larkBots) privateDir(join(c.dataDir, 'provision'), (msg) => this.log('warn', msg));
+    const routes = this.mountAdmin();
     const server = new ConsoleServer({
       config: c.console,
       host: {
@@ -823,7 +987,7 @@ export class Gateway {
         explain: (id) => this.router.explain(id),
         consoleOrigin: (key) => this.consoleOrigin(key),
         ...(this.configStore ? { configStore: this.configStore } : {}),
-        ...(this.larkBots ? { larkBots: this.larkBots } : {}),
+        routes,
         ...(this.configStore && c.console.liveChannels ? { applyChannels: () => this.applyChannels() } : {}),
       },
       log: (level, msg) => this.log(level, msg),
@@ -835,6 +999,7 @@ export class Gateway {
       await server.listen();
     } catch (e) {
       this.log('error', `console API not started: cannot listen on ${c.console.host}:${c.console.port}: ${(e as Error).message}`);
+      this.closeAdmin();
       return;
     }
     this.console = server;
@@ -847,52 +1012,50 @@ export class Gateway {
   }
 
   /**
-   * The external MCP endpoint (docs/design/external-mcp). A bad client token or token file
-   * fails the start; a port that is taken is logged, not fatal (as for the console).
+   * Mount what the channel types add to the console (`ChannelModule.admin`, in registration order):
+   * each contribution gets a context of its own (its console settings, the private work directory
+   * `<dataDir>/provision`, the config file when the daemon has one) for its `mount` and every call
+   * of its routes. A `mount` that throws fails the start.
    */
-  private async startExternalMcp(): Promise<void> {
+  private mountAdmin(): ContributedRoute[] {
     const c = this.o.config;
-    const cfg = c.externalMcp!;
-    const endpoint = new ExternalMcp({
-      config: cfg,
-      hostToken: this.token,
-      hub: this.hub,
-      outbox: this.outbox,
-      host: this.host,
-      outbound: (from, to, content) => this.externalOutbound(from, to, content),
-      sessions: () => this.adminSessions().sessions,
-      explain: (id, chain) => this.explain(id, chain),
-      status: () => {
-        const st = this.adminStatus();
-        return { channels: st.channels, host: st.host, agents: st.agents, sessions: st.sessions };
-      },
-      channelFor: (r) => this.channelFor(r),
-      noChannelMessage: (r) => this.noChannelMessage(r),
-      isSession: (key) => this.isOurSession(key),
-      lane: async (key) => this.lanes.get(key) ?? (await this.laneAfterClose(key)),
-      agentOf: (key) => this.agentOfSession(key),
-      record: (e) => this.router.record(e),
-      sending: (op, by) => (by ? this.externalSends.set(op, by) : this.externalSends.delete(op)),
-      stopped: () => this.stopped,
-      schedules: { put: (by, d) => this.putSchedule(by, d), remove: (by, id) => this.removeSchedule(by, id), list: () => this.listSchedules() },
-      log: (level, msg) => this.log(level, msg),
-    });
-    let url: string;
-    try {
-      url = await endpoint.listen();
-    } catch (e) {
-      this.log('error', `external MCP endpoint not started: cannot listen on ${cfg.host}:${cfg.port}: ${(e as Error).message}`);
-      return;
+    const contributions = this.channelRegistry.adminContributions;
+    const dir = join(c.dataDir, 'provision');
+    if (contributions.some(({ admin }) => admin.mount)) privateDir(dir, (msg) => this.log('warn', msg));
+    const routes: ContributedRoute[] = [];
+    for (const { type, admin } of contributions) {
+      const ctx: AdminContext = {
+        console: consoleSettings(c.console, admin.console),
+        dir,
+        log: (level, msg, data) => this.log(level, msg, data),
+        env: this.o.consoleEnv ?? process.env,
+        ...(this.configStore ? { config: this.configStore } : {}),
+        ...(this.configStore && c.console.liveChannels ? { applyChannels: () => this.applyChannels() } : {}),
+      };
+      const mounted = admin.mount?.(ctx);
+      if (mounted) this.adminMounts.push({ type, ...(mounted.close ? { close: () => mounted.close!() } : {}) });
+      for (const route of admin.routes ?? []) routes.push({ route, ctx });
     }
-    this.externalMcp = { endpoint, url };
-    this.log('info', `external MCP endpoint on ${url} (clients: ${cfg.clients.map((x) => x.name).join(', ') || 'none'})`);
+    return routes;
+  }
+
+  /** End what `mountAdmin` mounted (the console is gone). */
+  private closeAdmin(): void {
+    for (const m of this.adminMounts.splice(0)) {
+      try {
+        m.close?.();
+      } catch (e) {
+        this.log('warn', `channel type ${m.type}: closing its console part failed: ${(e as Error).message}`);
+      }
+    }
   }
 
   /**
-   * The outbound check of an external client's send (DL-6): a host that declared `outbound`
-   * decides, and while it is away nothing goes (an external send is never a turn's own reply
-   * route); an embedder's own `Policy.outbound` decides; otherwise the client's send scope,
-   * checked before, is the local allowance (what preregistered routes are for a turn).
+   * The outbound check of an external client's send (DL-6; the external MCP module asks it as
+   * `KernelContext.outbound`): a host that declared `outbound` decides, and while it is away
+   * nothing goes (an external send is never a turn's own reply route); an embedder's own
+   * `Policy.outbound` decides; otherwise the client's send scope, checked before, is the local
+   * allowance (what preregistered routes are for a turn).
    */
   private async externalOutbound(from: TurnContext, to: ReplyRoute, content?: RenderedMessage): Promise<'allow' | 'deny' | { hold: true; reason?: string }> {
     const held = this.host.outboundHeldBy();
@@ -933,6 +1096,8 @@ export class Gateway {
     const h = this.host.info();
     const st = this.router.hostTable();
     const sessions = this.sessions();
+    // The modules' entries, and the external MCP endpoint's block where it always was (`ModuleFields.status`).
+    const modules = this.modules.report();
     return {
       version: DAEMON_VERSION,
       protocol: PROTOCOL_VERSION,
@@ -962,7 +1127,8 @@ export class Gateway {
       sessions: { total: sessions.length, live: sessions.filter((s) => s.live).length, running: sessions.filter((s) => s.turnId !== undefined).length },
       runs: { running: this.runs.running() },
       queue: { head: this.hostQueue.head() },
-      ...(this.externalMcp ? { externalMcp: { url: this.externalMcp.url, clients: (c.externalMcp?.clients ?? []).map((x) => x.name) } } : {}),
+      ...(modules.fields as Partial<AdminStatus>),
+      modules: modules.modules,
     };
   }
 
@@ -1051,14 +1217,30 @@ export class Gateway {
     return a;
   }
 
-  /** An instance's adapter, built now: a module instance wraps what its factory returned at start. */
+  /** An instance's adapter, built now: a registered kind's by its module, a module instance wraps what its factory returned at start. */
   private build(inst: HarnessInstance): HarnessAdapter {
     const own = this.o.buildHarness?.(inst);
-    if (own) return own;
-    if (inst.kind !== 'module') return buildHarness(inst, blobResolvers(this.blobs));
+    if (own) {
+      this.embedderBuilt.add(own);
+      return own;
+    }
+    if (inst.kind === EMBEDDED_HARNESS && !this.harnessRegistry.get(inst.kind)) throw new ConfigError(`harness instance ${inst.name} stands for the embedder's adapter (no harness kind is registered): pass it to Gateway.start (GatewayOptions.harness or buildHarness)`);
+    if (inst.kind !== 'module') return buildHarness(inst, this.harnessBlobs, { registry: this.harnessRegistry, log: this.instanceLog(inst.name), harness: (name) => this.otherInstance(name) });
     const a = this.moduleAdapters.get(inst.name);
     if (!a) throw new Error(inst.unavailable ? `harness instance ${inst.name} is unavailable: ${inst.unavailable}` : `harness instance ${inst.name}: its module was not loaded`);
     return new InstanceHarness(inst, a);
+  }
+
+  /** The daemon log as an instance's adapter gets it (`HarnessFactoryInit.log`). */
+  private instanceLog(name: string): HarnessFactoryInit['log'] {
+    return (level, msg, data) => this.log(level, `harness ${name}: ${msg}`, data);
+  }
+
+  /** Another configured instance's adapter as an adapter gets it (`HarnessFactoryInit.harness`): built when first used. */
+  private otherInstance(name: string): HarnessAdapter {
+    const c = this.o.config;
+    if (!c.harnesses[name]) throw new Error(`unknown harness instance ${JSON.stringify(name)} (configured: ${Object.keys(c.harnesses).join(', ')})`);
+    return { id: name, probe: () => this.harness(name).probe(), open: (args) => this.harness(name).open(args) };
   }
 
   /**
@@ -1074,21 +1256,111 @@ export class Gateway {
       if (inst.kind !== 'module' || inst.unavailable) continue;
       const adapter = await loadHarnessModule({
         name: inst.name,
-        module: inst.module,
-        log: (level, msg, data) => this.log(level, `harness ${inst.name}: ${msg}`, data),
-        harness: (name) => {
-          if (!c.harnesses[name]) throw new Error(`unknown harness instance ${JSON.stringify(name)} (configured: ${Object.keys(c.harnesses).join(', ')})`);
-          return { id: name, probe: () => this.harness(name).probe(), open: (args) => this.harness(name).open(args) };
-        },
+        module: inst.launch as ModuleLaunch,
+        log: this.instanceLog(inst.name),
+        harness: (name) => this.otherInstance(name),
+        blobs: this.harnessBlobs,
+        env: inst.env,
+        profiles: inst.profiles,
       }).catch((e: Error) => {
         throw new ConfigError(e.message);
       });
       this.moduleAdapters.set(inst.name, adapter);
+      // Kept from now on (wrapping starts nothing): stop gives every module instance its lifecycle calls, used or not.
+      this.harness(inst.name);
     }
   }
 
   private instanceOf(harnessId: string | undefined): HarnessInstance | undefined {
     return this.o.harness || harnessId === undefined ? undefined : this.o.config.harnesses[harnessId];
+  }
+
+  /**
+   * An instance's adapter, for what it declares statically (`HarnessAdapter.adopts`, `compact`,
+   * `modes`, …): built without starting anything. An instance that cannot be built (unknown,
+   * unavailable) declares nothing.
+   */
+  private declared(harnessId: string | undefined): HarnessAdapter | undefined {
+    if (harnessId === undefined || (!this.o.harness && !this.o.config.harnesses[harnessId])) return undefined;
+    try {
+      return this.harness(harnessId);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Whether a session left mid-turn on this instance is reopened at start so that its harness adopts
+   * the turn (`HarnessAdapter.adopts`), also while it is unavailable for now (`declaredUnavailable`):
+   * the reopen then fails and the turn stays open in the log, for a later start to adopt (RS-2).
+   */
+  private adopts(harnessId: string | undefined): boolean {
+    const a = this.declared(harnessId) ?? (harnessId === undefined ? undefined : this.declaredUnavailable(harnessId));
+    return a?.adopts === true;
+  }
+
+  /**
+   * What an instance declares for the run-config commands, `/status` and `session.compact`
+   * (`displayName`, `compact`, `modes`, `ownerProfileSwitch`): its adapter's, also while it is
+   * unavailable for now (`declaredUnavailable`). An adapter the embedder passed
+   * (`GatewayOptions.harness`, or one `buildHarness` returned) that declares none of the four gets
+   * its instance kind's (`HarnessModule.declares`), as these were decided by the instance's kind
+   * before core-slimming G3: deprecated, kept for one release (packages/daemon/README.md).
+   */
+  private runDeclarations(name: string): RunDeclarations | undefined {
+    const a = this.declared(name) ?? this.declaredUnavailable(name);
+    if (a === undefined) return undefined;
+    const embedder = a === this.o.harness || this.embedderBuilt.has(a);
+    // What the embedder's own object declares (the gateway's wrappers read through, `ownerProfileSwitch` as a boolean).
+    const own = innerAdapter(a);
+    if (!embedder || RUN_DECLARATIONS.some((k) => own[k] !== undefined)) return a;
+    const kind = this.o.config.harnesses[name]?.kind;
+    return (kind === undefined ? undefined : this.harnessRegistry.get(kind)?.declares) ?? a;
+  }
+
+  /**
+   * Why a launched session's env cannot reach the instance `name`, if it cannot: what its adapter
+   * declares (`HarnessAdapter.sessionEnv`; built when asked, nothing started), also while it is
+   * unavailable for now (`declaredUnavailable`). One whose adapter cannot be built even so (a module
+   * whose factory never ran) cannot say, so it takes no session env: pinned, the launch might never
+   * run there. The answer then is why the instance cannot run (which names variables, never values).
+   */
+  private sessionEnvRefusal(name: string): string | undefined {
+    try {
+      return sessionEnvRefused(name, this.harness(name).sessionEnv);
+    } catch (e) {
+      const a = this.declaredUnavailable(name);
+      return a ? sessionEnvRefused(name, a.sessionEnv) : (e as Error).message;
+    }
+  }
+
+  /**
+   * The adapter of an instance that is unavailable for now (an `env:` reference is not set), for
+   * what it declares as it will once it is available: its kind's adapter built from the config as
+   * it stands, only to read the declarations or take a session over (never opened, not kept).
+   * Nothing for one that is available, or whose adapter cannot be built even so (a module whose
+   * factory never ran).
+   */
+  private declaredUnavailable(name: string): HarnessAdapter | undefined {
+    const inst = this.instanceOf(name);
+    if (inst?.unavailable === undefined) return undefined;
+    try {
+      return this.build({ ...inst, unavailable: undefined });
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** A module instance's adapter (its factory's, wrapped): every session of the instance shares it. */
+  private sharedAdapter(a: HarnessAdapter): boolean {
+    return a instanceof InstanceHarness && this.moduleAdapters.get(a.instance.name) === a.inner;
+  }
+
+  /** A harness lifecycle call (`detach` / `dispose`) when the adapter has it; a failure is logged, never thrown. */
+  private harnessCall(a: HarnessAdapter, call: 'detach' | 'dispose'): Promise<void> | undefined {
+    const f = a[call];
+    if (typeof f !== 'function') return undefined;
+    return (async () => f.call(a))().catch((e: unknown) => this.log('warn', `harness ${a.id}: ${call} failed: ${e instanceof Error ? e.message : String(e)}`));
   }
 
   /**
@@ -1133,10 +1405,10 @@ export class Gateway {
       },
       // A launched session's adapters go through both: the lane uses `harnessFor` whenever it is set.
       harness: launched ? launched.adapter(agent.harness) : this.agentHarness(agent),
-      // While a Claude Code TUI holds the session, its instance is that TUI (decision 15).
+      // While a harness's own terminal UI holds the session, its instance is that terminal (decision 15).
       harnessFor: (name: string) =>
-        this.claudeTui.holdOf(sessionKey)?.instance === name
-          ? this.claudeTui.holdOf(sessionKey)!.harness
+        this.takeovers.get(sessionKey)?.instance === name
+          ? this.takeovers.get(sessionKey)!.takeover.harness
           : launched
             ? launched.adapter(name)
             : this.agentHarness(agent, name),
@@ -1154,9 +1426,9 @@ export class Gateway {
         if (e.body.t === 'session.bound') this.topics.setNativeId(sessionKey, e.body.nativeId);
         this.o.onHarnessEvent?.(sessionKey, e);
       },
-      onTurnCompleted: (turnId, status) => {
-        if (status === 'completed') void this.updateTopicTitle(sessionKey, turnId).catch((e) => this.log('warn', `${sessionKey}: title update failed: ${(e as Error).message}`));
-      },
+      // The modules' hook (topic titles); a checked turn's once its checked answers settled (U20: what a
+      // module reads of it then is past the host's exit check, or held).
+      onTurnCompleted: (turnId, status, checked) => this.turnCompleted(sessionKey, turnId, status, checked),
       ...this.checkHooks(sessionKey),
     });
     this.lanes.set(sessionKey, lane);
@@ -1219,7 +1491,8 @@ export class Gateway {
     } catch (e) {
       return { ok: false, code: e instanceof LaneUnavailableError ? e.code : 'no_agent', message: (e as Error).message };
     }
-    const checked = checkLaunch(agent, launch, this.o.config.harnesses[agent.harness]);
+    // Whether the agent's instance can take a session env at all is what its adapter declares, also while it is unavailable.
+    const checked = checkLaunch(agent, launch, () => this.sessionEnvRefusal(agent.harness));
     if (!checked.ok) return checked;
     const pinned = this.records.launchOf(sessionKey);
     if (pinned) {
@@ -1265,7 +1538,7 @@ export class Gateway {
   /**
    * `session.compact` (CT-3): the harness compacts a quiet live session's context as a turn of its
    * own, from the host (`origin`), with no reply route and no context handed. Never opens a lane or
-   * a harness to do it; only harnesses with a compaction command (Claude Code `/compact`).
+   * a harness to do it; only harnesses that declare a compaction command (`HarnessAdapter.compact`: Claude Code `/compact`).
    */
   async compactSession(f: SessionCompact, origin: Origin): Promise<Outcome> {
     if (this.stopped) return fail('stopped', 'daemon is stopping');
@@ -1276,13 +1549,13 @@ export class Gateway {
     const lane = this.lanes.get(f.sessionKey);
     if (!lane) return fail('not_live', `${f.sessionKey} has no open lane (session.compact never opens a harness to compact)`);
     // What its next turn runs on (the agent's instance, or one a preset set here moved it to).
-    const run = this.commandHost.run(f.sessionKey);
-    if (run.kind !== 'claude-code') return fail('unsupported', `${run.harness} (${run.kind}) has no compaction command`);
+    const run = this.sessionRun(f.sessionKey);
+    if (run.compact === undefined) return fail('unsupported', `${run.harness} (${run.kind}) has no compaction command`);
     const inputId = f.inputId ?? `cmp_${randomUUID()}`;
     const input: InputRecord = {
       inputId,
       origin,
-      content: [{ type: 'text', text: '/compact' }],
+      content: [{ type: 'text', text: run.compact }],
       replyRoute: null,
       channelContext: { channel: 'host', nativeCommand: true },
     };
@@ -1452,40 +1725,37 @@ export class Gateway {
   /**
    * The adapters one launched session opens, built lazily per instance and kept
    * (the lane compares adapters by identity: a new object each time would restart
-   * the harness every turn). Claude takes the env per session; a Codex session with
-   * env gets its own stdio app-server (like a task run), closed with the lane.
+   * the harness every turn). The env reaches each as its adapter declares
+   * (`HarnessAdapter.sessionEnv`): through the open args (Claude Code), or on a process
+   * of the session's own (`ownProcess`: a Codex app-server over stdio), disposed with
+   * the lane; an instance that can do neither refuses the session (`launch_unsupported`).
    */
   private launchAdapters(agent: AgentConfig, launch: SessionLaunch): LaunchAdapters {
     const c = this.o.config;
     const env = launch.env ?? {};
     const hasEnv = Object.keys(env).length > 0;
+    const cwd = launch.cwd ?? agent.cwd;
     const cache = new Map<string, HarnessAdapter>();
     const owned: HarnessAdapter[] = [];
     const adapter = (name: string): HarnessAdapter => {
       const key = this.o.harness ? '' : name;
       let a = cache.get(key);
       if (a) return a;
-      if (this.o.harness) a = withLaunch(this.o.harness, undefined, hasEnv ? env : undefined);
-      else {
-        const inst = c.harnesses[name];
-        if (!inst) throw new Error(`unknown harness instance ${JSON.stringify(name)}`);
-        let base: HarnessAdapter;
-        let perOpen: Record<string, string> | undefined = hasEnv ? env : undefined;
-        if (inst.kind === 'codex' && hasEnv) {
-          if (inst.codex.transport.kind === 'unix') throw new Error(`launch_unsupported: harness instance ${name} is a shared Codex app-server (unix transport); this session's env cannot apply there`);
-          // The env reaches only this session's app-server; its CODEX_HOME replaces the instance's.
-          const own = {
-            ...inst,
-            env: { ...inst.env, ...env },
-            codex: { ...inst.codex, transport: { kind: 'stdio' as const }, ...(env.CODEX_HOME !== undefined ? { codexHome: env.CODEX_HOME } : {}) },
-          } as HarnessInstance;
-          base = this.build(own);
-          owned.push(base);
+      if (!this.o.harness && !c.harnesses[name]) throw new Error(`unknown harness instance ${JSON.stringify(name)}`);
+      let base = this.harness(name);
+      let perOpen: Record<string, string> | undefined = hasEnv ? env : undefined;
+      if (hasEnv) {
+        const refused = sessionEnvRefused(name, base.sessionEnv);
+        if (refused) throw new Error(`launch_unsupported: ${refused}; this session's env cannot apply there`);
+        if (base.sessionEnv === 'own-process' && typeof base.ownProcess === 'function') {
+          // The env reaches only this session's own process, which ends with the lane.
+          base = base.ownProcess({ env, ...(cwd !== undefined ? { cwd } : {}) });
+          if (!this.sharedAdapter(base)) owned.push(base);
           perOpen = undefined;
-        } else base = this.harness(name);
-        // Any instance (a session's preset may name another than the agent's) runs as the agent.
-        a = withLaunch(withAgent(base, agent, agent.cwd), launch.cwd ?? agent.cwd, perOpen);
+        }
       }
+      // Any instance (a session's preset may name another than the agent's) runs as the agent.
+      a = withLaunch(withAgent(base, agent, agent.cwd), cwd, perOpen);
       cache.set(key, a);
       return a;
     };
@@ -1493,7 +1763,7 @@ export class Gateway {
       adapter,
       owns: () => owned.length > 0,
       dispose: async () => {
-        await Promise.all(owned.map((a) => within(codexOf(a)?.dispose(), 3000)));
+        await Promise.all(owned.map((a) => within(this.harnessCall(a, 'dispose'), 3000)));
       },
     };
   }
@@ -1590,15 +1860,14 @@ export class Gateway {
     let own: HarnessAdapter | undefined;
     if (this.o.harness) adapter = this.o.harness;
     else {
-      // A Codex run gets its own app-server over stdio: the env reaches only this run's child, which ends with it.
-      const runInst = {
-        ...inst,
-        cwd: r.cwd,
-        env: { ...inst.env, ...env },
-        ...(inst.kind === 'codex' ? { codex: { ...inst.codex, transport: { kind: 'stdio' as const } } } : {}),
-      } as HarnessInstance;
-      own = this.build(runInst);
-      adapter = withAgent(own, r.agent, r.cwd);
+      // The instance's adapter built for this run: the env joins the instance's (under its configured config dir, which
+      // a run cannot replace) and reaches only this run's child. An adapter that shares one process between sessions
+      // sets up one of the run's own (`ownProcess`: a Codex app-server over stdio), which ends with it.
+      const fresh = this.build({ ...inst, cwd: r.cwd, env: { ...inst.env, ...env } } as HarnessInstance);
+      const built = typeof fresh.ownProcess === 'function' ? fresh.ownProcess({ env: {}, cwd: r.cwd }) : fresh;
+      // Disposed when the run ends, unless it is a module instance's adapter, which every session of the instance shares.
+      if (!this.sharedAdapter(built)) own = built;
+      adapter = withAgent(built, r.agent, r.cwd);
     }
     const spec = r.spec;
     let firstTurn = true;
@@ -1636,7 +1905,7 @@ export class Gateway {
         for (const x of comps) this.compositors.splice(this.compositors.indexOf(x), 1);
         this.lanes.delete(r.sessionKey);
         this.laneInfo.delete(r.sessionKey);
-        await within(codexOf(own)?.dispose(), 3000);
+        if (own) await within(this.harnessCall(own, 'dispose'), 3000);
       },
     };
   }
@@ -1682,10 +1951,18 @@ export class Gateway {
   }
 
   /**
-   * Outbox `atSend`: the sending turn's provenance (chain and flags) when the delivery starts.
-   * Taken at send time, not at settle: the lane may be closed by then (a parked topic, a stop)
-   * and a recovered echo must still carry the turn's flags (EX-5, never laundered).
+   * Outbox `atSend`: the sending turn's provenance when the delivery starts, or the external client
+   * that sends it. Taken at send time, not at settle, and kept in the in-flight mark: the lane may be
+   * closed by then (a parked topic, a stop) and a recovered echo must still carry the turn's flags
+   * (EX-5, never laundered); a send settled after a restart still names its client (EX-8).
    */
+  private sendTime(d: { operationId: string; sessionKey: string; turnId?: string }): SendTime | undefined {
+    const provenance = this.provenanceAtSend(d);
+    const external = this.externalSends.get(d.operationId);
+    return provenance || external ? { ...(provenance ? { provenance } : {}), ...(external ? { external } : {}) } : undefined;
+  }
+
+  /** The sending turn's provenance (chain and flags), while its lane is open or just closed. */
   private provenanceAtSend(d: { sessionKey: string; turnId?: string }): OutboundRecord['provenance'] {
     if (d.turnId === undefined) return undefined;
     // A closed lane's turns: what its renderers flush while it closes is still that turn's.
@@ -1693,9 +1970,13 @@ export class Gateway {
     return p ? { external: p.external, watched: p.watched, group: p.group, ...(p.cause ? { cause: p.cause } : {}) } : undefined;
   }
 
-  /** Outbox `onSettled`: every settled delivery, with the turn and the turn's chain (as at send time) when a turn made it. */
-  private indexOutbound(d: { sessionKey: string; turnId?: string }, rec: DeliveryRecord, atSend?: OutboundRecord['provenance']): void {
-    const p = atSend ?? this.provenanceAtSend(d);
+  /**
+   * Outbox `onSettled`: every settled delivery, with the turn and the turn's chain (as at send time) when a turn made it,
+   * or the inputs it answers (a system reply). Part of the settlement's transaction (DL-1): an error here fails it.
+   */
+  private indexOutbound(d: { sessionKey: string; turnId?: string; inputIds?: string[] }, rec: DeliveryRecord, atSend?: SendTime): void {
+    const p = atSend?.provenance ?? this.provenanceAtSend(d);
+    const external = atSend?.external ?? this.externalSends.get(rec.operationId);
     const agent = this.agentOfSession(d.sessionKey);
     this.records.putOutbound({
       operationId: rec.operationId,
@@ -1707,8 +1988,9 @@ export class Gateway {
       ...(agent !== undefined ? { agent } : {}),
       route: rec.route,
       result: rec.status,
+      ...(d.turnId === undefined && d.inputIds?.length ? { inputIds: [...d.inputIds] } : {}),
       ...(p ? { provenance: p } : {}),
-      ...(this.externalSends.has(rec.operationId) ? { external: this.externalSends.get(rec.operationId)! } : {}),
+      ...(external ? { external } : {}),
       at: Date.now(),
     });
   }
@@ -1991,10 +2273,9 @@ export class Gateway {
       return;
     }
     const { replyToMessageId: _r, ...route } = { ...a.route, account: ch.account };
-    await this.outbox.send(ch.adapter, { operationId: a.operationId, sessionKey: a.sessionKey, route, msg: { text: a.text }, kind: 'notice', exitChecked: true });
-    // No turn wrote it: explain of its operationId names the input it answers (EX-2).
-    const ob = a.inputId !== undefined ? this.records.outboundByOperation(a.operationId) : undefined;
-    if (ob && !ob.inputIds) this.records.putOutbound({ ...ob, inputIds: [a.inputId!] });
+    // No turn wrote it: explain of its operationId names the input it answers (EX-2), indexed with its settlement.
+    // A notice of the daemon's own (no agent wrote it): says what it is, not an exit check (U20).
+    await this.outbox.send(ch.adapter, { operationId: a.operationId, sessionKey: a.sessionKey, ...(a.inputId !== undefined ? { inputIds: [a.inputId] } : {}), route, msg: { text: a.text }, kind: 'notice', exitChecked: true });
   }
 
   /**
@@ -2048,8 +2329,83 @@ export class Gateway {
     return t;
   }
 
-  /** session_rotate: a new topic, current from now on, gets the turn's inputs with the summary ahead of them. */
+  /** The running turn `turnId` of a session, for what a module does for it (a topic handover, a live). */
+  private runningTurn(sessionKey: string, turnId: string): TurnContext {
+    const turn = this.lanes.get(sessionKey)?.currentTurn();
+    if (!turn || turn.turnId !== turnId) throw new ToolError(`no turn ${turnId} is running in session ${sessionKey}`);
+    return turn;
+  }
+
+  /**
+   * Session + turn → the handover of that turn (`handOverTurn`), claimed before its first await:
+   * TP-1's once per turn, whoever asks. A failed one is forgotten (the conversation stays in the
+   * topic, which may try again). The latest 1000.
+   */
+  private readonly handovers = new Map<string, { operationId: string; done: Promise<TopicHandover> }>();
+
+  /**
+   * The kernel's handover of the running turn `turnId` of a topic session (`KernelContext.topics.rotate` /
+   * `switch`, by `to`), under TP-1 for every caller: once per turn (the same `operationId` again
+   * answers what that one did, in flight or done; another is refused), and not at all when
+   * `handoverRefusal` says so (the topic is no longer current, the turn has no message of its own,
+   * or all of them were just handed here: no ping-pong).
+   */
+  private async handOverTurn(sessionKey: string, turnId: string, operationId: string, to: (turn: TurnContext) => Promise<TopicHandover>): Promise<TopicHandover> {
+    const key = `${sessionKey}\u0000${turnId}`;
+    const prior = this.handovers.get(key);
+    if (prior?.operationId === operationId) return prior.done;
+    if (prior) throw new ToolError(TOPIC_HANDED_ALREADY);
+    const turn = this.runningTurn(sessionKey, turnId);
+    const refusal = handoverRefusal(this.topicOfSession(sessionKey), turn.inputs);
+    if (refusal) throw new ToolError(refusal);
+    // No await before the claim: a second call for this turn, even a concurrent one, finds it.
+    const done = to(turn);
+    this.handovers.set(key, { operationId, done });
+    for (const k of this.handovers.keys()) {
+      if (this.handovers.size <= 1000) break;
+      this.handovers.delete(k);
+    }
+    done.catch(() => {
+      if (this.handovers.get(key)?.done === done) this.handovers.delete(key);
+    });
+    return done;
+  }
+
+  /**
+   * The model tools an agent's sessions are offered (`KernelContext.agents.tools`): its tools list,
+   * or the endpoint's whole catalog for `tools: true`; none without tools.
+   */
+  private agentTools(agent: string | undefined): string[] {
+    const c = this.o.config;
+    const a = c.agents[agent ?? c.defaultAgent ?? ''];
+    if (!a?.tools) return [];
+    if (a.toolNames) return [...a.toolNames];
+    this.catalogNames ??= this.tools ? toolCatalog(this.tools).map((t) => t.name) : [];
+    return [...this.catalogNames];
+  }
+
   // ---- live (decision 11) ----------------------------------------------------
+
+  /** live_say: said once per operationId (DL-2), explainable by it either way (EX-2). */
+  private async sayLive(sessionKey: string, text: string, a: { operationId: string; turnId: string }): Promise<void> {
+    const lane = this.lanes.get(sessionKey);
+    if (!lane?.liveInfo()) throw new ToolError('no live is running in this session; live_join first');
+    // Same operationId = the same call retried: said once (DL-2), and explainable either way (EX-2).
+    if (this.records.outboundByOperation(a.operationId)) return;
+    let result: 'delivered' | 'unknown' = 'unknown';
+    const route = lane.liveInfo()!.route;
+    // U20: what a live says cannot be checked before it is heard: never where an outbound.scoped host checks.
+    if (this.host.outboundScope() !== undefined && this.host.inScope(route)) {
+      void this.leaveLive(sessionKey, 'the route is checked by the host (outbound.scoped)');
+      throw new ToolError(`live_say: ${routeKey(route)} is checked by the host before anything is said there; a live cannot be, so it was left`);
+    }
+    try {
+      // U20: while settlements say what they were, what a live said says so too (never asked).
+      result = (await lane.liveSay(text, { ...a, ...(this.settlementsDetailed() ? { kind: 'live' as const } : {}) })).result;
+    } finally {
+      this.indexOutbound({ sessionKey, turnId: a.turnId }, { operationId: a.operationId, sessionKey, route, status: result, attempts: 1 });
+    }
+  }
 
   private async joinLive(sessionKey: string, turn: TurnContext, a: { target: string; channel?: string; instructions?: string; voice?: string }) {
     const lane = this.lanes.get(sessionKey);
@@ -2209,6 +2565,7 @@ export class Gateway {
     void cur.endpoint.close(reason).catch((e: Error) => this.log('warn', `${sessionKey}: closing live ${liveId}: ${e.message}`));
   }
 
+  /** session_rotate: a new topic, current from now on, gets the turn's inputs with the summary ahead of them. */
   private async rotateTopic(sessionKey: string, turn: TurnContext, a: { title: string; summary: string }): Promise<TopicHandover> {
     const from = this.topicOfSession(sessionKey);
     // U20: the agent's title and summary, where an outbound.scoped host checks, are asked first (one
@@ -2241,6 +2598,7 @@ ${a.summary}` }],
     const from = this.topicOfSession(sessionKey);
     const target = this.topics.get(topicId);
     if (!target || target.conversation !== from.conversation || target.agent !== from.agent) throw new ToolError(`no topic ${topicId} in this conversation`);
+    if (target.id === from.id) throw new ToolError(TOPIC_ALREADY_HERE);
     const r = this.topics.switchTo(topicId, 'agent', { turn: turnRef(turn) });
     const handed = await this.handOver(from, r.topic, turn);
     this.log('info', `${sessionKey}: switched back to topic ${r.topic.id} (${r.topic.sessionKey}), ${handed.length} input(s) handed over`);
@@ -2268,46 +2626,70 @@ ${a.summary}` }],
     if (c.from && c.from.sessionKey !== c.to.sessionKey && this.lanes.has(c.from.sessionKey)) this.idleOut(c.from.sessionKey);
   }
 
-  private async updateTopicTitle(sessionKey: string, turnId: string): Promise<void> {
-    const topic = this.topics.bySession(sessionKey);
+  /**
+   * A generated topic title (`KernelContext.topics.setAutoTitle`): set while the topic's title is
+   * still auto and still `expected`, then the latest card of its session refreshed on each channel.
+   * U20: a topic the scoped host checks (its conversation in scope, or a checked turn in its session)
+   * gets it only once the host allowed it (`kind: title`, the title as content), whoever made it.
+   */
+  private async setAutoTitle(topicId: string, expected: string | undefined, title: string, turnId?: string): Promise<boolean> {
+    const topic = this.topics.get(topicId);
+    if (!topic) return false;
+    // The title is said in its conversation (`/topics`, `/status`, the card) and read outside (`topic.changed`).
+    if (this.titleChecked(topic.conversation, this.hub.log.read(topic.sessionKey, 0)) && !(await this.titleAllowed(topic.sessionKey, topic.conversation, title, turnId ?? `auto_${randomUUID()}`))) return false;
+    if (this.stopped || !this.topics.setAutoTitle(topicId, expected, title)) return false;
+    const sessionKey = this.topics.get(topicId)!.sessionKey;
+    for (const c of this.sessionCompositors.get(sessionKey) ?? []) void c.refreshLatestTitle().catch((e) => this.log('warn', `${sessionKey}: title card refresh failed: ${(e as Error).message}`));
+    return true;
+  }
+
+  /**
+   * A session's turn ended (`Lane.onTurnCompleted`): the modules hear it (`onTurnCompleted`). A checked
+   * turn's (U20) once every compositor of the session settled its checked answer (at most the hook's
+   * timeout and the send later), so a module reading the turn then reads it past the exit check or held.
+   */
+  private turnCompleted(sessionKey: string, turnId: string, status: Parameters<ModuleHost['turnCompleted']>[0]['status'], checked: boolean): void {
+    if (!checked) return this.modules.turnCompleted({ sessionKey, turnId, status });
+    void this.checkedSettled(sessionKey, turnId)
+      .catch((e) => this.log('warn', `${sessionKey}: waiting for the checked answer of ${turnId} failed: ${(e as Error).message}`))
+      .then(() => {
+        if (!this.stopped) this.modules.turnCompleted({ sessionKey, turnId, status });
+      });
+  }
+
+  /** How many watches and schedules a session's agent keeps (created as `agentIdentity`): get_channel_context's `abilities`. */
+  private kept(sessionKey: string): { watches: number; schedules: number } {
+    const me = agentIdentity(sessionKey);
+    return { watches: this.listWatches(sessionKey).filter((w) => w.createdBy === me).length, schedules: this.listSchedules(sessionKey).filter((s) => s.createdBy === me).length };
+  }
+
+  /**
+   * What a module may run beside a configured agent's open lane (`KernelContext.lanes.harness`): an
+   * ephemeral turn on the adapter the session's turns open on the instance a turn ran on (the
+   * session's launch's, else the agent's), never that adapter itself; not a task run's lane.
+   */
+  private laneHarness(sessionKey: string, module: string): KernelLaneHarness | undefined {
     const info = this.laneInfo.get(sessionKey);
-    if (!topic || this.topics.titleSource(topic.id) !== 'auto' || !info?.agent.configured || this.titleJobs.has(topic.id)) return;
-    const events = this.hub.log.read(sessionKey, 0);
-    const started = events.find((e) => e.body.t === 'turn.started' && e.body.turnId === turnId);
-    if (started?.body.t !== 'turn.started' || !started.body.inputIds.length) return;
-    // The turn's own instance: a session's preset may have moved it off the agent's.
-    const name = started.body.run?.harness ?? info.agent.harness;
-    const adapter = this.launched.get(sessionKey)?.adapter(name) ?? this.agentHarness(info.agent, name);
-    if (!codexOf(adapter)) return;
-    const eligible = new Set(events.filter((e) => e.body.t === 'turn.started' && e.body.inputIds.length > 0).map((e) => e.body.t === 'turn.started' ? e.body.turnId : ''));
-    const completed = events.filter((e) => e.body.t === 'turn.completed' && e.body.status === 'completed' && eligible.has(e.body.turnId)).length;
-    if (completed !== 1 && completed % 3 !== 1) return;
-    // U20: a topic an outbound.scoped host checks gets a title from what passed the check only, and the
-    // title itself is asked before it is kept (it is said in the group: /topics, /status, the card).
-    const checked = this.titleChecked(topic.conversation, events);
-    this.titleJobs.add(topic.id);
-    try {
-      let read = events;
-      if (checked) {
-        // This turn's checked answer settles first: once it is past the check, the title may use it.
-        await this.checkedSettled(sessionKey, turnId);
-        if (this.stopped) return;
-        read = this.hub.log.read(sessionKey, 0);
-      }
-      const expected = topic.title;
-      const withheld = checked ? withholding(read) : undefined;
-      // An answer an external reader would read withheld (not past the check, held, denied) is left out.
-      const prompt = topicTitlePrompt(read, expected, withheld && !withheld.none ? (e) => e.body.t === 'text.snapshot' && withheld.of(e) !== undefined : undefined);
-      if (!prompt) return;
-      const run = started.body.run ?? { ...agentRun(info.agent, this.o.config.harnesses[name]!), profile: 'restricted' };
-      const title = await generateTopicTitle(adapter, { cwd: info.cwd ?? this.o.config.cwd, run, prompt });
-      if (!this.stopped && title && checked && !(await this.titleAllowed(sessionKey, topic.conversation, title, turnId))) return;
-      if (!this.stopped && title && this.topics.setAutoTitle(topic.id, expected, title)) {
-        for (const c of this.sessionCompositors.get(sessionKey) ?? []) void c.refreshLatestTitle().catch((e) => this.log('warn', `${sessionKey}: title card refresh failed: ${(e as Error).message}`));
-      }
-    } finally {
-      this.titleJobs.delete(topic.id);
-    }
+    if (!info?.agent.configured || sessionKey.startsWith('run:')) return undefined;
+    const agent = info.agent;
+    // The turn's own instance (a session's preset may have moved it off the agent's), the run it ran with, and the adapter.
+    const turn = (turnId: string) => {
+      const started = this.hub.log.read(sessionKey, 0).find((e) => e.body.t === 'turn.started' && e.body.turnId === turnId);
+      if (started?.body.t !== 'turn.started') return undefined;
+      const name = started.body.run?.harness ?? agent.harness;
+      return { name, run: started.body.run, adapter: this.launched.get(sessionKey)?.adapter(name) ?? this.agentHarness(agent, name) };
+    };
+    return {
+      ephemeral: (turnId) => turn(turnId)?.adapter.ephemeralOpen === true,
+      ephemeralTurn: async ({ turnId, prompt, instructions }) => {
+        const t = turn(turnId);
+        if (t?.adapter.ephemeralOpen !== true) throw new Error(`${sessionKey}: turn ${turnId} ran on no harness that runs ephemeral turns (ephemeralOpen)`);
+        const inst = this.o.config.harnesses[t.name];
+        if (!t.run && !inst) throw new Error(`unknown harness instance ${JSON.stringify(t.name)} (configured: ${Object.keys(this.o.config.harnesses).join(', ')})`);
+        const run = t.run ?? { ...agentRun(agent, inst!), profile: 'restricted' };
+        return ephemeralTurn(t.adapter, { module, cwd: info.cwd ?? this.o.config.cwd, run, prompt, instructions });
+      },
+    };
   }
 
   /** Close a parked topic's lane after `topics.parkedIdleMs` (later while it still has work); switching back reopens and resumes it. */
@@ -2430,9 +2812,13 @@ ${a.summary}` }],
    * `Outbox.exit`: with a scope declared, a checked turn's answer (`kind: reply`, checked as the turn
    * started) and anything else sent to a route in scope now are asked of the scoped host with their
    * content. The host away, slow, failing or answering badly: held (`host_unavailable`), the turn's own
-   * reply route too. No scope: nothing applies.
+   * reply route too. No scope: only an agent's send (`from`) to an `outbound` + `outbound.content` host.
+   * An agent's scheduled message as it fires (`firings`) is an agent's send, from the firing.
    */
-  private exitCheck(d: Delivery): Promise<ExitVerdict | undefined> | undefined {
+  private exitCheck(sent: Delivery): Promise<ExitVerdict | undefined> | undefined {
+    // An agent's scheduled message as it fires: checked as its send_message would be now, the firing as its turn.
+    const firing = sent.from === undefined ? this.firings.get(sent.operationId) : undefined;
+    const d = firing ? { ...sent, from: firing } : sent;
     if (d.kind === undefined) return undefined;
     // A send of a turn checked as it started, on a route it is checked on: checked whatever the scope is
     // now. A scope cleared meanwhile does not let it out unchecked (fail closed: no scoped host, held).
@@ -2559,9 +2945,13 @@ ${a.summary}` }],
 
   private compose(sessionKey: string, ch: RunningChannel): void {
     const { adapter, tier, account } = ch;
-    const isLark = adapter instanceof LarkBotAdapter;
-    const openDelayMs = ch.source?.openDelayMs ?? (isLark ? 5000 : undefined);
-    const previewDelayMs = ch.source?.previewDelayMs ?? (isLark ? 2000 : undefined);
+    // The channel says how its replies are paced (ChannelCaps.pacing); the entry overrides the delays.
+    const pacing = adapter.caps(account).pacing;
+    // What the process preview carries (the Stop control, the working state before answer text) only
+    // where the adapter has one: a JSONL bridge's peer can declare Lark's pacing, but no preview crosses it.
+    const preview = typeof adapter.previewProgress === 'function';
+    const openDelayMs = ch.source?.openDelayMs ?? pacing?.openDelayMs;
+    const previewDelayMs = ch.source?.previewDelayMs ?? pacing?.previewDelayMs;
     const ack = ch.source?.ack;
     const c = new Compositor({
       hub: this.hub,
@@ -2576,14 +2966,14 @@ ${a.summary}` }],
       ...(tier ? { tier } : {}),
       ...(openDelayMs !== undefined ? { openDelayMs } : {}),
       ...(previewDelayMs !== undefined ? { previewDelayMs } : {}),
-      ...(isLark ? { holdAnswerUntilOpen: true } : {}),
-      // The card opens at the first tool call (or once the delay passed with something to show) and
-      // lists the steps until the answer streams in (b0: 19 s of only the thinking bubble). Other
-      // channels when their entry says so (`openOnProcess`: open-lark's progress line, c-progress-edit).
-      ...((ch.source?.openOnProcess ?? isLark) && (openDelayMs ?? 0) > 0 ? { openOnProcess: true } : {}),
+      ...(pacing?.holdAnswerUntilOpen ? { holdAnswerUntilOpen: true } : {}),
+      ...(pacing?.requireAnswerToOpen && preview && (openDelayMs ?? 0) > 0 ? { requireAnswerToOpen: true } : {}),
+      // The first message opens at the first tool call (or once the delay passed with something to show) and
+      // lists the steps until the answer streams in: where the channel declares it (`pacing.openOnProcess`), or
+      // the entry says so (`openOnProcess`: a module channel that edits its message into the answer).
+      ...((ch.source?.openOnProcess ?? pacing?.openOnProcess) && (openDelayMs ?? 0) > 0 ? { openOnProcess: true } : {}),
       ...(ack ? { ack: { doneAfterMs: (typeof ack === 'object' ? ack.doneAfterMs : undefined) ?? 60_000 } } : {}),
-      // In Lark, the early process bubble carries progress; keep the reply card free of Stop controls.
-      interruptButton: !isLark,
+      interruptButton: preview ? (pacing?.interruptButton ?? true) : true,
       // Cards of a topic session carry the topic's title (Lark: the card header).
       title: () => this.topics.bySession(sessionKey)?.title,
       onError: (err) => this.log('warn', `render to ${adapter.id} failed: ${(err as Error).message}`),
@@ -2602,13 +2992,14 @@ ${a.summary}` }],
     try {
       let i = 0;
       for (const ch of this.o.config.channels) all.push(await this.buildConfigChannel(ch, i++));
-      for (const x of this.o.channels ?? []) all.push({ adapter: x.adapter, account: x.account ?? 'default', owner: x.adapter.constructor, ...(x.tier ? { tier: x.tier } : {}) });
+      // The embedder's own adapters: as trusted as the daemon's code, so their caps are their evidence (ID-3 boundary 2).
+      for (const x of this.o.channels ?? []) all.push({ adapter: x.adapter, account: x.account ?? 'default', owner: x.adapter.constructor, defaultEvidence: 'caps', ...(x.tier ? { tier: x.tier } : {}) });
       // Only now is a module channel's id known: one channel id belongs to one adapter, one (channel, account)
       // is one route target. A bridge without `id` that has not connected yet is checked at its hello.
       const known: BuiltChannel[] = [];
       for (const c of all) {
         if (!idKnown(c)) continue;
-        const why = idConflict(c.adapter.id, c.owner, c.account, known);
+        const why = this.idConflict(c.adapter.id, c, known);
         if (why) throw new ConfigError(why);
         known.push(c);
       }
@@ -2620,30 +3011,67 @@ ${a.summary}` }],
   }
 
   /**
-   * Build one configured channel (not started yet). A bridge whose first `hello` fails
-   * does not stop the daemon: once launched it is listed `failed` with the reason and
-   * keeps being retried with the bridge's restart backoff; it turns `running` once a
-   * peer answers.
+   * Build one configured channel (not started yet), through its type's `create` (or the
+   * embedder's `channelAdapter`). A bridge whose first `hello` fails does not stop the
+   * daemon: once launched it is listed `failed` with the reason and keeps being retried
+   * with the bridge's restart backoff; it turns `running` once a peer answers
+   * (`ChannelInit.onState`). An entry the gateway cannot build (its type is not in the
+   * gateway's registry, or `create` returned no channel: `badBuiltChannel` checks the shape) is a
+   * `ConfigError` naming the entry and the type; a `create` that throws fails the start with its
+   * own error. Only the shape is checked: what the adapter does once started is not (a `start`
+   * that returns no promise, a `caps` that throws fail as their own error, e.g. a `TypeError`).
    */
   private async buildConfigChannel(cfg: ResolvedChannel, index: number): Promise<BuiltChannel> {
     let entry: RunningChannel | undefined;
-    let early: BridgeState | undefined;
-    const onState = (st: BridgeState) => {
+    let early: ChannelState | undefined;
+    const onState = (st: ChannelState) => {
       if (!entry) return void (early = st);
-      this.bridgeState(entry, st);
+      this.channelState(entry, st);
     };
-    const owner = channelOwner(cfg);
+    const owner = this.channelRegistry.owner(cfg);
+    const defaultEvidence = this.channelRegistry.defaultEvidence(cfg.type);
     // Each hello's id is checked against the running channels (a bridge without `id` learns its id there).
-    const acceptId = (id: string) => idConflict(id, owner, cfg.account, this.channels.filter((e) => e !== entry));
+    const acceptId = (id: string) => this.idConflict(id, { owner, account: cfg.account, source: cfg }, this.channels.filter((e) => e !== entry));
     const own = this.o.channelAdapter?.(cfg);
-    const built = own ? { adapter: own, account: cfg.account, ...(cfg.tier ? { tier: cfg.tier } : {}) } : await buildChannel(cfg, index, (l, m, d) => this.log(l, m, d), onState, acceptId, join(this.o.config.dataDir, 'channels'));
+    let built: CreatedChannel;
+    if (own) built = { adapter: own };
+    else {
+      const m = this.channelRegistry.get(cfg.type);
+      if (!m) throw new ConfigError(`channels[${index}]: channel type ${JSON.stringify(cfg.type)} is not registered with the gateway; give Gateway.start the channel registry the config was resolved with`);
+      const config = (cfg as { config?: unknown }).config;
+      // A copy: what `create` (or its adapter later) does to the entry never reaches the host's keys read from `source` (`evidence`, `ack`, …).
+      built = await m.create(hostKeysCopied(cfg), {
+        index,
+        account: cfg.account,
+        config,
+        log: (l, msg, d) => this.log(l, msg, d),
+        // Its own directory under the data directory, e.g. a Lark bot's open thinking bubbles (closed after a restart).
+        stateDir: join(this.o.config.dataDir, 'channels', `${cfg.type}.${encodeURIComponent(cfg.account)}`),
+        acceptId,
+        onState,
+      });
+      // A third party's module is untyped code: the shape of what it built is checked here (not what its adapter does once started).
+      const bad = badBuiltChannel(built);
+      if (bad) {
+        const close = (built as { close?: unknown } | null)?.close;
+        if (typeof close === 'function') await (async () => close.call(built))().catch(() => undefined);
+        throw new ConfigError(`channels[${index}]: channel type ${JSON.stringify(cfg.type)}: create did not return a channel (bad ${bad})`);
+      }
+    }
+    const { adapter, config, close, idKnown: settled } = built;
     return {
-      ...built,
+      adapter,
+      account: cfg.account,
+      ...(cfg.tier ? { tier: cfg.tier } : {}),
+      ...(config !== undefined ? { config } : {}),
+      ...(close ? { close: () => close.call(built) } : {}),
+      ...(settled ? { idKnown: () => settled.call(built) } : {}),
       owner,
+      defaultEvidence,
       source: cfg,
       bind: (e) => {
         entry = e;
-        if (early) this.bridgeState(e, early);
+        if (early) this.channelState(e, early);
       },
     };
   }
@@ -2652,20 +3080,21 @@ ${a.summary}` }],
     const e = this.startChannel(b);
     if (b.source) e.source = b.source;
     b.bind?.(e);
-    // A bridge's caps are its peer's: checked once it connects (bridgeState).
-    if (idKnown(b) && !isBridge(b.adapter)) this.checkGrant(e);
+    // One that reported its state while built (a bridge: its caps are its peer's) is checked once it connects (channelState).
+    if (idKnown(b) && !e.reported) this.checkGrant(e);
     return e;
   }
 
   /**
    * The source a channel's envelopes are stamped against: its id and account, and
-   * the evidence it may give — the entry's `evidence` grant (default: caps for
-   * built-in and embedded adapters, `device_only` for bridges and modules) ∩ the
-   * adapter's current `caps.evidence` (a bridge's change with each hello), plus `none`.
+   * the evidence it may give — the entry's `evidence` grant (default: what its type was
+   * registered with, `ChannelRegistry.defaultEvidence`: caps for lark-bot and mail,
+   * `device_only` for bridges and modules; caps for embedded adapters) ∩ the adapter's
+   * current `caps.evidence` (a bridge's change with each hello), plus `none`.
    */
   private emitSource(e: RunningChannel): EmitSource {
     const caps = e.adapter.caps(e.account);
-    const grant = e.source?.evidence ?? (grantedByDefault(e.owner) ? caps.evidence : UNGRANTED_EVIDENCE);
+    const grant = e.source?.evidence ?? (e.defaultEvidence === 'caps' ? caps.evidence : UNGRANTED_EVIDENCE);
     const evidence: Evidence[] = [...caps.evidence.filter((x) => grant.includes(x)), 'none'];
     return { channel: e.adapter.id, account: e.account, evidence, declaresSender: caps.declaresSender };
   }
@@ -2703,7 +3132,7 @@ ${a.summary}` }],
       await b.close?.().catch(() => undefined);
       throw new Error('gateway stopping');
     }
-    const why = idKnown(b) ? idConflict(b.adapter.id, b.owner, b.account, this.channels) : undefined;
+    const why = idKnown(b) ? this.idConflict(b.adapter.id, b, this.channels) : undefined;
     if (why) {
       await b.close?.().catch(() => undefined);
       throw new ConfigError(why);
@@ -2711,7 +3140,25 @@ ${a.summary}` }],
     return this.launchChannel(b);
   }
 
-  private bridgeState(entry: RunningChannel, st: BridgeState): void {
+  /**
+   * Why a channel (`id`; its owner, account and entry) cannot run next to `others`, if it
+   * cannot: one channel id belongs to one adapter, only accounts differ (channel-stamping
+   * F4), and a configured channel takes a reserved id only when its type declares it
+   * (`ChannelRegistry.mayUse`: bridges and modules never take a built-in id).
+   */
+  private idConflict(id: string, ch: { owner: ChannelOwner; account: string; source?: ResolvedChannel }, others: Iterable<{ adapter: ChannelAdapter; owner: ChannelOwner; account: string }>): string | undefined {
+    const { owner, account } = ch;
+    if (ch.source && !this.channelRegistry.mayUse(ch.source.type, id)) return `channel id ${JSON.stringify(id)} is a built-in channel id; ${ownerName(owner)} cannot use it`;
+    for (const o of others) {
+      if (o.adapter.id !== id) continue;
+      if (o.owner !== owner) return `channel id ${JSON.stringify(id)} belongs to ${ownerName(o.owner)}; ${ownerName(owner)} cannot use it too (one channel id is one adapter, only accounts differ)`;
+      if (o.account === account) return `two channels have the same (channel, account) = (${id}, ${account}); give one another account`;
+    }
+    return undefined;
+  }
+
+  /** A channel reported its connection state (`ChannelInit.onState`, a bridge's peer): `running` once connected, else `failed` and retrying. */
+  private channelState(entry: RunningChannel, st: ChannelState): void {
     if (entry.ac.signal.aborted || entry.state === 'stopped') return;
     entry.reported = true;
     const was = entry.state;
@@ -2792,8 +3239,8 @@ ${a.summary}` }],
         launched.push(e);
       } catch (err) {
         failed.push({ ...ref(w.c), error: (err as Error).message });
-        // Under its channel id when the entry names one (a bridge's `id`); a module's id is only known once loaded.
-        const id = 'id' in w.c && typeof w.c.id === 'string' ? w.c.id : w.c.type;
+        // Under its channel id when known before it is built (`ChannelModule.idOf`: lark-bot, mail, a bridge's `id`); a module's only once loaded.
+        const id = this.channelRegistry.idOf(w.c) ?? w.c.type;
         this.configured.set(`${id}\0${w.c.account}`, { id, account: w.c.account });
         this.log('error', `channel ${w.c.type} (${w.c.account}) not started: ${(err as Error).message}`);
       }
@@ -2843,10 +3290,10 @@ ${a.summary}` }],
     this.log('info', `channel ${e.adapter.id} (${e.account}) stopped`);
   }
 
-  private startChannel(ch: { adapter: ChannelAdapter; account: string; owner: ChannelOwner; tier?: Tier; config?: unknown; close?: () => Promise<void> }): RunningChannel {
+  private startChannel(ch: { adapter: ChannelAdapter; account: string; owner: ChannelOwner; defaultEvidence: DefaultEvidence; tier?: Tier; config?: unknown; close?: () => Promise<void> }): RunningChannel {
     const ac = new AbortController();
     // Built before start(): an adapter may emit synchronously, before its first await.
-    const entry: RunningChannel = { adapter: ch.adapter, account: ch.account, ...(ch.tier ? { tier: ch.tier } : {}), ac, running: Promise.resolve(), state: 'running', owner: ch.owner, rejected: 0, evidenceCapped: 0, ...(ch.close ? { close: ch.close } : {}) };
+    const entry: RunningChannel = { adapter: ch.adapter, account: ch.account, ...(ch.tier ? { tier: ch.tier } : {}), ac, running: Promise.resolve(), state: 'running', owner: ch.owner, defaultEvidence: ch.defaultEvidence, rejected: 0, evidenceCapped: 0, ...(ch.close ? { close: ch.close } : {}) };
     // Test hooks on: `test.fault drop-response` applies to this adapter's sends (no change without an injection).
     this.testHooks?.wrap(ch.adapter);
     entry.running = ch.adapter
@@ -2939,23 +3386,23 @@ ${a.summary}` }],
   }
 
   /**
-   * Sessions the log shows mid-turn were left by a previous process. A Codex
-   * app-server on a Unix socket may still be running that turn: open the session
-   * now so the harness adopts it (turn.adopted; if it does not, the lane settles it).
-   * Any other harness died with the previous process (Codex over stdio, Claude Code
-   * killed mid-turn): the turn is settled now (ambiguous, host_restarted; RS-4, RS-5)
-   * through its lane, so the compositor takes over the old card and finalizes it,
-   * without opening a harness session and without waiting for a new input.
+   * Sessions the log shows mid-turn were left by a previous process. A harness that
+   * outlives the daemon (`HarnessAdapter.adopts`: Codex on a Unix socket) may still be
+   * running that turn: open the session now so the harness adopts it (turn.adopted; if
+   * it does not, the lane settles it). Any other harness died with the previous process
+   * (Codex over stdio, Claude Code killed mid-turn): the turn is settled now (ambiguous,
+   * host_restarted; RS-4, RS-5) through its lane, so the compositor takes over the old
+   * card and finalizes it, without opening a harness session and without waiting for a
+   * new input.
    */
   private async adoptRunningTurns(): Promise<void> {
     for (const key of this.hub.log.sessions()) {
       if (key.startsWith('run:')) continue; // runs are settled at start (Runs.settleAllDangling)
       const snap = this.hub.snapshot(key);
       if (!snap.turn) continue;
-      const inst = this.instanceOf(snap.harness);
-      const adoptable = inst?.kind === 'codex' && inst.codex.transport.kind === 'unix';
+      const reopen = this.adopts(snap.harness);
       try {
-        if (adoptable) {
+        if (reopen) {
           await this.lane(key).open();
           this.log('info', `${key}: reopened to adopt turn ${snap.turn.turnId}`);
         } else {
@@ -2963,7 +3410,7 @@ ${a.summary}` }],
           this.log('warn', `${key}: turn ${snap.turn.turnId} was running when the previous daemon stopped and its harness cannot resume it; settled ambiguous (host_restarted)`);
         }
       } catch (e) {
-        this.log('warn', `${key}: could not ${adoptable ? 'reopen' : 'settle the turn it left'}: ${(e as Error).message}`);
+        this.log('warn', `${key}: could not ${reopen ? 'reopen' : 'settle the turn it left'}: ${(e as Error).message}`);
       }
     }
   }
@@ -2990,25 +3437,67 @@ ${a.summary}` }],
     }
   }
 
-  /** A `message` schedule: one message through the outbox (once per firing, DL-2), checked like an output tool's. */
+  /**
+   * A `message` schedule: one message through the outbox (once per firing, DL-2). A module's client's
+   * (the external MCP endpoint's) goes out as that client, through its send_message's checks (DL-6).
+   * An agent's (`createdBy` a `session:` key) is the agent's message (`kind: tool`, as the agent, DL-4b):
+   * its route passed the outbound check when it was set (SC-3), and as it goes out the exit check sees
+   * it as it would the agent's send_message then (DL-7), the firing as its turn (`firingTurn`). Anyone
+   * else's (the owner's config, a host's `schedule.put`, the local principal's) is theirs, not checked
+   * again: `kind: host` for a host's, otherwise the daemon's own `notice`.
+   */
   private async sendScheduled(s: Schedule, operationId: string): Promise<void> {
     const route = s.route!;
-    // An external client's schedule sends as that client, through the same checks as its send_message (DL-6).
-    const client = this.o.config.externalMcp?.clients.find((x) => x.principal.id === s.createdBy);
-    if (client) {
-      if (!this.externalMcp) throw new Error(`the external endpoint is not running, so ${client.name}'s schedule cannot send as it`);
-      await this.externalMcp.endpoint.sendAs(client.name, { route, text: s.text, operationId });
-      return;
-    }
+    if (await this.modules.scheduledMessage({ schedule: s, operationId })) return;
     const ch = this.channelFor(route);
-    if (!ch) throw new Error(this.noChannelMessage(route));
-    const rec = await this.outbox.send(ch.adapter, {
-      operationId,
-      sessionKey: `schedule:${s.id}`,
-      route: { ...route, account: ch.account },
-      msg: { text: s.text },
-    });
-    if (rec.status === 'rejected') throw new Error(`not sent: ${rec.error ?? 'rejected'}`);
+    // What cannot go out by trying again ends the firing (SC-1): no channel, held, denied, rejected.
+    if (!ch) throw new FinalFiringError(this.noChannelMessage(route));
+    const d = { operationId, sessionKey: `schedule:${s.id}`, route: { ...route, account: ch.account }, msg: { text: s.text } };
+    const agentSession = s.createdBy.startsWith(AGENT_CREATOR) ? s.createdBy.slice(AGENT_CREATOR.length) : undefined;
+    let rec: DeliveryRecord;
+    if (agentSession === undefined) {
+      rec = await this.outbox.send(ch.adapter, { ...d, kind: s.createdBy.startsWith('host:') ? 'host' : 'notice', exitChecked: true });
+    } else {
+      this.firings.set(operationId, this.firingTurn(s, agentSession, operationId));
+      try {
+        rec = await this.outbox.send(ch.adapter, { ...d, kind: 'tool', as: agentIdentity(agentSession) });
+      } finally {
+        this.firings.delete(operationId);
+      }
+    }
+    if (rec.status === 'held') throw new FinalFiringError(`held by the host${rec.reason !== undefined ? ` (${rec.reason})` : ''}; not sent`);
+    if (rec.status === 'rejected') throw new FinalFiringError(rec.denied ? `denied by the host${rec.reason !== undefined ? ` (${rec.reason})` : ''}; not sent` : `not sent: ${rec.error ?? 'rejected'}`);
+  }
+
+  /**
+   * A firing that failed for good (SC-1): over, not tried again. Logged, and recorded in the schedule's
+   * log (`schedule:<id>`, where its sends settle) as a notice; recording it is best effort.
+   */
+  private scheduleFailed(s: Schedule, scheduledAt: number, err: unknown): void {
+    const message = `schedule ${s.id}: the firing due ${new Date(scheduledAt).toISOString()} was not delivered, not tried again: ${(err as Error)?.message ?? String(err)}`;
+    this.log('warn', message);
+    try {
+      this.hub.append(`schedule:${s.id}`, { ts: Date.now(), level: 'detail', audience: 'status', durability: 'durable', visibility: 'operators', body: { t: 'notice', code: 'other', message } });
+    } catch (e) {
+      this.log('warn', `schedule ${s.id}: could not record the failed firing: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * The turn an agent's scheduled message comes from as it fires (the exit check's `from`): the agent's
+   * session, the firing as the turn (`turnId` the operationId) with one system input (the schedule's,
+   * as a firing that starts a turn has), and no reply route of its own: nobody is being answered, so
+   * while the host that decides is away it is not let out as a turn's own reply would be (DL-5).
+   */
+  private firingTurn(s: Schedule, sessionKey: string, operationId: string): TurnContext {
+    const input: InputRecord = {
+      inputId: operationId,
+      origin: { kind: 'system', principal: null, evidence: 'none', via: `schedule:${s.id}`, adapter: 'schedule' },
+      content: [{ type: 'text', text: s.text }],
+      replyRoute: null,
+      channelContext: { schedule: s.id, createdBy: s.createdBy },
+    };
+    return { sessionKey, turnId: operationId, run: { harness: 'schedule', model: 'schedule', profile: 'restricted' }, inputs: [input], replyRoute: null, deliveries: [] };
   }
 
   /** A `host` schedule: one item into the host inbound queue (the host decides what to do). */
@@ -3039,8 +3528,10 @@ ${a.summary}` }],
 
   /**
    * `tui.attach` (decision 15): open the session's harness and say how to start the harness's own
-   * terminal UI on it. Codex: the TUI is another client of the same thread (`--remote`); a thread
-   * that never ran a turn gets a context note first, or it has no rollout to resume.
+   * terminal UI on it. As its adapter declares (`HarnessAdapter.attach`): the TUI joins as another
+   * client of the same native session (`nativeClient`; Codex: `--remote` on the thread; a thread
+   * that never ran a turn gets a context note first, or it has no rollout to resume), or it takes
+   * the session over (`takeover`; Claude Code).
    */
   async tuiAttach(sessionKey?: string): Promise<Outcome> {
     const key = sessionKey ?? this.ownerCurrentSession() ?? this.o.config.local.session;
@@ -3050,11 +3541,10 @@ ${a.summary}` }],
     } catch (e) {
       return { ok: false, code: e instanceof LaneUnavailableError ? e.code : 'internal', message: (e as Error).message };
     }
-    // Claude Code's TUI takes the session over; other harnesses say how their own TUI joins a running session.
     // The instance is the session's (a preset set here may name another than the agent's).
-    const run = this.commandHost.run(key);
-    const inst = this.o.config.harnesses[run.harness];
-    if (inst?.kind === 'claude-code') return this.claudeTuiAttach(key, lane, inst, run.model);
+    const run = this.sessionRun(key);
+    const taking = this.takeoverAdapter(key, run.harness);
+    if (taking) return this.takeOver(key, lane, run.harness, taking, run.model);
     const { harnessId, nativeId } = await lane.attachPoint();
     if (!nativeId) return { ok: false, code: 'unsupported', message: `${key}: harness ${harnessId} reported no session id to attach to` };
     const adapter = this.launched.get(key)?.adapter(harnessId) ?? this.harness(harnessId);
@@ -3077,33 +3567,78 @@ ${a.summary}` }],
   }
 
   /**
-   * Claude Code's TUI takes the session (S2): the headless binding is released once idle, the TUI
-   * starts on the same Claude session id (`--resume`, or `--session-id` for a new one) with this
-   * launch's hooks and bridge, and the lane's turns go to it until it exits.
+   * The adapter of the session's instance `name` when its terminal UI takes sessions over
+   * (`attach: 'takeover'` with `takeover`): the launched session's when the session is one. One
+   * unavailable for now declares as it will once it is available (`declaredUnavailable`): Claude
+   * Code's terminal takes the session over without its headless adapter, as it always has.
+   * Nothing for one that joins, or that cannot be built (the join path answers for it).
    */
-  private async claudeTuiAttach(key: string, lane: Lane, inst: Extract<HarnessInstance, { kind: 'claude-code' }>, model: string | undefined): Promise<Outcome> {
-    if (this.claudeTui.holdOf(key)?.connected) return { ok: false, code: 'conflict', message: `${key}: a terminal UI is already attached` };
-    this.claudeTui.holdOf(key)?.end('replaced by a new attach');
+  private takeoverAdapter(key: string, name: string): TakingOver | undefined {
+    let a: HarnessAdapter | undefined;
+    try {
+      a = this.launched.get(key)?.adapter(name) ?? this.declared(name);
+    } catch {
+      // An unavailable instance's adapter cannot be built, launched or not: what it declares is read below.
+    }
+    a ??= this.declaredUnavailable(name);
+    return a?.attach === 'takeover' && typeof a.takeover === 'function' ? (a as TakingOver) : undefined;
+  }
+
+  /**
+   * The harness's own terminal UI takes the session (`HarnessAdapter.takeover`; Claude Code, S2):
+   * one already connected is a conflict; the headless binding is released once idle (a turn still
+   * running is `busy`); the terminal runs on the session's native id on the instance (resumed), or
+   * on a new one; the lane opens the session on the takeover's harness, which stands in for the
+   * instance (`harnessFor`) until the terminal leaves, and the lane's turns go to it meanwhile.
+   */
+  private async takeOver(key: string, lane: Lane, instance: string, adapter: TakingOver, model: string | undefined): Promise<Outcome> {
+    const held = this.takeovers.get(key);
+    if (held?.takeover.connected) return { ok: false, code: 'conflict', message: `${key}: a terminal UI is already attached` };
+    if (held) this.endTakeover(held, 'replaced by a new attach');
     await lane.whenIdle();
     const released = await lane.release('a terminal UI takes the session');
     if (!released.ok) return { ok: false, code: 'busy', message: `${key}: a turn is running; try again when it ends` };
-    const prior = this.nativeIdOf(key, inst.name);
-    const hold = await this.claudeTui.hold(key, inst.name, prior ?? randomUUID());
+    const prior = this.nativeIdOf(key, instance);
+    const nativeId = prior ?? randomUUID();
+    let hold: { instance: string; takeover: HarnessTakeover } | undefined;
+    let endedEarly: string | undefined;
+    const takeover = await adapter.takeover({
+      sessionKey: key,
+      instance,
+      nativeId,
+      resume: prior !== undefined,
+      ...(model ? { model } : {}),
+      services: {
+        dir: join(this.o.config.dataDir, 'tui'),
+        // A helper the terminal starts runs as this CLI (`aio <command>`, a kind's `HarnessModule.cli`), next to this module in dist/.
+        cli: fileURLToPath(new URL('./cli.js', import.meta.url)),
+        fileOf: (ref) => this.blobs.stat(ref),
+        onEnd: (reason) => {
+          if (!hold) endedEarly = reason;
+          else if (this.takeovers.get(key) === hold) this.takeovers.delete(key);
+          this.log('info', `${key}: terminal UI left (${reason}); the session goes on headless`);
+        },
+      },
+    });
+    // A takeover over before it was handed back holds nothing.
+    if (endedEarly !== undefined) return { ok: false, code: 'internal', message: `${key}: the terminal UI's takeover ended at once (${endedEarly})` };
+    hold = { instance, takeover };
+    this.takeovers.set(key, hold);
     try {
       await lane.attachPoint();
     } catch (e) {
-      hold.end('attach failed');
+      this.endTakeover(hold, 'attach failed');
       throw e;
     }
-    const launch = this.claudeTui.launch(hold, {
-      executable: inst.claude.claudePath ?? 'claude',
-      resume: prior !== undefined,
-      ...(model ? { model } : {}),
-      ...(inst.claude.configDir ? { configDir: inst.claude.configDir } : {}),
-    });
+    const launch = takeover.launch();
     const cwd = this.laneInfo.get(key)?.cwd ?? this.o.config.cwd;
-    this.log('info', `${key}: Claude Code TUI attaching to ${inst.name} ${hold.nativeId}`);
-    return { ok: true, value: { sessionKey: key, harness: inst.name, nativeId: hold.nativeId, cwd, ...launch } };
+    this.log('info', `${key}: ${adapter.displayName ?? instance} TUI attaching to ${instance} ${nativeId}`);
+    return { ok: true, value: { sessionKey: key, harness: instance, nativeId, cwd, ...launch } };
+  }
+
+  /** A takeover's `end` (`HarnessTakeover.end`): a failure (a throw, a rejected promise) is logged, never thrown (RS-8). */
+  private endTakeover(hold: { instance: string; takeover: HarnessTakeover }, reason: string): void {
+    void (async () => hold.takeover.end(reason))().catch((e: unknown) => this.log('warn', `harness ${hold.instance}: takeover end failed: ${e instanceof Error ? e.message : String(e)}`));
   }
 
   /** Where the owner's own chat goes now: its current topic (of the agent it talks to), without a fixed session. */
@@ -3149,7 +3684,7 @@ ${a.summary}` }],
   }
 
   private command$(a: Parameters<typeof runCommand>[1]): Promise<{ ok: boolean; reply: string } | undefined> {
-    return runCommand(this.commandHost, a).then(async (r) => {
+    return runCommand(this.commandHost, a, this.commandTable).then(async (r) => {
       const route = a.env.replyRoute;
       const ch = route && this.channelFor(route);
       // Only channels configured to mark the inbound message can skip the text receipt.
@@ -3171,17 +3706,18 @@ ${a.summary}` }],
       allowed: async (sessionKey, origin) => (await this.policy.control({ sessionKey, op: 'reset', origin })) === 'allow',
       status: (key, d) => {
         const info = this.sessions().find((x) => x.sessionKey === key);
-        const run = this.commandHost.run(key);
+        const run = this.sessionRun(key);
         const topic = this.topics.bySession(key);
         const native = this.nativeIdOf(key, run.harness);
         return [
           `session ${key}${topic ? ` · topic ${topic.title ?? topic.id}` : ''}`,
           `agent ${d.agent ?? agentOf(key).name}${run.preset ? ` · preset ${run.preset}` : ''} · ${run.harness} (${run.kind}) · model ${run.model ?? 'default'}${run.effort ? ` · effort ${run.effort}` : ''}${run.overridden ? ' (set here)' : ''}`,
-          `Plan mode ${run.kind === 'codex' ? run.mode === 'plan' ? 'on' : 'off' : 'unavailable'} · bypass ${run.profile ?? 'default (agent policy)'}`,
+          // The modules' lines (the owner commands': Plan mode and bypass), after what the session runs.
+          ...this.modules.statusLines(key),
           `cwd ${this.laneInfo.get(key)?.cwd ?? agentOf(key).cwd ?? c.cwd}`,
           `state ${info?.state ?? 'not open'}${info?.turnId ? ` · turn ${info.turnId}` : ''}${info?.queued ? ` · ${info.queued} queued` : ''}${info?.pendingRequests.length ? ` · waiting on ${info.pendingRequests.length} approval(s)` : ''}`,
           ...(native ? [`native session ${native}`] : []),
-          ...(this.claudeTui.holdOf(key)?.connected ? ['a terminal UI holds this session'] : []),
+          ...(this.takeovers.get(key)?.takeover.connected ? ['a terminal UI holds this session'] : []),
         ].join('\n');
       },
       interrupt: async (sessionKey, origin, clear) => {
@@ -3207,52 +3743,89 @@ ${a.summary}` }],
         const lane = await this.laneAfterClose(ref.sessionKey);
         return lane.command({ type: 'resolve', sessionKey: ref.sessionKey, requestId: ref.requestId, decision, origin });
       },
-      run: (key) => {
-        const agent = agentOf(key);
-        const o = this.runOverride(key);
-        const set = this.overridePreset(o);
-        const inst = set?.inst ?? c.harnesses[agent.harness] ?? c.harnesses[c.defaultHarness]!;
-        const base = agentRun(set?.preset ?? agent, inst);
-        const model = o.model ?? base.model;
-        const effort = o.effort ?? base.effort;
-        const preset = set?.preset.name ?? agent.preset;
-        return {
-          harness: inst.name,
-          kind: inst.kind,
-          ...(preset ? { preset } : {}),
-          ...(model ? { model } : {}),
-          ...(effort ? { effort } : {}),
-          ...(o.mode ? { mode: o.mode } : {}),
-          ...(o.profile ? { profile: o.profile } : {}),
-          ...(o.preset !== undefined && !set ? { stalePreset: o.preset } : {}),
-          overridden: !!(set || o.model || o.effort || o.mode || o.profile),
-        };
-      },
-      setRun: (key, o) => {
-        const cur = this.runOverride(key);
-        const next = { ...cur };
-        if (o.preset !== undefined) o.preset === null ? delete next.preset : (next.preset = o.preset);
-        if (o.model !== undefined) o.model === null ? delete next.model : (next.model = o.model);
-        if (o.effort !== undefined) o.effort === null ? delete next.effort : (next.effort = o.effort);
-        if (o.mode !== undefined) next.mode = o.mode;
-        if (o.profile !== undefined) o.profile === null ? delete next.profile : (next.profile = o.profile);
-        this.records.setFlag(`run:${key}`, Object.keys(next).length ? JSON.stringify(next) : undefined);
-      },
-      presets: () =>
-        Object.values(c.presets).map((p) => {
-          const inst = c.harnesses[p.harness]!;
-          const run = agentRun(p, inst);
-          return { name: p.name, harness: inst.name, kind: inst.kind, ...(run.model ? { model: run.model } : {}), ...(run.effort ? { effort: run.effort } : {}), ...(p.description ? { description: p.description } : {}) };
-        }),
-      agents: () => {
-        const names = Object.values(c.agents).filter((a) => a.mode !== 'task').map((a) => a.name);
-        return names.length ? names : [c.defaultAgent ?? 'default'];
-      },
+      compactCommand: (key) => this.sessionRun(key).compact,
+      agents: () => this.chatAgents(),
       conversationAgent: (conversation) => this.router.conversationAgent(conversation),
       setConversationAgent: (conversation, agent) => this.router.setConversationAgent(conversation, agent),
       newTopic: (agent, conversation, title) => this.router.newTopic(agent, conversation, title !== undefined ? { title } : {}, 'user').topic.id,
       tuiHint: (key) => `On your computer: aio tui --session ${key}  (with AIO_CONFIG set to this deployment's config)`,
     };
+  }
+
+  /**
+   * What a session's next turn runs (`KernelContext.runConfig.get`; `/status`, `session.compact`,
+   * `tui.attach`): the agent's instance, or the one of the preset set for the session, what its
+   * adapter declares (`HarnessAdapter.compact` / `modes` / `ownerProfileSwitch`: `runDeclarations`,
+   * also while it is unavailable for now), and the run with what is set for the session over the agent's. `preset` is the one set here,
+   * else the agent's; `stalePreset` one set here that is no longer configured.
+   */
+  private sessionRun(key: string): KernelSessionRun {
+    const c = this.o.config;
+    const agent = this.laneInfo.get(key)?.agent ?? this.pickAgent(key, undefined);
+    const o = this.runOverride(key);
+    const set = this.overridePreset(o);
+    const inst = set?.inst ?? c.harnesses[agent.harness] ?? c.harnesses[c.defaultHarness]!;
+    const base = agentRun(set?.preset ?? agent, inst);
+    const model = o.model ?? base.model;
+    const effort = o.effort ?? base.effort;
+    const preset = set?.preset.name ?? agent.preset;
+    const a = this.runDeclarations(inst.name);
+    return {
+      harness: inst.name,
+      kind: inst.kind,
+      ...(a?.compact ? { compact: a.compact.command } : {}),
+      plan: a?.modes?.includes('plan') === true,
+      ownerProfileSwitch: a?.ownerProfileSwitch === true,
+      ...(preset ? { preset } : {}),
+      ...(model ? { model } : {}),
+      ...(effort ? { effort } : {}),
+      ...(o.mode ? { mode: o.mode } : {}),
+      ...(o.profile ? { profile: o.profile } : {}),
+      ...(o.preset !== undefined && !set ? { stalePreset: o.preset } : {}),
+      overridden: !!(set || o.model || o.effort || o.mode || o.profile),
+    };
+  }
+
+  /** Set (a value) or clear (`null`) what is set for a session's next turns (`KernelContext.runConfig.set`); a preset must be configured. */
+  private setRunOverride(key: string, o: KernelRunOverrides): void {
+    if (typeof o.preset === 'string' && !this.o.config.presets[o.preset]) throw new Error(`no preset ${o.preset} (configured: ${Object.keys(this.o.config.presets).join(', ') || 'none'})`);
+    const next = { ...this.runOverride(key) };
+    if (o.preset !== undefined) o.preset === null ? delete next.preset : (next.preset = o.preset);
+    if (o.model !== undefined) o.model === null ? delete next.model : (next.model = o.model);
+    if (o.effort !== undefined) o.effort === null ? delete next.effort : (next.effort = o.effort);
+    if (o.mode !== undefined) next.mode = o.mode;
+    if (o.profile !== undefined) o.profile === null ? delete next.profile : (next.profile = o.profile);
+    this.records.setFlag(`run:${key}`, Object.keys(next).length ? JSON.stringify(next) : undefined);
+  }
+
+  /** The configured presets, with the model and effort their instance gives when they set none (`KernelContext.runConfig.presets`). */
+  private presetViews(): KernelPreset[] {
+    const c = this.o.config;
+    return Object.values(c.presets).map((p) => {
+      const inst = c.harnesses[p.harness]!;
+      const run = agentRun(p, inst);
+      return { name: p.name, harness: inst.name, kind: inst.kind, ...(run.model ? { model: run.model } : {}), ...(run.effort ? { effort: run.effort } : {}), ...(p.description ? { description: p.description } : {}) };
+    });
+  }
+
+  /** The configured harnesses that declare Plan mode, or the owner's profile switch, by display name (each once); with none, the registered kinds that do. */
+  private offering(cap: 'plan' | 'ownerProfileSwitch'): string[] {
+    const has = (d: RunDeclarations | undefined) => d !== undefined && (cap === 'plan' ? d.modes?.includes('plan') === true : d.ownerProfileSwitch === true);
+    const configured = Object.keys(this.o.config.harnesses).map((name) => {
+      const a = this.runDeclarations(name);
+      return has(a) ? (a!.displayName ?? name) : undefined;
+    });
+    const names = configured.filter((n) => n !== undefined);
+    // None configured has it: the registered kinds that declare it (only Claude Code configured still hears "only on Codex").
+    if (!names.length) for (const m of this.harnessRegistry.modules) if (has(m.declares)) names.push(m.declares!.displayName ?? m.kind);
+    return [...new Set(names)];
+  }
+
+  /** The agents a chat may talk to (`/agent`, `/new @agent`): the configured ones but task agents; the default agent's name when none is. */
+  private chatAgents(): string[] {
+    const c = this.o.config;
+    const names = Object.values(c.agents).filter((a) => a.mode !== 'task').map((a) => a.name);
+    return names.length ? names : [c.defaultAgent ?? 'default'];
   }
 
   /** The owner's own chat with the deployment (the latest routed turn of `ownerSessionKey`), without a reply target. */
@@ -3266,20 +3839,6 @@ ${a.summary}` }],
   }
 
   /**
-   * `strangers: ask`: a turn none of whose inputs is the owner's (a guest's, or one the owner
-   * let in) asks the owner about its requests, in the owner's chat. Owner turns, live
-   * delegations (decision 11 amendment) and turns with no owner chat known keep the local policy.
-   */
-  private askOwner(ctx: TurnContext): Resolver | undefined {
-    const c = this.o.config;
-    if (c.policy.strangers !== 'ask' || ctx.run.profile === 'bypass' || ctx.live) return undefined;
-    if (ctx.inputs.some((i) => (i.origin.principal?.labels ?? []).includes('owner'))) return undefined;
-    const to = this.ownerRoute();
-    if (!to || !c.policy.owners.length) return undefined;
-    return { kind: 'human', principals: [...c.policy.owners], routes: [routeKey(to)] };
-  }
-
-  /**
    * Where turns a watch starts reply: the route of the target session's latest
    * turn that had one (e.g. the owner's DM), else nowhere but the session stream.
    */
@@ -3289,7 +3848,45 @@ ${a.summary}` }],
     return route;
   }
 
-  /** Create or replace a watch as `by` (checked by `Policy.watch`). Host MCP tools call this for agents. */
+  /**
+   * The outbound check of an output tool's message before it is recorded (`HostToolsOptions.policy`),
+   * and of a schedule's route an agent gives (`agentSchedule`): the policy, except that an `outbound`
+   * + `outbound.content` host without a scope is asked once, with the content, as the message goes out
+   * (`exit`, U20); here then only while it is away (DL-5).
+   */
+  private toolsOutbound(a: { from: TurnContext | null; to: ReplyRoute }): Promise<'allow' | 'deny'> {
+    return this.host.outboundScope() === undefined && this.host.answersContent() ? Promise.resolve('allow' as const) : this.policy.outbound(a);
+  }
+
+  /**
+   * A schedule set by a session's agent (`KernelContext.schedules.add`, the schedule tools): as the
+   * session's agent, under `putSchedule`'s rules (SC-3). One with a route only from the session's
+   * running turn `turnId`, and only where that turn may send its text now (`scheduleOutbound`), whoever asks.
+   */
+  async agentSchedule(sessionKey: string, draft: ScheduleDraft, turnId?: string): Promise<{ ok: true; schedule: Schedule } | { ok: false; code: string; message: string }> {
+    if (draft.route) {
+      const turn = this.lanes.get(sessionKey)?.currentTurn();
+      if (!turn || turnId === undefined || turn.turnId !== turnId) return { ok: false, code: 'forbidden', message: 'a route can only be given while you are answering a message ("current" is that conversation)' };
+      const v = await this.scheduleOutbound(turn, draft.route, draft.text);
+      if (v.verdict === 'hold') return { ok: false, code: 'forbidden', message: `the host took this message; the schedule was not set${v.reason ? ` (${v.reason})` : ''}. Do not set it again` };
+      if (v.verdict !== 'allow') return { ok: false, code: 'forbidden', message: `${scheduleRouteRefusal(draft.route)}${v.reason ? ` (${v.reason})` : ''}` };
+    }
+    return this.putSchedule(agentOrigin(sessionKey, this.agentOfSession(sessionKey)), draft);
+  }
+
+  /**
+   * SC-3: the route of a message schedule an agent sets, checked as its send_message there would be
+   * now (`toolsOutbound`), except that an `outbound` + `outbound.content` host without a scope, which
+   * send_message asks with the content as the message goes out, is asked here with the text (`kind:
+   * tool`, DL-5, DL-7): there is no message going out yet. Its firing is checked again (`exitCheck`).
+   */
+  private async scheduleOutbound(turn: TurnContext, route: ReplyRoute, text: string): Promise<ExitVerdict> {
+    if (this.host.outboundScope() === undefined && this.host.outboundContentDeclared()) {
+      return this.askContent({ operationId: `schedule_add:${turn.turnId}`, sessionKey: turn.sessionKey, turnId: turn.turnId, route, kind: 'tool', content: { text } }, turn);
+    }
+    return { verdict: await this.toolsOutbound({ from: turn, to: route }) };
+  }
+
   /**
    * A schedule from someone (Policy for schedules, SC-3): the owner, the local principal and the host
    * may set any; an agent only for its own session (a turn there, or a message it may send anyway),
@@ -3385,6 +3982,7 @@ ${a.summary}` }],
     return sessionKey === undefined ? all : all.filter((s) => s.target?.sessionKey === sessionKey || s.createdBy === `session:${sessionKey}`);
   }
 
+  /** Create or replace a watch as `by` (checked by `Policy.watch`). Host MCP tools call this for agents. */
   addWatch(by: Origin, watch: WatchDraft): Promise<AddWatchResult> {
     return this.watches.add(by, watch);
   }
@@ -3494,9 +4092,11 @@ ${a.summary}` }],
   }
 
   /**
-   * Shut down. Codex is detached, not closed: over a Unix socket its turns keep
-   * running and the next gateway adopts them. Other harnesses are closed (their
-   * running turn is interrupted and recorded).
+   * Shut down. Lanes on an adapter that declares `detach` (Codex) are detached, not
+   * closed, and the adapter detaches itself: its running turns stay open, for the next
+   * gateway to adopt (`adopts`: Codex over a Unix socket) or settle. Other lanes are
+   * closed (their running turn is interrupted and recorded), then their adapter is
+   * disposed.
    */
   /** Set by stop(): no new inbound while the last sends go out. */
   private refusingInbound = false;
@@ -3506,21 +4106,25 @@ ${a.summary}` }],
     this.stopped = true;
     for (const t of this.parkedTimers.values()) clearTimeout(t);
     this.parkedTimers.clear();
+    // No firing from here (SC-1): one due now waits for the next start; one running ends before the modules stop.
+    this.schedules.stop();
+    await within(this.schedules.idle(), 3000);
     this.host.close();
-    // No new external writes while stopping (the tools also answer "stopping").
-    await within(this.externalMcp?.endpoint.close(), 2000);
-    await this.claudeTui.close();
+    // Step 4: then the modules stop, in reverse order (each bounded), while what they use still runs.
+    // The external MCP endpoint is the last registered: it closes first, so no new external write comes in.
+    await this.modules.stop();
+    // Terminals holding sessions leave: the sessions go on headless (their lanes close below).
+    for (const hold of [...this.takeovers.values()]) this.endTakeover(hold, 'daemon stopping');
     // Lives end first: the voice runs in the harness and the media peer in a channel, both about to go.
     await within(Promise.all([...this.lives.keys()].map((k) => this.leaveLive(k, 'gateway stopping'))), 5000);
     // Runs end (interrupted) while their connections can still hear run.ended.
     await within(this.runs.stop(), 10_000);
     this.server?.close('gateway stopping');
     this.console?.close('gateway stopping');
-    this.larkBots?.close();
+    this.closeAdmin();
     if (this.tokenFile) removeTokenFile(this.tokenFile, this.token);
     if (this.consoleFile && this.console) removeTokenFile(this.consoleFile, this.console.url);
     this.watches.stop();
-    this.schedules.stop();
     // A live channel apply in progress finishes (it sees `stopped` and launches nothing more)
     // before the channels are aborted, so none starts after the snapshot below.
     await within(this.applying, 5000);
@@ -3529,22 +4133,28 @@ ${a.summary}` }],
     this.refusingInbound = true;
     // A launched session's own app-server (stdio) ends with it: its lane is closed, not detached.
     const own = new Set([...this.launched].filter(([, x]) => x.owns()).map(([k]) => k));
-    const codex = (l: Lane) => !own.has(l.sessionKey) && codexOf(this.o.harness ?? this.instances.get(l.harnessId));
-    const detached = [...this.lanes.values()].filter(codex);
-    const closed = [...this.lanes.values()].filter((l) => !codex(l));
+    const detaches = (a: HarnessAdapter | undefined) => typeof a?.detach === 'function';
+    const detaching = (l: Lane) => !own.has(l.sessionKey) && detaches(this.o.harness ?? this.instances.get(l.harnessId));
+    const detached = [...this.lanes.values()].filter(detaching);
+    const closed = [...this.lanes.values()].filter((l) => !detaching(l));
     for (const l of detached) l.detach('gateway stopping');
-    const adapters = this.o.harness ? [this.o.harness] : [...this.instances.values()];
+    // Every built instance (every module instance from start), each adapter once: two module instances may share one.
+    const adapters = this.o.harness ? [this.o.harness] : [...new Map([...this.instances.values()].map((a) => [innerAdapter(a), a])).values()];
     // Bounded by a timer that holds the event loop: harness close() may wait on unref'd timers only.
     await within(
       Promise.all([
-        ...adapters.map((a) => codexOf(a)?.detach()),
+        ...adapters.map((a) => this.harnessCall(a, 'detach')),
         ...closed.map((l) => l.close('gateway stopping').catch(() => undefined)),
       ]),
       8000,
     );
     // Let the last events (interrupted turn, consumed inputs) reach the log before it closes.
     await within(Promise.all(closed.map((l) => l.whenIdle())), 3000);
-    await within(Promise.all([...this.launched.values()].map((x) => x.dispose())), 3000);
+    // Then the processes of launched sessions, and of adapters that do not detach, end.
+    await within(
+      Promise.all([...[...this.launched.values()].map((x) => x.dispose()), ...adapters.filter((a) => !detaches(a)).map((a) => this.harnessCall(a, 'dispose'))]),
+      3000,
+    );
     await within(Promise.all(this.compositors.map((c) => c.stop())), 5000);
     // Sends still running settle while their channel and the records are open; no more retries.
     await this.outbox.drain(5000);
@@ -3596,6 +4206,16 @@ function fail(code: string, message = code): Outcome {
   return { ok: false, code, message };
 }
 
+/** How an outbox send ended, as a module's `KernelContext.send` answers it. */
+function sendResult(rec: DeliveryRecord): KernelSendResult {
+  return {
+    status: rec.status,
+    ...(rec.providerMessageId !== undefined ? { providerMessageId: rec.providerMessageId } : {}),
+    ...(rec.error !== undefined ? { error: rec.error } : {}),
+    ...(rec.reason !== undefined ? { reason: rec.reason } : {}),
+  };
+}
+
 /** Profiles every harness maps without configuration (Claude Code and Codex alike): `run.overrides` may name them on any instance. */
 const BUILTIN_PROFILES = ['bypass', 'restricted'];
 
@@ -3604,37 +4224,46 @@ const OVERRIDE_VALUE = /^[^\s\u0000-\u001f]{1,256}$/;
 /** A host-chosen input id (`session.compact`), as `run.start`'s: a plain token, not the lane's own `ctxo_…`. */
 const HOST_INPUT_ID = /^(?!ctxo_)[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
 
+/**
+ * For a config without `modules` (built by hand, as before modules): the registry's built-in
+ * modules as a file without their sections makes them (`ModuleHostOptions.defaults`).
+ */
+function builtinDefaults(registry: ModuleRegistry): ResolvedModule[] | undefined {
+  const builtin = registry.modules.filter((m) => m.origin === 'builtin');
+  return builtin.length ? resolveModules({}, new ModuleRegistry(builtin), {}, (p) => resolvePath(p)) : undefined;
+}
+
 /** An agent's (or a preset's) RunSpec over its instance's defaults (without the profile). */
 function agentRun(agent: Pick<AgentConfig, 'model' | 'effort'>, inst: HarnessInstance): Omit<RunSpec, 'profile'> {
   const effort = agent.effort ?? inst.run.effort;
   return { harness: inst.name, model: agent.model ?? inst.run.model, ...(effort !== undefined ? { effort } : {}) };
 }
 
-/**
- * An instance adapter as one agent opens it: the agent's working directory and
- * instructions (Claude: appended to the preset system prompt; Codex: developer
- * instructions) over the instance's. Other adapters (tests) are used as they are.
- */
 /** `daemon_flags` key of the owner's own chat with the deployment (its latest DM route). */
 const OWNER_DM_FLAG = 'owner-dm-route';
 
+/**
+ * An instance adapter as one agent opens it: the agent's working directory and
+ * instructions (`HarnessOpenArgs.instructions`, each adapter applies them its own way)
+ * over the instance's. Other adapters (tests) are used as they are.
+ */
 export function withAgent(a: HarnessAdapter, agent: AgentConfig, cwd: string | undefined): HarnessAdapter {
   if (!(a instanceof InstanceHarness)) return a;
-  const i = a.instance;
-  let options = i.options;
-  if (agent.instructions !== undefined) {
-    options =
-      i.kind === 'claude-code'
-        ? { ...options, sdk: { ...(options.sdk as Record<string, unknown> | undefined), systemPrompt: { type: 'preset', preset: 'claude_code', append: agent.instructions } } }
-        : { ...options, developerInstructions: agent.instructions };
-  }
-  return new InstanceHarness({ ...i, ...(cwd !== undefined ? { cwd } : {}), options } as HarnessInstance, a.inner);
+  return new InstanceHarness({ ...a.instance, ...(cwd !== undefined ? { cwd } : {}) }, a.inner, a.env, agent.instructions ?? a.instructions, a.profilesInOpen);
+}
+
+/** What the outbox takes when a delivery starts (`OutboxOptions.atSend`), kept in its in-flight mark (JSON data). */
+interface SendTime {
+  /** The sending turn's provenance (`OutboundRecord.provenance`). */
+  provenance?: OutboundRecord['provenance'];
+  /** The external MCP client that sends it (`OutboundRecord.external`). */
+  external?: ExternalSender;
 }
 
 /** Per-session adapters of a launched session (`Gateway.launchAdapters`). */
 interface LaunchAdapters {
   adapter(name: string): HarnessAdapter;
-  /** Some adapter runs its own process (a Codex app-server with the session's env). */
+  /** Some adapter runs on a process of its own with the session's env (`HarnessAdapter.ownProcess`). */
   owns(): boolean;
   dispose(): Promise<void>;
 }
@@ -3645,17 +4274,70 @@ interface LaunchAdapters {
  * get the env through their open args; their cwd is the lane's.
  */
 export function withLaunch(a: HarnessAdapter, cwd: string | undefined, env: Record<string, string> | undefined): HarnessAdapter {
-  if (a instanceof InstanceHarness) return new InstanceHarness({ ...a.instance, ...(cwd !== undefined ? { cwd } : {}) } as HarnessInstance, a.inner, env);
+  if (a instanceof InstanceHarness) return new InstanceHarness({ ...a.instance, ...(cwd !== undefined ? { cwd } : {}) }, a.inner, env, a.instructions, a.profilesInOpen);
   return env ? new LaunchEnvHarness(a, env) : a;
 }
 
-class LaunchEnvHarness implements HarnessAdapter {
+/** Why a launched session's env cannot reach the instance `name`'s adapter (`HarnessAdapter.sessionEnv`), if it cannot. */
+function sessionEnvRefused(name: string, how: SessionEnvSupport | undefined): string | undefined {
+  return typeof how === 'object' ? `harness instance ${name} is ${how.refused}` : undefined;
+}
+
+/** An adapter whose terminal UI takes sessions over (`attach: 'takeover'`), with its `takeover`. */
+type TakingOver = HarnessAdapter & Required<Pick<HarnessAdapter, 'takeover'>>;
+
+/** The static declarations the run-config commands, `/status` and `session.compact` read (`Gateway.runDeclarations`). */
+const RUN_DECLARATIONS = ['displayName', 'compact', 'modes', 'ownerProfileSwitch'] as const;
+type RunDeclarations = Pick<HarnessDeclarations, (typeof RUN_DECLARATIONS)[number]>;
+
+/** A gateway wrapper over the kind's adapter (`inner`): what that adapter declares statically reads through. */
+abstract class WrappedHarness {
+  abstract readonly inner: HarnessAdapter;
+
+  get adopts(): boolean {
+    return this.inner.adopts === true;
+  }
+
+  get displayName(): string | undefined {
+    return this.inner.displayName;
+  }
+
+  get compact(): { readonly command: string } | undefined {
+    return this.inner.compact;
+  }
+
+  get modes(): readonly 'plan'[] | undefined {
+    return this.inner.modes;
+  }
+
+  get ownerProfileSwitch(): boolean {
+    return this.inner.ownerProfileSwitch === true;
+  }
+
+  get ephemeralOpen(): boolean {
+    return this.inner.ephemeralOpen === true;
+  }
+
+  get sessionEnv(): SessionEnvSupport | undefined {
+    return this.inner.sessionEnv;
+  }
+
+  get attach(): 'join' | 'takeover' | undefined {
+    return this.inner.attach;
+  }
+}
+
+class LaunchEnvHarness extends WrappedHarness implements HarnessAdapter {
   readonly id: string;
+  /** The kind's takeover (`HarnessAdapter.takeover`), present only when its adapter has one. */
+  readonly takeover?: (a: HarnessTakeoverArgs) => Promise<HarnessTakeover>;
   constructor(
     readonly inner: HarnessAdapter,
     private readonly env: Record<string, string>,
   ) {
+    super();
     this.id = inner.id;
+    if (typeof inner.takeover === 'function') this.takeover = (a) => inner.takeover!(a);
   }
 
   probe(): Promise<{ version: string; caps: HarnessCaps }> {
@@ -3671,10 +4353,9 @@ class LaunchEnvHarness implements HarnessAdapter {
   }
 }
 
-/** The Codex adapter behind an instance adapter, if it is one (Codex is detached at shutdown, not closed). */
-function codexOf(a: HarnessAdapter | undefined): CodexHarness | undefined {
-  if (a instanceof InstanceHarness || a instanceof LaunchEnvHarness) return codexOf(a.inner);
-  return a instanceof CodexHarness ? a : undefined;
+/** The kind's adapter under the gateway's wrappers (an instance's, a launched session's env). */
+function innerAdapter(a: HarnessAdapter): HarnessAdapter {
+  return a instanceof InstanceHarness || a instanceof LaunchEnvHarness ? innerAdapter(a.inner) : a;
 }
 
 /**
@@ -3682,15 +4363,37 @@ function codexOf(a: HarnessAdapter | undefined): CodexHarness | undefined {
  * instance's environment and config dirs, under the instance name, opening its
  * sessions in the instance's cwd with its options.
  */
-export class InstanceHarness implements HarnessAdapter {
+export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
   readonly id: string;
+  /**
+   * Every open's `options.profiles` is the instance's `profiles` (`HarnessModule.profilesInOpen`):
+   * a module instance's, and a registered kind's that takes them there (Claude Code). Default: what
+   * the built-in registry says of the instance's kind.
+   */
+  readonly profilesInOpen: boolean;
+  /** The kind's lifecycle calls, present only when its adapter has them (the gateway reads their presence). */
+  readonly detach?: () => Promise<void>;
+  readonly dispose?: () => Promise<void>;
+  /** The same instance on the kind's adapter's own process (`HarnessAdapter.ownProcess`), present only when it has one. */
+  readonly ownProcess?: (o: { env: Record<string, string>; cwd?: string }) => InstanceHarness;
+  /** The kind's takeover by its terminal UI (`HarnessAdapter.takeover`), present only when its adapter has one. */
+  readonly takeover?: (a: HarnessTakeoverArgs) => Promise<HarnessTakeover>;
   constructor(
     readonly instance: HarnessInstance,
     readonly inner: HarnessAdapter,
     /** A launched session's env (decision 7), over the child's environment at open. */
     readonly env?: Record<string, string>,
+    /** The agent's instructions (`HarnessOpenArgs.instructions`), unless an open gives its own. */
+    readonly instructions?: string,
+    profilesInOpen?: boolean,
   ) {
+    super();
     this.id = instance.name;
+    this.profilesInOpen = profilesInOpen ?? (instance.kind === 'module' || builtinHarnesses.get(instance.kind)?.profilesInOpen === true);
+    if (typeof inner.detach === 'function') this.detach = () => inner.detach!();
+    if (typeof inner.dispose === 'function') this.dispose = () => inner.dispose!();
+    if (typeof inner.ownProcess === 'function') this.ownProcess = (o) => new InstanceHarness(instance, inner.ownProcess!(o), undefined, instructions, this.profilesInOpen);
+    if (typeof inner.takeover === 'function') this.takeover = (a) => inner.takeover!(a);
   }
 
   probe(): Promise<{ version: string; caps: HarnessCaps }> {
@@ -3703,56 +4406,54 @@ export class InstanceHarness implements HarnessAdapter {
 
   open(args: HarnessOpenArgs): Promise<HarnessSession> {
     const i = this.instance;
-    const options = i.kind === 'claude-code' || i.kind === 'module' ? { ...i.options, profiles: i.profiles } : i.options;
+    const options = this.profilesInOpen ? { ...i.options, profiles: i.profiles } : i.options;
     // A module harness runs in the daemon's process: the instance's env reaches it through the open args.
     const instEnv = i.kind === 'module' ? definedEnv(i.env) : undefined;
     const env = instEnv || this.env ? { ...instEnv, ...args.env, ...this.env } : undefined;
-    return this.inner.open({ ...args, ...(i.cwd ? { cwd: i.cwd } : {}), options: { ...options, ...args.options }, ...(env ? { env } : {}) });
+    const instructions = args.instructions ?? this.instructions;
+    // Transitional: a module harness also gets them as `options.developerInstructions`, as before `instructions` existed.
+    const legacy = i.kind === 'module' && instructions !== undefined ? { developerInstructions: instructions } : {};
+    return this.inner.open({
+      ...args,
+      ...(i.cwd ? { cwd: i.cwd } : {}),
+      options: { ...options, ...legacy, ...args.options },
+      ...(env ? { env } : {}),
+      ...(instructions !== undefined ? { instructions } : {}),
+    });
   }
 }
 
 /**
- * The adapter for one instance. Environment values are handed to the child process only, never logged.
- * `media` resolves stored blob refs for the harness (Claude: inline image / file path; Codex: local path).
+ * The adapter for one instance of a registered kind, built by the kind's module (`HarnessModule.create`;
+ * default registry: the built-in kinds). Environment values are handed to the child process only, never
+ * logged. `blobs` is the store media inputs point at: the adapter resolves them itself. `log` and
+ * `harness` are what the adapter gets as `HarnessFactoryInit` (outside a gateway: no log, no other instances).
  */
-export function buildHarness(i: HarnessInstance, media?: MediaResolvers): InstanceHarness {
+export function buildHarness(
+  i: HarnessInstance,
+  blobs?: BlobAccess,
+  o: { registry?: HarnessRegistry; log?: HarnessFactoryInit['log']; harness?: HarnessFactoryInit['harness'] } = {},
+): InstanceHarness {
   if (i.unavailable) throw new Error(`harness instance ${i.name} is unavailable: ${i.unavailable}`);
   if (i.kind === 'module') throw new Error(`harness instance ${i.name} is a module harness; the gateway loads it at start`);
-  if (i.kind === 'codex') {
-    const x = i.codex;
-    return new InstanceHarness(
-      i,
-      new CodexHarness({
-        bin: x.bin ?? 'codex',
-        env: i.env,
-        transport: x.transport,
-        profiles: i.profiles as Record<string, CodexProfile>,
-        ...(x.codexHome ? { codexHome: x.codexHome } : {}),
-        ...(x.config ? { config: x.config } : {}),
-        ...(x.enable ? { enable: x.enable } : {}),
-        ...(x.disable ? { disable: x.disable } : {}),
-        ...(x.live ? { live: true } : {}),
-        ...(media ? { resolveMedia: media.resolveMedia } : {}),
+  const registry = o.registry ?? builtinHarnesses;
+  const kind = registry.get(i.kind);
+  if (!kind) throw new Error(`harness instance ${i.name}: harness kind ${JSON.stringify(i.kind)} is not registered (registered: ${registry.kinds.join(', ')})`);
+  const adapter = kind.create({
+    name: i.name,
+    config: undefined,
+    log: o.log ?? (() => {}),
+    harness:
+      o.harness ??
+      ((name) => {
+        throw new Error(`harness instance ${i.name}: no instance ${JSON.stringify(name)} outside a gateway`);
       }),
-    );
-  }
-  const x = i.claude;
-  const claudePath = x.claudePath && !x.claudePath.includes('/') ? (findOnPath(x.claudePath, i.env.PATH ?? process.env.PATH) ?? x.claudePath) : x.claudePath;
-  const config: ClaudeCodeHarnessConfig = {
+    ...(blobs ? { blobs } : {}),
+    launch: i.launch,
     env: i.env,
-    ...(claudePath ? { claudePath } : {}),
-    ...(x.configDir ? { configDir: x.configDir } : {}),
-    ...(x.settings !== undefined ? { settings: x.settings as ClaudeCodeHarnessConfig['settings'] } : {}),
-    ...(x.settingSources ? { settingSources: x.settingSources } : {}),
-    ...(x.mcpServers ? { mcpServers: x.mcpServers as ClaudeCodeHarnessConfig['mcpServers'] } : {}),
-    ...(x.plugins ? { plugins: x.plugins } : {}),
-    ...(x.skills !== undefined ? { skills: x.skills } : {}),
-    ...(x.extraArgs ? { extraArgs: x.extraArgs } : {}),
-    ...(x.additionalDirectories ? { additionalDirectories: x.additionalDirectories } : {}),
-  };
-  // Resolvers ride in the instance's open options; explicit options in the config win.
-  const inst = media ? { ...i, options: { resolveImage: media.resolveImage, resolveFile: media.resolveFile, ...i.options } } : i;
-  return new InstanceHarness(inst, new ClaudeCodeHarness(config));
+    profiles: i.profiles,
+  });
+  return new InstanceHarness(i, adapter, undefined, undefined, kind.profilesInOpen === true);
 }
 
 /** The variables an env map sets (`undefined` removes one from a child's env; in-process there is nothing to remove). */
@@ -3761,30 +4462,9 @@ function definedEnv(env: Record<string, string | undefined>): Record<string, str
   return Object.keys(out).length ? out : undefined;
 }
 
-/** Import a harness module, run its factory, and check the adapter's shape. */
-async function loadHarnessModule(o: {
-  name: string;
-  module: ModuleLaunch;
-  log: (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
-  harness: (name: string) => HarnessAdapter;
-}): Promise<HarnessAdapter> {
-  const where = `harnesses.${o.name} (module ${o.module.file})`;
-  const name = o.module.export ?? 'createHarness';
-  const mod = (await import(pathToFileURL(o.module.file).href).catch((e: Error) => {
-    throw new Error(`${where}: cannot import: ${e.message}`);
-  })) as Record<string, unknown>;
-  const factory = o.module.export !== undefined ? mod[name] : (mod[name] ?? mod.default);
-  if (typeof factory !== 'function') throw new Error(`${where}: export ${JSON.stringify(name)}${o.module.export !== undefined ? '' : ' (or default)'} is not a function`);
-  let adapter: HarnessAdapter;
-  try {
-    adapter = await (factory as HarnessFactory)({ name: o.name, config: o.module.config, log: o.log, harness: o.harness });
-  } catch (e) {
-    throw new Error(`${where}: factory failed: ${(e as Error).message}`);
-  }
-  const a = adapter as unknown as Partial<Record<string, unknown>> | null;
-  const bad = !a || typeof a.id !== 'string' || !a.id ? 'id (a non-empty string)' : (['probe', 'open'] as const).find((k) => typeof a[k] !== 'function');
-  if (bad) throw new Error(`${where}: the factory did not return a HarnessAdapter (bad ${bad})`);
-  return adapter;
+/** `store` as `BlobAccess` and nothing more: no writes, and each method works detached from the object. */
+function readOnlyBlobs(store: BlobAccess): BlobAccess {
+  return Object.freeze({ stat: (ref: string) => store.stat(ref), get: (ref: string) => store.get(ref) });
 }
 
 /** What a live's voice is told when the agent gives no instructions (decision 11). */
@@ -3792,82 +4472,38 @@ const DEFAULT_LIVE_INSTRUCTIONS =
   'You take part by voice in a live session (a meeting or a call) as this deployment\'s assistant. Speak briefly and naturally, in the language people use. Stay quiet unless someone addresses you. For anything that needs facts, files, tools or actions, delegate it, then report the result accurately, without adding details.';
 
 /** A channel built but not started yet. */
-type BuiltChannel = { adapter: ChannelAdapter; account: string; owner: ChannelOwner; tier?: Tier; config?: unknown; close?: () => Promise<void>; source?: ResolvedChannel; bind?: (e: RunningChannel) => void };
+type BuiltChannel = {
+  adapter: ChannelAdapter;
+  account: string;
+  owner: ChannelOwner;
+  defaultEvidence: DefaultEvidence;
+  tier?: Tier;
+  config?: unknown;
+  close?: () => Promise<void>;
+  /** `ChannelModule.create`'s `idKnown`: absent, it is. */
+  idKnown?: () => boolean;
+  source?: ResolvedChannel;
+  bind?: (e: RunningChannel) => void;
+};
 
-const isBridge = (a: ChannelAdapter): a is BridgedChannel => typeof (a as Partial<BridgedChannel>).state === 'function' && typeof (a as Partial<BridgedChannel>).close === 'function';
+/** Its channel id is settled: anything but a bridge without `id` whose peer has not said hello yet (`BuiltChannel.idKnown`). */
+const idKnown = (b: { idKnown?: () => boolean }): boolean => b.idKnown?.() ?? true;
 
-/** Its channel id is settled: anything but a bridge without `id` whose peer has not said hello yet. */
-function idKnown(b: { adapter: ChannelAdapter; source?: ResolvedChannel }): boolean {
-  return !(b.source?.type === 'bridge' && b.source.id === undefined && isBridge(b.adapter) && !b.adapter.state().connected);
+/** A resolved channel entry for its type's `create`: a copy whose host keys (`evidence`, `ack`, …) are its own, so the module cannot change the entry's. */
+function hostKeysCopied(cfg: ResolvedChannel): ResolvedChannel {
+  return {
+    ...cfg,
+    ...(Array.isArray(cfg.evidence) ? { evidence: [...cfg.evidence] } : {}),
+    ...(cfg.ack !== null && typeof cfg.ack === 'object' ? { ack: { ...cfg.ack } } : {}),
+  };
 }
 
-/**
- * Why a channel (`id`, `owner`, `account`) cannot run next to `others`, if it cannot:
- * one channel id belongs to one adapter, only accounts differ (channel-stamping F4), and
- * bridges and modules never take a built-in id.
- */
-function idConflict(id: string, owner: ChannelOwner, account: string, others: Iterable<{ adapter: ChannelAdapter; owner: ChannelOwner; account: string }>): string | undefined {
-  if (typeof owner === 'string' && owner !== 'lark-bot' && owner !== 'mail' && RESERVED_CHANNEL_IDS.includes(id)) return `channel id ${JSON.stringify(id)} is a built-in channel id; ${ownerName(owner)} cannot use it`;
-  for (const o of others) {
-    if (o.adapter.id !== id) continue;
-    if (o.owner !== owner) return `channel id ${JSON.stringify(id)} belongs to ${ownerName(o.owner)}; ${ownerName(owner)} cannot use it too (one channel id is one adapter, only accounts differ)`;
-    if (o.account === account) return `two channels have the same (channel, account) = (${id}, ${account}); give one another account`;
-  }
-  return undefined;
-}
-
-async function buildChannel(
-  ch: ResolvedChannel,
-  index: number,
-  log: (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void,
-  onState?: (s: BridgeState) => void,
-  acceptId?: (id: string) => string | undefined,
-  /** Under the data directory: each built-in channel account gets a directory of its own here. */
-  channelsDir?: string,
-): Promise<{ adapter: ChannelAdapter; account: string; tier?: Tier; config?: unknown; close?: () => Promise<void> }> {
-  const tier = ch.tier ? { tier: ch.tier } : {};
-  switch (ch.type) {
-    case 'lark-bot':
-      return {
-        adapter: new LarkBotAdapter(
-          { ...ch.config, look: (ch.config.look ?? 'chat') as 'console' | 'chat' },
-          // Open thinking bubbles are recorded here, so a restart closes the ones left spinning.
-          channelsDir ? { stateDir: join(channelsDir, `lark-bot.${encodeURIComponent(ch.account)}`) } : {},
-        ),
-        account: ch.account,
-        ...tier,
-      };
-    case 'mail':
-      return { adapter: new MailChannel({ ...ch.config, account: ch.account } as MailChannelConfig), account: ch.account, ...tier };
-    case 'bridge': {
-      const b = await spawnChannel({
-        command: ch.command,
-        account: ch.account,
-        ...(ch.args ? { args: ch.args } : {}),
-        ...(ch.env ? { env: ch.env } : {}),
-        ...(ch.cwd ? { cwd: ch.cwd } : {}),
-        ...(ch.config !== undefined ? { config: ch.config } : {}),
-        // A peer that fails its first hello is retried with the restart backoff instead of failing the daemon.
-        retryFirstConnect: true,
-        ...(ch.id !== undefined ? { id: ch.id, expectId: ch.id } : {}),
-        ...(onState ? { onState } : {}),
-        ...(acceptId ? { acceptId } : {}),
-      });
-      return { adapter: b, account: ch.account, config: ch.config, close: () => b.close(), ...tier };
-    }
-    case 'module': {
-      // A plugin that fails to load is a config error (exit 2), like any other bad channel entry.
-      const adapter = await loadChannelModule({
-        file: ch.module,
-        ...(ch.export ? { export: ch.export } : {}),
-        index,
-        account: ch.account,
-        config: ch.config,
-        log: (level, msg, data) => log(level, `channel module ${ch.module}: ${msg}`, data),
-      }).catch((e: Error) => {
-        throw new ConfigError(e.message);
-      });
-      return { adapter, account: ch.account, config: ch.config, ...(adapter.close ? { close: () => adapter.close!() } : {}), ...tier };
-    }
-  }
+/** What is wrong with a value `ChannelModule.create` returned, described: not a `BuiltChannel` with a `ChannelAdapter`; none when it is one. */
+function badBuiltChannel(v: unknown): string | undefined {
+  if (typeof v !== 'object' || v === null) return 'value (an object with an adapter)';
+  const b = v as Partial<Record<string, unknown>>;
+  const adapter = badChannelAdapter(b.adapter);
+  if (adapter) return `adapter.${adapter}`;
+  const method = (['close', 'idKnown'] as const).find((k) => b[k] !== undefined && typeof b[k] !== 'function');
+  return method ? `${method} (a function when present)` : undefined;
 }

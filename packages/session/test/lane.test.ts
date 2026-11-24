@@ -95,7 +95,7 @@ describe('Lane: turns and queue', () => {
     await lane.whenIdle();
   });
 
-  it('a turn the idle deadline ended (failed, idle_timeout) re-queues what it did not consume: the follow-up runs next #HC-3b', async () => {
+  it('a turn the idle deadline ended (failed, idle_timeout) re-queues what it did not consume: the follow-up runs next #HC-8', async () => {
     const h = new ManualHarness();
     const { lane, events } = setup({ harness: h });
     await lane.command({ type: 'input', sessionKey: 's1', input: input('x', { id: 'x' }), mode: 'queue' });

@@ -1,7 +1,8 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { expect } from 'vitest';
-import { AdminConfigPutResult, AdminLarkBotJob, check, type AdminConfigDocument } from '@agents-io/protocol';
+import { AdminLarkBotJob } from '@agents-io/channel-lark-bot';
+import { AdminConfigPutResult, check, type AdminConfigDocument } from '@agents-io/protocol';
 import { FakeChannel } from '@agents-io/testkit';
 import type { ResolvedChannel } from '../src/config.js';
 import { SOURCE_LOADER, daemon, until } from './helpers.js';

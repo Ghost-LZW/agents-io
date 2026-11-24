@@ -2,14 +2,11 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BodyOf, HarnessEvent, Policy, SessionEvent, Tier } from '@agents-io/protocol';
-import { CodexHarness } from '@agents-io/harness-codex';
+import { CodexHarness, type CodexLaunch } from '@agents-io/harness-codex';
 import { TOPIC_KEY, isSnapshotEvent, passes, type TopicCardData } from '@agents-io/session';
 import { CHOICE_KEY, OUTPUT_EVENT, parseChoiceActionId, type ChoiceData, type OutputRecord } from '@agents-io/host-mcp';
 import { FakeChannel, checkEventStream, defaultChannelCaps } from '@agents-io/testkit';
-import type { ClientSubscription } from './client.js';
-import { LocalClient } from './client.js';
-import { DEFAULT_AGENT, defaultInstance, withDefaultInstance, type Config, type HarnessInstance } from './config.js';
-import { Gateway } from './gateway.js';
+import { DEFAULT_AGENT, Gateway, LocalClient, defaultInstance, withDefaultInstance, type ClientSubscription, type Config, type HarnessInstance } from '@agents-io/daemon';
 
 /*
  * Scenarios against the REAL harness from the config. Each one starts its own
@@ -462,7 +459,7 @@ export const SCENARIOS: Scenario[] = [
       const inst = defaultInstance(base);
       if (inst.kind !== 'codex') throw new Error('unreachable');
       const transport = { kind: 'unix', spawn: 'own', stateDir: join(dir, 'cx') } as const;
-      const config = withDefaultInstance(base, { ...inst, codex: { ...inst.codex, transport } });
+      const config = withDefaultInstance(base, { ...inst, launch: { ...(inst.launch as CodexLaunch), transport } });
       ctx.cleanup.push(() => new CodexHarness({ transport }).shutdownOwnServer().then(() => undefined));
       const sk = 'e2e:local';
       const one = await world(ctx, { dir, config });

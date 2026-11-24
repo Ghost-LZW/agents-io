@@ -5,9 +5,12 @@ import { afterEach } from 'vitest';
 import type { HarnessAdapter, Policy } from '@agents-io/protocol';
 import { FakeChannel, FakeHarness, type FakeTurnScript } from '@agents-io/testkit';
 import { LocalClient } from '../src/client.js';
+import type { ChannelRegistry } from '../src/channel-registry.js';
+import type { ModuleRegistry } from '../src/modules.js';
 import { resolveConfig, type Config, type HarnessInstance } from '../src/config.js';
 import { Gateway, InstanceHarness, type GatewayOptions } from '../src/gateway.js';
 import { readTokenFile, tokenPath } from '../src/token.js';
+import type { HarnessDeclares } from './declares.js';
 
 export const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
@@ -46,7 +49,7 @@ export interface World {
 
 /**
  * A daemon over a SQLite log in `dir` (reuse `dir` to restart it), a FakeChannel `fake`
- * (owner fake:alice) and a FakeHarness behind every instance.
+ * (owner fake:alice) and a FakeHarness behind every instance (declaring `declares`).
  */
 export async function daemon(
   o: {
@@ -63,6 +66,12 @@ export async function daemon(
     channelAdapter?: GatewayOptions['channelAdapter'];
     /** GatewayOptions.channelStartGraceMs. */
     channelStartGraceMs?: number;
+    /** What the FakeHarness declares (as the adapter it stands in for would). */
+    declares?: HarnessDeclares;
+    /** The channel types the config is resolved with and the daemon runs (default the built-in ones). */
+    channelRegistry?: ChannelRegistry;
+    /** The feature modules the config is resolved with and the daemon runs (default the built-in ones). */
+    moduleRegistry?: ModuleRegistry;
     /** GatewayOptions.testHooks, outboxAttemptTimeoutMs and logger. */
     gateway?: Pick<GatewayOptions, 'testHooks' | 'outboxAttemptTimeoutMs' | 'logger'>;
   } = {},
@@ -74,12 +83,12 @@ export async function daemon(
     const c = (raw as { console?: Record<string, unknown> }).console;
     (raw as Record<string, unknown>).console = { port: 0, ...c };
   }
-  const base = resolveConfig(raw, { env: {}, baseDir: dir, cwd: dir });
+  const base = resolveConfig(raw, { env: {}, baseDir: dir, cwd: dir, ...(o.channelRegistry ? { channelRegistry: o.channelRegistry } : {}), ...(o.moduleRegistry ? { moduleRegistry: o.moduleRegistry } : {}) });
   const configPath = join(dir, 'aio.config.json');
   if (o.console && !o.dir) writeFileSync(configPath, JSON.stringify(raw, null, 2) + '\n', { mode: 0o600 });
   const config = { ...base, socketPath: join(dir, 'run', 'aio.sock'), ...(o.console ? { source: { path: configPath, envFile: join(dir, '.env.live') } } : {}) };
   const chat = new FakeChannel('fake');
-  const harness = new FakeHarness(o.script);
+  const harness = Object.assign(new FakeHarness(o.script), o.declares);
   const built: HarnessInstance[] = [];
   const gw = await Gateway.start({
     config,
@@ -96,6 +105,8 @@ export async function daemon(
     ...(o.console ? { console: true, consoleEnv: o.consoleEnv ?? {} } : {}),
     ...(o.channelAdapter ? { channelAdapter: o.channelAdapter } : {}),
     ...(o.channelStartGraceMs !== undefined ? { channelStartGraceMs: o.channelStartGraceMs } : {}),
+    ...(o.channelRegistry ? { channelRegistry: o.channelRegistry } : {}),
+    ...(o.moduleRegistry ? { moduleRegistry: o.moduleRegistry } : {}),
     ...o.gateway,
   });
   let stopped = false;

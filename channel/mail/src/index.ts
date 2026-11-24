@@ -5,3 +5,4 @@ export { mailauthVerifier, verdictFromAuth } from './auth.js';
 export { parseInbound, isAutomated, threadRootOf, QUOTE_MAX_CHARS } from './inbound.js';
 export { splitQuote } from './quote.js';
 export { messageIdFor } from './outbound.js';
+export * from './module.js';

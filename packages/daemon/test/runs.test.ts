@@ -118,7 +118,8 @@ describe('run.start', () => {
     await tool.runStart({ runId: 'o', agent: 'exec', input: [{ type: 'text', text: 'wait' }], observe: { routes: [route] } });
     await until(() => w.chat.sent.some((s) => s.route.conversationId === 'ops'));
     const s = w.harness.sessions.at(-1)!;
-    expect((s.args.options as { sdk?: { systemPrompt?: unknown } }).sdk?.systemPrompt).toEqual({ type: 'preset', preset: 'claude_code', append: 'You are the executor.\n' });
+    // Each adapter applies them its own way (Claude Code: appended to its preset system prompt).
+    expect(s.args.instructions).toBe('You are the executor.\n');
     const endedToHost = host.runEndedOf('o');
     tool.close();
     await new Promise((r) => setTimeout(r, 50));

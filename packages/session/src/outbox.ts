@@ -48,6 +48,13 @@ export interface InFlightDelivery {
   sessionKey: string;
   route: ReplyRoute;
   turnId?: string;
+  /** The inputs it answers, when no turn made it (`Delivery.inputIds`): kept for its settlement after a restart. */
+  inputIds?: string[];
+  /**
+   * What `OutboxOptions.atSend` took when the delivery started (JSON data, e.g. who sent it), kept
+   * so that a settlement after a restart hands it to `onSettled` too. Absent when it took nothing.
+   */
+  atSend?: unknown;
   /** What the send was (U20): its settlement after a restart says so too. */
   kind?: OutboundKind;
   requestId?: string;
@@ -104,6 +111,20 @@ export interface OutboxOptions {
   /** Where `delivery.settled` events are written. */
   hub?: Hub;
   store?: OutboxStore;
+  /**
+   * The store and `onSettled` write into the hub log's database, on the same connection (the
+   * daemon's records and SQLite log): a settlement — the outcome, what `onSettled` writes and
+   * `delivery.settled` — then commits as one transaction (`Hub.batch`) or not at all. One
+   * that fails (any of the three throws, `onSettled` included, or a crash in the middle)
+   * leaves the in-flight mark, which `recover` (or the next `deliver` of that id) settles as
+   * `unknown`. A refusal of the outbound check (`policy`) is settled before any attempt, with no
+   * mark: when that settlement fails nothing is recorded, the caller gets the error, and the
+   * next `deliver` of that id checks again (nothing was sent). Unset, or on a hub whose log has
+   * no transactions (`SessionLog.transaction`), each of the three commits on its own and
+   * `onSettled` is best effort. Leave it unset for a store on another connection: it would wait
+   * for the log's lock.
+   */
+  atomic?: boolean;
   /** Checked when a delivery names the turn it comes from (agent-initiated sends). */
   policy?: Pick<Policy, 'outbound'>;
   maxAttempts?: number;
@@ -118,15 +139,19 @@ export interface OutboxOptions {
   /**
    * Every settled outcome of a delivery (not a duplicate answered from the store), e.g. to
    * index which turn sent which platform message (agent-messaging §4.3.3) and to explain a
-   * side effect by its operationId. Errors are ignored.
+   * side effect by its operationId. Errors are ignored, except with `atomic`: there what it
+   * writes is part of the settlement, and its error fails the settlement (rolled back, rethrown).
+   * `atSend` is what `OutboxOptions.atSend` took, also for a mark settled later (`recover`).
    */
-  onSettled?: (d: Pick<Delivery, 'sessionKey' | 'turnId' | 'kind' | 'requestId' | 'checked'>, rec: DeliveryRecord, atSend?: unknown) => void;
+  onSettled?: (d: Pick<Delivery, 'sessionKey' | 'turnId' | 'inputIds' | 'kind' | 'requestId' | 'checked'>, rec: DeliveryRecord, atSend?: unknown) => void;
   /**
    * Taken once when a delivery starts (send time), handed back to `onSettled` as `atSend`:
-   * what the sending turn was then (its provenance), which may be gone by the time the
-   * delivery settles (the lane closed). Errors are ignored.
+   * what the sending turn was then (its provenance), or who sent it, which may be gone by the
+   * time the delivery settles (the lane closed, the process restarted). Kept in the in-flight
+   * mark (`InFlightDelivery.atSend`), so it must be JSON data for a store that persists marks.
+   * Errors are ignored.
    */
-  atSend?: (d: Pick<Delivery, 'sessionKey' | 'turnId'>) => unknown;
+  atSend?: (d: Pick<Delivery, 'operationId' | 'sessionKey' | 'turnId'>) => unknown;
   /** The chain position an agent-authored send (`as` set) carries out-of-band (`SendOp.cause`). */
   causeOf?: (d: Delivery) => SendOp['cause'] | undefined;
   /**
@@ -144,6 +169,11 @@ export interface Delivery {
   sessionKey: string;
   route: ReplyRoute;
   turnId?: string;
+  /**
+   * The inputs a delivery no turn made answers (a system reply to a command), for `onSettled`;
+   * kept in the in-flight mark, so a settlement after a restart has them too.
+   */
+  inputIds?: string[];
   /**
    * The turn this send comes from. When given, `Policy.outbound` must allow the
    * destination. Leave out for the turn's own reply route rendering.
@@ -168,10 +198,17 @@ export interface Delivery {
  * process that died is settled as `unknown` (by `recover`, or by the next
  * `deliver` of that id) and never replayed. Retries use exponential backoff; an
  * outcome that stays unclear (retries run out, an attempt times out) is `unknown`.
+ * A settlement that throws is not a failed attempt: the error reaches the caller,
+ * nothing is sent again, and with `atomic` nothing of it is kept but the in-flight
+ * mark (settled `unknown` like a crash's, with an error that says what happened). An
+ * outbound refusal has no mark (nothing was attempted): its failed settlement leaves
+ * nothing, and the next `deliver` of that id checks again.
  */
 export class Outbox {
   private readonly store: OutboxStore;
   private inflight = new Map<string, Promise<DeliveryRecord>>();
+  /** Operations whose settlement failed in this process: why, for the error their in-flight mark is settled with. */
+  private unrecorded = new Map<string, string>();
   private draining = false;
   private closed = false;
   private wake!: () => void;
@@ -243,11 +280,33 @@ export class Outbox {
     this.wake();
   }
 
+  /**
+   * An in-flight mark nobody is running: left by an earlier process, or by a settlement that
+   * failed in this one. Unknown either way (the platform may have it), never resent.
+   */
   private settleStale(r: InFlightDelivery): DeliveryRecord {
-    return this.settle(
-      { sessionKey: r.sessionKey, ...(r.turnId !== undefined ? { turnId: r.turnId } : {}), ...(r.kind !== undefined ? { kind: r.kind } : {}), ...(r.requestId !== undefined ? { requestId: r.requestId } : {}), ...(r.checked ? { checked: true } : {}) },
-      { operationId: r.operationId, sessionKey: r.sessionKey, route: r.route, status: 'unknown', attempts: r.attempts, error: 'in flight when the previous process stopped; not resent' },
+    const failed = this.unrecorded.get(r.operationId);
+    const rec = this.settle(
+      {
+        sessionKey: r.sessionKey,
+        ...(r.turnId !== undefined ? { turnId: r.turnId } : {}),
+        ...(r.inputIds?.length ? { inputIds: r.inputIds } : {}),
+        ...(r.kind !== undefined ? { kind: r.kind } : {}),
+        ...(r.requestId !== undefined ? { requestId: r.requestId } : {}),
+        ...(r.checked ? { checked: true } : {}),
+      },
+      {
+        operationId: r.operationId,
+        sessionKey: r.sessionKey,
+        route: r.route,
+        status: 'unknown',
+        attempts: r.attempts,
+        error: failed !== undefined ? `recording its outcome failed in this process (${failed}); not resent` : 'in flight when the previous process stopped; not resent',
+      },
+      r.atSend,
     );
+    this.unrecorded.delete(r.operationId);
+    return rec;
   }
 
   private async run(d: Delivery, attempt: (n: number) => Promise<SendResult | void>): Promise<DeliveryRecord> {
@@ -263,7 +322,22 @@ export class Outbox {
     } catch {
       // best effort, like onSettled
     }
-    const settle = (rec: DeliveryRecord) => this.settle(d, rec, atSend);
+    const settle = (rec: DeliveryRecord) => {
+      try {
+        return this.settle(d, rec, atSend);
+      } catch (err) {
+        // Its in-flight mark is settled later as unknown, saying so. Without one (the outbound
+        // check refused it before any attempt) nothing is recorded: the next deliver checks again.
+        let marked = true;
+        try {
+          marked = this.store.inFlight(d.operationId) !== undefined;
+        } catch {
+          // keep the reason, in case
+        }
+        if (marked) this.unrecorded.set(d.operationId, err instanceof Error ? err.message : String(err));
+        throw err;
+      }
+    };
 
     if (d.from !== undefined && this.o.policy?.outbound) {
       let verdict: string;
@@ -298,23 +372,17 @@ export class Outbox {
         sessionKey: d.sessionKey,
         route: d.route,
         ...(d.turnId !== undefined ? { turnId: d.turnId } : {}),
+        ...(d.inputIds?.length ? { inputIds: [...d.inputIds] } : {}),
+        ...(atSend !== undefined ? { atSend } : {}),
         ...(d.kind !== undefined ? { kind: d.kind } : {}),
         ...(d.requestId !== undefined ? { requestId: d.requestId } : {}),
         ...(d.checked === true ? { checked: true } : {}),
         attempts: n,
         startedAt: Date.now(),
       });
+      let r: SendResult | void | typeof TIMED_OUT;
       try {
-        const r = await withTimeout(Promise.resolve().then(() => attempt(n)), timeout);
-        // The platform may have it: unknown, not retried.
-        if (r === TIMED_OUT) return settle({ ...rec, error: `attempt ${n} timed out after ${timeout} ms` });
-        return settle({
-          ...rec,
-          status: 'delivered',
-          ...(r && r.providerMessageId !== undefined ? { providerMessageId: r.providerMessageId } : {}),
-          ...(r && r.providerMessageIds?.length ? { providerMessageIds: [...r.providerMessageIds] } : {}),
-          ...(r && r.providerThreadId !== undefined ? { providerThreadId: r.providerThreadId } : {}),
-        });
+        r = await withTimeout(Promise.resolve().then(() => attempt(n)), timeout);
       } catch (err) {
         rec.error = err instanceof Error ? err.message : String(err);
         if ((err as { retryable?: unknown })?.retryable === false) return settle({ ...rec, status: 'rejected' });
@@ -322,7 +390,18 @@ export class Outbox {
           if (!this.draining) await Promise.race([sleep(Math.min(cap, base * 2 ** (n - 1))), this.stopping]);
           if (this.draining) return settle({ ...rec, error: `${rec.error}; not retried: stopping` });
         }
+        continue;
       }
+      // The attempt is over; settling is outside its `try`: a settlement that throws is not a failed send and never sends again.
+      // Timed out: the platform may have it: unknown, not retried.
+      if (r === TIMED_OUT) return settle({ ...rec, error: `attempt ${n} timed out after ${timeout} ms` });
+      return settle({
+        ...rec,
+        status: 'delivered',
+        ...(r && r.providerMessageId !== undefined ? { providerMessageId: r.providerMessageId } : {}),
+        ...(r && r.providerMessageIds?.length ? { providerMessageIds: [...r.providerMessageIds] } : {}),
+        ...(r && r.providerThreadId !== undefined ? { providerThreadId: r.providerThreadId } : {}),
+      });
     }
     return settle(rec);
   }
@@ -337,10 +416,17 @@ export class Outbox {
     return this.settle(d, { operationId: d.operationId, sessionKey: d.sessionKey, route: d.route, status: 'held', attempts: 0, ...(reason !== undefined ? { reason } : {}) });
   }
 
-  private settle(d: Pick<Delivery, 'sessionKey' | 'turnId' | 'kind' | 'requestId' | 'checked'>, rec: DeliveryRecord, atSend?: unknown): DeliveryRecord {
+  /**
+   * The outcome, then `onSettled`, then `delivery.settled`. With `atomic`, in one transaction:
+   * a throw of any of the three (the log refuses the event, the index cannot be written) rolls
+   * all three back and leaves the in-flight mark. Without it, `onSettled` is best effort.
+   */
+  private settle(d: Pick<Delivery, 'sessionKey' | 'turnId' | 'inputIds' | 'kind' | 'requestId' | 'checked'>, rec: DeliveryRecord, atSend?: unknown): DeliveryRecord {
     // Closed: the in-flight mark stays, and the next process settles it as unknown.
     if (this.closed) return rec;
-    this.store.put(rec);
+    const hub = this.o.hub;
+    // Only a log with transactions can take the three back together; on another, each commits on its own.
+    const atomic = this.o.atomic === true && hub?.log.transaction !== undefined;
     // A checked turn's sends say what they were even if the scope went meanwhile: readers release its text by them.
     let detailed = d.checked === true;
     try {
@@ -348,32 +434,43 @@ export class Outbox {
     } catch {
       // not detailed
     }
-    try {
-      this.o.onSettled?.(d, rec, atSend);
-    } catch {
-      // an index is best effort; the outcome is recorded
-    }
-    this.o.hub?.append(d.sessionKey, {
-      ts: Date.now(),
-      ...(d.turnId !== undefined ? { turnId: d.turnId } : {}),
-      level: 'detail',
-      audience: 'status',
-      durability: 'durable',
-      visibility: 'operators',
-      body: {
-        t: 'delivery.settled',
-        operationId: rec.operationId,
-        route: rec.route,
-        result: rec.status,
-        ...(rec.providerMessageId !== undefined ? { providerMessageId: rec.providerMessageId } : {}),
-        // U20: a scoped host tells its turn's answer from a tool's message by kind, not by operationId.
-        ...(detailed && d.kind !== undefined ? { kind: d.kind } : {}),
-        ...(detailed && d.turnId !== undefined ? { turnId: d.turnId } : {}),
-        ...(detailed && d.requestId !== undefined ? { requestId: d.requestId } : {}),
-        ...(rec.status === 'held' || (detailed && rec.reason !== undefined) ? (rec.reason !== undefined ? { reason: rec.reason } : {}) : {}),
-        ...(detailed && rec.denied ? { denied: true } : {}),
-      },
-    });
+    const write = () => {
+      this.store.put(rec);
+      if (atomic) {
+        // Not caught: a failed write may have ended the whole transaction (SQLITE_FULL, IOERR),
+        // and what came after it would commit on its own.
+        this.o.onSettled?.(d, rec, atSend);
+      } else {
+        try {
+          this.o.onSettled?.(d, rec, atSend);
+        } catch {
+          // an index is best effort; the outcome is recorded
+        }
+      }
+      hub?.append(d.sessionKey, {
+        ts: Date.now(),
+        ...(d.turnId !== undefined ? { turnId: d.turnId } : {}),
+        level: 'detail',
+        audience: 'status',
+        durability: 'durable',
+        visibility: 'operators',
+        body: {
+          t: 'delivery.settled',
+          operationId: rec.operationId,
+          route: rec.route,
+          result: rec.status,
+          ...(rec.providerMessageId !== undefined ? { providerMessageId: rec.providerMessageId } : {}),
+          // U20: a scoped host tells its turn's answer from a tool's message by kind, not by operationId.
+          ...(detailed && d.kind !== undefined ? { kind: d.kind } : {}),
+          ...(detailed && d.turnId !== undefined ? { turnId: d.turnId } : {}),
+          ...(detailed && d.requestId !== undefined ? { requestId: d.requestId } : {}),
+          ...(rec.status === 'held' || (detailed && rec.reason !== undefined) ? (rec.reason !== undefined ? { reason: rec.reason } : {}) : {}),
+          ...(detailed && rec.denied ? { denied: true } : {}),
+        },
+      });
+    };
+    if (atomic) hub.batch(write);
+    else write();
     return rec;
   }
 }

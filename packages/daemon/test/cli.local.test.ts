@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { faultRequest, parseCli, parseEnvPairs, replayRequest, runRequest, socketOf } from '../src/cli.js';
 import { ConfigError, configTable, resolveConfig } from '../src/config.js';
+import { cli } from './cli-helpers.js';
 import { tmp } from './helpers.js';
 
 const ctx = (dir: string) => ({ env: {}, baseDir: dir, cwd: dir });
@@ -62,6 +63,29 @@ describe('cli arguments', () => {
   it('--socket / $AIO_SOCKET pick the daemon without loading a config', () => {
     expect(socketOf(parseCli(['tail', '--socket', '/x/aio.sock']))).toBe('/x/aio.sock');
     expect(socketOf(parseCli(['tail']), { AIO_SOCKET: '/y/aio.sock' })).toBe('/y/aio.sock');
+  });
+
+  it('`aio tui-bridge` runs the bridge the Claude Code kind adds (`HarnessModule.cli`), which its terminal UI starts: outside one it says so and exits 2', async () => {
+    const saved = { url: process.env.AIO_TUI_URL, session: process.env.AIO_TUI_SESSION };
+    delete process.env.AIO_TUI_URL;
+    delete process.env.AIO_TUI_SESSION;
+    try {
+      const r = await cli(['tui-bridge']);
+      expect(r.code).toBe(2);
+      expect(r.err).toContain('[agents-io bridge] AIO_TUI_URL / AIO_TUI_SESSION missing; started outside `aio tui`?');
+    } finally {
+      if (saved.url !== undefined) process.env.AIO_TUI_URL = saved.url;
+      if (saved.session !== undefined) process.env.AIO_TUI_SESSION = saved.session;
+    }
+    expect((await cli(['no-such-command'])).code).toBe(2);
+  });
+
+  it('`aio e2e` moved out of the daemon: it names `pnpm e2e` and `aio-e2e` and exits 2', async () => {
+    const r = await cli(['e2e', '--only', 'a']);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain('pnpm e2e');
+    expect(r.err).toContain('aio-e2e');
+    expect(r.out).toBe('');
   });
 });
 

@@ -1,5 +1,9 @@
-// Writes the protocol's JSON Schemas to packages/protocol/schema/ for non-TypeScript implementers.
+// Writes JSON Schemas for non-TypeScript implementers: the protocol's to packages/protocol/schema/,
+// and each built-in module's own wire types into its package: the `schemas` of its admin
+// contribution (`ChannelModule.admin`; channel/lark-bot/schema/: its console endpoints).
+// Every `$id` is `agents-io/v<PROTOCOL_VERSION>/<name>`, wherever the file lives.
 import { mkdirSync, writeFileSync } from 'node:fs';
+import * as lark from '../channel/lark-bot/dist/index.js';
 import * as p from '../packages/protocol/dist/index.js';
 
 const names = [
@@ -23,12 +27,26 @@ const names = [
   'ExternalCalloutAnswer', 'ExternalSender',
   // Console / admin HTTP API
   'AdminError', 'AdminLoginRequest', 'AdminLoginResult', 'AdminStatus', 'AdminConfigDocument', 'AdminConfigPut', 'AdminConfigPutResult',
-  'AdminChannelsApplied', 'AdminConfigValidateRequest', 'AdminConfigValidation', 'AdminQueue', 'AdminSessions', 'AdminLarkBotRequest', 'AdminLarkBotStarted', 'AdminLarkBotJob',
+  'AdminChannelsApplied', 'AdminConfigValidateRequest', 'AdminConfigValidation', 'AdminQueue', 'AdminSessions',
 ];
-const dir = new URL('../packages/protocol/schema/', import.meta.url);
-mkdirSync(dir, { recursive: true });
-for (const n of names) {
-  const schema = { $schema: 'https://json-schema.org/draft/2020-12/schema', $id: `agents-io/v${p.PROTOCOL_VERSION}/${n}`, ...p[n] };
-  writeFileSync(new URL(`${n}.json`, dir), JSON.stringify(schema, null, 2) + '\n');
+/** Modules whose admin contribution declares schemas, and where they go. */
+const modules = [
+  // Lark bot provisioning (POST /api/bots/lark, GET /api/bots/lark/:job)
+  { dir: '../channel/lark-bot/schema/', module: lark.larkBotChannelModule },
+];
+const sets = [
+  { dir: '../packages/protocol/schema/', schemas: Object.fromEntries(names.map((n) => [n, p[n]])) },
+  ...modules.map((m) => ({ dir: m.dir, schemas: m.module.admin?.schemas ?? {} })),
+];
+let written = 0;
+for (const set of sets) {
+  const dir = new URL(set.dir, import.meta.url);
+  mkdirSync(dir, { recursive: true });
+  for (const [n, s] of Object.entries(set.schemas)) {
+    if (!s) throw new Error(`${set.dir}: no schema ${n}`);
+    const schema = { $schema: 'https://json-schema.org/draft/2020-12/schema', $id: `agents-io/v${p.PROTOCOL_VERSION}/${n}`, ...s };
+    writeFileSync(new URL(`${n}.json`, dir), JSON.stringify(schema, null, 2) + '\n');
+    written++;
+  }
 }
-console.log(`wrote ${names.length} schemas`);
+console.log(`wrote ${written} schemas`);

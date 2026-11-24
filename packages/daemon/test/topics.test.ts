@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import type { InputRecord } from '@agents-io/protocol';
+import type { InputRecord, KernelContext, ModuleManifest, ModuleTopicHandover } from '@agents-io/protocol';
+import { builtinModules } from '../src/bundle.js';
+import { ModuleRegistry } from '../src/modules.js';
 import { daemon, tmp, until, type World } from './helpers.js';
 import { alice, CONV, mcpCall, of, read, textOf, turnsIn, world } from './topics-helpers.js';
 
@@ -66,6 +68,63 @@ describe('topics in the daemon', () => {
     // Its card is the turn's own answer, not a "moved" line.
     await until(() => w.chat.sent.filter((s) => s.finalized).length >= 3);
     expect(w.chat.sent.map((s) => s.edits.at(-1)?.text).at(-1)).toBe('→ back');
+  });
+
+  it("the kernel's handover holds TP-1 for any module that asks: one per turn (the same operation again answers the same, also in flight; another is refused), never from a topic no longer current, never a message just handed here, never to the topic the turn runs in #TP-1", async () => {
+    const kernels: KernelContext[] = [];
+    const probe: ModuleManifest = { id: 'probe', kind: 'feature', needs: ['kernel:topics'], setup: (k) => (kernels.push(k), {}) };
+    const moduleRegistry = new ModuleRegistry([...builtinModules.modules, { manifest: probe, origin: 'module' }], { fields: Object.fromEntries(builtinModules.fields) });
+    const holder: { w?: World } = {};
+    const running: { sessionKey: string; turnId: string; inputs: InputRecord[] }[] = [];
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const w = await daemon({
+      moduleRegistry,
+      script: async (t) => {
+        const topicId = t.inputs.map((i) => i.channelContext.topic).find((x) => typeof x === 'string') as string;
+        running.push({ sessionKey: holder.w!.gw.topics.get(topicId)!.sessionKey, turnId: t.turnId, inputs: t.inputs });
+        await held;
+        t.emit({ t: 'text.snapshot', text: 'ok', final: true }, { audience: 'answer' });
+      },
+    });
+    holder.w = w;
+    const k = kernels[0]!;
+    const turnIn = (sessionKey: string) => running.find((r) => r.sessionKey === sessionKey);
+    const handedAlready = 'this turn was already handed to another topic; end the turn now without answering';
+    // A's turn still runs when the owner starts topic C: A is no longer current, so its turn stays.
+    await w.chat.inject({ sender: alice, text: 'Rust CLI question' });
+    const t1 = (await until(() => turnIn(CONV))).turnId;
+    await w.chat.inject({ sender: alice, text: '/new Elsewhere' });
+    const c = await until(() => w.gw.topics.list({ conversation: CONV }).find((t) => t.title === 'Elsewhere' && t.state === 'current'));
+    await expect(k.topics.rotate(CONV, t1, { title: 'X', summary: 'none', operationId: 'op0' })).rejects.toThrow("this topic is no longer the conversation's current one (the user or another turn switched); just answer here");
+    // C's turn: not to C itself; then one handover, however many ask at once.
+    const m2 = await w.chat.inject({ sender: alice, text: 'what is the capital of Australia?' });
+    const t2 = (await until(() => turnIn(c.sessionKey))).turnId;
+    await expect(k.topics.switch(c.sessionKey, t2, { topicId: c.id, operationId: 'op1' })).rejects.toThrow('you are already in that topic; just answer');
+    const rotate = (title: string, operationId: string) => k.topics.rotate(c.sessionKey, t2, { title, summary: 'none', operationId });
+    const [first, retried, other] = await Promise.allSettled([rotate('Capitals', 'op2'), rotate('Capitals', 'op2'), rotate('Other', 'op3')]);
+    expect(first.status).toBe('fulfilled');
+    const r = (first as PromiseFulfilledResult<ModuleTopicHandover>).value;
+    expect(retried).toEqual({ status: 'fulfilled', value: r });
+    expect(other).toMatchObject({ status: 'rejected', reason: { name: 'ToolError', message: handedAlready } });
+    // After it too: the same operation answers the same; any other, a switch as well, is refused.
+    expect(await rotate('Capitals', 'op2')).toEqual(r);
+    await expect(rotate('Other', 'op4')).rejects.toThrow(handedAlready);
+    await expect(k.topics.switch(c.sessionKey, t2, { topicId: w.gw.topics.bySession(CONV)!.id, operationId: 'op5' })).rejects.toThrow(handedAlready);
+    // One new topic got the message, once.
+    expect(r).toMatchObject({ topic: { title: 'Capitals', state: 'current' }, previous: { id: c.id }, handed: [`${m2.inputId}>${r.topic.id}`] });
+    expect(w.gw.topics.list({ conversation: CONV })).toHaveLength(3);
+    expect(w.gw.topics.current(CONV, 'default')!.id).toBe(r.topic.id);
+    // B answers the message handed to it: it does not hand it on (no ping-pong).
+    const inB = await until(() => turnIn(r.topic.sessionKey));
+    expect(inB.inputs.filter((i) => i.channelContext.context !== true)).toEqual([expect.objectContaining({ inputId: `${m2.inputId}>${r.topic.id}`, channelContext: expect.objectContaining({ handedFrom: c.sessionKey }) })]);
+    const handedHere = 'this message was just handed to this topic by a topic switch; answer it here, in this turn';
+    await expect(k.topics.switch(r.topic.sessionKey, inB.turnId, { topicId: c.id, operationId: 'op6' })).rejects.toThrow(handedHere);
+    await expect(k.topics.rotate(r.topic.sessionKey, inB.turnId, { title: 'Y', summary: 'none', operationId: 'op7' })).rejects.toThrow(handedHere);
+    expect(w.gw.topics.current(CONV, 'default')!.id).toBe(r.topic.id);
+    release();
+    await until(() => turnsIn(w, r.topic.sessionKey).length === 1);
+    expect(running.map((x) => x.sessionKey)).toEqual([CONV, c.sessionKey, r.topic.sessionKey]);
   });
 
   it("parked topics' lanes close after topics.parkedIdleMs and resume by native id when switched back #TP-1", async () => {

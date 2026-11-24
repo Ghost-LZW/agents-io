@@ -61,6 +61,8 @@ agents-io 要在任何通道、任何模态上给出同样的可信度，健壮�
 
 ### 接着
 
+- **瘦身**（决定 16，`docs/design/core-slimming/` §4）：P0 清理 → P1 接缝 G3 / G2 / G6 / G5 → P2 搬家（组合根 `bundle.ts`、host 级功能做成模块、core-only 构建）→ P3 删除。守卫 `pnpm boundaries:check` 基线只降。
+
 5. **agent 通信第二步**：`agents_list` / `agent_send` / `agent_status`（§2 第 2、3、5 项），aio-dev 里加两 agent 对话、一 agent 监督另一个的 e2e 场景；然后 `agent_run`（第 4 项）、代为审批。
 6. **Claude Code 跨重启接管**（`docs/design/claude-persistence.md`）：原则 5 的门槛，从"等需要时再做"提前。
 7. **视频**：实时侧已有 frames 传输（静态视频帧，决定 11 补记）、`MediaKind` 已含 `video`；内容侧 `ContentBlock` 目前有 text / image / file / audio / transcript / quote / event，缺 `video` 块。

@@ -120,3 +120,70 @@ x-work-os 的执行器是"一轮一个无头进程、只通过命令输出、运
 2. `Trust` 枚举 → `Principal.labels`，由 `identify` 钩子给出。
 3. `RuntimeAdapter.open({profile: 'owner'|'restricted'})` → `open(RunSpec)`，harness 与 model 分离。
 4. M2 的上线闸门由"必须有审批流"改为"必须有身份盖章，并按来源决定 profile"。
+
+## 9. 在 agent 框架生态里的位置
+
+> 补记（2026-11-23，决定 16 采纳）：把定位从"x-work-os 等宿主的 IO 层"扩大为"各 agent 框架共用的会话 IO 运行时"。§1–§6 的边界不变，本节说明在众多框架之间它占哪一层、替代各框架里的哪一部分，以及怎样做到不耦合业务。
+
+### 9.1 分层
+
+| 层 | 解决什么 | 代表（2026-11） | 与 agents-io 的关系 |
+|---|---|---|---|
+| 模型 | 推理 | 各家模型与模型网关 | 不碰：`RunSpec.model` 原样传给 harness |
+| harness / agent loop | 工具、上下文、沙箱、一轮怎么跑 | Claude Code、Codex、OpenCode、Gemini CLI；框架有 Claude Agent SDK、OpenAI Agents SDK、LangGraph、Mastra、Google ADK、CrewAI | **南向**：驱动它们（`HarnessAdapter`） |
+| agent ↔ 工具 | 调工具 | MCP | 给 agent 挂 IO 工具；对外 MCP 端点 |
+| agent ↔ agent | 发现、委派 | A2A | 远端 agent 可作为一种 harness；`run.start` 可对外以 A2A 暴露（规划） |
+| agent ↔ 单个前端 | 把一个 agent 的事件流交给一个在线的界面 | AG-UI、ACP（Zed 的 Agent Client Protocol）、A2UI、MCP Apps | **北向投影**：任何会话都能以这些形式被一个端订阅（规划） |
+| 通道 | 各 IM 平台的收发 | Vercel Chat SDK、Bot Framework、openclaw 的通道插件 | **北向通道**：自有适配器，也可桥接 Chat SDK 的适配器（规划） |
+| 产品 / 宿主 | 任务、记忆、信任、界面 | persona、openclaw、x-work-os、multica、happyclaw、botmux | **宿主**：经 `Policy` 钩子和宿主协议使用 agents-io |
+
+标准协议规定的是**某一条边的线格式**：MCP 是 agent 到工具，A2A 是 agent 到 agent，AG-UI 和 ACP 是 agent 到一个在线前端。它们都不管**中间**那一层：
+
+- 同一个会话被多个通道、多个端、多个人同时看、同时说；
+- 进程或守护进程重启后不丢输入、不丢正在跑的一轮；
+- 每条消息是谁说的、有没有资格让 agent 做事；
+- 每次投递有没有真正送到、会不会发两次。
+
+于是每个产品都自己造一遍这一层：
+
+- persona 在 Go 里写了 seq 续传、三种回执、审批路由、通道读轮、needs-you 计数（`docs/design/core-slimming/` §7）；
+- openclaw 有约 250 个字段的 `MsgContext`；
+- happyclaw、botmux、multica 各有一套（`RECOMMENDATION.md` §1）。
+
+**agents-io 占的就是这一层：会话 IO 运行时**，相当于 agent 的 tty 加 tmux：
+
+- 通道适配器是终端设备；
+- lane 是行规程（排队、插话、Ctrl-C）；
+- 日志加订阅是可以随时 attach / detach 的多路复用器。
+
+### 9.2 替代各框架里的哪一部分
+
+替代的是各框架自己手写的这 7 件事，不替代框架本身：
+
+1. 入站归一、来源盖章、去重；
+2. 确定的会话路由（Binding 表），每会话单写者 lane（queue / steer / interrupt），admitted ≠ consumed 对账；
+3. 过程日志：seq、快照、续传、多端 fan-out、按 tier 投影（中立的卡片模型）；
+4. 请求生命周期：审批和提问只结算一次、超时、可插拔 resolver；
+5. 投递义务：outbox、幂等、`delivery.settled`、流式编辑的节奏；
+6. 因果与可解释：`aio explain`、因果链、防循环；
+7. 重启接续：轮次接管、排队输入有明确终态。
+
+不替代的：agent loop、工具语义、记忆与上下文、任务的真相、信任结论、产品界面。
+
+**护城河是这 7 件事的语义（`INVARIANTS.md` 的 103 条承诺），不是适配器的数量。** 适配器是可以买来的：Chat SDK 已经覆盖了一批 IM 平台，ACP 已经覆盖了一批 coding agent。但这些语义，没有哪个标准规定过。
+
+### 9.3 怎样成为不耦合业务的通用组件
+
+1. **内核不认识任何具体通道、harness、模型**：由 `scripts/boundaries.mjs` 守住，基线只降（`docs/design/core-slimming/` §6）。内建适配器与第三方走同一条契约。
+2. **内核不发起模型调用、不带产品默认值**：话题标题、预设、陌生人放行、改运行配置的聊天命令，都做成可替换的模块或交还宿主（core-slimming §2 的 host 级）。
+3. **三个面都接标准协议**，这样框架接入时一行代码都不用改：
+   - **南向**：原生适配器接 Claude Code、Codex（最深：插话、对账、重启接管）；**一个 ACP 适配器**接一批支持 ACP 的 coding agent；**一个 AG-UI 客户端适配器**接以 AG-UI 暴露后端的框架；JSONL harness 帧兜底任意程序（帧已定义，宿主端还没有实现，core-slimming §3 G9）。
+   - **北向**：原生通道（飞书、邮件）、JSONL 桥、**Chat SDK 桥**（复用它的 Slack / Teams / Discord / Telegram / WhatsApp 等适配器）；会话按标准协议对外投影：**AG-UI 服务端**让网页界面订阅任意会话，**ACP 服务端**让编辑器加入会话，MCP 端点（已有）给外部 agent，A2A 服务端（规划）给调用方形态的 agent 通信。
+   - **宿主**：`Policy` 钩子和宿主协议，任意语言（HOSTS §1）。
+4. **语义可以离开 TS 验证**：一致性 fixture（core-slimming G8）让其他语言的实现和宿主不跑 TS 也能自检。实现语言的取舍见 core-slimming §8。
+
+框架与宿主的接入路线，与 §3 的三种用法一一对应：
+
+- **只要通道**：例如 LangGraph、Mastra 应用只想让 agent 进飞书和邮件，就用 channel 模块加 Compositor。
+- **只要观察**：已有 harness 的产品想让多端看到过程，就用 harness 适配器加 Hub。
+- **完整会话网关**：例如 persona 这类产品，可以把通道读轮与中立卡片（persona #13408）、`interactive_sessions` 的会话语义（#13551）、`work_executor`（#13555）交给 agents-io，自己只留业务。

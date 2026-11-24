@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { describe, expect, it } from 'vitest';
-import type { TuiAttach } from '@agents-io/protocol';
+import type { HarnessTakeoverArgs, TuiAttach } from '@agents-io/protocol';
+import { claudeTuiTakeover } from '@agents-io/harness-claude-code';
 import { MemorySessionLog } from '@agents-io/session';
 import { FakeChannel, FakeHarness } from '@agents-io/testkit';
 import { LocalClient } from '../src/client.js';
@@ -24,8 +25,8 @@ async function setup() {
   const base = resolveConfig({ policy: { owners: ['fake:alice'], ownerSessionKey: 'main' }, local: { principal: 'fake:alice' } }, { env: {}, baseDir: dir, cwd: dir });
   const config = { ...base, socketPath: join(dir, 'run', 'aio.sock') };
   const chat = new FakeChannel('fake');
-  // Stands in for the headless claude-code adapter of the instance.
-  const headless = new FakeHarness(undefined, base.defaultHarness);
+  // Stands in for the headless claude-code adapter of the instance: like it, its terminal UI takes the session over (Claude Code's own takeover).
+  const headless = Object.assign(new FakeHarness(undefined, base.defaultHarness), { attach: 'takeover' as const, takeover: (a: HarnessTakeoverArgs) => claudeTuiTakeover(a) });
   const gw = await Gateway.start({ config, harness: headless, log: new MemorySessionLog(), channels: [{ adapter: chat }], logger: () => {} });
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   cleanups.push(() => gw.stop());

@@ -1,7 +1,7 @@
 import { realpathSync, statSync } from 'node:fs';
 import { isAbsolute, relative } from 'node:path';
 import type { SessionLaunch } from '@agents-io/protocol';
-import { VAR_NAME, type AgentConfig, type HarnessInstance } from './config.js';
+import { VAR_NAME, type AgentConfig } from './config.js';
 
 /*
  * Session launches (decision 7, docs/design/session-launch): a host gives one
@@ -27,11 +27,12 @@ export function sameLaunch(a: SessionLaunch, b: SessionLaunch): boolean {
 }
 
 /**
- * Check a launch against the agent's bounds and the instance that will run it;
- * the result carries the launch as it is pinned (cwd and path values by realpath,
- * an empty env left out).
+ * Check a launch against the agent's bounds and the instance that will run it
+ * (`envRefused`, asked only for a launch with env: why that instance cannot take a
+ * session env, from what its adapter declares); the result carries the launch as it
+ * is pinned (cwd and path values by realpath, an empty env left out).
  */
-export function checkLaunch(agent: AgentConfig, launch: SessionLaunch, inst: HarnessInstance | undefined): LaunchCheck {
+export function checkLaunch(agent: AgentConfig, launch: SessionLaunch, envRefused: () => string | undefined): LaunchCheck {
   const p = agent.sessionParams;
   if (!agent.configured || !p) return no('launch_not_allowed', `agent ${agent.name} takes no session launch (its config has no sessionParams)`);
   if (agent.mode !== 'interactive') return no('launch_not_allowed', `agent ${agent.name} is a task agent`);
@@ -59,8 +60,9 @@ export function checkLaunch(agent: AgentConfig, launch: SessionLaunch, inst: Har
         checked[k] = r;
       } else checked[k] = v;
     }
-    // A Codex app-server on a Unix socket outlives the daemon and serves every session: no per-session env.
-    if (inst?.kind === 'codex' && inst.codex.transport.kind === 'unix') return no('launch_unsupported', `harness instance ${inst.name} is a shared Codex app-server (unix transport); a session env cannot apply there (a cwd alone can)`);
+    // E.g. a shared server that outlives the daemon and serves every session: no per-session env (`HarnessAdapter.sessionEnv`).
+    const refused = envRefused();
+    if (refused) return no('launch_unsupported', `${refused}; a session env cannot apply there (a cwd alone can)`);
     out.env = checked;
   }
   return { ok: true, launch: out };

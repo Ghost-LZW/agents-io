@@ -382,12 +382,12 @@ describe('a chat that shows no process: while the turn runs its card says only �
     return [m.content, ...m.patches].map((c) => JSON.parse(c).config.summary.content as string);
   };
 
-  /** What a turn the idle deadline stopped after a tool with side effects says after what it said so far (HC-3b, the host's `idleStallNotice`). */
+  /** What a turn the idle deadline stopped after a tool with side effects says after what it said so far (HC-8, the host's `idleStallNotice`). */
   const STALL = '（这一轮停住了：模型 90 秒没有回音。已经做过的（Bash）不会重做；要接着做就说一声。）';
   /**
    * How the turn ends: it answers (`completed`); it fails or is interrupted while the model is
    * saying something, with no final snapshot (`failed`, `interrupted`); the idle deadline stops it
-   * after a Bash call (HC-3b): its final snapshot is what it said so far and the notice, `failed`.
+   * after a Bash call (HC-8): its final snapshot is what it said so far and the notice, `failed`.
    */
   type End = 'completed' | 'failed' | 'interrupted' | 'stalled';
   const view = () => {
@@ -475,7 +475,7 @@ describe('a chat that shows no process: while the turn runs its card says only �
     });
 
     for (const how of ['failed', 'interrupted', 'stalled'] as const) {
-      it(`${name}: a turn that ${how === 'stalled' ? 'the idle deadline stopped (HC-3b: what it said so far and the notice as its final snapshot)' : `${how} with no final snapshot`} ends saying only 「${ENDED[how]}」, none of what it said along the way`, async () => {
+      it(`${name}: a turn that ${how === 'stalled' ? 'the idle deadline stopped (HC-8: what it said so far and the notice as its final snapshot)' : `${how} with no final snapshot`} ends saying only 「${ENDED[how]}」, none of what it said along the way`, async () => {
         const { lark, adapter } = await started(config);
         await learn(lark);
         const { id, given } = await compositorTurn(adapter, how);

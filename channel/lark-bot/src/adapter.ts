@@ -258,6 +258,9 @@ export class LarkBotAdapter implements ChannelAdapter {
       defaultTier: 'card',
       evidence: ['platform_signed'],
       declaresSender: true,
+      // The thinking bubble shows progress first; the reply card opens at the first tool call (or once
+      // the delay passed with something to show) and lists the steps, and carries no Stop control (the bubble has it).
+      pacing: { openDelayMs: 5000, previewDelayMs: 2000, holdAnswerUntilOpen: true, openOnProcess: true, interruptButton: false },
     };
   }
 
@@ -969,7 +972,7 @@ export class LarkBotAdapter implements ChannelAdapter {
    *
    * When the turn ended: its final answer (`progress.finalAnswer`), how it ended and the buttons;
    * no plan. Without a final answer — it failed or was interrupted (also with a final snapshot: an
-   * idle-deadline stop's is what it said so far and a notice, HC-3b), its outcome is unknown, or it
+   * idle-deadline stop's is what it said so far and a notice, HC-8), its outcome is unknown, or it
    * completed saying nothing a harness took as its answer — `text` is what was said along the way:
    * the card says only how it ended (「没答完」, 「被打断了」…), as its body and summary.
    *

@@ -1,4 +1,9 @@
 export * from './config.js';
+export * from './harness-registry.js';
+export * from './channel-registry.js';
+export * from './modules.js';
+export * from './core.js';
+export * from './bundle.js';
 export * from './gateway.js';
 export { Gateway as Daemon } from './gateway.js';
 export * from './client.js';
@@ -9,5 +14,3 @@ export * from './token.js';
 export { FrameConn, LocalServer, type FrameTransport, type HostFrames, type LocalHost, type Peer } from './local-server.js';
 export * from './console.js';
 export * from './console-config.js';
-export * from './provision.js';
-export { runScenarios, SCENARIOS, e2eConfig } from './e2e.js';

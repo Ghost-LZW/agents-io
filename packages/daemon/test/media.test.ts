@@ -4,11 +4,13 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { InputRecord } from '@agents-io/protocol';
 import { FsBlobStore, MemorySessionLog } from '@agents-io/session';
-import { toUserMessage } from '@agents-io/harness-claude-code';
-import { renderInputs } from '@agents-io/harness-codex';
+import { CLAUDE_IMAGE_MAX_BYTES, blobResolvers as claudeBlobResolvers, toUserMessage } from '@agents-io/harness-claude-code';
+import { blobMediaResolver, renderInputs } from '@agents-io/harness-codex';
 import { resolveConfig } from '../src/config.js';
 import { Gateway, InstanceHarness } from '../src/gateway.js';
-import { CLAUDE_IMAGE_MAX_BYTES, blobResolvers } from '../src/media.js';
+
+/** What each built-in adapter resolves media with, given the daemon's blob store (`HarnessFactoryInit.blobs`). */
+const blobResolvers = (store: FsBlobStore) => ({ ...claudeBlobResolvers(store), resolveMedia: blobMediaResolver(store) });
 
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {

@@ -1,6 +1,6 @@
 # 对外 MCP 端点：不在本守护进程上的 agent 读会话、经这里输出
 
-> 状态：已实现（2026-10-20），可选开启，不配置时行为不变。承诺与测试见 `docs/INVARIANTS.md` SE-5、ID-10、CF-10、DL-6、EX-8，IN-8 随之扩到 `peer` 输入。
+> 状态：已实现（2026-10-20），可选开启，不配置时行为不变。承诺与测试见 `docs/INVARIANTS.md` SE-5、ID-10、CF-10、DL-6、EX-8，IN-8 随之扩到 `peer` 输入。2026-11-24 起是内建功能模块（core-slimming G6 第 1 步：`packages/daemon/src/external-mcp.ts` 的 `externalMcpModule`，`bundle.ts` 注册；配置、行为与承诺不变，外发检查与"是谁发的"仍由内核做，模块经 `KernelContext` 用）。
 > 依据：`docs/ROADMAP.md` §2 末段（"不在 agents-io 上的 agent 通过一个 MCP 端点使用同一组原语，进来时带外部来源"）、§4"之后"第 10 项；原则 2、4、6；`docs/design/agent-messaging/` §5 最后一行（本文与它的设想不同处见 §8）；`docs/HOSTS.md` §4.1（回调钩子）。
 
 ## 1. 一句话

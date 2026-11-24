@@ -2,27 +2,25 @@
 import { spawn } from 'node:child_process';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { readFileSync, realpathSync } from 'node:fs';
-import { constants as osConstants, homedir } from 'node:os';
+import { constants as osConstants } from 'node:os';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import type { RenderedMessage, ReplyRoute, RunEnded, RunStart, SessionEvent, SessionLaunch, SessionScope, Tier, TuiAttach } from '@agents-io/protocol';
 import { runAttach } from './attach.js';
 import { CommandError, DaemonUnavailable, LocalClient } from './client.js';
-import { ConfigError, defaultInstance, loadConfig, type LoadOptions } from './config.js';
+import { ConfigError, loadConfig, type LoadOptions } from './config.js';
 import { consoleProof } from './console.js';
-import { runScenarios } from './e2e.js';
-import { Gateway, buildHarness } from './gateway.js';
+import { Gateway } from './gateway.js';
 import { testHooksFromEnv } from './test-hooks.js';
 import { TokenError, consoleUrlPath, readTokenFile, tokenPath } from './token.js';
-import { tuiBridge } from './tui-bridge.js';
+import { builtinHarnesses } from './bundle.js';
 import { WATCH_SPEC_HELP, formatWatch, parseDuration, parseWatchSpec } from './watch-spec.js';
 
 const USAGE = `aio: the agents-io daemon and its CLI
 
 daemon
   aio serve     [--harness <instance>] [--token-file <path>]   (stable host token: read, or generated 0600)
-  aio e2e       [--harness <instance>] [--only <id|name>[,…]] [--data-dir <dir>] [--verbose]
 
 local ends (as the local principal)
   aio attach    [--session <key>] [--tier full|card|headline|final] [--from <seq>] [--verbose]
@@ -92,6 +90,7 @@ export function parseCli(argv: string[]): CliArgs {
         tier: { type: 'string' },
         from: { type: 'string' },
         mode: { type: 'string' },
+        // --only, --data-dir: aio-e2e (packages/daemon-e2e) parses its arguments with this parser.
         only: { type: 'string' },
         'data-dir': { type: 'string' },
         wait: { type: 'boolean' },
@@ -740,21 +739,16 @@ async function consoleLink(a: CliArgs): Promise<number> {
   return 0;
 }
 
-async function e2e(a: CliArgs): Promise<number> {
-  const c = config(a, { channels: false });
-  const inst = defaultInstance(c);
-  const probe = await buildHarness(inst).probe();
-  const modelFrom = process.env[inst.kind === 'codex' ? 'AGENTS_IO_LIVE_CODEX_MODEL' : 'AGENTS_IO_LIVE_CLAUDE_MODEL'] ? 'env' : 'config/default';
-  console.log(`e2e against ${inst.name} (${inst.kind}): ${probe.version}; model ${inst.run.model || '(codex default)'} from ${modelFrom}`);
-  const only = str(a, 'only')?.split(',').map((s) => s.trim());
-  const root = str(a, 'data-dir');
-  const results = await runScenarios(c, { ...(only ? { only } : {}), ...(root ? { root: resolve(root.replace(/^~(?=$|\/)/, homedir())) } : {}), verbose: a.values.verbose === true });
-  const n = (s: string) => results.filter((r) => r.status === s).length;
-  console.log(`\n${n('PASS')} passed, ${n('FAIL')} failed, ${n('SKIP')} skipped`);
-  return n('FAIL') ? 1 : 0;
-}
+const COMMANDS: Record<string, (a: CliArgs) => Promise<number>> = { serve, attach, tui, input, sessions, watch, run: runCmd, send, tail, ack, redispatch, schedule, bindings, explain, verify, replay, fault, 'console-link': consoleLink, console: consoleLink };
 
-const COMMANDS: Record<string, (a: CliArgs) => Promise<number>> = { serve, attach, tui, 'tui-bridge': () => tuiBridge(), input, sessions, watch, e2e, run: runCmd, send, tail, ack, redispatch, schedule, bindings, explain, verify, replay, fault, 'console-link': consoleLink, console: consoleLink };
+/**
+ * A command a built-in harness kind adds (`HarnessModule.cli`; Claude Code's `tui-bridge`, which its
+ * terminal UI starts), with the positional arguments after its name. The CLI's own commands come first.
+ */
+function kindCommand(a: CliArgs): ((a: CliArgs) => Promise<number>) | undefined {
+  const run = builtinHarnesses.cliCommand(a.cmd);
+  return run ? () => run({ argv: a.rest, env: process.env }) : undefined;
+}
 
 export async function main(argv: string[]): Promise<number> {
   const a = parseCli(argv);
@@ -762,7 +756,12 @@ export async function main(argv: string[]): Promise<number> {
     console.log(USAGE);
     return 0;
   }
-  const f = COMMANDS[a.cmd];
+  if (a.cmd === 'e2e') {
+    // The scenario runner left the daemon (docs/design/core-slimming §4 P0): it is @agents-io/daemon-e2e.
+    console.error('aio e2e moved: run `pnpm e2e` from the repo root, or `aio-e2e` (packages/daemon-e2e), with the same options');
+    return 2;
+  }
+  const f = COMMANDS[a.cmd] ?? kindCommand(a);
   if (!f) {
     console.error(`unknown command ${a.cmd}\n\n${USAGE}`);
     return 2;

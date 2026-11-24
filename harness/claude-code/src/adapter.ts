@@ -3,9 +3,11 @@ import { randomUUID } from 'node:crypto';
 import { accessSync, constants, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { delimiter, dirname, join } from 'node:path';
-import type { HarnessAdapter, HarnessCaps, HarnessOpenArgs, HarnessSession } from '@agents-io/protocol';
+import type { BlobAccess, HarnessAdapter, HarnessCaps, HarnessDeclarations, HarnessOpenArgs, HarnessSession, HarnessTakeover, HarnessTakeoverArgs } from '@agents-io/protocol';
+import { blobResolvers } from './media.js';
 import { AsyncQueue } from './queue.js';
 import { ClaudeCodeSession, defaultProfile, isEffort, permissionModeFor } from './session.js';
+import { claudeTuiTakeover } from './takeover.js';
 import type { ClaudeCodeOptions, ClaudeProfile, Options, QueryFn, SDKUserMessage } from './types.js';
 import {
   DEFAULT_FIRST_BYTE_TIMEOUT_MS,
@@ -43,6 +45,12 @@ export interface ClaudeCodeHarnessConfig {
   /** Path of the `claude` CLI to drive (default: first `claude` on PATH). */
   claudePath?: string;
   /**
+   * The `claude` command its own terminal UI runs as when it takes a session over (`takeover`),
+   * started by the host's `aio tui` client: a bare name is looked up on that client's PATH.
+   * Default: `claudePath`, else `claude`.
+   */
+  tuiCommand?: string;
+  /**
    * Environment for the CLI, over `process.env` (an `undefined` value removes
    * the variable). Per-open `ClaudeCodeOptions.env` goes over this.
    */
@@ -69,6 +77,11 @@ export interface ClaudeCodeHarnessConfig {
   additionalDirectories?: string[];
   /** Profile name → native settings, defaults for every session (per-open `options.profiles` win). */
   profiles?: Record<string, ClaudeProfile>;
+  /**
+   * The host's blob store (`HarnessFactoryInit.blobs`): media inputs resolve against it
+   * (`blobResolvers`) unless the open options give `resolveImage` / `resolveFile`.
+   */
+  blobs?: BlobAccess;
   /** Injected `query` (tests). Default: the Agent SDK's. */
   query?: QueryFn;
   /** Override detected versions (tests). */
@@ -114,15 +127,40 @@ export function assertSupported(sdk: string, cli: string): void {
     throw new Error(`@agents-io/harness-claude-code: unsupported Claude Code CLI ${cli} (supported: 2.x)`);
 }
 
+/** What every Claude Code adapter declares statically (`HarnessModule.declares`). */
+export const CLAUDE_CODE_DECLARATIONS = Object.freeze({
+  displayName: 'Claude Code',
+  /** `/compact` sent as the turn's user message compacts the session (`compact_boundary`, no answer text). */
+  compact: Object.freeze({ command: '/compact' } as const),
+  /** Every session runs its own CLI child: `args.env` is the top layer of its environment. */
+  sessionEnv: 'open',
+  /** Its own TUI takes a session over (`takeover`): one Claude session has one writer. */
+  attach: 'takeover',
+}) satisfies HarnessDeclarations;
+
 /**
  * Drives the locally installed Claude Code CLI through the official Agent SDK's
  * `query()` with streaming input. No agent loop of its own.
  */
 export class ClaudeCodeHarness implements HarnessAdapter {
   readonly id = 'claude-code';
+  readonly displayName = CLAUDE_CODE_DECLARATIONS.displayName;
+  readonly compact = CLAUDE_CODE_DECLARATIONS.compact;
+  readonly sessionEnv = CLAUDE_CODE_DECLARATIONS.sessionEnv;
+  readonly attach = CLAUDE_CODE_DECLARATIONS.attach;
   private probed: Promise<{ version: string; caps: HarnessCaps }> | undefined;
 
   constructor(private readonly config: ClaudeCodeHarnessConfig = {}) {}
+
+  /**
+   * Claude Code's interactive TUI takes the session (decision 15, S2): it starts on the same
+   * Claude session id with hooks and a bridge of this launch only (`claudeTuiTakeover`), in this
+   * instance's config dir; its `harness` (`ClaudeTuiHarness`) runs the session's turns meanwhile.
+   */
+  takeover(a: HarnessTakeoverArgs): Promise<HarnessTakeover> {
+    const executable = this.config.tuiCommand ?? this.config.claudePath;
+    return claudeTuiTakeover(a, { ...(executable ? { executable } : {}), ...(this.config.configDir ? { configDir: this.config.configDir } : {}) });
+  }
 
   private claudePath(): string {
     const p = this.config.claudePath ?? findOnPath('claude');
@@ -160,7 +198,8 @@ export class ClaudeCodeHarness implements HarnessAdapter {
     await this.probe();
     const c = this.config;
     const given = (args.options ?? {}) as ClaudeCodeOptions;
-    const options: ClaudeCodeOptions = { ...given, profiles: { ...c.profiles, ...given.profiles } };
+    // Explicit options win over the blob store's resolvers.
+    const options: ClaudeCodeOptions = { ...(c.blobs ? blobResolvers(c.blobs) : {}), ...given, profiles: { ...c.profiles, ...given.profiles } };
     const profile = options.profiles?.[args.run.profile] ?? defaultProfile(args.run.profile);
     // Never omit: the CLI default may be 'auto'. With `bypassModels` it is the run model's (HC-5).
     const permissionMode = permissionModeFor(profile, args.run.model);
@@ -227,6 +266,8 @@ export class ClaudeCodeHarness implements HarnessAdapter {
       // Without a systemPrompt the SDK sends an empty one: no Claude Code prompt, no tool guidance.
       systemPrompt: { type: 'preset', preset: 'claude_code' },
       ...options.sdk,
+      // The agent's instructions go after Claude Code's own prompt, over one the options set.
+      ...(args.instructions !== undefined ? { systemPrompt: { type: 'preset', preset: 'claude_code', append: args.instructions } } : {}),
       cwd: args.cwd,
       model: args.run.model,
       ...(isEffort(args.run.effort) ? { effort: args.run.effort } : {}),

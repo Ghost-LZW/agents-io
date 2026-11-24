@@ -2,7 +2,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { ConfigError, codexStateDir, defaultInstance, findEnvFile, loadConfig, resolveConfig, substituteEnv } from '../src/config.js';
+import { codexStateDir, type CodexLaunch } from '@agents-io/harness-codex';
+import { ConfigError, defaultInstance, findEnvFile, loadConfig, resolveConfig, substituteEnv } from '../src/config.js';
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -20,7 +21,7 @@ describe('config', () => {
     const c = resolve({});
     expect(c.defaultHarness).toBe('claude-code');
     expect(Object.keys(c.harnesses)).toEqual(['claude-code']);
-    expect(defaultInstance(c)).toMatchObject({ name: 'claude-code', kind: 'claude-code', run: { harness: 'claude-code', model: 'haiku' }, claude: {} });
+    expect(defaultInstance(c)).toMatchObject({ name: 'claude-code', kind: 'claude-code', run: { harness: 'claude-code', model: 'haiku' }, launch: {} });
     expect(c.logPath).toBe(join(c.dataDir, 'log.sqlite'));
     expect(c.socketPath).toBe(join(c.dataDir, 'run', 'aio.sock'));
     expect(c.cwd).toBe('/work');
@@ -41,7 +42,7 @@ describe('config', () => {
     const cx = defaultInstance(c);
     expect(cx.run).toEqual({ harness: 'codex', model: 'env-model', effort: 'low' });
     if (cx.kind !== 'codex') throw new Error('codex');
-    expect(cx.codex.transport).toMatchObject({ kind: 'unix', spawn: 'own', stateDir: join(homedir(), 'cx') });
+    expect((cx.launch as CodexLaunch).transport).toMatchObject({ kind: 'unix', spawn: 'own', stateDir: join(homedir(), 'cx') });
     expect(c.policy.owners).toEqual(['lark-bot:u1', 'mail:a@b.c', 'lark-bot:u2']);
     // The local end is the owner by default, in the owner's session.
     expect(c.local).toEqual({ principal: { id: 'lark-bot:u1', labels: ['owner'] }, session: 'main' });
@@ -53,7 +54,7 @@ describe('config', () => {
     expect(defaultInstance(c).run).toEqual({ harness: 'codex', model: '' });
     // The older form keeps the adapter's default stateDir so a running deployment still adopts its turns.
     const u = defaultInstance(resolve({ harness: { use: 'codex', codex: { transport: { kind: 'unix', spawn: 'own' } } } }));
-    expect(u.kind === 'codex' && u.codex.transport).toEqual({ kind: 'unix', spawn: 'own' });
+    expect(u.kind === 'codex' && (u.launch as CodexLaunch).transport).toEqual({ kind: 'unix', spawn: 'own' });
   });
 
   it('named instances: per-kind launch settings, env refs, paths, default and --harness by name', () => {
@@ -101,7 +102,7 @@ describe('config', () => {
       // Secrets for argv-bound settings (inline settings, mcpServers) ride in the child env.
       env: { ANTHROPIC_BASE_URL: 'https://gw.example', ANTHROPIC_AUTH_TOKEN: 'tok-secret', ANTHROPIC_API_KEY: undefined, FIXED: 'v', X: 'tok-secret', GW_TOKEN: 'tok-secret' },
       cwd: '/base/work',
-      claude: {
+      launch: {
         claudePath: '/base/bin/claude',
         configDir: join(homedir(), '.claude-gw'),
         settings: { permissions: { allow: ['Read'] }, env: {} },
@@ -114,12 +115,12 @@ describe('config', () => {
       },
     });
     expect('ANTHROPIC_API_KEY' in gw.env).toBe(true); // null → removed from the child's environment
-    expect(c.harnesses.claude).toMatchObject({ run: { harness: 'claude', model: 'haiku' }, env: {}, claude: {} });
+    expect(c.harnesses.claude).toMatchObject({ run: { harness: 'claude', model: 'haiku' }, env: {}, launch: {} });
     const cx = c.harnesses.codex!;
     expect(cx).toMatchObject({
       kind: 'codex',
       run: { harness: 'codex', model: '' },
-      codex: {
+      launch: {
         bin: 'codex',
         codexHome: join(homedir(), '.codex-aio'),
         config: { model_reasoning_summary: 'concise', 'mcp_servers.x.url': 'https://x', 'mcp_servers.x.bearer_token_env_var': 'GW_TOKEN' },

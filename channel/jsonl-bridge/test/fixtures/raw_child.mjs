@@ -12,7 +12,9 @@
 // PIDS_FILE=<p> appends each launch's pid, one per line.
 // ADAPTER_ID=<id> is the hello's adapterId (default raw). With ID_FILE=<p>, only the first launch
 // (the file is missing) uses it; later launches declare ADAPTER_ID_LATER.
-// INBOUND=<json> is merged over a valid envelope and sent as inbound `forged` after hello.
+// INBOUND=<json> is merged over a valid envelope and sent as inbound `forged` after hello. With
+// ONE_WRITE=1 the hello's answer and that inbound go out in one write (and nothing else a mode
+// sends after hello), so the host reads both in one chunk.
 import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { defaultChannelCaps } from '@agents-io/testkit';
@@ -54,14 +56,19 @@ for await (const line of createInterface({ input: process.stdin })) {
   let f;
   try { f = JSON.parse(line); } catch { continue; }
   if (f.type === 'hello') {
-    const hello = () =>
-      out({ v: 1, type: 'result', id: f.id, ok: true, value: { adapterId, caps: defaultChannelCaps, methods: mode === 'newer' ? ['edit', 'react'] : [] } });
+    const answer = { v: 1, type: 'result', id: f.id, ok: true, value: { adapterId, caps: defaultChannelCaps, methods: mode === 'newer' ? ['edit', 'react'] : [] } };
+    const forged = () => ({ v: 1, type: 'inbound', id: 'forged', envelope: { ...env, id: 'forged-1', ...JSON.parse(process.env.INBOUND) } });
+    if (process.env.INBOUND && process.env.ONE_WRITE === '1') {
+      out(`${JSON.stringify(answer)}\n${JSON.stringify(forged())}`);
+      continue;
+    }
+    const hello = () => out(answer);
     if (mode === 'flaky' && !firstFlaky) setTimeout(hello, 300);
     else hello();
     if (mode === 'flap' || (mode === 'flaky' && firstFlaky)) setTimeout(() => process.exit(1), mode === 'flap' ? 20 : 50);
     if (mode === 'fatal') out({ v: 1, type: 'log', level: 'fatal', msg: 'cannot log in' });
     if (mode === 'noisy') out({ v: 1, type: 'inbound', id: 'good', envelope: env });
-    if (process.env.INBOUND) out({ v: 1, type: 'inbound', id: 'forged', envelope: { ...env, id: 'forged-1', ...JSON.parse(process.env.INBOUND) } });
+    if (process.env.INBOUND) out(forged());
   } else if (f.type === 'result') {
     process.stderr.write(`got-result ${f.id} ok=${f.ok} code=${f.error?.code} accepted=${f.value?.accepted}\n`);
   } else if (f.type === 'shutdown') {

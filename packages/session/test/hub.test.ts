@@ -1,9 +1,18 @@
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 import type { SessionEvent } from '@agents-io/protocol';
-import { Hub, MemorySessionLog, isSnapshotEvent } from '../src/index.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Hub, MemorySessionLog, SqliteSessionLog, isSnapshotEvent, type SessionLog } from '../src/index.js';
 import { draft, take } from './helpers.js';
 
 const seqs = (evs: SessionEvent[]) => evs.filter((e) => e.durability === 'durable').map((e) => e.seq);
+const logs: [string, () => SessionLog][] = [
+  ['memory', () => new MemorySessionLog()],
+  ['sqlite', () => new SqliteSessionLog()],
+];
+const dir = mkdtempSync(join(tmpdir(), 'aio-hub-'));
+afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 function seeded(n: number, opts: { retain?: number } = {}) {
   const hub = new Hub(new MemorySessionLog(opts));
@@ -60,7 +69,7 @@ describe('Hub', () => {
     expect(eb).toEqual(ea.slice(1));
   });
 
-  it('drops only ephemeral events for a slow subscriber, then catches up from the log #LN-1', async () => {
+  it('drops only ephemeral events for a slow subscriber, then catches up from the log #LN-1 #LN-10', async () => {
     const hub = new Hub(new MemorySessionLog());
     const slow = hub.subscribe({ sessionKey: 's', fromSeq: 0, tier: 'full', bufferSize: 4 });
     const fast = hub.subscribe({ sessionKey: 's', fromSeq: 0, tier: 'full' });
@@ -80,6 +89,181 @@ describe('Hub', () => {
     // After catching up, live delivery resumes, ephemeral included.
     hub.append('s', draft({ t: 'text.delta', delta: 'again', stream: 'answer' }));
     expect((await take(slow, 1))[0]).toMatchObject({ durability: 'ephemeral', body: { delta: 'again' } });
+  });
+
+  it.each(logs)('a slow subscriber (%s log) is never cut off: it misses exactly the ephemeral events it counts as dropped, and gets every durable one once, in seq order #LN-10', async (_name, make) => {
+    const hub = new Hub(make());
+    const slow = hub.subscribe({ sessionKey: 's', fromSeq: 0, tier: 'full', bufferSize: 3 });
+    for (let i = 1; i <= 15; i++) {
+      hub.append('s', draft({ t: 'text.delta', delta: `d${i}`, stream: 'answer' }));
+      hub.append('s', draft({ t: 'headline', text: `h${i}` }));
+    }
+    expect(slow.lagging).toBe(true);
+    expect(hub.subscriberCount('s')).toBe(1);
+    const got: SessionEvent[] = [];
+    while (seqs(got).length < 15) got.push(...(await take(slow, 1)));
+    expect(seqs(got)).toEqual(Array.from({ length: 15 }, (_, i) => i + 1));
+    expect(got.filter((e) => e.durability === 'durable').map((e) => e.body)).toEqual(Array.from({ length: 15 }, (_, i) => ({ t: 'headline', text: `h${i + 1}` })));
+    expect(slow.lagging).toBe(false);
+    // Every ephemeral event either arrived or was counted.
+    expect(got.filter((e) => e.durability === 'ephemeral').length + slow.dropped).toBe(15);
+    expect(slow.dropped).toBeGreaterThan(0);
+    // Caught up: live again, ephemeral included.
+    hub.append('s', draft({ t: 'text.delta', delta: 'live', stream: 'answer' }));
+    hub.append('s', draft({ t: 'headline', text: 'h16' }));
+    expect(await take(slow, 2)).toMatchObject([{ durability: 'ephemeral', body: { delta: 'live' } }, { seq: 16, body: { text: 'h16' } }]);
+    slow.close();
+  });
+
+  it('a cursor ahead of the head (the log was rebuilt or replaced) gets a snapshot first, then continues from the head #LN-10 #LN-1', async () => {
+    // The client read up to seq 5 of a log that is gone; this one has two events.
+    const hub = seeded(2);
+    const sub = hub.subscribe({ sessionKey: 's', fromSeq: 5, tier: 'full' });
+    const [snap] = await take(sub, 1);
+    expect(isSnapshotEvent(snap!)).toBe(true);
+    expect(snap!.seq).toBe(2);
+    expect((snap as SessionEvent & { native: { headline: string } }).native.headline).toBe('h1');
+    hub.append('s', draft({ t: 'headline', text: 'next' }));
+    expect(await take(sub, 1)).toMatchObject([{ seq: 3, body: { text: 'next' } }]);
+    // A cursor at the head is not ahead: no snapshot, live from there.
+    const at = hub.subscribe({ sessionKey: 's', fromSeq: 3, tier: 'full' });
+    hub.append('s', draft({ t: 'headline', text: 'four' }));
+    expect(await take(at, 1)).toMatchObject([{ seq: 4, body: { text: 'four' } }]);
+    sub.close();
+    at.close();
+  });
+
+  it('a batch commits its appends together and publishes them after the commit, in seq order; a throw rolls back the store and the memory view, and nobody sees them #LN-1 #DL-1', async () => {
+    const path = join(dir, 'batch.sqlite');
+    const log = new SqliteSessionLog({ path });
+    const hub = new Hub(log);
+    hub.append('s', draft({ t: 'session.state', state: 'idle' }));
+    const sub = hub.subscribe({ sessionKey: 's', fromSeq: 1, tier: 'full' });
+    // A subscriber with room for one event: it starts lagging at the second one it is offered.
+    const probe = hub.subscribe({ sessionKey: 's', fromSeq: 1, tier: 'full', bufferSize: 1 });
+    const first = take(sub, 2);
+    hub.batch(() => {
+      hub.append('s', draft({ t: 'headline', text: 'a' }));
+      hub.append('s', draft({ t: 'turn.started', turnId: 't1', inputIds: [], replyRoute: null }));
+      // Nothing is published (or indexed) while the transaction is open.
+      expect(log.db.isTransaction).toBe(true);
+      expect(probe.lagging).toBe(false);
+      expect(hub.locate({ turnId: 't1' })).toBeUndefined();
+    });
+    expect(log.db.isTransaction).toBe(false);
+    expect(probe.lagging).toBe(true);
+    expect(hub.locate({ turnId: 't1' })).toBe('s');
+    expect(await first).toMatchObject([{ seq: 2, body: { text: 'a' } }, { seq: 3, body: { t: 'turn.started' } }]);
+    probe.close();
+
+    // A throw: rolled back in the database and in memory (head, fold, ephemeral ring); the error is the caller's.
+    expect(() =>
+      hub.batch(() => {
+        hub.append('s', draft({ t: 'turn.completed', turnId: 't1', status: 'completed' }));
+        hub.append('s', draft({ t: 'text.delta', delta: 'gone', stream: 'answer' }));
+        hub.append('t', draft({ t: 'turn.started', turnId: 't2', inputIds: [], replyRoute: null }));
+        throw new Error('refused');
+      }),
+    ).toThrow('refused');
+    expect(log.head('s')).toBe(3);
+    expect(log.snapshot('s')).toMatchObject({ seq: 3, state: 'running', turn: { turnId: 't1' }, partialText: '', headline: null });
+    expect(log.ephemeral('s')).toEqual([]);
+    expect(log.head('t')).toBe(0);
+    expect(hub.locate({ turnId: 't2' })).toBeUndefined();
+    expect(log.read('s', 0).map((e) => e.seq)).toEqual([1, 2, 3]);
+
+    // A batch inside a batch is a savepoint: its rollback keeps what the outer one wrote, gapless.
+    hub.batch(() => {
+      hub.append('s', draft({ t: 'headline', text: 'outer' }));
+      expect(() =>
+        hub.batch(() => {
+          hub.append('s', draft({ t: 'headline', text: 'inner' }));
+          throw new Error('inner refused');
+        }),
+      ).toThrow('inner refused');
+      hub.batch(() => hub.append('s', draft({ t: 'headline', text: 'inner kept' })));
+    });
+    // The subscriber never saw the rolled-back events: the next ones it gets continue the seq.
+    expect(await take(sub, 2)).toMatchObject([
+      { seq: 4, body: { text: 'outer' } },
+      { seq: 5, body: { text: 'inner kept' } },
+    ]);
+    const view = log.snapshot('s');
+    log.close();
+    // The database agrees with the memory view.
+    const again = new SqliteSessionLog({ path });
+    expect(again.read('s', 0).map((e) => (e.body.t === 'headline' ? e.body.text : e.body.t))).toEqual(['session.state', 'a', 'turn.started', 'outer', 'inner kept']);
+    expect(again.snapshot('s')).toEqual(view);
+    expect(again.head('t')).toBe(0);
+    again.close();
+  });
+
+  it('a subscriber made inside a batch reads nothing uncommitted: after a rollback it gets the events that reuse those seqs; after a commit the batch\'s, once #LN-1 #LN-10', async () => {
+    const log = new SqliteSessionLog({ path: join(dir, 'batch-sub.sqlite') });
+    const hub = new Hub(log);
+    hub.append('s', draft({ t: 'headline', text: 'one' }));
+    let rolled: ReturnType<Hub['subscribe']> | undefined;
+    expect(() =>
+      hub.batch(() => {
+        hub.append('s', draft({ t: 'headline', text: 'ghost2' }));
+        hub.append('s', draft({ t: 'headline', text: 'ghost3' }));
+        rolled = hub.subscribe({ sessionKey: 's', fromSeq: 1, tier: 'full' });
+        throw new Error('refused');
+      }),
+    ).toThrow('refused');
+    expect(log.head('s')).toBe(1);
+    for (const text of ['real2', 'real3', 'real4']) hub.append('s', draft({ t: 'headline', text }));
+    const texts = (evs: SessionEvent[]) => evs.map((e) => [e.seq, e.body.t === 'headline' ? e.body.text : e.body.t]);
+    expect(texts(await take(rolled!, 3))).toEqual([[2, 'real2'], [3, 'real3'], [4, 'real4']]);
+    rolled!.close();
+
+    let committed: ReturnType<Hub['subscribe']> | undefined;
+    hub.batch(() => {
+      hub.append('s', draft({ t: 'headline', text: 'five' }));
+      committed = hub.subscribe({ sessionKey: 's', fromSeq: 4, tier: 'full' });
+      hub.append('s', draft({ t: 'headline', text: 'six' }));
+    });
+    hub.append('s', draft({ t: 'headline', text: 'seven' }));
+    expect(texts(await take(committed!, 3))).toEqual([[5, 'five'], [6, 'six'], [7, 'seven']]);
+    // Closed before its batch ended: it never starts.
+    hub.batch(() => hub.subscribe({ sessionKey: 's', tier: 'full' }).close());
+    expect(hub.subscriberCount('s')).toBe(1);
+    committed!.close();
+    log.close();
+  });
+
+  it('a nested batch whose failure ended the whole transaction (SQLITE_FULL, IOERR): appends the outer one goes on with throw instead of autocommitting, so nothing of it is stored or published and the seq stays gapless #LN-1 #DL-1', async () => {
+    const path = join(dir, 'batch-ended.sqlite');
+    const log = new SqliteSessionLog({ path });
+    const hub = new Hub(log);
+    hub.append('s', draft({ t: 'headline', text: 'one' }));
+    const sub = hub.subscribe({ sessionKey: 's', fromSeq: 1, tier: 'full' });
+    expect(() =>
+      hub.batch(() => {
+        hub.append('s', draft({ t: 'headline', text: 'outer1' }));
+        try {
+          hub.batch(() => {
+            hub.append('s', draft({ t: 'headline', text: 'inner' }));
+            // What SQLite does on such an error: the whole transaction is gone.
+            log.db.exec('ROLLBACK');
+            throw new Error('disk full');
+          });
+        } catch {
+          // The outer batch carries on.
+        }
+        hub.append('s', draft({ t: 'headline', text: 'outer2' }));
+      }),
+    ).toThrow('the transaction this append belongs to has ended');
+    expect(log.db.isTransaction).toBe(false);
+    expect(log.head('s')).toBe(1);
+    expect(log.read('s', 0).map((e) => e.seq)).toEqual([1]);
+    hub.append('s', draft({ t: 'headline', text: 'two' }));
+    expect(await take(sub, 1)).toMatchObject([{ seq: 2, body: { text: 'two' } }]);
+    sub.close();
+    log.close();
+    const again = new SqliteSessionLog({ path });
+    expect(again.read('s', 0).map((e) => (e.body.t === 'headline' ? e.body.text : e.body.t))).toEqual(['one', 'two']);
+    again.close();
   });
 
   it('filters by tier and never filters out human approvals #RQ-5', async () => {

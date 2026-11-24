@@ -64,6 +64,8 @@ export class MailChannel implements ChannelAdapter {
       defaultTier: 'final',
       evidence: this.cfg.internalDelivery?.domains.length ? ['dkim_pass', 'platform_signed', 'none'] : ['dkim_pass', 'none'],
       declaresSender: true,
+      // Any address may write to the mailbox: unknown senders are routine, never asked about (ID-9).
+      openInbox: true,
     };
   }
 

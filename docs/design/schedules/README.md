@@ -1,6 +1,6 @@
 # 定时任务：`schedules`
 
-> 状态：已实现（2026-10-27）：核心、配置、agent 工具、宿主请求、对外 MCP、`aio schedule`。
+> 状态：已实现（2026-10-27）：核心、配置、agent 工具、宿主请求、对外 MCP、`aio schedule`。2026-11-24 并进 core-slimming 的新结构（决定 16，`docs/design/core-slimming/` §2、§4）：机制（时间表、到点、跨重启、主人的配置、宿主请求与 feature `schedules`）照旧在内核，与监听同形；给 agent 的 `schedule_*` 工具是内建工具模块 `tools.schedules`（`packages/daemon/src/tool-modules.ts`，配置段 `scheduleTools`，缺省开），经 `KernelContext.schedules` 以会话的 agent 身份设，带路由的由内核查这一轮能不能发到那里；对外 MCP 端点（功能模块 `external-mcp`）经同一处以客户端身份设，客户端的定时消息到点经 `ModuleHooks.scheduledMessage` 由它以客户端身份发出。行为不变。
 > 依据：`docs/POSITIONING.md` §2（机制与策略的判据）；`docs/CHANNELS.md` §6（监听：digest 的持久化与到点触发）、§7（输出工具）；`docs/HOSTS.md` §4（宿主请求、`session.prewarm` 里"提醒、例行快到点"的用途）；决定 13（扩展冻结时只加有真实出处的能力）。
 > 出处：主人 2026-10-27：「加自定义消息监控和定时任务……特定时间推送什么的，感觉像是一个通用能力」；同日「怎么让别的 agent 知道怎么用这个定时任务的能力呢？以及发消息的能力呢？」。
 
@@ -56,6 +56,7 @@
 - 触发分两步，同监听 digest 的 flush：先写一条待定记录 `firing(id, scheduledAt)`，再投递，投递后删记录、推进 `nextAt`。进程死在中间：下次启动按待定记录重做，输入 id 固定为 `schedule:<id>:<scheduledAt>`，会话里已经有这个 id 就是重复（`duplicate`），不会投两次。
 - 启动时：`nextAt` 已过的，`missed: "once"` 补一次（`channelContext.missed=true`，`scheduledAt` 是错过的那个最近时刻），`skip` 直接排下一次。不论错过几次，最多补一次。
 - 一个定时器：总是只等最近的那个 `nextAt`（上限 2^31-1 ms），到点处理所有到期的，再等下一个。
+- 投递失败（2026-11-24 补）：再试也发不出去的（没有通道、被扣下或拒绝、拒收、外部客户端的 scope 已不含这个路由；错误带 `final: true`）这一次就此结束，记在 `schedule:<id>` 的日志里，排下一次；别的失败留着待定记录，隔 10 s 起逐次加倍（至多 15 min）以同一个 id 再试，不立刻重试。守护进程停止时定时器先停，启动时最后才开始（通道与模块都已在跑）。agent 设的 `message` 到点时是 agent 的消息（`kind: "tool"`），宿主的出口检查照它这时的 `send_message` 那样看（INVARIANTS DL-7）。
 
 ### 4.3 谁能建
 

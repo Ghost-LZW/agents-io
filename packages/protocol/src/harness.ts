@@ -16,12 +16,49 @@ export interface HarnessOpenArgs {
   /** Harness-specific options from deployment config. */
   options?: Record<string, unknown>;
   /**
-   * Extra child-process environment for this session (a session launch, decision 7),
-   * over the adapter's own. Never logged or put on argv. Adapters that cannot apply
-   * it per session must not be given it.
+   * Extra child-process environment for this session, over the adapter's own. Never logged or
+   * put on argv. A launched session's env (decision 7) comes here only when the adapter declares
+   * `sessionEnv: 'open'` (the default); otherwise it goes to `ownProcess` or the launch is refused
+   * (`HarnessAdapter.sessionEnv`). A built-in adapter gets nothing else here: its instance's env
+   * and a task run's are part of how the host builds it. A module harness (`HarnessFactory`) runs
+   * in the host's process, so its opens also carry its instance's env here, with a task run's env
+   * (at least `AGENTS_IO_RUN_ID`) over it, whatever `sessionEnv` says, also the opens of an
+   * adapter its `ownProcess` returned: such an `open` takes them.
    */
   env?: Record<string, string>;
+  /**
+   * The agent's instructions for this session, in the harness's own way: Claude Code appends
+   * them to its preset system prompt, Codex gives them as developer instructions. They replace
+   * whatever native instruction option the deployment config sets.
+   */
+  instructions?: string;
 }
+
+/**
+ * Read access to the host's blob store (the media channels put: `ContentBlock.ref`), for a
+ * harness that hands images and files to its agent.
+ */
+export interface BlobAccess {
+  /** Local path, mime and size of a stored blob; `undefined` for a ref the store does not hold (a platform ref such as `lark-file:…`). */
+  stat(ref: string): Promise<{ path: string; mime: string; name?: string; size: number } | undefined>;
+  /** The stored bytes; throws for a ref the store does not hold. */
+  get(ref: string): Promise<{ bytes: Uint8Array; mime: string; name?: string }>;
+}
+
+/**
+ * How an adapter honours a launched session's own env (decision 7):
+ * - `'open'`: it comes in `HarnessOpenArgs.env`, and `open` applies it to that session's own
+ *   child (Claude Code).
+ * - `'own-process'`: one process serves every session, so a launched session's env never comes
+ *   through `open` (Codex's refuses a non-empty one); such a session runs on `ownProcess({ env })`
+ *   instead (Codex over stdio).
+ * - `{ refused }`: neither, e.g. a shared server that outlives the host (Codex over a Unix
+ *   socket). A launch with env is refused (`launch_unsupported`: "harness instance <name> is
+ *   <refused>; …"); a cwd alone is fine.
+ * Only a launched session's env follows it: a module harness's opens carry its instance's env and
+ * a task run's in `HarnessOpenArgs.env` whatever it declares.
+ */
+export type SessionEnvSupport = 'open' | 'own-process' | { readonly refused: string };
 
 /** Start a realtime voice session on the harness session's native thread (decision 11). */
 export interface LiveStartArgs {
@@ -82,6 +119,102 @@ export interface HarnessAdapter {
    * the app-server). Undefined when it cannot, or no server is running yet.
    */
   nativeClient?(nativeId: string): NativeClient | undefined;
+  /**
+   * Static, like `adopts`: how the harness's own terminal UI comes onto a session the host keeps
+   * (`tui.attach`, decision 15). `'join'` (the default): as one more client of the session the
+   * host has open, which goes on driving it (`nativeClient`; Codex). `'takeover'`: the terminal
+   * holds the session while it runs, in place of this adapter, and the session goes on here
+   * when it leaves (`takeover`, which it needs; Claude Code).
+   */
+  readonly attach?: 'join' | 'takeover';
+  /**
+   * Hand a session to the harness's own terminal UI (`attach: 'takeover'`, decision 15). The host
+   * has released the session's binding (its lane was idle) and chosen the native session the
+   * terminal runs on: the session's own on this instance when it has one (`resume`), else a new
+   * id. While the takeover lasts, `harness` stands in for this instance on the session: the host
+   * opens the session on it, then asks for the terminal's command line (`launch`). It ends when
+   * the terminal leaves, or when the host ends it (`end`: a new attach replacing one that never
+   * connected, a failed open, the host stopping); either way `services.onEnd` follows, once, and
+   * the session's next turn opens on this adapter again, resuming the same native id.
+   */
+  takeover?(args: HarnessTakeoverArgs): Promise<HarnessTakeover>;
+  /**
+   * The host is stopping and this harness outlives it (e.g. Codex: its app-server keeps a
+   * turn running for the next host, or dies with the host but must not be told to stop it).
+   * End every session of this adapter without interrupting or unsubscribing anything and
+   * without emitting more events, keep what a later `open({ resume })` needs, and close the
+   * connections. With it the host detaches the sessions' lanes instead of closing them: a
+   * running turn stays open in the session log, for the next host to adopt (`adopts`) or to
+   * settle as ambiguous (`host_restarted`). Called once per adapter, bounded by the host's
+   * stop timeout. Without it the host closes each session (`HarnessSession.close`).
+   */
+  detach?(): Promise<void>;
+  /**
+   * Shut this adapter's own processes down now, failing whatever session still runs on
+   * them. The host calls it on an adapter it built for one launched session or task run
+   * alone when that ends, and at stop on an adapter without `detach`, after its sessions
+   * closed. Never on an adapter that `detach` was called on.
+   */
+  dispose?(): Promise<void>;
+  /**
+   * Static, answered without starting anything: after a host restart `open({ resume })` may
+   * adopt (`turn.adopted`) a turn the previous host left running, because the harness
+   * outlived it (Codex over a Unix socket). A restarted host reopens such sessions at start;
+   * others' leftover turns are settled ambiguous (`host_restarted`) without opening the
+   * harness. Only meaningful with `detach`.
+   */
+  readonly adopts?: boolean;
+  /**
+   * Static, like `adopts`: the harness's name in user-facing texts (chat command replies),
+   * e.g. "Codex". Without it the host names it by its instance.
+   */
+  readonly displayName?: string;
+  /**
+   * Static: the session compacts its context when a turn's one input is this command, handed
+   * to the harness as it is (`channelContext.nativeCommand`), e.g. Claude Code `/compact`.
+   * The host's `session.compact` and the owner's `/compact` start such a turn; without it both
+   * answer `unsupported`.
+   */
+  readonly compact?: { readonly command: string };
+  /**
+   * Static: the collaboration modes `RunSpec.mode` selects on this harness besides `default`
+   * (Codex: `['plan']`). The owner's `/plan` and the Plan line of `/status` need `plan` here;
+   * without it `/plan` answers that it is unavailable.
+   */
+  readonly modes?: readonly 'plan'[];
+  /**
+   * Static: the owner may switch the permission profile of their own turns in a session
+   * between `bypass` and `restricted` (`/bypass`). Without it `/bypass` answers that it is
+   * unavailable, whatever profiles the harness maps (Codex declares it; Claude Code does not).
+   */
+  readonly ownerProfileSwitch?: boolean;
+  /**
+   * Static: `open` takes `options.ephemeral` (a throwaway session kept out of the harness's
+   * history), `options.preface: false`, instructions of the caller's (`instructions`) and a
+   * read-only `options.profiles` entry (`approvalPolicy`, `sandbox`), so the host runs a module's
+   * ephemeral turns on it (`KernelLaneHarness.ephemeralTurn`; the daemon's topic titles module
+   * `topic-title`, which a host may turn off, is one). The options are Codex's shape. Codex
+   * declares it.
+   */
+  readonly ephemeralOpen?: boolean;
+  /**
+   * Static: how a launched session's env reaches its harness (`SessionEnvSupport`). Default
+   * `'open'`. `'own-process'` needs `ownProcess`.
+   */
+  readonly sessionEnv?: SessionEnvSupport;
+  /**
+   * An adapter like this one on a process of its own, for one launched session
+   * (`sessionEnv: 'own-process'`: `env` is the session's, the top layer of that process's
+   * environment, so it may name another config dir) or one task run. A task run always runs on
+   * one when the adapter has this method, whatever `sessionEnv` says: the host builds the
+   * instance's adapter for the run, the run's env (at least `AGENTS_IO_RUN_ID`) joined to the
+   * instance's own and so under its configured config dir, and calls `ownProcess({ env: {} })`
+   * on it. Starts nothing until its first `open`. The host keeps the result for that session or
+   * run (the session layer compares adapters by identity) and calls its `dispose` when the
+   * session's lane closes or the run ends. `cwd` is where that session or run works (its opens
+   * say so too).
+   */
+  ownProcess?(o: { env: Record<string, string>; cwd?: string }): HarnessAdapter;
 }
 
 /** A command that starts a harness's terminal UI attached to a running session. */
@@ -90,6 +223,63 @@ export interface NativeClient {
   args: string[];
   /** Over the caller's environment (e.g. CODEX_HOME), never secrets. */
   env?: Record<string, string>;
+}
+
+/** What `HarnessAdapter.takeover` gets. */
+export interface HarnessTakeoverArgs {
+  sessionKey: string;
+  /**
+   * The instance the terminal stands in for (`harnesses.<name>`): the id of the takeover's
+   * `harness`, so the session's events and native id stay that instance's.
+   */
+  instance: string;
+  /** The native session the terminal runs on. */
+  nativeId: string;
+  /** `nativeId` is the session's own on the instance (the terminal resumes it); else it is new. */
+  resume: boolean;
+  /** The model the session's next turn would run, when one is set (`RunSpec.model`). */
+  model?: string;
+  services: TakeoverServices;
+}
+
+/** What the host gives a takeover. */
+export interface TakeoverServices {
+  /**
+   * A directory of the host's for the terminal's files of this launch only (settings, configs);
+   * a takeover writes under a directory of its own there (0700) and removes it when it ends.
+   */
+  dir: string;
+  /**
+   * The host's CLI as a script for `node`: `process.execPath <cli> <command>` runs a command a
+   * registered harness kind contributes to it (`HarnessModule.cli`), e.g. a helper the terminal
+   * starts as its own child.
+   */
+  cli: string;
+  /** A stored file an input refers to (`ContentBlock.ref`) as a local path the terminal can read; `undefined` for a ref the host's store does not hold. */
+  fileOf(ref: string): Promise<{ path: string; mime: string; name?: string } | undefined>;
+  /** Called once when the takeover ends, whatever ended it: why (e.g. "the terminal UI exited"). */
+  onEnd(reason: string): void;
+}
+
+/** How to start the terminal UI of a takeover (`tui.attach`'s answer). */
+export interface TakeoverLaunch extends NativeClient {
+  /** Removed from the caller's environment first (e.g. markers of a session of the harness the caller runs inside). */
+  unsetEnv?: string[];
+}
+
+/** A session held by the harness's own terminal UI (`HarnessAdapter.takeover`). */
+export interface HarnessTakeover {
+  /** Stands in for the instance on the session while the takeover lasts: the host's lane opens it. */
+  readonly harness: HarnessAdapter;
+  /** The terminal is connected and has not left: another attach is refused meanwhile (`conflict`). */
+  readonly connected: boolean;
+  /**
+   * The terminal's command line, asked once the session is open on `harness` (what that open
+   * got, e.g. the host's MCP endpoint, may go into it).
+   */
+  launch(): TakeoverLaunch;
+  /** End it now; idempotent. `services.onEnd` follows. The host logs a failure (a throw, a rejected promise) and goes on. */
+  end(reason: string): void;
 }
 
 export interface HarnessSession {
@@ -126,11 +316,31 @@ export interface HarnessFactoryInit {
   log(level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown): void;
   /** Another configured instance's adapter (e.g. a text harness a voice harness hands its delegated turns to). */
   harness(name: string): HarnessAdapter;
+  /**
+   * The host's blob store, read-only (`stat` and `get`, nothing else; each works detached): what
+   * the media blocks of inputs (`ref`) point at. The built-in adapters resolve images and files
+   * with the same view; absent when the host has none.
+   */
+  blobs?: BlobAccess;
 }
 
 /**
  * What a harness plugin module exports (as `createHarness`, or as default), for a
  * `{ "use": "module" }` harness entry. Runs in the daemon's process; a rejection or
- * a throw fails the daemon's start.
+ * a throw fails the daemon's start. The adapter it returns serves every session of the
+ * instance, task runs included, so the daemon never disposes it when one ends; it gets the
+ * same lifecycle calls as a built-in adapter: at stop `detach` when it has one, else its
+ * sessions are closed and then `dispose` is called; `adopts` is read at start. Every loaded
+ * instance gets them, whether or not a session used it; an adapter returned for several
+ * instances gets each call once. Its other static declarations (`displayName`, `compact`,
+ * `modes`, `ownerProfileSwitch`, `ephemeralOpen`, `sessionEnv`, `attach`), `ownProcess` and
+ * `takeover` are read as a built-in adapter's; they and the lifecycle members are checked when
+ * the factory returns, and one of the wrong type fails the start. Its opens, the opens of an
+ * adapter its `ownProcess` returned included, carry the instance's env in `args.env`, a task
+ * run's over it, and a launched session's only with `sessionEnv: 'open'`; and the agent's
+ * instructions in `args.instructions`, during a transition also as
+ * `options.developerInstructions`, as before `instructions` existed.
+ * `init.blobs` reads the media inputs point at (`stat` and `get`, nothing else). The module may
+ * export a `HarnessModule` descriptor instead (`harness-module.ts`): its `create` gets this init too.
  */
 export type HarnessFactory = (init: HarnessFactoryInit) => HarnessAdapter | Promise<HarnessAdapter>;

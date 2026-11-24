@@ -2,7 +2,8 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { launchFlags } from '@agents-io/harness-codex';
+import type { ClaudeLaunch } from '@agents-io/harness-claude-code';
+import { launchFlags, type CodexLaunch } from '@agents-io/harness-codex';
 import { ConfigError, defaultInstance, findEnvFile, loadConfig, resolveConfig } from '../src/config.js';
 
 const dirs: string[] = [];
@@ -165,18 +166,20 @@ describe('config', () => {
         { GW_TOKEN: 'tok-secret', GH: 'gh-secret' },
       );
       const a = c.harnesses.a!;
-      expect(a.kind === 'claude-code' && a.claude.mcpServers).toEqual({
+      // The instance's launch settings, as the claude-code kind resolved them (harness/claude-code `module.ts`).
+      const claude = a.launch as ClaudeLaunch;
+      expect(a.kind === 'claude-code' && claude.mcpServers).toEqual({
         docs: { type: 'http', url: 'https://docs', headers: { Authorization: '${GW_TOKEN}' } },
         gh: { command: 'gh-mcp', env: { GITHUB_TOKEN: '${GH}' } },
       });
       expect(a.env).toEqual({ GW_TOKEN: 'tok-secret', GH: 'gh-secret' });
-      expect(JSON.stringify(a.kind === 'claude-code' && a.claude)).not.toMatch(/secret/);
+      expect(JSON.stringify(a.kind === 'claude-code' && claude)).not.toMatch(/secret/);
     });
 
     it('claude inline settings: settings.env refs move to the child env; others are refused #SE-1', () => {
       const c = resolve({ harnesses: { a: { use: 'claude-code', settings: { model: 'x', env: { X: 'env:T' } } } } }, { T: 'tok-secret' });
       const a = c.harnesses.a!;
-      expect(a.kind === 'claude-code' && a.claude.settings).toEqual({ model: 'x', env: {} });
+      expect(a.kind === 'claude-code' && (a.launch as ClaudeLaunch).settings).toEqual({ model: 'x', env: {} });
       expect(a.env).toEqual({ X: 'tok-secret' });
       expect(() => resolve({ harnesses: { a: { use: 'claude-code', settings: { apiKeyHelper: 'env:T' } } } }, { T: 'tok-secret' })).toThrow(
         /harnesses\.a\.settings\.apiKeyHelper: .*command line/,
@@ -211,7 +214,8 @@ describe('config', () => {
       );
       const cx = c.harnesses.cx!;
       if (cx.kind !== 'codex') throw new Error('kind');
-      expect(cx.codex.config).toEqual({
+      const codex = cx.launch as CodexLaunch;
+      expect(codex.config).toEqual({
         'mcp_servers.x': { url: 'https://x', http_headers: { 'X-Plain': 'p' } },
         'model_providers.p': { base_url: 'https://p' },
         mcp_servers: { s: { command: 's', env: { B: 'b' } } },
@@ -223,7 +227,7 @@ describe('config', () => {
       });
       expect(cx.env).toEqual({ GW_TOKEN: 'tok-secret', KEY: 'key-secret', GITHUB_TOKEN: 'gh-secret', A: 'key-secret' });
       // What the adapter puts on argv: accepted, and no value in it.
-      const flags = launchFlags(cx.codex).join(' ');
+      const flags = launchFlags(codex).join(' ');
       expect(flags).not.toMatch(/secret/);
     });
 

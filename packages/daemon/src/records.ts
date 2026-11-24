@@ -155,14 +155,21 @@ export class DaemonRecords implements OutboxStore {
 
   // ---- outbound index and causes (agent-messaging §4.3) -------------------
 
+  /** The row and its parts in one savepoint (inside the outbox's settlement transaction, INVARIANTS DL-1). */
   putOutbound(r: OutboundRecord): void {
     // Only a delivered message a turn made is a key the index answers by.
     const msg = r.result === 'delivered' && r.turnId !== undefined && r.providerMessageId !== undefined ? r.providerMessageId : null;
     // Any delivered message is ours (`sentByUs`), whoever made it.
     const sent = r.result === 'delivered' && r.providerMessageId !== undefined ? r.providerMessageId : null;
-    this.q.obPut.run(r.operationId, r.channel, msg, sent, r.at, JSON.stringify(r));
-    if (sent === null) return;
-    for (const id of r.providerMessageIds ?? []) if (id !== sent) this.q.obPartPut.run(r.channel, id, r.operationId, r.at);
+    this.db.exec('SAVEPOINT outbound_put');
+    try {
+      this.q.obPut.run(r.operationId, r.channel, msg, sent, r.at, JSON.stringify(r));
+      if (sent !== null) for (const id of r.providerMessageIds ?? []) if (id !== sent) this.q.obPartPut.run(r.channel, id, r.operationId, r.at);
+      this.db.exec('RELEASE outbound_put');
+    } catch (e) {
+      rollbackTo(this.db, 'outbound_put');
+      throw e;
+    }
   }
 
   /** The delivery an operationId names, if it settled. */
@@ -239,7 +246,7 @@ export class DaemonRecords implements OutboxStore {
     return r ? (JSON.parse(r.json) as DeliveryRecord) : undefined;
   }
 
-  /** The outcome and the end of the in-flight mark in one savepoint (also inside another transaction). */
+  /** The outcome and the end of the in-flight mark in one savepoint (also inside the outbox's settlement transaction). */
   put(rec: DeliveryRecord): void {
     this.db.exec('SAVEPOINT outbox_settle');
     try {
@@ -247,8 +254,7 @@ export class DaemonRecords implements OutboxStore {
       this.q.flyDel.run(rec.operationId);
       this.db.exec('RELEASE outbox_settle');
     } catch (e) {
-      this.db.exec('ROLLBACK TO outbox_settle');
-      this.db.exec('RELEASE outbox_settle');
+      rollbackTo(this.db, 'outbox_settle');
       throw e;
     }
   }
@@ -324,5 +330,17 @@ export class DaemonRecords implements OutboxStore {
 
   close(): void {
     if (this.ownsDb) this.db.close();
+  }
+}
+
+/**
+ * Undo a savepoint after a failed write. The failure may have ended the whole transaction
+ * already (SQLITE_FULL, IOERR), and the savepoint with it: the write's error is the one to report.
+ */
+function rollbackTo(db: DatabaseSync, savepoint: string): void {
+  try {
+    db.exec(`ROLLBACK TO ${savepoint}; RELEASE ${savepoint}`);
+  } catch {
+    // nothing left to roll back
   }
 }

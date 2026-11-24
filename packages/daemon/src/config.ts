@@ -1,13 +1,35 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { Type, type Static } from '@sinclair/typebox';
-import { Binding, Evidence, IdentityEntry, ScheduleDraft, Tier, WatchDraft, errors, type BindingTable, type Principal, type RunSpec, type WatchSource } from '@agents-io/protocol';
-import { DEFAULT_BLOB_MAX_BYTES, OWNER_LABEL, Router, RouterError, checkIdentities, ownerIdentities, ownersTable, type AgentContactRule, type AgentSpec, type LoopGuardOptions } from '@agents-io/session';
-import { resolveChannelModule } from './channel-module.js';
-import { loadEnvFile } from '@agents-io/testkit';
-import type { CodexTransportOption } from '@agents-io/harness-codex';
-import { TOOL_NAMES, parseScope, type ExternalScopes } from '@agents-io/host-mcp';
+import { Type, type Static, type TObject, type TSchema } from '@sinclair/typebox';
+import {
+  Binding,
+  Evidence,
+  IdentityEntry,
+  ScheduleDraft,
+  Tier,
+  WatchDraft,
+  errors,
+  type BindingTable,
+  type ChannelResolveContext,
+  type ChannelValidateContext,
+  type HarnessChildSecrets,
+  type HarnessModule,
+  type HarnessResolveContext,
+  type ModuleManifest,
+  type Principal,
+  type RunSpec,
+  type WatchSource,
+} from '@agents-io/protocol';
+import { DEFAULT_BLOB_MAX_BYTES, Router, RouterError, checkIdentities, ownerIdentities, ownersTable, type AgentContactRule, type AgentSpec, type LoopGuardOptions } from '@agents-io/session';
+import { builtinChannels, builtinHarnesses, builtinModules, type BuiltinChannelEntry, type BuiltinChannelSettings, type BuiltinModuleSections, type ExternalMcpConfig } from './bundle.js';
+import type { ChannelRegistry } from './channel-registry.js';
+import { ConfigError } from './config-error.js';
+import { loadEnvFile } from './env-file.js';
+import type { HarnessRegistry } from './harness-registry.js';
+import { resolveModuleFile } from './module-loader.js';
+import type { ModuleRegistry, ResolvedModule } from './modules.js';
+import { KERNEL_TOOL_NAMES } from '@agents-io/host-mcp';
 
 /*
  * aio.config.json: what runs. Secrets never go in it: they come from the
@@ -18,7 +40,10 @@ import { TOOL_NAMES, parseScope, type ExternalScopes } from '@agents-io/host-mcp
  * `settings`, codex `config`) never get the value itself: it goes into the
  * child's environment and the setting names the variable (`${NAME}`,
  * `settings.env`, codex `env_http_headers` / `bearer_token_env_var` /
- * `env_key` / `env_vars`); where that is impossible "env:" is refused.
+ * `env_key` / `env_vars`); where that is impossible "env:" is refused. Each
+ * harness kind's module does that for its own keys (`HarnessModule.resolve`,
+ * through `HarnessChildSecrets`); the kinds are the ones a `HarnessRegistry`
+ * holds (`bundle.ts` registers Claude Code and Codex).
  *
  * Agents (`agents: { <name>: { harness | preset, model?, effort?, profile?, cwd?,
  * mode?, tools?, instructionsFile? } }`) are named run configurations over the
@@ -40,8 +65,8 @@ import { TOOL_NAMES, parseScope, type ExternalScopes } from '@agents-io/host-mcp
 
 const Closed = { additionalProperties: false } as const;
 
-const HarnessKind = Type.Union([Type.Literal('claude-code'), Type.Literal('codex')]);
-export type HarnessKind = Static<typeof HarnessKind>;
+/** A registered harness kind's name (`HarnessModule.kind`, the `use` of its instances). */
+export type HarnessKind = string;
 
 const RunDefaults = Type.Object({ model: Type.Optional(Type.String()), effort: Type.Optional(Type.String()) }, Closed);
 const Profiles = Type.Record(Type.String(), Type.Record(Type.String(), Type.Unknown()));
@@ -54,20 +79,6 @@ const LegacySection = {
   /** Passed through as HarnessOpenArgs.options (ClaudeCodeOptions / CodexOpenOptions). */
   options: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 };
-
-const CodexTransport = Type.Union([
-  Type.Object({ kind: Type.Literal('stdio') }, Closed),
-  Type.Object(
-    {
-      kind: Type.Literal('unix'),
-      spawn: Type.Union([Type.Literal('own'), Type.Literal('daemon'), Type.Literal('none')]),
-      path: Type.Optional(Type.String()),
-      stateDir: Type.Optional(Type.String()),
-      reconnectWindowMs: Type.Optional(Type.Number()),
-    },
-    Closed,
-  ),
-]);
 
 const InstanceCommon = {
   /**
@@ -85,67 +96,47 @@ const InstanceCommon = {
   options: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 };
 
-const ClaudeInstance = Type.Object(
-  {
-    use: Type.Literal('claude-code'),
-    ...InstanceCommon,
-    /** CLAUDE_CONFIG_DIR: login, user settings, user skills/agents/commands, transcripts (default ~/.claude). */
-    configDir: Type.Optional(Type.String()),
-    /** The `claude` CLI (default: first on PATH). */
-    executable: Type.Optional(Type.String()),
-    /** Flag-layer settings: a settings.json path, or an inline object (Agent SDK `settings`). */
-    settings: Type.Optional(Type.Union([Type.String(), Type.Record(Type.String(), Type.Unknown())])),
-    /** Which settings files load (`[]` = none; default all). */
-    settingSources: Type.Optional(Type.Array(Type.Union([Type.Literal('user'), Type.Literal('project'), Type.Literal('local')]))),
-    mcpServers: Type.Optional(Type.Record(Type.String(), Type.Record(Type.String(), Type.Unknown()))),
-    /** Local plugin directories (each may carry skills, agents, commands, hooks). */
-    plugins: Type.Optional(Type.Array(Type.String())),
-    /** Skills to enable: "all" or names (default: the CLI's own). */
-    skills: Type.Optional(Type.Union([Type.Literal('all'), Type.Array(Type.String())])),
-    /** Extra CLI flags: name without `--` → value, null for a bare flag. */
-    extraArgs: Type.Optional(Type.Record(Type.String(), Type.Union([Type.String(), Type.Null()]))),
-    additionalDirectories: Type.Optional(Type.Array(Type.String())),
-  },
-  Closed,
-);
-
-const CodexInstance = Type.Object(
-  {
-    use: Type.Literal('codex'),
-    ...InstanceCommon,
-    /** CODEX_HOME: config.toml, auth, sessions, skills (default ~/.codex). */
-    home: Type.Optional(Type.String()),
-    /** The `codex` binary (default `codex` on PATH). */
-    executable: Type.Optional(Type.String()),
-    /** Dotted key → value, passed as `-c key=<TOML>` to `codex app-server` (argv: "env:NAME" only where Codex can name a variable). */
-    config: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
-    enable: Type.Optional(Type.Array(Type.String())),
-    disable: Type.Optional(Type.Array(Type.String())),
-    transport: Type.Optional(CodexTransport),
-    /** Realtime voice (decision 11): opt the app-server connection into Codex's experimental realtime API, so `live_join` works. Default false. */
-    live: Type.Optional(Type.Boolean()),
-    /** Not supported: `codex app-server` rejects --profile (checked: codex-cli 0.160). Listed to give a clear error. */
-    profile: Type.Optional(Type.String()),
-  },
-  Closed,
-);
-
 /**
- * In-process harness plugin: an ES module exporting a HarnessFactory (`@agents-io/protocol`).
- * `module` resolves like a channel module's (relative to the config file, absolute, a package
- * directory, or a bare specifier); `config` is env-substituted and handed to the factory.
+ * In-process harness plugin: an ES module exporting a HarnessFactory (`@agents-io/protocol`), or a
+ * HarnessModule. `module` resolves like a channel module's (relative to the config file, absolute,
+ * a package directory, or a bare specifier); `config` is env-substituted and handed to the factory.
  */
 const ModuleInstance = Type.Object(
   {
     use: Type.Literal('module'),
     ...InstanceCommon,
     module: Type.String(),
-    /** Export holding the factory (default `createHarness`, else `default`). */
+    /** Export holding the factory or descriptor (default `createHarness`, else `default`). */
     export: Type.Optional(Type.String()),
     config: Type.Optional(Type.Unknown()),
   },
   Closed,
 );
+
+const instanceSchemas = new WeakMap<HarnessModule, TObject>();
+
+/** A registered kind's instance entry: `use`, the keys every instance has, then the kind's own (closed). */
+function instanceSchema(m: HarnessModule): TObject {
+  let s = instanceSchemas.get(m);
+  if (!s) instanceSchemas.set(m, (s = Type.Object({ use: Type.Literal(m.kind), ...InstanceCommon, ...m.schema.properties }, Closed)));
+  return s;
+}
+
+/** Named instances (`harnesses`): each entry's `use` is a registered kind or `module`; the rest is checked against that. */
+function harnessesSchema(registry: HarnessRegistry) {
+  return Type.Optional(Type.Record(Type.String(), Type.Object({ use: registry.kinds.length ? Type.Union([kindSchema(registry), Type.Literal('module')]) : Type.Literal('module') })));
+}
+
+/** The older single `harness` block: `use`, then each kind's section (`HarnessModule.legacy`), named after it. */
+function legacyBlockSchema(registry: HarnessRegistry) {
+  const sections = registry.modules.flatMap((m) => (m.legacy ? [[m.kind, Type.Optional(Type.Object({ ...LegacySection, ...m.legacy.schema.properties }, Closed))] as const] : []));
+  return Type.Optional(Type.Object({ use: Type.Optional(kindSchema(registry)), ...Object.fromEntries(sections) }, Closed));
+}
+
+/** One of the registered kinds (`Type.Never` for none). */
+function kindSchema(registry: HarnessRegistry): TSchema {
+  return Type.Union(registry.kinds.map((k) => Type.Literal(k)));
+}
 
 const INSTANCE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
@@ -162,9 +153,10 @@ const ChannelCommon = {
   /**
    * With `openDelayMs`: the first message opens at the turn's first tool call, or once the delay
    * passed with something to show (a tool, thinking, answer text), instead of with the first
-   * answer text. Default: on for Lark bots (their card lists the steps), off elsewhere. A module
-   * channel that edits its message (open-lark's personal account on the `card` tier) sets it to
-   * show one progress line early and edit it into the answer.
+   * answer text. Default: what the adapter declares (`ChannelCaps.pacing.openOnProcess`: on for
+   * Lark bots, whose card lists the steps), off elsewhere. A module channel that edits its message
+   * (open-lark's personal account on the `card` tier) sets it to show one progress line early and
+   * edit it into the answer.
    */
   openOnProcess: Type.Optional(Type.Boolean()),
   /** Lark native process preview delay (ms), before the reply card. Default 2000. */
@@ -177,68 +169,111 @@ const ChannelCommon = {
   ack: Type.Optional(Type.Union([Type.Boolean(), Type.Object({ doneAfterMs: Type.Optional(Type.Integer({ minimum: 0 })) }, Closed)])),
   /**
    * Sender evidence this channel may give (channel-stamping): the cap is this ∩ the
-   * adapter's `caps.evidence`, and stronger claims become `none`. Default: lark-bot and
-   * mail `caps.evidence`; bridge and module channels only `device_only` (never
-   * `platform_signed` / `dkim_pass` unless granted here).
+   * adapter's `caps.evidence`, and stronger claims become `none`. Default: what the
+   * type was registered with (`ChannelRegistry.defaultEvidence`; `bundle.ts`: lark-bot
+   * and mail `caps.evidence`); bridge and module channels, and any type registered
+   * without, only `device_only` (never `platform_signed` / `dkim_pass` unless granted here).
    */
   evidence: Type.Optional(Type.Array(Evidence)),
 };
 
+type ChannelCommonFields = Static<TObject<typeof ChannelCommon>>;
+
+/** The keys of a channel entry the host owns (`type` and `ChannelCommon`): what a type's `resolve` returns for them does not count. */
+const HOST_CHANNEL_KEYS: ReadonlySet<string> = new Set(['type', ...Object.keys(ChannelCommon)]);
+
 /**
  * Channel ids of the built-in adapters, local ends and agent addresses (`agent:<agent>:<sessionKey>`
  * routes, the `agent` identity namespace the daemon stamps, ID-7): no bridge or module channel may use them.
+ * The ones the built-in types declare (`ChannelModule.ids`), then the daemon's own (`CORE_CHANNEL_IDS`).
  */
-export const RESERVED_CHANNEL_IDS: readonly string[] = ['lark-bot', 'mail', 'local', 'agent'];
-/** Evidence a bridge or module channel may give without an `evidence` grant. */
+export const RESERVED_CHANNEL_IDS: readonly string[] = builtinChannels.reservedIds;
+/** Evidence a channel of a type registered `ungranted` (bridge, module) may give without an `evidence` grant. */
 export const UNGRANTED_EVIDENCE: readonly Evidence[] = ['device_only', 'none'];
 
-const ChannelEntry = Type.Union([
+const channelEntrySchemas = new WeakMap<ChannelRegistry, TSchema>();
+
+/** A `channels[]` entry: for each registered type (in order), `type`, the keys every entry has, then the type's own (`ChannelModule.entry`), closed. */
+function channelEntrySchema(registry: ChannelRegistry): TSchema {
+  let s = channelEntrySchemas.get(registry);
+  if (!s) {
+    const members = registry.modules.map((m) => {
+      const taken = Object.keys(m.entry).find((k) => k === 'type' || Object.hasOwn(ChannelCommon, k));
+      if (taken !== undefined) throw new Error(`channel type ${JSON.stringify(m.type)}: every channel entry has ${JSON.stringify(taken)}; its module cannot declare it`);
+      return Type.Object({ type: Type.Literal(m.type), ...ChannelCommon, ...m.entry }, Closed);
+    });
+    channelEntrySchemas.set(registry, (s = Type.Union(members)));
+  }
+  return s;
+}
+
+/** A `channels[]` entry of a built-in type, as written. */
+export type ChannelEntry = ChannelCommonFields & BuiltinChannelEntry;
+const ChannelEntry = channelEntrySchema(builtinChannels) as TSchema & { static: ChannelEntry };
+
+/** The `console` section's own keys before the modules' ones: the console server's. */
+const ConsoleServerKeys = {
+  enabled: Type.Optional(Type.Boolean()),
+  host: Type.Optional(Type.String()),
+  /** 0: any free port (the URL is written next to the socket, `<socket>.console`). */
+  port: Type.Optional(Type.Integer({ minimum: 0, maximum: 65535 })),
+  allowRemote: Type.Optional(Type.Boolean()),
   /**
-   * Feishu/Lark bot, one app per entry. `config.appId` / `config.appSecret` / `config.domain`
-   * (values or "env:NAME"; the whole config is env-substituted) name the app; an entry
-   * without them reads LARK_APP_ID / LARK_APP_SECRET / LARK_DOMAIN (at most one such entry).
+   * Extra names the `Host` header may carry (anti DNS rebinding), e.g. the LAN name or
+   * address remote browsers use. Loopback names and a concrete `host` are always accepted.
+   * Required with a wildcard `host` (0.0.0.0, ::) and `allowRemote`.
    */
-  Type.Object({ type: Type.Literal('lark-bot'), ...ChannelCommon, config: Type.Optional(Type.Record(Type.String(), Type.Unknown())) }, Closed),
-  /** IMAP/SMTP mail: a MailChannelConfig (use "env:NAME" for passwords). */
-  Type.Object({ type: Type.Literal('mail'), ...ChannelCommon, config: Type.Record(Type.String(), Type.Unknown()) }, Closed),
-  /** Out-of-process channel spoken to over JSONL stdio (jsonl-bridge `spawnChannel`); how private channels attach. */
-  Type.Object(
-    {
-      type: Type.Literal('bridge'),
-      ...ChannelCommon,
-      /**
-       * The channel id: every `hello` must declare it as `adapterId`, else the peer is refused
-       * (`bad_hello`) and restarted with backoff. Not a built-in id (`lark-bot`, `mail`, `local`);
-       * bridge entries sharing an id must run the same `command` / `args` (one program, several
-       * accounts). Without it the first hello's id is pinned (and checked the same way).
-       */
-      id: Type.Optional(Type.String({ minLength: 1 })),
-      command: Type.String(),
-      args: Type.Optional(Type.Array(Type.String())),
-      env: Type.Optional(Type.Record(Type.String(), Type.String())),
-      cwd: Type.Optional(Type.String()),
-      config: Type.Optional(Type.Unknown()),
-    },
-    Closed,
-  ),
+  allowedHosts: Type.Optional(Type.Array(Type.String())),
+  /** Origins of separately hosted UIs allowed to call the API (CORS); none by default. */
+  origins: Type.Optional(Type.Array(Type.String())),
+  /** Where the UI is; login links point there (default: the console URL itself). */
+  uiUrl: Type.Optional(Type.String()),
+  /** Lifetime of console sessions from a login link (default 12 h). */
+  sessionTtlMs: Type.Optional(Type.Number({ minimum: 1000 })),
   /**
-   * In-process channel plugin: an ES module exporting a ChannelFactory (`@agents-io/protocol`).
-   * `module` is a path (relative to the config file) to a package directory or a .js/.mjs file,
-   * or a bare package specifier resolved from the config file's directory.
+   * WebSocket heartbeat of `/ws`: a ping every `intervalMs` (default 30 s; 0 turns it off);
+   * a connection that has not answered (pong, or any message) within `timeoutMs` after a
+   * ping (default 10 s) is closed, which frees the host role it held.
    */
-  Type.Object(
-    {
-      type: Type.Literal('module'),
-      ...ChannelCommon,
-      module: Type.String(),
-      /** Export holding the factory (default `createChannel`, else `default`). */
-      export: Type.Optional(Type.String()),
-      config: Type.Optional(Type.Unknown()),
-    },
-    Closed,
-  ),
-]);
-export type ChannelEntry = Static<typeof ChannelEntry>;
+  heartbeat: Type.Optional(Type.Object({ intervalMs: Type.Optional(Type.Integer({ minimum: 0 })), timeoutMs: Type.Optional(Type.Integer({ minimum: 100 })) }, Closed)),
+};
+
+/** The `console` section's own keys after the modules' ones. */
+const ConsoleApplyKeys = {
+  /**
+   * Apply `channels` changes written through the console (`PUT /api/config`, or a module's
+   * route that adds a channel, such as a provisioned bot) to the running daemon: start new or
+   * changed entries, stop removed or changed ones, keep the rest. Default false (changes take
+   * effect at the next start).
+   */
+  liveChannels: Type.Optional(Type.Boolean()),
+};
+
+type ConsoleSection = TObject<typeof ConsoleServerKeys & typeof ConsoleApplyKeys>;
+const consoleSections = new WeakMap<ChannelRegistry, ConsoleSection>();
+
+/**
+ * The `console` section over a registry's channel types: the console's own keys and, between the
+ * server's and `liveChannels`, the settings the types contribute (`AdminContribution.console`,
+ * each optional, in registration order; lark-bot's `larkBotCommand` is where it always was).
+ * Closed, so a setting no registered type declares is a config error.
+ */
+function consoleSchema(registry: ChannelRegistry): ConsoleSection {
+  let s = consoleSections.get(registry);
+  if (!s) {
+    const contributed: Record<string, TSchema> = {};
+    for (const { type, admin } of registry.adminContributions) {
+      for (const [k, schema] of Object.entries(admin.console ?? {})) {
+        if (Object.hasOwn(ConsoleServerKeys, k) || Object.hasOwn(ConsoleApplyKeys, k)) throw new Error(`channel type ${JSON.stringify(type)}: admin setting console.${k} is the console's own`);
+        contributed[k] = Type.Optional(schema);
+      }
+    }
+    // The static type has the console's own keys only: `resolveConsole` reads the others by name.
+    s = Type.Object({ ...ConsoleServerKeys, ...contributed, ...ConsoleApplyKeys }, Closed) as unknown as ConsoleSection;
+    consoleSections.set(registry, s);
+  }
+  return s;
+}
 
 /** A named run preset: one harness instance with its model and effort (`presets.<name>`). */
 const PresetEntry = Type.Object(
@@ -308,7 +343,11 @@ const AgentEntry = Type.Object(
   Closed,
 );
 
-export const ConfigFile = Type.Object(
+/**
+ * The config file's own keys (the kernel's) over the built-in harness kinds and channel types:
+ * `ConfigFile` without the modules' sections (`configFileSchema` adds a registry's).
+ */
+const KernelFile = Type.Object(
   {
     /** State directory (default ~/.agents-io/aio). Relative paths are relative to the config file. */
     dataDir: Type.Optional(Type.String()),
@@ -324,21 +363,12 @@ export const ConfigFile = Type.Object(
     blobs: Type.Optional(Type.Object({ dir: Type.Optional(Type.String()), maxBytes: Type.Optional(Type.Number({ minimum: 1 })) }, Closed)),
     /** Working directory for harness sessions (default: the current directory). */
     cwd: Type.Optional(Type.String()),
-    /** Named harness instances; `RunSpec.harness` is the name. Each entry is checked against its `use`. */
-    harnesses: Type.Optional(Type.Record(Type.String(), Type.Object({ use: Type.Union([HarnessKind, Type.Literal('module')]) }))),
+    /** Named harness instances; `RunSpec.harness` is the name. Each entry is checked against its `use` (a registered kind, or `module`). */
+    harnesses: harnessesSchema(builtinHarnesses),
     /** Instance the default policy plans (default: the only one, else the first). */
     defaultHarness: Type.Optional(Type.String()),
     /** Older single-harness form; each section becomes an instance named after its kind. */
-    harness: Type.Optional(
-      Type.Object(
-        {
-          use: Type.Optional(HarnessKind),
-          'claude-code': Type.Optional(Type.Object({ ...LegacySection, claudePath: Type.Optional(Type.String()) }, Closed)),
-          codex: Type.Optional(Type.Object({ ...LegacySection, bin: Type.Optional(Type.String()), transport: Type.Optional(CodexTransport) }, Closed)),
-        },
-        Closed,
-      ),
-    ),
+    harness: legacyBlockSchema(builtinHarnesses),
     /**
      * Named presets: harness instance + model + effort. An agent's `preset` is its default;
      * the owner switches one session to another with `/preset <name>` (`default` is reserved).
@@ -394,7 +424,8 @@ export const ConfigFile = Type.Object(
           /**
            * Messages from people the deployment does not know, addressed to it (a DM, an @ in a group;
            * not mail): `drop` (default) leaves them as routed; `ask` asks the owner, in the chat of
-           * `ownerSessionKey`, whether to let the agent answer (decision 15).
+           * `ownerSessionKey`, whether to let the agent answer (decision 15). The stranger approval
+           * module's setting (an alias of its section `strangers`: `ask` turns it on, `drop` off).
            */
           strangers: Type.Optional(Type.Union([Type.Literal('drop'), Type.Literal('ask')])),
           routes: Type.Optional(Type.Array(Type.String())),
@@ -479,46 +510,7 @@ export const ConfigFile = Type.Object(
      * `aio serve`, on 127.0.0.1:7464. A non-loopback `host` is refused unless
      * `allowRemote` is true (then every request still needs a token).
      */
-    console: Type.Optional(
-      Type.Object(
-        {
-          enabled: Type.Optional(Type.Boolean()),
-          host: Type.Optional(Type.String()),
-          /** 0: any free port (the URL is written next to the socket, `<socket>.console`). */
-          port: Type.Optional(Type.Integer({ minimum: 0, maximum: 65535 })),
-          allowRemote: Type.Optional(Type.Boolean()),
-          /**
-           * Extra names the `Host` header may carry (anti DNS rebinding), e.g. the LAN name or
-           * address remote browsers use. Loopback names and a concrete `host` are always accepted.
-           * Required with a wildcard `host` (0.0.0.0, ::) and `allowRemote`.
-           */
-          allowedHosts: Type.Optional(Type.Array(Type.String())),
-          /** Origins of separately hosted UIs allowed to call the API (CORS); none by default. */
-          origins: Type.Optional(Type.Array(Type.String())),
-          /** Where the UI is; login links point there (default: the console URL itself). */
-          uiUrl: Type.Optional(Type.String()),
-          /** Lifetime of console sessions from a login link (default 12 h). */
-          sessionTtlMs: Type.Optional(Type.Number({ minimum: 1000 })),
-          /**
-           * WebSocket heartbeat of `/ws`: a ping every `intervalMs` (default 30 s; 0 turns it off);
-           * a connection that has not answered (pong, or any message) within `timeoutMs` after a
-           * ping (default 10 s) is closed, which frees the host role it held.
-           */
-          heartbeat: Type.Optional(
-            Type.Object({ intervalMs: Type.Optional(Type.Integer({ minimum: 0 })), timeoutMs: Type.Optional(Type.Integer({ minimum: 100 })) }, Closed),
-          ),
-          /** create-lark-bot invocation for `POST /api/bots/lark` (argv; default npx of the pinned release). */
-          larkBotCommand: Type.Optional(Type.Array(Type.String(), { minItems: 1 })),
-          /**
-           * Apply `channels` changes written through the console (`PUT /api/config`, a bot added by
-           * `POST /api/bots/lark`) to the running daemon: start new or changed entries, stop removed
-           * or changed ones, keep the rest. Default false (changes take effect at the next start).
-           */
-          liveChannels: Type.Optional(Type.Boolean()),
-        },
-        Closed,
-      ),
-    ),
+    console: Type.Optional(consoleSchema(builtinChannels)),
     /**
      * The host connection. `tokenFile`: an operator-set host token, stable across restarts
      * (relative paths are relative to the config file). Read when the file exists (it must be
@@ -527,59 +519,6 @@ export const ConfigFile = Type.Object(
      * The token is still copied to `<socket>.token` for the CLI.
      */
     host: Type.Optional(Type.Object({ tokenFile: Type.Optional(Type.String()) }, Closed)),
-    /**
-     * The external MCP endpoint (docs/design/external-mcp): agents outside this daemon (a
-     * Claude Code or Codex on the owner's machine, a host's proxy) read sessions and send
-     * through it, each as its own client. Off unless this section is present (and
-     * `enabled` is not false). Loopback only. Every client has its own token (`token:
-     * "env:NAME"`, or `tokenFile`: read, or generated 0600 like `host.tokenFile`) and the
-     * scopes it may use; nothing else is allowed (`read`, `read:<session pattern>`,
-     * `send:<route pattern>`, `input:<session pattern>`; `*` matches any run of characters).
-     */
-    externalMcp: Type.Optional(
-      Type.Object(
-        {
-          enabled: Type.Optional(Type.Boolean()),
-          /** `host:port` (default `127.0.0.1:7465`; port 0: any free port). Only loopback addresses. */
-          listen: Type.Optional(Type.String()),
-          clients: Type.Record(
-            Type.String(),
-            Type.Object(
-              {
-                /** `env:NAME`: the variable holding the token (never a literal). */
-                token: Type.Optional(Type.String()),
-                /** A token file (relative to the config file): read when it exists, else generated (0600). */
-                tokenFile: Type.Optional(Type.String()),
-                scopes: Type.Array(Type.String()),
-                /** The principal it acts as (default `external:<name>`); always `external:…`, never a person. */
-                principal: Type.Optional(Type.String()),
-                /** Extra principal labels (`external` is always there; `owner` is refused). */
-                labels: Type.Optional(Type.Array(Type.String())),
-                /** It may say whom it acts for (`X-Agents-IO-Declared` header), recorded as `origin.declared`. */
-                declare: Type.Optional(Type.Boolean()),
-              },
-              Closed,
-            ),
-          ),
-          limits: Type.Optional(
-            Type.Object(
-              {
-                /** Largest request body (default 256 KiB). */
-                maxBodyBytes: Type.Optional(Type.Integer({ minimum: 1024 })),
-                /** Longest `text` of a send or an input (default 16000 characters). */
-                maxTextChars: Type.Optional(Type.Integer({ minimum: 1 })),
-                /** Requests per client per minute (default 120); more answer 429. */
-                requestsPerMinute: Type.Optional(Type.Integer({ minimum: 1 })),
-                /** Sends and inputs per client per minute (default 20). */
-                writesPerMinute: Type.Optional(Type.Integer({ minimum: 1 })),
-              },
-              Closed,
-            ),
-          ),
-        },
-        Closed,
-      ),
-    ),
     /** Who local socket clients are. */
     local: Type.Optional(
       Type.Object(
@@ -596,7 +535,65 @@ export const ConfigFile = Type.Object(
   },
   Closed,
 );
-export type ConfigFile = Static<typeof ConfigFile>;
+
+/** The config file as written, over the built-in harness kinds, channel types and modules. */
+export type ConfigFile = Static<typeof KernelFile> & BuiltinModuleSections;
+
+const fileSchemas = new WeakMap<HarnessRegistry, WeakMap<ChannelRegistry, WeakMap<ModuleRegistry, TObject>>>();
+
+/**
+ * The registered modules' config sections (`ModuleConfig`): each its `section` key, an object of
+ * `enabled` and the module's own keys, closed. A section may not be one of the file's own keys.
+ */
+function moduleSections(modules: ModuleRegistry): Record<string, TSchema> {
+  const out: Record<string, TSchema> = {};
+  for (const { manifest: m } of modules.modules) {
+    if (!m.config) continue;
+    const key = m.config.section;
+    if (Object.hasOwn(KernelFile.properties, key)) throw new Error(`module ${m.id}: config section ${JSON.stringify(key)} is one of the config file's own keys`);
+    out[key] = Type.Optional(Type.Object({ enabled: Type.Optional(Type.Boolean()), ...m.config.schema }, Closed));
+  }
+  return out;
+}
+
+/**
+ * The config file's schema over a registry's harness kinds (`harnesses.<name>.use`, the older
+ * `harness` block), a registry's channel types (`channels[].type` and the settings they add to
+ * `console`; default the built-in ones) and a registry's modules (their config sections; default
+ * the built-in ones); the rest is the kernel's own keys. The modules' sections come before `local`,
+ * where `externalMcp` was before it was a module, so a file's schema errors come in the order they
+ * always did. Built once per set of registries (`ConfigFile` is the built-in ones').
+ */
+export function configFileSchema(registry: HarnessRegistry, channels: ChannelRegistry = builtinChannels, modules: ModuleRegistry = builtinModules): TObject {
+  let byChannels = fileSchemas.get(registry);
+  if (!byChannels) fileSchemas.set(registry, (byChannels = new WeakMap()));
+  let byModules = byChannels.get(channels);
+  if (!byModules) byChannels.set(channels, (byModules = new WeakMap()));
+  let s = byModules.get(modules);
+  if (!s) {
+    const { local, ...head } = KernelFile.properties;
+    s = Type.Object(
+      {
+        ...head,
+        harnesses: harnessesSchema(registry),
+        harness: legacyBlockSchema(registry),
+        channels: Type.Optional(Type.Array(channelEntrySchema(channels))),
+        console: Type.Optional(consoleSchema(channels)),
+        ...moduleSections(modules),
+        local,
+      },
+      Closed,
+    );
+    byModules.set(modules, s);
+  }
+  return s;
+}
+
+/**
+ * The config file's schema over the built-in harness kinds, channel types and modules (`bundle.ts`):
+ * the kernel's keys and the built-in modules' sections (`externalMcp`).
+ */
+export const ConfigFile: TObject = configFileSchema(builtinHarnesses, builtinChannels, builtinModules);
 
 interface InstanceBase {
   /** Instance name: `RunSpec.harness`, and the `harness` of its session events. */
@@ -614,30 +611,6 @@ interface InstanceBase {
   unavailable?: string;
 }
 
-/** Claude Code launch settings (ClaudeCodeHarnessConfig). */
-export interface ClaudeLaunch {
-  claudePath?: string;
-  configDir?: string;
-  settings?: string | Record<string, unknown>;
-  settingSources?: ('user' | 'project' | 'local')[];
-  mcpServers?: Record<string, Record<string, unknown>>;
-  plugins?: string[];
-  skills?: 'all' | string[];
-  extraArgs?: Record<string, string | null>;
-  additionalDirectories?: string[];
-}
-
-/** Codex launch settings (CodexHarnessOptions). */
-export interface CodexLaunch {
-  bin?: string;
-  codexHome?: string;
-  config?: Record<string, unknown>;
-  enable?: string[];
-  disable?: string[];
-  transport: CodexTransportOption;
-  live?: boolean;
-}
-
 /** A harness plugin module (`use: "module"`). */
 export interface ModuleLaunch {
   /** The resolved file to import. */
@@ -648,8 +621,23 @@ export interface ModuleLaunch {
   config?: unknown;
 }
 
-export type HarnessInstance = InstanceBase &
-  ({ kind: 'claude-code'; claude: ClaudeLaunch } | { kind: 'codex'; codex: CodexLaunch } | { kind: 'module'; module: ModuleLaunch });
+export type HarnessInstance = InstanceBase & {
+  /**
+   * A registered kind (`HarnessModule.kind`, e.g. `claude-code`, `codex`), or `module`; with no kind
+   * registered and none configured, `embedded` (`EMBEDDED_HARNESS`: the embedder's adapter).
+   */
+  kind: string;
+  /**
+   * The kind's launch settings, as its module resolved the entry (`HarnessModule.resolve`, e.g.
+   * `ClaudeLaunch` / `CodexLaunch` of the harness packages); for `module`, a `ModuleLaunch`.
+   *
+   * Deprecated, kept for one release: an instance `resolveConfig` returns also has it under the
+   * field it had before (`module`; a registered kind's `HarnessRegistry.launchAlias`, the built-in
+   * ones `claude` / `codex`), an accessor of `launch` for reading and writing, not enumerable (a
+   * spread or JSON copy has only `launch`).
+   */
+  launch: unknown;
+};
 
 /** A named run preset (`presets.<name>`). */
 export interface PresetConfig {
@@ -692,8 +680,8 @@ export interface SessionParams {
   envPathRoots: Record<string, string[]>;
 }
 
-/** Variables naming a harness config dir: in `envKeys` only with roots in `envPathRoots`. */
-export const CONFIG_DIR_KEYS = ['CLAUDE_CONFIG_DIR', 'CODEX_HOME'];
+/** Variables naming a built-in harness's config dir (`HarnessModule.defaults.configDirEnv`): in `envKeys` only with roots in `envPathRoots`. */
+export const CONFIG_DIR_KEYS: string[] = builtinHarnesses.configDirKeys();
 
 export interface Config {
   /** Not fatal, logged at start (e.g. a lark-bot account with ':'). */
@@ -724,7 +712,12 @@ export interface Config {
     selfAccounts: string[];
     agentAccounts: string[];
     ownerSessionKey?: string;
-    /** `policy.strangers` (default `drop`). */
+    /**
+     * `policy.strangers` (default `drop`). Deprecated, kept for one release: whether the stranger
+     * approval module is on (`ask`) or off (`drop`), as `modules` says (its section `strangers`
+     * decides over `policy.strangers`). Given the other value before `Gateway.start`, or in a config
+     * without `modules`, it still turns the module on or off (`ModuleFields.switch`).
+     */
     strangers: 'drop' | 'ask';
     routes: string[];
     watchAllowlist: Partial<Pick<WatchSource, 'channel' | 'account' | 'conversation' | 'conversationKind'>>[];
@@ -756,8 +749,18 @@ export interface Config {
   console: ConsoleConfig;
   /** The host connection: `tokenFile` is an absolute path when set. */
   host?: { tokenFile?: string };
-  /** The external MCP endpoint (`externalMcp`), when on. */
+  /**
+   * Deprecated, kept for one release: the external MCP endpoint's settings (section `externalMcp`),
+   * when it is on; the same object as its module's in `modules` (`ModuleFields.config`, set by
+   * `bundle.ts`). Given another value or removed before `Gateway.start`, it still turns the
+   * endpoint on, changes or off.
+   */
   externalMcp?: ExternalMcpConfig;
+  /**
+   * The registered feature modules, on or off, with their settings (`resolveModules`), in
+   * registration order; absent when the registry has none.
+   */
+  modules?: ResolvedModule[];
   /** Where this config came from (loadConfig): the file (it may not exist) and the env file found for it. */
   source?: { path: string; envFile?: string };
 }
@@ -773,15 +776,17 @@ export interface ConsoleConfig {
   origins: string[];
   uiUrl?: string;
   sessionTtlMs: number;
-  larkBotCommand: string[];
   /** `/ws` ping interval (0: off) and how long a ping waits for an answer. */
   heartbeat: { intervalMs: number; timeoutMs: number };
   /** Apply channel changes written through the console at once. */
   liveChannels: boolean;
+  /**
+   * The settings the channel types contribute (`AdminContribution.console`; the built-in lark-bot
+   * type's `larkBotCommand`), by key, as `consoleSettings` resolves them: the value written, else
+   * the key's schema default.
+   */
+  readonly [setting: string]: unknown;
 }
-
-/** create-lark-bot, pinned. */
-export const CREATE_LARK_BOT = ['npx', '-y', 'github:Ghost-LZW/create-lark-bot#v0.2.4'];
 export const DEFAULT_CONSOLE_PORT = 7464;
 export const DEFAULT_WS_HEARTBEAT_MS = 30_000;
 export const DEFAULT_WS_HEARTBEAT_TIMEOUT_MS = 10_000;
@@ -798,7 +803,22 @@ export function isWildcardHost(host: string): boolean {
   return h === '0.0.0.0' || h === '::' || h === '';
 }
 
-function resolveConsole(c: ConfigFile['console']): ConsoleConfig {
+/**
+ * The console settings one contribution declares (`AdminContribution.console`), from a console
+ * section (as written, or a resolved `ConsoleConfig`): each key's value, else a copy of its
+ * schema's `default`; a key with neither is left out. What the module gets as `AdminContext.console`.
+ */
+export function consoleSettings(section: Readonly<Record<string, unknown>> | undefined, keys: Readonly<Record<string, TSchema>> | undefined): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, schema] of Object.entries(keys ?? {})) {
+    const written = section?.[k];
+    const v = written !== undefined ? written : structuredClone((schema as { default?: unknown }).default);
+    if (v !== undefined) out[k] = v;
+  }
+  return out;
+}
+
+function resolveConsole(c: ConfigFile['console'], channels: ChannelRegistry): ConsoleConfig {
   const host = c?.host ?? '127.0.0.1';
   if (!isLoopbackHost(host) && c?.allowRemote !== true)
     fail(`console.host ${JSON.stringify(host)} is not a loopback address; the console only listens on loopback unless console.allowRemote is true`);
@@ -828,108 +848,29 @@ function resolveConsole(c: ConfigFile['console']): ConsoleConfig {
     origins,
     ...(c?.uiUrl !== undefined ? { uiUrl: c.uiUrl.replace(/\/$/, '') } : {}),
     sessionTtlMs: c?.sessionTtlMs ?? 12 * 3_600_000,
-    larkBotCommand: c?.larkBotCommand ?? CREATE_LARK_BOT,
+    ...Object.assign({}, ...channels.adminContributions.map(({ admin }) => consoleSettings(c, admin.console))),
     heartbeat: { intervalMs: c?.heartbeat?.intervalMs ?? DEFAULT_WS_HEARTBEAT_MS, timeoutMs: c?.heartbeat?.timeoutMs ?? DEFAULT_WS_HEARTBEAT_TIMEOUT_MS },
     liveChannels: c?.liveChannels === true,
   };
 }
 
-/** One client of the external MCP endpoint, resolved. */
-export interface ExternalMcpClient {
-  /** Its name in `externalMcp.clients` (`[A-Za-z0-9._-]`, at most 64). */
-  name: string;
-  /** From `token: "env:NAME"`. SECRET: never log it. */
-  token?: string;
-  /** Absolute; read or generated when the endpoint starts. */
-  tokenFile?: string;
-  /** `external:<name>` unless configured (always `external:…`); labels always include `external`, never `owner`. */
-  principal: Principal;
-  scopes: ExternalScopes;
-  /** May declare whom it acts for (`X-Agents-IO-Declared`). */
-  declare: boolean;
-}
-
-export interface ExternalMcpConfig {
-  host: string;
-  port: number;
-  clients: ExternalMcpClient[];
-  limits: { maxBodyBytes: number; maxTextChars: number; requestsPerMinute: number; writesPerMinute: number };
-}
-
-export const DEFAULT_EXTERNAL_MCP_PORT = 7465;
-const CLIENT_NAME = /^[A-Za-z0-9._-]{1,64}$/;
-const EXTERNAL_PRINCIPAL = /^external:[^\s]{1,128}$/;
-
-function resolveExternalMcp(c: NonNullable<ConfigFile['externalMcp']>, env: Record<string, string | undefined>, path: (p: string) => string, owners: string[]): ExternalMcpConfig {
-  const listen = c.listen ?? `127.0.0.1:${DEFAULT_EXTERNAL_MCP_PORT}`;
-  const m = /^(\[[^\]]+\]|[^:]+):(\d{1,5})$/.exec(listen);
-  if (!m || Number(m[2]) > 65535) fail(`externalMcp.listen ${JSON.stringify(listen)} is not host:port`);
-  const host = m![1]!.replace(/^\[|\]$/g, '');
-  // Tokens are bearer credentials in clear text: never reachable off this machine.
-  if (!isLoopbackHost(host) || host.toLowerCase() === 'localhost') fail(`externalMcp.listen ${JSON.stringify(listen)}: the external MCP endpoint listens on a loopback address only (127.0.0.1 or ::1)`);
-  const clients = Object.entries(c.clients).map(([name, e]): ExternalMcpClient => {
-    const at = `externalMcp.clients.${name}`;
-    if (!CLIENT_NAME.test(name)) fail(`externalMcp.clients: ${JSON.stringify(name)} is not a client name (letters, digits, . _ -, at most 64)`);
-    if ((e.token === undefined) === (e.tokenFile === undefined)) fail(`${at}: give exactly one of token ("env:NAME") or tokenFile`);
-    let token: string | undefined;
-    if (e.token !== undefined) {
-      if (!e.token.startsWith('env:')) fail(`${at}.token must be "env:NAME" (a literal token does not belong in the config; or use tokenFile)`);
-      token = substituteEnv(e.token, env, `${at}.token`) as string;
-      if (token.length < 16 || /\s/.test(token)) fail(`${at}.token: the variable ${e.token.slice(4)} must hold at least 16 characters and no whitespace`);
-    }
-    const scopes: ExternalScopes = { read: [], readAll: false, send: [], input: [], schedule: [] };
-    e.scopes.forEach((x, i) => {
-      const p = parseScope(x);
-      if (!p) fail(`${at}.scopes[${i}]: ${JSON.stringify(x)} is not a scope (read, read:<session pattern>, send:<route pattern>, input:<session pattern>, schedule:<route pattern>)`);
-      scopes[p!.kind].push(p!.pattern);
-      if (x === 'read') scopes.readAll = true;
-    });
-    const id = e.principal ?? `external:${name}`;
-    if (!EXTERNAL_PRINCIPAL.test(id)) fail(`${at}.principal must be "external:<id>" (an external client is never a person, an agent or a host)`);
-    if (owners.includes(id)) fail(`${at}.principal is an owner: an external client is never a person`);
-    const labels = [...new Set(['external', ...(e.labels ?? [])])];
-    if (labels.includes(OWNER_LABEL)) fail(`${at}.labels: an external client never carries the ${OWNER_LABEL} label`);
-    return {
-      name,
-      ...(token !== undefined ? { token } : {}),
-      ...(e.tokenFile !== undefined ? { tokenFile: path(e.tokenFile) } : {}),
-      principal: { id, labels },
-      scopes,
-      declare: e.declare === true,
-    };
-  });
-  const files = clients.map((x) => x.tokenFile).filter((f): f is string => f !== undefined);
-  if (new Set(files).size !== files.length) fail('externalMcp.clients: two clients name the same tokenFile');
-  const l = c.limits ?? {};
-  return {
-    host,
-    port: Number(m![2]),
-    clients,
-    limits: { maxBodyBytes: l.maxBodyBytes ?? 256 * 1024, maxTextChars: l.maxTextChars ?? 16_000, requestsPerMinute: l.requestsPerMinute ?? 120, writesPerMinute: l.writesPerMinute ?? 20 },
-  };
-}
-
-/** A lark-bot entry's config after env substitution, with its app resolved. */
-export type LarkChannelConfig = Record<string, unknown> & { appId: string; appSecret: string; domain: 'feishu' | 'lark' };
-
-export type ResolvedChannel =
-  | (Omit<Extract<ChannelEntry, { type: 'lark-bot' }>, 'config'> & { account: string; config: LarkChannelConfig })
-  | (Extract<ChannelEntry, { type: 'mail' }> & { account: string })
-  | (Extract<ChannelEntry, { type: 'bridge' }> & { account: string })
-  /** `module` is the resolved file to import. */
-  | (Extract<ChannelEntry, { type: 'module' }> & { account: string });
+/**
+ * A `channels[]` entry as resolved: `type`, the keys every entry has, `account` (default `default`)
+ * and what the type's module made of the rest (`ChannelModule.resolve`; a `module` entry's `module`
+ * is the resolved file to import). Typed for the built-in types; another registry's resolve the same way.
+ */
+export type ResolvedChannel = ChannelCommonFields & { account: string } & BuiltinChannelSettings;
 
 /** `topics.parkedIdleMs` default: a parked topic's lane closes after 30 idle minutes. */
 export const DEFAULT_PARKED_IDLE_MS = 30 * 60_000;
 
-export class ConfigError extends Error {
-  override name = 'ConfigError';
-}
+export { ConfigError };
 
-const DEFAULT_MODEL: Record<HarnessKind | 'module', string> = { 'claude-code': 'haiku', codex: '', module: '' };
-const MODEL_ENV: Record<HarnessKind, string> = { 'claude-code': 'AGENTS_IO_LIVE_CLAUDE_MODEL', codex: 'AGENTS_IO_LIVE_CODEX_MODEL' };
-/** `.env.live` keys handed to the harness CLI; everything else (Lark, mail secrets) stays in this process. */
-const HARNESS_ENV = /^(ANTHROPIC_|CLAUDE_|OPENAI_|CODEX_|HTTPS?_PROXY$|NO_PROXY$)/;
+/**
+ * `.env.live` keys the older block's instances get besides their kinds' own (`legacy.envPrefixes`);
+ * everything else (Lark, mail secrets) stays in this process.
+ */
+const PROXY_ENV = /^(HTTPS?_PROXY|NO_PROXY)$/;
 
 /**
  * Where `.env.live` is: an explicit path, next to the config file, or the nearest one up from `cwd`.
@@ -968,6 +909,12 @@ export interface LoadOptions {
   cwd?: string;
   /** Resolve `channels` (default true). Clients and e2e leave them out, so they need no channel secrets. */
   channels?: boolean;
+  /** The harness kinds `use` may name (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
+  harnessRegistry?: HarnessRegistry;
+  /** The channel types `channels[].type` may name (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
+  channelRegistry?: ChannelRegistry;
+  /** The feature modules whose config sections the file may have (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
+  moduleRegistry?: ModuleRegistry;
 }
 
 export function loadConfig(o: LoadOptions = {}): Config {
@@ -986,7 +933,17 @@ export function loadConfig(o: LoadOptions = {}): Config {
   const envPath = findEnvFile({ envFile: o.envFile, configDir: dirname(path), cwd });
   const fileEnv = envPath ? loadEnvFile(envPath) : {};
   const env: Record<string, string | undefined> = { ...fileEnv, ...procEnv };
-  const c = resolveConfig(raw, { env, fileEnv, baseDir: dirname(path), harness: o.harness, cwd, channels: o.channels });
+  const c = resolveConfig(raw, {
+    env,
+    fileEnv,
+    baseDir: dirname(path),
+    harness: o.harness,
+    cwd,
+    channels: o.channels,
+    ...(o.harnessRegistry ? { harnessRegistry: o.harnessRegistry } : {}),
+    ...(o.channelRegistry ? { channelRegistry: o.channelRegistry } : {}),
+    ...(o.moduleRegistry ? { moduleRegistry: o.moduleRegistry } : {}),
+  });
   return { ...c, source: { path, ...(envPath ? { envFile: resolve(cwd, envPath) } : {}) } };
 }
 
@@ -998,12 +955,22 @@ export interface ResolveContext {
   harness?: string;
   cwd?: string;
   channels?: boolean;
+  /** The harness kinds `use` may name (default the built-in ones, `bundle.ts`). */
+  harnessRegistry?: HarnessRegistry;
+  /** The channel types `channels[].type` may name (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
+  channelRegistry?: ChannelRegistry;
+  /** The feature modules whose config sections the file may have (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
+  moduleRegistry?: ModuleRegistry;
 }
 
 /** Validate a parsed config file and fill defaults. Error messages name keys, never values. */
 export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
-  const errs = errors(ConfigFile, raw);
-  if (errs.length) throw new ConfigError(`invalid config: ${errs.slice(0, 5).join('; ')}`);
+  const registry = ctx.harnessRegistry ?? builtinHarnesses;
+  const channelRegistry = ctx.channelRegistry ?? builtinChannels;
+  const moduleRegistry = ctx.moduleRegistry ?? builtinModules;
+  const schema = configFileSchema(registry, channelRegistry, moduleRegistry);
+  const errs = errors(schema, raw);
+  if (errs.length) throw new ConfigError(`invalid config: ${[...errs.slice(0, 5), ...unregistered(raw, schema, registry, channelRegistry)].join('; ')}`);
   const c = raw as ConfigFile;
   const env = ctx.env;
   const path = (p: string) => {
@@ -1013,20 +980,22 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
 
   const warnings: string[] = [];
   const dataDir = path(c.dataDir ?? join(homedir(), '.agents-io', 'aio'));
-  const { harnesses, defaultHarness } = resolveHarnesses(c, ctx, path);
+  const { harnesses, defaultHarness } = resolveHarnesses(c, ctx, path, registry);
 
   const owners = [...(c.policy?.owners ?? []), ...(env.AGENTS_IO_OWNERS ?? '').split(',').map((s) => s.trim()).filter(Boolean)];
   const ownerSessionKey = c.policy?.ownerSessionKey;
   // Off unless asked for (principle 2, decision 13: the default was true before 2026-10-11).
   const outputTools = c.outputTools ?? false;
   const presets = resolvePresets(c, harnesses);
-  const { agents, defaultAgent } = resolveAgents(c, harnesses, presets, defaultHarness, outputTools, path);
+  // Which modules are on now (the tool catalog needs it); their settings resolve last (below).
+  const switches = moduleSwitches(raw as Record<string, unknown>, moduleRegistry);
+  const { agents, defaultAgent } = resolveAgents(c, harnesses, presets, defaultHarness, outputTools, path, registry.configDirKeys(), toolCatalog(moduleRegistry, switches));
   const identities = c.identities ?? [];
   const localSession = c.local?.session ?? ownerSessionKey ?? 'local:main';
   const table: BindingTable | undefined = c.bindings ? { version: 'config', bindings: c.bindings, identities: [] } : undefined;
   checkTable({ agents, defaultAgent, owners, identities, table, ownerSessionKey, localSession });
 
-  return {
+  const config: Config = {
     dataDir,
     logPath: path(c.logPath ?? join(dataDir, 'log.sqlite')),
     socketPath: path(c.socketPath ?? join(dataDir, 'run', 'aio.sock')),
@@ -1039,7 +1008,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     defaultAgent,
     ...(table ? { table } : {}),
     identities,
-    channels: ctx.channels === false ? [] : resolveChannels(c.channels ?? [], env, path, warnings),
+    channels: ctx.channels === false ? [] : resolveChannels(c.channels ?? [], env, path, warnings, channelRegistry),
     outputTools,
     topics: { parkedIdleMs: c.topics?.parkedIdleMs ?? DEFAULT_PARKED_IDLE_MS },
     hostCallouts: {
@@ -1069,11 +1038,186 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
       principal: { id: c.local?.principal ?? owners[0] ?? 'local:owner', labels: c.local?.labels ?? ['owner'] },
       session: localSession,
     },
-    console: resolveConsole(c.console),
+    console: resolveConsole(c.console, channelRegistry),
     host: c.host?.tokenFile !== undefined ? { tokenFile: path(c.host.tokenFile) } : {},
-    ...(c.externalMcp && c.externalMcp.enabled !== false ? { externalMcp: resolveExternalMcp(c.externalMcp, env, path, c.policy?.owners ?? []) } : {}),
+  };
+  // After everything else, where the external MCP endpoint's settings were resolved before it was a
+  // module: a file with several mistakes fails on the one it always did.
+  const modules = moduleSettings(switches, { raw: raw as Record<string, unknown>, env, path });
+  const fields = moduleRegistry.fields;
+  for (const m of modules) {
+    // Where a module's on/off was before it was a module (`policy.strangers`): what it is now (deprecated).
+    const sw = fields.get(m.id)?.switch;
+    if (sw !== undefined) {
+      const keys = sw.path.split('.');
+      const parent = keys.slice(0, -1).reduce<unknown>((o, k) => (o && typeof o === 'object' && !Array.isArray(o) ? (o as Record<string, unknown>)[k] : undefined), config);
+      if (!parent || typeof parent !== 'object' || Array.isArray(parent)) throw new Error(`module ${m.id}: Config.${sw.path} is not in an object of the config`);
+      (parent as Record<string, unknown>)[keys.at(-1)!] = m.enabled ? sw.on : sw.off;
+    }
+    const field = fields.get(m.id)?.config;
+    if (field === undefined || !m.enabled || m.config === undefined) continue;
+    if (Object.hasOwn(config, field) || ['table', 'modules', 'warnings', 'source'].includes(field)) throw new Error(`module ${m.id}: Config.${field} is one of the config's own fields`);
+    (config as unknown as Record<string, unknown>)[field] = m.config;
+  }
+  return {
+    ...config,
+    ...(moduleRegistry.size ? { modules } : {}),
     ...(warnings.length ? { warnings } : {}),
   };
+}
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/** A name the errors below may quote (a type or kind name, not a value that could be a secret). */
+const quotable = (v: string) => (/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(v) ? ` ${JSON.stringify(v)}` : '');
+
+/**
+ * What a file that fails its schema uses of a module these registries do not have (CF-4): a
+ * channel type, a harness kind, a config section, a console setting. Said after the schema's
+ * errors, so a config written for modules the daemon lacks (one built with `coreRegistries`, an
+ * embedder's own registries) fails naming them, not only the schema path.
+ */
+function unregistered(raw: unknown, schema: TObject, harnesses: HarnessRegistry, channels: ChannelRegistry): string[] {
+  if (!isRecord(raw)) return [];
+  const out: string[] = [];
+  const listed = (names: string[]) => (names.length ? names.join(', ') : 'none');
+  if (Array.isArray(raw.channels)) {
+    raw.channels.forEach((e, i) => {
+      const type = isRecord(e) ? e.type : undefined;
+      if (typeof type === 'string' && !channels.get(type)) out.push(`channels[${i}].type: no channel module${quotable(type)} is registered (registered types: ${listed(channels.types)})`);
+    });
+  }
+  const kinds = `registered kinds: ${listed(harnesses.kinds)}`;
+  if (isRecord(raw.harnesses)) {
+    for (const [name, e] of Object.entries(raw.harnesses)) {
+      const use = isRecord(e) ? e.use : undefined;
+      if (typeof use === 'string' && use !== 'module' && !harnesses.get(use)) out.push(`harnesses.${name}.use: no harness module${quotable(use)} is registered (${kinds}; or "module")`);
+    }
+  }
+  if (isRecord(raw.harness)) {
+    for (const [k, v] of Object.entries(raw.harness)) {
+      const kind = k === 'use' ? v : k;
+      if (typeof kind === 'string' && kind !== 'module' && !harnesses.get(kind)) out.push(`harness.${k}: no harness module${quotable(kind)} is registered (${kinds})`);
+    }
+  }
+  for (const k of Object.keys(raw)) if (!Object.hasOwn(schema.properties, k)) out.push(`${k}: not a key of the config, and no registered module has a section of that name`);
+  if (isRecord(raw.console)) {
+    const settings = (consoleSchema(channels) as unknown as TObject).properties;
+    for (const k of Object.keys(raw.console)) if (!Object.hasOwn(settings, k)) out.push(`console.${k}: not a console setting, and no registered channel module adds one of that name`);
+  }
+  return out;
+}
+
+/** The value at a dotted path of the file (`policy.strangers`), if set. */
+function at(raw: Record<string, unknown>, dotted: string): unknown {
+  let cur: unknown = raw;
+  for (const k of dotted.split('.')) {
+    if (!cur || typeof cur !== 'object' || Array.isArray(cur) || !Object.hasOwn(cur, k)) return undefined;
+    cur = (cur as Record<string, unknown>)[k];
+  }
+  return cur;
+}
+
+/**
+ * Step 1 of the module lifecycle (core-slimming G6): every registered module, on or off, with its
+ * settings. A module without a config section is on. One with a section: the section present is on
+ * unless `enabled: false` (`resolve` gets the rest); absent, the first of its `aliases` that is set
+ * decides: on unless its `aliasEnabled` says false or, without one, the value is an object with
+ * `enabled: false` (`resolve` gets the value as it is); with neither, `defaultEnabled` (`resolve`
+ * gets `{}`). A module that is on and needs another (`module:<id>`) that is off fails the config.
+ * Whether each is on is settled first, for all of them; then the ones that are on resolve.
+ */
+export function resolveModules(raw: Record<string, unknown>, registry: ModuleRegistry, env: Record<string, string | undefined>, path: (p: string) => string): ResolvedModule[] {
+  return moduleSettings(moduleSwitches(raw, registry), { raw, env, path });
+}
+
+/** A module on or off, and, when on, what its `config.resolve` gets. */
+interface ModuleSwitch {
+  m: ModuleManifest<unknown>;
+  id: string;
+  enabled: boolean;
+  value?: unknown;
+  where?: string;
+  alias?: string;
+}
+
+/** `resolveModules`, first half: every module on or off (and the `needs` between them). */
+function moduleSwitches(raw: Record<string, unknown>, registry: ModuleRegistry): ModuleSwitch[] {
+  const out: ModuleSwitch[] = [];
+  for (const { manifest: m } of registry.modules) {
+    const cfg = m.config;
+    if (!cfg) {
+      out.push({ m, id: m.id, enabled: true });
+      continue;
+    }
+    const section = Object.hasOwn(raw, cfg.section) ? (raw[cfg.section] as Record<string, unknown>) : undefined;
+    let value: unknown;
+    let where = cfg.section;
+    let alias: string | undefined;
+    let enabled: boolean;
+    if (section !== undefined) {
+      const { enabled: on, ...rest } = section;
+      enabled = on !== false;
+      value = rest;
+    } else {
+      alias = cfg.aliases?.find((a) => at(raw, a) !== undefined);
+      if (alias !== undefined) {
+        value = at(raw, alias);
+        where = alias;
+        if (cfg.aliasEnabled) {
+          const on: unknown = cfg.aliasEnabled(value, alias);
+          if (typeof on !== 'boolean') fail(`module ${m.id}: config.aliasEnabled must return a boolean (got ${typeof on} for ${alias})`);
+          enabled = on;
+        } else enabled = !(value && typeof value === 'object' && !Array.isArray(value) && (value as { enabled?: unknown }).enabled === false);
+      } else {
+        enabled = cfg.defaultEnabled;
+        value = {};
+      }
+    }
+    out.push(enabled ? { m, id: m.id, enabled, value, where, ...(alias !== undefined ? { alias } : {}) } : { m, id: m.id, enabled });
+  }
+  const on = new Set(out.filter((x) => x.enabled).map((x) => x.id));
+  for (const { manifest: m } of registry.modules) {
+    if (!on.has(m.id)) continue;
+    for (const n of m.needs ?? []) if (n.startsWith('module:') && !on.has(n.slice('module:'.length))) fail(`module ${m.id} needs module ${n.slice('module:'.length)}, which is off`);
+  }
+  return out;
+}
+
+/** `resolveModules`, second half: the settings of the modules that are on, in registration order. */
+function moduleSettings(switches: readonly ModuleSwitch[], o: { raw: Record<string, unknown>; env: Record<string, string | undefined>; path: (p: string) => string }): ResolvedModule[] {
+  return switches.map((x): ResolvedModule => {
+    if (!x.enabled) return { id: x.id, enabled: false };
+    if (!x.m.config) return { id: x.id, enabled: true };
+    const config = x.m.config.resolve(x.value, {
+      where: x.where!,
+      ...(x.alias !== undefined ? { alias: x.alias } : {}),
+      env: o.env,
+      substitute: (v, w) => substituteEnv(v, o.env, w),
+      path: o.path,
+      valueAt: (dotted) => structuredClone(at(o.raw, dotted)),
+      fail: (msg) => fail(msg),
+    });
+    return { id: x.id, enabled: true, config };
+  });
+}
+
+/**
+ * The model tools agents may list (`agents.<name>.tools`): the kernel's six, then the modules' that
+ * are on (the watch, live and topic tools are the built-in modules'), in that order; and whose tools are off.
+ */
+interface ToolCatalog {
+  names: readonly string[];
+  /** A tool of a registered module that is off → that module. */
+  off: ReadonlyMap<string, string>;
+}
+
+function toolCatalog(registry: ModuleRegistry, modules: readonly { id: string; enabled: boolean }[]): ToolCatalog {
+  const on = new Set(modules.filter((x) => x.enabled).map((x) => x.id));
+  const names: string[] = [...KERNEL_TOOL_NAMES];
+  const off = new Map<string, string>();
+  for (const { manifest: m } of registry.modules) for (const t of m.mcpTools ?? []) (on.has(m.id) ? names.push(t.name) : off.set(t.name, m.id));
+  return { names, off };
 }
 
 /** The synthesized agent of a config without `agents`: the default instance, bare route-key sessions. */
@@ -1107,6 +1251,8 @@ function resolveAgents(
   defaultHarness: string,
   outputTools: boolean,
   path: (p: string) => string,
+  configDirKeys: readonly string[],
+  catalog: ToolCatalog,
 ): { agents: Record<string, AgentConfig>; defaultAgent: string | undefined } {
   if (!c.agents) {
     if (c.defaultAgent !== undefined && c.defaultAgent !== DEFAULT_AGENT) fail('`defaultAgent` needs `agents`');
@@ -1133,11 +1279,13 @@ function resolveAgents(
         fail(`${where}.instructionsFile: cannot read ${file}: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`);
       }
     }
-    const sessionParams = a.sessionParams && resolveSessionParams(a.sessionParams, `${where}.sessionParams`, a.mode ?? 'interactive', path);
+    const sessionParams = a.sessionParams && resolveSessionParams(a.sessionParams, `${where}.sessionParams`, a.mode ?? 'interactive', path, configDirKeys);
     let toolNames: string[] | undefined;
     if (Array.isArray(a.tools)) {
-      const unknown = a.tools.filter((t) => !(TOOL_NAMES as readonly string[]).includes(t));
-      if (unknown.length) fail(`${where}.tools: unknown tool ${unknown.map((t) => JSON.stringify(t)).join(', ')} (tools: ${TOOL_NAMES.join(', ')})`);
+      const unknown = a.tools.filter((t) => !catalog.names.includes(t) && !catalog.off.has(t));
+      if (unknown.length) fail(`${where}.tools: unknown tool ${unknown.map((t) => JSON.stringify(t)).join(', ')} (tools: ${catalog.names.join(', ')})`);
+      const off = a.tools.find((t) => catalog.off.has(t));
+      if (off !== undefined) fail(`${where}.tools: ${JSON.stringify(off)} is a tool of module ${catalog.off.get(off)}, which is off`);
       toolNames = [...new Set(a.tools)];
     }
     agents[name] = {
@@ -1164,7 +1312,7 @@ function resolveAgents(
   return { agents, defaultAgent: c.defaultAgent ?? Object.values(agents).find((a) => a.mode === 'interactive')?.name };
 }
 
-function resolveSessionParams(p: NonNullable<AgentEntry['sessionParams']>, where: string, mode: 'interactive' | 'task', path: (p: string) => string): SessionParams {
+function resolveSessionParams(p: NonNullable<AgentEntry['sessionParams']>, where: string, mode: 'interactive' | 'task', path: (p: string) => string, configDirKeys: readonly string[]): SessionParams {
   if (mode === 'task') fail(`${where}: task agents take their cwd and env per run (run.start), not sessionParams`);
   for (const k of p.envKeys) {
     if (!VAR_NAME.test(k)) fail(`${where}.envKeys: ${JSON.stringify(k)} is not a variable name`);
@@ -1176,7 +1324,8 @@ function resolveSessionParams(p: NonNullable<AgentEntry['sessionParams']>, where
     if (!roots.length) fail(`${where}.envPathRoots.${k}: needs at least one root`);
     envPathRoots[k] = roots.map(path);
   }
-  for (const k of CONFIG_DIR_KEYS) {
+  // Each harness kind's config-dir variables (`HarnessModule.defaults.configDirEnv`).
+  for (const k of configDirKeys) {
     if (p.envKeys.includes(k) && !envPathRoots[k]) fail(`${where}: ${k} is in envKeys, so envPathRoots.${k} must say under which roots its value may point`);
   }
   return { cwdRoots: p.cwdRoots.map(path), envKeys: [...p.envKeys], envPathRoots };
@@ -1244,14 +1393,17 @@ export function withDefaultInstance(c: Config, i: HarnessInstance): Config {
   return { ...c, harnesses: { ...c.harnesses, [c.defaultHarness]: i } };
 }
 
-/** Where a codex instance keeps its socket, server record and turn snapshots unless it sets `transport.stateDir`. */
-export function codexStateDir(name: string): string {
-  return join(homedir(), '.agents-io', `codex.${name}`);
-}
+type Section = { run?: { model?: string; effort?: string }; profiles?: Record<string, Record<string, unknown>>; options?: Record<string, unknown> };
 
-const pathish = (p: string) => p.startsWith('~') || p.startsWith('.') || p.includes('/');
+/**
+ * The name and kind of the one instance of a config resolved with no harness kind registered that
+ * configures no harness (a kernel with no modules, `coreRegistries`): it stands for the adapter the
+ * embedder passes the gateway (`GatewayOptions.harness` or `buildHarness`), which builds nothing
+ * for it. Its run has no model (the embedder's adapter decides); it has no launch, env or profiles.
+ */
+export const EMBEDDED_HARNESS = 'embedded';
 
-function resolveHarnesses(c: ConfigFile, ctx: ResolveContext, path: (p: string) => string): { harnesses: Record<string, HarnessInstance>; defaultHarness: string } {
+function resolveHarnesses(c: ConfigFile, ctx: ResolveContext, path: (p: string) => string, registry: HarnessRegistry): { harnesses: Record<string, HarnessInstance>; defaultHarness: string } {
   const env = ctx.env;
   if (c.harness && c.harnesses) fail('use either `harnesses` (named instances) or the older `harness` block, not both');
   const out: Record<string, HarnessInstance> = {};
@@ -1259,89 +1411,92 @@ function resolveHarnesses(c: ConfigFile, ctx: ResolveContext, path: (p: string) 
   if (c.harnesses) {
     const names = Object.keys(c.harnesses);
     if (!names.length) fail('`harnesses` is empty');
-    for (const name of names) out[name] = resolveInstance(name, c.harnesses[name], env, path);
+    for (const name of names) out[name] = resolveInstance(name, c.harnesses[name], env, path, registry);
     def = c.defaultHarness ?? names[0]!;
     if (!out[def]) fail(`defaultHarness ${JSON.stringify(def)} is not one of the harnesses (${names.join(', ')})`);
   } else {
     if (c.defaultHarness) fail('`defaultHarness` needs `harnesses`');
     // Older form: one instance per present section, named after its kind, with the
-    // harness-ish `.env.live` keys passed through as before.
-    const legacyEnv = Object.fromEntries(Object.entries(ctx.fileEnv ?? {}).filter(([k]) => HARNESS_ENV.test(k)));
-    def = c.harness?.use ?? 'claude-code';
-    const cc = c.harness?.['claude-code'];
-    if (cc || def === 'claude-code') {
-      out['claude-code'] = {
-        ...base('claude-code', 'claude-code', cc ?? {}),
-        env: legacyEnv,
-        kind: 'claude-code',
-        claude: cc?.claudePath ? { claudePath: path(cc.claudePath) } : {},
-      };
-    }
-    const cx = c.harness?.codex;
-    if (cx || def === 'codex') {
-      out.codex = {
-        ...base('codex', 'codex', cx ?? {}),
-        env: legacyEnv,
-        kind: 'codex',
-        // stateDir stays the adapter default (~/.agents-io/codex), so a running deployment keeps adopting its turns.
-        codex: { ...(cx?.bin ? { bin: cx.bin } : {}), transport: transportOf(cx?.transport, undefined, path) },
-      };
+    // harness-ish `.env.live` keys (the kinds' `legacy.envPrefixes`, proxies) passed through as before.
+    const block = (c.harness ?? {}) as Record<string, unknown> & { use?: string };
+    const prefixes = registry.modules.flatMap((m) => m.legacy?.envPrefixes ?? []);
+    const legacyEnv = Object.fromEntries(Object.entries(ctx.fileEnv ?? {}).filter(([k]) => PROXY_ENV.test(k) || prefixes.some((x) => k.startsWith(x))));
+    // With no kind registered (the file schema then admits no `use` and no section), the embedder's adapter.
+    def = block.use ?? registry.defaultKind ?? EMBEDDED_HARNESS;
+    if (registry.defaultKind === undefined) out[def] = { ...base(def, undefined, {}), env: {}, kind: def, launch: undefined };
+    for (const m of registry.modules) {
+      const sec = block[m.kind] as (Section & Record<string, unknown>) | undefined;
+      if (!sec && def !== m.kind) continue;
+      out[m.kind] = m.legacy
+        ? { ...base(m.kind, m, sec ?? {}), env: legacyEnv, kind: m.kind, launch: m.legacy.resolve(sec ?? {}, { name: m.kind, where: `harness.${m.kind}`, path, fail }) }
+        : { ...resolveInstance(m.kind, { use: m.kind }, env, path, registry), env: legacyEnv };
     }
   }
 
   // --harness: an instance name, or a kind (its first instance, else one with defaults).
   const pick = ctx.harness;
   if (pick !== undefined && !out[pick]) {
-    const kind = pick === 'claude-code' || pick === 'codex' ? pick : undefined;
+    const kind = registry.get(pick) ? pick : undefined;
     if (!kind) fail(`unknown harness instance ${JSON.stringify(pick)} (configured: ${Object.keys(out).join(', ')})`);
     const first = Object.values(out).find((i) => i.kind === kind);
     if (first) def = first.name;
     else {
-      out[kind] =
-        kind === 'codex'
-          ? { ...base(kind, kind, {}), env: {}, kind, codex: { transport: { kind: 'stdio' } } }
-          : { ...base(kind, kind, {}), env: {}, kind, claude: {} };
+      out[kind] = resolveInstance(kind, { use: kind }, env, path, registry);
       def = kind;
     }
   } else if (pick !== undefined) def = pick;
 
   // Env model override applies to the default instance only (other instances may target other providers).
   const d = out[def]!;
-  const envModel = d.kind === 'module' ? undefined : env[MODEL_ENV[d.kind]];
+  const modelEnv = registry.get(d.kind)?.defaults?.modelEnv;
+  const envModel = modelEnv !== undefined ? env[modelEnv] : undefined;
   if (envModel) d.run = { ...d.run, model: envModel };
 
-  // Two codex instances must never share a server record or turn snapshots: restart adoption would cross them.
-  const dirs = new Map<string, string>();
-  for (const i of Object.values(out)) {
-    if (i.kind !== 'codex' || i.codex.transport.kind !== 'unix') continue;
-    const dir = i.codex.transport.stateDir ?? '(default ~/.agents-io/codex)';
-    const other = dirs.get(dir);
-    if (other) fail(`harnesses ${other} and ${i.name} use the same codex stateDir ${dir}; give each its own`);
-    dirs.set(dir, i.name);
+  // Rules across one kind's instances (e.g. two codex instances never share a stateDir).
+  for (const m of registry.modules) {
+    const broken = m.checkAll?.(Object.values(out).filter((i) => i.kind === m.kind).map((i) => ({ name: i.name, launch: i.launch })));
+    if (broken) fail(broken);
   }
+  for (const i of Object.values(out)) launchAlias(i, i.kind === 'module' ? 'module' : registry.launchAlias(i.kind));
   return { harnesses: out, defaultHarness: def };
 }
 
-function base(name: string, kind: HarnessKind | 'module', sec: { run?: { model?: string; effort?: string }; profiles?: Record<string, Record<string, unknown>>; options?: Record<string, unknown> }) {
+/**
+ * Deprecated, for one release: `i[field]` reads and writes `i.launch` (hosts written before `launch`
+ * read `claude` / `codex` / `module`, and set one before `buildHarness`). Not enumerable, so copies
+ * and JSON show `launch` only.
+ */
+function launchAlias(i: HarnessInstance, field: string | undefined): void {
+  if (!field) return;
+  Object.defineProperty(i, field, {
+    get(this: HarnessInstance) {
+      return this.launch;
+    },
+    set(this: HarnessInstance, v: unknown) {
+      this.launch = v;
+    },
+    enumerable: false,
+    configurable: true,
+  });
+}
+
+/** An instance's name, RunSpec defaults (the kind's default model), profiles and options. */
+function base(name: string, kind: HarnessModule | undefined, sec: Section) {
   return {
     name,
-    run: { harness: name, model: sec.run?.model ?? DEFAULT_MODEL[kind], ...(sec.run?.effort ? { effort: sec.run.effort } : {}) },
+    run: { harness: name, model: sec.run?.model ?? kind?.defaults?.model ?? '', ...(sec.run?.effort ? { effort: sec.run.effort } : {}) },
     profiles: sec.profiles ?? {},
     options: sec.options ?? {},
   };
 }
 
-function transportOf(t: Static<typeof CodexTransport> | undefined, defaultStateDir: string | undefined, path: (p: string) => string): CodexTransportOption {
-  if (!t || t.kind === 'stdio') return { kind: 'stdio' };
-  const stateDir = t.stateDir ? path(t.stateDir) : defaultStateDir;
-  return { ...t, ...(t.path ? { path: path(t.path) } : {}), ...(stateDir ? { stateDir } : {}) };
-}
-
-function resolveInstance(name: string, raw: unknown, env: Record<string, string | undefined>, path: (p: string) => string): HarnessInstance {
+function resolveInstance(name: string, raw: unknown, env: Record<string, string | undefined>, path: (p: string) => string, registry: HarnessRegistry): HarnessInstance {
   const where = `harnesses.${name}`;
   if (!INSTANCE_NAME.test(name)) fail(`${where}: instance names are letters, digits, '.', '_' and '-' (at most 64)`);
-  const use = (raw as { use: HarnessKind | 'module' }).use;
-  const errs = errors(use === 'codex' ? CodexInstance : use === 'module' ? ModuleInstance : ClaudeInstance, raw);
+  const use = (raw as { use: string }).use;
+  // `use` is a registered kind or `module` (the file schema says so).
+  const kind = use === 'module' ? undefined : registry.get(use);
+  const errs = errors(kind ? instanceSchema(kind) : ModuleInstance, raw);
   if (errs.length) fail(`invalid config: ${errs.slice(0, 5).map((e) => `${where}${e}`).join('; ')}`);
   // A missing "env:NAME" makes only this instance unusable (reported when it is built), not the whole config.
   let unavailable: string | undefined;
@@ -1361,7 +1516,8 @@ function resolveInstance(name: string, raw: unknown, env: Record<string, string 
   // "env:NAME" in settings that end up on the child's command line (codex `-c`, claude
   // `--mcp-config` / `--settings`, readable by other local users via ps) never becomes the
   // value there: the value goes into the child's environment and the setting names the variable.
-  const secrets: ChildSecrets = {
+  // The kind's module decides which of its settings those are (`HarnessModule.resolve`).
+  const secrets: HarnessChildSecrets = {
     value: (name, at) => {
       if (!VAR_NAME.test(name)) fail(`${at}: ${JSON.stringify(name)} is not a variable name`);
       const v = env[name];
@@ -1374,260 +1530,48 @@ function resolveInstance(name: string, raw: unknown, env: Record<string, string 
     },
   };
   const common = {
-    ...base(name, use, raw as Static<typeof CodexInstance>),
+    ...base(name, kind, raw as Section),
     env: envOut,
     ...((raw as { cwd?: string }).cwd ? { cwd: path((raw as { cwd: string }).cwd) } : {}),
   };
-  if (use === 'module') {
+  if (!kind) {
     const x = raw as Static<typeof ModuleInstance>;
     const spec = x.module;
     const rel = spec.startsWith('.') || spec.startsWith('~') || isAbsolute(spec);
-    const r = resolveChannelModule(spec, rel ? path(spec) : undefined, path('.'));
+    const r = resolveModuleFile(spec, rel ? path(spec) : undefined, path('.'));
     if ('error' in r) fail(`${where}.module: ${r.error}`);
     const module: ModuleLaunch = { file: r.file, ...(x.export ? { export: x.export } : {}), ...(x.config !== undefined ? { config: sub(x.config, 'config') } : {}) };
-    return { ...common, kind: 'module', module, ...(unavailable ? { unavailable } : {}) };
+    return { ...common, kind: 'module', launch: module, ...(unavailable ? { unavailable } : {}) };
   }
-  if (use === 'codex') {
-    const x = raw as Static<typeof CodexInstance>;
-    if (x.profile !== undefined)
-      fail(`${where}.profile: \`codex app-server\` does not accept --profile (codex-cli 0.160 rejects it, and \`-c profile=…\` is legacy); use \`config\` keys or a separate \`home\``);
-    if ('CODEX_HOME' in envOut && x.home) fail(`${where}: set \`home\` or env.CODEX_HOME, not both`);
-    const transport = transportOf(x.transport, codexStateDir(name), path);
-    if ((x.config && Object.keys(x.config).length) || x.enable?.length || x.disable?.length) {
-      if (transport.kind === 'unix' && transport.spawn !== 'own')
-        fail(`${where}: config/enable/disable only apply to a server the gateway starts (stdio or unix spawn "own"), not spawn "${transport.spawn}"`);
-    }
-    const codex: CodexLaunch = {
-      ...(x.executable ? { bin: pathish(x.executable) ? path(x.executable) : x.executable } : {}),
-      ...(x.home ? { codexHome: path(x.home) } : {}),
-      ...(x.config ? { config: codexConfigViaEnv(x.config, `${where}.config`, secrets) } : {}),
-      ...(x.enable ? { enable: x.enable } : {}),
-      ...(x.disable ? { disable: x.disable } : {}),
-      ...(x.live ? { live: true } : {}),
-      transport,
-    };
-    return { ...common, kind: 'codex', codex, ...(unavailable ? { unavailable } : {}) };
-  }
-  const x = raw as Static<typeof ClaudeInstance>;
-  if ('CLAUDE_CONFIG_DIR' in envOut && x.configDir) fail(`${where}: set \`configDir\` or env.CLAUDE_CONFIG_DIR, not both`);
-  const claude: ClaudeLaunch = {
-    ...(x.executable ? { claudePath: pathish(x.executable) ? path(x.executable) : x.executable } : {}),
-    ...(x.configDir ? { configDir: path(x.configDir) } : {}),
-    ...(x.settings !== undefined ? { settings: typeof x.settings === 'string' ? path(x.settings) : claudeSettingsViaEnv(x.settings, `${where}.settings`, secrets) } : {}),
-    ...(x.settingSources ? { settingSources: x.settingSources } : {}),
-    ...(x.mcpServers ? { mcpServers: claudeMcpViaEnv(x.mcpServers, `${where}.mcpServers`, secrets) } : {}),
-    ...(x.plugins ? { plugins: x.plugins.map(path) } : {}),
-    ...(x.skills !== undefined ? { skills: x.skills } : {}),
-    ...(x.extraArgs ? { extraArgs: x.extraArgs } : {}),
-    ...(x.additionalDirectories ? { additionalDirectories: x.additionalDirectories.map(path) } : {}),
-  };
-  return { ...common, kind: 'claude-code', claude, ...(unavailable ? { unavailable } : {}) };
+  const rctx: HarnessResolveContext = { name, where, env: envOut, path, secrets, fail };
+  const r: { launch: unknown; unavailable?: string } = kind.resolve ? kind.resolve(raw as Record<string, unknown>, rctx) : { launch: raw };
+  unavailable ??= r.unavailable;
+  return { ...common, kind: kind.kind, launch: r.launch, ...(unavailable ? { unavailable } : {}) };
 }
 
 export const VAR_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const envRef = (v: unknown): string | undefined => (typeof v === 'string' && v.startsWith('env:') ? v.slice(4) : undefined);
-
-/** How a harness instance hands "env:NAME" values to its child process. */
-interface ChildSecrets {
-  /** The variable's value; undefined (instance unavailable) when it is not set. */
-  value(name: string, at: string): string | undefined;
-  /** Put `k=v` into the child's environment. */
-  toChild(k: string, v: string, at: string): void;
-}
-
-/** Claude `mcpServers`: "env:NAME" becomes `${NAME}` (the CLI expands it in command, args, env, url, headers). */
-function claudeMcpViaEnv<T>(v: T, at: string, s: ChildSecrets): T {
-  const name = envRef(v);
-  if (name !== undefined) {
-    const value = s.value(name, at);
-    if (value !== undefined) s.toChild(name, value, at);
-    return `\${${name}}` as T;
-  }
-  if (Array.isArray(v)) return v.map((x, i) => claudeMcpViaEnv(x, `${at}[${i}]`, s)) as T;
-  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, claudeMcpViaEnv(x, `${at}.${k}`, s)])) as T;
-  return v;
-}
-
-/** Claude inline `settings` (passed as `--settings <json>`): "env:NAME" only under `settings.env`, moved to the child env. */
-function claudeSettingsViaEnv(st: Record<string, unknown>, at: string, s: ChildSecrets): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(st)) {
-    if (k === 'env' && v && typeof v === 'object' && !Array.isArray(v)) {
-      const kept: Record<string, unknown> = {};
-      for (const [vk, vv] of Object.entries(v)) {
-        const name = envRef(vv);
-        if (name === undefined) kept[vk] = vv;
-        else if (!VAR_NAME.test(vk)) fail(`${at}.env: ${JSON.stringify(vk)} is not a variable name`);
-        else {
-          const value = s.value(name, `${at}.env.${vk}`);
-          if (value !== undefined) s.toChild(vk, value, `${at}.env.${vk}`);
-        }
-      }
-      out[k] = kept;
-    } else out[k] = noEnvRefs(v, `${at}.${k}`, 'the claude command line (--settings)', 'set it under settings.env or the instance env');
-  }
-  return out;
-}
-
-function noEnvRefs(v: unknown, at: string, line: string, hint: string): unknown {
-  if (envRef(v) !== undefined) fail(`${at}: "env:" values would be on ${line}, visible to other local users via ps; ${hint}`);
-  if (Array.isArray(v)) v.forEach((x, i) => noEnvRefs(x, `${at}[${i}]`, line, hint));
-  else if (v && typeof v === 'object') for (const [k, x] of Object.entries(v)) noEnvRefs(x, `${at}.${k}`, line, hint);
-  return v;
-}
-
-const TOML_SEG = /[A-Za-z0-9_][A-Za-z0-9_-]*|"[^"\\]*"/g;
-const tomlKey = (segs: string[]) => segs.map((x) => (/^[A-Za-z0-9_-]+$/.test(x) ? x : JSON.stringify(x))).join('.');
 
 /**
- * Codex `config` (passed as `-c key=value`): each "env:NAME" is replaced by the Codex setting
- * that names a variable instead of holding the value, with the value in the app-server's env:
- * `…http_headers.H` → `…env_http_headers.H`, `…bearer_token` → `…bearer_token_env_var`,
- * `…experimental_bearer_token` → `…env_key`, `mcp_servers.<id>.env.VAR` → `mcp_servers.<id>.env_vars`.
- * Anywhere else it is an error.
+ * Every channel entry, resolved by its type's module (`ChannelModule.resolve`, in config order),
+ * then each type's rules across its entries (`validateAll`, in registration order): e.g. the
+ * lark-bot rules of decision 8, and one bridge program per channel id.
  */
-function codexConfigViaEnv(config: Record<string, unknown>, at: string, s: ChildSecrets): Record<string, unknown> {
-  const DROP = Symbol('drop');
-  const extra: [string, unknown][] = [];
-  const forward = new Map<string, string[]>();
-  const visit = (v: unknown, segs: string[]): unknown => {
-    const name = envRef(v);
-    if (name !== undefined) {
-      const where = `${at}.${segs.join('.')}`;
-      const [last, parent] = [segs.at(-1)!, segs.at(-2)];
-      const value = s.value(name, where);
-      if (parent === 'env' && segs.length >= 3 && VAR_NAME.test(last)) {
-        // A stdio MCP server's env: forward the variable from the app-server's environment.
-        const server = tomlKey(segs.slice(0, -2));
-        forward.set(server, [...(forward.get(server) ?? []), last]);
-        if (value !== undefined) s.toChild(last, value, where);
-        return DROP;
-      }
-      let key: string[] | undefined;
-      if (parent === 'http_headers') key = [...segs.slice(0, -2), 'env_http_headers', last];
-      else if (last === 'bearer_token') key = [...segs.slice(0, -1), 'bearer_token_env_var'];
-      else if (last === 'experimental_bearer_token') key = [...segs.slice(0, -1), 'env_key'];
-      if (!key)
-        fail(
-          `${where}: "env:" values would be on the codex app-server command line, visible to other local users via ps; ` +
-            'use a setting that names a variable (http_headers → env_http_headers, bearer_token → bearer_token_env_var, ' +
-            'experimental_bearer_token → env_key, mcp_servers.<id>.env.<VAR>) or write a non-secret value literally',
-        );
-      if (value !== undefined) s.toChild(name, value, where);
-      extra.push([tomlKey(key), name]);
-      return DROP;
-    }
-    if (Array.isArray(v)) return v.map((x, i) => visit(x, [...segs, `[${i}]`]));
-    if (v && typeof v === 'object') {
-      const out: Record<string, unknown> = {};
-      for (const [k, x] of Object.entries(v)) {
-        const r = visit(x, [...segs, k]);
-        if (r !== DROP) out[k] = r;
-      }
-      return out;
-    }
-    return v;
-  };
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(config)) {
-    const segs = (k.match(TOML_SEG) ?? [k]).map((x) => x.replace(/^"|"$/g, ''));
-    const r = visit(v, segs);
-    if (r !== DROP) out[k] = r;
-  }
-  for (const [k, v] of extra) out[k] = v;
-  for (const [server, vars] of forward) out[`${server}.env_vars`] = vars;
-  return out;
-}
-
-/**
- * Every channel entry, plus the rules across lark-bot entries (decision 8): one
- * app per entry (two entries of one app would split its events), at most one entry
- * reading LARK_APP_*, accounts unique and, with several bots, plain names (they
- * go into route and session keys, separated by ':').
- */
-function resolveChannels(entries: ChannelEntry[], env: Record<string, string | undefined>, path: (p: string) => string, warnings: string[]): ResolvedChannel[] {
-  const out = entries.map((ch, i) => resolveChannel(ch, env, path, i));
-  const lark = out.map((ch, i) => ({ ch, i })).filter((x): x is { ch: Extract<ResolvedChannel, { type: 'lark-bot' }>; i: number } => x.ch.type === 'lark-bot');
-  const name = (x: { ch: { account: string }; i: number }) => `channels[${x.i}] (account ${JSON.stringify(x.ch.account)})`;
-  const fallback = lark.filter((x) => !hasExplicitApp(entries[x.i]!));
-  if (fallback.length > 1) fail(`lark-bot channels ${fallback.map(name).join(' and ')} both read LARK_APP_ID; give each its own config.appId / config.appSecret`);
-  const seen = new Map<string, (typeof lark)[number]>();
-  const apps = new Map<string, (typeof lark)[number]>();
-  for (const x of lark) {
-    const prior = seen.get(x.ch.account);
-    if (prior) fail(`lark-bot channels ${name(prior)} and channels[${x.i}] have the same account; accounts must differ`);
-    seen.set(x.ch.account, x);
-    const app = `${x.ch.config.domain}:${x.ch.config.appId}`;
-    const same = apps.get(app);
-    // One long connection per app: a second one would get some of its events (Feishu delivers each to one connection).
-    if (same) fail(`lark-bot channels ${name(same)} and ${name(x)} are the same app ${x.ch.config.appId}; run each app in one entry only (two connections split its events)`);
-    apps.set(app, x);
-  }
-  if (lark.length > 1) {
-    for (const x of lark) if (!INSTANCE_NAME.test(x.ch.account)) fail(`${name(x)}: with several lark-bot channels, accounts are letters, digits, '.', '_' and '-' (at most 64, not starting with '.', '_' or '-')`);
-  } else if (lark[0]?.ch.account.includes(':')) warnings.push(`${name(lark[0])}: an account with ':' makes route and session keys ambiguous; use letters, digits, '.', '_' and '-'`);
-  // One channel id belongs to one adapter, only accounts differ (channel-stamping F4). Module ids and
-  // a bridge's id without `id` are only known once loaded / connected; the gateway checks those.
-  const bridges = new Map<string, { program: string; i: number }>();
-  out.forEach((ch, i) => {
-    if (ch.type !== 'bridge' || ch.id === undefined) return;
-    if (RESERVED_CHANNEL_IDS.includes(ch.id)) fail(`channels[${i}]: bridge id ${JSON.stringify(ch.id)} is a built-in channel id; a bridge cannot use it`);
-    const program = JSON.stringify([ch.command, ch.args ?? []]);
-    const prior = bridges.get(ch.id);
-    if (prior && prior.program !== program) fail(`channels[${prior.i}] and channels[${i}] run different programs under one channel id ${JSON.stringify(ch.id)}; one channel id belongs to one adapter (entries sharing it differ only in account)`);
-    bridges.set(ch.id, { program, i });
+function resolveChannels(entries: readonly ChannelEntry[], env: Record<string, string | undefined>, path: (p: string) => string, warnings: string[], registry: ChannelRegistry): ResolvedChannel[] {
+  const substitute = (v: unknown, where: string) => substituteEnv(v, env, where);
+  const out = entries.map((ch, index): ResolvedChannel => {
+    // The file schema admits only registered types.
+    const m = registry.get(ch.type)!;
+    const ctx: ChannelResolveContext = { index, where: `channels[${index}]`, env, substitute, path, fail };
+    // The host's keys stay as written (its `evidence` grant above all, ID-3 / ID-4): only the type's own keys come from its module.
+    const own = Object.entries((m.resolve(ch, ctx) ?? {}) as Record<string, unknown>).filter(([k]) => !HOST_CHANNEL_KEYS.has(k));
+    return { ...ch, ...Object.fromEntries(own), account: ch.account ?? 'default' } as ResolvedChannel;
   });
-  return out;
-}
-
-/** The entry names its app itself (`config.appId` or `config.appSecret`), instead of reading LARK_APP_*. */
-function hasExplicitApp(ch: ChannelEntry): boolean {
-  const c = ch.type === 'lark-bot' ? ch.config : undefined;
-  return c?.appId !== undefined || c?.appSecret !== undefined;
-}
-
-function resolveChannel(ch: ChannelEntry, env: Record<string, string | undefined>, path: (p: string) => string, i: number): ResolvedChannel {
-  const account = ch.account ?? 'default';
-  switch (ch.type) {
-    case 'lark-bot': {
-      const where = `channels[${i}].config`;
-      const config = substituteEnv(ch.config ?? {}, env, where) as Record<string, unknown>;
-      let appId: unknown;
-      let appSecret: unknown;
-      let domain: unknown;
-      if (hasExplicitApp(ch)) {
-        if (config.appId === undefined || config.appSecret === undefined) fail(`${where}: give both appId and appSecret (or neither, to read LARK_APP_ID / LARK_APP_SECRET)`);
-        ({ appId, appSecret } = config);
-        domain = config.domain ?? 'feishu';
-      } else {
-        const need = (k: string) => env[k] || fail(`channel lark-bot needs ${k} (environment or .env.live), or config.appId / config.appSecret`);
-        appId = need('LARK_APP_ID');
-        appSecret = need('LARK_APP_SECRET');
-        domain = config.domain ?? (env.LARK_DOMAIN || 'feishu');
-      }
-      if (typeof appId !== 'string' || !appId) fail(`${where}.appId must be a non-empty string`);
-      if (typeof appSecret !== 'string' || !appSecret) fail(`${where}.appSecret must be a non-empty string`);
-      if (domain !== 'feishu' && domain !== 'lark') fail(`${where}.domain (or LARK_DOMAIN) must be 'feishu' or 'lark'`);
-      return { ...ch, account, config: { ...config, appId, appSecret, domain } };
-    }
-    case 'mail':
-      return { ...ch, account, config: substituteEnv(ch.config, env, 'mail.config') as Record<string, unknown> };
-    case 'bridge':
-      return {
-        ...ch,
-        account,
-        ...(ch.cwd ? { cwd: path(ch.cwd) } : {}),
-        ...(ch.env ? { env: substituteEnv(ch.env, env, 'bridge.env') as Record<string, string> } : {}),
-        ...(ch.config !== undefined ? { config: substituteEnv(ch.config, env, 'bridge.config') } : {}),
-      };
-    case 'module': {
-      const spec = ch.module;
-      const rel = spec.startsWith('.') || spec.startsWith('~') || isAbsolute(spec);
-      const r = resolveChannelModule(spec, rel ? path(spec) : undefined, path('.'));
-      if ('error' in r) fail(`channels[${i}].module: ${r.error}`);
-      return { ...ch, account, module: r.file, ...(ch.config !== undefined ? { config: substituteEnv(ch.config, env, `channels[${i}].config`) } : {}) };
-    }
+  const vctx: ChannelValidateContext = { reservedIds: registry.reservedIds, fail, warn: (msg) => void warnings.push(msg) };
+  for (const m of registry.modules) {
+    if (!m.validateAll) continue;
+    m.validateAll(entries.flatMap((entry, index) => (entry.type === m.type ? [{ index, entry, resolved: out[index]! }] : [])), vctx);
   }
+  return out;
 }
 
 /** Replace every string `"env:NAME"` with the variable's value; a missing variable is an error naming it. */

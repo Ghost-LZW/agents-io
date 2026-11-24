@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { HOST_RESULT_VALUES, InboundAnswer, RunEnded, errors, type Binding, type BindingTable } from '@agents-io/protocol';
 import type { FakeTurnScript } from '@agents-io/testkit';
+import { CLAUDE_CODE_DECLARES } from './declares.js';
 import { daemon } from './helpers.js';
 
 // What the daemon answers must match the protocol's result-value schemas (host.ts), which other implementations rely on.
@@ -15,7 +16,7 @@ const valid = (type: keyof typeof HOST_RESULT_VALUES, value: unknown) => expect(
 
 describe('host result values', () => {
   it('match the protocol schemas #PR-1', async () => {
-    const w = await daemon({ raw: { agents: { chat: { harness: 'claude-code' }, exec: { harness: 'claude-code', mode: 'task' } } }, script });
+    const w = await daemon({ raw: { agents: { chat: { harness: 'claude-code' }, exec: { harness: 'claude-code', mode: 'task' } } }, script, declares: CLAUDE_CODE_DECLARES });
     const c = await w.client();
     valid('host.hello', await c.hello({ token: w.gw.token, name: 'xwo', consumer: 'xwo' }));
     const answer = { accepted: true };

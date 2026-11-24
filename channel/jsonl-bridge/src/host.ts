@@ -181,6 +181,12 @@ interface Conn {
   gone: boolean;
   /** Requests that timed out since the peer last answered one. */
   timeouts: number;
+  /**
+   * Settles once this connection's hello is applied (true: its id and caps are the bridge's) or
+   * has failed (false: the peer is killed). Inbound frames wait for it, so one the peer sends after
+   * answering hello is stamped with that hello, even when both arrive in one chunk.
+   */
+  ready: Promise<boolean>;
 }
 
 class Bridge implements BridgedChannel {
@@ -352,7 +358,9 @@ class Bridge implements BridgedChannel {
     if (this.closing) throw new ChannelBridgeError('closed', 'bridge is closing', false);
     const transport = await this.opener();
     const pending = new Map<string, Pending>();
-    const conn: Conn = { transport, pending, since: Date.now(), gone: false, timeouts: 0, link: undefined as never };
+    let established!: (ok: boolean) => void;
+    const ready = new Promise<boolean>((r) => (established = r));
+    const conn: Conn = { transport, pending, since: Date.now(), gone: false, timeouts: 0, link: undefined as never, ready };
     conn.link = new FrameLink(
       transport.input,
       transport.output,
@@ -385,33 +393,40 @@ class Bridge implements BridgedChannel {
         conn.pending.delete(id);
       }
     });
-    if (this.closing) {
-      transport.kill();
-      throw new ChannelBridgeError('closed', 'bridge is closing', false);
-    }
-    this.dialing = transport;
     try {
-      const value = await this.call(conn, 'hello', { account: this.opts.account, config: this.opts.config }, this.helloTimeoutMs);
-      if (!check(ChannelHello, value)) throw new ChannelBridgeError('bad_hello', `invalid hello: ${errors(ChannelHello, value).slice(0, 3).join('; ')}`, false);
-      // The channel id is fixed: configured (`expectId`), else the first hello's.
-      const pinned = this.opts.expectId ?? this.hello?.adapterId;
-      if (pinned !== undefined && value.adapterId !== pinned) throw new ChannelBridgeError('bad_hello', `hello declares adapter id ${JSON.stringify(value.adapterId)}, this channel is ${JSON.stringify(pinned)}`, false);
-      const refused = this.opts.acceptId?.(value.adapterId);
-      if (refused !== undefined) throw new ChannelBridgeError('bad_hello', `hello adapter id ${JSON.stringify(value.adapterId)} refused: ${refused}`, false);
-      this.hello = value;
-      this.attachMethods(value.methods);
+      if (this.closing) {
+        transport.kill();
+        throw new ChannelBridgeError('closed', 'bridge is closing', false);
+      }
+      this.dialing = transport;
+      try {
+        const value = await this.call(conn, 'hello', { account: this.opts.account, config: this.opts.config }, this.helloTimeoutMs);
+        if (!check(ChannelHello, value)) throw new ChannelBridgeError('bad_hello', `invalid hello: ${errors(ChannelHello, value).slice(0, 3).join('; ')}`, false);
+        // The channel id is fixed: configured (`expectId`), else the first hello's.
+        const pinned = this.opts.expectId ?? this.hello?.adapterId;
+        if (pinned !== undefined && value.adapterId !== pinned) throw new ChannelBridgeError('bad_hello', `hello declares adapter id ${JSON.stringify(value.adapterId)}, this channel is ${JSON.stringify(pinned)}`, false);
+        const refused = this.opts.acceptId?.(value.adapterId);
+        if (refused !== undefined) throw new ChannelBridgeError('bad_hello', `hello adapter id ${JSON.stringify(value.adapterId)} refused: ${refused}`, false);
+        this.hello = value;
+        this.attachMethods(value.methods);
+      } catch (err) {
+        transport.kill();
+        throw err;
+      } finally {
+        this.dialing = undefined;
+      }
+      if (this.closing) {
+        transport.kill();
+        throw new ChannelBridgeError('closed', 'bridge is closing', false);
+      }
     } catch (err) {
-      transport.kill();
+      // Its inbound frames are never taken: the peer is killed and redelivers them to the next one.
+      established(false);
       throw err;
-    } finally {
-      this.dialing = undefined;
-    }
-    if (this.closing) {
-      transport.kill();
-      throw new ChannelBridgeError('closed', 'bridge is closing', false);
     }
     this.conn = conn;
     this.lastError = undefined;
+    established(true);
     this.opts.onState?.(this.state());
   }
 
@@ -511,6 +526,9 @@ class Bridge implements BridgedChannel {
   }
 
   private async onInbound(conn: Conn, id: string, envelope: InboundEnvelope): Promise<void> {
+    // After the hello, as the peer sent it: stamped with that hello's id and caps (ID-3), never
+    // with the ones before it (offline caps after a failed first connect); none if it failed.
+    if (!(await conn.ready)) return void this.log('debug', `dropping inbound ${id}: its connection's hello failed`);
     // Messages that arrive before `start` wait for the context instead of being lost.
     if (!this.ctx) await new Promise<void>((r) => this.ctxWaiters.push(r));
     try {

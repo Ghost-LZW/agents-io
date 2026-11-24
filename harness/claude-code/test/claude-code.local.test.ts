@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { mapAnswers, riskOf } from '../src/index.js';
+import type { BlobAccess } from '@agents-io/protocol';
+import { CLAUDE_IMAGE_MAX_BYTES, blobResolvers, mapAnswers, riskOf } from '../src/index.js';
 import type { PermissionResult } from '../src/types.js';
 import { bodies, collectUntil, input, isTurnCompleted, sdk, type FakeQuery } from './fake-query.js';
 import { run, setup, uuidOf } from './claude-code-helpers.js';
@@ -66,6 +67,46 @@ describe('open → SDK options', () => {
       delete process.env.AGENTS_IO_TEST_INHERITED;
       delete process.env.AGENTS_IO_TEST_REMOVED;
     }
+  });
+});
+
+describe('what the host hands over: media (instructions: claude-code.test.ts)', () => {
+  it('media inputs resolve against the blob store it is given: an image inline, a file by its path; explicit options win', async () => {
+    const bytes = new Uint8Array([1, 2, 3]);
+    const blobs: BlobAccess = {
+      stat: async (ref) =>
+        ref === 'sha256:i' ? { path: '/blobs/i.png', mime: 'image/png', size: 3 } : ref === 'sha256:f' ? { path: '/blobs/f.pdf', mime: 'application/pdf', size: 3 } : undefined,
+      get: async () => ({ bytes, mime: 'image/png' }),
+    };
+    const media = [
+      { type: 'image' as const, ref: 'sha256:i', mime: 'image/png' },
+      { type: 'file' as const, ref: 'sha256:f', mime: 'application/pdf', name: 'f.pdf' },
+    ];
+    const blocksOf = async (q: FakeQuery) => {
+      await q.waitWritten(1);
+      return q.written[0]!.message.content as { type: string; text?: string; source?: unknown }[];
+    };
+    const a = await setup({}, {}, { blobs });
+    await a.s.startTurn('t1', [input('i1', 'look', { content: media })]);
+    const blocks = await blocksOf(a.q);
+    expect(blocks[1]).toEqual({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: Buffer.from(bytes).toString('base64') } });
+    expect(blocks[2]).toEqual({ type: 'text', text: '[file f.pdf application/pdf at /blobs/f.pdf]' });
+
+    const b = await setup({}, { resolveFile: async () => ({ path: '/elsewhere/f.pdf' }) }, { blobs });
+    await b.s.startTurn('t1', [input('i1', 'look', { content: media })]);
+    expect((await blocksOf(b.q))[2]).toEqual({ type: 'text', text: '[file f.pdf application/pdf at /elsewhere/f.pdf]' });
+  });
+
+  it('an image over the inline limit is refused with its size and path, before its bytes are read; a ref the store does not hold is nothing', async () => {
+    const unread = async (): Promise<never> => {
+      throw new Error('read');
+    };
+    const r = blobResolvers({ stat: async () => ({ path: '/blobs/big.png', mime: 'image/png', size: CLAUDE_IMAGE_MAX_BYTES + 1 }), get: unread });
+    expect(CLAUDE_IMAGE_MAX_BYTES).toBe(3_750_000);
+    await expect(r.resolveImage('sha256:big', 'image/png')).rejects.toThrow('image is 3750001 bytes, over the 3750000-byte inline limit (file at /blobs/big.png)');
+    const none = blobResolvers({ stat: async () => undefined, get: unread });
+    expect(await none.resolveImage('lark-file:om_1/k', 'image/*')).toBeUndefined();
+    expect(await none.resolveFile('lark-file:om_1/k', 'application/pdf')).toBeUndefined();
   });
 });
 

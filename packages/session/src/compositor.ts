@@ -239,7 +239,7 @@ export function foldTurn(v: TurnView, e: SessionEvent): boolean {
 /**
  * The turn has a final answer (`ProgressView.finalAnswer`): a final snapshot, while it runs or once it
  * completed. One that failed, was interrupted or has an unknown outcome has none: a harness's final
- * snapshot there is what it said so far (Codex's last message; HC-3b's, with the stall notice).
+ * snapshot there is what it said so far (Codex's last message; HC-8's, with the stall notice).
  */
 const hasFinalAnswer = (v: TurnView) => v.finalText !== null && (v.status === null || v.status === 'completed');
 

@@ -9,7 +9,7 @@ export const RunSpec = Type.Object({
   harness: Type.String(),
   model: Type.String(),
   effort: Type.Optional(Type.String()),
-  /** Codex collaboration mode for this turn. Other harnesses ignore it. */
+  /** Collaboration mode for this turn: `plan` on a harness that declares it (`HarnessAdapter.modes`); others ignore it. */
   mode: Type.Optional(Type.Union([Type.Literal('default'), Type.Literal('plan')])),
   /** Permission profile name; mapped to harness-native settings by deployment config. */
   profile: Type.String(),

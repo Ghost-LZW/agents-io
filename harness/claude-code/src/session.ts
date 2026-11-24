@@ -66,7 +66,7 @@ interface ActiveTurn {
    * not written either: the idle CLI would start it on the model that hangs. It joins `withdrawn`.
    */
   retry?: { old: Set<string>; withdrawn: Set<string>; swallowed: boolean; switching: boolean; cont?: string; prevCont?: string };
-  /** Idle deadline (HC-3b): this turn's tool calls in flight (tool_use seen, no result yet), id → tool name. */
+  /** Idle deadline (HC-8): this turn's tool calls in flight (tool_use seen, no result yet), id → tool name. */
   tools?: Map<string, string>;
   /** Tools of this turn that ran and may have changed something (not read-only, not declined). */
   effects?: string[];
@@ -83,7 +83,7 @@ interface ActiveTurn {
    * The stalled turn's interrupt is taking follow-ups the CLI has not started out of its queue: a
    * result that arrives meanwhile ends the turn once that is settled (`finishLater`), so only what was
    * really withdrawn is left unconsumed. What the CLI sends after that result is its next run's, not
-   * this turn's (a follow-up it dequeued meanwhile): held for the turn that adopts it (HC-3b).
+   * this turn's (a follow-up it dequeued meanwhile): held for the turn that adopts it (HC-8).
    */
   withdrawing?: boolean;
   finishLater?: { status: Status; error?: TurnError };
@@ -188,7 +188,7 @@ export interface SessionInit {
   stderrTail: () => string;
   /** First-byte watchdog (absent: off). `fallbackModels` is read when it fires. */
   watchdog?: { timeoutMs: number; fallbackModels: () => string[] };
-  /** Idle deadline within a turn (HC-3b; absent: off). `notice` is the answer of a turn it ends. */
+  /** Idle deadline within a turn (HC-8; absent: off). `notice` is the answer of a turn it ends. */
   stall?: { timeoutMs: number; notice: string; fallbackModels: () => string[] };
   /** The permission mode the CLI was launched in (default: the profile's for `run.model`). */
   permissionMode?: PermissionMode;
@@ -225,7 +225,7 @@ export class ClaudeCodeSession implements HarnessSession {
   /** Unconsumed inputs of turns that already ended (interrupted / failed). */
   private stray = new Map<string, string[]>();
   /**
-   * Follow-ups a turn the idle deadline ended left with the CLI unconfirmed (HC-3b): not withdrawn,
+   * Follow-ups a turn the idle deadline ended left with the CLI unconfirmed (HC-8): not withdrawn,
    * not named by a result. They are not consumed (the host re-queues them), and never written again
    * while the CLI may hold them: the next turn given their inputs adopts the uuid, so the CLI's run of
    * it is that turn's; one the CLI gives back late is written again then. uuid → inputIds.
@@ -246,7 +246,7 @@ export class ClaudeCodeSession implements HarnessSession {
   private items = new Map<string, { item: ItemSummary; parentItemId?: string; turnId?: string }>();
   private requests = new Map<string, OpenRequest>();
   private declined = new Set<string>();
-  /** The main thread's text of its current message: what it said so far (HC-3b's answer). */
+  /** The main thread's text of its current message: what it said so far (HC-8's answer). */
   private msgText: { id: string; text: string } | undefined;
   /**
    * What the main thread said after its last tool call: the turn's answer when the CLI's result has
@@ -363,7 +363,7 @@ export class ClaudeCodeSession implements HarnessSession {
     const r = run ?? this.init.args.run;
     const t: ActiveTurn = { turnId, run: r, pending: new Map(), interrupting: false, sawActivity: false, sent: new Map() };
     this.turn = t; // claim before any await so a concurrent startTurn fails
-    // Carried follow-ups among the inputs (HC-3b): the CLI may still run them, so they are adopted
+    // Carried follow-ups among the inputs (HC-8): the CLI may still run them, so they are adopted
     // (their run is this turn's), not written again.
     const adopted = this.adopt(t, inputs);
     try {
@@ -729,7 +729,7 @@ export class ClaudeCodeSession implements HarnessSession {
     this.write(t, [{ inputIds: ids, message: { ...m, uuid: randomUUID() as SDKUserMessage['uuid'], timestamp: new Date().toISOString() } }]);
   }
 
-  /** Carried follow-ups among a new turn's inputs become its pending messages (HC-3b); their inputIds. */
+  /** Carried follow-ups among a new turn's inputs become its pending messages (HC-8); their inputIds. */
   private adopt(t: ActiveTurn, inputs: InputRecord[]): Set<string> {
     const given = new Set(inputs.map((i) => i.inputId));
     const adopted = new Set<string>();
@@ -806,7 +806,7 @@ export class ClaudeCodeSession implements HarnessSession {
 
   private onMessage(m: SDKMessage): void {
     if (this.owed && this.lateStalled(m)) return this.emit({ t: 'native', name: m.type }, { native: m, turnId: undefined });
-    // A carried follow-up may be what the CLI runs now: held for the turn that adopts it (HC-3b).
+    // A carried follow-up may be what the CLI runs now: held for the turn that adopts it (HC-8).
     // So is what comes after the stalled turn's own result while its withdraws settle: the CLI's
     // run of a follow-up it dequeued meanwhile, never the stalled turn's.
     const t = this.turn;
@@ -866,7 +866,7 @@ export class ClaudeCodeSession implements HarnessSession {
     return late;
   }
 
-  /** HC-3b: what the CLI showed it took (in its history), from the uuids it stamps on its output. */
+  /** HC-8: what the CLI showed it took (in its history), from the uuids it stamps on its output. */
   private noteTook(t: ActiveTurn, m: SDKMessage): void {
     const us = named(m);
     if (!us.length) return;
@@ -1384,7 +1384,7 @@ export class ClaudeCodeSession implements HarnessSession {
     this.write(t, again);
   }
 
-  // ---- idle deadline (HC-3b) ------------------------------------------------
+  // ---- idle deadline (HC-8) ------------------------------------------------
   // The first-byte watchdog covers a turn until its first output. After that a model request can
   // hang too (most often the one after a tool result): Claude Code waits for it (`API_TIMEOUT_MS`).
   // This deadline times the CLI's silence while it waits on the model: every CLI message starts it

@@ -16,4 +16,5 @@ export * from './router.js';
 export * from './host-queue.js';
 export * from './topics.js';
 export * from './loop-guard.js';
+export * from './async-queue.js';
 export * from './withhold.js';

@@ -15,6 +15,7 @@ import {
   TopicError,
   TopicRegistry,
   defaultBindings,
+  handoverRefusal,
   defaultPolicy,
   ownersTable,
   type AgentSpec,
@@ -281,5 +282,25 @@ describe('topic commands (Ingress)', () => {
     expect(w.replies.at(-1)!.text).toMatch(/only for the owner/);
     expect(calls).toEqual([`reset:${CONV}`]);
     expect(w.topics.list({ conversation: CONV })).toHaveLength(1);
+  });
+});
+
+describe('handoverRefusal (TP-1)', () => {
+  it('refuses a turn of a topic no longer current, one with no message of its own, one whose messages were all just handed here; a fresh message batched with a handed one moves #TP-1', () => {
+    const msg = (id: string, ctx: Record<string, string | boolean> = {}): InputRecord => ({
+      inputId: id,
+      origin: { kind: 'human', principal: null, evidence: 'none' },
+      content: [{ type: 'text', text: id }],
+      replyRoute: null,
+      channelContext: ctx,
+    });
+    expect(handoverRefusal({ state: 'current' }, [msg('in1')])).toBeUndefined();
+    expect(handoverRefusal(undefined, [msg('in1')])).toBeUndefined();
+    expect(handoverRefusal({ state: 'parked' }, [msg('in1')])).toBe("this topic is no longer the conversation's current one (the user or another turn switched); just answer here");
+    expect(handoverRefusal({ state: 'current' }, [msg('h1', { context: true })])).toBe('this turn has no message to hand over');
+    expect(handoverRefusal({ state: 'current' }, [])).toBe('this turn has no message to hand over');
+    const handed = msg('in1>tp_b', { handedFrom: `${CONV}#tp_a` });
+    expect(handoverRefusal({ state: 'current' }, [msg('h1', { context: true }), handed])).toBe('this message was just handed to this topic by a topic switch; answer it here, in this turn');
+    expect(handoverRefusal({ state: 'current' }, [handed, msg('in2')])).toBeUndefined();
   });
 });

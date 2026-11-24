@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { join } from 'node:path';
-import type { HarnessAdapter, HarnessCaps, HarnessOpenArgs, HarnessSession, NativeClient } from '@agents-io/protocol';
+import type { BlobAccess, HarnessAdapter, HarnessCaps, HarnessDeclarations, HarnessOpenArgs, HarnessSession, NativeClient, SessionEnvSupport } from '@agents-io/protocol';
 import type { ClientInfo } from './generated/ClientInfo.js';
 import type { InitializeParams } from './generated/InitializeParams.js';
 import type { InitializeResponse } from './generated/InitializeResponse.js';
@@ -12,7 +12,7 @@ import type { ThreadResumeParams } from './generated/v2/ThreadResumeParams.js';
 import type { ThreadResumeResponse } from './generated/v2/ThreadResumeResponse.js';
 import type { JsonValue } from './generated/serde_json/JsonValue.js';
 import { CODEX_CAPS, DEFAULT_OPT_OUT, LIVE_NOTIFICATIONS } from './caps.js';
-import { resolveProfile, sandboxModeOf, type CodexProfile, type MediaResolver } from './map.js';
+import { blobMediaResolver, resolveProfile, sandboxModeOf, type CodexProfile, type MediaResolver } from './map.js';
 import { RpcClient, spawnTransport, type Transport } from './rpc.js';
 import { CodexSession, type CodexOpenOptions, type SessionHost, type TurnSnapshot } from './session.js';
 import {
@@ -96,7 +96,10 @@ export interface CodexHarnessOptions {
   live?: boolean;
   /** Defaults for every session; `HarnessOpenArgs.options` overrides per session. */
   profiles?: Record<string, CodexProfile>;
+  /** How media inputs reach Codex; default with `blobs`: their local paths in the host's blob store. */
   resolveMedia?: MediaResolver;
+  /** The host's blob store (`HarnessFactoryInit.blobs`), read for media inputs. */
+  blobs?: BlobAccess;
 }
 
 interface Buffered {
@@ -376,6 +379,22 @@ class AppServer implements SessionHost {
 }
 
 /**
+ * What every Codex adapter declares statically, whatever its transport (`HarnessModule.declares`);
+ * `adopts` and `sessionEnv` depend on the transport, so each adapter declares them itself.
+ */
+export const CODEX_DECLARATIONS = Object.freeze({
+  displayName: 'Codex',
+  /** Plan is a collaboration mode of the turn (`RunSpec.mode`). */
+  modes: Object.freeze(['plan'] as const),
+  /** `bypass` and `restricted` map to Codex approval policies and sandboxes per turn. */
+  ownerProfileSwitch: true,
+  /** `thread/start { ephemeral }` (a module's ephemeral turns: topic titles). */
+  ephemeralOpen: true,
+  /** Its TUI joins a thread as another client of the app-server (`nativeClient`, unix transports). */
+  attach: 'join',
+}) satisfies HarnessDeclarations;
+
+/**
  * Harness adapter for Codex. One app-server per adapter instance; each `open()`
  * is one Codex thread on it. Over stdio the process is a child of this host and
  * is stopped with the last session. Over a Unix socket the server outlives the
@@ -385,12 +404,48 @@ class AppServer implements SessionHost {
  */
 export class CodexHarness implements HarnessAdapter {
   readonly id = 'codex';
+  /**
+   * A restarted host's `open({ resume })` adopts a turn still running: only a Unix socket's
+   * app-server outlives the host (over stdio it dies with it, so the host settles the turn).
+   */
+  readonly adopts: boolean;
+  readonly displayName = CODEX_DECLARATIONS.displayName;
+  readonly modes = CODEX_DECLARATIONS.modes;
+  readonly ownerProfileSwitch = CODEX_DECLARATIONS.ownerProfileSwitch;
+  readonly ephemeralOpen = CODEX_DECLARATIONS.ephemeralOpen;
+  readonly attach = CODEX_DECLARATIONS.attach;
+  /**
+   * One app-server serves every session, so a launched session's env needs one of its own
+   * (`ownProcess`); a Unix socket's server is shared and outlives the host, so it cannot.
+   */
+  readonly sessionEnv: SessionEnvSupport;
   private server: Promise<AppServer> | undefined;
   private opening = 0;
   private readonly connector: Connector;
+  private readonly opts: CodexHarnessOptions;
 
-  constructor(private readonly opts: CodexHarnessOptions = {}) {
-    this.connector = makeConnector(opts);
+  constructor(opts: CodexHarnessOptions = {}) {
+    // Media inputs resolve against the host's blob store unless the options say how.
+    this.opts = opts.resolveMedia || !opts.blobs ? opts : { ...opts, resolveMedia: blobMediaResolver(opts.blobs) };
+    this.connector = makeConnector(this.opts);
+    const unix = typeof opts.transport === 'object' && opts.transport.kind === 'unix';
+    this.adopts = unix;
+    this.sessionEnv = unix ? { refused: 'a shared Codex app-server (unix transport)' } : 'own-process';
+  }
+
+  /**
+   * These settings on an app-server of its own over stdio (`HarnessAdapter.ownProcess`), for one
+   * launched session or task run: `env` over this adapter's environment, its `CODEX_HOME` (a
+   * launched session's) as the home. Ended by `dispose`. Over a Unix socket too: a task run gets a
+   * server of its own even where a launched session cannot (`sessionEnv`).
+   */
+  ownProcess(o: { env: Record<string, string> }): CodexHarness {
+    return new CodexHarness({
+      ...this.opts,
+      env: { ...this.opts.env, ...o.env },
+      transport: typeof this.opts.transport === 'function' ? this.opts.transport : { kind: 'stdio' },
+      ...(o.env.CODEX_HOME !== undefined ? { codexHome: o.env.CODEX_HOME } : {}),
+    });
   }
 
   /**
@@ -435,9 +490,10 @@ export class CodexHarness implements HarnessAdapter {
   }
 
   /**
-   * Host shutdown that must not disturb Codex: sessions end without interrupting
-   * or unsubscribing, running turns stay snapshotted, the connection closes. Over
-   * a Unix socket the app-server keeps running; over stdio it dies with us.
+   * Host shutdown that must not disturb Codex (`HarnessAdapter.detach`, both transports):
+   * sessions end without interrupting or unsubscribing, running turns stay snapshotted,
+   * the connection closes. Over a Unix socket the app-server keeps running (`adopts`);
+   * over stdio it dies with us, and the next host settles the turn it left.
    */
   async detach(): Promise<void> {
     const p = this.server;
@@ -449,7 +505,7 @@ export class CodexHarness implements HarnessAdapter {
     s.close();
   }
 
-  /** Closes the connection (and the stdio child) now, failing every session on it. */
+  /** Closes the connection (and the stdio child) now, failing every session on it (`HarnessAdapter.dispose`). */
   async dispose(): Promise<void> {
     const p = this.server;
     this.server = undefined;
@@ -485,7 +541,8 @@ export class CodexHarness implements HarnessAdapter {
       sandbox: sandboxModeOf(profile) ?? null,
       config: Object.keys(config).length ? config : null,
       baseInstructions: opts.baseInstructions ?? null,
-      developerInstructions: opts.developerInstructions ?? null,
+      // The agent's instructions replace the options' (`HarnessOpenArgs.instructions`).
+      developerInstructions: args.instructions ?? opts.developerInstructions ?? null,
       ...(args.run.model ? { model: args.run.model } : {}),
     };
     let res: ThreadStartResponse | ThreadResumeResponse;

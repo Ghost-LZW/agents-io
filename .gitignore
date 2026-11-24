@@ -7,3 +7,5 @@ coverage/
 .claude/worktrees/
 aio.config.json
 lark-app.json
+*.swp
+*.swo

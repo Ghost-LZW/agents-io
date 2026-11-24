@@ -14,7 +14,8 @@
   ],
   "dependencies": {
     "@agents-io/protocol": "workspace:*",
-    "@larksuiteoapi/node-sdk": "^1.0.0"
+    "@larksuiteoapi/node-sdk": "^1.0.0",
+    "@sinclair/typebox": "^0.34.0"
   },
   "devDependencies": {
     "@agents-io/testkit": "workspace:*"

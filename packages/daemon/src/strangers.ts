@@ -1,7 +1,20 @@
-import type { DatabaseSync, StatementSync } from 'node:sqlite';
-import type { IdentityEntry, InboundEnvelope, InboundItem, InputRecord, Origin, RenderedMessage, ReplyRoute } from '@agents-io/protocol';
+import type {
+  IdentityEntry,
+  InboundEnvelope,
+  InboundItem,
+  InputRecord,
+  KernelContext,
+  KernelDatabase,
+  KernelStatement,
+  ModuleActionResult,
+  ModuleManifest,
+  Origin,
+  RenderedMessage,
+  ReplyRoute,
+  Resolver,
+  TurnContext,
+} from '@agents-io/protocol';
 import { routeKey } from '@agents-io/protocol';
-import type { IngressResult } from '@agents-io/session';
 
 /**
  * Messages from people the deployment does not know, addressed to it (a DM, or an @ in a
@@ -10,10 +23,92 @@ import type { IngressResult } from '@agents-io/session';
  * session as they arrived (original sender, `restricted` like any non-owner turn); "always"
  * also keeps the sender as a `guest` identity, whose later messages go there without asking.
  * Who is trusted stays the owner's call; this only asks.
+ *
+ * A built-in feature module (core-slimming G6 step 4; a host-level feature, decision 16):
+ * `strangersModule`, which `bundle.ts` registers (nothing else in the daemon imports this file),
+ * over the hooks `onUndispatched` (a stranger's message), `onAction` (the card's buttons,
+ * `aio:stranger:`), `resolver` (a guest's turn asks the owner) and `identities` (the guests, below
+ * the configured identities and a host's map). The owner's chat (`ownerRoute`) and who the owner
+ * is stay the kernel's.
  */
 
 export const GUEST_LABEL = 'guest';
 const ACTION_PREFIX = 'aio:stranger:';
+
+/** The `strangers` section of the config file: only `enabled` (the daemon's); `policy.strangers` is where the setting was before. */
+export interface StrangersSection {
+  enabled?: boolean;
+}
+
+/** What the section resolves to: nothing of its own. */
+export type StrangersConfig = Record<string, never>;
+
+export const strangersModule: ModuleManifest<StrangersConfig> = {
+  id: 'strangers',
+  kind: 'feature',
+  needs: ['kernel:db', 'kernel:router', 'kernel:owner', 'kernel:ownerRoute', 'kernel:send', 'kernel:channelFor', 'kernel:redispatch'],
+  config: {
+    section: 'strangers',
+    schema: {},
+    // Where the setting always was: `ask` turns it on; `drop`, as its absence, leaves it off (the default).
+    aliases: ['policy.strangers'],
+    aliasEnabled: (value) => value === 'ask',
+    defaultEnabled: false,
+    resolve: () => ({}),
+  },
+  setup: (kernel) => {
+    // Built on first use (the guests, asked for when the daemon starts): the kernel is ready only after setup.
+    let strangers: Strangers | undefined;
+    const ask = (): Strangers => (strangers ??= new Strangers(strangersOptions(kernel)));
+    return {
+      hooks: {
+        identities: () => ask().guests(),
+        onUndispatched: (a) => ask().undispatched(a, a.addressed),
+        onAction: { prefix: ACTION_PREFIX, handle: (a) => ask().action(a) },
+        resolver: (ctx) => askOwner(kernel, ctx),
+      },
+    };
+  },
+};
+
+/** The kernel as `Strangers` uses it. */
+function strangersOptions(k: KernelContext): StrangersOptions {
+  return {
+    db: k.db,
+    ownerRoute: () => k.ownerRoute(),
+    // Settled in the owner's fixed session, else a log of its own (`strangers`).
+    send: async (route, msg, operationId) => {
+      const r = await k.send(route, msg, { operationId, sessionKey: k.owner().sessionKey ?? 'strangers' });
+      return r?.status === 'delivered' ? r.providerMessageId : undefined;
+    },
+    edit: async (route, id, msg) => {
+      await k.channelFor(route)?.edit?.(route, id, msg, { operationId: `stranger:${id}:answered`, sequence: 1 });
+    },
+    // As the host's inbound.redispatch, by the owner.
+    admit: async (item, session) => {
+      const r = await k.redispatch(item, { by: 'owner', session });
+      return r.ok ? { ok: true } : { ok: false, message: r.message };
+    },
+    onGuests: (entries) => k.router.setExtraIdentities(entries),
+    openInbox: (env) => k.channelFor({ channel: env.channel, account: env.account })?.caps(env.account).openInbox === true,
+    log: (level, msg) => k.log(level, msg),
+  };
+}
+
+/**
+ * A turn none of whose inputs is the owner's (a guest's, or one the owner let in) asks the owner
+ * about its requests, in the owner's chat (the `resolver` hook). Owner turns, `bypass` turns, live
+ * delegations (decision 11 amendment) and turns while no owner chat is known keep the local policy.
+ */
+function askOwner(k: KernelContext, ctx: TurnContext): Resolver | undefined {
+  if (ctx.run.profile === 'bypass' || ctx.live) return undefined;
+  if (ctx.inputs.some((i) => (i.origin.principal?.labels ?? []).includes('owner'))) return undefined;
+  const to = k.ownerRoute();
+  const owners = k.owner().principals;
+  if (!to || !owners.length) return undefined;
+  return { kind: 'human', principals: owners, routes: [routeKey(to)] };
+}
+
 type Answer = 'once' | 'always' | 'ignore';
 const ANSWERS: readonly Answer[] = ['once', 'always', 'ignore'];
 /** Messages held per ask; later ones are counted, not kept. */
@@ -32,7 +127,8 @@ interface Ask {
 }
 
 export interface StrangersOptions {
-  db: DatabaseSync;
+  /** Where the asks and the guests are kept (the tables `daemon_stranger_asks`, `daemon_guests`). */
+  db: KernelDatabase;
   /** Where the question goes: the owner's own chat with the deployment; null while unknown. */
   ownerRoute: () => ReplyRoute | null;
   /** Send (through the outbox) on a route; resolves the platform message id when delivered. */
@@ -41,16 +137,19 @@ export interface StrangersOptions {
   edit: (route: ReplyRoute, providerMessageId: string, msg: RenderedMessage) => Promise<void>;
   /** Deliver a held input to its chat's session, as it arrived. */
   admit: (item: InboundItem, session: 'per-conversation' | 'per-thread') => Promise<{ ok: boolean; message?: string }>;
-  /** The guests changed: identify them from now on. */
+  /** The guests changed: identify them from now on (those of the start are `guests()`). */
   onGuests: (entries: IdentityEntry[]) => void;
-  /** Ask about `channel:channelUserId` senders on these channels only (default: every channel but mail). */
-  channels?: (channel: string) => boolean;
+  /**
+   * Anyone may write to the deployment on the channel the message came in on (`ChannelCaps.openInbox`:
+   * mail): its unknown senders are routine, never asked about.
+   */
+  openInbox: (env: InboundEnvelope) => boolean;
   log: (level: 'info' | 'warn', msg: string) => void;
   now?: () => number;
 }
 
 export class Strangers {
-  private readonly q: Record<'askGet' | 'askOpen' | 'askPut' | 'askNew' | 'guestAll' | 'guestPut', StatementSync>;
+  private readonly q: Record<'askGet' | 'askOpen' | 'askPut' | 'askNew' | 'guestAll' | 'guestPut', KernelStatement>;
   private readonly now: () => number;
 
   constructor(private readonly o: StrangersOptions) {
@@ -69,7 +168,6 @@ export class Strangers {
       guestAll: p('SELECT json FROM daemon_guests ORDER BY at'),
       guestPut: p('INSERT INTO daemon_guests (key, at, json) VALUES (?, ?, ?) ON CONFLICT(key) DO NOTHING'),
     };
-    this.o.onGuests(this.guests());
   }
 
   guests(): IdentityEntry[] {
@@ -85,7 +183,7 @@ export class Strangers {
     const { env, origin, input } = a;
     if (!addressed || !env.replyRoute || origin.kind !== 'human' || origin.self) return;
     if (origin.evidence !== 'platform_signed' && origin.evidence !== 'dkim_pass') return;
-    if (!(this.o.channels ?? ((c) => c !== 'mail'))(env.channel)) return;
+    if (this.o.openInbox(env)) return;
     if (isClick(env)) return;
     const labels = origin.principal?.labels ?? [];
     if (labels.includes('owner')) return;
@@ -125,11 +223,11 @@ export class Strangers {
     if (providerMessageId) this.save({ ...ask, card: { route: to, providerMessageId } });
   }
 
-  /** A click on an ask's button (Ingress `onAction`); undefined for any other action id. */
-  async action(a: { actionId: string; origin: Origin }): Promise<IngressResult | undefined> {
+  /** A click on an ask's button (the `onAction` hook); undefined for any other action id. */
+  async action(a: { actionId: string; origin: Origin }): Promise<ModuleActionResult | undefined> {
     if (!a.actionId.startsWith(ACTION_PREFIX)) return undefined;
     const [idText, answer] = a.actionId.slice(ACTION_PREFIX.length).split(':');
-    const done = (ok: boolean, reason?: string): IngressResult => ({ accepted: true, action: 'command', origin: a.origin, result: ok ? { ok: true } : { ok: false, reason: reason ?? 'refused' } });
+    const done = (ok: boolean, reason?: string): ModuleActionResult => (ok ? { ok: true } : { ok: false, reason: reason ?? 'refused' });
     if (!(a.origin.principal?.labels ?? []).includes('owner')) return done(false, 'not_owner');
     const row = this.q.askGet.get(Number(idText)) as { json: string } | undefined;
     if (!row || !ANSWERS.includes(answer as Answer)) return done(false, 'unknown_request');

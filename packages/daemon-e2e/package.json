@@ -1,0 +1,21 @@
+{
+  "name": "@agents-io/daemon-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "End-to-end scenarios for the agents-io daemon against the real harness from the config (aio-e2e; was `aio e2e`)",
+  "type": "module",
+  "bin": { "aio-e2e": "./dist/cli.js" },
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist"],
+  "scripts": {
+    "e2e": "node dist/cli.js"
+  },
+  "dependencies": {
+    "@agents-io/daemon": "workspace:*",
+    "@agents-io/harness-codex": "workspace:*",
+    "@agents-io/host-mcp": "workspace:*",
+    "@agents-io/protocol": "workspace:*",
+    "@agents-io/session": "workspace:*",
+    "@agents-io/testkit": "workspace:*"
+  }
+}

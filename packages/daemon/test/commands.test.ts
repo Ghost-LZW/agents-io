@@ -1,12 +1,15 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import type { AckState, ReplyRoute, SessionEvent } from '@agents-io/protocol';
+import type { AckState, KernelContext, ReplyRoute, SessionEvent } from '@agents-io/protocol';
 import { Ingress, MemorySessionLog, defaultPolicy } from '@agents-io/session';
 import { FakeChannel, FakeHarness, fakeEnvelope, type FakeTurnScript } from '@agents-io/testkit';
 import { resolveConfig, type HarnessInstance } from '../src/config.js';
+import { COMMAND_HELP, CommandTable, KERNEL_COMMAND_NAMES, KERNEL_COMMAND_TABLE, runCommand, type CommandHost } from '../src/commands.js';
 import { Gateway, InstanceHarness } from '../src/gateway.js';
+import { ownerCommandsModule } from '../src/owner-commands.js';
+import { CLAUDE_CODE_DECLARES, CODEX_DECLARES } from './declares.js';
 import { cleanups, until } from './gateway-helpers.js';
 
 /* `/commands` in a chat with the deployment: the owner operates the session and its harness. */
@@ -21,13 +24,13 @@ class MarkedChannel extends FakeChannel {
   }
 }
 
-async function setup(o: { fixed?: boolean; script?: FakeTurnScript; marked?: boolean; codex?: boolean } = {}) {
+async function setup(o: { fixed?: boolean; script?: FakeTurnScript; marked?: boolean; codex?: boolean; helper?: 'codex' | 'claude-code' } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'aio-cmd-'));
   const channelId = o.marked ? 'lark-bot' : 'fake';
   const base = resolveConfig(
     {
       ...(o.codex ? { harnesses: { codex: { use: 'codex' as const }, 'claude-code': { use: 'claude-code' as const } }, defaultHarness: 'codex' } : {}),
-      agents: { helper: { harness: o.codex ? 'codex' : 'claude-code' }, coder: { harness: 'claude-code', model: 'sonnet' } },
+      agents: { helper: { harness: o.helper ?? (o.codex ? 'codex' : 'claude-code') }, coder: { harness: 'claude-code', model: 'sonnet' } },
       defaultAgent: 'helper',
       policy: { owners: [`${channelId}:alice`], ...(o.fixed ? { ownerSessionKey: 'main' } : {}), strangers: 'ask' },
       local: { principal: `${channelId}:alice` },
@@ -38,7 +41,10 @@ async function setup(o: { fixed?: boolean; script?: FakeTurnScript; marked?: boo
   const config = { ...base, socketPath: join(dir, 'run', 'aio.sock') };
   const chat = o.marked ? new MarkedChannel(channelId) : new FakeChannel(channelId);
   const harness = new FakeHarness(o.script);
-  const gw = await Gateway.start({ config, harness, log: new MemorySessionLog(), ...(o.marked ? { channelAdapter: () => chat } : { channels: [{ adapter: chat }] }), logger: () => {} });
+  // With Codex configured, its instance is a fake declaring what the Codex adapter declares (Plan mode, the owner's profile switch).
+  const codex = Object.assign(new FakeHarness(o.script), CODEX_DECLARES);
+  const harnesses = o.codex ? { buildHarness: (i: HarnessInstance) => new InstanceHarness(i, i.kind === 'codex' ? codex : harness) } : { harness };
+  const gw = await Gateway.start({ config, ...harnesses, log: new MemorySessionLog(), ...(o.marked ? { channelAdapter: () => chat } : { channels: [{ adapter: chat }] }), logger: () => {} });
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   cleanups.push(() => gw.stop());
   let nextMessage = 0;
@@ -81,6 +87,16 @@ describe('commands', () => {
     expect(turns(w.gw)[2]!.run?.model).not.toBe('opus');
   });
 
+  it('in the default deployment (only Claude Code configured) /plan and /bypass say they are available only on Codex #CT-2', async () => {
+    // No configured instance declares Plan mode or the profile switch: the reply names the registered kind that does.
+    const w = await setup();
+    await w.say('/plan on');
+    await w.say('/bypass off');
+    await until(() => w.replies().length === 2);
+    expect(w.replies()).toEqual(['/plan is available only on Codex (this session runs claude-code).', '/bypass is available only on Codex (this session runs claude-code).']);
+    expect(w.harness.sessions).toHaveLength(0);
+  });
+
   it('/preset switches the session to another harness, model and effort as its agent (cwd, instructions); /preset default goes back #CT-2', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'aio-cmd-'));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
@@ -102,7 +118,7 @@ describe('commands', () => {
     };
     const fakes: Record<string, FakeHarness> = {};
     const chat = new FakeChannel('fake');
-    const gw = await Gateway.start({ config, buildHarness: (i: HarnessInstance) => new InstanceHarness(i, (fakes[i.name] ??= new FakeHarness())), log: new MemorySessionLog(), channels: [{ adapter: chat }], logger: () => {} });
+    const gw = await Gateway.start({ config, buildHarness: (i: HarnessInstance) => new InstanceHarness(i, (fakes[i.name] ??= Object.assign(new FakeHarness(), i.kind === 'codex' ? CODEX_DECLARES : CLAUDE_CODE_DECLARES))), log: new MemorySessionLog(), channels: [{ adapter: chat }], logger: () => {} });
     cleanups.push(() => gw.stop());
     const say = (text: string) => chat.inject({ ...dm, sender: alice, text });
     const replies = () => chat.sent.map((x) => x.edits.at(-1)?.text ?? x.msg.text);
@@ -131,7 +147,7 @@ describe('commands', () => {
     // The other instance runs as the same agent: its cwd and instructions.
     const opened = fakes.cc!.sessions[0]!.args;
     expect(opened.cwd).toBe(work);
-    expect((opened.options as { sdk?: { systemPrompt?: { append?: string } } }).sdk?.systemPrompt?.append).toBe('Be brief.');
+    expect(opened.instructions).toBe('Be brief.');
 
     await say('/status');
     expect(await reply('session ')).toContain('agent helper · preset claude · cc (claude-code) · model opus · effort high (set here)');
@@ -262,5 +278,80 @@ describe('nativeCommand is the daemon\'s to set', () => {
     await ingress.accept(fakeEnvelope({ admission: 'dispatch', text: '/compact', context: { nativeCommand: true, chatName: 'x' } }));
     expect(seen[0]).toMatchObject({ chatName: 'x' });
     expect(seen[0]!.nativeCommand).toBeUndefined();
+  });
+});
+
+describe('the chat command table (core-slimming G6)', () => {
+  /** A host that lets everyone operate and answers every question with something; enough to tell commands from messages. */
+  const host: CommandHost = {
+    allowed: async () => true,
+    status: () => 'status',
+    interrupt: async () => ({ ok: true }),
+    running: () => [],
+    input: async () => ({ ok: true }),
+    answer: async () => ({ ok: true }),
+    compactCommand: () => undefined,
+    agents: () => ['a'],
+    conversationAgent: () => undefined,
+    setConversationAgent: () => {},
+    newTopic: () => 't1',
+    tuiHint: () => 'tui',
+  };
+  /** The bundled aio's table: the kernel's commands and the owner-commands module's, over a kernel that answers what they read in the same way. */
+  const bundled = async () => {
+    const kernel = {
+      runConfig: { get: () => ({ harness: 'h', kind: 'k', plan: false, ownerProfileSwitch: false, overridden: false }), set: () => {}, presets: () => [], offering: () => [] },
+      agents: { names: () => ['a'] },
+      router: { setConversationAgent: () => {} },
+    } as unknown as KernelContext;
+    const instance = await ownerCommandsModule.setup(kernel, {});
+    return new CommandTable(ownerCommandsModule.commands!.map((def) => ({ module: ownerCommandsModule.id, def, handler: instance.commands![def.name]! })));
+  };
+  const run = (name: string, args = '', table?: CommandTable, h: CommandHost = host) => {
+    const env = fakeEnvelope({ admission: 'dispatch', text: `/${name}` });
+    const origin = { kind: 'human' as const, principal: { id: 'fake:alice', labels: ['owner'] }, evidence: 'platform_signed' as const, via: 'fake:default:c1', adapter: 'fake' };
+    const input = { inputId: 'in1', origin, content: env.content, replyRoute: env.replyRoute ?? null, channelContext: { chatName: 'x' } };
+    return runCommand(h, { name, args, env, origin, input, delivery: { bindingId: 'b', source: 'config', on: 'dispatch', sessionKey: 's1', agent: 'a' } as never }, table);
+  };
+  const HELP = readFileSync(new URL('./fixtures/command-help.txt', import.meta.url), 'utf8');
+
+  it('in the bundled aio (the owner commands on), /help is the list as it was, byte for byte, and exactly these names are commands; any other /name is an ordinary message #CT-2', async () => {
+    // Captured from commands.ts before the table existed.
+    const table = await bundled();
+    expect(table.help).toBe(HELP);
+    expect(await run('help', '', table)).toEqual({ ok: true, reply: HELP });
+    const names = [...KERNEL_COMMAND_NAMES, ...ownerCommandsModule.commands!.flatMap((d) => [d.name, ...(d.aliases ?? [])])];
+    expect([...names].sort()).toEqual(['agent', 'answer', 'bypass', 'compact', 'effort', 'help', 'model', 'new', 'plan', 'preset', 'status', 'steer', 'stop', 'switch', 'topics', 'tui']);
+    for (const name of names) expect(await run(name, '', table), name).toMatchObject({ reply: expect.any(String) });
+    for (const name of ['probe', 'helpme', 'x', 'models']) expect(await run(name, '', table), name).toBeUndefined();
+  });
+
+  it('with no module active, /help is the kernel\'s lines of that list, in its order, and the owner commands are ordinary messages #CT-2', async () => {
+    const owners = /^\/(agent|preset|model|plan|bypass|compact) /;
+    expect(COMMAND_HELP).toBe(HELP.split('\n').filter((l) => !owners.test(l)).join('\n'));
+    expect(KERNEL_COMMAND_TABLE.help).toBe(COMMAND_HELP);
+    expect(await run('help')).toEqual({ ok: true, reply: COMMAND_HELP });
+    expect([...KERNEL_COMMAND_NAMES].sort()).toEqual(['answer', 'help', 'new', 'status', 'steer', 'stop', 'switch', 'topics', 'tui']);
+    for (const name of KERNEL_COMMAND_NAMES) expect(await run(name), name).toMatchObject({ reply: expect.any(String) });
+    for (const name of ['agent', 'preset', 'model', 'effort', 'plan', 'bypass', 'compact', 'probe', 'helpme', 'x', 'models']) expect(await run(name), name).toBeUndefined();
+  });
+
+  it('a module command\'s compact() queues the compaction command of the session\'s harness as the command\'s message, marked native by the kernel; unsupported without one; forbidden for a sender who may not operate the session (a command anyone may run) #CT-2', async () => {
+    const answers: unknown[] = [];
+    const given: { delivery: unknown; input: unknown; mode: string }[] = [];
+    const table = new CommandTable([{ module: 'm', def: { name: 'squash', help: '/squash', ownerOnly: false }, handler: async (c) => (answers.push(await c.compact()), { ok: true, reply: 'done' }) }]);
+    const h = (o: Partial<CommandHost>): CommandHost => ({ ...host, input: async (delivery, input, mode) => (given.push({ delivery, input, mode }), { ok: true, disposition: 'queued' }), ...o });
+    expect(await run('squash', '', table, h({ compactCommand: () => '/compact' }))).toEqual({ ok: true, reply: 'done' });
+    expect(given).toEqual([
+      {
+        delivery: expect.objectContaining({ sessionKey: 's1' }),
+        input: expect.objectContaining({ inputId: 'in1', content: [{ type: 'text', text: '/compact' }], channelContext: { chatName: 'x', nativeCommand: true } }),
+        mode: 'queue',
+      },
+    ]);
+    await run('squash', '', table, h({ compactCommand: () => undefined }));
+    await run('squash', '', table, h({ allowed: async () => false, compactCommand: () => '/compact' }));
+    expect(answers).toEqual([{ ok: true, disposition: 'queued' }, { ok: false, reason: 'unsupported' }, { ok: false, reason: 'forbidden' }]);
+    expect(given).toHaveLength(1);
   });
 });

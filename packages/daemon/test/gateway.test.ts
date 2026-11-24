@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { FrameDecoder, encodeFrame, type Policy, type SessionEvent } from '@agents-io/protocol';
-import { MemorySessionLog, SqliteSessionLog } from '@agents-io/session';
+import { MemorySessionLog, SqliteSessionLog, isSnapshotEvent } from '@agents-io/session';
 import { FakeChannel, FakeHarness, assertConformingStream } from '@agents-io/testkit';
 import { CommandError, LocalClient } from '../src/client.js';
 import { resolveConfig, type HarnessInstance } from '../src/config.js';
@@ -115,6 +115,28 @@ describe('gateway wiring', () => {
     await until(() => ev.some((e) => e.body.t === 'turn.completed'));
     await new Promise((r) => setTimeout(r, 20));
     expect(ev.map((e) => e.seq)).toEqual(w.gw.hub.log.read('s', head).map((e) => e.seq));
+  });
+
+  it('a client whose cursor is ahead of the head (the log was rebuilt) gets a snapshot first, then the live events #LN-10', async () => {
+    const w = await setup();
+    const c1 = await w.client();
+    await c1.input('s', 'one');
+    await until(() => w.gw.sessions()[0]?.state === 'idle' && w.gw.hub.log.read('s', 0).some((e) => e.body.t === 'turn.completed'));
+    const head = w.gw.hub.log.head('s');
+    const c2 = await w.client();
+    const out: SessionEvent[] = [];
+    const sub = await c2.subscribe({ sessionKey: 's', tier: 'full', fromSeq: head + 50 });
+    expect(sub.head).toBe(head);
+    void (async () => {
+      for await (const e of sub) out.push(e);
+    })();
+    await until(() => out.length > 0);
+    expect(isSnapshotEvent(out[0]!)).toBe(true);
+    expect(out[0]!.seq).toBe(head);
+    await c1.input('s', 'two');
+    await until(() => out.some((e) => e.body.t === 'turn.completed'));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(out.slice(1).filter((e) => e.durability === 'durable').map((e) => e.seq)).toEqual(w.gw.hub.log.read('s', head).map((e) => e.seq));
   });
 
   it('socket is private, rejects bad frames, and tells subscribers when the gateway stops #RS-8 #SE-2', async () => {

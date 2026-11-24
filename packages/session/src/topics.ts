@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
-import type { Topic, TopicChangeReason, TopicSwitchResult } from '@agents-io/protocol';
+import type { InputRecord, Topic, TopicChangeReason, TopicSwitchResult } from '@agents-io/protocol';
 import type { Hub } from './hub.js';
 import { contentText } from './watch.js';
 
@@ -369,4 +369,35 @@ export function titleFrom(text: string, max = 40): string | undefined {
   const line = text.split('\n').map((l) => l.trim()).find(Boolean);
   if (!line || line.startsWith('/')) return undefined;
   return line.length > max ? `${line.slice(0, max - 1)}…` : line;
+}
+
+/*
+ * TP-1, the rules of handing a turn over to another topic (`session_rotate` / `session_switch`).
+ * The kernel's handover (the daemon's `KernelContext.topics.rotate` / `switch`) applies them for
+ * every caller; the topic tools apply them too, first, so a model reads the same refusal before
+ * its arguments are looked at. A turn is handed over once: another try is refused
+ * (`TOPIC_HANDED_ALREADY`), a retry of the same operation answers what it did. A switch never goes
+ * to the topic the turn runs in (`TOPIC_ALREADY_HERE`). `handoverRefusal` says why a turn may not
+ * be handed over at all.
+ */
+
+/** A second handover of one turn (TP-1: once per turn). */
+export const TOPIC_HANDED_ALREADY = 'this turn was already handed to another topic; end the turn now without answering';
+
+/** A switch to the topic the turn runs in. */
+export const TOPIC_ALREADY_HERE = 'you are already in that topic; just answer';
+
+/**
+ * Why a turn running in `topic`, with `inputs`, may not be handed to another topic (TP-1), or
+ * undefined: the topic is no longer the conversation's current one (the user or another turn
+ * switched), the turn has no message of its own (only context items), or every message of it was
+ * just handed here by a handover (`handedFrom`: no ping-pong between topics; a fresh message
+ * batched with one still moves).
+ */
+export function handoverRefusal(topic: Pick<Topic, 'state'> | undefined, inputs: readonly InputRecord[]): string | undefined {
+  if (topic && topic.state !== 'current') return "this topic is no longer the conversation's current one (the user or another turn switched); just answer here";
+  const own = inputs.filter((i) => i.channelContext.context !== true);
+  if (!own.length) return 'this turn has no message to hand over';
+  if (own.every((i) => i.channelContext.handedFrom !== undefined)) return 'this message was just handed to this topic by a topic switch; answer it here, in this turn';
+  return undefined;
 }

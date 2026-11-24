@@ -109,6 +109,13 @@ describe('external MCP endpoint: off by default, loopback, tokens, limits', () =
     expect(hello.features).not.toContain('external.mcp');
     const off = resolveConfig({ externalMcp: { enabled: false, clients: { a: { token: 'env:T', scopes: ['read'] } } } }, { env: {}, baseDir: tmp(), cwd: tmp() });
     expect(off.externalMcp).toBeUndefined();
+    // With enabled: false, the daemon is as without it: nothing listens, hello does not advertise it.
+    const d = await daemon({ raw: { externalMcp: { enabled: false, listen: '127.0.0.1:0', clients: { a: { token: 'env:T', scopes: ['read'] } } } } });
+    expect(d.gw.adminStatus().externalMcp).toBeUndefined();
+    const dc = await d.client();
+    const dhello = await dc.hello({ token: d.gw.token, name: 'probe' });
+    expect(dhello.features).toContain('callouts.external');
+    expect(dhello.features).not.toContain('external.mcp');
   });
 
   it('listens on loopback only; a literal token, a short one, a missing variable are config errors that never echo the value #SE-5 #SE-1', () => {
@@ -354,6 +361,31 @@ describe('external MCP endpoint: stamping, loop guard, sends, explain', () => {
     expect(d).toMatchObject({ status: 'delivered' });
     expect((w.gw.explain('host:hd1', false) as { value: Record<string, unknown> }).value.external).toBeUndefined();
   });
+
+  it('an external send whose settlement failed still names its client when the next start settles it (who sent it is kept in the in-flight mark) #EX-8 #DL-1', async () => {
+    const { w, url } = await world();
+    // From here on this process's log refuses delivery.settled (a disk error; a crash at this point is the same).
+    const log = w.gw.hub.log;
+    const append = log.append.bind(log);
+    log.append = (key, d) => {
+      if (d.body.t === 'delivery.settled') throw new Error('disk I/O error');
+      return append(key, d);
+    };
+    const ops = await mcp(url, TOKENS.ops, { 'x-agents-io-declared': 'member-7' });
+    const r = await call(ops, 'send_message', { route: 'fake:default:c1', text: 'sent, settlement lost', operation_id: 'op-r' });
+    expect(r.isError).toBe(true);
+    expect(w.chat.sent).toHaveLength(1);
+    expect(w.gw.explain('external:ops:op-r', false)).toMatchObject({ ok: false, code: 'unknown_input' });
+    await w.stop();
+
+    const w2 = await daemon({ dir: w.dir });
+    expect(w2.gw.hub.log.read('external:ops', 0).map((e) => e.body)).toContainEqual(expect.objectContaining({ t: 'delivery.settled', operationId: 'external:ops:op-r', result: 'unknown' }));
+    expect(w2.gw.explain('external:ops:op-r', false)).toMatchObject({
+      ok: true,
+      value: { operationId: 'external:ops:op-r', sessionKey: 'external:ops', inputIds: [], result: 'unknown', external: { client: 'ops', principal: 'external:ops', declared: 'member-7' } },
+    });
+    expect(w2.chat.sent).toHaveLength(0);
+  });
 });
 
 describe('external MCP endpoint end to end', () => {
@@ -407,6 +439,30 @@ describe('external schedules', () => {
     const sent = w.chat.sent.find((s) => s.msg.text === 'good morning')!;
     expect(sent.route.conversationId).toBe('dm-alice');
     expect(w.gw.schedules.registry.get('timer:hello')).toBeUndefined();
+  });
+
+  // INVARIANTS SC-1 不成立 (2026-11-24): the firing throws, keeps its time, and is redone at once: about 500 tries a second, each logged.
+  it("a client's message schedule whose route its scope no longer has fails once as it fires and is over: recorded in the schedule's log, not tried again, nothing sent #SC-1 #SC-3", async () => {
+    const dir = tmp();
+    const f = tokenFiles(dir);
+    const raw = (scope: string) => ({ externalMcp: { listen: '127.0.0.1:0', clients: { timer: { tokenFile: f.ops, scopes: [scope] } } } });
+    const w = await daemon({ dir, raw: raw('schedule:fake:default:*') });
+    const timer = await mcp(w.gw.adminStatus().externalMcp!.url, TOKENS.ops);
+    const added = await call(timer, 'schedule_add', { id: 'hello', when: { at: Date.now() + 600 }, route: 'fake:default:dm-alice', text: 'good morning' });
+    expect(added.isError).toBe(false);
+    await timer.close();
+    await w.stop();
+    // The owner narrows the client's scope; the daemon starts again before the time.
+    const logs: string[] = [];
+    const again = await daemon({ dir, raw: raw('schedule:fake:default:other'), gateway: { logger: (_level, msg) => logs.push(msg) } });
+    await until(() => again.gw.schedules.registry.get('timer:hello') === undefined, 3000);
+    await new Promise((r) => setTimeout(r, 500));
+    const failures = logs.filter((m) => m.includes('schedule timer:hello'));
+    expect(failures).toEqual([expect.stringMatching(/no longer in timer's schedule scope/)]);
+    const notes = again.gw.hub.log.read('schedule:timer:hello', 0).filter((e) => e.body.t === 'notice');
+    expect(notes.map((e) => (e.body as { message: string }).message)).toEqual([expect.stringMatching(/not delivered, not tried again: route fake:default:dm-alice is no longer in timer's schedule scope/)]);
+    expect(again.gw.schedules.registry.pending()).toEqual([]);
+    expect(again.chat.sent).toEqual([]);
   });
 });
 

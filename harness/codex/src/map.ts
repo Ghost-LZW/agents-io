@@ -1,4 +1,4 @@
-import { prefaceContext, type Audience, type BodyOf, type ContentBlock, type InputRecord, type ItemSummary, type Level, type PrefaceMemo } from '@agents-io/protocol';
+import { prefaceContext, type Audience, type BlobAccess, type BodyOf, type ContentBlock, type InputRecord, type ItemSummary, type Level, type PrefaceMemo } from '@agents-io/protocol';
 import type { ThreadItem } from './generated/v2/ThreadItem.js';
 import type { UserInput } from './generated/v2/UserInput.js';
 import type { TurnError } from './generated/v2/TurnError.js';
@@ -18,6 +18,14 @@ export type MediaResolver = (block: { ref: string; mime: string; name?: string; 
   | { path: string }
   | { url: string }
   | null;
+
+/** Media from the host's blob store as local paths (`localImage` / `localAudio`, or a path line for files); refs it does not hold resolve to nothing. */
+export function blobMediaResolver(blobs: BlobAccess): MediaResolver {
+  return async (block) => {
+    const st = await blobs.stat(block.ref);
+    return st ? { path: st.path } : null;
+  };
+}
 
 const text = (t: string): UserInput => ({ type: 'text', text: t, text_elements: [] });
 

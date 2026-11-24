@@ -21,7 +21,7 @@ export const WATCHDOG_CONTINUE =
   '[agents-io] That interruption was automatic, not the user: no reply came in time, so the model was switched. Please answer the message above.';
 
 /**
- * Idle deadline default (ms, HC-3b): within a turn that has had output, this long with no CLI
+ * Idle deadline default (ms, HC-8): within a turn that has had output, this long with no CLI
  * message at all (no stream, no tool event, no status) while it waits on the model ends the wait.
  * 90 s, a common stream idle deadline, is the starting value.
  */

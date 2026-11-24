@@ -77,8 +77,8 @@ export interface HostServiceDeps {
   answerOnBehalf?: boolean;
   /** Per-hook timeouts of the `resolve` / `review` / `outbound` / `contact` / `external` callouts (config `hostCallouts`). */
   calloutTimeouts?: { resolve?: number; review?: number; outbound?: number; contact?: number; external?: number };
-  /** The external MCP endpoint is on: `external.mcp` is advertised. */
-  externalMcp?: () => boolean;
+  /** The features of the modules that run (`ModuleManifest.features`; the external MCP module's `external.mcp`), advertised after the kernel's own. */
+  moduleFeatures?: () => readonly string[];
   /** `explain`: a routing record, a side effect by operationId, or (`chain`) an agent input's chain. */
   explain(inputId: string, chain: boolean): Outcome;
   /** Test hooks are on (`test.hooks` is advertised; HOSTS §4.3, SE-6). */
@@ -350,7 +350,7 @@ export class HostService implements HostFrames {
       bindings: { version: st?.table.version ?? null, active: st?.active ?? false, ...(st?.suspended ? { suspended: st.suspended } : {}) },
       ...(f.consumer !== undefined ? { inbound: { consumer: f.consumer, acked: this.d.queue.cursor(f.consumer), head: this.d.queue.head() } } : {}),
       ...(replaced !== undefined ? { replaced: { name: replaced } } : {}),
-      features: FEATURES.filter((x) => (x !== 'resolve.onBehalfOf' || this.d.answerOnBehalf) && (x !== 'external.mcp' || this.d.externalMcp?.() === true) && (x !== 'test.hooks' || this.d.testHooks?.() === true)),
+      features: [...FEATURES.filter((x) => (x !== 'resolve.onBehalfOf' || this.d.answerOnBehalf) && (x !== 'test.hooks' || this.d.testHooks?.() === true)), ...(this.d.moduleFeatures?.() ?? [])],
       ...(f.callouts !== undefined ? { callouts: role ? [...hooks] : [] } : {}),
       ...(role && hooks.has('outbound.scoped') ? { outboundScope: { revision: this.outboundScope()!.revision, routes: this.outboundScope()!.routes.length } } : {}),
       ...(f.optIn !== undefined ? { optIn: role ? [...optIn] : [] } : {}),
@@ -492,7 +492,7 @@ export class HostService implements HostFrames {
  * Capabilities `host.hello` advertises (a host must not rely on one this list lacks); `resolve.onBehalfOf` only with `policy.answerOnBehalf`.
  * `run.overrides`: `run.start.overrides` apply (or fail `bad_override`); `run.ended.usage`: `run.ended` carries `durationMs`,
  * `usage`, `turnId`, `inputId` and says `timeout`; `run.correlation`: `run.start.inputId` / `correlation`.
- * `callouts.external`: the `external` hook; `external.mcp` (only while the endpoint runs): the external MCP endpoint.
+ * `callouts.external`: the `external` hook (always: the external MCP endpoint's feature `external.mcp` is its module's, while it listens).
  * `callouts.review`: the `review` hook (a `model` resolver's review); `resolve.native`: `resolve` and `review` callouts carry
  * the harness's `native` request; `resolver.human.extras`: a human resolver's `timeoutMs`, `note` and `allowSessionAs`, and
  * a model resolver's `escalate`, apply. `session.compact`: the `session.compact` request (a quiet live session's harness
@@ -502,7 +502,8 @@ export class HostService implements HostFrames {
  * MCP tool items carry `tool { server, name }` while the host declared `outbound.scoped`, `outbound` + `outbound.content`,
  * or asked `optIn: ["item.tool"]` (granted in the result's `optIn`). `host-mcp.send_file.blob_scoped` (SE-7): `send_file`
  * sends a `blob` ref only when it appeared in the calling session (an input's content block, an attachment it sent);
- * any other ref is refused like a missing one.
+ * any other ref is refused like a missing one. These are the kernel's own; `host.hello` adds the features of the modules
+ * that run (`ModuleManifest.features`) after them.
  */
 export const FEATURES = [
   'session.launch',
@@ -520,7 +521,6 @@ export const FEATURES = [
   'run.ended.usage',
   'run.correlation',
   'callouts.external',
-  'external.mcp',
   'session.compact',
   'session.prewarm',
   'test.hooks',

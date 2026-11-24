@@ -2,15 +2,18 @@ import { get } from 'node:http';
 import { createConnection } from 'node:net';
 import { createInterface } from 'node:readline';
 
+/** The host CLI command that runs `tuiBridge` (`HarnessModule.cli`): `aio tui-bridge`. */
+export const TUI_BRIDGE_COMMAND = 'tui-bridge';
+
 /**
  * `aio tui-bridge` (decision 15, S2): a stdio MCP server Claude Code's TUI starts as its own child.
  * It offers no tools; it exists because a child of the TUI holds the TUI's inbox token
  * (`CLAUDE_CODE_MESSAGING_SOCKET` / `_TOKEN`), so what it writes there is delivered in any
- * permission mode. It keeps the daemon's stream for this TUI open (`AIO_TUI_URL/stream`) and writes
+ * permission mode. It keeps the host's stream for this TUI open (`AIO_TUI_URL/stream`) and writes
  * each message it gets into the inbox; it exits when the TUI closes its stdin, which closes the
- * stream and tells the daemon the TUI left.
+ * stream and tells the host the TUI left.
  */
-export async function tuiBridge(env: NodeJS.ProcessEnv = process.env): Promise<number> {
+export async function tuiBridge(env: Readonly<Record<string, string | undefined>> = process.env): Promise<number> {
   const url = env.AIO_TUI_URL;
   const sessionId = env.AIO_TUI_SESSION;
   const inbox = env.CLAUDE_CODE_MESSAGING_SOCKET;
