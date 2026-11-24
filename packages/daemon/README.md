@@ -198,7 +198,9 @@ see `docs/E2E.md` §0). New:
   `live_say { text }` and `live_leave` while some running channel implements
   `ChannelAdapter.openLive` (none of the public lark-bot, mail and bridge does: a deployment
   with only those has no `live_*`; checked at every request to the tool endpoint, so a channel
-  that comes up later brings them on the harness's next `tools/list`). That channel
+  that comes up later brings them on the harness's next `tools/list`), and `live_say` /
+  `live_leave` also while a live runs (one outlives its channel when that is removed or its
+  `start` ends, and is still spoken in and left). That channel
   (e.g. a meeting) provides the media peer, the session's
   Codex thread answers it with realtime v3 over WebRTC, and the audio flows between
   them, never through the daemon. What people say there is delegated by the voice
@@ -1339,10 +1341,13 @@ What changed for embedders with the live tools offered only where a live can be 
   `get_channel_context`'s `abilities.tools` leaves them out. It is
   asked at every request to the host MCP endpoint, so a channel started later (`console.liveChannels`,
   a module channel) brings them on the next `tools/list`, and one stopped or removed takes them
-  away. When they are offered they are listed byte for byte as before.
+  away; but `live_say` and `live_leave` stay while some session's live runs (a live outlives the
+  channel it opened on when that is removed or its `start` ends, unless its endpoint ends too, and
+  is still spoken in and left: LN-4). When they are offered they are listed byte for byte as before.
 - New: `ModuleInstance.offeredTools?()` (`@agents-io/protocol`; not a function fails the setup as
-  for `features`), `KernelContext.live.channels()`, `KernelBackend.liveChannels` (required, so this
-  breaks an embedder that implements it); in `@agents-io/host-mcp`, `ModuleTools.offered?()` and
+  for `features`), `KernelContext.live.channels()` and `running()` (the sessions with a live
+  running), `KernelBackend.liveChannels` and `liveSessions` (required, so this breaks an embedder
+  that implements it); in `@agents-io/host-mcp`, `ModuleTools.offered?()` and
   `HostTools.withheld()` (`HostMcpServer` asks it at every request; `toolCatalog` is still all the
   endpoint may offer). `KernelContext.agents.tools` is what an agent's sessions are offered now
   (without what a module withholds at the moment). An embedder that passes

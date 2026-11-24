@@ -869,6 +869,8 @@ export interface KernelBackend {
   leaveLive(sessionKey: string): Promise<boolean>;
   /** The running channels that can open a live (`KernelContext.live.channels`). */
   liveChannels(): string[];
+  /** The sessions with a running live (`KernelContext.live.running`). */
+  liveSessions(): string[];
   /** The tools an agent's sessions are offered (`KernelContext.agents.tools`). */
   agentTools(agent: string | undefined): string[];
   /** The agents a chat may talk to (`KernelContext.agents.names`). */
@@ -987,6 +989,7 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
       say: async (sessionKey, said, a) => live().sayLive(sessionKey, said, { operationId: text(a?.operationId, 'live.say: operationId'), turnId: text(a?.turnId, 'live.say: turnId') }),
       leave: async (sessionKey) => live().leaveLive(sessionKey),
       channels: () => [...live().liveChannels()],
+      running: () => [...live().liveSessions()],
     },
     agents: {
       names: () => [...live().agentNames()],

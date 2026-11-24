@@ -201,7 +201,8 @@ export interface ModuleTools {
   /**
    * Which of `tools` the endpoint offers now (default: all of them), asked at every request to it
    * (`HostTools.withheld`): one it leaves out is neither listed nor callable in that request (the
-   * daemon's `tools.live`: only while a running channel can open a live). A throw offers none.
+   * daemon's `tools.live`: only while a running channel can open a live, `live_say` / `live_leave`
+   * also while a live runs). A throw offers none.
    */
   offered?(): Iterable<string>;
 }

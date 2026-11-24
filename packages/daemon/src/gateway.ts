@@ -829,6 +829,7 @@ export class Gateway {
       sayLive: (key, text, a) => gw().sayLive(key, text, a),
       leaveLive: (key) => gw().leaveLive(key, 'left by the agent'),
       liveChannels: () => gw().liveChannels(),
+      liveSessions: () => [...gw().lives.keys()],
       agentTools: (agent) => gw().agentTools(agent),
       agentNames: () => gw().chatAgents(),
       identify: (a) => gw().router.identify(a),
@@ -2409,8 +2410,8 @@ export class Gateway {
   /**
    * The model tools an agent's sessions are offered now (`KernelContext.agents.tools`): its tools
    * list, or the endpoint's whole catalog for `tools: true`, but those a module withholds at the
-   * moment (`HostTools.withheld`: the live tools while no running channel can open a live); none
-   * without tools.
+   * moment (`HostTools.withheld`: the live tools while no running channel can open a live, but
+   * `live_say` / `live_leave` while a live runs); none without tools.
    */
   private agentTools(agent: string | undefined): string[] {
     const c = this.o.config;
@@ -2534,9 +2535,10 @@ export class Gateway {
   }
 
   /**
-   * The running channels that can open a live (`KernelContext.live.channels`; the live tools are
-   * offered only while there is one): `id:account`, in the order they started. One counts until its
-   * `start` ends or it is removed, also while it reconnects.
+   * The running channels that can open a live (`KernelContext.live.channels`; `live_join` is
+   * offered only while there is one, `live_say` / `live_leave` also while a live runs, `lives`):
+   * `id:account`, in the order they started. One counts until its `start` ends or it is removed,
+   * also while it reconnects; a live it opened is not ended with it.
    */
   private liveChannels(): string[] {
     return this.channels.filter((c) => !c.ended && typeof c.adapter.openLive === 'function').map((c) => `${c.adapter.id}:${c.account}`);

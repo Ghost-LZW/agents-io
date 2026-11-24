@@ -19,7 +19,8 @@ import { TOPIC_TOOLS_HINT } from '@agents-io/session';
  * `outputTools` decide as before (CF-6). The live tools are offered only while a running channel
  * can open a live (`KernelContext.live.channels`, asked at every request to the endpoint: ROADMAP
  * §1 principle 2, a tool the model cannot use is a burden), so a channel that comes up later brings
- * them on the harness's next `tools/list`.
+ * them on the harness's next `tools/list`; `live_say` and `live_leave` also while a live runs
+ * (`KernelContext.live.running`), which may outlive its channel (LN-4).
  */
 
 /** The section of one of the tool modules (`watchTools`, `scheduleTools`, `liveTools`, `topicTools`): only `enabled` (the daemon's). */
@@ -66,9 +67,15 @@ export const scheduleToolsModule: ModuleManifest<ToolModuleConfig> = {
 /** The live tools' names (`live_join`, `live_say`, `live_leave`). */
 const LIVE_TOOL_NAMES: readonly string[] = TOOL_GROUP_DEFS.live.map((t) => t.name);
 
+/** The live tools used in a live that runs: speaking there and leaving it. */
+const IN_LIVE_TOOL_NAMES: readonly string[] = LIVE_TOOL_NAMES.filter((n) => n !== 'live_join');
+
 /**
  * `live_*`: the agent joins a live (realtime voice) on a channel that can open one, speaks there,
- * leaves. Offered only while some running channel can open a live (`offeredTools`).
+ * leaves. Offered only while some running channel can open a live (`offeredTools`); `live_say` and
+ * `live_leave` also while a session's live runs: the kernel does not end a live when the channel it
+ * opened on is removed or its `start` ends (only its endpoint ending does), so it is still spoken in
+ * and left (LN-4).
  */
 export const liveToolsModule: ModuleManifest<ToolModuleConfig> = {
   id: 'tools.live',
@@ -82,7 +89,7 @@ export const liveToolsModule: ModuleManifest<ToolModuleConfig> = {
       say: (sessionKey, text, a) => k.live.say(sessionKey, text, a),
       leave: (sessionKey) => k.live.leave(sessionKey),
     }),
-    offeredTools: () => (k.live.channels().length ? LIVE_TOOL_NAMES : []),
+    offeredTools: () => (k.live.channels().length ? LIVE_TOOL_NAMES : k.live.running().length ? IN_LIVE_TOOL_NAMES : []),
   }),
 };
 

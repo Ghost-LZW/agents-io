@@ -479,7 +479,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     expect(w.gw.adminStatus().modules).toEqual([{ id: 'probe', origin: 'module', enabled: false }]);
   });
 
-  it('offeredTools: asked at every request to the endpoint, a module offers only those of its tools it names then (other names ignored), agents.tools too; a throw is logged and offers none; live.channels names the running channels that can open a live (none here)', async () => {
+  it('offeredTools: asked at every request to the endpoint, a module offers only those of its tools it names then (other names ignored), agents.tools too; a throw is logged and offers none; live.channels names the running channels that can open a live, live.running the sessions in a live (none here)', async () => {
     let now: string[] = [];
     let boom = false;
     const logs: string[] = [];
@@ -510,6 +510,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     expect(await listed(mcp)).toEqual(KERNEL_TOOL_NAMES);
     expect(logs).toContain('warn module probe: offeredTools failed: boom');
     expect(k.live.channels()).toEqual([]);
+    expect(k.live.running()).toEqual([]);
   });
 
   it('a module an alias turns off (console: { enabled: false }, policy.strangers: "drop") is never set up: no features, no status of its own', async () => {

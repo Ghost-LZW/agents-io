@@ -355,10 +355,11 @@ export interface ModuleInstance {
   /**
    * Which of the manifest's `mcpTools` the host's endpoint offers now (default: all of them): for a
    * tool the model cannot use without something that comes and goes (the live tools: a running
-   * channel that can open a live). Asked at every request a harness sends the endpoint, so a tool
-   * appears on the harness's next `tools/list` once it can be used, and is gone from the next one
-   * after; one not offered at a request is not callable in it either. Names that are not the
-   * manifest's are ignored; a throw offers none of its tools (logged).
+   * channel that can open a live, or for `live_say` / `live_leave` a live that runs). Asked at
+   * every request a harness sends the endpoint, so a tool appears on the harness's next
+   * `tools/list` once it can be used, and is gone from the next one after; one not offered at a
+   * request is not callable in it either. Names that are not the manifest's are ignored; a throw
+   * offers none of its tools (logged).
    */
   offeredTools?(): readonly string[];
   /** A handler for each of the manifest's `commands`, by name (exactly those; its `aliases` run the same handler). */
@@ -710,6 +711,12 @@ export interface KernelContext {
      * removed (also while it reconnects).
      */
     channels(): string[];
+    /**
+     * The sessions with a live running now, by key, in the order they joined. A live may outlive
+     * the channel it opened on (the channel removed, its `start` ended): it runs, and is spoken in
+     * and left, until one of its ends ends it (LN-4).
+     */
+    running(): string[];
   };
   /** The deployment's agents. */
   readonly agents: {

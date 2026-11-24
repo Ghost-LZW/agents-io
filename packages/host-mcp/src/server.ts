@@ -165,7 +165,7 @@ export class HostMcpServer {
   private build(b: ToolBinding, allow?: ReadonlySet<string>): McpServer {
     const server = new McpServer({ name: SERVER_NAME, version: '0.1.0' }, { capabilities: { tools: {} } });
     // Asked now, for this request: a module's tool it does not offer at the moment (the live tools
-    // while no running channel can open a live) is neither listed nor callable in it (CF-6).
+    // while no running channel can open a live and no live runs) is neither listed nor callable in it (CF-6).
     const withheld = this.o.tools.withheld();
     let registered = 0;
     for (const def of this.catalog) {
