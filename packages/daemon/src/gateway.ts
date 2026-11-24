@@ -2639,9 +2639,11 @@ ${a.summary}` }],
    */
   private turnCompleted(sessionKey: string, turnId: string, status: Parameters<ModuleHost['turnCompleted']>[0]['status'], checked: boolean): void {
     if (!checked) return this.modules.turnCompleted({ sessionKey, turnId, status });
-    void this.checkedSettled(sessionKey, turnId).then(() => {
-      if (!this.stopped) this.modules.turnCompleted({ sessionKey, turnId, status });
-    });
+    void this.checkedSettled(sessionKey, turnId)
+      .catch((e) => this.log('warn', `${sessionKey}: waiting for the checked answer of ${turnId} failed: ${(e as Error).message}`))
+      .then(() => {
+        if (!this.stopped) this.modules.turnCompleted({ sessionKey, turnId, status });
+      });
   }
 
   /** How many watches and schedules a session's agent keeps (created as `agentIdentity`): get_channel_context's `abilities`. */
