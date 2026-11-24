@@ -5,11 +5,9 @@ import { Type } from '@sinclair/typebox';
 import { describe, expect, it } from 'vitest';
 import type { HarnessModule, HarnessModuleInit } from '@agents-io/protocol';
 import { FakeChannel, FakeHarness } from '@agents-io/testkit';
-import { LocalClient } from '../src/client.js';
-import { ConfigError, configFileSchema, ConfigFile, resolveConfig, type HarnessInstance } from '../src/config.js';
+import { ConfigError, type HarnessInstance, HarnessRegistry, LocalClient } from '@agents-io/kernel';
+import { buildHarness, ConfigFile, configFileSchema, Gateway, resolveConfig } from '../src/defaults.js';
 import { builtinHarnesses } from '../src/bundle.js';
-import { buildHarness, Gateway } from '../src/gateway.js';
-import { HarnessRegistry } from '../src/harness-registry.js';
 import { cleanups, tmp, until } from './helpers.js';
 
 /*

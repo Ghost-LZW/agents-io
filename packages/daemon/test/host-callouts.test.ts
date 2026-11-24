@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { FakeTurnScript } from '@agents-io/testkit';
 import type { ReplyRoute } from '@agents-io/protocol';
-import { calloutHooks } from '../src/host.js';
+import { calloutHooks } from '@agents-io/kernel';
 import { closeAndWait, daemon, until, type World } from './helpers.js';
 
 /*

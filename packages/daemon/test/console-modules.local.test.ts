@@ -1,24 +1,25 @@
 import { join } from 'node:path';
 import { Type, type TObject } from '@sinclair/typebox';
 import { describe, expect, it } from 'vitest';
-import type { AdminContribution, AdminRoute, ChannelModule } from '@agents-io/protocol';
+import type { AdminContribution, AdminRoute, ChannelModule, HarnessModule } from '@agents-io/protocol';
 import { bridgeChannelModule } from '@agents-io/channel-jsonl-bridge';
 import { CREATE_LARK_BOT, larkBotChannelModule } from '@agents-io/channel-lark-bot';
 import { mailChannelModule } from '@agents-io/channel-mail';
 import { FakeChannel, FakeHarness } from '@agents-io/testkit';
 import { builtinChannels, builtinHarnesses, CREATE_LARK_BOT as DEPRECATED_CREATE_LARK_BOT } from '../src/bundle.js';
-import { ChannelRegistry } from '../src/channel-registry.js';
-import { ConfigError, ConfigFile, configFileSchema, consoleSettings, resolveConfig, type HarnessInstance } from '../src/config.js';
-import { Gateway, InstanceHarness } from '../src/gateway.js';
+import { ChannelRegistry, ConfigError, consoleSettings, type HarnessInstance, HarnessRegistry } from '@agents-io/kernel';
+import { ConfigFile, configFileSchema, Gateway, InstanceHarness, resolveConfig } from '../src/defaults.js';
 import { cleanups, tmp } from './helpers.js';
 
 /*
- * What channel types contribute to the console (`ChannelModule.admin`): the registry checks it,
- * config.ts merges the settings into the closed `console` section, the gateway mounts it.
+ * What channel types and harness kinds contribute to the console (`ChannelModule.admin`,
+ * `HarnessModule.admin`): the registries check it, config.ts merges the settings into the closed
+ * `console` section, the gateway mounts it.
  */
 
 const route = (over: Partial<AdminRoute> = {}): AdminRoute => ({ method: 'GET', path: '/api/notes/:id', status: 200, response: Type.Object({}), handle: () => ({ status: 200, body: {} }), ...over });
 const notes = (admin: AdminContribution, type = 'notes'): ChannelModule => ({ type, entry: {}, resolve: (e) => e, create: () => ({ adapter: new FakeChannel(type) }), admin });
+const notebook = (admin: AdminContribution, kind = 'notebook'): HarnessModule => ({ kind, schema: Type.Object({}), create: () => new FakeHarness(), admin });
 
 describe('the registry checks admin contributions', () => {
   it('refuses members that are not an AdminContribution\'s, naming the type and the member', () => {
@@ -54,6 +55,37 @@ describe('the registry checks admin contributions', () => {
     const own = new ChannelRegistry([notes({ console: { port: Type.Integer() } })]);
     expect(() => configFileSchema(builtinHarnesses, own)).toThrow('channel type "notes": admin setting console.port is the console\'s own');
     expect(builtinChannels.adminContributions.map((c) => c.type)).toEqual(['lark-bot']);
+  });
+});
+
+describe('the harness registry checks admin contributions too', () => {
+  it('refuses members that are not an AdminContribution\'s, naming the kind and the member', () => {
+    expect(() => new HarnessRegistry([notebook('routes' as never)])).toThrow('harness kind "notebook": bad admin (an object when present)');
+    expect(() => new HarnessRegistry([notebook({ routes: [route({ public: true })] })])).toThrow('harness kind "notebook": bad admin.routes[0].public (a module route always needs credentials)');
+    expect(() => new HarnessRegistry([notebook({ mount: true as never })])).toThrow('harness kind "notebook": bad admin.mount (a function when present)');
+    expect(new HarnessRegistry([notebook({ routes: [route()] }), notebook({}, 'other')]).adminContributions.map((c) => c.kind)).toEqual(['notebook', 'other']);
+    expect(builtinHarnesses.adminContributions).toEqual([]);
+  });
+
+  it('a route, a console setting or a schema belongs to one kind or type, across the two registries; a core endpoint or console key to the console', () => {
+    expect(() => new HarnessRegistry([notebook({ routes: [route({ path: '/api/status' })] })])).toThrow('harness kind "notebook": admin route GET /api/status is the console\'s own');
+    expect(() => new HarnessRegistry([notebook({ routes: [route()] }), notebook({ routes: [route({ path: '/api/notes/:key' })] }, 'more')])).toThrow('harness kinds "notebook" and "more" both contribute admin route GET /api/notes/:key');
+    // Against the channel types' where both registries meet: the config file schema (and the gateway's console).
+    const lark = (admin: AdminContribution) => () => configFileSchema(new HarnessRegistry([notebook(admin)]), builtinChannels);
+    expect(lark({ console: { larkBotCommand: Type.String() } })).toThrow('channel type "lark-bot" and harness kind "notebook" both contribute admin setting console.larkBotCommand');
+    expect(lark({ routes: [route({ method: 'POST', path: '/api/bots/lark' })] })).toThrow('channel type "lark-bot" and harness kind "notebook" both contribute admin route POST /api/bots/lark');
+    expect(lark({ schemas: { AdminLarkBotJob: Type.Object({}) } })).toThrow('channel type "lark-bot" and harness kind "notebook" both contribute admin schema AdminLarkBotJob');
+    expect(() => configFileSchema(new HarnessRegistry([notebook({ console: { port: Type.Integer() } })]))).toThrow('harness kind "notebook": admin setting console.port is the console\'s own');
+  });
+
+  it('its settings join the console section after the channel types\'', () => {
+    const base = { env: {}, baseDir: '/base', cwd: '/work' };
+    const harnesses = new HarnessRegistry([notebook({ console: { notebookPages: Type.Integer({ default: 10 }) } })]);
+    const keys = Object.keys(((configFileSchema(harnesses, builtinChannels).properties.console as TObject).properties));
+    expect(keys.slice(-3)).toEqual(['larkBotCommand', 'notebookPages', 'liveChannels']);
+    expect(resolveConfig({}, { ...base, harnessRegistry: harnesses }).console).toMatchObject({ notebookPages: 10 });
+    expect(resolveConfig({ console: { notebookPages: 3 } }, { ...base, harnessRegistry: harnesses }).console).toMatchObject({ notebookPages: 3 });
+    expect(() => resolveConfig({ console: { notebookPages: 'x' } }, { ...base, harnessRegistry: harnesses })).toThrow(/invalid config: .*console/);
   });
 });
 

@@ -5,9 +5,8 @@ import { describe, expect, it } from 'vitest';
 import type { BodyOf, ChainExplanation, EffectExplanation, RouteExplanation, SessionEvent } from '@agents-io/protocol';
 import { agentInput } from '@agents-io/session';
 import { FakeChannel, FakeHarness, type FakeTurnScript } from '@agents-io/testkit';
-import { ConfigError, resolveConfig, type HarnessInstance } from '../src/config.js';
-import { Gateway, InstanceHarness } from '../src/gateway.js';
-import { DaemonRecords } from '../src/records.js';
+import { ConfigError, DaemonRecords, type HarnessInstance } from '@agents-io/kernel';
+import { Gateway, InstanceHarness, resolveConfig } from '../src/defaults.js';
 import { cleanups, daemon, tmp, until } from './helpers.js';
 import { CONV, alice, turnsIn, world as topicsWorld } from './topics-helpers.js';
 

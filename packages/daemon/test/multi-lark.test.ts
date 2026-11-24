@@ -3,8 +3,8 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { Deliver } from '@agents-io/protocol';
 import { FakeChannel, FakeHarness, type FakeTurnScript } from '@agents-io/testkit';
-import { resolveConfig, type HarnessInstance } from '../src/config.js';
-import { Gateway, InstanceHarness } from '../src/gateway.js';
+import type { HarnessInstance } from '@agents-io/kernel';
+import { Gateway, InstanceHarness, resolveConfig } from '../src/defaults.js';
 import { cleanups, tmp, until } from './helpers.js';
 
 /*

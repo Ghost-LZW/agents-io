@@ -6,7 +6,8 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { HostEventFrame, check, type InputRecord, type SessionEvent } from '@agents-io/protocol';
 import { globMatch } from '@agents-io/host-mcp';
-import { ConfigError, resolveConfig } from '../src/config.js';
+import { ConfigError } from '@agents-io/kernel';
+import { resolveConfig } from '../src/defaults.js';
 import { EXTERNAL_EVENT } from '../src/external-mcp.js';
 import { cleanups, daemon, tmp, until, type World } from './helpers.js';
 

@@ -5,8 +5,7 @@ import { describe, expect, it } from 'vitest';
 import type { SessionEvent } from '@agents-io/protocol';
 import { MemorySessionLog } from '@agents-io/session';
 import { FakeChannel, FakeHarness, defaultChannelCaps, type FakeTurnScript } from '@agents-io/testkit';
-import { resolveConfig } from '../src/config.js';
-import { Gateway } from '../src/gateway.js';
+import { Gateway, resolveConfig } from '../src/defaults.js';
 import { cleanups, until } from './gateway-helpers.js';
 
 /*

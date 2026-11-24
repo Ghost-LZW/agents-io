@@ -7,11 +7,9 @@ import { bridgeChannelModule } from '@agents-io/channel-jsonl-bridge';
 import { larkBotChannelModule } from '@agents-io/channel-lark-bot';
 import { FakeChannel, FakeHarness } from '@agents-io/testkit';
 import { builtinChannels, builtinHarnesses } from '../src/bundle.js';
-import { ChannelRegistry, CORE_CHANNEL_IDS } from '../src/channel-registry.js';
-import { ConfigError, ConfigFile, configFileSchema, RESERVED_CHANNEL_IDS, resolveConfig, type HarnessInstance } from '../src/config.js';
+import { ChannelRegistry, ConfigError, CORE_CHANNEL_IDS, type HarnessInstance } from '@agents-io/kernel';
+import { ConfigFile, configFileSchema, ConfigStore, Gateway, InstanceHarness, isCredential, RESERVED_CHANNEL_IDS, resolveConfig } from '../src/defaults.js';
 import { exitCodeFor } from '../src/cli.js';
-import { ConfigStore, isCredential } from '../src/console-config.js';
-import { Gateway, InstanceHarness } from '../src/gateway.js';
 import { cleanups, tmp } from './helpers.js';
 
 /*
@@ -279,7 +277,7 @@ describe('what the registry says of an entry', () => {
     expect(isCredential(doc, ['channels', 2, 'config', 'encryptKey'], new ChannelRegistry([larkBotChannelModule]))).toBe(true);
   });
 
-  it('a literal credential is answered with its type\'s advice where it has one (credentialHint: a bridge argument), else the host\'s', () => {
+  it('a literal credential is answered with its type\'s advice where it has one (credentialHint: a bridge argument), else the host\'s', async () => {
     const vault: ChannelModule = {
       type: 'vault',
       entry: { code: Type.String({ 'x-credential': true }), pin: Type.Optional(Type.String({ 'x-credential': true })) },
@@ -298,13 +296,13 @@ describe('what the registry says of an entry', () => {
     const inline = (issues: { code: string; path: string; message: string; severity: string }[]) => issues.filter((i) => i.code === 'inline_secret').map((i) => [i.path, i.severity, i.message]);
     const bridgeArg = 'a secret on the bridge command line is visible to other local users (ps); pass it in the bridge env ("env": { "NAME": "env:NAME" })';
     // Stored in the file: warnings.
-    expect(inline(s.document().issues)).toEqual([
+    expect(inline((await s.document()).issues)).toEqual([
       ['/channels/0/args/1', 'warning', bridgeArg],
       ['/channels/1/code', 'warning', 'vault codes come from the vault agent'],
       ['/channels/1/pin', 'warning', 'a literal secret is stored in the config file; move it to the env file and reference it as "env:NAME"'],
     ]);
     // New ones: errors, the same advice.
-    expect(inline(s.validate({ channels }).issues)).toEqual([
+    expect(inline((await s.validate({ channels })).issues)).toEqual([
       ['/channels/0/args/1', 'error', bridgeArg],
       ['/channels/1/code', 'error', 'vault codes come from the vault agent'],
       ['/channels/1/pin', 'error', 'secrets do not go into the config file: put the value in the env file (or the environment) and write "env:NAME"'],

@@ -6,6 +6,8 @@
     { "path": "../protocol" },
     { "path": "../session" },
     { "path": "../host-mcp" },
+    { "path": "../kernel" },
+    { "path": "../console" },
     { "path": "../../harness/claude-code" },
     { "path": "../../harness/codex" },
     { "path": "../../harness/jsonl-bridge" },

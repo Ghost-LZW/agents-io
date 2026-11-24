@@ -32,7 +32,7 @@
 
 `scripts/boundaries.mjs` 也只读文本，守核心与模块的边界（`docs/design/core-slimming/` §6）：
 
-- `pnpm boundaries:check`：核心文件新增了不该有的包引用（`import:<包>`），或多了具体模块的名字（`vendor`：标识符里带 lark / codex / claude 等词，字符串等于模块 id）。分类在 `scripts/boundaries.json`，已知违例在 `scripts/boundaries.baseline.json`。计数高于基线就报错，退出码 1。
+- `pnpm boundaries:check`：核心文件新增了不该有的包引用（`import:<包>`），或多了具体模块的名字（`vendor`：标识符里带 lark / codex / claude 等词，字符串等于模块 id）；包的 `package.json` 依赖了不该依赖的工作区包（`dep:<包>`：生产依赖不在它的许可列表里，或者组合根之外的核心包在任何依赖里写了模块包，没有 import 也算）。分类在 `scripts/boundaries.json`，已知违例在 `scripts/boundaries.baseline.json`。计数高于基线就报错，退出码 1。守卫自己的测试是 `packages/kernel/test/boundaries.local.test.ts`（`--root` 指向临时的工作区）。
 - 基线只降不升：修掉违例后跑 `node scripts/boundaries.mjs shrink` 把新计数写进基线。新违例不许加进基线，要在代码里修掉。`report` 按文件列出现有计数。
 
 ## 给改 agents-io 的人和 agent 的规则
@@ -41,7 +41,7 @@
 2. 改完：总是跑受影响编号的 core 测试（`affected` 打印的命令），再跑 `pnpm test`（core + local，几秒）和 `pnpm boundaries:check`。
 3. **core 红了 = 可能打破了一条承诺。** 先读那条不变量。是有意改变承诺的，先改 INVARIANTS（和相关决定），再改测试；不允许只改断言让它变绿。确实是测试写错了的，要能说清为什么。
 4. **local 红了 = 一个细节变了。** 确认是有意改的，就删掉或重写这个测试；它不是信任的来源。
-5. `affected` 命中的编号在 e2e 里有测试，或改动碰了传输与生命周期代码（`packages/daemon/src/gateway.ts`、`channel/jsonl-bridge/src`、`harness/*/src`）：跑 `pnpm test:e2e`。合并到 `main` 前无论如何跑一次。
+5. `affected` 命中的编号在 e2e 里有测试，或改动碰了传输与生命周期代码（`packages/kernel/src/gateway.ts`、`channel/jsonl-bridge/src`、`harness/*/src`）：跑 `pnpm test:e2e`。合并到 `main` 前无论如何跑一次。
 6. 改了通道或 harness 适配器：列出要跑的 live 项（`pnpm test:live` 加对应环境变量、`pnpm e2e --only …`（即 `aio-e2e`，`packages/daemon-e2e`）、`docs/E2E.md` 的手工步骤）交给人，写明没跑。
 7. 新承诺：先在 INVARIANTS 写一节、给编号，再写带标签的测试。新功能没有承诺的，测试放 `*.local.test.ts`。
 8. 发现一条不成立的路径：先写 `it.fails`，在 INVARIANTS 的"不成立"里记一条，再决定修不修。

@@ -181,8 +181,12 @@ export const AdminConfigDocument = Type.Object({
   config: AdminConfigBody,
   /** Problems of the document as it is on disk (the running daemon may be on an older, valid one). */
   issues: Type.Array(ConfigIssue),
-  /** Every `env:NAME` the document references, and whether the daemon's environment / env file sets it. Values are never shown. */
-  env: Type.Array(Type.Object({ name: Type.String(), set: Type.Boolean() })),
+  /**
+   * Every `env:NAME` the document references, then every variable a channel entry reads without
+   * naming it (`ChannelModule.implicitEnv`, marked `implicit`), and whether the daemon's
+   * environment / env file sets it. Values are never shown.
+   */
+  env: Type.Array(Type.Object({ name: Type.String(), set: Type.Boolean(), implicit: Type.Optional(Type.Boolean()) })),
 });
 export type AdminConfigDocument = Static<typeof AdminConfigDocument>;
 

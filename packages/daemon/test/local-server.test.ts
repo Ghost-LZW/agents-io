@@ -4,9 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FakeHarness } from '@agents-io/testkit';
-import { resolveConfig } from '../src/config.js';
-import { Gateway } from '../src/gateway.js';
-import { LocalServer, type LocalHost } from '../src/local-server.js';
+import { type LocalHost, LocalServer } from '@agents-io/kernel';
+import { Gateway, resolveConfig } from '../src/defaults.js';
 
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {

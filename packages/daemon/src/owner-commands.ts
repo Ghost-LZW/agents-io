@@ -1,5 +1,5 @@
 import type { KernelContext, KernelSessionRun, ModuleCommandDef, ModuleCommandHandler, ModuleManifest } from '@agents-io/protocol';
-import { FIXED_SESSION } from './commands.js';
+import { FIXED_SESSION } from '@agents-io/kernel';
 
 /*
  * The owner's run-config chat commands, as a built-in feature module (core-slimming G6 step 5;
@@ -11,9 +11,11 @@ import { FIXED_SESSION } from './commands.js';
  * 16): on unless `ownerCommands: { enabled: false }`; off, these `/names` are ordinary messages and
  * `/status` has no Plan line. What is set stays the kernel's (`KernelContext.runConfig`: kept in its
  * records, applied over the agent's policy's plan, also while this module is off), and so do the
- * presets as configured (`presets`, an agent's `preset`, `run.start` `overrides.preset`) and the
  * IO-control commands (`/help`, `/status`, `/stop`, `/steer`, `/answer`, `/new`, `/topics`,
- * `/switch`, `/tui`). Every reply is as it was when the kernel answered these commands (CT-2).
+ * `/switch`, `/tui`). The presets are the presets module's (`presets.ts`: named run defaults,
+ * `ModuleManifest.runDefaults`): `/preset` lists them and sets one through `runConfig`
+ * (`presets()`, `set`), which asks that module what a name gives; in a build without it there are
+ * none. Every reply is as it was when the kernel answered these commands (CT-2).
  */
 
 /** The `ownerCommands` section of the config file: only `enabled` (the daemon's). */

@@ -3,8 +3,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { FakeChannel, FakeHarness } from '@agents-io/testkit';
-import { resolveConfig, type HarnessInstance } from '../src/config.js';
-import { Gateway, InstanceHarness } from '../src/gateway.js';
+import type { HarnessInstance } from '@agents-io/kernel';
+import { Gateway, InstanceHarness, resolveConfig } from '../src/defaults.js';
 import { cleanups, tmp, until } from './helpers.js';
 
 /* `type: "module"` channels and `use: "module"` harnesses: adapters loaded from an external ES module (fixtures/chan-*, fixtures/harness-*). */

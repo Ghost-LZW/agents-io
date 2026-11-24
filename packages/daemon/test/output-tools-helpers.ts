@@ -4,9 +4,8 @@ import { join } from 'node:path';
 import type { SessionEvent } from '@agents-io/protocol';
 import { MemorySessionLog } from '@agents-io/session';
 import { FakeChannel, FakeHarness, type FakeTurnScript } from '@agents-io/testkit';
-import { LocalClient } from '../src/client.js';
-import { resolveConfig } from '../src/config.js';
-import { Gateway } from '../src/gateway.js';
+import { LocalClient } from '@agents-io/kernel';
+import { Gateway, resolveConfig } from '../src/defaults.js';
 import { cleanups } from './helpers.js';
 
 type Mcp = { url: string; token: string } | undefined;

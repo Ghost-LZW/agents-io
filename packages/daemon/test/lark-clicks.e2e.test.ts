@@ -7,9 +7,8 @@ import { LarkBotAdapter } from '@agents-io/channel-lark-bot';
 import { MemorySessionLog } from '@agents-io/session';
 import { FakeHarness, type FakeTurnScript } from '@agents-io/testkit';
 import { FakeLark, messageEvent } from '../../../channel/lark-bot/test/fake-lark.js';
-import { LocalClient } from '../src/client.js';
-import { resolveConfig } from '../src/config.js';
-import { Gateway } from '../src/gateway.js';
+import { LocalClient } from '@agents-io/kernel';
+import { Gateway, resolveConfig } from '../src/defaults.js';
 
 /* Lark card clicks arrive as conversation kind `other` (no DM/thread info): they must still reach the owning session. */
 

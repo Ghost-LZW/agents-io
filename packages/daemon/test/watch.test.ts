@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { PROTOCOL_VERSION, type BodyOf } from '@agents-io/protocol';
-import { parseClientFrame } from '../src/frames.js';
+import { parseClientFrame } from '../../kernel/src/frames.js';
 import { tmp, until } from './helpers.js';
 import { config, eve, group, start } from './watch-helpers.js';
 

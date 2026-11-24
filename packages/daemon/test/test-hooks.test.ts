@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { HOST_RESULT_VALUES, errors, type SessionEvent } from '@agents-io/protocol';
-import { testHooksFromEnv } from '../src/test-hooks.js';
+import { testHooksFromEnv } from '@agents-io/kernel';
 import { daemon, until, type World } from './helpers.js';
 
 /*

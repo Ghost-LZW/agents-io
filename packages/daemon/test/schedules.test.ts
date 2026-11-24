@@ -1,8 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ModuleManifest } from '@agents-io/protocol';
 import type { FakeTurnScript } from '@agents-io/testkit';
-import { FEATURES } from '../src/host.js';
-import { ModuleRegistry } from '../src/modules.js';
+import { FEATURES, ModuleRegistry } from '@agents-io/kernel';
 import { daemon, until } from './helpers.js';
 
 // Config schedules reach their session as a turn, survive a restart, and a host schedule lands in the host queue.

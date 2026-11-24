@@ -12,13 +12,17 @@ import { coreRegistries } from '../src/core.js';
 import { Gateway } from '../src/gateway.js';
 import { FEATURES } from '../src/host.js';
 import { readTokenFile, tokenPath } from '../src/token.js';
+// The console is its own core package, which depends on the kernel: reached by path, not as a dependency.
+import { consoleFactory } from '../../console/src/index.js';
 import { cleanups, closeAndWait, tmp, until } from './helpers.js';
 
 /*
- * The kernel without modules is a product of its own (core-slimming §5): registries with nothing
- * registered (`coreRegistries`, no module package and not bundle.ts), and the channel and harness
- * the embedder passes (here testkit's FakeChannel and FakeHarness). The kernel's promises hold end
- * to end, and nothing a module adds is there. This file imports no module package either.
+ * The kernel without modules is a product of its own (core-slimming §5): the kernel package alone
+ * (`@agents-io/kernel`: no module package, not `@agents-io/daemon`), registries with nothing
+ * registered (`coreRegistries`), and the channel and harness the embedder passes (here testkit's
+ * FakeChannel and FakeHarness); its console API is the console package's (`@agents-io/console`,
+ * `GatewayOptions.consoleFactory`), as an embedder would give it. The kernel's promises hold end to
+ * end, and nothing a module adds is there. This file imports no module package either.
  */
 
 const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };
@@ -57,7 +61,7 @@ async function core(o: { dir?: string; raw?: Record<string, unknown>; script?: F
     ...(o.policy ? { policy: o.policy } : {}),
     hostPush: { timeoutMs: 300, retryMs: 20 },
     logger: () => {},
-    ...(o.console ? { console: true, consoleEnv: {} } : {}),
+    ...(o.console ? { console: true, consoleFactory, consoleEnv: {} } : {}),
   });
   let stopped = false;
   const stop = async () => {
@@ -334,5 +338,29 @@ describe('the kernel with no modules (coreRegistries, the embedder\'s channel an
     const started = Gateway.start({ config, ...registries, listen: false, logger: () => {} });
     await expect(started).rejects.toBeInstanceOf(ConfigError);
     await expect(started).rejects.toThrow(`harness instance ${EMBEDDED_HARNESS} stands for the embedder's adapter (no harness kind is registered): pass it to Gateway.start (GatewayOptions.harness or buildHarness)`);
+  });
+
+  it('presets are a module\'s (named run defaults): with none registered, a config naming one fails the load, saying no registered module provides presets (their section is an unknown key); a task run naming one is refused with bad_override and nothing runs #CF-4 #RN-2', async () => {
+    const dir = tmp('aio-core-');
+    const load = (raw: Record<string, unknown>) => {
+      try {
+        resolveConfig(raw, { env: {}, baseDir: dir, cwd: dir, ...coreRegistries() });
+      } catch (e) {
+        expect(e).toBeInstanceOf(ConfigError);
+        return (e as Error).message;
+      }
+      throw new Error('loaded');
+    };
+    expect(load({ presets: { fast: { harness: EMBEDDED_HARNESS } } })).toBe('invalid config: /presets: Unexpected property; presets: not a key of the config, and no registered module has a section of that name');
+    expect(load({ agents: { a: { preset: 'fast' } } })).toBe('agents.a.preset: unknown preset "fast" (no registered module provides presets)');
+
+    const w = await core({ raw: { agents: { exec: { harness: EMBEDDED_HARNESS, mode: 'task' } } } });
+    const h = await w.host();
+    const input = [{ type: 'text' as const, text: 'go' }];
+    await expect(h.runStart({ runId: 'p', agent: 'exec', input, overrides: { preset: 'fast' } })).rejects.toMatchObject({ code: 'bad_override', message: expect.stringMatching(/unknown preset "fast" \(no registered module provides presets\)$/) });
+    expect(w.gw.hub.log.head('run:p')).toBe(0);
+    expect(w.harness.sessions).toHaveLength(0);
+    // Without it the run runs on the agent's own.
+    expect((await h.runStart({ runId: 'q', agent: 'exec', input })).run).toMatchObject({ harness: EMBEDDED_HARNESS });
   });
 });

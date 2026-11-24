@@ -8,13 +8,23 @@ import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import type { Attention, RenderedMessage, ReplyRoute, RunEnded, RunStart, SessionEvent, SessionLaunch, SessionScope, Tier, TuiAttach } from '@agents-io/protocol';
 import { runAttach } from './attach.js';
-import { CommandError, DaemonUnavailable, LocalClient } from './client.js';
-import { ConfigError, loadConfig, type LoadOptions } from './config.js';
-import { consoleProof } from './console.js';
-import { Gateway } from './gateway.js';
-import { testHooksFromEnv } from './test-hooks.js';
-import { TokenError, consoleUrlPath, readTokenFile, tokenPath } from './token.js';
+import {
+  CommandError,
+  ConfigError,
+  DaemonUnavailable,
+  LocalClient,
+  TokenError,
+  consoleUrlPath,
+  harnessModuleCommands,
+  readTokenFile,
+  testHooksFromEnv,
+  tokenPath,
+  type LoadOptions,
+  type ModuleLaunch,
+} from '@agents-io/kernel';
+import { consoleProof } from '@agents-io/console';
 import { builtinHarnesses } from './bundle.js';
+import { Gateway, loadConfig, loadConfigModules } from './defaults.js';
 import { WATCH_SPEC_HELP, formatWatch, parseDuration, parseWatchSpec } from './watch-spec.js';
 
 const USAGE = `aio: the agents-io daemon and its CLI
@@ -157,13 +167,17 @@ function need(a: CliArgs, k: string): string {
   return v;
 }
 
-function config(a: CliArgs, extra: Partial<LoadOptions> = {}) {
-  return loadConfig({
+/** Where the config is and how to read it, from the common options. */
+function loadOptions(a: CliArgs): LoadOptions {
+  return {
     ...(str(a, 'config') ? { path: str(a, 'config') } : {}),
     ...(str(a, 'env-file') ? { envFile: str(a, 'env-file') } : {}),
     ...(str(a, 'harness') ? { harness: str(a, 'harness') } : {}),
-    ...extra,
-  });
+  };
+}
+
+function config(a: CliArgs, extra: Partial<LoadOptions> = {}) {
+  return loadConfig({ ...loadOptions(a), ...extra });
 }
 
 /** The daemon's socket: --socket, $AIO_SOCKET, else the config's `socketPath`. */
@@ -211,12 +225,21 @@ function json<T>(text: string, what: string): T {
 const print = (v: unknown) => console.log(JSON.stringify(v, null, 2));
 
 async function serve(a: CliArgs): Promise<number> {
-  const c = config(a);
+  // The modules the config names (`modules`, module channel files) first: what they say about the config is read as it resolves.
+  const registries = await loadConfigModules(loadOptions(a));
+  const c = config(a, registries);
   const tokenFile = str(a, 'token-file');
   let gw: Gateway;
   try {
     // Test hooks only from the daemon's own environment, never from the config file (SE-6).
-    gw = await Gateway.start({ config: c, console: c.console.enabled, ...(tokenFile ? { tokenFile: resolve(tokenFile) } : {}), ...(testHooksFromEnv(process.env) ? { testHooks: true } : {}), logger: (level, msg) => console.error(`[aio] ${level}: ${msg}`) });
+    gw = await Gateway.start({
+      config: c,
+      ...registries,
+      console: c.console.enabled,
+      ...(tokenFile ? { tokenFile: resolve(tokenFile) } : {}),
+      ...(testHooksFromEnv(process.env) ? { testHooks: true } : {}),
+      logger: (level, msg) => console.error(`[aio] ${level}: ${msg}`),
+    });
   } catch (e) {
     // A bad operator token file is a configuration error, not "daemon not running".
     if (e instanceof TokenError) throw new ConfigError(e.message);
@@ -234,7 +257,8 @@ async function serve(a: CliArgs): Promise<number> {
   console.error(`[aio] harnesses: ${instances.join(', ')}; log ${c.logPath}; local principal ${c.local.principal.id}; default session ${c.local.session}`);
   const agents = Object.values(c.agents).map((x) => `${x.name} (${x.mode}, ${x.preset ? `preset ${x.preset} on ` : ''}${x.harness}${x.name === c.defaultAgent ? ', default' : ''})`);
   console.error(`[aio] agents: ${agents.join(', ') || 'none'}; bindings: ${c.table ? `${c.table.bindings.length} from config` : 'owners default table'}`);
-  const presets = Object.values(c.presets).map((p) => `${p.name} (${p.harness}${p.model ? ` ${p.model}` : ''}${p.effort ? ` ${p.effort}` : ''})`);
+  // The presets the module providing them gives (named run defaults; none in a build without it).
+  const presets = gw.namedRuns.names().flatMap((name) => gw.namedRuns.get(name) ?? []).map((p) => `${p.name} (${p.harness}${p.model ? ` ${p.model}` : ''}${p.effort ? ` ${p.effort}` : ''})`);
   if (presets.length) console.error(`[aio] presets: ${presets.join(', ')} (/preset <name> in a chat switches its session)`);
   console.error(`[aio] channels: ${c.channels.map((ch) => ch.type).join(', ') || 'none'}; owners: ${c.policy.owners.length}`);
   if (gw.console) console.error(`[aio] console API on ${gw.console.url} (login link: aio console-link)`);
@@ -763,6 +787,36 @@ function kindCommand(a: CliArgs): ((a: CliArgs) => Promise<number>) | undefined 
   return run ? () => run({ argv: a.rest, env: process.env }) : undefined;
 }
 
+/**
+ * A command a `use: "module"` harness instance's descriptor adds (`HarnessModule.cli`), found
+ * through the config (`--config`, `$AIO_CONFIG`, `./aio.config.json`; a kind's helper gets the
+ * daemon's as `TakeoverServices.config`): each such instance's module is imported, nothing is
+ * built. After the CLI's own commands and the built-in kinds'. Two instances' modules adding the
+ * name differently is a config error. A config that does not load adds none (`reason` says why).
+ */
+async function moduleKindCommand(a: CliArgs): Promise<{ run?: (a: CliArgs) => Promise<number>; reason?: string }> {
+  let c;
+  try {
+    c = config(a, { channels: false });
+  } catch (e) {
+    if (e instanceof ConfigError) return { reason: e.message };
+    throw e;
+  }
+  let found: { instance: string; run: (o: { argv: readonly string[]; env: Readonly<Record<string, string | undefined>> }) => Promise<number> } | undefined;
+  for (const inst of Object.values(c.harnesses)) {
+    if (inst.kind !== 'module') continue;
+    const cli = await harnessModuleCommands({ name: inst.name, module: inst.launch as ModuleLaunch }).catch((e: Error) => {
+      throw new ConfigError(e.message);
+    });
+    const run = cli?.[a.cmd];
+    if (!run) continue;
+    if (found && found.run !== run) throw new ConfigError(`harnesses.${inst.name}: cli ${JSON.stringify(a.cmd)}: harnesses.${found.instance} adds it too`);
+    found = { instance: inst.name, run };
+  }
+  const run = found?.run;
+  return run ? { run: () => run({ argv: a.rest, env: process.env }) } : {};
+}
+
 export async function main(argv: string[]): Promise<number> {
   const a = parseCli(argv);
   if (a.cmd === 'help') {
@@ -774,9 +828,11 @@ export async function main(argv: string[]): Promise<number> {
     console.error('aio e2e moved: run `pnpm e2e` from the repo root, or `aio-e2e` (packages/daemon-e2e), with the same options');
     return 2;
   }
-  const f = COMMANDS[a.cmd] ?? kindCommand(a);
+  let f = COMMANDS[a.cmd] ?? kindCommand(a);
+  let reason: string | undefined;
+  if (!f) ({ run: f, reason } = await moduleKindCommand(a));
   if (!f) {
-    console.error(`unknown command ${a.cmd}\n\n${USAGE}`);
+    console.error(`unknown command ${a.cmd}${reason !== undefined ? ` (no harness module's either: the config does not load: ${reason})` : ''}\n\n${USAGE}`);
     return 2;
   }
   return f(a);

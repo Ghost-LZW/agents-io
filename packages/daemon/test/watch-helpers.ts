@@ -1,8 +1,7 @@
 import { join } from 'node:path';
 import { FakeChannel, FakeHarness } from '@agents-io/testkit';
-import { LocalClient } from '../src/client.js';
-import { resolveConfig, type Config } from '../src/config.js';
-import { Gateway } from '../src/gateway.js';
+import { LocalClient } from '@agents-io/kernel';
+import { type Config, Gateway, resolveConfig } from '../src/defaults.js';
 import { cleanups } from './helpers.js';
 
 export const eve = { channelUserId: 'eve', evidence: 'platform_signed' as const };

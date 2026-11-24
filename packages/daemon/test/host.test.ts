@@ -2,8 +2,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
 import type { Binding, BindingTable, InboundItem } from '@agents-io/protocol';
-import { CommandError } from '../src/client.js';
-import { tokenPath } from '../src/token.js';
+import { CommandError, tokenPath } from '@agents-io/kernel';
 import { closeAndWait, daemon, until, type World } from './helpers.js';
 
 const hostRule = (o: Partial<Binding> = {}): Binding => ({ id: 'to-host', match: { channel: 'fake', keywords: ['xwo'] }, on: 'host', ...o });

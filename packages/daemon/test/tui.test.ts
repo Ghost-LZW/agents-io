@@ -5,9 +5,8 @@ import { describe, expect, it } from 'vitest';
 import type { HarnessOpenArgs, HarnessSession, InputRecord, NativeClient } from '@agents-io/protocol';
 import { MemorySessionLog } from '@agents-io/session';
 import { FakeChannel, FakeHarness, fakeHarnessCaps } from '@agents-io/testkit';
-import { CommandError, LocalClient } from '../src/client.js';
-import { resolveConfig } from '../src/config.js';
-import { Gateway } from '../src/gateway.js';
+import { CommandError, LocalClient } from '@agents-io/kernel';
+import { Gateway, resolveConfig } from '../src/defaults.js';
 import { cleanups, until } from './gateway-helpers.js';
 
 /*

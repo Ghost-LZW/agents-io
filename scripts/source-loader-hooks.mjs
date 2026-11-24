@@ -7,6 +7,8 @@ const dirs = {
   testkit: 'packages/testkit',
   session: 'packages/session',
   'host-mcp': 'packages/host-mcp',
+  kernel: 'packages/kernel',
+  console: 'packages/console',
   daemon: 'packages/daemon',
   'channel-jsonl-bridge': 'channel/jsonl-bridge',
   'channel-lark-bot': 'channel/lark-bot',

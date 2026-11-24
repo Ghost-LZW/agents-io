@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { ServerFrame, check, type ClientResultFrame, type SessionEvent } from '@agents-io/protocol';
 import { SqliteSessionLog } from '@agents-io/session';
 import type { FakeTurnScript } from '@agents-io/testkit';
-import type { OpReceipt } from '../src/client-ops.js';
-import { FEATURES } from '../src/host.js';
+import { FEATURES } from '@agents-io/kernel';
+import type { OpReceipt } from '../../kernel/src/client-ops.js';
 import { daemon, until, type World } from './helpers.js';
 
 /*

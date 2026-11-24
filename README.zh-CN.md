@@ -36,7 +36,9 @@ agents-io 提供底层机制。信任、审批、模型选择、任务和记忆�
 | `channel/lark-bot` | 官方飞书/Lark 机器人，支持长连接和流式卡片；可用 [create-lark-bot](https://github.com/Ghost-LZW/create-lark-bot) 创建应用，也可以在控制台开通（`POST /api/bots/lark`，schema 在本包的 `schema/` 下）。 |
 | `channel/mail` | 通过 IMAP 收信、SMTP 发信，以 DKIM/DMARC 作为身份证据。 |
 | `channel/jsonl-bridge` | 通过 stdio 或 socket 接入用任何语言编写的私有通道。 |
-| `packages/daemon` | `aio` 守护进程与命令行：通道、Binding 表、宿主协议、task run、宿主入站队列、终端端点，以及可选的对外 MCP 端点（给守护进程之外的 agent）。 |
+| `packages/kernel` | 不含任何模块的守护进程内核：网关、配置解析、模块宿主与注册表、本地 socket、宿主与客户端协议服务、记录、与控制台之间的接缝。不依赖任何通道或 harness 包；不给注册表时就是空的（`coreRegistries`），只跑嵌入方交给它的通道和 harness。 |
+| `packages/console` | 给网页界面用的控制台 API：admin HTTP 端点与 `/ws`、登录链接、遮挡机密的配置编辑，以及通道与 harness 模块贡献的 admin 路由。只依赖 protocol 与内核。 |
+| `packages/daemon` | `aio` 守护进程与命令行：组合根，在内核上注册内建的通道、harness 和功能模块（话题标题、模型工具组、主人命令、预设、陌生人放行，以及可选的对外 MCP 端点，给守护进程之外的 agent），接上控制台，并以它们为缺省再导出内核与控制台的 API。 |
 | `packages/daemon-e2e` | `aio-e2e`（`pnpm e2e`）：对配置里真实的 Claude Code 或 Codex 跑端到端场景，每个场景一个进程内守护进程；私有包，不属于守护进程包。 |
 | `examples/dev-gateway` | `aio-dev`，兼容 `aio` 旧名称的包装。 |
 

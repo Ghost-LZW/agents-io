@@ -2,7 +2,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { SendResult } from '@agents-io/protocol';
 import { Hub, Outbox, SqliteSessionLog, type Delivery } from '@agents-io/session';
-import { DaemonRecords } from '../src/records.js';
+import { DaemonRecords } from '@agents-io/kernel';
 import { cleanups, tmp } from './helpers.js';
 
 /*

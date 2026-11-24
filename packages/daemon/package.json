@@ -1,7 +1,7 @@
 {
   "name": "@agents-io/daemon",
   "version": "0.1.0",
-  "description": "The agents-io daemon and CLI (aio): channels, binding-table router, lanes, host protocol on a local socket, task runs, host inbound queue",
+  "description": "The agents-io daemon and CLI (aio): the composition root that registers the built-in modules (Claude Code, Codex, Lark, mail, JSONL bridges, feature modules) on the kernel (@agents-io/kernel), wires the console (@agents-io/console), and re-exports their API",
   "type": "module",
   "bin": { "aio": "./dist/cli.js" },
   "exports": {
@@ -17,18 +17,20 @@
     "@agents-io/channel-jsonl-bridge": "workspace:*",
     "@agents-io/channel-lark-bot": "workspace:*",
     "@agents-io/channel-mail": "workspace:*",
+    "@agents-io/console": "workspace:*",
     "@agents-io/host-mcp": "workspace:*",
     "@agents-io/harness-claude-code": "workspace:*",
     "@agents-io/harness-codex": "workspace:*",
     "@agents-io/harness-jsonl-bridge": "workspace:*",
+    "@agents-io/kernel": "workspace:*",
     "@agents-io/protocol": "workspace:*",
     "@agents-io/session": "workspace:*",
-    "@sinclair/typebox": "^0.34.0",
-    "ws": "^8.22.0"
+    "@sinclair/typebox": "^0.34.0"
   },
   "devDependencies": {
     "@agents-io/testkit": "workspace:*",
     "@modelcontextprotocol/sdk": "1.32.1",
-    "@types/ws": "^8.18.2"
+    "@types/ws": "^8.18.2",
+    "ws": "^8.22.0"
   }
 }

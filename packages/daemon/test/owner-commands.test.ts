@@ -6,10 +6,9 @@ import type { SessionEvent } from '@agents-io/protocol';
 import { MemorySessionLog } from '@agents-io/session';
 import { FakeChannel, FakeHarness } from '@agents-io/testkit';
 import { builtinModules } from '../src/bundle.js';
-import { COMMAND_HELP } from '../src/commands.js';
-import { resolveConfig, type HarnessInstance } from '../src/config.js';
-import { Gateway, InstanceHarness } from '../src/gateway.js';
-import { ModuleRegistry } from '../src/modules.js';
+import { type HarnessInstance, ModuleRegistry } from '@agents-io/kernel';
+import { COMMAND_HELP } from '../../kernel/src/commands.js';
+import { Gateway, InstanceHarness, resolveConfig } from '../src/defaults.js';
 import { CLAUDE_CODE_DECLARES, CODEX_DECLARES } from './declares.js';
 import { cleanups, until } from './gateway-helpers.js';
 

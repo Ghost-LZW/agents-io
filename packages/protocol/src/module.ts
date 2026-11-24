@@ -22,11 +22,12 @@ import type { Watch } from './watch.js';
  * its model tool catalog and its `host.hello` features from its own entries and the active
  * modules' entries; a module that is off is not there at all (no tools, no commands, no
  * features). Built-in modules and a third party's are the same shape; `ModuleOrigin` tells them
- * apart in the host's status. Channel types and harness kinds keep their own contracts
- * (`ChannelModule`, `HarnessModule`).
+ * apart in the host's status. A third party's comes from an embedder's registry or from the
+ * deployment's config file (the daemon's `modules` entries, imported when the daemon starts).
+ * Channel types and harness kinds keep their own contracts (`ChannelModule`, `HarnessModule`).
  *
  * In progress: the daemon reads the manifest (`id`, `kind`, `needs`, `config`, `features`,
- * `mcpTools`, `commands`, `setup`) and, of the instance, `tools`, `offeredTools`, `commands`,
+ * `mcpTools`, `commands`, `runDefaults`, `setup`) and, of the instance, `tools`, `offeredTools`, `commands`,
  * `features`, `status`, `start`, `stop` and the hooks `onTurnCompleted`, `inputHint`, `onUndispatched`,
  * `onAction`, `resolver`, `identities`, `statusLines`, `scheduledMessage` and `scheduledWake`. `admin`, the other `hooks` and
  * `localFrames` were sketched for the Claude Code terminal (G6 step 6), which became a harness
@@ -34,10 +35,15 @@ import type { Watch } from './watch.js';
  * the daemon serves one, a module that sets it fails to register (`admin`) or to set up
  * (`hooks.<name>`, `localFrames`), naming it, rather than being silently ignored. The built-in
  * modules are the topic titles (step 2), the watch, live and topic tools (step 3), the stranger
- * approval (step 4), the owner's run-config commands (step 5) and the external MCP endpoint (step 1).
+ * approval (step 4), the presets (named run defaults: `runDefaults`), the owner's run-config
+ * commands (step 5) and the external MCP endpoint (step 1).
  */
 
-/** Where a registered module comes from: shipped with the host (`builtin`), or someone else's (`module`). */
+/**
+ * Where a registered module comes from: shipped with the host (`builtin`), or someone else's
+ * (`module`): an embedder's, or one the deployment's config file names (the daemon's `modules`
+ * entries). Both get the same `KernelContext`.
+ */
 export type ModuleOrigin = 'builtin' | 'module';
 
 /** What a module is. Only `feature` for now; channel types and harness kinds register as `ChannelModule` / `HarnessModule`. */
@@ -64,6 +70,12 @@ export interface ModuleResolveContext {
    * `policy.owners`). The file schema has checked it. Never put a value in a message.
    */
   valueAt(dotted: string): unknown;
+  /**
+   * The configured harness instances, by name (`RunSpec.harness`), in config order: for settings
+   * that name one (a preset's `harness`). Empty where no config is being resolved (a module
+   * resolved alone, from a file with nothing but its own value).
+   */
+  readonly harnesses: readonly string[];
   /** Fail the config with this message. Messages name keys and variables, never values. */
   fail(msg: string): never;
 }
@@ -73,14 +85,23 @@ export interface ModuleResolveContext {
  * the module's own keys (`schema`) and `enabled`, which the host adds and owns; the host closes the
  * object (an unknown key is a config error). Present, the module is on unless `enabled` is
  * `false`; absent, the first alias path that is set decides instead (on or off: see `aliases`);
- * with neither, the module is on when `defaultEnabled`. A config change to a section or an alias
- * takes effect at the next start (the console answers `applied: "restart"`).
+ * with neither, the module is on when `defaultEnabled`. A section may instead be a map of names the
+ * deployment chooses (`entries`: the presets' `presets: { <name>: { … } }`). A config change to a
+ * section or an alias takes effect at the next start (the console answers `applied: "restart"`).
  */
 export interface ModuleConfig<C = unknown> {
   /** The top-level key: ASCII letters, digits and `_`, starting with a letter; never one of the host's own keys. */
   readonly section: string;
-  /** The section's own keys, in the order the schema lists them (not `enabled`: the host's). */
+  /** The section's own keys, in the order the schema lists them (not `enabled`: the host's). Empty (`{}`) with `entries`. */
   readonly schema: Readonly<Record<string, TSchema>>;
+  /**
+   * The section is a map from names the deployment chooses to entries of this schema (the presets:
+   * `presets: { <name>: { harness, … } }`) instead of an object of the module's own keys: `schema`
+   * is then empty, and the section has no `enabled` (any name is an entry's), so present it is on;
+   * absent, its aliases and `defaultEnabled` decide as for any section. `resolve` gets the map as
+   * written (`{}` when absent) and checks the names. A `modules` entry's `config` is such a map too.
+   */
+  readonly entries?: TSchema;
   /**
    * Where the settings were before they were the module's, as dotted paths of the config file
    * (`policy.strangers`): read when the section is absent, as valued there (the file schema checks
@@ -100,11 +121,46 @@ export interface ModuleConfig<C = unknown> {
   /** Whether the module is on when neither its section nor an alias is in the file. */
   readonly defaultEnabled: boolean;
   /**
-   * The section's value (valid against `schema`, without `enabled`; `{}` when absent) or an alias's
-   * value as it is there (an object keeps its `enabled`), as the module's settings; called only
-   * when the module is on. Throwing (`ctx.fail`) fails the config.
+   * The section's value (valid against `schema`, without `enabled`; for `entries`, the map as
+   * written; `{}` when absent) or an alias's value as it is there (an object keeps its `enabled`),
+   * as the module's settings; called only when the module is on. Throwing (`ctx.fail`) fails the
+   * config.
    */
   resolve(raw: unknown, ctx: ModuleResolveContext): C;
+}
+
+/**
+ * What one name of a module's named run defaults gives (`ModuleRunDefaults.resolve`; a preset): a
+ * harness instance with a model and effort over that instance's own. A run that takes it runs on
+ * that instance as its agent still (the agent's cwd, instructions and tools).
+ */
+export interface NamedRunDefaults {
+  /** The harness instance: one the host configured (`ModuleResolveContext.harnesses`). */
+  harness: string;
+  /** Over the instance's model (`RunSpec.model`). */
+  model?: string;
+  /** Over the instance's effort (`RunSpec.effort`). */
+  effort?: string;
+  /** One line a listing shows next to the name (`/preset`). */
+  description?: string;
+}
+
+/**
+ * Named run defaults a module provides (the presets): what the host's config and requests name by
+ * name (the daemon: an agent's `preset`, `run.start` `overrides.preset`, a session's preset set
+ * through `KernelContext.runConfig.set`, the listing `runConfig.presets()`). The host asks them
+ * without running the module, from what its config section resolved to (`config`; undefined
+ * without a section): while the config resolves (an agent naming one, right after the module's
+ * section resolved) and while it runs (a turn's plan, a task run's overrides). At most one
+ * registered module provides them; with none, or with that module off, every name is unknown (a
+ * config naming one fails, saying so). Synchronous, quick and pure: the same `config` and name give
+ * the same answer.
+ */
+export interface ModuleRunDefaults<C = unknown> {
+  /** The names it gives, in the order they are listed (the config's). */
+  names(config: C): readonly string[];
+  /** What `name` gives; undefined for a name it does not give. The host checks the answer (a configured instance, strings). */
+  resolve(config: C, name: string): NamedRunDefaults | undefined;
 }
 
 /**
@@ -396,6 +452,8 @@ export interface ModuleManifest<C = unknown> {
   readonly needs?: readonly string[];
   /** Its config section; without one the module is on whenever it is registered. */
   readonly config?: ModuleConfig<C>;
+  /** The named run defaults it provides (the presets), read from what its section resolved to; at most one registered module's. */
+  readonly runDefaults?: ModuleRunDefaults<C>;
   /** `host.hello` features it adds while it runs (after the host's own); never one of the host's own. */
   readonly features?: readonly string[];
   readonly mcpTools?: readonly ModuleToolDef[];
@@ -489,7 +547,7 @@ export interface KernelSessionRun {
   ownerProfileSwitch: boolean;
   /** The preset: the one set for the session, else the agent's. */
   preset?: string;
-  /** A preset set for the session that is no longer configured (the agent's own runs). */
+  /** A preset set for the session that is no longer given (not configured, or no module provides presets now): the agent's own runs. */
   stalePreset?: string;
   model?: string;
   effort?: string;
@@ -507,7 +565,7 @@ export interface KernelSessionRun {
  * whose inputs are all the owner's.
  */
 export interface KernelRunOverrides {
-  /** A configured preset (another throws). */
+  /** A preset the module providing named run defaults gives (`ModuleManifest.runDefaults`; another throws). */
   preset?: string | null;
   model?: string | null;
   effort?: string | null;
@@ -515,7 +573,10 @@ export interface KernelRunOverrides {
   profile?: 'bypass' | 'restricted' | null;
 }
 
-/** A configured preset (`presets`), with the model and effort its instance gives when it sets none. */
+/**
+ * A preset (a name of the named run defaults, `ModuleManifest.runDefaults`: the bundled presets
+ * module's `presets`), with the model and effort its instance gives when it sets none.
+ */
 export interface KernelPreset {
   name: string;
   /** Its harness instance and that instance's kind. */
@@ -545,10 +606,12 @@ export interface KernelDatabase {
 /**
  * What a module gets of the kernel: views of the host's core objects, each an existing capability
  * of the host (nothing a built-in feature could not already do). A module is in-process code the
- * composition root (or the embedder) registered, as trusted as the daemon's own (INVARIANTS ID-3
- * boundary 2): the views keep its untyped code to the kernel's rules (what it may stamp, say or
- * set), they are no sandbox. `db` is the whole records database. Late-bound: only `id` and `log`
- * work during `setup`; every other member throws until `setup` returned.
+ * composition root, the embedder or the deployment's config file (the daemon's `modules` entries)
+ * registered, as trusted as the daemon's own (INVARIANTS ID-3 boundary 2), and gets this whatever
+ * its origin: the views keep its untyped code to the kernel's rules (what it may stamp, say or
+ * set: only a peer's origin, never an evidence grant or the policy), they are no sandbox. `db` is
+ * the whole records database. Late-bound: only `id` and `log` work during `setup`; every other
+ * member throws until `setup` returned.
  */
 export interface KernelContext {
   /** The module's id. */
@@ -578,7 +641,10 @@ export interface KernelContext {
   status(): AdminStatus;
   /** The daemon is stopping: start no new work (the module's `stop` comes next). */
   stopping(): boolean;
-  /** The deployment's policy as lanes see it (a connected host's hooks over the local ones). */
+  /**
+   * The deployment's policy as lanes see it (a connected host's hooks over the local ones), frozen:
+   * a module asks it, it never sets it (assigning a hook throws, and changes nothing the lanes use).
+   */
   readonly policy: Policy;
   /** Small values of the module's own, kept across restarts (the host's records, under `module:<id>:`). */
   readonly records: {
@@ -781,13 +847,14 @@ export interface KernelContext {
    * What a session's next turn runs, and what is set for the session over the agent's run (the
    * owner's run-config commands: `/preset`, `/model`, `/effort`, `/plan`, `/bypass`). The kernel
    * keeps what is set (its records, across restarts) and applies it over what the agent's policy
-   * plans (`Policy.plan`), so it holds also while no module sets it.
+   * plans (`Policy.plan`), so it holds also while no module sets it. A preset is what the module
+   * providing named run defaults gives for its name (`ModuleManifest.runDefaults`), asked when it applies.
    */
   readonly runConfig: {
     get(sessionKey: string): KernelSessionRun;
     /** From the session's next turn. */
     set(sessionKey: string, o: KernelRunOverrides): void;
-    /** The configured presets, in config order. */
+    /** The presets the module providing named run defaults gives, in its order (none without one that is on). */
     presets(): KernelPreset[];
     /**
      * The configured harness instances that declare Plan mode (`plan`) or the owner's profile

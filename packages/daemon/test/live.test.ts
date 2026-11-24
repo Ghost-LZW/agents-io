@@ -6,9 +6,8 @@ import { TOOL_NAMES } from '@agents-io/host-mcp';
 import type { ChannelContext, HarnessOpenArgs, HarnessSession, LiveEndpoint, LiveFrame, LiveSpeaker, LiveStartArgs, LiveTransport, Policy, SessionEvent } from '@agents-io/protocol';
 import { MemorySessionLog, SqliteSessionLog, type SessionLog } from '@agents-io/session';
 import { FakeChannel, FakeHarness, type FakeHarnessSession, type FakeTurnScript } from '@agents-io/testkit';
-import { LocalClient } from '../src/client.js';
-import { resolveConfig } from '../src/config.js';
-import { Gateway } from '../src/gateway.js';
+import { LocalClient } from '@agents-io/kernel';
+import { Gateway, resolveConfig } from '../src/defaults.js';
 
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {

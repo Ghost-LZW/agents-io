@@ -1,6 +1,6 @@
 import { createInterface } from 'node:readline';
 import type { Tier } from '@agents-io/protocol';
-import { CommandError, type LocalClient } from './client.js';
+import { CommandError, type LocalClient } from '@agents-io/kernel';
 import { EventRenderer } from './render.js';
 import { WatchSpecError, formatWatch, parseWatchSpec } from './watch-spec.js';
 

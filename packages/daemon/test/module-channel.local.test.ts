@@ -1,7 +1,7 @@
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { resolveConfig } from '../src/config.js';
+import { resolveConfig } from '../src/defaults.js';
 
 /* `type: "module"` channels: path and exports resolution of the config entry (fixtures/chan-*). */
 

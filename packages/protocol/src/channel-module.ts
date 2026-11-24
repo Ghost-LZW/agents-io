@@ -59,7 +59,9 @@ export interface ChannelInit extends ChannelFactoryInit {
   /**
    * A directory of this channel account's own under the host's data directory, for state kept
    * across restarts (the daemon's: `<dataDir>/channels/<type>.<account, URI-encoded>`); it may not
-   * exist yet.
+   * exist yet. It is the type's on the account: a type whose entries may share an account (several
+   * adapters, `ChannelModule.owner`) divides it itself, as the daemon's `module` type does for the
+   * channels of a module file's descriptor (`<that>/<hash of the file and export>`).
    */
   stateDir: string;
   /**
@@ -98,7 +100,19 @@ export interface BuiltChannel {
  * composition root grants it when it registers the type (the daemon's `bundle.ts`: lark-bot and
  * mail their caps; every other type, bridge and module included, `device_only` only).
  *
- * In progress (core-slimming G2): the daemon reads all of it except `implicitEnv`.
+ * A `type: "module"` entry's file (the daemon's own `module` type) may export one of these instead
+ * of a `ChannelFactory` (as `createChannel`, or the entry's `export`, else default), when the
+ * daemon imported the config's module files before it resolved the config (`loadConfigModules`;
+ * `aio serve` does): its `entry` checks the entry's `config` (an absent one as `{}`; closed), its
+ * `resolve` resolves it, its `validateAll` gets the entries naming the same file and export (their
+ * `config`s), its `isCredential` / `credentialHint` / `implicitEnv` answer for paths under
+ * `config`, its `create` gets the resolved `config` with the entry's `account` and a `stateDir` of
+ * its file and export's (`<dataDir>/channels/module.<account>/<the first 16 hex digits of the
+ * SHA-256 of the file and export>`: the same after a restart while the file stays where it is; its
+ * entries on one account share it, which its `validateAll` can refuse), and its `admin` routes,
+ * schemas and `mount` are served (not `admin.console`: the config's `console` section is checked
+ * before module files load). Its `type`, `ids`, `owner` and `idOf` are not read there: one file
+ * and export is one owner of its channel id, as for a factory.
  */
 export interface ChannelModule<E = Record<string, unknown>, R = E> {
   /**

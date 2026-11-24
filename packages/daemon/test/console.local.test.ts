@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type { AdminConfigDocument } from '@agents-io/protocol';
 import { main } from '../src/cli.js';
-import { consoleUrlPath } from '../src/token.js';
+import { consoleUrlPath } from '@agents-io/kernel';
 import { consoleDaemon } from './console-helpers.js';
 import { daemon, tmp } from './helpers.js';
 

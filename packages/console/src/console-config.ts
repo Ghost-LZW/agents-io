@@ -1,15 +1,25 @@
 import { createHash } from 'node:crypto';
 import { chmodSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import type { TSchema } from '@sinclair/typebox';
 import { Value } from '@sinclair/typebox/value';
-import { ADMIN_REDACTED, type AdminConfigDocument, type AdminConfigPutResult, type AdminConfigValidation, type ChannelModule, type ConfigAccess, type ConfigIssue } from '@agents-io/protocol';
-import { builtinChannels, builtinHarnesses, builtinModules } from './bundle.js';
-import type { ChannelRegistry } from './channel-registry.js';
-import { ConfigError, configFileSchema, findEnvFile, resolveConfig, type Config } from './config.js';
-import { loadEnvFile } from './env-file.js';
-import type { HarnessRegistry } from './harness-registry.js';
-import type { ModuleRegistry } from './modules.js';
+import { ADMIN_REDACTED, type AdminConfigDocument, type AdminConfigValidation, type ChannelModule, type ConfigIssue } from '@agents-io/protocol';
+import {
+  ConfigError,
+  NO_REGISTRIES,
+  canonical,
+  configFileSchema,
+  credentialMark,
+  findEnvFile,
+  loadEnvFile,
+  resolveConfig,
+  type ChannelRegistry,
+  type Config,
+  type ConfigStoreOptions,
+  type ConsoleConfigStore,
+  type HarnessRegistry,
+  type ModuleRegistry,
+  type PutOutcome,
+} from '@agents-io/kernel';
 
 /*
  * The config file as the console sees it (`GET/PUT /api/config`,
@@ -29,8 +39,15 @@ import type { ModuleRegistry } from './modules.js';
  * and any new literal in a credential field is refused (`inline_secret`; in a
  * channel entry with its type's advice when it has one, `credentialHint`: a
  * bridge argument is visible to other local users). Validation is the startup
- * one (`resolveConfig` over the daemon's registries, with the env file read
- * afresh). Writes are atomic (temp file + fsync + rename) and 0600. The
+ * one (`resolveConfig`, with the env file read afresh) over the registries the
+ * next start would read the document with: the module files it names imported
+ * first (`modules` entries, module channel files: `ConfigStoreOptions.importModules`,
+ * as `aio serve` does at its start), else the daemon's. The same registries say
+ * which variables it reads; which of its strings are credentials (redacted by
+ * `GET`, kept for the marker and refused as literals by `PUT`) both they and the
+ * daemon's say: a module channel file gone or changed since the start does not
+ * unmark what its descriptor marked then. Writes are
+ * atomic (temp file + fsync + rename) and 0600. The
  * daemon does not reload its config: a changed file (a module's config
  * section too) takes effect at the next start (`applied: "restart"`), except `channels`
  * with `console.liveChannels` (the gateway applies them and calls
@@ -53,30 +70,14 @@ type Path = (string | number)[];
 /** Codex `config` keys are dotted TOML paths (`mcp_servers.x.env`); split them into segments. */
 const tomlSegs = (k: string) => (k.match(/[A-Za-z0-9_][A-Za-z0-9_-]*|"[^"\\]*"/g) ?? [k]).map((x) => x.replace(/^"|"$/g, ''));
 
-/** The `x-credential` mark (`ChannelModule.entry`). */
-const marked = (s: TSchema | undefined) => (s as { 'x-credential'?: unknown } | undefined)?.['x-credential'] === true;
-
 /**
- * Whether the schema marks the value at `path` under `s` as a credential: a schema marked
- * `x-credential` at the path or above it (a map or array of secrets). Follows object properties,
- * maps (`Type.Record`), array items and every member of a union; a part it cannot follow
- * (`Type.Unknown`, free-form) marks nothing.
+ * The channel registries whose types say which strings of a document are credentials: one, or
+ * several, where a string any of them marks is one (the console's: the document's own registries
+ * and the daemon's, `ConfigStore`).
  */
-function credentialMark(s: TSchema | undefined, path: readonly string[]): boolean {
-  if (!s) return false;
-  if (marked(s)) return true;
-  const [seg, ...rest] = path;
-  if (seg === undefined) return false;
-  const x = s as { anyOf?: TSchema[]; properties?: Record<string, TSchema>; patternProperties?: Record<string, TSchema>; additionalProperties?: unknown; items?: unknown };
-  if (Array.isArray(x.anyOf)) return x.anyOf.some((m) => credentialMark(m, path));
-  if (x.properties && Object.hasOwn(x.properties, seg)) return credentialMark(x.properties[seg], rest);
-  if (x.patternProperties) {
-    for (const [re, v] of Object.entries(x.patternProperties)) if (new RegExp(re).test(seg)) return credentialMark(v, rest);
-  }
-  if (x.additionalProperties && typeof x.additionalProperties === 'object') return credentialMark(x.additionalProperties as TSchema, rest);
-  if (x.items && typeof x.items === 'object' && !Array.isArray(x.items) && /^\d+$/.test(seg)) return credentialMark(x.items as TSchema, rest);
-  return false;
-}
+export type CredentialMarks = ChannelRegistry | readonly ChannelRegistry[];
+
+const eachRegistry = (marks: CredentialMarks): readonly ChannelRegistry[] => (typeof (marks as ChannelRegistry).get === 'function' ? [marks as ChannelRegistry] : (marks as readonly ChannelRegistry[]));
 
 /**
  * The channel entry `at` is in (below `channels[<i>]`), when its type is registered in `channels`:
@@ -93,10 +94,11 @@ function channelAt(doc: Json, at: Path, channels: ChannelRegistry): { module: Ch
 /**
  * Whether the string at `at` in `doc` is a credential, by where the config
  * schema (config.ts) puts it. A channel entry's type says for its own keys
- * (`channels`: the registry the document's types come from, default the
- * built-in one): its `x-credential` marks and `isCredential`.
+ * (`channels`: the registry the document's types come from, default none,
+ * `@agents-io/daemon`'s the built-in one; several: what any of their types for it marks): its
+ * `x-credential` marks and `isCredential`.
  */
-export function isCredential(doc: Json, at: Path, channels: ChannelRegistry = builtinChannels): boolean {
+export function isCredential(doc: Json, at: Path, channels: CredentialMarks = NO_REGISTRIES.channelRegistry): boolean {
   const s = at.map(String);
   const leaf = s.at(-1);
   // `host.tokenFile` is a path, not the token.
@@ -117,8 +119,9 @@ export function isCredential(doc: Json, at: Path, channels: ChannelRegistry = bu
       if (parent === 'env' || last === 'bearer_token' || last === 'experimental_bearer_token') return true;
     }
   }
-  const ch = channelAt(doc, at, channels);
-  if (ch) {
+  for (const registry of eachRegistry(channels)) {
+    const ch = channelAt(doc, at, registry);
+    if (!ch) continue;
     const [key, ...below] = ch.path;
     const own = Object.hasOwn(ch.module.entry, key) ? ch.module.entry[key] : undefined;
     if (credentialMark(own, below) || ch.module.isCredential?.(ch.path, ch.entry) === true) return true;
@@ -146,10 +149,10 @@ function get(v: Json, at: Path): Json {
 }
 
 /** A literal (not an `env:` reference, not empty) in a credential field. */
-const literalCredential = (doc: Json, value: string, at: Path, channels: ChannelRegistry) => value !== '' && envRef(value) === undefined && isCredential(doc, at, channels);
+const literalCredential = (doc: Json, value: string, at: Path, channels: CredentialMarks) => value !== '' && envRef(value) === undefined && isCredential(doc, at, channels);
 
 /** The document with every literal credential replaced by ADMIN_REDACTED (`channels`: as for `isCredential`). */
-export function redact(raw: Json, channels: ChannelRegistry = builtinChannels): Json {
+export function redact(raw: Json, channels: CredentialMarks = NO_REGISTRIES.channelRegistry): Json {
   return walk(raw, [], (value, at) => (literalCredential(raw, value, at, channels) ? ADMIN_REDACTED : undefined));
 }
 
@@ -165,12 +168,35 @@ export function envRefs(raw: Json): string[] {
 }
 
 /**
+ * Every variable the document's channel entries read without naming it as `env:NAME`
+ * (`ChannelModule.implicitEnv` of each entry's type, in entry order), each once, none of `skip`.
+ * A type's answer that is no array of strings (or that throws: the document may not validate) gives none.
+ */
+export function implicitEnv(raw: Json, channels: ChannelRegistry = NO_REGISTRIES.channelRegistry, skip: readonly string[] = []): string[] {
+  const out = new Set<string>();
+  const entries = raw && typeof raw === 'object' ? (raw as { channels?: unknown }).channels : undefined;
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const type = entry && typeof entry === 'object' ? (entry as { type?: unknown }).type : undefined;
+    const m = typeof type === 'string' ? channels.get(type) : undefined;
+    if (!m?.implicitEnv) continue;
+    let names: unknown;
+    try {
+      names = m.implicitEnv(entry);
+    } catch {
+      continue;
+    }
+    for (const n of Array.isArray(names) ? names : []) if (typeof n === 'string' && n && !skip.includes(n)) out.add(n);
+  }
+  return [...out];
+}
+
+/**
  * Put the stored values back where a document says ADMIN_REDACTED. Returns the
  * document and the paths kept that way; an ADMIN_REDACTED with no stored
  * literal at its path, or in a field that is not a credential (GET would show
  * the stored value there), is an issue (`channels`: as for `isCredential`).
  */
-export function unredact(next: Json, stored: Json, channels: ChannelRegistry = builtinChannels): { doc: Json; kept: Set<string>; issues: ConfigIssue[] } {
+export function unredact(next: Json, stored: Json, channels: CredentialMarks = NO_REGISTRIES.channelRegistry): { doc: Json; kept: Set<string>; issues: ConfigIssue[] } {
   const kept = new Set<string>();
   const issues: ConfigIssue[] = [];
   const doc = walk(next, [], (value, at) => {
@@ -189,16 +215,21 @@ export function unredact(next: Json, stored: Json, channels: ChannelRegistry = b
 
 /**
  * Literal secrets: errors, except at `kept` paths (already in the file), which are warnings. In a
- * channel entry its type may say what to do instead (`ChannelModule.credentialHint`).
+ * channel entry its type may say what to do instead (`ChannelModule.credentialHint`; with several
+ * registries, the first that does).
  */
-function secretIssues(raw: Json, kept: Set<string> | 'all', channels: ChannelRegistry): ConfigIssue[] {
+function secretIssues(raw: Json, kept: Set<string> | 'all', channels: CredentialMarks): ConfigIssue[] {
   const issues: ConfigIssue[] = [];
   walk(raw, [], (value, at) => {
     if (!literalCredential(raw, value, at, channels)) return undefined;
     const path = pointer(at);
     const old = kept === 'all' || kept.has(path);
-    const ch = channelAt(raw, at, channels);
-    const hint = ch?.module.credentialHint?.(ch.path, ch.entry);
+    const hint = eachRegistry(channels)
+      .map((registry) => {
+        const ch = channelAt(raw, at, registry);
+        return ch?.module.credentialHint?.(ch.path, ch.entry);
+      })
+      .find((h) => typeof h === 'string' && h);
     issues.push({
       path,
       code: 'inline_secret',
@@ -215,6 +246,17 @@ function secretIssues(raw: Json, kept: Set<string> | 'all', channels: ChannelReg
   return issues;
 }
 
+/** Each issue once (a file that does not import may fail the resolution with the same message). */
+function distinct(issues: ConfigIssue[]): ConfigIssue[] {
+  const seen = new Set<string>();
+  return issues.filter((i) => {
+    const k = JSON.stringify([i.path, i.code, i.message]);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
 /** Map a ConfigError message (`agents.x.harness: …`) to a JSON pointer when it names a key of the file (`file`: its schema). */
 function pathOfMessage(msg: string, file: { properties: Record<string, unknown> }): string {
   const m = /^(?:invalid config: )?`?([A-Za-z_][\w-]*(?:\[\d+\])*(?:\.[\w-]+(?:\[\d+\])*)*)`?(?:[: ]|$)/.exec(msg);
@@ -222,44 +264,59 @@ function pathOfMessage(msg: string, file: { properties: Record<string, unknown> 
   return pointer(m[1]!.split('.').flatMap((s) => s.split(/\[(\d+)\]/).filter(Boolean)));
 }
 
-export interface ConfigStoreOptions {
-  /** The config file (may not exist yet). */
-  path: string;
-  /** The env file `env:` references resolve from (default: found next to the config, as at startup). */
-  envFile?: string;
-  /** Process environment (default process.env); wins over the env file, as at startup. */
-  env?: NodeJS.ProcessEnv;
-  cwd?: string;
-  /** The harness kinds the file may name (default the built-in ones): the daemon's (`Gateway.harnessRegistry`). */
-  harnessRegistry?: HarnessRegistry;
-  /** The channel types the file may name, and what they mark as credentials (default the built-in ones): the daemon's (`Gateway.channelRegistry`). */
-  channelRegistry?: ChannelRegistry;
-  /** The feature modules whose config sections the file may have (default the built-in ones): the daemon's (`Gateway.moduleRegistry`). */
-  moduleRegistry?: ModuleRegistry;
+/** The registries a document is read with. */
+interface Registries {
+  harnesses: HarnessRegistry;
+  channels: ChannelRegistry;
+  modules: ModuleRegistry;
+  /**
+   * Whose marks say which of its strings are credentials (`CredentialMarks`): `channels`, and the
+   * daemon's when they are others. The daemon's `module` type knows the descriptors its start
+   * imported, by each entry's `module` as written (`ChannelModuleFiles`): one whose file is gone or
+   * resolves to another file since (a package upgraded, a file replaced) still marks what it marked.
+   */
+  marks: readonly ChannelRegistry[];
 }
 
-export type PutOutcome =
-  | { status: 200; body: AdminConfigPutResult }
-  | { status: 409; code: 'conflict'; message: string }
-  | { status: 422; body: AdminConfigValidation };
-
-/** The config file of a daemon; the `ConfigAccess` its modules' admin contributions get (`AdminContext.config`). */
-export class ConfigStore implements ConfigAccess {
+/**
+ * The config file of a daemon (`ConsoleConfigStore`, the console's and the gateway's); the
+ * `ConfigAccess` its modules' admin contributions get (`AdminContext.config`).
+ */
+export class ConfigStore implements ConsoleConfigStore {
   /**
    * The file as the running daemon reflects it: as it started, with `channels` replaced by
    * the ones last applied live. To tell whether a change needs a restart.
    */
   private running: Record<string, unknown>;
-  private readonly harnesses: HarnessRegistry;
-  private readonly channels: ChannelRegistry;
-  private readonly modules: ModuleRegistry;
+  /** The daemon's registries (`ConfigStoreOptions`). */
+  private readonly daemon: Registries;
 
   constructor(private readonly o: ConfigStoreOptions) {
-    this.harnesses = o.harnessRegistry ?? builtinHarnesses;
-    this.channels = o.channelRegistry ?? builtinChannels;
-    this.modules = o.moduleRegistry ?? builtinModules;
+    const channels = o.channelRegistry ?? NO_REGISTRIES.channelRegistry;
+    this.daemon = { harnesses: o.harnessRegistry ?? NO_REGISTRIES.harnessRegistry, channels, modules: o.moduleRegistry ?? NO_REGISTRIES.moduleRegistry, marks: [channels] };
     const raw = this.read().raw;
     this.running = raw && typeof raw === 'object' && !Array.isArray(raw) ? structuredClone(raw as Record<string, unknown>) : {};
+  }
+
+  /**
+   * The registries `raw` is read with: with `importModules`, the module files it names imported
+   * (cached by the module loader: a file imported before is not run again), a descriptor's admin
+   * contribution claimed against the daemon's harness kinds' too; a file that does not import is
+   * an issue, and `raw` is then read with the daemon's. Without it, the daemon's. Its
+   * credentials are what these and the daemon's mark (`Registries.marks`): a module channel file
+   * that cannot be found now is the resolution's issue, never a reason to show what it marked.
+   */
+  private async registriesOf(raw: Json): Promise<{ regs: Registries; issues: ConfigIssue[] }> {
+    if (!this.o.importModules) return { regs: this.daemon, issues: [] };
+    try {
+      const r = await this.o.importModules(raw, { baseDir: dirname(this.o.path), harnessRegistry: this.daemon.harnesses });
+      const marks = r.channelRegistry === this.daemon.channels ? this.daemon.marks : [r.channelRegistry, this.daemon.channels];
+      return { regs: { harnesses: this.daemon.harnesses, channels: r.channelRegistry, modules: r.moduleRegistry, marks }, issues: [] };
+    } catch (e) {
+      if (!(e instanceof ConfigError)) throw e;
+      const file = configFileSchema(this.daemon.harnesses, this.daemon.channels, this.daemon.modules);
+      return { regs: this.daemon, issues: [{ path: pathOfMessage(e.message, file), code: 'invalid', message: e.message, severity: 'error' }] };
+    }
   }
 
   /** `live` when the running daemon matches `doc`, else `restart`. */
@@ -274,9 +331,25 @@ export class ConfigStore implements ConfigAccess {
     this.running = ch === undefined ? rest : { ...rest, channels: structuredClone(ch) };
   }
 
-  /** The startup resolution of `raw`, with the env file read afresh (throws `ConfigError`). */
+  /** The startup resolution of `raw` with the daemon's registries, the env file read afresh (throws `ConfigError`). */
   resolve(raw: Json): Config {
-    return resolveConfig(raw, { env: this.env(), baseDir: dirname(this.o.path), ...(this.o.cwd ? { cwd: this.o.cwd } : {}), harnessRegistry: this.harnesses, channelRegistry: this.channels, moduleRegistry: this.modules });
+    return this.resolveWith(raw, this.daemon);
+  }
+
+  /** `resolve` with `regs`. */
+  private resolveWith(raw: Json, regs: Registries): Config {
+    return resolveConfig(raw, { env: this.env(), baseDir: dirname(this.o.path), ...(this.o.cwd ? { cwd: this.o.cwd } : {}), harnessRegistry: regs.harnesses, channelRegistry: regs.channels, moduleRegistry: regs.modules });
+  }
+
+  /**
+   * The startup resolution of `raw` with the registries the next start would read it with (its
+   * module files imported, `importModules`), and the channel registry among them: what a channel
+   * applied live is built with. Throws `ConfigError` (a file that does not import too).
+   */
+  async resolveImported(raw: Json): Promise<{ config: Config; channelRegistry: ChannelRegistry }> {
+    const { regs, issues } = await this.registriesOf(raw);
+    if (issues.length) throw new ConfigError(issues[0]!.message);
+    return { config: this.resolveWith(raw, regs), channelRegistry: regs.channels };
   }
 
   get path(): string {
@@ -328,42 +401,55 @@ export class ConfigStore implements ConfigAccess {
     }
   }
 
-  document(): AdminConfigDocument {
+  /** The file as `GET /api/config` shows it: read with the registries of its module files (`registriesOf`). */
+  async document(): Promise<AdminConfigDocument> {
     const { raw, revision, parseError } = this.read();
     const env = this.env();
-    const issues = parseError ? [{ path: '', code: 'parse', message: `the file is not JSON: ${parseError}`, severity: 'error' as const }] : this.check(raw, 'all');
+    const { regs, issues: unimported } = parseError ? { regs: this.daemon, issues: [] } : await this.registriesOf(raw);
+    const issues = parseError ? [{ path: '', code: 'parse', message: `the file is not JSON: ${parseError}`, severity: 'error' as const }] : distinct([...unimported, ...this.check(raw, 'all', regs)]);
     return {
       path: this.o.path,
       revision,
-      config: redact(raw, this.channels) as Record<string, unknown>,
+      config: redact(raw, regs.marks) as Record<string, unknown>,
       issues,
-      env: envRefs(raw).map((name) => ({ name, set: env[name] !== undefined })),
+      env: [
+        ...envRefs(raw).map((name) => ({ name, set: env[name] !== undefined })),
+        // What a channel entry reads without an `env:` reference: its type says (`ChannelModule.implicitEnv`).
+        ...implicitEnv(raw, regs.channels, envRefs(raw)).map((name) => ({ name, set: env[name] !== undefined, implicit: true })),
+      ],
     };
   }
 
   /** Validate a document as `PUT` would (ADMIN_REDACTED keeps stored values). */
-  validate(next: Record<string, unknown>): AdminConfigValidation {
-    const r = this.prepare(next);
+  async validate(next: Record<string, unknown>): Promise<AdminConfigValidation> {
+    const r = await this.prepare(next, this.read().raw);
     return { valid: !r.issues.some((i) => i.severity === 'error'), issues: r.issues };
   }
 
-  private prepare(next: Record<string, unknown>): { doc: Json; issues: ConfigIssue[] } {
-    const { doc, kept, issues } = unredact(next, this.read().raw, this.channels);
-    return { doc, issues: [...issues, ...this.check(doc, kept)] };
+  /** `next` as it would replace `stored`, and its issues, read with the registries of its module files. */
+  private async prepare(next: Record<string, unknown>, stored: Json): Promise<{ doc: Json; issues: ConfigIssue[] }> {
+    const { regs, issues: unimported } = await this.registriesOf(next);
+    const { doc, kept, issues } = unredact(next, stored, regs.marks);
+    return { doc, issues: distinct([...unimported, ...issues, ...this.check(doc, kept, regs)]) };
   }
 
-  /** Schema issues (with paths), literal secrets, then the startup checks. */
-  private check(raw: Json, kept: Set<string> | 'all'): ConfigIssue[] {
+  /** Schema issues (with paths), literal secrets, then the startup checks (with `regs`). */
+  private check(raw: Json, kept: Set<string> | 'all', regs: Registries): ConfigIssue[] {
     const issues: ConfigIssue[] = [];
-    const file = configFileSchema(this.harnesses, this.channels, this.modules);
+    const file = configFileSchema(regs.harnesses, regs.channels, regs.modules);
     for (const e of Value.Errors(file, raw)) {
       issues.push({ path: e.path, code: 'schema', message: e.message, severity: 'error' });
       if (issues.length >= 20) break;
     }
-    issues.push(...secretIssues(raw, kept, this.channels));
+    issues.push(...secretIssues(raw, kept, regs.marks));
     if (!issues.some((i) => i.code === 'schema')) {
       try {
-        this.resolve(raw);
+        const c = this.resolveWith(raw, regs);
+        // A daemon that imports no module files would not start on a `modules` entry (`Gateway.start`).
+        if (!this.o.importModules) {
+          for (const [i, e] of (c.moduleEntries ?? []).entries())
+            if (!regs.modules.fromEntry(e)) issues.push({ path: `/modules/${i}`, code: 'invalid', message: `modules[${i}] (module ${e.module}) is not loaded: this daemon imports no module files of its config, so it would not start on this file`, severity: 'error' });
+        }
       } catch (e) {
         if (!(e instanceof ConfigError)) throw e;
         issues.push({ path: pathOfMessage(e.message, file), code: 'invalid', message: e.message, severity: 'error' });
@@ -372,13 +458,17 @@ export class ConfigStore implements ConfigAccess {
     return issues;
   }
 
-  put(next: Record<string, unknown>, ifRevision?: string): PutOutcome {
-    const cur = this.read();
-    if (ifRevision !== undefined && ifRevision !== cur.revision) return { status: 409, code: 'conflict', message: `the config file changed (revision ${cur.revision}, not ${ifRevision}); reload it` };
-    const { doc, issues } = this.prepare(next);
-    if (issues.some((i) => i.severity === 'error')) return { status: 422, body: { valid: false, issues } };
-    const revision = this.write(doc);
-    return { status: 200, body: { revision, issues, applied: this.appliedOf(doc) } };
+  async put(next: Record<string, unknown>, ifRevision?: string): Promise<PutOutcome> {
+    for (;;) {
+      const cur = this.read();
+      if (ifRevision !== undefined && ifRevision !== cur.revision) return { status: 409, code: 'conflict', message: `the config file changed (revision ${cur.revision}, not ${ifRevision}); reload it` };
+      const { doc, issues } = await this.prepare(next, cur.raw);
+      // Changed while its module files were imported: again, against the file as it is now.
+      if (this.read().revision !== cur.revision) continue;
+      if (issues.some((i) => i.severity === 'error')) return { status: 422, body: { valid: false, issues } };
+      const revision = this.write(doc);
+      return { status: 200, body: { revision, issues, applied: this.appliedOf(doc) } };
+    }
   }
 
   /** Change the file programmatically (a module's admin route); same atomic 0600 write, no secret checks. */
@@ -398,7 +488,8 @@ export class ConfigStore implements ConfigAccess {
     const cur = this.read();
     if (cur.parseError) throw new ConfigError(`${this.o.path} is not JSON: ${cur.parseError}`);
     const doc = fn(structuredClone(cur.raw) as Record<string, unknown>);
-    const issues = this.check(doc, 'all').filter((i) => i.severity === 'error');
+    // Synchronous (`ConfigAccess`): with the daemon's registries; module files written since its start were checked when written.
+    const issues = this.check(doc, 'all', this.daemon).filter((i) => i.severity === 'error');
     if (issues.length) return { ok: false, issues };
     return { ok: true, revision: this.write(doc) };
   }
@@ -431,10 +522,4 @@ export function writeFileAtomic(path: string, text: string): void {
     }
     throw e;
   }
-}
-
-export function canonical(v: Json): string {
-  const sort = (x: Json): Json =>
-    Array.isArray(x) ? x.map(sort) : x && typeof x === 'object' ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, y]) => [k, sort(y)])) : x;
-  return JSON.stringify(sort(v));
 }

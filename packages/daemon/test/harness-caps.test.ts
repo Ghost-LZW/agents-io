@@ -6,9 +6,8 @@ import { ClaudeCodeHarness, claudeCodeHarnessModule } from '@agents-io/harness-c
 import { CodexHarness, codexHarnessModule } from '@agents-io/harness-codex';
 import { FakeChannel } from '@agents-io/testkit';
 import { builtinHarnesses } from '../src/bundle.js';
-import { resolveConfig } from '../src/config.js';
-import { Gateway } from '../src/gateway.js';
-import { HarnessRegistry } from '../src/harness-registry.js';
+import { HarnessRegistry } from '@agents-io/kernel';
+import { Gateway, resolveConfig } from '../src/defaults.js';
 import { CLAUDE_CODE_DECLARES, CODEX_DECLARES } from './declares.js';
 import { nextKey, rec, start } from './harness-caps-helpers.js';
 import { cleanups, tmp, until } from './helpers.js';

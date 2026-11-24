@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { HOST_RESULT_VALUES, errors, type BodyOf, type InputRecord, type SessionEvent } from '@agents-io/protocol';
 import type { FakeTurnScript } from '@agents-io/testkit';
-import { FEATURES } from '../src/host.js';
+import { FEATURES } from '@agents-io/kernel';
 import { CLAUDE_CODE_DECLARES, CODEX_DECLARES } from './declares.js';
 import { daemon, until, type World } from './helpers.js';
 

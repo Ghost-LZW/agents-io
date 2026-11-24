@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { InputRecord, KernelContext, ModuleManifest, ModuleTopicHandover } from '@agents-io/protocol';
 import { builtinModules } from '../src/bundle.js';
-import { ModuleRegistry } from '../src/modules.js';
+import { ModuleRegistry } from '@agents-io/kernel';
 import { daemon, tmp, until, type World } from './helpers.js';
 import { alice, CONV, mcpCall, of, read, textOf, turnsIn, world } from './topics-helpers.js';
 

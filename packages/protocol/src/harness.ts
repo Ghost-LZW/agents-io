@@ -258,6 +258,12 @@ export interface TakeoverServices {
    * starts as its own child.
    */
   cli: string;
+  /**
+   * The host's config file, when it has one (the daemon's `Config.source.path`): the CLI finds the
+   * commands a `use: "module"` instance's descriptor adds (`HarnessModule.cli`) through it, so a
+   * helper of such a kind runs `process.execPath <cli> --config <config> <command>`.
+   */
+  config?: string;
   /** A stored file an input refers to (`ContentBlock.ref`) as a local path the terminal can read; `undefined` for a ref the host's store does not hold. */
   fileOf(ref: string): Promise<{ path: string; mime: string; name?: string } | undefined>;
   /** Called once when the takeover ends, whatever ended it: why (e.g. "the terminal UI exited"). */

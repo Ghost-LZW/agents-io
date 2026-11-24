@@ -4,20 +4,28 @@
 //   node scripts/boundaries.mjs check     fail when a core file gains an import or a vendor name its baseline lacks
 //   node scripts/boundaries.mjs shrink    lower the baseline to today's counts (refuses while any count is above it)
 //   node scripts/boundaries.mjs report    counts per file and rule, worst first [--json]
+//   … --root <dir>                        another workspace (with its own scripts/boundaries*.json); tests
 //
 // Classification: scripts/boundaries.json. Baseline: scripts/boundaries.baseline.json, which may only shrink:
 // a new violation is fixed, never added to the baseline. Only `src/` of each package is production code.
 //
 // Rules, per production file:
-//   import:<pkg>   a workspace package its package's `may` list lacks (core and module files; a core
-//                  package's `bundle` files may also import modules)
+//   import:<pkg>   a workspace package its package's `may` list lacks (every package but examples; the
+//                  composition root's `bundle` files may also import modules)
 //   vendor         in core files outside a bundle: identifiers containing a vendor word, and string
 //                  literals equal to a module id (comments are ignored)
+// and per package.json (counted on that file), so a dependency no import shows is seen too:
+//   dep:<pkg>      a workspace package in `dependencies`, `optionalDependencies` or `peerDependencies`
+//                  its `may` list lacks (the composition root, `root`, may also depend on modules); and
+//                  a module package in a core package's `devDependencies` but the root's (its tests run
+//                  without modules)
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const root = fileURLToPath(new URL('..', import.meta.url));
+const argv = process.argv.slice(2);
+const rootAt = argv.indexOf('--root');
+const root = rootAt >= 0 && argv[rootAt + 1] ? resolve(argv[rootAt + 1]) : fileURLToPath(new URL('..', import.meta.url));
 const CLASSIFICATION = join(root, 'scripts', 'boundaries.json');
 const BASELINE = join(root, 'scripts', 'boundaries.baseline.json');
 
@@ -106,8 +114,13 @@ function loadClassification() {
   const pkgs = new Map();
   for (const [dir, spec] of Object.entries(cls.packages)) {
     const pj = readJson(join(root, dir, 'package.json'));
-    pkgs.set(dir, { dir, name: pj.name, ...spec, bundle: new Set((spec.bundle ?? []).map((f) => `${dir}/${f}`)) });
+    // The composition root is a core package, the only one that may have `bundle` files (or depend on modules).
+    if (spec.root && spec.role !== 'core') throw new Error(`${dir}: only a core package can be the composition root (root)`);
+    if (spec.bundle?.length && !spec.root) throw new Error(`${dir}: only the composition root (root: true) has bundle files`);
+    pkgs.set(dir, { dir, name: pj.name, json: pj, ...spec, root: spec.root === true, bundle: new Set((spec.bundle ?? []).map((f) => `${dir}/${f}`)) });
   }
+  const roots = [...pkgs.values()].filter((p) => p.root).map((p) => p.dir);
+  if (roots.length > 1) throw new Error(`more than one composition root (root: true): ${roots.join(', ')}`);
   const byName = new Map([...pkgs.values()].map((p) => [p.name, p]));
   // Every workspace package must be classified, so a new one cannot slip past.
   for (const group of ['packages', 'harness', 'channel', 'examples']) {
@@ -141,6 +154,19 @@ function count() {
   };
   for (const pkg of pkgs.values()) {
     if (pkg.role === 'example') continue;
+    // package.json: what the package depends on, whether or not an import shows it.
+    const manifest = `${pkg.dir}/package.json`;
+    for (const field of ['dependencies', 'optionalDependencies', 'peerDependencies', 'devDependencies']) {
+      for (const name of Object.keys(pkg.json[field] ?? {})) {
+        const target = byName.get(name);
+        if (!target || target === pkg) continue;
+        const allowed =
+          field === 'devDependencies'
+            ? !(pkg.role === 'core' && !pkg.root && target.role === 'module')
+            : pkg.may.includes('*') || pkg.may.includes(target.dir) || (pkg.root && target.role === 'module');
+        if (!allowed) bump(manifest, `dep:${name}`);
+      }
+    }
     for (const path of walk(join(root, pkg.dir, 'src'))) {
       const file = rel(path);
       const src = readFileSync(path, 'utf8');
@@ -244,11 +270,11 @@ function cmdReport(json) {
   }
 }
 
-const [cmd, ...rest] = process.argv.slice(2);
+const [cmd, ...rest] = argv.filter((_, i) => rootAt < 0 || (i !== rootAt && i !== rootAt + 1));
 if (cmd === 'check') cmdCheck();
 else if (cmd === 'shrink') cmdShrink();
 else if (cmd === 'report') cmdReport(rest.includes('--json'));
 else {
-  console.error('usage: node scripts/boundaries.mjs check | shrink | report [--json]');
+  console.error('usage: node scripts/boundaries.mjs check | shrink | report [--json] [--root <dir>]');
   process.exit(2);
 }

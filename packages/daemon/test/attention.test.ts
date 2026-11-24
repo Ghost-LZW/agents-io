@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { HostEventFrame, SessionInfo, errors, type AttentionChanged } from '@agents-io/protocol';
 import type { FakeTurnScript } from '@agents-io/testkit';
-import { FEATURES } from '../src/host.js';
+import { FEATURES } from '@agents-io/kernel';
 import { cli } from './cli-helpers.js';
 import { daemon, until } from './helpers.js';
 

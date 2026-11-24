@@ -3,8 +3,10 @@ import { HarnessRegistry } from './harness-registry.js';
 import { ModuleRegistry } from './modules.js';
 
 /*
- * The kernel with no modules (docs/design/core-slimming §5: "无模块也是产品"). This file imports
- * no module package and not the composition root (`bundle.ts`); `core-only.local.test.ts` checks it.
+ * The kernel with no modules (docs/design/core-slimming §5: "无模块也是产品"). The kernel package
+ * (`@agents-io/kernel`) depends on no module package, and nothing here registers one: a registry not
+ * given is an empty one. `@agents-io/daemon` is the composition root that registers the built-in
+ * modules (its `bundle.ts`) and gives them as the defaults. `core-only.local.test.ts` checks it.
  */
 
 /**
@@ -33,3 +35,12 @@ export function coreRegistries(): Registries {
     moduleRegistry: new ModuleRegistry([]),
   };
 }
+
+/**
+ * What the kernel takes when it is given no registry (`ResolveContext`, `LoadOptions`,
+ * `GatewayOptions`, `importConfigModules`, `buildHarness`; and the console package's
+ * `ConfigStoreOptions`, credential marks and `adminEndpoints`): nothing registered, one set for
+ * all of them (registries never change; `with` makes new ones), so a config resolved and a gateway
+ * started without registries agree.
+ */
+export const NO_REGISTRIES: Readonly<Registries> = Object.freeze(coreRegistries());

@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ConfigStore } from '../src/console-config.js';
+import { ConfigStore } from '../src/defaults.js';
 import { tmp } from './helpers.js';
 
 /*
@@ -31,21 +31,21 @@ describe('console config: several lark-bot channels', () => {
     ['a missing variable', [bot('a', { appId: 'env:NOPE', appSecret: 'env:A_SECRET' })], /environment variable NOPE is not set/],
   ];
   for (const [what, channels, message] of cases) {
-    it(`${what}: validate and PUT answer 422, the file is unchanged #CF-3 #SE-1`, () => {
+    it(`${what}: validate and PUT answer 422, the file is unchanged #CF-3 #SE-1`, async () => {
       const { path, s, initial } = store();
       const next = { ...(JSON.parse(initial) as Record<string, unknown>), channels };
-      const v = s.validate(next);
+      const v = await s.validate(next);
       expect(v.valid).toBe(false);
       expect(v.issues).toContainEqual(expect.objectContaining({ code: 'invalid', severity: 'error', message: expect.stringMatching(message) }));
       for (const i of v.issues) for (const secret of ['secret-d', 'secret-a']) expect(i.message).not.toContain(secret);
-      expect(s.put(next)).toMatchObject({ status: 422 });
+      expect(await s.put(next)).toMatchObject({ status: 422 });
       expect(readFileSync(path, 'utf8')).toBe(initial);
     });
   }
 
-  it('two bots with their own references are accepted #CF-3', () => {
+  it('two bots with their own references are accepted #CF-3', async () => {
     const { s, initial } = store();
     const next = { ...(JSON.parse(initial) as Record<string, unknown>), channels: [bot(undefined), bot('proj-a', { appId: 'env:A_ID', appSecret: 'env:A_SECRET' })] };
-    expect(s.put(next)).toMatchObject({ status: 200 });
+    expect(await s.put(next)).toMatchObject({ status: 200 });
   });
 });

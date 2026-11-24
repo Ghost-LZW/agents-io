@@ -1,4 +1,5 @@
-import { ADMIN_ENDPOINTS, type AdminContribution, type ChannelModule } from '@agents-io/protocol';
+import type { AdminContribution, ChannelModule } from '@agents-io/protocol';
+import { AdminClaims, badAdmin } from './admin-contributions.js';
 
 /**
  * Channel ids the daemon itself gives out: local ends (`local`) and agent addresses
@@ -20,6 +21,12 @@ export interface ChannelRegistryOptions {
    * mail), never a module's own claim: a `ChannelModule` has no say in it.
    */
   defaultEvidence?: Readonly<Record<string, DefaultEvidence>>;
+  /**
+   * Admin contributions besides the types' own (`ChannelModule.admin`), after them, each checked and
+   * claimed as a type's is: the descriptors `type: "module"` entries' files export (`loadConfigModules`).
+   * `type` names it in messages.
+   */
+  admins?: readonly ChannelAdminContribution[];
 }
 
 /** A resolved `channels[]` entry, as far as the registry reads it. */
@@ -41,7 +48,7 @@ const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'obj
  * all are. A module may be untyped code: one without `create` would pass the config and fail the
  * gateway's start with a TypeError.
  */
-function badChannelModule(m: Partial<Record<string, unknown>>): string | undefined {
+export function badChannelModule(m: Partial<Record<string, unknown>>): string | undefined {
   if (!isObject(m.entry)) return 'entry (an object of schemas)';
   const required = (['resolve', 'create'] as const).find((k) => typeof m[k] !== 'function');
   if (required) return `${required} (a function)`;
@@ -50,41 +57,6 @@ function badChannelModule(m: Partial<Record<string, unknown>>): string | undefin
   if (m.ids !== undefined && !(Array.isArray(m.ids) && m.ids.every((id) => typeof id === 'string' && id.length > 0))) return 'ids (an array of non-empty strings when present)';
   return m.admin === undefined ? undefined : badAdmin(m.admin);
 }
-
-const ROUTE_METHODS: readonly unknown[] = ['GET', 'PUT', 'POST'];
-
-/** The first member of an `AdminContribution` that is not what it says, described (`admin.…`). */
-function badAdmin(a: unknown): string | undefined {
-  if (!isObject(a)) return 'admin (an object when present)';
-  for (const k of ['console', 'schemas'] as const) if (a[k] !== undefined && !(isObject(a[k]) && Object.values(a[k]).every(isObject))) return `admin.${k} (an object of schemas when present)`;
-  if (a.mount !== undefined && typeof a.mount !== 'function') return 'admin.mount (a function when present)';
-  if (a.routes === undefined) return undefined;
-  if (!Array.isArray(a.routes)) return 'admin.routes (an array when present)';
-  for (const [i, r] of a.routes.entries()) {
-    const bad = badRoute(r);
-    if (bad) return `admin.routes[${i}]${bad}`;
-  }
-  return undefined;
-}
-
-/** What is wrong with one `AdminRoute` (`.member (what it must be)`), if anything. */
-function badRoute(r: unknown): string | undefined {
-  if (!isObject(r)) return ' (an object)';
-  if (!ROUTE_METHODS.includes(r.method)) return '.method (GET, PUT or POST)';
-  if (typeof r.path !== 'string' || !r.path.startsWith('/api/')) return '.path (a path under /api/)';
-  if (r.status !== 200 && r.status !== 202) return '.status (200 or 202)';
-  if (!isObject(r.response)) return '.response (a schema)';
-  if (r.body !== undefined && !isObject(r.body)) return '.body (a schema when present)';
-  if (r.public !== undefined && r.public !== false) return '.public (a module route always needs credentials)';
-  if (typeof r.handle !== 'function') return '.handle (a function)';
-  return undefined;
-}
-
-/** A route's method and path with its parameters unnamed: two routes with the same key are one. */
-const routeKey = (e: { method: string; path: string }) => `${e.method} ${e.path.replace(/:[^/]*/g, ':')}`;
-
-/** A route's method and path as the messages name it. */
-const routeName = (e: { method: string; path: string }) => `${e.method} ${e.path}`;
 
 /** One registered type's admin contribution (`ChannelModule.admin`). */
 export interface ChannelAdminContribution {
@@ -112,11 +84,13 @@ export class ChannelRegistry {
   /** The registered types' admin contributions (`ChannelModule.admin`), in registration order. */
   readonly adminContributions: readonly ChannelAdminContribution[];
   private readonly admins: ChannelAdminContribution[] = [];
+  private readonly options: ChannelRegistryOptions;
 
   constructor(modules: readonly ChannelModule[], o: ChannelRegistryOptions = {}) {
+    this.options = o;
     const ids = new Map<string, string>();
-    // What the contributions claim, by kind and name: the type that claimed it.
-    const claimed = new Map<string, string>(ADMIN_ENDPOINTS.map((e) => [`route ${routeKey(e)}`, '']));
+    // What the contributions claim: a route, a console key or a schema name is one type's.
+    const claims = new AdminClaims();
     for (const m of modules) {
       if (typeof m.type !== 'string' || !m.type) throw new Error('a channel module needs a non-empty type');
       if (!TYPE_NAME.test(m.type)) throw new Error(`channel type ${JSON.stringify(m.type)}: a type name is ASCII letters, digits, "-" and "_", starting with a letter or digit (it names owners "<type>:<owner>" and state directories "<type>.<account>")`);
@@ -131,8 +105,13 @@ export class ChannelRegistry {
         if (other !== undefined) throw new Error(`channel types ${JSON.stringify(other)} and ${JSON.stringify(m.type)} both declare channel id ${JSON.stringify(id)}`);
         ids.set(id, m.type);
       }
-      if (m.admin) this.claimAdmin(m.type, m.admin, claimed);
+      if (m.admin) this.claimAdmin(m.type, m.admin, claims);
       this.byType.set(m.type, m);
+    }
+    for (const { type, admin } of o.admins ?? []) {
+      const bad = badAdmin(admin);
+      if (bad) throw new Error(`${type}: bad ${bad}`);
+      this.claimAdmin(type, admin, claims);
     }
     for (const [type, ev] of Object.entries(o.defaultEvidence ?? {})) {
       if (!this.byType.has(type)) throw new Error(`defaultEvidence: channel type ${JSON.stringify(type)} is not registered`);
@@ -145,24 +124,29 @@ export class ChannelRegistry {
 
   /**
    * Record `type`'s admin contribution after checking it against the core's endpoints and the
-   * contributions registered before it: a route (method and path, parameters unnamed), a console
-   * key or a schema name belongs to one type. The console's own keys are config.ts's to check.
+   * contributions registered before it (`AdminClaims`): a route (method and path, parameters
+   * unnamed), a console key or a schema name belongs to one type. The console's own keys are
+   * config.ts's to check; a harness kind's contributions are checked against these where both
+   * registries meet (`adminContributions`).
    */
-  private claimAdmin(type: string, admin: AdminContribution, claimed: Map<string, string>): void {
-    const claim = (what: string, name: string) => {
-      const other = claimed.get(what);
-      if (other === '') throw new Error(`channel type ${JSON.stringify(type)}: admin ${name} is the console's own`);
-      if (other !== undefined) throw new Error(`channel types ${JSON.stringify(other)} and ${JSON.stringify(type)} both contribute admin ${name}`);
-      claimed.set(what, type);
-    };
-    for (const r of admin.routes ?? []) claim(`route ${routeKey(r)}`, `route ${routeName(r)}`);
-    for (const k of Object.keys(admin.console ?? {})) claim(`console ${k}`, `setting console.${k}`);
-    for (const k of Object.keys(admin.schemas ?? {})) claim(`schema ${k}`, `schema ${k}`);
+  private claimAdmin(type: string, admin: AdminContribution, claims: AdminClaims): void {
+    claims.claim({ owner: 'channel type', name: type }, admin);
     this.admins.push({ type, admin });
   }
 
   get(type: string): ChannelModule | undefined {
     return this.byType.get(type);
+  }
+
+  /**
+   * A registry of the same types and options, `replace` in the place of the type of its name
+   * (registered here) and `admins` after the contributions this one has; checked as a new one is.
+   */
+  with(o: { replace?: ChannelModule; admins?: readonly ChannelAdminContribution[] }): ChannelRegistry {
+    const r = o.replace;
+    if (r && !this.byType.has(r.type)) throw new Error(`channel type ${JSON.stringify(r.type)} is not registered`);
+    const modules = this.modules.map((m) => (r && m.type === r.type ? r : m));
+    return new ChannelRegistry(modules, { ...this.options, admins: [...(this.options.admins ?? []), ...(o.admins ?? [])] });
   }
 
   /** In registration order. */

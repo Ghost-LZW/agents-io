@@ -1,7 +1,7 @@
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { loadChannelModule, loadHarnessModule } from '../src/module-loader.js';
+import { loadChannelModule, loadHarnessModule } from '../../kernel/src/module-loader.js';
 
 /*
  * One loader for both kinds of plugin module, each with its own export rule: a channel module's

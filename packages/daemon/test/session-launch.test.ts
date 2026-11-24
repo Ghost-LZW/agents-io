@@ -5,10 +5,8 @@ import { CodexHarness, type CodexHarnessOptions } from '@agents-io/harness-codex
 import type { Binding, BindingTable, HarnessAdapter, Policy, SessionLaunch } from '@agents-io/protocol';
 import { LaneUnavailableError } from '@agents-io/session';
 import { FakeChannel, FakeHarness } from '@agents-io/testkit';
-import { LocalClient } from '../src/client.js';
-import { resolveConfig, type HarnessInstance } from '../src/config.js';
-import { Gateway, InstanceHarness, buildHarness } from '../src/gateway.js';
-import { readTokenFile, tokenPath } from '../src/token.js';
+import { type HarnessInstance, LocalClient, readTokenFile, tokenPath } from '@agents-io/kernel';
+import { buildHarness, Gateway, InstanceHarness, resolveConfig } from '../src/defaults.js';
 import { cleanups, tmp, until } from './helpers.js';
 
 /*

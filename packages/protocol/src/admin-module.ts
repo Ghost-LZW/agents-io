@@ -5,8 +5,9 @@ import type { AdminChannelsApplied, AdminEndpoint, ConfigIssue } from './admin.j
  * What a module adds to the host's admin API and console (core-slimming G5, persona's
  * `settings_section`): keys of the console section of the config file, JSON Schemas of its own
  * wire types, HTTP routes, and what it runs while the console serves them. A channel module
- * declares it as `ChannelModule.admin`; the host knows a contribution only through this, a
- * built-in module's (lark-bot's bot provisioning) and a third party's alike.
+ * declares it as `ChannelModule.admin`, a harness kind as `HarnessModule.admin`; the host knows a
+ * contribution only through this, a built-in module's (lark-bot's bot provisioning) and a third
+ * party's alike.
  */
 
 /** What an `AdminRoute`'s handler gets of the request. */
@@ -95,8 +96,8 @@ export interface AdminMount {
 
 /**
  * A module's part of the admin API and console. Every member is optional. The host checks the
- * contributions of the modules it registers against one another and its own: a console key, a
- * schema name or a route (method and path) belongs to one of them.
+ * contributions of the modules it registers (channel types and harness kinds alike) against one
+ * another and its own: a console key, a schema name or a route (method and path) belongs to one of them.
  */
 export interface AdminContribution {
   /**

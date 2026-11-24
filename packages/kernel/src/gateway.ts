@@ -1,7 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, rmSync } from 'node:fs';
 import { dirname, join, resolve as resolvePath } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import {
   PROTOCOL_VERSION,
   formatAddress,
@@ -128,13 +127,16 @@ import {
   withholding,
 } from '@agents-io/session';
 import { HostMcpServer, HostTools, ToolError, agentIdentity, agentOrigin, scheduleRouteRefusal, toolCatalog, type TopicHandover } from '@agents-io/host-mcp';
-import { builtinChannels, builtinHarnesses, builtinModules } from './bundle.js';
-import { badChannelAdapter, loadHarnessModule } from './module-loader.js';
-import { ConfigError, EMBEDDED_HARNESS, UNGRANTED_EVIDENCE, agentSpec, configTable, consoleSettings, resolveModules, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type PresetConfig, type ResolvedChannel } from './config.js';
-import { ConsoleServer, type ContributedRoute } from './console.js';
+import { NO_REGISTRIES } from './core.js';
+import { badChannelAdapter, declaredInner, loadHarnessModule } from './module-loader.js';
+import { descriptorAdmin } from './module-channel.js';
+import { ConfigError, EMBEDDED_HARNESS, UNGRANTED_EVIDENCE, agentSpec, configTable, consoleSettings, resolveModules, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type ResolvedChannel } from './config.js';
+import { canonical, type ConsoleConfigStore, type ConsoleFactory, type ConsoleListener, type ContributedRoute } from './console-host.js';
+import { adminContributions } from './admin-contributions.js';
 import type { ChannelRegistry, DefaultEvidence } from './channel-registry.js';
 import type { HarnessRegistry } from './harness-registry.js';
-import { ConfigStore, canonical } from './console-config.js';
+import type { ImportConfigModules } from './config-modules.js';
+import { NamedRuns, type NamedRun } from './run-defaults.js';
 import type { ClientCommand, SessionInfo } from './frames.js';
 import { ClientOps, type Op, type OpFrame, type OpOutcome } from './client-ops.js';
 import { HostService, isHostOrigin, type CalloutHook } from './host.js';
@@ -171,19 +173,27 @@ export interface GatewayOptions {
   harness?: HarnessAdapter;
   /** Build instance adapters with this instead of `buildHarness` (tests). */
   buildHarness?: (instance: HarnessInstance) => HarnessAdapter;
-  /** The harness kinds instances are built from (default the built-in ones, `bundle.ts`): the registry the config was resolved with. */
+  /** The harness kinds instances are built from (default none; `@agents-io/daemon`'s: the built-in ones): the registry the config was resolved with. */
   harnessRegistry?: HarnessRegistry;
   /**
-   * The channel types configured channels are built from (`ChannelModule.create`; default the
-   * built-in ones, `bundle.ts`): the registry the config was resolved with. It also says who owns
+   * The channel types configured channels are built from (`ChannelModule.create`; default none;
+   * `@agents-io/daemon`'s: the built-in ones): the registry the config was resolved with. It also says who owns
    * an entry's channel id and the evidence an entry gives without a grant.
    */
   channelRegistry?: ChannelRegistry;
   /**
-   * The feature modules (`ModuleManifest`; default the built-in ones, `bundle.ts`, none yet): the
-   * registry the config was resolved with (`Config.modules` names exactly its modules).
+   * The feature modules (`ModuleManifest`; default none; `@agents-io/daemon`'s: the built-in ones):
+   * the registry the config was resolved with (`Config.modules` names exactly its modules).
    */
   moduleRegistry?: ModuleRegistry;
+  /**
+   * How the config's module files were imported (`ConfigModules.importModules`: what
+   * `loadConfigModules` answers with the registries, so `...registries` passes it): the console
+   * then reads a document it shows, validates, writes or applies live as the next start would, its
+   * module files imported (`ConfigStoreOptions.importModules`). Without it the console reads every
+   * document with the registries above, and a `modules` entry they lack is an error there.
+   */
+  importModules?: ImportConfigModules;
   /** In-process channels besides the configured ones (with `coreRegistries`, the only ones: no channel type is registered). */
   channels?: ExtraChannel[];
   /** Build a configured channel's adapter with this instead of its type's `create` when it returns one (embedding, tests). */
@@ -213,8 +223,14 @@ export interface GatewayOptions {
   tokenFile?: string;
   /** Inbound push: how long a pushed item waits for the host's result, and the retry delay (tests). */
   hostPush?: { timeoutMs?: number; retryMs?: number };
-  /** Serve the console API per `config.console` (default false; `aio serve` turns it on unless `console.enabled` is false). */
+  /** Serve the console API per `config.console` (default false; `aio serve` turns it on unless `console.enabled` is false); it needs `consoleFactory`. */
   console?: boolean;
+  /**
+   * What serves the console API and edits the config file (`@agents-io/console`'s `consoleFactory`;
+   * `@agents-io/daemon` gives it): the composition root's. Without it there is no console:
+   * `console: true` fails the start (`ConfigError`), and there is no `configStore`.
+   */
+  consoleFactory?: ConsoleFactory;
   /** Environment of provisioning children (default process.env; tests). */
   consoleEnv?: NodeJS.ProcessEnv;
   /**
@@ -230,6 +246,12 @@ export interface GatewayOptions {
   testHooks?: boolean;
   /** One outbox attempt's upper bound (default 60 s; tests). */
   outboxAttemptTimeoutMs?: number;
+  /**
+   * The CLI a terminal UI's helpers run as, a script for `node` (`TakeoverServices.cli`: the
+   * commands a harness kind adds, `HarnessModule.cli`, such as Claude Code's `tui-bridge`): the
+   * composition root's (`@agents-io/daemon` gives its `aio`). Without it a takeover is refused.
+   */
+  cli?: string;
 }
 
 /** Outcome of a local command, mapped 1:1 onto a `result` frame. */
@@ -365,6 +387,12 @@ export class Gateway {
   readonly moduleRegistry: ModuleRegistry;
   /** The modules of this run: set up before the gateway is built, started after its channels and sockets, stopped first. */
   readonly modules: ModuleHost;
+  /**
+   * The presets: the named run defaults the module providing them gives (`ModuleManifest.runDefaults`,
+   * `ModuleHost.runDefaults`; none without one that is on). A turn's plan, a task run's
+   * `overrides.preset` and `KernelContext.runConfig` ask them.
+   */
+  readonly namedRuns: NamedRuns;
   /** The chat commands: the kernel's, then the active modules'. */
   private readonly commandTable: CommandTable;
   /** Extra identity map entries by who set them (each module's: the stranger approval's guests), merged into the router's. */
@@ -436,20 +464,23 @@ export class Gateway {
   private readonly configured = new Map<string, { id: string; account: string }>();
   private server: LocalServer | undefined;
   private tokenFile: string | undefined;
-  /** The console API server (`GatewayOptions.console`). */
-  console: ConsoleServer | undefined;
+  /** The console API server (`GatewayOptions.console`, made by `GatewayOptions.consoleFactory`). */
+  console: ConsoleListener | undefined;
   private consoleFile: string | undefined;
-  /** The config file as the console edits it (when the config came from a file). */
-  readonly configStore: ConfigStore | undefined;
-  /** What the channel types' admin contributions mounted with the console (`ChannelModule.admin`), ended with it. */
-  private readonly adminMounts: { type: string; close?(): void }[] = [];
+  /** The config file as the console edits it (when the config came from a file and there is a `consoleFactory`). */
+  readonly configStore: ConsoleConfigStore | undefined;
+  /**
+   * What the channel types' and harness kinds' admin contributions mounted with the console
+   * (`ChannelModule.admin`, `HarnessModule.admin`), ended with it; `who` names the owner in the log.
+   */
+  private readonly adminMounts: { who: string; close?(): void }[] = [];
   readonly startedAt = Date.now();
   private readonly log: LogFn;
   private stopped = false;
   /** Parked topic sessions whose lane closes when this fires (`topics.parkedIdleMs`). */
   private readonly parkedTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-  private constructor(
+  protected constructor(
     private readonly o: GatewayOptions,
     modules: ModuleHost,
   ) {
@@ -457,11 +488,14 @@ export class Gateway {
     // The default harness is built below and captures its media resolvers now.
     this.blobs = new FsBlobStore(c.blobs);
     this.harnessBlobs = readOnlyBlobs(this.blobs);
-    this.harnessRegistry = o.harnessRegistry ?? builtinHarnesses;
-    this.channelRegistry = o.channelRegistry ?? builtinChannels;
-    this.moduleRegistry = o.moduleRegistry ?? builtinModules;
+    this.harnessRegistry = o.harnessRegistry ?? NO_REGISTRIES.harnessRegistry;
+    this.channelRegistry = o.channelRegistry ?? NO_REGISTRIES.channelRegistry;
+    this.moduleRegistry = o.moduleRegistry ?? NO_REGISTRIES.moduleRegistry;
     this.modules = modules;
     this.commandTable = modules.commandTable();
+    // What each preset gives names a configured instance (the config checked it; a value written since, or a config built by hand, is checked here).
+    this.namedRuns = new NamedRuns(modules.runDefaults(), (n) => Object.hasOwn(c.harnesses, n));
+    this.namedRuns.check();
     // The default instance must be usable (e.g. its env refs set); others fail when a turn names them.
     // A module default is checked in `start`, once its module is loaded.
     if (o.harness || o.buildHarness || c.harnesses[c.defaultHarness]?.kind !== 'module') this.harness();
@@ -757,15 +791,17 @@ export class Gateway {
           }
         : {}),
     });
-    if (c.source) {
-      this.configStore = new ConfigStore({
+    if (c.source && o.consoleFactory) {
+      this.configStore = o.consoleFactory.configStore({
         path: c.source.path,
         ...(c.source.envFile ? { envFile: c.source.envFile } : {}),
         ...(o.consoleEnv ? { env: o.consoleEnv } : {}),
-        // The console validates and redacts the file against the kinds and types this daemon runs.
+        // The console validates and redacts the file against the kinds and types this daemon runs,
+        // with the module files a document names imported as the next start would (`importModules`).
         harnessRegistry: this.harnessRegistry,
         channelRegistry: this.channelRegistry,
         moduleRegistry: this.moduleRegistry,
+        ...(o.importModules ? { importModules: o.importModules } : {}),
       });
     }
   }
@@ -919,10 +955,17 @@ export class Gateway {
   }
 
   static async start(o: GatewayOptions): Promise<Gateway> {
+    // Before anything runs: the kernel has no console of its own (the composition root gives `@agents-io/console`'s).
+    if (o.console && !o.consoleFactory) throw new ConfigError('console: the console API needs a console implementation (GatewayOptions.consoleFactory: @agents-io/console\'s consoleFactory); this gateway has none');
     // Module lifecycle step 2 (step 1 ran in loadConfig): set up before the gateway builds its
     // ingress, so their tools and commands are assembled with the kernel's. Their kernel context is
     // late-bound: it works once the gateway exists.
-    const registry = o.moduleRegistry ?? builtinModules;
+    const registry = o.moduleRegistry ?? NO_REGISTRIES.moduleRegistry;
+    // A `modules` entry's module runs only when it was imported before the config was resolved, into the registry given here.
+    for (const [i, e] of (o.config.moduleEntries ?? []).entries()) {
+      if (!registry.fromEntry(e))
+        throw new ConfigError(`modules[${i}] (module ${e.module}) is not loaded: import the config's modules before resolving it (loadConfigModules, as aio serve does) and give loadConfig and Gateway.start the registries it returns`);
+    }
     const defaults = o.config.modules === undefined ? builtinDefaults(registry) : undefined;
     const modules = new ModuleHost({
       registry,
@@ -964,7 +1007,7 @@ export class Gateway {
         gw.tokenFile = tokenPath(o.config.socketPath);
         writeTokenFile(gw.tokenFile, gw.token);
       }
-      if (o.console) await gw.startConsole();
+      if (o.console) await gw.startConsole(o.consoleFactory!);
       // Step 3: after the channels, the local socket and the console (the external MCP endpoint last).
       await gw.modules.start();
       // Schedules fire once what they send through runs: the channels, and the modules that send a
@@ -985,10 +1028,10 @@ export class Gateway {
    * The console API. A port that is taken is logged, not fatal: the daemon's
    * channels and sockets keep working without it.
    */
-  private async startConsole(): Promise<void> {
+  private async startConsole(factory: ConsoleFactory): Promise<void> {
     const c = this.o.config;
     const routes = this.mountAdmin();
-    const server = new ConsoleServer({
+    const server = factory.server({
       config: c.console,
       host: {
         local: this,
@@ -1024,18 +1067,20 @@ export class Gateway {
   }
 
   /**
-   * Mount what the channel types add to the console (`ChannelModule.admin`, in registration order):
-   * each contribution gets a context of its own (its console settings, the private work directory
-   * `<dataDir>/provision`, the config file when the daemon has one) for its `mount` and every call
-   * of its routes. A `mount` that throws fails the start.
+   * Mount what the channel types and harness kinds add to the console (`ChannelModule.admin`,
+   * `HarnessModule.admin`, in the order `adminContributions` lists them: the channel types', then
+   * the harness kinds', each in registration order): each contribution gets a context of its own
+   * (its console settings, the private work directory `<dataDir>/provision`, the config file when
+   * the daemon has one) for its `mount` and every call of its routes. A `mount` that throws fails the start.
    */
   private mountAdmin(): ContributedRoute[] {
     const c = this.o.config;
-    const contributions = this.channelRegistry.adminContributions;
+    const contributions = adminContributions(this.harnessRegistry, this.channelRegistry);
     const dir = join(c.dataDir, 'provision');
     if (contributions.some(({ admin }) => admin.mount)) privateDir(dir, (msg) => this.log('warn', msg));
     const routes: ContributedRoute[] = [];
-    for (const { type, admin } of contributions) {
+    for (const contribution of contributions) {
+      const { admin } = contribution;
       const ctx: AdminContext = {
         console: consoleSettings(c.console, admin.console),
         dir,
@@ -1045,7 +1090,7 @@ export class Gateway {
         ...(this.configStore && c.console.liveChannels ? { applyChannels: () => this.applyChannels() } : {}),
       };
       const mounted = admin.mount?.(ctx);
-      if (mounted) this.adminMounts.push({ type, ...(mounted.close ? { close: () => mounted.close!() } : {}) });
+      if (mounted) this.adminMounts.push({ who: `${contribution.owner} ${contribution.name}`, ...(mounted.close ? { close: () => mounted.close!() } : {}) });
       for (const route of admin.routes ?? []) routes.push({ route, ctx });
     }
     return routes;
@@ -1057,7 +1102,7 @@ export class Gateway {
       try {
         m.close?.();
       } catch (e) {
-        this.log('warn', `channel type ${m.type}: closing its console part failed: ${(e as Error).message}`);
+        this.log('warn', `${m.who}: closing its console part failed: ${(e as Error).message}`);
       }
     }
   }
@@ -1264,16 +1309,28 @@ export class Gateway {
   private async loadHarnessModules(): Promise<void> {
     if (this.o.harness || this.o.buildHarness) return;
     const c = this.o.config;
+    // The commands the modules' descriptors add to the CLI (`HarnessModule.cli`): each name one's, none a registered kind's.
+    const commands = new Map<string, { instance: string; run: unknown }>();
     for (const inst of Object.values(c.harnesses)) {
       if (inst.kind !== 'module' || inst.unavailable) continue;
+      const launch = inst.launch as ModuleLaunch;
       const adapter = await loadHarnessModule({
         name: inst.name,
-        module: inst.launch as ModuleLaunch,
+        module: launch,
         log: this.instanceLog(inst.name),
         harness: (name) => this.otherInstance(name),
         blobs: this.harnessBlobs,
         env: inst.env,
         profiles: inst.profiles,
+        commands: (cli) => {
+          for (const [name, run] of Object.entries(cli)) {
+            const where = `harnesses.${inst.name} (module ${launch.file}): cli ${JSON.stringify(name)}`;
+            if (this.harnessRegistry.cliCommand(name)) throw new Error(`${where}: a registered harness kind adds it too`);
+            const other = commands.get(name);
+            if (other && other.run !== run) throw new Error(`${where}: harnesses.${other.instance} adds it too`);
+            commands.set(name, { instance: inst.name, run });
+          }
+        },
       }).catch((e: Error) => {
         throw new ConfigError(e.message);
       });
@@ -1832,10 +1889,11 @@ export class Gateway {
 
   /**
    * A task run's RunSpec (feature `run.overrides`): the agent's instance, model and effort, or
-   * those of `overrides.preset`; `overrides.model` / `effort` over them (passed through); the
-   * profile `overrides.profile`, else the agent's, else `restricted`. `bad_override` when a preset
-   * is not configured, a value is not a plain token, or (with a `profile` or `preset` override) the
-   * profile is neither one the run's instance defines nor built in: never a silent fallback.
+   * those `overrides.preset` gives (`namedRuns`); `overrides.model` / `effort` over them (passed
+   * through); the profile `overrides.profile`, else the agent's, else `restricted`. `bad_override`
+   * when no preset of that name is given (none configured, or no module provides presets), a value
+   * is not a plain token, or (with a `profile` or `preset` override) the profile is neither one the
+   * run's instance defines nor built in: never a silent fallback.
    */
   private runSpec(agent: AgentConfig, o: RunOverrides | undefined): { ok: true; spec: RunSpec } | { ok: false; code: string; message: string } {
     const c = this.o.config;
@@ -1848,8 +1906,9 @@ export class Gateway {
     if (!inst) return { ok: false, code: 'harness_unavailable', message: `agent ${agent.name}: unknown harness instance ${agent.harness}` };
     let base = agentRun(agent, inst);
     if (o?.preset !== undefined) {
-      const preset = c.presets[o.preset];
-      if (!preset) return bad(`unknown preset ${JSON.stringify(o.preset)} (${Object.keys(c.presets).length ? `configured: ${Object.keys(c.presets).join(', ')}` : 'no `presets` configured'})`);
+      // What the module providing the presets gives for the name (none: `unknown preset …`, saying why).
+      const preset = this.namedRuns.get(o.preset);
+      if (!preset) return bad(this.namedRuns.unknown(o.preset));
       inst = c.harnesses[preset.harness]!;
       base = agentRun(preset, inst);
     }
@@ -3081,22 +3140,22 @@ ${a.summary}` }],
    * own error. Only the shape is checked: what the adapter does once started is not (a `start`
    * that returns no promise, a `caps` that throws fail as their own error, e.g. a `TypeError`).
    */
-  private async buildConfigChannel(cfg: ResolvedChannel, index: number): Promise<BuiltChannel> {
+  private async buildConfigChannel(cfg: ResolvedChannel, index: number, registry: ChannelRegistry = this.channelRegistry): Promise<BuiltChannel> {
     let entry: RunningChannel | undefined;
     let early: ChannelState | undefined;
     const onState = (st: ChannelState) => {
       if (!entry) return void (early = st);
       this.channelState(entry, st);
     };
-    const owner = this.channelRegistry.owner(cfg);
-    const defaultEvidence = this.channelRegistry.defaultEvidence(cfg.type);
+    const owner = registry.owner(cfg);
+    const defaultEvidence = registry.defaultEvidence(cfg.type);
     // Each hello's id is checked against the running channels (a bridge without `id` learns its id there).
     const acceptId = (id: string) => this.idConflict(id, { owner, account: cfg.account, source: cfg }, this.channels.filter((e) => e !== entry));
     const own = this.o.channelAdapter?.(cfg);
     let built: CreatedChannel;
     if (own) built = { adapter: own };
     else {
-      const m = this.channelRegistry.get(cfg.type);
+      const m = registry.get(cfg.type);
       if (!m) throw new ConfigError(`channels[${index}]: channel type ${JSON.stringify(cfg.type)} is not registered with the gateway; give Gateway.start the channel registry the config was resolved with`);
       const config = (cfg as { config?: unknown }).config;
       // A copy: what `create` (or its adapter later) does to the entry never reaches the host's keys read from `source` (`evidence`, `ack`, …).
@@ -3184,9 +3243,9 @@ ${a.summary}` }],
     }
   }
 
-  /** Build and start one configured channel next to the running ones (live apply). */
-  private async startConfigChannel(cfg: ResolvedChannel, index: number): Promise<RunningChannel> {
-    const b = await this.buildConfigChannel(cfg, index);
+  /** Build and start one configured channel next to the running ones (live apply), through `registry` (the one the file resolved with). */
+  private async startConfigChannel(cfg: ResolvedChannel, index: number, registry: ChannelRegistry): Promise<RunningChannel> {
+    const b = await this.buildConfigChannel(cfg, index, registry);
     // stop() may have run while it was built: close it rather than start it into closed stores.
     if (this.stopped) {
       await b.close?.().catch(() => undefined);
@@ -3247,8 +3306,11 @@ ${a.summary}` }],
    * rejects within `channelStartGraceMs`, is listed in `failed` instead, and so is an
    * unchanged one still failing; the file then does not count as applied. A failure
    * an adapter only logs (it retries internally, as lark-bot does with bad credentials)
-   * or one after the grace shows in `GET /api/status` only. Returns
-   * undefined when it is off, there is no config file, or the file does not resolve.
+   * or one after the grace shows in `GET /api/status` only. The file is resolved, and new
+   * channels built, as the next start would (its module files imported, `ConfigStore.resolveImported`);
+   * one whose module file's descriptor adds admin routes the console did not mount at the start
+   * is `failed` (it runs from the next start). Returns undefined when it is off, there is no
+   * config file, or the file does not resolve.
    */
   applyChannels(): Promise<{ applied: 'live' | 'restart'; channels: AdminChannelsApplied } | undefined> {
     const p = this.applying.then(() => this.applyChannelsNow());
@@ -3262,8 +3324,12 @@ ${a.summary}` }],
     const cur = store.read();
     if (cur.parseError) return undefined;
     let next: ResolvedChannel[];
+    let registry: ChannelRegistry;
     try {
-      next = store.resolve(cur.raw).channels;
+      ({
+        config: { channels: next },
+        channelRegistry: registry,
+      } = await store.resolveImported(cur.raw));
     } catch (e) {
       this.log('warn', `config channels not applied: ${(e as Error).message}`);
       return undefined;
@@ -3289,18 +3355,23 @@ ${a.summary}` }],
     }
     const failed: NonNullable<AdminChannelsApplied['failed']> = [];
     const launched: RunningChannel[] = [];
+    // The admin routes the console serves: the ones it mounted at the start.
+    const mounted = new Set(this.channelRegistry.adminContributions.map((c) => c.admin));
     for (const w of want) {
       if (w.kept) continue;
       if (this.stopped) break;
       try {
-        const e = await this.startConfigChannel(w.c, w.index);
+        const admin = descriptorAdmin(registry, w.c);
+        if (admin && !mounted.has(admin))
+          throw new ConfigError(`channels[${w.index}]: its module file's descriptor adds admin routes, which the console mounts when the daemon starts: restart the daemon to run it`);
+        const e = await this.startConfigChannel(w.c, w.index, registry);
         // Sessions already open render to it too, as if it had been there at their start.
         for (const key of this.lanes.keys()) this.compose(key, e);
         launched.push(e);
       } catch (err) {
         failed.push({ ...ref(w.c), error: (err as Error).message });
         // Under its channel id when known before it is built (`ChannelModule.idOf`: lark-bot, mail, a bridge's `id`); a module's only once loaded.
-        const id = this.channelRegistry.idOf(w.c) ?? w.c.type;
+        const id = registry.idOf(w.c) ?? w.c.type;
         this.configured.set(`${id}\0${w.c.account}`, { id, account: w.c.account });
         this.log('error', `channel ${w.c.type} (${w.c.account}) not started: ${(err as Error).message}`);
       }
@@ -3662,6 +3733,8 @@ ${a.summary}` }],
    * instance (`harnessFor`) until the terminal leaves, and the lane's turns go to it meanwhile.
    */
   private async takeOver(key: string, lane: Lane, instance: string, adapter: TakingOver, model: string | undefined): Promise<Outcome> {
+    const cli = this.o.cli;
+    if (cli === undefined) return { ok: false, code: 'unsupported', message: `${key}: harness ${instance}'s terminal UI takes the session over, and this daemon has no CLI for its helpers (GatewayOptions.cli)` };
     const held = this.takeovers.get(key);
     if (held?.takeover.connected) return { ok: false, code: 'conflict', message: `${key}: a terminal UI is already attached` };
     if (held) this.endTakeover(held, 'replaced by a new attach');
@@ -3680,8 +3753,10 @@ ${a.summary}` }],
       ...(model ? { model } : {}),
       services: {
         dir: join(this.o.config.dataDir, 'tui'),
-        // A helper the terminal starts runs as this CLI (`aio <command>`, a kind's `HarnessModule.cli`), next to this module in dist/.
-        cli: fileURLToPath(new URL('./cli.js', import.meta.url)),
+        // A helper the terminal starts runs as the composition root's CLI (`aio <command>`, a kind's `HarnessModule.cli`).
+        cli,
+        // Where the CLI finds a `use: "module"` instance's commands (its descriptor's `cli`).
+        ...(this.o.config.source?.path ? { config: this.o.config.source.path } : {}),
         fileOf: (ref) => this.blobs.stat(ref),
         onEnd: (reason) => {
           if (!hold) endedEarly = reason;
@@ -3726,15 +3801,16 @@ ${a.summary}` }],
     return v ? (JSON.parse(v) as RunOverride) : {};
   }
 
-  /** The configured preset a session override names, with its instance (one no longer configured is ignored). */
-  private overridePreset(o: RunOverride): { preset: PresetConfig; inst: HarnessInstance } | undefined {
-    const preset = o.preset !== undefined ? this.o.config.presets[o.preset] : undefined;
+  /** The preset a session override names, as its provider gives it, with its instance (one no longer given is ignored). */
+  private overridePreset(o: RunOverride): { preset: NamedRun; inst: HarnessInstance } | undefined {
+    const preset = o.preset !== undefined ? this.namedRuns.get(o.preset) : undefined;
     return preset && { preset, inst: this.o.config.harnesses[preset.harness]! };
   }
 
   /**
    * Apply owner chat overrides after the agent's policy: a preset replaces the harness, model and
-   * effort, `/model` and `/effort` go over that; guests retain their policy profile.
+   * effort (what its provider gives for it at this turn, `namedRuns`), `/model` and `/effort` go
+   * over that; guests retain their policy profile.
    */
   private withRunOverride(p: FullPolicy, sessionKey: string): FullPolicy {
     return {
@@ -3827,7 +3903,7 @@ ${a.summary}` }],
    * `tui.attach`): the agent's instance, or the one of the preset set for the session, what its
    * adapter declares (`HarnessAdapter.compact` / `modes` / `ownerProfileSwitch`: `runDeclarations`,
    * also while it is unavailable for now), and the run with what is set for the session over the agent's. `preset` is the one set here,
-   * else the agent's; `stalePreset` one set here that is no longer configured.
+   * else the agent's; `stalePreset` one set here that is no longer given (not configured, or no module provides presets now).
    */
   private sessionRun(key: string): KernelSessionRun {
     const c = this.o.config;
@@ -3856,9 +3932,9 @@ ${a.summary}` }],
     };
   }
 
-  /** Set (a value) or clear (`null`) what is set for a session's next turns (`KernelContext.runConfig.set`); a preset must be configured. */
+  /** Set (a value) or clear (`null`) what is set for a session's next turns (`KernelContext.runConfig.set`); a preset must be one its provider gives. */
   private setRunOverride(key: string, o: KernelRunOverrides): void {
-    if (typeof o.preset === 'string' && !this.o.config.presets[o.preset]) throw new Error(`no preset ${o.preset} (configured: ${Object.keys(this.o.config.presets).join(', ') || 'none'})`);
+    if (typeof o.preset === 'string' && !this.namedRuns.get(o.preset)) throw new Error(`no preset ${o.preset} (${this.namedRuns.missing() ?? `configured: ${this.namedRuns.names().join(', ') || 'none'}`})`);
     const next = { ...this.runOverride(key) };
     if (o.preset !== undefined) o.preset === null ? delete next.preset : (next.preset = o.preset);
     if (o.model !== undefined) o.model === null ? delete next.model : (next.model = o.model);
@@ -3868,13 +3944,15 @@ ${a.summary}` }],
     this.records.setFlag(`run:${key}`, Object.keys(next).length ? JSON.stringify(next) : undefined);
   }
 
-  /** The configured presets, with the model and effort their instance gives when they set none (`KernelContext.runConfig.presets`). */
+  /** The presets their provider gives, in its order, with the model and effort their instance gives when they set none (`KernelContext.runConfig.presets`). */
   private presetViews(): KernelPreset[] {
     const c = this.o.config;
-    return Object.values(c.presets).map((p) => {
+    return this.namedRuns.names().flatMap((name) => {
+      const p = this.namedRuns.get(name);
+      if (!p) return [];
       const inst = c.harnesses[p.harness]!;
       const run = agentRun(p, inst);
-      return { name: p.name, harness: inst.name, kind: inst.kind, ...(run.model ? { model: run.model } : {}), ...(run.effort ? { effort: run.effort } : {}), ...(p.description ? { description: p.description } : {}) };
+      return [{ name: p.name, harness: inst.name, kind: inst.kind, ...(run.model ? { model: run.model } : {}), ...(run.effort ? { effort: run.effort } : {}), ...(p.description ? { description: p.description } : {}) }];
     });
   }
 
@@ -4236,7 +4314,7 @@ ${a.summary}` }],
     const detached = [...this.lanes.values()].filter(detaching);
     const closed = [...this.lanes.values()].filter((l) => !detaching(l));
     for (const l of detached) l.detach('gateway stopping');
-    // Every built instance (every module instance from start), each adapter once: two module instances may share one.
+    // Every built instance (every module instance from start), each adapter once: two module instances may share one (under two descriptors' declarations too).
     const adapters = this.o.harness ? [this.o.harness] : [...new Map([...this.instances.values()].map((a) => [innerAdapter(a), a])).values()];
     // Bounded by a timer that holds the event loop: harness close() may wait on unref'd timers only.
     await within(
@@ -4463,9 +4541,12 @@ class LaunchEnvHarness extends WrappedHarness implements HarnessAdapter {
   }
 }
 
-/** The kind's adapter under the gateway's wrappers (an instance's, a launched session's env). */
+/**
+ * The kind's adapter under the gateway's wrappers (an instance's, a launched session's env) and a
+ * module descriptor's declarations (`declaredInner`): the object a factory or `create` returned.
+ */
 function innerAdapter(a: HarnessAdapter): HarnessAdapter {
-  return a instanceof InstanceHarness || a instanceof LaunchEnvHarness ? innerAdapter(a.inner) : a;
+  return a instanceof InstanceHarness || a instanceof LaunchEnvHarness ? innerAdapter(a.inner) : declaredInner(a);
 }
 
 /**
@@ -4477,8 +4558,8 @@ export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
   readonly id: string;
   /**
    * Every open's `options.profiles` is the instance's `profiles` (`HarnessModule.profilesInOpen`):
-   * a module instance's, and a registered kind's that takes them there (Claude Code). Default: what
-   * the built-in registry says of the instance's kind.
+   * a module instance's, and a registered kind's that takes them there (Claude Code). Default: a
+   * module instance's only (`@agents-io/daemon`'s: also what the built-in registry says of its kind).
    */
   readonly profilesInOpen: boolean;
   constructor(
@@ -4492,7 +4573,7 @@ export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
   ) {
     super();
     this.id = instance.name;
-    this.profilesInOpen = profilesInOpen ?? (instance.kind === 'module' || builtinHarnesses.get(instance.kind)?.profilesInOpen === true);
+    this.profilesInOpen = profilesInOpen ?? instance.kind === 'module';
   }
 
   // Read through when asked: an adapter that learns them from its harness (`HarnessModule.probeAtStart`, a bridge) has them only after its first probe.
@@ -4549,7 +4630,7 @@ export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
 
 /**
  * The adapter for one instance of a registered kind, built by the kind's module (`HarnessModule.create`;
- * default registry: the built-in kinds). Environment values are handed to the child process only, never
+ * default registry: none; `@agents-io/daemon`'s: the built-in kinds). Environment values go to the child process only, never
  * logged. `blobs` is the store media inputs point at: the adapter resolves them itself. `log` and
  * `harness` are what the adapter gets as `HarnessFactoryInit` (outside a gateway: no log, no other instances).
  */
@@ -4560,7 +4641,7 @@ export function buildHarness(
 ): InstanceHarness {
   if (i.unavailable) throw new Error(`harness instance ${i.name} is unavailable: ${i.unavailable}`);
   if (i.kind === 'module') throw new Error(`harness instance ${i.name} is a module harness; the gateway loads it at start`);
-  const registry = o.registry ?? builtinHarnesses;
+  const registry = o.registry ?? NO_REGISTRIES.harnessRegistry;
   const kind = registry.get(i.kind);
   if (!kind) throw new Error(`harness instance ${i.name}: harness kind ${JSON.stringify(i.kind)} is not registered (registered: ${registry.kinds.join(', ')})`);
   const adapter = kind.create({

@@ -7,9 +7,7 @@ import type { InputRecord, RouteExplanation, RunEnded } from '@agents-io/protoco
 import { Hub, MemorySessionLog } from '@agents-io/session';
 import type { Lane } from '@agents-io/session';
 import type { FakeTurnScript } from '@agents-io/testkit';
-import type { AgentConfig } from '../src/config.js';
-import type { Peer } from '../src/local-server.js';
-import { Runs, type RunDeps } from '../src/runs.js';
+import { type AgentConfig, type Peer, type RunDeps, Runs } from '@agents-io/kernel';
 import { daemon, tmp, until } from './helpers.js';
 
 const AGENTS = {

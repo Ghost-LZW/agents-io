@@ -2,20 +2,21 @@ import { statSync } from 'node:fs';
 import { join } from 'node:path';
 import { Type } from '@sinclair/typebox';
 import { describe, expect, it } from 'vitest';
-import { ADMIN_ENDPOINTS, check, type AdminContext, type ChannelModule } from '@agents-io/protocol';
+import { ADMIN_ENDPOINTS, check, type AdminContext, type ChannelModule, type HarnessModule } from '@agents-io/protocol';
 import { bridgeChannelModule } from '@agents-io/channel-jsonl-bridge';
 import { LARK_BOT_ADMIN_ENDPOINTS } from '@agents-io/channel-lark-bot';
 import { mailChannelModule } from '@agents-io/channel-mail';
-import { FakeChannel } from '@agents-io/testkit';
+import { FakeChannel, FakeHarness } from '@agents-io/testkit';
 import { builtinChannels } from '../src/bundle.js';
-import { ChannelRegistry } from '../src/channel-registry.js';
-import { adminEndpoints } from '../src/console.js';
-import { ConfigStore } from '../src/console-config.js';
+import { adminEndpoints } from '@agents-io/console';
+import { ChannelRegistry, HarnessRegistry } from '@agents-io/kernel';
+import { ConfigStore } from '../src/defaults.js';
 import { consoleDaemon } from './console-helpers.js';
 
 /*
  * Modules contribute admin routes and console settings (core-slimming G5): the console serves the
- * core endpoints, then the routes of its registry's channel types, with the same auth.
+ * core endpoints, then the routes of its registry's channel types, then its harness kinds', with
+ * the same auth.
  */
 
 const key = (e: { method: string; path: string }) => `${e.method} ${e.path}`;
@@ -134,6 +135,86 @@ describe('a module\'s routes', () => {
     ]);
     // The same context as the mount's, for every call.
     for (const s of seen) expect(s.ctx).toBe(ctx);
+    expect(closed).toBe(0);
+    await w.stop();
+    expect(closed).toBe(1);
+  });
+});
+
+describe('a harness kind\'s routes', () => {
+  it('are served as a channel type\'s are, after them: listed once in the endpoint table, credentials needed, the body checked; its console settings, its own context for mount and handler, closed at stop #SE-3 #PR-1', async () => {
+    const mounted: AdminContext[] = [];
+    const seen: AdminContext[] = [];
+    let closed = 0;
+    const Page = Type.Object({ text: Type.String() });
+    // A fixture harness kind: what it adds to the console is its `HarnessModule.admin`, as a channel type's `ChannelModule.admin`.
+    const notebook: HarnessModule = {
+      kind: 'notebook',
+      schema: Type.Object({}),
+      create: () => new FakeHarness(),
+      admin: {
+        console: { notebookPages: Type.Integer({ minimum: 1, default: 10 }), notebookTitle: Type.String({ default: 'Notebook' }) },
+        schemas: { NotebookPage: Page },
+        routes: [
+          {
+            method: 'GET',
+            path: '/api/notebook/:page',
+            status: 200,
+            response: Page,
+            handle: (req, ctx) => {
+              seen.push(ctx);
+              return { status: 200, body: { text: `${req.params.page} of ${String(ctx.console.notebookPages)}` } };
+            },
+          },
+          {
+            method: 'PUT',
+            path: '/api/notebook/:page',
+            body: Page,
+            status: 200,
+            response: Page,
+            handle: (req, ctx) => {
+              seen.push(ctx);
+              return { status: 200, body: req.body };
+            },
+          },
+        ],
+        mount: (ctx) => {
+          mounted.push(ctx);
+          return { close: () => void closed++ };
+        },
+      },
+    };
+    const harnesses = new HarnessRegistry([notebook]);
+    expect(harnesses.adminContributions.map((c) => c.kind)).toEqual(['notebook']);
+    // The endpoint table: the core's, the channel types' (lark-bot's), then the harness kinds', each once, without handlers.
+    const all = adminEndpoints(builtinChannels, harnesses);
+    expect(all.map(key)).toEqual([...ADMIN_ENDPOINTS.map(key), 'POST /api/bots/lark', 'GET /api/bots/lark/:job', 'GET /api/notebook/:page', 'PUT /api/notebook/:page']);
+    for (const e of all) expect('handle' in e).toBe(false);
+
+    const w = await consoleDaemon({ harnessRegistry: harnesses, raw: { console: { notebookPages: 3 } } });
+    // One context for the kind's contribution: its settings (written, else the schema default), the private directory, the config file.
+    expect(mounted).toHaveLength(1);
+    const ctx = mounted[0]!;
+    expect(ctx.console).toEqual({ notebookPages: 3, notebookTitle: 'Notebook' });
+    expect(ctx.dir).toBe(join(w.dir, 'provision'));
+    expect(statSync(ctx.dir).mode & 0o777).toBe(0o700);
+    expect(ctx.config).toBeInstanceOf(ConfigStore);
+
+    // Credentials as for every /api route.
+    expect(await w.api('/api/notebook/p1', { token: null })).toMatchObject({ status: 401, body: { error: { code: 'unauthorized' } } });
+    expect(await w.api('/api/notebook/p1', { method: 'PUT', json: { text: 'x' }, token: 'nope' })).toMatchObject({ status: 401 });
+    expect(seen).toEqual([]);
+    const page = await w.api('/api/notebook/p%201');
+    expect(page).toMatchObject({ status: 200, body: { text: 'p 1 of 3' } });
+    expect(check(Page, page.body)).toBe(true);
+    expect(await w.api('/api/notebook/p1', { method: 'PUT', json: { text: 1 } })).toMatchObject({ status: 400, body: { error: { code: 'invalid_request' } } });
+    expect(await w.api('/api/notebook/p1', { method: 'PUT', json: { text: 'hi' } })).toMatchObject({ status: 200, body: { text: 'hi' } });
+    expect(await w.api('/api/notebook/p1', { method: 'POST', json: { text: 'hi' } })).toMatchObject({ status: 404, body: { error: { code: 'not_found', message: 'no POST /api/notebook/p1' } } });
+    // The channel types' routes are served beside them.
+    expect(await w.api('/api/bots/lark/lark_nope')).toMatchObject({ status: 404, body: { error: { code: 'unknown_job', message: 'no provisioning job lark_nope' } } });
+    // The same context as the mount's, for every call.
+    expect(seen).toHaveLength(2);
+    for (const s of seen) expect(s).toBe(ctx);
     expect(closed).toBe(0);
     await w.stop();
     expect(closed).toBe(1);

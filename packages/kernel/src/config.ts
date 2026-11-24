@@ -16,19 +16,22 @@ import {
   type HarnessChildSecrets,
   type HarnessModule,
   type HarnessResolveContext,
+  type ModuleConfig,
   type ModuleManifest,
   type Principal,
   type RunSpec,
   type WatchSource,
 } from '@agents-io/protocol';
 import { DEFAULT_BLOB_MAX_BYTES, Router, RouterError, checkIdentities, ownerIdentities, ownersTable, type AgentContactRule, type AgentSpec, type LoopGuardOptions } from '@agents-io/session';
-import { builtinChannels, builtinHarnesses, builtinModules, type BuiltinChannelEntry, type BuiltinChannelSettings, type BuiltinModuleSections, type ExternalMcpConfig } from './bundle.js';
+import { NO_REGISTRIES } from './core.js';
+import { adminContributions, ownerName } from './admin-contributions.js';
 import type { ChannelRegistry } from './channel-registry.js';
 import { ConfigError } from './config-error.js';
 import { loadEnvFile } from './env-file.js';
 import type { HarnessRegistry } from './harness-registry.js';
 import { resolveModuleFile } from './module-loader.js';
-import type { ModuleRegistry, ResolvedModule } from './modules.js';
+import type { ModuleEntryRef, ModuleRegistry, RegisteredModule, ResolvedModule } from './modules.js';
+import { NamedRuns, type NamedRun, type RunDefaultsProvider } from './run-defaults.js';
 import { KERNEL_TOOL_NAMES } from '@agents-io/host-mcp';
 
 /*
@@ -43,13 +46,16 @@ import { KERNEL_TOOL_NAMES } from '@agents-io/host-mcp';
  * `env_key` / `env_vars`); where that is impossible "env:" is refused. Each
  * harness kind's module does that for its own keys (`HarnessModule.resolve`,
  * through `HarnessChildSecrets`); the kinds are the ones a `HarnessRegistry`
- * holds (`bundle.ts` registers Claude Code and Codex).
+ * holds (`@agents-io/daemon`'s `bundle.ts` registers Claude Code and Codex).
  *
  * Agents (`agents: { <name>: { harness | preset, model?, effort?, profile?, cwd?,
  * mode?, tools?, instructionsFile? } }`) are named run configurations over the
- * instances. Presets (`presets: { <name>: { harness, model?, effort? } }`) name
- * one harness instance + model + effort: an agent may take its defaults from
- * one, and the owner switches a session to another with `/preset <name>`.
+ * instances. A preset names one harness instance + model + effort: an agent may
+ * take its defaults from one, and the owner switches a session to another with
+ * `/preset <name>`. The presets are named run defaults a module provides
+ * (`ModuleManifest.runDefaults`; the bundled `presets` module's section
+ * `presets: { <name>: { harness, model?, effort? } }`), which an agent's
+ * `preset` is resolved against (`run-defaults.ts`).
  * `bindings` (+ `identities`) is the local binding table
  * (docs/HOSTS.md §2). Without `bindings` the owners-based default table routes
  * to the default agent. Without `agents` there is one agent, `default`, on the
@@ -177,17 +183,17 @@ const ChannelCommon = {
   evidence: Type.Optional(Type.Array(Evidence)),
 };
 
-type ChannelCommonFields = Static<TObject<typeof ChannelCommon>>;
+export type ChannelCommonFields = Static<TObject<typeof ChannelCommon>>;
 
 /** The keys of a channel entry the host owns (`type` and `ChannelCommon`): what a type's `resolve` returns for them does not count. */
 const HOST_CHANNEL_KEYS: ReadonlySet<string> = new Set(['type', ...Object.keys(ChannelCommon)]);
 
-/**
- * Channel ids of the built-in adapters, local ends and agent addresses (`agent:<agent>:<sessionKey>`
- * routes, the `agent` identity namespace the daemon stamps, ID-7): no bridge or module channel may use them.
- * The ones the built-in types declare (`ChannelModule.ids`), then the daemon's own (`CORE_CHANNEL_IDS`).
+/*
+ * The channel ids no bridge or module channel may use are a registry's (`ChannelRegistry.reservedIds`:
+ * the ids its types declare, `ChannelModule.ids`, then the daemon's own, `CORE_CHANNEL_IDS`: local
+ * ends and agent addresses, `agent:<agent>:<sessionKey>` routes, the `agent` identity namespace the
+ * daemon stamps, ID-7); `RESERVED_CHANNEL_IDS` is `@agents-io/daemon`'s, over the built-in types.
  */
-export const RESERVED_CHANNEL_IDS: readonly string[] = builtinChannels.reservedIds;
 /** Evidence a channel of a type registered `ungranted` (bridge, module) may give without an `evidence` grant. */
 export const UNGRANTED_EVIDENCE: readonly Evidence[] = ['device_only', 'none'];
 
@@ -207,9 +213,9 @@ function channelEntrySchema(registry: ChannelRegistry): TSchema {
   return s;
 }
 
-/** A `channels[]` entry of a built-in type, as written. */
-export type ChannelEntry = ChannelCommonFields & BuiltinChannelEntry;
-const ChannelEntry = channelEntrySchema(builtinChannels) as TSchema & { static: ChannelEntry };
+/** A `channels[]` entry as written: `type` (a registered one), the keys every entry has and the type's own (`@agents-io/daemon`'s `ChannelEntry` is typed for the built-in types). */
+export type ChannelEntry = ChannelCommonFields & { type: string; [key: string]: unknown };
+const ChannelEntry = channelEntrySchema(NO_REGISTRIES.channelRegistry) as TSchema & { static: ChannelEntry };
 
 /** The `console` section's own keys before the modules' ones: the console server's. */
 const ConsoleServerKeys = {
@@ -250,51 +256,42 @@ const ConsoleApplyKeys = {
 };
 
 type ConsoleSection = TObject<typeof ConsoleServerKeys & typeof ConsoleApplyKeys>;
-const consoleSections = new WeakMap<ChannelRegistry, ConsoleSection>();
+const consoleSections = new WeakMap<HarnessRegistry, WeakMap<ChannelRegistry, ConsoleSection>>();
 
 /**
- * The `console` section over a registry's channel types: the console's own keys and, between the
- * server's and `liveChannels`, the settings the types contribute (`AdminContribution.console`,
- * each optional, in registration order; lark-bot's `larkBotCommand` is where it always was).
- * Closed, so a setting no registered type declares is a config error.
+ * The `console` section over a registry's harness kinds and a registry's channel types: the
+ * console's own keys and, between the server's and `liveChannels`, the settings they contribute
+ * (`AdminContribution.console`, each optional, in the order `adminContributions` lists them: the
+ * channel types', then the harness kinds'; lark-bot's `larkBotCommand` is where it always was).
+ * Closed, so a setting no registered type or kind declares is a config error.
  */
-function consoleSchema(registry: ChannelRegistry): ConsoleSection {
-  let s = consoleSections.get(registry);
+function consoleSchema(harnesses: HarnessRegistry, channels: ChannelRegistry): ConsoleSection {
+  let byChannels = consoleSections.get(harnesses);
+  if (!byChannels) consoleSections.set(harnesses, (byChannels = new WeakMap()));
+  let s = byChannels.get(channels);
   if (!s) {
     const contributed: Record<string, TSchema> = {};
-    for (const { type, admin } of registry.adminContributions) {
-      for (const [k, schema] of Object.entries(admin.console ?? {})) {
-        if (Object.hasOwn(ConsoleServerKeys, k) || Object.hasOwn(ConsoleApplyKeys, k)) throw new Error(`channel type ${JSON.stringify(type)}: admin setting console.${k} is the console's own`);
+    for (const c of adminContributions(harnesses, channels)) {
+      for (const [k, schema] of Object.entries(c.admin.console ?? {})) {
+        if (Object.hasOwn(ConsoleServerKeys, k) || Object.hasOwn(ConsoleApplyKeys, k)) throw new Error(`${ownerName(c)}: admin setting console.${k} is the console's own`);
         contributed[k] = Type.Optional(schema);
       }
     }
     // The static type has the console's own keys only: `resolveConsole` reads the others by name.
     s = Type.Object({ ...ConsoleServerKeys, ...contributed, ...ConsoleApplyKeys }, Closed) as unknown as ConsoleSection;
-    consoleSections.set(registry, s);
+    byChannels.set(channels, s);
   }
   return s;
 }
-
-/** A named run preset: one harness instance with its model and effort (`presets.<name>`). */
-const PresetEntry = Type.Object(
-  {
-    /** Harness instance (a name from `harnesses`). */
-    harness: Type.String(),
-    /** Over the instance's `run.model`. */
-    model: Type.Optional(Type.String()),
-    /** Over the instance's `run.effort`. */
-    effort: Type.Optional(Type.String()),
-    /** One line `/preset` shows next to it. */
-    description: Type.Optional(Type.String()),
-  },
-  Closed,
-);
 
 const AgentEntry = Type.Object(
   {
     /** Harness instance (a name from `harnesses`). Give this or `preset`. */
     harness: Type.Optional(Type.String()),
-    /** Preset (a name from `presets`) giving the harness, model and effort; the agent's own `model` / `effort` win. Give this or `harness`. */
+    /**
+     * Preset (a name the module providing named run defaults gives: the bundled one's `presets`)
+     * giving the harness, model and effort; the agent's own `model` / `effort` win. Give this or `harness`.
+     */
     preset: Type.Optional(Type.String()),
     /** Over the instance's (or preset's) model. */
     model: Type.Optional(Type.String()),
@@ -344,8 +341,28 @@ const AgentEntry = Type.Object(
 );
 
 /**
- * The config file's own keys (the kernel's) over the built-in harness kinds and channel types:
- * `ConfigFile` without the modules' sections (`configFileSchema` adds a registry's).
+ * A `modules` entry: a feature module of someone else's, from an ES module outside this repo.
+ * `module` resolves like a module channel's (relative to the config file, absolute, a package
+ * directory, or a bare specifier); `export` names the `ModuleManifest` (default `manifest`, else
+ * `default`; a named one never falls back); `config` is the module's settings, what a built-in
+ * module's section holds (`enabled` and the keys of its `config.schema`, closed; absent: `{}`).
+ */
+const ModuleFileEntry = Type.Object(
+  {
+    use: Type.Literal('module'),
+    module: Type.String(),
+    export: Type.Optional(Type.String()),
+    config: Type.Optional(Type.Unknown()),
+  },
+  Closed,
+);
+
+/** A `modules` entry as written. */
+export type ModuleFileEntry = Static<typeof ModuleFileEntry>;
+
+/**
+ * The config file's own keys (the kernel's), with no harness kind or channel type registered:
+ * `configFileSchema` puts a registry's in their places and adds its modules' sections.
  */
 const KernelFile = Type.Object(
   {
@@ -364,16 +381,12 @@ const KernelFile = Type.Object(
     /** Working directory for harness sessions (default: the current directory). */
     cwd: Type.Optional(Type.String()),
     /** Named harness instances; `RunSpec.harness` is the name. Each entry is checked against its `use` (a registered kind, or `module`). */
-    harnesses: harnessesSchema(builtinHarnesses),
+    harnesses: harnessesSchema(NO_REGISTRIES.harnessRegistry),
     /** Instance the default policy plans (default: the only one, else the first). */
     defaultHarness: Type.Optional(Type.String()),
     /** Older single-harness form; each section becomes an instance named after its kind. */
-    harness: legacyBlockSchema(builtinHarnesses),
-    /**
-     * Named presets: harness instance + model + effort. An agent's `preset` is its default;
-     * the owner switches one session to another with `/preset <name>` (`default` is reserved).
-     */
-    presets: Type.Optional(Type.Record(Type.String(), PresetEntry)),
+    harness: legacyBlockSchema(NO_REGISTRIES.harnessRegistry),
+    // (The presets module's section `presets` comes here: `ModuleFields.sectionAfter`.)
     /** Named run configurations (agents); see AgentEntry. */
     agents: Type.Optional(Type.Record(Type.String(), AgentEntry)),
     /** Agent of the owners default table and of rules that name none (default: the first interactive agent). */
@@ -383,6 +396,13 @@ const KernelFile = Type.Object(
     /** Identity map entries (channel identity → principal + labels), next to the ones `policy.owners` makes. */
     identities: Type.Optional(Type.Array(IdentityEntry)),
     channels: Type.Optional(Type.Array(ChannelEntry)),
+    /**
+     * Feature modules of someone else's to load (`ModuleManifest`, `@agents-io/protocol`), each
+     * imported when the daemon starts, before the config is resolved (`loadConfigModules`; `aio
+     * serve` does): `module` resolves like a module channel's, `export` names the manifest (default
+     * `manifest`, else `default`), `config` is its settings (its section, closed).
+     */
+    modules: Type.Optional(Type.Array(ModuleFileEntry)),
     /**
      * Default of every agent's `tools`: mount the host MCP output tools (send_file,
      * ask_choice, mention, reply_to, send_message, watch_*, session_*, live_*…).
@@ -510,7 +530,7 @@ const KernelFile = Type.Object(
      * `aio serve`, on 127.0.0.1:7464. A non-loopback `host` is refused unless
      * `allowRemote` is true (then every request still needs a token).
      */
-    console: Type.Optional(consoleSchema(builtinChannels)),
+    console: Type.Optional(consoleSchema(NO_REGISTRIES.harnessRegistry, NO_REGISTRIES.channelRegistry)),
     /**
      * The host connection. `tokenFile`: an operator-set host token, stable across restarts
      * (relative paths are relative to the config file). Read when the file exists (it must be
@@ -536,35 +556,47 @@ const KernelFile = Type.Object(
   Closed,
 );
 
-/** The config file as written, over the built-in harness kinds, channel types and modules. */
-export type ConfigFile = Static<typeof KernelFile> & BuiltinModuleSections;
+/** The config file as written: the kernel's keys (`@agents-io/daemon`'s `ConfigFile` adds the built-in modules' sections). */
+export type ConfigFile = Static<typeof KernelFile>;
 
 const fileSchemas = new WeakMap<HarnessRegistry, WeakMap<ChannelRegistry, WeakMap<ModuleRegistry, TObject>>>();
 
+/** A module's section as the file's schema checks it: a map of named entries (`ModuleConfig.entries`), else `enabled` and its own keys, closed. */
+function sectionSchema(c: Pick<ModuleConfig, 'schema' | 'entries'>): TSchema {
+  return c.entries !== undefined ? Type.Record(Type.String(), c.entries) : Type.Object({ enabled: Type.Optional(Type.Boolean()), ...c.schema }, Closed);
+}
+
 /**
  * The registered modules' config sections (`ModuleConfig`): each its `section` key, an object of
- * `enabled` and the module's own keys, closed. A section may not be one of the file's own keys.
+ * `enabled` and the module's own keys, closed, or a map of named entries (`entries`); and the
+ * file's own key each comes right after, when its registry says (`ModuleFields.sectionAfter`). A
+ * section may not be one of the file's own keys.
  */
-function moduleSections(modules: ModuleRegistry): Record<string, TSchema> {
-  const out: Record<string, TSchema> = {};
-  for (const { manifest: m } of modules.modules) {
-    if (!m.config) continue;
+function moduleSections(modules: ModuleRegistry): { key: string; schema: TSchema; after?: string }[] {
+  const out: { key: string; schema: TSchema; after?: string }[] = [];
+  for (const { manifest: m, entry } of modules.modules) {
+    // A module a `modules` entry loaded has its settings in the entry (`config`), not in a section.
+    if (!m.config || entry) continue;
     const key = m.config.section;
     if (Object.hasOwn(KernelFile.properties, key)) throw new Error(`module ${m.id}: config section ${JSON.stringify(key)} is one of the config file's own keys`);
-    out[key] = Type.Optional(Type.Object({ enabled: Type.Optional(Type.Boolean()), ...m.config.schema }, Closed));
+    const after = modules.fields.get(m.id)?.sectionAfter;
+    if (after !== undefined && (!Object.hasOwn(KernelFile.properties, after) || after === 'local')) throw new Error(`module ${m.id}: sectionAfter ${JSON.stringify(after)} is not one of the config file's own keys before local`);
+    out.push({ key, schema: Type.Optional(sectionSchema(m.config)), ...(after !== undefined ? { after } : {}) });
   }
   return out;
 }
 
 /**
  * The config file's schema over a registry's harness kinds (`harnesses.<name>.use`, the older
- * `harness` block), a registry's channel types (`channels[].type` and the settings they add to
- * `console`; default the built-in ones) and a registry's modules (their config sections; default
- * the built-in ones); the rest is the kernel's own keys. The modules' sections come before `local`,
- * where `externalMcp` was before it was a module, so a file's schema errors come in the order they
- * always did. Built once per set of registries (`ConfigFile` is the built-in ones').
+ * `harness` block and the settings they add to `console`), a registry's channel types
+ * (`channels[].type` and the settings they add to `console`; default none) and a registry's modules (their config sections; default none); the
+ * rest is the kernel's own keys. The modules' sections come before `local`,
+ * where `externalMcp` was before it was a module, unless the registry places one after a key of
+ * the file's own, where it was before it was a module's (`ModuleFields.sectionAfter`: `presets`
+ * after `harness`), so a file's schema errors come in the order they always did. Built once per set
+ * of registries (`@agents-io/daemon`'s `ConfigFile` is the built-in ones').
  */
-export function configFileSchema(registry: HarnessRegistry, channels: ChannelRegistry = builtinChannels, modules: ModuleRegistry = builtinModules): TObject {
+export function configFileSchema(registry: HarnessRegistry, channels: ChannelRegistry = NO_REGISTRIES.channelRegistry, modules: ModuleRegistry = NO_REGISTRIES.moduleRegistry): TObject {
   let byChannels = fileSchemas.get(registry);
   if (!byChannels) fileSchemas.set(registry, (byChannels = new WeakMap()));
   let byModules = byChannels.get(channels);
@@ -572,28 +604,26 @@ export function configFileSchema(registry: HarnessRegistry, channels: ChannelReg
   let s = byModules.get(modules);
   if (!s) {
     const { local, ...head } = KernelFile.properties;
-    s = Type.Object(
-      {
-        ...head,
-        harnesses: harnessesSchema(registry),
-        harness: legacyBlockSchema(registry),
-        channels: Type.Optional(Type.Array(channelEntrySchema(channels))),
-        console: Type.Optional(consoleSchema(channels)),
-        ...moduleSections(modules),
-        local,
-      },
-      Closed,
-    );
+    const own: Record<string, TSchema> = {
+      ...head,
+      harnesses: harnessesSchema(registry),
+      harness: legacyBlockSchema(registry),
+      channels: Type.Optional(Type.Array(channelEntrySchema(channels))),
+      console: Type.Optional(consoleSchema(registry, channels)),
+    };
+    const sections = moduleSections(modules);
+    const props: Record<string, TSchema> = {};
+    for (const [k, v] of Object.entries(own)) {
+      props[k] = v;
+      for (const x of sections) if (x.after === k) props[x.key] = x.schema;
+    }
+    for (const x of sections) if (x.after === undefined) props[x.key] = x.schema;
+    props.local = local;
+    s = Type.Object(props, Closed);
     byModules.set(modules, s);
   }
   return s;
 }
-
-/**
- * The config file's schema over the built-in harness kinds, channel types and modules (`bundle.ts`):
- * the kernel's keys and the built-in modules' sections (`externalMcp`).
- */
-export const ConfigFile: TObject = configFileSchema(builtinHarnesses, builtinChannels, builtinModules);
 
 interface InstanceBase {
   /** Instance name: `RunSpec.harness`, and the `harness` of its session events. */
@@ -639,22 +669,12 @@ export type HarnessInstance = InstanceBase & {
   launch: unknown;
 };
 
-/** A named run preset (`presets.<name>`). */
-export interface PresetConfig {
-  name: string;
-  /** Harness instance name. */
-  harness: string;
-  model?: string;
-  effort?: string;
-  description?: string;
-}
-
 /** A named run configuration. */
 export interface AgentConfig {
   name: string;
   /** Harness instance name (the preset's, when the agent names one). */
   harness: string;
-  /** The preset `harness`, `model` and `effort` came from (the agent's own `model` / `effort` win). */
+  /** The preset `harness`, `model` and `effort` came from (the agent's own `model` / `effort` win), as the module providing presets gave it when the config resolved. */
   preset?: string;
   model?: string;
   effort?: string;
@@ -680,9 +700,6 @@ export interface SessionParams {
   envPathRoots: Record<string, string[]>;
 }
 
-/** Variables naming a built-in harness's config dir (`HarnessModule.defaults.configDirEnv`): in `envKeys` only with roots in `envPathRoots`. */
-export const CONFIG_DIR_KEYS: string[] = builtinHarnesses.configDirKeys();
-
 export interface Config {
   /** Not fatal, logged at start (e.g. a lark-bot account with ':'). */
   warnings?: string[];
@@ -696,8 +713,6 @@ export interface Config {
   harnesses: Record<string, HarnessInstance>;
   /** The instance the default policy plans. */
   defaultHarness: string;
-  /** Named presets (harness instance + model + effort), in config order. */
-  presets: Record<string, PresetConfig>;
   /** Named agents (without `agents` in the file: one, `default`, on the default instance). */
   agents: Record<string, AgentConfig>;
   /** Agent of the default table and of rules naming none; undefined when there is no interactive agent. */
@@ -750,17 +765,17 @@ export interface Config {
   /** The host connection: `tokenFile` is an absolute path when set. */
   host?: { tokenFile?: string };
   /**
-   * Deprecated, kept for one release: the external MCP endpoint's settings (section `externalMcp`),
-   * when it is on; the same object as its module's in `modules` (`ModuleFields.config`, set by
-   * `bundle.ts`). Given another value or removed before `Gateway.start`, it still turns the
-   * endpoint on, changes or off.
-   */
-  externalMcp?: ExternalMcpConfig;
-  /**
    * The registered feature modules, on or off, with their settings (`resolveModules`), in
-   * registration order; absent when the registry has none.
+   * registration order (a module of a `modules` entry where its entry is); absent when there are none.
+   * A module's settings may also be on a field of the config its registry names (`ModuleFields.config`:
+   * `@agents-io/daemon`'s deprecated `Config.presets` and `Config.externalMcp`).
    */
   modules?: ResolvedModule[];
+  /**
+   * The file's `modules` entries, resolved: the module file and export each names (absent without
+   * `modules`). `Gateway.start` needs each in its module registry (`loadConfigModules` imports them).
+   */
+  moduleEntries?: ModuleEntryRef[];
   /** Where this config came from (loadConfig): the file (it may not exist) and the env file found for it. */
   source?: { path: string; envFile?: string };
 }
@@ -781,9 +796,9 @@ export interface ConsoleConfig {
   /** Apply channel changes written through the console at once. */
   liveChannels: boolean;
   /**
-   * The settings the channel types contribute (`AdminContribution.console`; the built-in lark-bot
-   * type's `larkBotCommand`), by key, as `consoleSettings` resolves them: the value written, else
-   * the key's schema default.
+   * The settings the channel types and harness kinds contribute (`AdminContribution.console`; the
+   * built-in lark-bot type's `larkBotCommand`), by key, as `consoleSettings` resolves them: the
+   * value written, else the key's schema default.
    */
   readonly [setting: string]: unknown;
 }
@@ -818,7 +833,7 @@ export function consoleSettings(section: Readonly<Record<string, unknown>> | und
   return out;
 }
 
-function resolveConsole(c: ConfigFile['console'], channels: ChannelRegistry): ConsoleConfig {
+function resolveConsole(c: ConfigFile['console'], harnesses: HarnessRegistry, channels: ChannelRegistry): ConsoleConfig {
   const host = c?.host ?? '127.0.0.1';
   if (!isLoopbackHost(host) && c?.allowRemote !== true)
     fail(`console.host ${JSON.stringify(host)} is not a loopback address; the console only listens on loopback unless console.allowRemote is true`);
@@ -848,7 +863,7 @@ function resolveConsole(c: ConfigFile['console'], channels: ChannelRegistry): Co
     origins,
     ...(c?.uiUrl !== undefined ? { uiUrl: c.uiUrl.replace(/\/$/, '') } : {}),
     sessionTtlMs: c?.sessionTtlMs ?? 12 * 3_600_000,
-    ...Object.assign({}, ...channels.adminContributions.map(({ admin }) => consoleSettings(c, admin.console))),
+    ...Object.assign({}, ...adminContributions(harnesses, channels).map(({ admin }) => consoleSettings(c, admin.console))),
     heartbeat: { intervalMs: c?.heartbeat?.intervalMs ?? DEFAULT_WS_HEARTBEAT_MS, timeoutMs: c?.heartbeat?.timeoutMs ?? DEFAULT_WS_HEARTBEAT_TIMEOUT_MS },
     liveChannels: c?.liveChannels === true,
   };
@@ -857,9 +872,9 @@ function resolveConsole(c: ConfigFile['console'], channels: ChannelRegistry): Co
 /**
  * A `channels[]` entry as resolved: `type`, the keys every entry has, `account` (default `default`)
  * and what the type's module made of the rest (`ChannelModule.resolve`; a `module` entry's `module`
- * is the resolved file to import). Typed for the built-in types; another registry's resolve the same way.
+ * is the resolved file to import). `@agents-io/daemon`'s `ResolvedChannel` is typed for the built-in types.
  */
-export type ResolvedChannel = ChannelCommonFields & { account: string } & BuiltinChannelSettings;
+export type ResolvedChannel = ChannelCommonFields & { type: string; account: string; [key: string]: unknown };
 
 /** `topics.parkedIdleMs` default: a parked topic's lane closes after 30 idle minutes. */
 export const DEFAULT_PARKED_IDLE_MS = 30 * 60_000;
@@ -909,15 +924,20 @@ export interface LoadOptions {
   cwd?: string;
   /** Resolve `channels` (default true). Clients and e2e leave them out, so they need no channel secrets. */
   channels?: boolean;
-  /** The harness kinds `use` may name (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
+  /** The harness kinds `use` may name (default none, as `coreRegistries`; `@agents-io/daemon`'s: the built-in ones); give `Gateway.start` the same. */
   harnessRegistry?: HarnessRegistry;
-  /** The channel types `channels[].type` may name (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
+  /** The channel types `channels[].type` may name (default none; `@agents-io/daemon`'s: the built-in ones); give `Gateway.start` the same. */
   channelRegistry?: ChannelRegistry;
-  /** The feature modules whose config sections the file may have (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
+  /** The feature modules whose config sections the file may have (default none; `@agents-io/daemon`'s: the built-in ones); give `Gateway.start` the same. */
   moduleRegistry?: ModuleRegistry;
 }
 
-export function loadConfig(o: LoadOptions = {}): Config {
+/**
+ * The config file `loadConfig` reads (`o.path`, else `$AIO_CONFIG`, else `./aio.config.json`) and
+ * what it holds: `{}` when the default one is missing; a missing explicit one or one that is not
+ * JSON is a config error.
+ */
+export function readConfigFile(o: Pick<LoadOptions, 'path' | 'env' | 'cwd'> = {}): { path: string; raw: unknown } {
   const procEnv = o.env ?? process.env;
   const cwd = o.cwd ?? process.cwd();
   const explicit = o.path ?? procEnv.AIO_CONFIG;
@@ -930,6 +950,13 @@ export function loadConfig(o: LoadOptions = {}): Config {
       throw new ConfigError(`${path}: ${(e as Error).message}`);
     }
   } else if (explicit) throw new ConfigError(`config file not found: ${path}`);
+  return { path, raw };
+}
+
+export function loadConfig(o: LoadOptions = {}): Config {
+  const procEnv = o.env ?? process.env;
+  const cwd = o.cwd ?? process.cwd();
+  const { path, raw } = readConfigFile(o);
   const envPath = findEnvFile({ envFile: o.envFile, configDir: dirname(path), cwd });
   const fileEnv = envPath ? loadEnvFile(envPath) : {};
   const env: Record<string, string | undefined> = { ...fileEnv, ...procEnv };
@@ -955,28 +982,45 @@ export interface ResolveContext {
   harness?: string;
   cwd?: string;
   channels?: boolean;
-  /** The harness kinds `use` may name (default the built-in ones, `bundle.ts`). */
+  /** The harness kinds `use` may name (default none, as `coreRegistries`; `@agents-io/daemon`'s: the built-in ones). */
   harnessRegistry?: HarnessRegistry;
-  /** The channel types `channels[].type` may name (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
+  /** The channel types `channels[].type` may name (default none; `@agents-io/daemon`'s: the built-in ones); give `Gateway.start` the same. */
   channelRegistry?: ChannelRegistry;
-  /** The feature modules whose config sections the file may have (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
+  /** The feature modules whose config sections the file may have (default none; `@agents-io/daemon`'s: the built-in ones); give `Gateway.start` the same. */
   moduleRegistry?: ModuleRegistry;
+}
+
+/** Paths from a config file in `baseDir`: `~` is the home directory, a relative one is relative to `baseDir`. */
+export function configPath(baseDir: string): (p: string) => string {
+  return (p) => {
+    const home = p === '~' || p.startsWith('~/') ? join(homedir(), p.slice(1)) : p;
+    return isAbsolute(home) || home === ':memory:' ? home : resolve(baseDir, home);
+  };
+}
+
+/**
+ * A `modules` entry's file, resolved like a module channel's (`resolveModuleFile`): the entry's
+ * module file (absolute) and export; a missing one fails the config (`modules[<i>].module: …`).
+ */
+export function resolveModuleEntry(e: ModuleFileEntry, index: number, path: (p: string) => string): ModuleEntryRef {
+  const spec = e.module;
+  const rel = spec.startsWith('.') || spec.startsWith('~') || isAbsolute(spec);
+  const r = resolveModuleFile(spec, rel ? path(spec) : undefined, path('.'));
+  if ('error' in r) fail(`modules[${index}].module: ${r.error}`);
+  return { module: r.file, ...(e.export !== undefined ? { export: e.export } : {}) };
 }
 
 /** Validate a parsed config file and fill defaults. Error messages name keys, never values. */
 export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
-  const registry = ctx.harnessRegistry ?? builtinHarnesses;
-  const channelRegistry = ctx.channelRegistry ?? builtinChannels;
-  const moduleRegistry = ctx.moduleRegistry ?? builtinModules;
+  const registry = ctx.harnessRegistry ?? NO_REGISTRIES.harnessRegistry;
+  const channelRegistry = ctx.channelRegistry ?? NO_REGISTRIES.channelRegistry;
+  const moduleRegistry = ctx.moduleRegistry ?? NO_REGISTRIES.moduleRegistry;
   const schema = configFileSchema(registry, channelRegistry, moduleRegistry);
   const errs = errors(schema, raw);
   if (errs.length) throw new ConfigError(`invalid config: ${[...errs.slice(0, 5), ...unregistered(raw, schema, registry, channelRegistry)].join('; ')}`);
   const c = raw as ConfigFile;
   const env = ctx.env;
-  const path = (p: string) => {
-    const home = p === '~' || p.startsWith('~/') ? join(homedir(), p.slice(1)) : p;
-    return isAbsolute(home) || home === ':memory:' ? home : resolve(ctx.baseDir, home);
-  };
+  const path = configPath(ctx.baseDir);
 
   const warnings: string[] = [];
   const dataDir = path(c.dataDir ?? join(homedir(), '.agents-io', 'aio'));
@@ -986,10 +1030,19 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
   const ownerSessionKey = c.policy?.ownerSessionKey;
   // Off unless asked for (principle 2, decision 13: the default was true before 2026-10-11).
   const outputTools = c.outputTools ?? false;
-  const presets = resolvePresets(c, harnesses);
-  // Which modules are on now (the tool catalog needs it); their settings resolve last (below).
-  const switches = moduleSwitches(raw as Record<string, unknown>, moduleRegistry);
-  const { agents, defaultAgent } = resolveAgents(c, harnesses, presets, defaultHarness, outputTools, path, registry.configDirKeys(), toolCatalog(moduleRegistry, switches));
+  // The modules of this config: the registry's own, then the ones its `modules` entries loaded, where the entries are.
+  const entries = (c.modules ?? []).map((e, i) => resolveModuleEntry(e, i, path));
+  const listed = listedModules(moduleRegistry, c.modules ?? [], entries);
+  // Which modules are on now (the tool catalog needs it); their settings resolve last (below), but for
+  // the one providing named run defaults (the presets): the agents name them, so its settings resolve
+  // now, where the kernel resolved its presets before they were a module's.
+  const switches = moduleSwitches(raw as Record<string, unknown>, listed);
+  const settings = { raw: raw as Record<string, unknown>, env, path, harnesses: Object.keys(harnesses) };
+  const provided = moduleSettings(switches.filter((x) => x.m.runDefaults), settings);
+  const runDefaults = new NamedRuns(runDefaultsProvider(listed, switches, provided), (n) => Object.hasOwn(harnesses, n));
+  runDefaults.check();
+  const catalog = toolCatalog(listed, switches, entries.some((e) => !moduleRegistry.fromEntry(e)));
+  const { agents, defaultAgent } = resolveAgents(c, harnesses, runDefaults, defaultHarness, outputTools, path, registry.configDirKeys(), catalog);
   const identities = c.identities ?? [];
   const localSession = c.local?.session ?? ownerSessionKey ?? 'local:main';
   const table: BindingTable | undefined = c.bindings ? { version: 'config', bindings: c.bindings, identities: [] } : undefined;
@@ -1003,7 +1056,6 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     cwd: path(c.cwd ?? ctx.cwd ?? process.cwd()),
     harnesses,
     defaultHarness,
-    presets,
     agents,
     defaultAgent,
     ...(table ? { table } : {}),
@@ -1038,12 +1090,12 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
       principal: { id: c.local?.principal ?? owners[0] ?? 'local:owner', labels: c.local?.labels ?? ['owner'] },
       session: localSession,
     },
-    console: resolveConsole(c.console, channelRegistry),
+    console: resolveConsole(c.console, registry, channelRegistry),
     host: c.host?.tokenFile !== undefined ? { tokenFile: path(c.host.tokenFile) } : {},
   };
   // After everything else, where the external MCP endpoint's settings were resolved before it was a
-  // module: a file with several mistakes fails on the one it always did.
-  const modules = moduleSettings(switches, { raw: raw as Record<string, unknown>, env, path });
+  // module: a file with several mistakes fails on the one it always did (the presets' resolved above).
+  const modules = moduleSettings(switches, settings, provided);
   const fields = moduleRegistry.fields;
   for (const m of modules) {
     // Where a module's on/off was before it was a module (`policy.strangers`): what it is now (deprecated).
@@ -1061,7 +1113,8 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
   }
   return {
     ...config,
-    ...(moduleRegistry.size ? { modules } : {}),
+    ...(listed.length ? { modules } : {}),
+    ...(c.modules ? { moduleEntries: entries } : {}),
     ...(warnings.length ? { warnings } : {}),
   };
 }
@@ -1102,7 +1155,7 @@ function unregistered(raw: unknown, schema: TObject, harnesses: HarnessRegistry,
   }
   for (const k of Object.keys(raw)) if (!Object.hasOwn(schema.properties, k)) out.push(`${k}: not a key of the config, and no registered module has a section of that name`);
   if (isRecord(raw.console)) {
-    const settings = (consoleSchema(channels) as unknown as TObject).properties;
+    const settings = (consoleSchema(harnesses, channels) as unknown as TObject).properties;
     for (const k of Object.keys(raw.console)) if (!Object.hasOwn(settings, k)) out.push(`console.${k}: not a console setting, and no registered channel module adds one of that name`);
   }
   return out;
@@ -1121,14 +1174,40 @@ function at(raw: Record<string, unknown>, dotted: string): unknown {
 /**
  * Step 1 of the module lifecycle (core-slimming G6): every registered module, on or off, with its
  * settings. A module without a config section is on. One with a section: the section present is on
- * unless `enabled: false` (`resolve` gets the rest); absent, the first of its `aliases` that is set
- * decides: on unless its `aliasEnabled` says false or, without one, the value is an object with
- * `enabled: false` (`resolve` gets the value as it is); with neither, `defaultEnabled` (`resolve`
- * gets `{}`). A module that is on and needs another (`module:<id>`) that is off fails the config.
- * Whether each is on is settled first, for all of them; then the ones that are on resolve.
+ * unless `enabled: false` (`resolve` gets the rest; a map of named entries, `ModuleConfig.entries`,
+ * has no `enabled` and is on, `resolve` getting all of it); absent, the first of its `aliases` that
+ * is set decides: on unless its `aliasEnabled` says false or, without one, the value is an object
+ * with `enabled: false` (`resolve` gets the value as it is); with neither, `defaultEnabled`
+ * (`resolve` gets `{}`). A module that is on and needs another (`module:<id>`) that is off fails
+ * the config. Whether each is on is settled first, for all of them; then the ones that are on
+ * resolve. `harnesses`: the configured instances a module's settings may name
+ * (`ModuleResolveContext.harnesses`; default none).
  */
-export function resolveModules(raw: Record<string, unknown>, registry: ModuleRegistry, env: Record<string, string | undefined>, path: (p: string) => string): ResolvedModule[] {
-  return moduleSettings(moduleSwitches(raw, registry), { raw, env, path });
+export function resolveModules(raw: Record<string, unknown>, registry: ModuleRegistry, env: Record<string, string | undefined>, path: (p: string) => string, harnesses: readonly string[] = []): ResolvedModule[] {
+  const own = (Array.isArray(raw.modules) ? raw.modules : []) as ModuleFileEntry[];
+  return moduleSettings(moduleSwitches(raw, listedModules(registry, own, own.map((e, i) => resolveModuleEntry(e, i, path)))), { raw, env, path, harnesses });
+}
+
+/** A module of a config: as registered, and for one a `modules` entry loaded, that entry. */
+interface ListedModule {
+  r: RegisteredModule;
+  from?: { index: number; entry: ModuleFileEntry };
+}
+
+/**
+ * The modules of a config, in registration order: the registry's (those no `modules` entry
+ * loaded), then, in file order, the one each entry loaded (a module of the registry an entry
+ * loaded is left out when the file has no entry naming its file and export: the entry was
+ * removed). An entry whose module the registry lacks is not loaded (`resolveConfig` then checks
+ * less of the file: the daemon needs it loaded to start).
+ */
+function listedModules(registry: ModuleRegistry, written: readonly ModuleFileEntry[], entries: readonly ModuleEntryRef[]): ListedModule[] {
+  const out: ListedModule[] = registry.modules.filter((r) => !r.entry).map((r) => ({ r }));
+  entries.forEach((e, index) => {
+    const r = registry.fromEntry(e);
+    if (r) out.push({ r, from: { index, entry: written[index]! } });
+  });
+  return out;
 }
 
 /** A module on or off, and, when on, what its `config.resolve` gets. */
@@ -1141,10 +1220,35 @@ interface ModuleSwitch {
   alias?: string;
 }
 
+const entrySchemas = new WeakMap<ModuleManifest<unknown>, TSchema>();
+
+/** What a `modules` entry's `config` is checked against: its section's schema (`enabled` and the module's own keys, closed, or a map of named entries). */
+function entryConfigSchema(m: ModuleManifest<unknown>): TSchema {
+  let s = entrySchemas.get(m);
+  if (!s) entrySchemas.set(m, (s = sectionSchema(m.config ?? { schema: {} })));
+  return s;
+}
+
 /** `resolveModules`, first half: every module on or off (and the `needs` between them). */
-function moduleSwitches(raw: Record<string, unknown>, registry: ModuleRegistry): ModuleSwitch[] {
+function moduleSwitches(raw: Record<string, unknown>, listed: readonly ListedModule[]): ModuleSwitch[] {
   const out: ModuleSwitch[] = [];
-  for (const { manifest: m } of registry.modules) {
+  for (const { r, from } of listed) {
+    const m = r.manifest as ModuleManifest<unknown>;
+    if (from) {
+      // A module a `modules` entry loaded: the entry is its section (on unless `enabled: false`).
+      const config = from.entry.config ?? {};
+      const where = `modules[${from.index}].config`;
+      const errs = errors(entryConfigSchema(m), config);
+      if (errs.length) fail(`invalid config: ${errs.slice(0, 5).map((e) => `${where}${e}`).join('; ')}`);
+      // A map of named entries has no `enabled`: all of it is the module's.
+      if (m.config?.entries !== undefined) {
+        out.push({ m, id: m.id, enabled: true, value: config, where });
+        continue;
+      }
+      const { enabled: on, ...rest } = config as Record<string, unknown>;
+      out.push(on === false ? { m, id: m.id, enabled: false } : { m, id: m.id, enabled: true, value: rest, where });
+      continue;
+    }
     const cfg = m.config;
     if (!cfg) {
       out.push({ m, id: m.id, enabled: true });
@@ -1155,7 +1259,11 @@ function moduleSwitches(raw: Record<string, unknown>, registry: ModuleRegistry):
     let where = cfg.section;
     let alias: string | undefined;
     let enabled: boolean;
-    if (section !== undefined) {
+    if (section !== undefined && cfg.entries !== undefined) {
+      // A map of named entries: present is on, and every name in it is an entry (none is `enabled`).
+      enabled = true;
+      value = section;
+    } else if (section !== undefined) {
       const { enabled: on, ...rest } = section;
       enabled = on !== false;
       value = rest;
@@ -1177,17 +1285,28 @@ function moduleSwitches(raw: Record<string, unknown>, registry: ModuleRegistry):
     out.push(enabled ? { m, id: m.id, enabled, value, where, ...(alias !== undefined ? { alias } : {}) } : { m, id: m.id, enabled });
   }
   const on = new Set(out.filter((x) => x.enabled).map((x) => x.id));
-  for (const { manifest: m } of registry.modules) {
+  for (const { r } of listed) {
+    const m = r.manifest;
     if (!on.has(m.id)) continue;
     for (const n of m.needs ?? []) if (n.startsWith('module:') && !on.has(n.slice('module:'.length))) fail(`module ${m.id} needs module ${n.slice('module:'.length)}, which is off`);
   }
   return out;
 }
 
-/** `resolveModules`, second half: the settings of the modules that are on, in registration order. */
-function moduleSettings(switches: readonly ModuleSwitch[], o: { raw: Record<string, unknown>; env: Record<string, string | undefined>; path: (p: string) => string }): ResolvedModule[] {
+/**
+ * `resolveModules`, second half: the settings of the modules that are on, in registration order;
+ * those of `done` as they resolved there (the presets', resolved before the agents).
+ */
+function moduleSettings(
+  switches: readonly ModuleSwitch[],
+  o: { raw: Record<string, unknown>; env: Record<string, string | undefined>; path: (p: string) => string; harnesses: readonly string[] },
+  done: readonly ResolvedModule[] = [],
+): ResolvedModule[] {
   return switches.map((x): ResolvedModule => {
+    const already = done.find((d) => d.id === x.id);
+    if (already) return already;
     if (!x.enabled) return { id: x.id, enabled: false };
+    // A module without settings (one a `modules` entry loaded too: its `config` may hold only `enabled`).
     if (!x.m.config) return { id: x.id, enabled: true };
     const config = x.m.config.resolve(x.value, {
       where: x.where!,
@@ -1196,10 +1315,24 @@ function moduleSettings(switches: readonly ModuleSwitch[], o: { raw: Record<stri
       substitute: (v, w) => substituteEnv(v, o.env, w),
       path: o.path,
       valueAt: (dotted) => structuredClone(at(o.raw, dotted)),
+      harnesses: [...o.harnesses],
       fail: (msg) => fail(msg),
     });
     return { id: x.id, enabled: true, config };
   });
+}
+
+/**
+ * The module of a config that provides named run defaults (the registry lets one module claim
+ * them), on or off, with its settings (`resolved`: what `moduleSettings` made of it). Its section
+ * names what "none configured" says, unless a `modules` entry loaded it (its settings are the entry's).
+ */
+function runDefaultsProvider(listed: readonly ListedModule[], switches: readonly ModuleSwitch[], resolved: readonly ResolvedModule[]): RunDefaultsProvider | undefined {
+  const x = switches.find((s) => s.m.runDefaults);
+  if (!x) return undefined;
+  const fromEntry = listed.some((l) => l.r.manifest.id === x.id && l.from);
+  const section = !fromEntry ? x.m.config?.section : undefined;
+  return { id: x.id, ...(section !== undefined ? { section } : {}), enabled: x.enabled, runDefaults: x.m.runDefaults!, config: resolved.find((m) => m.id === x.id)?.config };
 }
 
 /**
@@ -1210,44 +1343,30 @@ interface ToolCatalog {
   names: readonly string[];
   /** A tool of a registered module that is off → that module. */
   off: ReadonlyMap<string, string>;
+  /** A `modules` entry is not loaded: its module's tools are unknown here, so a name not in `names` is taken as written (the daemon's start, which loads it, checks). */
+  open?: boolean;
 }
 
-function toolCatalog(registry: ModuleRegistry, modules: readonly { id: string; enabled: boolean }[]): ToolCatalog {
+function toolCatalog(listed: readonly ListedModule[], modules: readonly { id: string; enabled: boolean }[], open = false): ToolCatalog {
   const on = new Set(modules.filter((x) => x.enabled).map((x) => x.id));
   const names: string[] = [...KERNEL_TOOL_NAMES];
   const off = new Map<string, string>();
-  for (const { manifest: m } of registry.modules) for (const t of m.mcpTools ?? []) (on.has(m.id) ? names.push(t.name) : off.set(t.name, m.id));
-  return { names, off };
+  for (const { r } of listed) for (const t of r.manifest.mcpTools ?? []) (on.has(r.manifest.id) ? names.push(t.name) : off.set(t.name, r.manifest.id));
+  return { names, off, ...(open ? { open } : {}) };
 }
 
 /** The synthesized agent of a config without `agents`: the default instance, bare route-key sessions. */
 export const DEFAULT_AGENT = 'default';
 
-/** `/preset default` goes back to the agent's own: no preset may have this name. */
-export const DEFAULT_PRESET = 'default';
-
-function resolvePresets(c: ConfigFile, harnesses: Record<string, HarnessInstance>): Record<string, PresetConfig> {
-  const presets: Record<string, PresetConfig> = {};
-  for (const [name, p] of Object.entries(c.presets ?? {})) {
-    const where = `presets.${name}`;
-    if (!INSTANCE_NAME.test(name)) fail(`${where}: preset names are letters, digits, '.', '_' and '-' (at most 64)`);
-    if (name === DEFAULT_PRESET) fail(`${where}: "${DEFAULT_PRESET}" is reserved (\`/preset ${DEFAULT_PRESET}\` goes back to the agent's own)`);
-    if (!harnesses[p.harness]) fail(`${where}.harness: unknown harness instance ${JSON.stringify(p.harness)} (configured: ${Object.keys(harnesses).join(', ')})`);
-    presets[name] = {
-      name,
-      harness: p.harness,
-      ...(p.model !== undefined ? { model: p.model } : {}),
-      ...(p.effort !== undefined ? { effort: p.effort } : {}),
-      ...(p.description !== undefined ? { description: p.description } : {}),
-    };
-  }
-  return presets;
-}
-
+/**
+ * The agents. One naming a `preset` takes the harness instance, model and effort that the module
+ * providing named run defaults gives for it (`runDefaults`), its own `model` / `effort` over them; a
+ * name it does not give, or no such module (a build without the presets), fails, saying which.
+ */
 function resolveAgents(
   c: ConfigFile,
   harnesses: Record<string, HarnessInstance>,
-  presets: Record<string, PresetConfig>,
+  runDefaults: NamedRuns,
   defaultHarness: string,
   outputTools: boolean,
   path: (p: string) => string,
@@ -1263,10 +1382,10 @@ function resolveAgents(
     const where = `agents.${name}`;
     if (!INSTANCE_NAME.test(name)) fail(`${where}: agent names are letters, digits, '.', '_' and '-' (at most 64)`);
     if ((a.harness === undefined) === (a.preset === undefined)) fail(`${where}: give either \`harness\` or \`preset\``);
-    let preset: PresetConfig | undefined;
+    let preset: NamedRun | undefined;
     if (a.preset !== undefined) {
-      preset = presets[a.preset];
-      if (!preset) fail(`${where}.preset: unknown preset ${JSON.stringify(a.preset)} (${Object.keys(presets).length ? `configured: ${Object.keys(presets).join(', ')}` : 'no `presets` configured'})`);
+      preset = runDefaults.get(a.preset);
+      if (!preset) fail(`${where}.preset: ${runDefaults.unknown(a.preset)}`);
     } else if (!harnesses[a.harness!]) fail(`${where}.harness: unknown harness instance ${JSON.stringify(a.harness)} (configured: ${Object.keys(harnesses).join(', ')})`);
     const model = a.model ?? preset?.model;
     const effort = a.effort ?? preset?.effort;
@@ -1282,7 +1401,7 @@ function resolveAgents(
     const sessionParams = a.sessionParams && resolveSessionParams(a.sessionParams, `${where}.sessionParams`, a.mode ?? 'interactive', path, configDirKeys);
     let toolNames: string[] | undefined;
     if (Array.isArray(a.tools)) {
-      const unknown = a.tools.filter((t) => !catalog.names.includes(t) && !catalog.off.has(t));
+      const unknown = catalog.open ? [] : a.tools.filter((t) => !catalog.names.includes(t) && !catalog.off.has(t));
       if (unknown.length) fail(`${where}.tools: unknown tool ${unknown.map((t) => JSON.stringify(t)).join(', ')} (tools: ${catalog.names.join(', ')})`);
       const off = a.tools.find((t) => catalog.off.has(t));
       if (off !== undefined) fail(`${where}.tools: ${JSON.stringify(off)} is a tool of module ${catalog.off.get(off)}, which is off`);
