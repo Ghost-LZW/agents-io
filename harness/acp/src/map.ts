@@ -211,8 +211,9 @@ export function elicitationContent(properties: Record<string, Record<string, unk
 
 // ---- turns --------------------------------------------------------------------
 
-/** How a prompt turn ended (`stopReason`) as a turn's status; an unknown reason is `ambiguous`. */
-export function turnOutcome(stop: StopReason | string): { status: BodyOf<'turn.completed'>['status']; error?: BodyOf<'turn.completed'>['error'] } {
+/** How a prompt turn ended (`stopReason`) as a turn's status; an unknown or missing reason is `ambiguous`. */
+export function turnOutcome(stop: StopReason | string | null | undefined): { status: BodyOf<'turn.completed'>['status']; error?: BodyOf<'turn.completed'>['error'] } {
+  if (typeof stop !== 'string') return { status: 'ambiguous', error: { code: 'unknown_stop_reason', retryable: false, message: 'the agent answered the prompt with no stop reason' } };
   switch (stop) {
     case 'end_turn':
       return { status: 'completed' };

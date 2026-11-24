@@ -15,6 +15,8 @@
  *   mcp         lists the tools of the session's MCP server (stdio or http), answers their names
  *   usage       a usage update, then `used`
  *   fail        answers the prompt with an error
+ *   null        says something, then answers the prompt with a null result (no stop reason), as a
+ *               non-conforming agent may
  *   exit        exits mid-turn (code 1)
  *   twice       two messages around a tool call; the answer is the second
  *   compacting  a compaction reported as Claude Code's ACP agent does (a tool call "Compact
@@ -203,6 +205,10 @@ const app = agent({ name: 'fake-acp' })
     const has = (w: string) => cmd.split(/\s+/).includes(w);
 
     if (has('fail')) throw RequestError.internalError({ why: 'asked to fail' }, 'the fake agent failed');
+    if (has('null')) {
+      await say(client, s, 'no stop reason');
+      return null as never;
+    }
     if (has('exit')) {
       await say(client, s, 'about to exit');
       setTimeout(() => process.exit(1), 10);

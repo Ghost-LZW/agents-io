@@ -69,7 +69,7 @@ async function start(dir: string, harnesses: Record<string, unknown>, raw: Recor
     await c.hello({ token: readTokenFile(tokenPath(socketPath)), name: 'test' });
     return c;
   };
-  return { gw, chat, stop, say, key, log, host };
+  return { gw, chat, stop, say, replies, key, log, host };
 }
 
 describe('an ACP agent as a harness', () => {
@@ -94,6 +94,37 @@ describe('an ACP agent as a harness', () => {
     const h = await w.host();
     expect(await h.sessionCompact({ sessionKey: w.key(), inputId: 'cmp-1' })).toMatchObject({ sessionKey: w.key(), inputId: 'cmp-1', duplicate: false });
     await until(() => compacts().length === 2, 10_000);
+  });
+
+  it("an agent's question (a form elicitation) asks the turn's person, on the owner's bypass turn too: a question card in the chat, the answer goes back typed, and the log records the answer the agent got #RQ-5 #HC-1", async () => {
+    const dir = tmp();
+    const w = await start(dir, { agent: acp(dir) });
+    await w.chat.inject({ ...dm, sender: alice, text: 'ask' });
+    const question = (m: { channelData?: unknown }) => (m.channelData as Record<string, unknown> | undefined)?.['agents-io/question'];
+    const card = await until(() => w.chat.sent.find((s) => question(s.msg) !== undefined), 10_000);
+    expect(question(card.msg)).toMatchObject({
+      title: 'Which colour?',
+      questions: [
+        { id: 'colour', text: 'Colour', options: [{ label: 'Red' }, { label: 'Green' }] },
+        { id: 'count', text: 'How many' },
+        { id: 'sure', text: 'Sure?' },
+      ],
+    });
+    expect((w.log().find((e) => e.body.t === 'turn.started')!.body as { run: { profile: string } }).run.profile).toBe('bypass');
+    const opened = w.log().find((e) => e.body.t === 'request.opened')!.body as Record<string, any>;
+    expect(opened).toMatchObject({ kind: 'question', resolver: { kind: 'human', principals: ['fake:alice'] } });
+    // Nobody answered for the person: the agent is still waiting.
+    expect(calls(dir).some((c) => c.call === 'elicitation-outcome')).toBe(false);
+
+    const code = /\/answer (ask:[A-Za-z0-9_-]+)/.exec(card.msg.text)?.[1];
+    expect(code).toBeDefined();
+    expect(await w.say(`/answer ${code} {"colour":"Green","count":"2","sure":"yes"}`)).toBe('Answer submitted.');
+    await until(() => w.replies().find((r) => r.startsWith('answered:')), 10_000);
+    expect(w.replies()).toContain('answered: {"colour":"g","count":2,"sure":true}');
+    expect(calls(dir).filter((c) => c.call === 'elicitation-outcome').map((c) => c.outcome)).toEqual([{ action: 'accept', content: { colour: 'g', count: 2, sure: true } }]);
+    const resolved = w.log().filter((e) => e.body.t === 'request.resolved').map((e) => e.body as Record<string, any>);
+    expect(resolved).toEqual([expect.objectContaining({ requestId: opened.requestId, decision: { kind: 'answer', answers: { colour: 'Green', count: '2', sure: 'yes' } }, by: expect.objectContaining({ kind: 'human', id: 'fake:alice' }) })]);
+    expect(w.log().filter((e) => e.body.t === 'notice').map((e) => (e.body as { message: string }).message)).not.toContainEqual(expect.stringMatching(/respond failed/));
   });
 
   it("an agent with tools gets the host's MCP endpoint, here through the stdio bridge, and lists the kernel's tools; one without gets no MCP server #CF-6", async () => {

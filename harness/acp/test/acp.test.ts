@@ -127,6 +127,33 @@ describe('the ACP harness: contract', () => {
     expect(checkEventStream(ev.all, { turnInputs: { t1: ['in-1'], t2: ['in-2'] } })).toEqual([]);
   });
 
+  it('an agent that answers the prompt with a null result ends the turn ambiguous (unknown_stop_reason) without an unhandled rejection; the session goes on #HC-1', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown) => unhandled.push(e);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const f = fake();
+      const s = await f.h.open(openArgs());
+      const ev = events(s);
+      await s.startTurn('t1', [input('in-1', 'null')], run);
+      await ev.until(completed('t1'));
+      expect(ev.of('turn.completed')).toEqual([expect.objectContaining({ turnId: 't1', status: 'ambiguous', error: expect.objectContaining({ code: 'unknown_stop_reason' }) })]);
+      expect(ev.of('input.consumed')).toEqual([{ t: 'input.consumed', inputIds: ['in-1'], turnId: 't1' }]);
+      // The same session and agent process take the next turn.
+      await s.startTurn('t2', [input('in-2', 'hello')], run);
+      await ev.until(completed('t2'));
+      expect(ev.of('turn.completed').at(-1)).toMatchObject({ turnId: 't2', status: 'completed' });
+      expect(f.calls().filter((c) => c.call === 'start')).toHaveLength(1);
+      await s.close('done');
+      await ev.done;
+      expect(checkEventStream(ev.all, { turnInputs: { t1: ['in-1'], t2: ['in-2'] } })).toEqual([]);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
   it('a session with its own env is refused on the shared process; on ownProcess the env reaches the agent process and nothing else #HC-2', async () => {
     const secret = `s-${Math.random().toString(36).slice(2)}`;
     const { h } = fake({ FAKE_ACP_ENV_KEYS: 'AIO_TEST_SECRET' });
@@ -218,7 +245,7 @@ describe('the ACP harness: questions', () => {
     await s.startTurn('t1', [input('in-1', 'ask')], run);
     const opened = (await ev.until((e) => e.body.t === 'request.opened')).body as Extract<import('@agents-io/protocol').HarnessEvent['body'], { t: 'request.opened' }>;
     expect(opened).toMatchObject({
-      kind: 'elicitation',
+      kind: 'question',
       title: 'Which colour?',
       allowedDecisions: ['answer', 'deny', 'native'],
       questions: [

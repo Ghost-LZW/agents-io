@@ -208,21 +208,34 @@ export class AcpSession implements HarnessSession {
     const t: Turn = { turnId, inputIds: inputs.map((i) => i.inputId), consumed: false, done: false, lastWords: '', items: new Map(), interrupted: false };
     this.turn = t;
     this.emit({ t: 'turn.started', turnId, inputIds: t.inputIds, replyRoute: inputs[0]?.replyRoute ?? null, ...(run ? { run } : {}) }, { turnId });
-    this.link.prompt({ sessionId: this.sessionId, prompt }).then(
-      (r) => {
-        this.consume(t);
-        // The prompt's own usage when the agent reports it, else its last usage update.
-        const usage = (r as { usage?: unknown }).usage;
-        if (usage !== undefined && usage !== null) t.usage = usage;
-        const o = turnOutcome(r.stopReason);
-        this.finish(t, o.status, o.error);
-      },
-      (err: Error) => {
-        if (this.link.gone) return this.finish(t, 'ambiguous', { code: 'agent_exited', retryable: false, message: 'the ACP agent process exited during the turn' });
-        // The agent answered the prompt with an error: it did not run it (its inputs were not consumed) unless it said something first.
-        this.finish(t, t.interrupted ? 'interrupted' : 'failed', { code: 'prompt_failed', retryable: false, message: err.message });
-      },
-    );
+    this.link
+      .prompt({ sessionId: this.sessionId, prompt })
+      .then(
+        (r) => {
+          this.consume(t);
+          // Not checked by the SDK: an agent may answer anything, `null` among it (no stop reason: ambiguous).
+          const res = (r && typeof r === 'object' ? r : {}) as Partial<PromptResponse> & { usage?: unknown };
+          // The prompt's own usage when the agent reports it, else its last usage update.
+          if (res.usage !== undefined && res.usage !== null) t.usage = res.usage;
+          const o = turnOutcome(res.stopReason);
+          this.finish(t, o.status, o.error);
+        },
+        (err: unknown) => {
+          if (this.link.gone) return this.finish(t, 'ambiguous', { code: 'agent_exited', retryable: false, message: 'the ACP agent process exited during the turn' });
+          // The agent answered the prompt with an error: it did not run it (its inputs were not consumed) unless it said something first.
+          this.finish(t, t.interrupted ? 'interrupted' : 'failed', { code: 'prompt_failed', retryable: false, message: err instanceof Error ? err.message : String(err) });
+        },
+      )
+      // Nothing that goes wrong mapping the answer may be left unhandled (it would end the daemon): the turn ends ambiguous.
+      .catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        try {
+          this.finish(t, 'ambiguous', { code: 'adapter_error', retryable: false, message: `mapping the agent's answer to the prompt failed: ${message}` });
+          this.link.log('error', `acp session ${this.sessionId}: mapping the answer to session/prompt failed: ${message}`);
+        } catch {
+          // Nothing more to do here; still never an unhandled rejection.
+        }
+      });
   }
 
   /**
@@ -556,17 +569,19 @@ export class AcpSession implements HarnessSession {
     const requestId = `acp-question-${++this.nextRequest}`;
     return new Promise((resolve) => {
       this.requests.set(requestId, { requestId, turnId: t.turnId, kind: 'elicitation', properties: form.requestedSchema.properties ?? {}, answer: (v) => resolve(v as CreateElicitationResponse) });
+      // The agent asks its user: a `question` (as Codex's `requestUserInput`), which the host asks
+      // the turn's person and never approves for them; `elicitation` is an MCP server's ask.
       this.emit(
         {
           t: 'request.opened',
           requestId,
-          kind: 'elicitation',
+          kind: 'question',
           title: form.message || form.requestedSchema.title || 'The agent asks',
           risk: {},
           questions: this.link.flavor.elicitationQuestions(form),
           allowedDecisions: ['answer', 'deny', 'native'],
           allowAlways: false,
-          defaultDeny: true,
+          defaultDeny: false,
         },
         { turnId: t.turnId },
       );

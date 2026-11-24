@@ -43,7 +43,7 @@ when it decides to. An agent answering another protocol version is refused, clea
 | `steer: 'none'` | ACP has no prompt while a prompt runs: an input during a turn waits in the lane's queue for the next one. |
 | `interrupt` | `session/cancel` (every request the agent waits on is answered cancelled first, as the protocol asks; the turn ends when the prompt answers `cancelled`, or after 15 s anyway, as interrupted). |
 | `approvals` | `session/request_permission` → `request.opened` (kind `file_change` for edit/delete/move tools, else `tool_approval`); `allow_once` picks the agent's one-time allow option and never a wider one, `allow_session` its "always" option (else the one-time one), `deny` its reject option (else the `cancelled` outcome), `native` an option by `{ optionId }`; the "always" options are the request's `suggestions`. A decision that picks nothing offered is answered as a deny and `respond` says so. |
-| `questions` | `elicitation/create` in form mode → `request.opened` kind `elicitation`, one question per field (choices by their titles); an `answer` goes back typed (numbers, booleans, a choice's `const`), a `deny` as `decline`. Only with `elicitation` on. URL elicitations are declined. |
+| `questions` | `elicitation/create` in form mode → `request.opened` kind `question` (the agent asks its user, as Codex's `requestUserInput`: the host asks the turn's person, a question card in the chat, and never approves it for them, on an owner's bypass turn either), one question per field (choices by their titles); an `answer` goes back typed (numbers, booleans, a choice's `const`), a `deny` as `decline`. Only with `elicitation` on. URL elicitations are declined. |
 | `resume` | `loadSession`: `open({ resume })` sends `session/load`; the conversation the agent replays is not turned into events (updates outside a turn only change what the session knows), so the log holds it once. An agent that cannot load starts a new session, with a `continuity` notice. |
 | `modes` (Plan) | `availableModes` of `session/new` / `session/load` (or `planMode`). |
 | `compact` | The commands it advertises (`available_commands_update`), through the flavor (or `compact`). |
@@ -66,7 +66,9 @@ title starting `<server>.<tool>`; the claude flavor's `Agent` / `Task` is `subag
 `diff.updated`; `plan` → `plan.updated`; the prompt's usage (else the last `usage_update`) →
 `turn.completed.usage`; other updates → `native` (ephemeral). Stop reasons: `end_turn` completed,
 `cancelled` interrupted, `refusal` / `max_tokens` / `max_turn_requests` failed with that code, an
-unknown one ambiguous. The sender preface is Codex's (INVARIANTS ID-2): context that stays the same
+unknown or missing one ambiguous (`unknown_stop_reason`: the SDK does not check the answer, so a
+`null` one is taken as no stop reason; anything else that goes wrong mapping it also ends the turn
+ambiguous, `adapter_error`, and never takes the daemon down). The sender preface is Codex's (INVARIANTS ID-2): context that stays the same
 across a conversation or a sender is shown when it changes, and in full again after an input the
 agent may not have read, a turn of the compaction command, or a compaction the flavor recognises in
 the agent's updates (`compaction`). A prompt answered with an error fails the turn (`prompt_failed`; its inputs not

@@ -1,6 +1,7 @@
 import { describe, expect, it, afterEach } from 'vitest';
 import type { BlobAccess, HarnessResolveContext } from '@agents-io/protocol';
 import {
+  AcpSession,
   acpHarnessModule,
   claudeFlavor,
   diffFiles,
@@ -15,6 +16,7 @@ import {
   renderPrompt,
   turnOutcome,
   withDefaults,
+  type AcpLink,
 } from '../src/index.js';
 import { completed, disposeAll, events, fake, input, openArgs, run } from './acp-helpers.js';
 
@@ -62,6 +64,7 @@ describe('ACP mapping', () => {
     expect(turnOutcome('refusal')).toMatchObject({ status: 'failed', error: { code: 'refusal' } });
     expect(turnOutcome('max_tokens')).toMatchObject({ status: 'failed', error: { code: 'max_tokens' } });
     expect(turnOutcome('something_new')).toMatchObject({ status: 'ambiguous', error: { code: 'unknown_stop_reason' } });
+    expect(turnOutcome(undefined)).toMatchObject({ status: 'ambiguous', error: { code: 'unknown_stop_reason', message: 'the agent answered the prompt with no stop reason' } });
     expect(itemTypeOf({ toolCallId: 'x', kind: 'execute' }, undefined, false)).toBe('command');
     expect(itemTypeOf({ toolCallId: 'x', kind: 'move' }, undefined, false)).toBe('file_change');
     expect(itemTypeOf({ toolCallId: 'x', kind: 'fetch' }, undefined, false)).toBe('web_search');
@@ -214,5 +217,38 @@ describe('the acp harness kind', () => {
     expect(ev.of('input.consumed')).toEqual([]);
     expect(ev.of('turn.completed')).toEqual([expect.objectContaining({ status: 'failed', error: expect.objectContaining({ code: 'prompt_failed', message: expect.stringContaining('the fake agent failed') }) })]);
     await s.close('done');
+  });
+
+  it("anything that throws while mapping the prompt's answer ends the turn ambiguous (adapter_error), logged, and is never an unhandled rejection", async () => {
+    const logs: string[] = [];
+    const link: AcpLink = {
+      request: async () => ({}) as never,
+      // An answer whose stop reason cannot even be read.
+      prompt: async () =>
+        ({
+          get stopReason(): never {
+            throw new Error('unreadable');
+          },
+        }) as never,
+      notify: async () => undefined,
+      gone: false,
+      flavor: withDefaults(genericFlavor),
+      support: {},
+      closes: false,
+      cancelTimeoutMs: 1_000,
+      profiles: {},
+      planMode: undefined,
+      learned: () => undefined,
+      forget: () => undefined,
+      log: (level, msg) => logs.push(`${level}: ${msg}`),
+    };
+    const s = new AcpSession(link, 'sess-x');
+    const ev = events(s);
+    await s.startTurn('t1', [input('in-1', 'hello')]);
+    await ev.until(completed('t1'));
+    expect(ev.of('turn.completed')).toEqual([expect.objectContaining({ turnId: 't1', status: 'ambiguous', error: expect.objectContaining({ code: 'adapter_error', message: expect.stringContaining('unreadable') }) })]);
+    expect(logs).toEqual([expect.stringMatching(/^error: acp session sess-x: mapping the answer to session\/prompt failed: unreadable/)]);
+    await s.close('done');
+    await ev.done;
   });
 });
