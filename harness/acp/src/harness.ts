@@ -45,7 +45,11 @@ export interface AcpHarnessOptions {
   id?: string;
   /** Its quirks (`ACP_FLAVORS` by name, or one of your own). Default: the one matching the agent's `agentInfo`, else `generic`. */
   flavor?: string | AcpFlavor;
-  /** Instance profiles: profile name → `{ mode }`, the session mode a turn of that profile runs in (`session/set_mode`). */
+  /**
+   * Instance profiles: profile name → `{ mode }`, the session mode a turn of that profile runs in
+   * (`session/set_mode`). Without one, `bypass` runs in the mode the session opened in and every
+   * other profile in the agent's asking mode (the flavor's `restrictedMode`), or does not start.
+   */
   profiles?: Readonly<Record<string, Record<string, unknown>>>;
   /**
    * How the host's MCP endpoint (`HarnessOpenArgs.mcp`) reaches the agent: `http` (an `http` MCP

@@ -91,9 +91,13 @@ describe('recorded ACP transcripts (Claude Code ACP agent 0.110.1), replayed thr
     expect(r.of('turn.completed')).toEqual([expect.objectContaining({ turnId: 't1', status: 'completed', usage: expect.objectContaining({ outputTokens: expect.any(Number) }) })]);
   });
 
-  it('a permission: the profile selects the session mode (session/set_mode), the request opens, allow once goes back as the option the agent offered, the command runs and the turn completes #HC-1 #RQ-1', async () => {
+  it('a permission: a restricted turn with no mode configured runs in the agent\'s asking session mode (session/set_mode default, not the auto it opened in), the request opens, allow once goes back as the option the agent offered, the command runs and the turn completes #HC-1 #RQ-1', async () => {
     const r = await replay('permission');
     expect(r.violations).toEqual([]);
+    // The replay played every frame: the adapter, given no profiles, wrote this set_mode.
+    const frames = r.t.entries.flatMap((e) => (e.type === 'runtime_exit' ? [] : [e.frame as { method?: string; params?: { modeId?: string }; result?: { modes?: { currentModeId?: string } } }]));
+    expect(frames.find((f) => f.result?.modes)?.result?.modes?.currentModeId).toBe('auto');
+    expect(frames.filter((f) => f.method === 'session/set_mode').map((f) => f.params?.modeId)).toEqual(['default']);
     const [opened] = r.of('request.opened');
     expect(opened).toMatchObject({ kind: 'tool_approval', title: 'touch approved.txt', risk: { writes: true }, inputPreview: 'touch approved.txt', allowedDecisions: ['allow_once', 'allow_session', 'deny', 'native'], allowAlways: false });
     expect(r.of('request.resolved')).toEqual([expect.objectContaining({ requestId: opened!.requestId, decision: { kind: 'allow_once' } })]);

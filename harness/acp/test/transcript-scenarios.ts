@@ -67,7 +67,12 @@ export interface AcpScenario {
   drive(s: HarnessSession, ev: Events): Promise<void>;
 }
 
-const run: RunSpec = { harness: 'acp', model: '', profile: 'restricted' };
+/**
+ * An owner's turn: `bypass` with no mode configured runs in the mode the session opened in (no
+ * `session/set_mode`). A `restricted` one runs in the agent's asking mode (`permission`).
+ */
+const run: RunSpec = { harness: 'acp', model: '', profile: 'bypass' };
+const restricted: RunSpec = { ...run, profile: 'restricted' };
 
 export const ACP_SCENARIOS: AcpScenario[] = [
   {
@@ -82,11 +87,11 @@ export const ACP_SCENARIOS: AcpScenario[] = [
   {
     name: 'permission',
     description: 'A shell command the agent asks permission for (session/request_permission) in the session mode the profile selects (session/set_mode): allowed once, it runs and the turn completes.',
-    run,
-    // Claude Code's ACP agent opens in "auto"; "default" asks before it changes anything.
-    profiles: { restricted: { mode: 'default' } },
+    run: restricted,
+    // No mode configured: Claude Code's ACP agent opens in "auto" (it decides by itself); a
+    // restricted turn runs in its "default", which asks before it changes anything.
     async drive(s, ev) {
-      await s.startTurn('t1', [input('in-1', 'Run exactly this shell command in the current directory: touch approved.txt — then reply with the word: done')], run);
+      await s.startTurn('t1', [input('in-1', 'Run exactly this shell command in the current directory: touch approved.txt — then reply with the word: done')], restricted);
       const opened = await ev.until((e) => e.body.t === 'request.opened');
       await s.respond((opened.body as { requestId: string }).requestId, { kind: 'allow_once' });
       await ev.until(completed);

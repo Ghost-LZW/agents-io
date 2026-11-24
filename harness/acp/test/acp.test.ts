@@ -76,6 +76,37 @@ describe('the ACP harness: contract', () => {
     expect(checkEventStream(ev.all, { turnInputs: { t1: ['in-1'] } })).toEqual([]);
   });
 
+  it('conversation-wide and per-sender context is shown when it changes, and again after a compaction: the compaction command, or one the agent reports (claude flavor) #ID-2', async () => {
+    const ctx = { conversationKind: 'group', senderName: 'Alice' };
+    const say = (id: string, text: string) => input(id, text, { channelContext: ctx });
+    const full = (text: string) => `[sender from=owner kind=human evidence=platform_signed via=test:default:c1 conversationKind="group" senderName="Alice"]\n${text}`;
+    const bare = (text: string) => `[sender from=owner kind=human evidence=platform_signed via=test:default:c1]\n${text}`;
+    const prompts = (c: Record<string, any>[]) => c.filter((x) => x.call === 'session/prompt').map((x) => (x.params.prompt as { text?: string }[]).map((b) => b.text).join(''));
+    const turns = async (h: ReturnType<typeof fake>['h'], inputs: ReturnType<typeof input>[]) => {
+      const s = await h.open(openArgs());
+      const ev = events(s);
+      for (const [i, x] of inputs.entries()) {
+        await s.startTurn(`t${i}`, [x], run);
+        await ev.until(completed(`t${i}`));
+      }
+      await s.close('done');
+    };
+
+    const a = fake();
+    await turns(a.h, [say('i1', 'hello'), say('i2', 'again'), input('c', '/compact', { channelContext: { ...ctx, nativeCommand: true } }), say('i3', 'after'), say('i4', 'then')]);
+    // The command goes as it is; the context it may have dropped is given in full on the next input.
+    expect(prompts(a.calls())).toEqual([full('hello'), bare('again'), '/compact', full('after'), bare('then')]);
+
+    // Claude Code's ACP agent reports a compaction (its own too) as a tool call the claude flavor knows.
+    const b = fake({}, { flavor: 'claude' });
+    await turns(b.h, [say('i1', 'hello'), say('i2', 'compacting'), say('i3', 'after')]);
+    expect(prompts(b.calls())).toEqual([full('hello'), bare('compacting'), full('after')]);
+    // The generic flavor knows no such report.
+    const c = fake();
+    await turns(c.h, [say('i1', 'hello'), say('i2', 'compacting'), say('i3', 'after')]);
+    expect(prompts(c.calls())).toEqual([full('hello'), bare('compacting'), bare('after')]);
+  });
+
   it('tool calls are items: started, completed with their output; a tool before the answer leaves only the answer final #HC-1', async () => {
     const { h } = fake();
     const s = await h.open(openArgs());

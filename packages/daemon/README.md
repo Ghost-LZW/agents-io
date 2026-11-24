@@ -236,7 +236,10 @@ see `docs/E2E.md` §0). New:
   launched session a copy of the program of its own, and a task run always runs on one. An
   instance unavailable for now is not started and declares nothing.
   An `acp` instance (`command`, `args`, `mcp`, `flavor`, `planMode`, `compact`, `displayName`,
-  `elicitation`, `authMethod`; `profiles` whose entries name only a session `mode`;
+  `elicitation`, `authMethod`; `profiles` whose entries name only a session `mode`: without one,
+  `bypass` runs in the mode the session opened in and every other profile, `restricted` among
+  them, in the agent's mode that asks before it acts (its flavor's `restrictedMode`, generic
+  `default`), or does not start when the agent offers none;
   `@agents-io/harness-acp`) is any Agent Client Protocol agent, the daemon its ACP client over
   stdio (`docs/HOSTS.md` §4.10, `harness/acp/README.md`). It is started on first use, not at the
   daemon's start; what it can do comes from its `initialize` answer and each session's

@@ -103,6 +103,11 @@ describe('ACP mapping', () => {
     expect(c.planMode).toBe('plan');
     expect(c.compactCommand([{ name: 'compact' }])).toBe('/compact');
     expect(withDefaults(genericFlavor).compactCommand([{ name: 'init' }])).toBeUndefined();
+    expect(c.restrictedMode([{ id: 'auto' }, { id: 'default', name: 'Manual' }])).toBe('default');
+    expect(withDefaults(genericFlavor).restrictedMode([{ id: 'auto' }, { id: 'yolo' }])).toBeUndefined();
+    expect(c.compaction({ toolCallId: 'x', title: 'Compact conversation', kind: 'think', meta: { claudeCode: { toolName: 'compact' } } })).toBe(true);
+    expect(c.compaction({ toolCallId: 'x', title: 'Run ls', meta: { claudeCode: { toolName: 'Bash' } } })).toBe(false);
+    expect(withDefaults(genericFlavor).compaction({ toolCallId: 'x', meta: { claudeCode: { toolName: 'compact' } } })).toBe(false);
   });
 });
 
@@ -160,6 +165,44 @@ describe('the acp harness kind', () => {
     await ev.until(completed('t3'));
     expect(ev.of('turn.completed').at(-1)).toMatchObject({ usage: { used: 1200, size: 200000, cost: { amount: 0.01, currency: 'USD' } } });
     await s.close('done');
+  });
+
+  it("a profile with no mode configured: restricted (any profile but bypass) runs in the agent's asking mode, not the one the session opened in; bypass in that one; with no asking mode among the agent's the turn does not start until one is configured; an agent with no modes runs as it is", async () => {
+    const modes = (c: Record<string, any>[]) => c.filter((x) => x.call === 'session/prompt').map((x) => x.mode);
+    const turns = async (f: ReturnType<typeof fake>, profiles: string[]) => {
+      const s = await f.h.open(openArgs());
+      const ev = events(s);
+      for (const [i, profile] of profiles.entries()) {
+        await s.startTurn(`t${i}`, [input(`in-${i}`, 'hi')], { ...run, profile });
+        await ev.until(completed(`t${i}`));
+      }
+      return s;
+    };
+    // It opens in a mode that decides by itself, as Claude Code's ACP agent opens in `auto`.
+    const a = fake({ FAKE_ACP_OPEN_MODE: 'yolo' });
+    await (await turns(a, ['restricted', 'bypass', 'custom', 'restricted'])).close('done');
+    expect(modes(a.calls())).toEqual(['default', 'yolo', 'default', 'default']);
+
+    // None of its modes is known to ask: a restricted turn does not start, and says what to configure; bypass runs.
+    const b = fake({ FAKE_ACP_MODES: 'auto,full-access', FAKE_ACP_OPEN_MODE: 'auto' });
+    const s = await b.h.open(openArgs());
+    const ev = events(s);
+    await expect(s.startTurn('t0', [input('in-0', 'hi')], run)).rejects.toThrow(
+      'profile restricted: no session mode is configured for it (profiles.restricted.mode) and the agent offers none known to ask before it acts (it has "auto", "full-access"); configure the mode its turns run in',
+    );
+    await s.startTurn('t1', [input('in-1', 'hi')], { ...run, profile: 'bypass' });
+    await ev.until(completed('t1'));
+    expect(ev.of('turn.started').map((x) => x.turnId)).toEqual(['t1']);
+    expect(modes(b.calls())).toEqual(['auto']);
+    await s.close('done');
+    const configured = fake({ FAKE_ACP_MODES: 'auto,full-access', FAKE_ACP_OPEN_MODE: 'auto' }, { profiles: { restricted: { mode: 'auto' } } });
+    await (await turns(configured, ['restricted'])).close('done');
+    expect(modes(configured.calls())).toEqual(['auto']);
+
+    // No session modes: nothing to select.
+    const none = fake({ FAKE_ACP_NO_MODES: '1' });
+    await (await turns(none, ['restricted'])).close('done');
+    expect(none.calls().filter((x) => x.call === 'session/set_mode')).toEqual([]);
   });
 
   it('a prompt the agent answers with an error fails the turn (prompt_failed), its input not consumed', async () => {

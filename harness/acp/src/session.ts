@@ -9,11 +9,12 @@ import type {
   SessionNotification,
   ToolCallContent,
 } from '@agentclientprotocol/sdk';
-import type { AcpCommand, AcpElicitationForm, AcpFlavor, AcpToolCallView } from './flavors.js';
+import type { AcpCommand, AcpElicitationForm, AcpFlavor, AcpMode, AcpToolCallView } from './flavors.js';
 import {
   diffFiles,
   elicitationContent,
   inputSummary,
+  isNativeCommand,
   itemStatus,
   itemTypeOf,
   permissionDecisions,
@@ -143,8 +144,8 @@ export class AcpSession implements HarnessSession {
   private nextRequest = 0;
   private closed = false;
   private readonly memo = new PrefaceMemo();
-  /** Session modes: the one the agent is in, the one it opened in (a profile without a mode goes back to it), and what it offers. */
-  private mode: { current?: string; base?: string; available: string[] } = { available: [] };
+  /** Session modes: the one the agent is in, the one it opened in (`bypass` without a mode goes back to it), and what it offers (ids, and as offered). */
+  private mode: { current?: string; base?: string; available: string[]; offered: AcpMode[] } = { available: [], offered: [] };
   private configOptions: SessionConfigOption[] = [];
   private modelNoticed = false;
 
@@ -160,7 +161,13 @@ export class AcpSession implements HarnessSession {
 
   /** What `session/new` or `session/load` answered: the session's modes and config options. */
   setup(o: { modes?: SessionModeState | null; configOptions?: SessionConfigOption[] | null }): void {
-    if (o.modes) this.mode = { current: o.modes.currentModeId, base: o.modes.currentModeId, available: o.modes.availableModes.map((m) => m.id) };
+    if (o.modes)
+      this.mode = {
+        current: o.modes.currentModeId,
+        base: o.modes.currentModeId,
+        available: o.modes.availableModes.map((m) => m.id),
+        offered: o.modes.availableModes.map((m) => ({ id: m.id, name: m.name, ...(m.description !== undefined ? { description: m.description } : {}) })),
+      };
     if (o.configOptions) this.configOptions = o.configOptions;
     if (this.mode.available.length) this.link.learned({ modes: this.mode.available });
   }
@@ -194,6 +201,9 @@ export class AcpSession implements HarnessSession {
     if (this.link.gone) throw new Error('the ACP agent process is gone');
     if (this.turn && !this.turn.done) throw new Error('turn already active');
     if (run) await this.applyRun(run);
+    // A harness command (the compaction command, the only one the host sends) may drop what the
+    // model was shown: the next input's preface gives its context in full again (ID-2).
+    if (inputs.length === 1 && isNativeCommand(inputs[0]!)) this.memo.reset();
     const prompt = await renderPrompt(inputs, { ...(this.link.blobs ? { blobs: this.link.blobs } : {}), support: this.link.support, memo: this.memo });
     const t: Turn = { turnId, inputIds: inputs.map((i) => i.inputId), consumed: false, done: false, lastWords: '', items: new Map(), interrupted: false };
     this.turn = t;
@@ -218,19 +228,37 @@ export class AcpSession implements HarnessSession {
   /**
    * The session mode the turn's run selects, set when it differs from the agent's: Plan mode
    * (`run.mode: "plan"`) selects the plan mode when the agent offers it, else the profile's `mode`
-   * (an instance profile `{ "mode": "<session mode id>" }`), else the mode the session opened in. A
-   * profile's mode the agent does not offer fails the turn's start (its permissions are at stake);
-   * an unavailable Plan mode is a notice. A model the agent offers as a config option (`category:
-   * "model"`) is selected the same way.
+   * (an instance profile `{ "mode": "<session mode id>" }`). A profile with no `mode` runs, when it
+   * is `bypass`, in the mode the session opened in; any other (the built-in `restricted` among
+   * them) in the agent's asking mode (the flavor's `restrictedMode`, generic: `default`), never in
+   * one the agent may have opened in that decides by itself (Claude Code's ACP agent opens in
+   * `auto`). An agent offering modes none of which the flavor knows to ask, or not offering the
+   * profile's mode, fails the turn's start (its permissions are at stake); an agent with no session
+   * modes runs as it is. An unavailable Plan mode is a notice. A model the agent offers as a config
+   * option (`category: "model"`) is selected the same way.
    */
   private async applyRun(run: RunSpec): Promise<void> {
     const profileMode = this.link.profiles[run.profile]?.mode;
-    let want = typeof profileMode === 'string' ? profileMode : this.mode.base;
+    let want: string | undefined;
+    /** No mode to run this profile's turn in: the agent's modes, none known to ask. */
+    let unasked = false;
+    if (typeof profileMode === 'string') want = profileMode;
+    else if (run.profile === 'bypass' || !this.mode.available.length) want = this.mode.base;
+    else {
+      want = this.link.flavor.restrictedMode(this.mode.offered);
+      unasked = want === undefined;
+    }
     if (run.mode === 'plan') {
       const plan = this.link.planMode ?? this.link.flavor.planMode;
-      if (this.mode.available.includes(plan)) want = plan;
-      else this.notice('other', `Plan mode is not available on this agent (its modes: ${this.mode.available.join(', ') || 'none'})`);
+      if (this.mode.available.includes(plan)) {
+        want = plan;
+        unasked = false;
+      } else this.notice('other', `Plan mode is not available on this agent (its modes: ${this.mode.available.join(', ') || 'none'})`);
     }
+    if (unasked)
+      throw new Error(
+        `profile ${run.profile}: no session mode is configured for it (profiles.${run.profile}.mode) and the agent offers none known to ask before it acts (it has ${this.mode.available.map((m) => JSON.stringify(m)).join(', ')}); configure the mode its turns run in`,
+      );
     if (want !== undefined && want !== this.mode.current) {
       if (!this.mode.available.includes(want))
         throw new Error(`profile ${run.profile}: the agent has no session mode ${JSON.stringify(want)} (it has ${this.mode.available.map((m) => JSON.stringify(m)).join(', ') || 'none'})`);
@@ -452,6 +480,9 @@ export class AcpSession implements HarnessSession {
     if (typeof u.name === 'string') v.name = u.name;
     if (typeof u.kind === 'string') v.kind = u.kind;
     if (u.rawInput !== undefined) v.rawInput = u.rawInput;
+    if (u._meta && typeof u._meta === 'object') v.meta = u._meta as Record<string, unknown>;
+    // The agent compacting its context (on its own too) may drop what the model was shown (ID-2).
+    if (this.link.flavor.compaction(v)) this.memo.reset();
     const tool = this.link.flavor.mcpTool(v);
     const sub = !tool && this.link.flavor.subagent(v);
     const label = tool ? `${tool.server}.${tool.name}` : undefined;
@@ -574,4 +605,5 @@ interface ToolUpdate {
   locations?: { path: string }[] | null;
   rawInput?: unknown;
   rawOutput?: unknown;
+  _meta?: unknown;
 }

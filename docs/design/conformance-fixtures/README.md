@@ -82,7 +82,7 @@ aio-transcript-replay <transcript.ndjson> [--bind name=value]... [--after-end er
 
 `harness/codex/test/transcripts.test.ts` 用 `aio-transcript-replay` 当 app-server，经真实 `CodexHarness` 把四段各回放一遍，会话做录制时做的事（`transcript-scenarios.ts`：输入固定，所以适配器写出的帧一字不差；每个动作等一个在 transcript 里先于它所产生的帧的事件）。回放程序以 0 退出（每行都放了、没有不同），事件流过 `checkEventStream`（HC-1），再查各自的结果：普通一轮的回答与录下的相同、0.171 不告警；steer 的输入由同一轮消费；审批的决定作为录下的那个答复回到 Codex（HC-9）；打断后这一轮是 `interrupted`。
 
-`harness/acp/test/transcripts.test.ts` 同样用 `aio-transcript-replay` 当 agent，经真实 `AcpHarness` 回放四段（Claude Code 的 ACP agent `@agentclientprotocol/claude-agent-acp` 0.110.1，模型 `gpt-6-sol`，2026-11-25）：普通一轮写出的帧与录下的一字不差（`initialize` 里没有 `fs`、`terminal`）、回答相同；审批先按 profile 设 session mode（`session/set_mode`），`allow_once` 作为 agent 给的那个选项回去；取消后这一轮 `interrupted`、输入记消费；`session/load` 时 agent 先重放对话再回答，重放的不成为事件，下一轮照常（HC-1、RQ-1、IN-1、RS-1）。
+`harness/acp/test/transcripts.test.ts` 同样用 `aio-transcript-replay` 当 agent，经真实 `AcpHarness` 回放四段（Claude Code 的 ACP agent `@agentclientprotocol/claude-agent-acp` 0.110.1，模型 `gpt-6-sol`，2026-11-25）：普通一轮写出的帧与录下的一字不差（`initialize` 里没有 `fs`、`terminal`）、回答相同；审批那一段是没配 profile 的 `restricted` 一轮：agent 打开时在 `auto`，适配器先 `session/set_mode` 到它会先问的 `default`，`allow_once` 作为 agent 给的那个选项回去；其余三段是主人的 `bypass` 轮次，跑在会话打开时的 mode 上，没有 `session/set_mode`；取消后这一轮 `interrupted`、输入记消费；`session/load` 时 agent 先重放对话再回答，重放的不成为事件，下一轮照常（HC-1、RQ-1、IN-1、RS-1）。
 
 录下的 steer 查出 HC-1 的一条不成立：Codex 0.171 在 steer 时放弃正在写的回答（`agentMessage` 有 `item/started`，没有 `item/completed`），适配器把这个 item 一直开着。由同一文件的 `it.fails` 复现，没修（INVARIANTS HC-1 不成立 1）。
 

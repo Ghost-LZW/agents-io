@@ -17,12 +17,17 @@
  *   fail        answers the prompt with an error
  *   exit        exits mid-turn (code 1)
  *   twice       two messages around a tool call; the answer is the second
+ *   compacting  a compaction reported as Claude Code's ACP agent does (a tool call "Compact
+ *               conversation", `_meta.claudeCode.toolName` `compact`), then `compacted`
  *
  * Environment: FAKE_ACP_LOG (append every call, one JSON line each), FAKE_ACP_STATE (a directory
  * the sessions' history is kept in, so another process can `session/load` it), FAKE_ACP_PROTOCOL
  * (the protocol version answered, default 1), FAKE_ACP_CAPS (JSON over the agent capabilities),
  * FAKE_ACP_ENV_KEYS (comma list of variables whose values the log records at start),
- * FAKE_ACP_NO_MODES=1 (no session modes), FAKE_ACP_NO_COMMANDS=1 (advertise no commands).
+ * FAKE_ACP_NO_MODES=1 (no session modes), FAKE_ACP_MODES (comma list of the session mode ids
+ * offered, default `default,plan,yolo`), FAKE_ACP_OPEN_MODE (the mode a session opens in, default
+ * `default`), FAKE_ACP_NO_COMMANDS=1 (advertise no commands). A prompt's log entry has the session
+ * mode it ran in (`mode`).
  */
 import { spawn } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -63,16 +68,14 @@ const loaded = (id: string): Sess['history'] | undefined => {
   const f = stateDir ? join(stateDir, `${id}.json`) : undefined;
   return f && existsSync(f) ? (JSON.parse(readFileSync(f, 'utf8')) as Sess['history']) : undefined;
 };
+const MODE_NAMES: Record<string, { name: string; description?: string }> = { default: { name: 'Default' }, plan: { name: 'Plan', description: 'Plans before acting' }, yolo: { name: 'Bypass permissions' } };
+const OPEN_MODE = env.FAKE_ACP_OPEN_MODE ?? 'default';
 const modes = (current: string) =>
   env.FAKE_ACP_NO_MODES === '1'
     ? undefined
     : {
         currentModeId: current,
-        availableModes: [
-          { id: 'default', name: 'Default' },
-          { id: 'plan', name: 'Plan', description: 'Plans before acting' },
-          { id: 'yolo', name: 'Bypass permissions' },
-        ],
+        availableModes: (env.FAKE_ACP_MODES ?? 'default,plan,yolo').split(',').map((id) => ({ id, ...(MODE_NAMES[id] ?? { name: id }) })),
       };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const text = (t: string): ContentBlock => ({ type: 'text', text: t });
@@ -151,7 +154,7 @@ const app = agent({ name: 'fake-acp' })
   })
   .onRequest(methods.agent.session.new, ({ params, client }) => {
     log({ call: 'session/new', params });
-    const s: Sess = { id: `sess-${process.pid}-${++seq}`, cwd: params.cwd, mode: 'default', mcp: params.mcpServers, cancelled: false, history: [] };
+    const s: Sess = { id: `sess-${process.pid}-${++seq}`, cwd: params.cwd, mode: OPEN_MODE, mcp: params.mcpServers, cancelled: false, history: [] };
     sessions.set(s.id, s);
     save(s);
     if (env.FAKE_ACP_NO_COMMANDS !== '1')
@@ -163,7 +166,7 @@ const app = agent({ name: 'fake-acp' })
     log({ call: 'session/load', params });
     const history = loaded(params.sessionId);
     if (!history) throw RequestError.resourceNotFound(params.sessionId);
-    const s: Sess = { id: params.sessionId, cwd: params.cwd, mode: 'default', mcp: params.mcpServers, cancelled: false, history };
+    const s: Sess = { id: params.sessionId, cwd: params.cwd, mode: OPEN_MODE, mcp: params.mcpServers, cancelled: false, history };
     sessions.set(s.id, s);
     // Replays the conversation before answering (the spec), a tool call and a plan among it.
     for (const [i, h] of history.entries()) {
@@ -188,8 +191,8 @@ const app = agent({ name: 'fake-acp' })
     if (s) s.cancelled = true;
   })
   .onRequest(methods.agent.session.prompt, async ({ params, client }) => {
-    log({ call: 'session/prompt', params });
     const s = sessions.get(params.sessionId);
+    log({ call: 'session/prompt', params, ...(s && env.FAKE_ACP_NO_MODES !== '1' ? { mode: s.mode } : {}) });
     if (!s) throw RequestError.resourceNotFound(params.sessionId);
     s.cancelled = false;
     const words = params.prompt.flatMap((b) => (b.type === 'text' ? [b.text] : [])).join('\n');
@@ -283,6 +286,11 @@ const app = agent({ name: 'fake-acp' })
       const server = s.mcp[0];
       answer = server ? `tools: ${(await listTools(server)).join(',')}` : 'no mcp';
     } else if (cmd === '/compact') {
+      answer = 'compacted';
+    } else if (has('compacting')) {
+      const meta = { claudeCode: { toolName: 'compact' } };
+      await update(client, s.id, { sessionUpdate: 'tool_call', toolCallId: 'compact-1', title: 'Compact conversation', kind: 'think', status: 'in_progress', _meta: meta });
+      await update(client, s.id, { sessionUpdate: 'tool_call_update', toolCallId: 'compact-1', status: 'completed', rawOutput: { trigger: 'auto' }, _meta: meta });
       answer = 'compacted';
     } else answer = `echo: ${words}`;
 

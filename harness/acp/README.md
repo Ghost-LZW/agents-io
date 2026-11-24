@@ -13,7 +13,7 @@ It only starts the command you configure; it never installs an agent from the AC
     "use": "acp",
     "command": "/opt/acp/node_modules/.bin/claude-agent-acp",
     "env": { "ANTHROPIC_API_KEY": "env:ANTHROPIC_API_KEY" },
-    "profiles": { "restricted": { "mode": "default" }, "bypass": { "mode": "bypassPermissions" } }
+    "profiles": { "bypass": { "mode": "bypassPermissions" } }
   }
 }
 ```
@@ -22,7 +22,7 @@ It only starts the command you configure; it never installs an agent from the AC
 |---|---|
 | `command`, `args` | The agent program (a path, `~` and relative to the config file, or a name on PATH) and its arguments, as written: other local users can read them (`ps`), so no secrets here; put them in `env`. |
 | `env`, `cwd` | The agent process's environment (over the daemon's) and working directory (also its sessions' unless an agent or launch gives another). |
-| `profiles` | Profile name → `{ "mode": "<session mode id>" }`: the session mode (`session/set_mode`) a turn of that profile runs in, set before its prompt whenever it differs. A profile without `mode` runs in the mode the session opened in. Nothing else is allowed in an acp profile (a config error). A mode the agent does not offer fails the turn's start. |
+| `profiles` | Profile name → `{ "mode": "<session mode id>" }`: the session mode (`session/set_mode`) a turn of that profile runs in, set before its prompt whenever it differs. Without `mode`, `bypass` runs in the mode the session opened in, and every other profile (the built-in `restricted`: guests, admitted strangers, peers, tasks) in the agent's mode that asks before it acts, as Claude Code's `default` and Codex's `on-request` do: the flavor's `restrictedMode`, generic `default` when the agent offers it (Claude Code's ACP agent opens in `auto`, where it decides by itself; its `default` asks). An agent offering modes none of which the flavor knows to ask does not start such a turn, saying so, until the profile's `mode` is configured; an agent with no session modes runs as it is. Nothing else is allowed in an acp profile (a config error). A mode the agent does not offer fails the turn's start. |
 | `mcp` | How the host's MCP endpoint (agents-io's tools) reaches the agent: `http` (an `http` MCP server, the bearer token in its `Authorization` header; the agent must advertise `mcpCapabilities.http`) or `stdio-bridge` (a stdio MCP server, `bin/mcp-stdio-bridge.mjs` of this package run with node, which forwards each message to the endpoint; the URL and token go in its environment, never on a command line; every ACP agent takes stdio). Default: `http` when the agent advertises it, else `stdio-bridge`. |
 | `flavor` | The agent's quirks by name (`generic`, `claude`); default: picked by the agent's `initialize` answer (`agentInfo.name`), else `generic`. |
 | `planMode` | The session mode Plan mode selects. Declares Plan mode at once (otherwise only once a session showed the flavor's plan mode, `plan`, among its modes). |
@@ -66,7 +66,10 @@ title starting `<server>.<tool>`; the claude flavor's `Agent` / `Task` is `subag
 `diff.updated`; `plan` → `plan.updated`; the prompt's usage (else the last `usage_update`) →
 `turn.completed.usage`; other updates → `native` (ephemeral). Stop reasons: `end_turn` completed,
 `cancelled` interrupted, `refusal` / `max_tokens` / `max_turn_requests` failed with that code, an
-unknown one ambiguous. A prompt answered with an error fails the turn (`prompt_failed`; its inputs not
+unknown one ambiguous. The sender preface is Codex's (INVARIANTS ID-2): context that stays the same
+across a conversation or a sender is shown when it changes, and in full again after an input the
+agent may not have read, a turn of the compaction command, or a compaction the flavor recognises in
+the agent's updates (`compaction`). A prompt answered with an error fails the turn (`prompt_failed`; its inputs not
 consumed unless the agent said something first); an agent that exits mid-turn ends it ambiguous
 (`agent_exited`), and the next open starts the agent again.
 
@@ -74,16 +77,21 @@ consumed unless the agent said something first); an agent that exits mid-turn en
 
 Native steer, native turn and item ids, truncation and rollback, context without a turn, adoption
 across a daemon restart, approvals that survive the agent process, subagent visibility (beyond a
-flavor's guess), stable usage figures. Mid-session model switches only through the agent's
+flavor's guess), stable usage figures, the agent's own compactions (ACP v1 has no such update: only
+a flavor that recognises one sees it, so the sender preface gives its context in full again only
+then and after the compaction command). Mid-session model switches only through the agent's
 (unstable) config options.
 
 ## Flavors
 
 `src/flavors.ts`: named hooks for an agent's quirks, never in the kernel (the boundary guard keeps
 vendor names out of core files). `generic` is the protocol as written; `claude` (Claude Code's ACP
-agent, `@agentclientprotocol/claude-agent-acp`) adds its display name and its `Agent` / `Task`
-subagent tool. A hook not given is `generic`'s: `matches`, `displayName`, `planMode`,
-`compactCommand`, `mcpTool`, `subagent`, `elicitationQuestions`. Embedders may pass a flavor object
+agent, `@agentclientprotocol/claude-agent-acp`) adds its display name, its `Agent` / `Task`
+subagent tool and its compaction report (a tool call "Compact conversation" whose
+`_meta.claudeCode.toolName` is `compact`, sent for its own compactions and `/compact`'s). A hook not
+given is `generic`'s: `matches`, `displayName`, `planMode`, `restrictedMode` (the asking mode a
+profile without `mode` runs in), `compactCommand`, `mcpTool`, `subagent`, `compaction`,
+`elicitationQuestions`. Embedders may pass a flavor object
 of their own (`AcpHarnessOptions.flavor`).
 
 ## Tests and transcripts
@@ -94,7 +102,9 @@ of their own (`AcpHarnessOptions.flavor`).
 - Recorded transcripts (docs/design/conformance-fixtures §2, protocol `acp`):
   `packages/testkit/conformance/transcripts/acp/` (`plain-turn`, `permission`, `cancel`, `load`),
   replayed through the real adapter by `test/transcripts.test.ts` with `aio-transcript-replay` in the
-  agent's place. Re-record them (real model, by hand) when the frames the adapter writes change on
+  agent's place. `plain-turn`, `cancel` and `load` are owner turns (`bypass`, the mode the session
+  opened in: no `session/set_mode`); `permission` is a `restricted` turn with no profiles configured,
+  which selects the agent's `default` mode. Re-record them (real model, by hand) when the frames the adapter writes change on
   purpose:
 
   ```sh
