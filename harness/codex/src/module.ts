@@ -135,6 +135,8 @@ export const codexHarnessModule: HarnessModule<CodexLaunch> = {
       ...(x.disable ? { disable: x.disable } : {}),
       ...(x.live ? { live: true } : {}),
       ...(init.blobs ? { blobs: init.blobs } : {}),
+      // The daemon log: an unverified codex version is warned of there (decision 17).
+      log: init.log,
     });
   },
 };

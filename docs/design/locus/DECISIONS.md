@@ -210,3 +210,11 @@
 - **实现语言**（owner）：参考实现继续用 TypeScript（Node 24），不重写。语言中立靠协议、JSON Schema 与一致性 fixture（core-slimming G8）。有宿主要把内核嵌进进程时，再按 core-slimming §8 只移植内核，首选 Rust。
 - **定位**（owner）：POSITIONING §9 生效：agents-io 是各 agent 框架共用的会话 IO 运行时；南向接 harness（原生、ACP、AG-UI、JSONL），北向接通道与投影（原生、JSONL、Chat SDK 桥；AG-UI / ACP / MCP / A2A 投影），宿主经 `Policy` 与宿主协议。
 - **守卫**：`pnpm boundaries:check`（core-slimming §6），基线只降不升；新违例在代码里修掉。搬家 PR 只搬代码或抽接口、不改行为；INVARIANTS 不因搬家而改。
+
+## 决定 17：codex 协议不要卡死
+
+日期：2026-11-25。owner 原话"codex 协议不要卡死"。背景：Codex 会自己升级（`codex` 链接、Codex 自管的 app-server daemon；本机 2026-11-24 已到 0.172.0），适配器只认已验证的版本线（0.160、0.171），新版本一来就在第一次用到实例时拒绝，部署跟着停摆；协议里不认识的东西（没处理的服务端请求、还没登记的 thread 的请求、形状变了的通知）也可能让一轮卡住，或从回调里抛出去。
+
+- **版本**（owner）：低于最老的已验证版本线（`SUPPORTED_CODEX_LINES[0]`，0.160）照旧明确拒绝（`UnsupportedCodexVersionError`，文字不变）；已验证的线照旧、不告警；更新的、没验证过的版本（0.172、0.180、1.x，以及两条已验证线之间的）照常运行，每个适配器告警一次：守护进程日志一条 warn（第一次连上时，通常是启动时的 probe），第一个会话的事件流里一条 detail 级的 `notice`，文字说出版本、已验证的线，并指向 `harness/codex/scripts/gen-types.sh`。读不出版本（`initialize` 的回答没有可解析的 `userAgent`）也照常运行并告警，`probe` 报 `unknown`。`allowUnknownVersion: true` 仍是"什么版本都跑、不告警"；新增 `strictVersion: true`（要显式打开）恢复以前的做法：没验证过的、读不出的都拒绝。两者都给时 `allowUnknownVersion` 优先。
+- **协议不卡死**（owner）：每个服务端请求都在有限时间内得到答复；不认识的通知不让会话结束。具体做法依原则自决，承诺写成 INVARIANTS HC-9：适配器不处理的方法立即答 `-32601`（照旧）；没有 thread 的请求立即答错误，记成这个连接上各会话的 `native`；发给还没登记的 thread 的请求最多等 10 秒（或缓存满 256 条），之后答 `-32603`，别的客户端已经答了的（`serverRequest/resolved`）不再答；审批请求带着不认识的字段或决定种类时照常打开，只给能映射回去的决定（0.171 的 `humanCommand` 只给一次性的决定）；参数完全读不了的答这种请求的拒绝，记 `native` 和一条 `notice`，这一轮接着走；通知映射抛错时记 `native` 和一条 detail 级 `notice`，会话照常；RPC 层的处理函数抛错不再传到传输层。
+- **不变**：已验证的线上，事件流、帧、错误码与文字都不变；验证一条新线的做法照旧（`harness/codex/README.md`"Supporting a new codex line"）：告警说的是"没验证过"，不是"支持了"。

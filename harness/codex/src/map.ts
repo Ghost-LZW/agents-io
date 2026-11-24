@@ -280,8 +280,9 @@ export function phaseAudience(phase: string | null | undefined): Audience {
 
 // ---- Turn / plan / diff -------------------------------------------------------
 
+/** A status this adapter does not know (a newer codex) is `ambiguous`: how the turn ended is unknown (HC-9). */
 export function turnStatus(s: TurnStatus): BodyOf<'turn.completed'>['status'] {
-  return s === 'inProgress' ? 'ambiguous' : s;
+  return s === 'completed' || s === 'failed' || s === 'interrupted' ? s : 'ambiguous';
 }
 
 const RETRYABLE = new Set([
