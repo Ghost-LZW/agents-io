@@ -5,10 +5,13 @@
  *
  * What a prompt does depends on a word in its last text block:
  *   (default)   answers `echo: <text>` in two chunks
+ *   pause       waits 300 ms, then answers as the default
  *   tool        a command tool call that runs and completes, then `done`
  *   permission  an edit tool call that asks permission (allow once / always / reject); answers
  *               `permission: <optionId>` (or stops `cancelled` when the outcome is cancelled)
  *   slow        streams a chunk every 30 ms until `session/cancel` (stops `cancelled`)
+ *   stubborn    ignores `session/cancel`: streams `stale <i> ` every 30 ms for FAKE_ACP_STUBBORN_MS
+ *               (default 1500), stopping early only at `session/close`; then stops `cancelled`
  *   plan        a plan, then `planned`
  *   think       a thought chunk, then `thought`
  *   ask         a form elicitation (when the client advertised one), answers what it got
@@ -29,13 +32,14 @@
  * FAKE_ACP_NO_MODES=1 (no session modes), FAKE_ACP_MODES (comma list of the session mode ids
  * offered, default `default,plan,yolo`), FAKE_ACP_OPEN_MODE (the mode a session opens in, default
  * `default`), FAKE_ACP_NO_COMMANDS=1 (advertise no commands). A prompt's log entry has the session
- * mode it ran in (`mode`).
+ * mode it ran in (`mode`); `prompt-end` (with its `sessionId`) is logged as it answers. `session/close`
+ * stops a session's work (its prompt answers `cancelled`) and forgets it: `session/load` reopens it.
  */
 import { spawn } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Readable, Writable } from 'node:stream';
-import { agent, methods, ndJsonStream, RequestError, type AgentContext, type ContentBlock, type McpServer, type SessionUpdate } from '@agentclientprotocol/sdk';
+import { agent, methods, ndJsonStream, RequestError, type AgentContext, type ContentBlock, type McpServer, type PromptRequest, type PromptResponse, type SessionUpdate } from '@agentclientprotocol/sdk';
 
 const env = process.env;
 const log = (entry: Record<string, unknown>) => {
@@ -55,6 +59,7 @@ interface Sess {
   mode: string;
   mcp: McpServer[];
   cancelled: boolean;
+  closed?: boolean;
   history: { role: 'user' | 'agent'; text: string }[];
 }
 const sessions = new Map<string, Sess>();
@@ -192,118 +197,142 @@ const app = agent({ name: 'fake-acp' })
     const s = sessions.get(params.sessionId);
     if (s) s.cancelled = true;
   })
-  .onRequest(methods.agent.session.prompt, async ({ params, client }) => {
+  .onRequest(methods.agent.session.close, ({ params }) => {
+    log({ call: 'session/close', params });
     const s = sessions.get(params.sessionId);
-    log({ call: 'session/prompt', params, ...(s && env.FAKE_ACP_NO_MODES !== '1' ? { mode: s.mode } : {}) });
-    if (!s) throw RequestError.resourceNotFound(params.sessionId);
-    s.cancelled = false;
-    const words = params.prompt.flatMap((b) => (b.type === 'text' ? [b.text] : [])).join('\n');
-    const last = [...params.prompt].reverse().find((b) => b.type === 'text');
-    const cmd = last && last.type === 'text' ? last.text.split('\n').at(-1)!.trim() : '';
-    s.history.push({ role: 'user', text: cmd });
-    let answer: string;
-    const has = (w: string) => cmd.split(/\s+/).includes(w);
+    if (s) s.cancelled = s.closed = true;
+    sessions.delete(params.sessionId);
+    return {};
+  })
+  .onRequest(methods.agent.session.prompt, async ({ params, client }) => {
+    try {
+      return await prompt(params, client);
+    } finally {
+      log({ call: 'prompt-end', sessionId: params.sessionId });
+    }
+  });
 
-    if (has('fail')) throw RequestError.internalError({ why: 'asked to fail' }, 'the fake agent failed');
-    if (has('null')) {
-      await say(client, s, 'no stop reason');
-      return null as never;
-    }
-    if (has('exit')) {
-      await say(client, s, 'about to exit');
-      setTimeout(() => process.exit(1), 10);
-      await sleep(10_000);
-    }
-    if (has('slow')) {
-      for (let i = 0; !s.cancelled && i < 400; i++) {
-        await update(client, s.id, { sessionUpdate: 'agent_message_chunk', content: text(`${i} `) });
-        await sleep(30);
-      }
-      return { stopReason: s.cancelled ? 'cancelled' : 'end_turn' };
-    }
-    if (has('tool')) {
-      await update(client, s.id, { sessionUpdate: 'tool_call', toolCallId: 'call-1', title: 'Run ls', kind: 'execute', status: 'pending', rawInput: { command: 'ls -la' } });
-      await update(client, s.id, { sessionUpdate: 'tool_call_update', toolCallId: 'call-1', status: 'in_progress' });
-      await update(client, s.id, { sessionUpdate: 'tool_call_update', toolCallId: 'call-1', status: 'completed', content: [{ type: 'content', content: text('a.txt\nb.txt') }] });
-      answer = 'done';
-    } else if (has('twice')) {
-      await say(client, s, 'let me look', 'm1');
-      await update(client, s.id, { sessionUpdate: 'tool_call', toolCallId: 'call-2', title: 'mcp__agents-io__get_channel_context', name: 'mcp__agents-io__get_channel_context', kind: 'other', status: 'pending' });
-      await update(client, s.id, { sessionUpdate: 'tool_call_update', toolCallId: 'call-2', status: 'completed', rawOutput: { ok: true } });
-      answer = 'here it is';
-      await say(client, s, answer, 'm2');
-      s.history.push({ role: 'agent', text: answer });
-      save(s);
-      return { stopReason: 'end_turn' };
-    } else if (has('permission')) {
-      await update(client, s.id, { sessionUpdate: 'tool_call', toolCallId: 'call-p', title: 'Edit a.txt', kind: 'edit', status: 'pending', rawInput: { path: '/tmp/a.txt' }, locations: [{ path: '/tmp/a.txt' }] });
-      const r = await client.request(methods.client.session.requestPermission, {
-        sessionId: s.id,
-        toolCall: { toolCallId: 'call-p', title: 'Edit a.txt', kind: 'edit', status: 'pending', rawInput: { path: '/tmp/a.txt' } },
-        options: [
-          { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
-          { optionId: 'always', name: 'Always allow edits', kind: 'allow_always' },
-          { optionId: 'reject', name: 'Reject', kind: 'reject_once' },
-        ],
-      });
-      log({ call: 'permission-outcome', outcome: r.outcome });
-      if (r.outcome.outcome === 'cancelled') return { stopReason: 'cancelled' };
-      const ok = r.outcome.optionId !== 'reject';
-      await update(client, s.id, { sessionUpdate: 'tool_call_update', toolCallId: 'call-p', status: ok ? 'completed' : 'failed' });
-      answer = `permission: ${r.outcome.optionId}`;
-    } else if (has('plan')) {
-      await update(client, s.id, {
-        sessionUpdate: 'plan',
-        entries: [
-          { content: 'look', priority: 'high', status: 'completed' },
-          { content: 'think', priority: 'medium', status: 'in_progress' },
-          { content: 'answer', priority: 'low', status: 'pending' },
-        ],
-      });
-      answer = 'planned';
-    } else if (has('think')) {
-      await update(client, s.id, { sessionUpdate: 'agent_thought_chunk', content: text('hmm') });
-      answer = 'thought';
-    } else if (has('usage')) {
-      await update(client, s.id, { sessionUpdate: 'usage_update', used: 1200, size: 200000, cost: { amount: 0.01, currency: 'USD' } });
-      answer = 'used';
-    } else if (has('ask')) {
-      if (!(clientCaps.elicitation as { form?: unknown } | undefined)?.form) answer = 'no elicitation';
-      else {
-        const r = await client.request(methods.client.elicitation.create, {
-          sessionId: s.id,
-          mode: 'form',
-          message: 'Which colour?',
-          requestedSchema: {
-            type: 'object',
-            properties: {
-              colour: { type: 'string', title: 'Colour', oneOf: [{ const: 'r', title: 'Red' }, { const: 'g', title: 'Green' }] },
-              count: { type: 'integer', title: 'How many' },
-              sure: { type: 'boolean', title: 'Sure?' },
-            },
-            required: ['colour'],
-          },
-        });
-        log({ call: 'elicitation-outcome', outcome: r });
-        if (r.action === 'cancel') return { stopReason: 'cancelled' };
-        answer = r.action === 'accept' ? `answered: ${JSON.stringify((r as { content?: unknown }).content ?? {})}` : `declined`;
-      }
-    } else if (has('mcp')) {
-      const server = s.mcp[0];
-      answer = server ? `tools: ${(await listTools(server)).join(',')}` : 'no mcp';
-    } else if (cmd === '/compact') {
-      answer = 'compacted';
-    } else if (has('compacting')) {
-      const meta = { claudeCode: { toolName: 'compact' } };
-      await update(client, s.id, { sessionUpdate: 'tool_call', toolCallId: 'compact-1', title: 'Compact conversation', kind: 'think', status: 'in_progress', _meta: meta });
-      await update(client, s.id, { sessionUpdate: 'tool_call_update', toolCallId: 'compact-1', status: 'completed', rawOutput: { trigger: 'auto' }, _meta: meta });
-      answer = 'compacted';
-    } else answer = `echo: ${words}`;
+async function prompt(params: PromptRequest, client: AgentContext): Promise<PromptResponse> {
+  const s = sessions.get(params.sessionId);
+  log({ call: 'session/prompt', params, ...(s && env.FAKE_ACP_NO_MODES !== '1' ? { mode: s.mode } : {}) });
+  if (!s) throw RequestError.resourceNotFound(params.sessionId);
+  s.cancelled = false;
+  const words = params.prompt.flatMap((b) => (b.type === 'text' ? [b.text] : [])).join('\n');
+  const last = [...params.prompt].reverse().find((b) => b.type === 'text');
+  const cmd = last && last.type === 'text' ? last.text.split('\n').at(-1)!.trim() : '';
+  s.history.push({ role: 'user', text: cmd });
+  let answer: string;
+  const has = (w: string) => cmd.split(/\s+/).includes(w);
 
-    await say(client, s, answer);
+  if (has('fail')) throw RequestError.internalError({ why: 'asked to fail' }, 'the fake agent failed');
+  if (has('null')) {
+    await say(client, s, 'no stop reason');
+    return null as never;
+  }
+  if (has('exit')) {
+    await say(client, s, 'about to exit');
+    setTimeout(() => process.exit(1), 10);
+    await sleep(10_000);
+  }
+  if (has('pause')) await sleep(300);
+  if (has('stubborn')) {
+    const until = Date.now() + Number(env.FAKE_ACP_STUBBORN_MS ?? 1500);
+    for (let i = 0; !s.closed && Date.now() < until; i++) {
+      await update(client, s.id, { sessionUpdate: 'agent_message_chunk', content: text(`stale ${i} `) });
+      await sleep(30);
+    }
+    return { stopReason: 'cancelled' };
+  }
+  if (has('slow')) {
+    for (let i = 0; !s.cancelled && i < 400; i++) {
+      await update(client, s.id, { sessionUpdate: 'agent_message_chunk', content: text(`${i} `) });
+      await sleep(30);
+    }
+    return { stopReason: s.cancelled ? 'cancelled' : 'end_turn' };
+  }
+  if (has('tool')) {
+    await update(client, s.id, { sessionUpdate: 'tool_call', toolCallId: 'call-1', title: 'Run ls', kind: 'execute', status: 'pending', rawInput: { command: 'ls -la' } });
+    await update(client, s.id, { sessionUpdate: 'tool_call_update', toolCallId: 'call-1', status: 'in_progress' });
+    await update(client, s.id, { sessionUpdate: 'tool_call_update', toolCallId: 'call-1', status: 'completed', content: [{ type: 'content', content: text('a.txt\nb.txt') }] });
+    answer = 'done';
+  } else if (has('twice')) {
+    await say(client, s, 'let me look', 'm1');
+    await update(client, s.id, { sessionUpdate: 'tool_call', toolCallId: 'call-2', title: 'mcp__agents-io__get_channel_context', name: 'mcp__agents-io__get_channel_context', kind: 'other', status: 'pending' });
+    await update(client, s.id, { sessionUpdate: 'tool_call_update', toolCallId: 'call-2', status: 'completed', rawOutput: { ok: true } });
+    answer = 'here it is';
+    await say(client, s, answer, 'm2');
     s.history.push({ role: 'agent', text: answer });
     save(s);
     return { stopReason: 'end_turn' };
-  });
+  } else if (has('permission')) {
+    await update(client, s.id, { sessionUpdate: 'tool_call', toolCallId: 'call-p', title: 'Edit a.txt', kind: 'edit', status: 'pending', rawInput: { path: '/tmp/a.txt' }, locations: [{ path: '/tmp/a.txt' }] });
+    const r = await client.request(methods.client.session.requestPermission, {
+      sessionId: s.id,
+      toolCall: { toolCallId: 'call-p', title: 'Edit a.txt', kind: 'edit', status: 'pending', rawInput: { path: '/tmp/a.txt' } },
+      options: [
+        { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+        { optionId: 'always', name: 'Always allow edits', kind: 'allow_always' },
+        { optionId: 'reject', name: 'Reject', kind: 'reject_once' },
+      ],
+    });
+    log({ call: 'permission-outcome', outcome: r.outcome });
+    if (r.outcome.outcome === 'cancelled') return { stopReason: 'cancelled' };
+    const ok = r.outcome.optionId !== 'reject';
+    await update(client, s.id, { sessionUpdate: 'tool_call_update', toolCallId: 'call-p', status: ok ? 'completed' : 'failed' });
+    answer = `permission: ${r.outcome.optionId}`;
+  } else if (has('plan')) {
+    await update(client, s.id, {
+      sessionUpdate: 'plan',
+      entries: [
+        { content: 'look', priority: 'high', status: 'completed' },
+        { content: 'think', priority: 'medium', status: 'in_progress' },
+        { content: 'answer', priority: 'low', status: 'pending' },
+      ],
+    });
+    answer = 'planned';
+  } else if (has('think')) {
+    await update(client, s.id, { sessionUpdate: 'agent_thought_chunk', content: text('hmm') });
+    answer = 'thought';
+  } else if (has('usage')) {
+    await update(client, s.id, { sessionUpdate: 'usage_update', used: 1200, size: 200000, cost: { amount: 0.01, currency: 'USD' } });
+    answer = 'used';
+  } else if (has('ask')) {
+    if (!(clientCaps.elicitation as { form?: unknown } | undefined)?.form) answer = 'no elicitation';
+    else {
+      const r = await client.request(methods.client.elicitation.create, {
+        sessionId: s.id,
+        mode: 'form',
+        message: 'Which colour?',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            colour: { type: 'string', title: 'Colour', oneOf: [{ const: 'r', title: 'Red' }, { const: 'g', title: 'Green' }] },
+            count: { type: 'integer', title: 'How many' },
+            sure: { type: 'boolean', title: 'Sure?' },
+          },
+          required: ['colour'],
+        },
+      });
+      log({ call: 'elicitation-outcome', outcome: r });
+      if (r.action === 'cancel') return { stopReason: 'cancelled' };
+      answer = r.action === 'accept' ? `answered: ${JSON.stringify((r as { content?: unknown }).content ?? {})}` : `declined`;
+    }
+  } else if (has('mcp')) {
+    const server = s.mcp[0];
+    answer = server ? `tools: ${(await listTools(server)).join(',')}` : 'no mcp';
+  } else if (cmd === '/compact') {
+    answer = 'compacted';
+  } else if (has('compacting')) {
+    const meta = { claudeCode: { toolName: 'compact' } };
+    await update(client, s.id, { sessionUpdate: 'tool_call', toolCallId: 'compact-1', title: 'Compact conversation', kind: 'think', status: 'in_progress', _meta: meta });
+    await update(client, s.id, { sessionUpdate: 'tool_call_update', toolCallId: 'compact-1', status: 'completed', rawOutput: { trigger: 'auto' }, _meta: meta });
+    answer = 'compacted';
+  } else answer = `echo: ${words}`;
+
+  await say(client, s, answer);
+  s.history.push({ role: 'agent', text: answer });
+  save(s);
+  return { stopReason: 'end_turn' };
+}
 
 app.connect(ndJsonStream(Writable.toWeb(process.stdout) as WritableStream<Uint8Array>, Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>));

@@ -75,7 +75,11 @@ export interface AcpHarnessOptions {
   log?: AcpLog;
   /** Timeout of `initialize`, `session/new`, `session/load` and the other setup requests. Default 60 s. */
   requestTimeoutMs?: number;
-  /** How long an interrupted turn waits for the agent to stop before it ends anyway. Default 15 s. */
+  /**
+   * How long an interrupted turn waits for the agent to stop before it ends anyway; and how long the
+   * next turn then waits for the agent to answer that prompt before the session is closed and opened
+   * again. Default 15 s.
+   */
   cancelTimeoutMs?: number;
   /** How long the agent has to exit after its stdin closes (`dispose`), and then after SIGTERM, before it is killed. Default 1 s. */
   shutdownGraceMs?: number;
@@ -306,21 +310,17 @@ export class AcpHarness implements HarnessAdapter {
       if (!caps.sessionCapabilities?.systemPrompt) throw new Error("the ACP agent does not take instructions (it advertises no sessionCapabilities.systemPrompt); remove the agent's instructions or use another harness");
       systemPrompt = { mode: 'append', content: [{ type: 'text', text: args.instructions }] };
     }
-    const link = this.link(p);
     const common = { cwd: args.cwd, mcpServers, ...(systemPrompt ? { systemPrompt } : {}) };
+    const link = this.link(p, common);
 
     if (args.resume) {
       if (caps.loadSession) {
-        // Registered before the request: the replay comes before the answer, and is not the session's events.
         const s = new AcpSession(link, args.resume);
-        this.register(p, s);
         try {
-          const r = await within(p.conn.agent.request('session/load', { ...common, sessionId: args.resume }), this.requestTimeoutMs, 'session/load');
-          s.setup((r ?? {}) as LoadSessionResponse);
+          s.setup(await this.load(p, s, common));
           s.bound();
           return s;
         } catch (e) {
-          if (p.sessions.get(args.resume) === s) p.sessions.delete(args.resume);
           if (e instanceof Timeout || p.gone) throw e;
           const s2 = await this.newSession(p, link, common);
           s2.notice('continuity', `could not resume ACP session ${args.resume} (${errMsg(e)}); started a new one`);
@@ -335,12 +335,28 @@ export class AcpHarness implements HarnessAdapter {
   }
 
   private async newSession(p: Proc, link: AcpLink, common: Record<string, unknown>): Promise<AcpSession> {
-    const r = await within(p.conn.agent.request('session/new', common as never), this.requestTimeoutMs, 'session/new');
-    const s = new AcpSession(link, (r as NewSessionResponse).sessionId);
+    const r = await this.requestNew(p, common);
+    const s = new AcpSession(link, r.sessionId);
     this.register(p, s);
-    s.setup(r as NewSessionResponse);
+    s.setup(r);
     s.bound();
     return s;
+  }
+
+  private async requestNew(p: Proc, common: Record<string, unknown>): Promise<NewSessionResponse> {
+    return (await within(p.conn.agent.request('session/new', common as never), this.requestTimeoutMs, 'session/new')) as NewSessionResponse;
+  }
+
+  /** `session/load` of `s`'s id; `s` is registered before the request (the replay comes before the answer, and is not the session's events), and not after a failure. */
+  private async load(p: Proc, s: AcpSession, common: Record<string, unknown>): Promise<LoadSessionResponse> {
+    const id = s.sessionId;
+    this.register(p, s);
+    try {
+      return ((await within(p.conn.agent.request('session/load', { ...common, sessionId: id } as never), this.requestTimeoutMs, 'session/load')) ?? {}) as LoadSessionResponse;
+    } catch (e) {
+      if (p.sessions.get(id) === s) p.sessions.delete(id);
+      throw e;
+    }
   }
 
   private register(p: Proc, s: AcpSession): void {
@@ -366,7 +382,7 @@ export class AcpHarness implements HarnessAdapter {
     return [{ name, command: process.execPath, args: [MCP_STDIO_BRIDGE], env: [{ name: 'AIO_MCP_URL', value: m.url }, { name: 'AIO_MCP_TOKEN', value: m.token }] }];
   }
 
-  private link(p: Proc): AcpLink {
+  private link(p: Proc, common: Record<string, unknown>): AcpLink {
     const self = this;
     const a = p.init.agentCapabilities ?? {};
     return {
@@ -383,6 +399,14 @@ export class AcpHarness implements HarnessAdapter {
       ...(this.o.blobs ? { blobs: this.o.blobs } : {}),
       support: a.promptCapabilities ?? {},
       closes: !!a.sessionCapabilities?.close,
+      loads: a.loadSession === true,
+      open: async (s, how) => {
+        if (how === 'load') return this.load(p, s, common);
+        const r = await this.requestNew(p, common);
+        s.rebind(r.sessionId);
+        this.register(p, s);
+        return r;
+      },
       cancelTimeoutMs: this.o.cancelTimeoutMs ?? 15_000,
       profiles: this.o.profiles ?? {},
       planMode: this.o.planMode,

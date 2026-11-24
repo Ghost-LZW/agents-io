@@ -41,7 +41,7 @@ when it decides to. An agent answering another protocol version is refused, clea
 | `HarnessCaps` / declaration | From |
 |---|---|
 | `steer: 'none'` | ACP has no prompt while a prompt runs: an input during a turn waits in the lane's queue for the next one. |
-| `interrupt` | `session/cancel` (every request the agent waits on is answered cancelled first, as the protocol asks; the turn ends when the prompt answers `cancelled`, or after 15 s anyway, as interrupted). |
+| `interrupt` | `session/cancel` (every request the agent waits on is answered cancelled first, as the protocol asks; the turn ends when the prompt answers `cancelled`, or after 15 s anyway, as interrupted, `cancel_timeout`). A prompt the agent goes on with after that keeps the session: ACP updates carry no turn id, so what it streams is `native` (in no turn) and the next turn's `session/prompt` waits for it to answer, at most another 15 s (`cancelTimeoutMs`); still no answer, the session is closed and opened again (with `session/close` answered and `loadSession`, the same session is loaded again; otherwise a new one is started and bound, its context given in full in the next preface) and a `continuity` notice says which (INVARIANTS LN-2, DL-3). |
 | `approvals` | `session/request_permission` → `request.opened` (kind `file_change` for edit/delete/move tools, else `tool_approval`); `allow_once` picks the agent's one-time allow option and never a wider one, `allow_session` its "always" option (else the one-time one), `deny` its reject option (else the `cancelled` outcome), `native` an option by `{ optionId }`; the "always" options are the request's `suggestions`. A decision that picks nothing offered is answered as a deny and `respond` says so. |
 | `questions` | `elicitation/create` in form mode → `request.opened` kind `question` (the agent asks its user, as Codex's `requestUserInput`: the host asks the turn's person, a question card in the chat, and never approves it for them, on an owner's bypass turn either), one question per field (choices by their titles); an `answer` goes back typed (numbers, booleans, a choice's `const`), a `deny` as `decline`. Only with `elicitation` on. URL elicitations are declined. |
 | `resume` | `loadSession`: `open({ resume })` sends `session/load`; the conversation the agent replays is not turned into events (updates outside a turn only change what the session knows), so the log holds it once. An agent that cannot load starts a new session, with a `continuity` notice. |
@@ -99,7 +99,8 @@ of their own (`AcpHarnessOptions.flavor`).
 ## Tests and transcripts
 
 - `test/fake-agent.ts`: a fake ACP agent on stdio built on the SDK's agent side; `test/acp.test.ts`
-  (core: the conformance suite, version refusal, env, permissions, questions, load, exits, MCP) and
+  (core: the conformance suite, version refusal, env, permissions, a prompt the agent will not
+  cancel, questions, load, exits, MCP) and
   `acp.local.test.ts`; `packages/daemon/test/harness-acp.test.ts` in the daemon.
 - Recorded transcripts (docs/design/conformance-fixtures §2, protocol `acp`):
   `packages/testkit/conformance/transcripts/acp/` (`plain-turn`, `permission`, `cancel`, `load`),

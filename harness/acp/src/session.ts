@@ -1,6 +1,8 @@
 import { PrefaceMemo, type BlobAccess, type Body, type BodyOf, type Decision, type HarnessEvent, type HarnessSession, type InputRecord, type ItemSummary, type RunSpec, type SteerResult } from '@agents-io/protocol';
 import type {
   CreateElicitationResponse,
+  LoadSessionResponse,
+  NewSessionResponse,
   PermissionOption,
   PromptResponse,
   RequestPermissionOutcome,
@@ -36,6 +38,9 @@ import { AsyncQueue } from './queue.js';
  * does not reach the session log. ACP has no mid-turn steer (`steer` answers `unsupported`, so the
  * lane queues), interrupts with `session/cancel`, and asks permission (`session/request_permission`)
  * and questions (`elicitation/create`) as requests that live only while the agent process does.
+ * Updates carry no turn id, so a prompt the agent goes on with after its turn ended (the cancel timed
+ * out) keeps the session: what it streams is `native`, and the next turn's prompt waits for it to
+ * answer, or for the session to be closed and opened again.
  */
 
 /** What a session uses of its adapter's connection. */
@@ -51,7 +56,18 @@ export interface AcpLink {
   readonly support: PromptSupport;
   /** The agent takes `session/close`. */
   readonly closes: boolean;
-  /** How long `interrupt` waits for the prompt to stop before ending the turn anyway. */
+  /** The agent takes `session/load`. */
+  readonly loads: boolean;
+  /**
+   * Open `s` again as its adapter opened it (cwd, MCP servers, instructions): `load` loads the ACP
+   * session of its id, `new` starts a new one and rebinds `s` to it. Registered either way: the
+   * agent's updates of that id reach `s`.
+   */
+  open(s: AcpSession, how: 'load' | 'new'): Promise<LoadSessionResponse | NewSessionResponse>;
+  /**
+   * How long `interrupt` waits for the prompt to stop before ending the turn anyway; and how long
+   * the next turn then waits for that prompt to answer before the session is closed and opened again.
+   */
   readonly cancelTimeoutMs: number;
   /** Instance profiles: profile → its settings (`mode`: the session mode it selects). */
   readonly profiles: Readonly<Record<string, Record<string, unknown>>>;
@@ -91,6 +107,10 @@ interface Turn {
   usage?: unknown;
   cancelTimer?: NodeJS.Timeout;
   interrupted: boolean;
+  /** Settles when the agent answers the turn's `session/prompt` (or the connection ends). */
+  answered: Promise<void>;
+  /** It has. */
+  isAnswered: boolean;
 }
 
 const EPHEMERAL = new Set<Body['t']>(['text.delta', 'item.progress', 'headline']);
@@ -140,6 +160,10 @@ export class AcpSession implements HarnessSession {
   private readonly queue = new AsyncQueue<HarnessEvent>();
   readonly events: AsyncIterable<HarnessEvent> = this.queue;
   private turn: Turn | undefined;
+  /** A turn that ended at its cancel timeout while the agent goes on with its prompt: until the prompt answers, no other is sent. */
+  private stale: Turn | undefined;
+  /** Ends the next turn's wait for the stale prompt (the session closed, or the agent is gone). */
+  private wake: (() => void) | undefined;
   private readonly requests = new Map<string, OpenRequest>();
   private nextRequest = 0;
   private closed = false;
@@ -152,8 +176,18 @@ export class AcpSession implements HarnessSession {
   constructor(
     private readonly link: AcpLink,
     /** The ACP session id: the native id. */
-    readonly sessionId: string,
+    private id: string,
   ) {}
+
+  /** The ACP session id: the native id (another once the session was opened again as a new one). */
+  get sessionId(): string {
+    return this.id;
+  }
+
+  /** The adapter opened this session again as a new ACP session: its id from now on. */
+  rebind(sessionId: string): void {
+    this.id = sessionId;
+  }
 
   nativeId(): string {
     return this.sessionId;
@@ -197,19 +231,24 @@ export class AcpSession implements HarnessSession {
   // ---- turns ------------------------------------------------------------------
 
   async startTurn(turnId: string, inputs: InputRecord[], run?: RunSpec): Promise<void> {
-    if (this.closed) throw new Error('acp session is closed');
-    if (this.link.gone) throw new Error('the ACP agent process is gone');
-    if (this.turn && !this.turn.done) throw new Error('turn already active');
+    this.usable();
+    // The agent still runs the prompt of a turn whose cancel timed out: a second prompt beside it would get what it streams.
+    if (this.stale) await this.outlast(this.stale);
+    this.usable();
     if (run) await this.applyRun(run);
     // A harness command (the compaction command, the only one the host sends) may drop what the
     // model was shown: the next input's preface gives its context in full again (ID-2).
     if (inputs.length === 1 && isNativeCommand(inputs[0]!)) this.memo.reset();
     const prompt = await renderPrompt(inputs, { ...(this.link.blobs ? { blobs: this.link.blobs } : {}), support: this.link.support, memo: this.memo });
-    const t: Turn = { turnId, inputIds: inputs.map((i) => i.inputId), consumed: false, done: false, lastWords: '', items: new Map(), interrupted: false };
+    const t: Turn = { turnId, inputIds: inputs.map((i) => i.inputId), consumed: false, done: false, lastWords: '', items: new Map(), interrupted: false, answered: Promise.resolve(), isAnswered: false };
     this.turn = t;
     this.emit({ t: 'turn.started', turnId, inputIds: t.inputIds, replyRoute: inputs[0]?.replyRoute ?? null, ...(run ? { run } : {}) }, { turnId });
-    this.link
-      .prompt({ sessionId: this.sessionId, prompt })
+    const answer = this.link.prompt({ sessionId: this.sessionId, prompt });
+    t.answered = answer.then(
+      () => this.promptAnswered(t),
+      () => this.promptAnswered(t),
+    );
+    answer
       .then(
         (r) => {
           this.consume(t);
@@ -236,6 +275,92 @@ export class AcpSession implements HarnessSession {
           // Nothing more to do here; still never an unhandled rejection.
         }
       });
+  }
+
+  private usable(): void {
+    if (this.closed) throw new Error('acp session is closed');
+    if (this.link.gone) throw new Error('the ACP agent process is gone');
+    if (this.turn && !this.turn.done) throw new Error('turn already active');
+  }
+
+  /** The agent answered a turn's prompt: a stale one no longer holds the session. */
+  private promptAnswered(t: Turn): void {
+    t.isAnswered = true;
+    if (this.stale !== t) return;
+    this.stale = undefined;
+    this.link.log('info', `acp session ${this.sessionId}: the agent answered the prompt of turn ${t.turnId} after its cancel timeout`);
+  }
+
+  /**
+   * Wait for the agent to answer the prompt of turn `t`, which ended at its cancel timeout, at most
+   * `cancelTimeoutMs`. Still no answer: the ACP session is closed and opened again (`reopen`). A
+   * session that cannot be opened again ends (the lane opens another).
+   */
+  private async outlast(t: Turn): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    const woken = new Promise<'woken'>((resolve) => (this.wake = () => resolve('woken')));
+    const late = new Promise<'late'>((resolve) => {
+      timer = setTimeout(() => resolve('late'), this.link.cancelTimeoutMs);
+      timer.unref?.();
+    });
+    const why = await Promise.race([t.answered.then(() => 'answered' as const), woken, late]);
+    clearTimeout(timer);
+    this.wake = undefined;
+    if (why !== 'late' || this.stale !== t || this.closed || this.link.gone) return;
+    try {
+      await this.reopen(t);
+    } catch (e) {
+      const message = `could not open ACP session ${this.sessionId} again after turn ${t.turnId}'s prompt would not stop: ${e instanceof Error ? e.message : String(e)}`;
+      this.link.log('warn', `acp session ${this.sessionId}: ${message}`);
+      await this.close(message);
+      throw new Error(message);
+    }
+  }
+
+  /**
+   * Close the ACP session, whose agent goes on with turn `t`'s prompt, and open it again: with
+   * `session/close` (the protocol has it cancel the session's work) answered, the same session is
+   * loaded again (`session/load`), keeping the conversation; else a new session is started, since
+   * the prompt may still stream into the old one. A `continuity` notice says which.
+   */
+  private async reopen(t: Turn): Promise<void> {
+    const old = this.sessionId;
+    const ms = this.link.cancelTimeoutMs;
+    const why = `the agent did not stop turn ${t.turnId}: no answer to its session/prompt within ${ms}ms of session/cancel, nor in the ${ms}ms after`;
+    let detail = 'the agent does not take session/close';
+    let closed = false;
+    if (this.link.closes) {
+      try {
+        await this.link.request('session/close', { sessionId: old }, 5_000);
+        closed = true;
+      } catch (e) {
+        detail = `session/close failed: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    }
+    // Whatever the old session still says is no session's now.
+    this.stale = undefined;
+    this.link.forget(this);
+    if (this.closed || this.link.gone) return; // startTurn says why
+    if (closed && this.link.loads) {
+      try {
+        const r = await this.link.open(this, 'load');
+        if (this.closed) return this.link.forget(this);
+        this.setup(r);
+        this.notice('continuity', `${why}: closed ACP session ${old} and loaded it again`);
+        return;
+      } catch (e) {
+        this.link.forget(this);
+        if (this.closed || this.link.gone) throw e;
+        detail = `session/load failed: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    } else if (closed) detail = 'the agent cannot load sessions';
+    const r = await this.link.open(this, 'new');
+    if (this.closed) return this.link.forget(this);
+    this.setup(r);
+    // None of the conversation is in the new session: the next input's preface gives its context in full again (ID-2).
+    this.memo.reset();
+    this.notice('continuity', `${why}: started a new ACP session ${this.sessionId} (${detail}); the conversation so far is not in it`);
+    this.bound();
   }
 
   /**
@@ -302,7 +427,8 @@ export class AcpSession implements HarnessSession {
   /**
    * `session/cancel`; every request the agent is waiting on is answered cancelled first (the
    * protocol asks that). The turn ends when the agent answers the prompt (`cancelled`), or after
-   * `cancelTimeoutMs` anyway, as interrupted.
+   * `cancelTimeoutMs` anyway, as interrupted; a prompt still not answered then is stale: it keeps
+   * the session until it answers (`outlast`).
    */
   async interrupt(turnId: string): Promise<void> {
     const t = this.turn;
@@ -310,7 +436,11 @@ export class AcpSession implements HarnessSession {
     t.interrupted = true;
     this.cancelRequests(t.turnId);
     if (!t.cancelTimer) {
-      t.cancelTimer = setTimeout(() => this.finish(t, 'interrupted', { code: 'cancel_timeout', retryable: false, message: `the agent did not stop within ${this.link.cancelTimeoutMs}ms of session/cancel` }), this.link.cancelTimeoutMs);
+      t.cancelTimer = setTimeout(() => {
+        if (t.done) return;
+        this.finish(t, 'interrupted', { code: 'cancel_timeout', retryable: false, message: `the agent did not stop within ${this.link.cancelTimeoutMs}ms of session/cancel` });
+        if (!t.isAnswered) this.stale = t;
+      }, this.link.cancelTimeoutMs);
       t.cancelTimer.unref?.();
     }
     if (!this.link.gone) await this.link.notify('session/cancel', { sessionId: this.sessionId }).catch(() => undefined);
@@ -353,6 +483,7 @@ export class AcpSession implements HarnessSession {
   async close(reason: string): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.wake?.();
     const t = this.turn;
     if (t && !t.done) {
       this.cancelRequests(t.turnId);
@@ -372,6 +503,7 @@ export class AcpSession implements HarnessSession {
       this.finish(t, 'ambiguous', { code: 'agent_exited', retryable: false, message: reason });
     }
     this.closed = true;
+    this.wake?.();
     this.queue.close();
   }
 
@@ -404,7 +536,10 @@ export class AcpSession implements HarnessSession {
 
   // ---- what the agent sends -----------------------------------------------------
 
-  /** A `session/update`: an event of the running turn, else (a load's replay, advertisements between turns) only what the session knows. */
+  /**
+   * A `session/update`: an event of the running turn, else (a load's replay, advertisements between
+   * turns) only what the session knows; while a stale prompt holds the session, `native` (no turn's).
+   */
   update(n: SessionNotification): void {
     const u = n?.update as (SessionNotification['update'] & Record<string, unknown>) | undefined;
     if (!u || typeof u !== 'object') return;
@@ -421,6 +556,7 @@ export class AcpSession implements HarnessSession {
       case 'session_info_update':
         return;
     }
+    if (this.stale) return this.native(u);
     const t = this.turn;
     if (!t || t.done) return;
     this.consume(t);

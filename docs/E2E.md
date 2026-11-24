@@ -260,6 +260,7 @@ export AIO_ACP_COMMAND=/tmp/acp-agents/node_modules/.bin/claude-agent-acp CLAUDE
    - [ ] 说一句 hello：有回答；`aio tail` 的 `turn.started` 里 `harness` 是 `acp`；`ps` 里有 `claude-agent-acp`（第一次用到时才拉起）。
    - [ ] 第一轮之后主人发 `/plan on`：答 `Plan mode on from the next turn.`（会话的 `availableModes` 里有 `plan`，第一个会话打开之后才可用），下一轮 agent 只做计划、不改文件；`/compact` 答 `Compacting (queued behind anything running).`（agent 公布了 `compact` 命令），随后一轮的输入是 `/compact`。
    - [ ] 非主人（restricted，没配 `mode`：agent 打开时在 `auto`，这一轮之前 `session/set_mode` 到 `default`）让它跑一条命令：卡片上出现审批（Allow once / Deny），允许后命令执行。
+   - [ ] 让它跑一条长命令（`sleep 30` 之后再回答）时主人发 `/stop`，随即再发一句别的：第一轮记 `interrupted`，第二轮的回答只有它自己的内容（#LN-2、#DL-3）。agent 15 s 内没停时，第一轮是 `cancel_timeout`，`aio tail` 里第二轮之前它还流出的只是 `native`，第二轮等它回答，至多再 15 s，还不回答就有一条 `continuity` 提示（关掉会话再打开）。
    - [ ] Ctrl-C 停 serve：`claude-agent-acp` 进程退出；再 `aio serve` 后发一条，回答接得上前面的对话（`session/load`），`aio tail` 里没有重放的旧消息。
 3. 重新录 transcript（适配器写出的帧有意变了时；同样要真模型）：`node --experimental-transform-types --disable-warning=ExperimentalWarning --import ./scripts/source-loader.mjs harness/acp/scripts/record-transcripts.ts`，写进 `packages/testkit/conformance/transcripts/acp/`，再跑 `harness/acp/test/transcripts.test.ts`。2026-11-25 的录制：claude-agent-acp 0.110.1、模型 `gpt-6-sol`（AsterGate 的 Gemini Flash 当时答 503）。
 
