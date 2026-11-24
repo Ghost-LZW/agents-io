@@ -1,4 +1,5 @@
 export * from './log.js';
+export * from './attention.js';
 export * from './sqlite-log.js';
 export * from './tier.js';
 export * from './hub.js';

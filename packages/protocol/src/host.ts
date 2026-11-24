@@ -1,4 +1,5 @@
 import { Type, type Static, type TObject, type TSchema } from '@sinclair/typebox';
+import { AttentionChanged } from './attention.js';
 import { ContentBlock, Evidence, OriginEvidence, ReplyRoute, V } from './common.js';
 import { Body } from './events.js';
 import { Decision, Resolver } from './requests.js';
@@ -281,10 +282,13 @@ export const HostHello = Type.Object({
   /** With `callouts: [..., "outbound.scoped"]`: the conversations the host checks (every thread of each). */
   outboundScope: Type.Optional(Type.Object({ routes: Type.Array(OutboundScopeRoute) })),
   /**
-   * What this host asks to see in the session logs, by the name of the result's `features`; only a
-   * hello that makes this connection the host counts (kept while it is away, cleared by a host hello
-   * without it). `item.tool`: an MCP tool item keeps `tool { server, name }` (HC-7), and nothing else
-   * changes. Unknown names are ignored; the result's `optIn` lists what was granted.
+   * What this host asks to see (in the session logs, or as frames), by the name of the result's
+   * `features`; only a hello that makes this connection the host counts. `item.tool` (kept while the
+   * host is away, cleared by a host hello without it): an MCP tool item keeps `tool { server, name }`
+   * (HC-7), and nothing else changes. `attention` (feature `attention`, LN-11): this connection gets
+   * an `attention.changed` frame whenever a session's attention changes, while it is the host
+   * (nothing is kept for it while it is away: list `sessions` again on reconnect). Unknown names are
+   * ignored; the result's `optIn` lists what was granted.
    */
   optIn: Type.Optional(Type.Array(Type.String())),
   /**
@@ -752,11 +756,12 @@ export type ReviewCalloutAnswer = Static<typeof ReviewCalloutAnswer>;
 export const ContactCalloutAnswer = Type.Object({ verdict: Type.Union([Type.Literal('allow'), Type.Literal('deny')]) });
 export type ContactCalloutAnswer = Static<typeof ContactCalloutAnswer>;
 
-export const HostEventFrame = Type.Union([InboundFrame, RouteCallout, ResolveCallout, ReviewCallout, OutboundCallout, ContactCallout, ExternalCallout, RunEnded, ResultFrame]);
+/** `attention.changed` (`AttentionChanged`): only to a host whose hello asked `optIn: ["attention"]`. */
+export const HostEventFrame = Type.Union([InboundFrame, RouteCallout, ResolveCallout, ReviewCallout, OutboundCallout, ContactCallout, ExternalCallout, RunEnded, AttentionChanged, ResultFrame]);
 export type HostEventFrame = Static<typeof HostEventFrame>;
 
 export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'deliver.update', 'message.ack', 'conversation.create', 'schedule.put', 'schedule.remove', 'schedule.list', 'history.read', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare', 'inbound.redispatch', 'session.compact', 'session.prewarm', 'test.replay', 'test.fault', 'host.outboundScope'] as const;
-export const HOST_EVENT_FRAME_TYPES = ['inbound', 'policy', 'run.ended', 'result'] as const;
+export const HOST_EVENT_FRAME_TYPES = ['inbound', 'policy', 'run.ended', 'attention.changed', 'result'] as const;
 
 // ---- result values --------------------------------------------------------
 // The `value` of the `result` frame that answers each host request, and of the

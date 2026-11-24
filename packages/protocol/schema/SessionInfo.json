@@ -55,6 +55,143 @@
           }
         }
       }
+    },
+    "attention": {
+      "type": "object",
+      "required": [
+        "state",
+        "reasons",
+        "since",
+        "seq"
+      ],
+      "properties": {
+        "state": {
+          "anyOf": [
+            {
+              "const": "needs_you",
+              "type": "string"
+            },
+            {
+              "const": "working",
+              "type": "string"
+            },
+            {
+              "const": "failed",
+              "type": "string"
+            },
+            {
+              "const": "idle",
+              "type": "string"
+            }
+          ]
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "anyOf": [
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "requestId",
+                  "requestKind",
+                  "title",
+                  "since"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "request",
+                    "type": "string"
+                  },
+                  "requestId": {
+                    "type": "string"
+                  },
+                  "requestKind": {
+                    "type": "string"
+                  },
+                  "title": {
+                    "type": "string"
+                  },
+                  "since": {
+                    "type": "number"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "turnId",
+                  "since"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "failed",
+                    "type": "string"
+                  },
+                  "turnId": {
+                    "type": "string"
+                  },
+                  "code": {
+                    "type": "string"
+                  },
+                  "since": {
+                    "type": "number"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "since"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "stalled",
+                    "type": "string"
+                  },
+                  "since": {
+                    "type": "number"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "inputIds",
+                  "since"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "queued",
+                    "type": "string"
+                  },
+                  "inputIds": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "since": {
+                    "type": "number"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "since": {
+          "type": "number"
+        },
+        "seq": {
+          "type": "number"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      }
     }
   }
 }

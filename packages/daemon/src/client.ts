@@ -4,6 +4,7 @@ import {
   FrameDecoder,
   PROTOCOL_VERSION,
   encodeFrame,
+  type AttentionChanged,
   type BindingTable,
   type ClientResultFrame,
   type ContentBlock,
@@ -76,6 +77,7 @@ export class LocalClient {
   private readonly handlers = new Map<string, DaemonRequestHandler>();
   private readonly runEnded = new Map<string, RunEnded>();
   private readonly runWaiters = new Map<string, ((e: RunEnded) => void)[]>();
+  private readonly attentionCbs: ((f: AttentionChanged) => void)[] = [];
 
   private constructor(private readonly socket: Socket) {
     const decoder = new FrameDecoder();
@@ -124,6 +126,11 @@ export class LocalClient {
     }
   }
 
+  /** `attention.changed` frames (feature `attention`): sent to a host whose `hello` asked `optIn: ["attention"]`. */
+  onAttentionChanged(cb: (f: AttentionChanged) => void): void {
+    this.attentionCbs.push(cb);
+  }
+
   onClose(cb: (reason: string) => void): void {
     if (this.closedReason !== undefined) cb(this.closedReason);
     else this.closeCbs.push(cb);
@@ -132,6 +139,10 @@ export class LocalClient {
   private onFrame(raw: ServerFrame | { type: string; [k: string]: unknown }): void {
     if (raw.type === 'inbound' || raw.type === 'policy') {
       if (typeof raw.id === 'string') void this.answer(raw as Record<string, unknown>);
+      return;
+    }
+    if (raw.type === 'attention.changed') {
+      for (const cb of this.attentionCbs) cb(raw as unknown as AttentionChanged);
       return;
     }
     if (raw.type === 'run.ended') {
@@ -240,7 +251,7 @@ export class LocalClient {
   }
 
   /** Authenticate as a host. `consumer` / `callouts` make this connection THE host (at most one). */
-  hello(o: { token: string; name: string; consumer?: string; callouts?: boolean | string[]; takeover?: boolean }): Promise<HelloResult> {
+  hello(o: { token: string; name: string; consumer?: string; callouts?: boolean | string[]; takeover?: boolean; optIn?: string[] }): Promise<HelloResult> {
     return this.call('host.hello', o);
   }
 

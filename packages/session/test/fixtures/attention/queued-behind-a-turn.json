@@ -1,0 +1,14 @@
+{
+  "description": "Inputs queued behind the running turn wait, oldest first, since the first came; a cancelled one stops waiting; steered and observed inputs never wait.",
+  "input": [
+    {"ts": 1000, "body": {"t": "input.admitted", "inputId": "i1", "disposition": "new_turn"}},
+    {"ts": 1001, "body": {"t": "turn.started", "turnId": "t1", "inputIds": ["i1"], "replyRoute": null}},
+    {"ts": 1002, "body": {"t": "session.state", "state": "running"}},
+    {"ts": 1100, "body": {"t": "input.admitted", "inputId": "i2", "disposition": "queued"}},
+    {"ts": 1200, "body": {"t": "input.admitted", "inputId": "i3", "disposition": "queued"}},
+    {"ts": 1300, "body": {"t": "input.cancelled", "inputIds": ["i2"], "reason": "cancelled_by_owner"}},
+    {"ts": 1400, "body": {"t": "input.admitted", "inputId": "i4", "disposition": "steer"}},
+    {"ts": 1500, "body": {"t": "input.admitted", "inputId": "i5", "disposition": "observe_only"}}
+  ],
+  "expected": {"state": "working", "reasons": [{"kind": "queued", "inputIds": ["i3"], "since": 1100}], "since": 1000, "seq": 6, "turnId": "t1"}
+}

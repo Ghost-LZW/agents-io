@@ -332,6 +332,29 @@ without `opId` are unchanged; on other frames and commands `opId` is an unknown 
 lists the feature; `LocalClient.exchange` sends a frame and returns its whole result frame. Spec:
 `docs/HOSTS.md` §4.7, INVARIANTS PR-3.
 
+## Attention (`attention`)
+
+What is pending in a session now, folded from its log (core-slimming G7): `Attention { state,
+reasons, since, seq, turnId? }`. `state` is `needs_you` while a request whose resolver is `human`
+is open, else `working` while a turn runs, inputs wait or the harness says it is `stalled`, else
+`failed` when the last turn failed, else `idle`; `reasons` lists, in this order, the open human
+requests (`requestId`, `requestKind`, `title`, `since`), the last turn's failure (`turnId`, its
+`error.code`), `stalled`, the waiting inputs (`inputIds`, `since`). `since` is when the session
+entered `state`; `seq` is the seq of the event that last changed the value (events that change
+nothing leave it). It says what waits, never who to tell: badges and pushes are the host's. It is
+on `SessionInfo` (the `sessions` frame, `GET /api/sessions`; the external MCP endpoint's
+`sessions_list` leaves the requests' titles out), in the snapshot a subscription starts with, and
+in the last column of `aio sessions`. A host whose role-taking `host.hello` has
+`optIn: ["attention"]` (granted in the result's `optIn`) gets an `attention.changed { sessionKey,
+attention }` frame for each change, once the events that changed it commit, in `seq` order per
+session; nothing is kept while it is away (list `sessions` on reconnect). `host.hello` lists the
+feature. The rules are pinned by language-neutral fixtures in
+`packages/session/test/fixtures/attention/` (format: `docs/design/core-slimming/` §3 G8). For
+embedders: `Hub.onAttention(fn)` / `Hub.attention(key)`, `foldAttention` and `emptyAttention` from
+`@agents-io/session`; a `SessionLog` of your own may implement `attention(key)` and fill
+`SessionSnapshot.attention` (both optional: without them there is no attention and no frame).
+Spec: `docs/HOSTS.md` §4.9, INVARIANTS LN-11.
+
 ## Console API (for web UIs)
 
 `aio serve` also serves the console API of `packages/protocol/src/admin.ts`
@@ -588,6 +611,9 @@ aio console-link                                              (one-time console 
   line per tool call / request / notice to stderr, prints the final answer to
   stdout, and exits with the run's exit code. Ctrl-C cancels the run (twice:
   stop waiting).
+- `aio sessions` prints one line per session, tab-separated: key, state, `seq <head>`, then
+  `turn`, `requests`, `cwd`, `env` when there are any, and last `attention <state>` with what is
+  pending in parentheses (e.g. `attention needs_you (request r1, 2 queued)`; LN-11).
 - `aio tail` prints one JSON `InboundItem` per line (with its `cursor`) and keeps
   long-polling; it never acks. `--once` prints what is pending and exits.
 - Exit codes besides a run's: 1 failed, 2 usage / config error (also an unknown

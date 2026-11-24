@@ -649,6 +649,8 @@ export class Gateway {
       ...(o.hostPush?.timeoutMs !== undefined ? { pushTimeoutMs: o.hostPush.timeoutMs } : {}),
       ...(o.hostPush?.retryMs !== undefined ? { pushRetryMs: o.hostPush.retryMs } : {}),
     });
+    // LN-11: each change of a session's attention, once committed, to a host that asked for it.
+    this.hub.onAttention((key, attention) => this.host.attentionChanged(key, attention));
     // Watches live next to the log (same SQLite file), so they and their digest buffers survive a restart.
     const registry = o.watches ?? new WatchRegistry(log instanceof SqliteSessionLog ? { db: log.db } : {});
     this.watches = new WatchDispatcher({
@@ -4168,6 +4170,7 @@ ${a.summary}` }],
         pendingRequests: s.pendingRequests.map((r) => r.requestId),
         live: this.lanes.has(sessionKey),
         ...(launch ? { launch: launchView(launch) } : {}),
+        ...(s.attention ? { attention: s.attention } : {}),
       };
     });
   }

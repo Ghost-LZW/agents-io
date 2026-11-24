@@ -6,7 +6,7 @@ import { constants as osConstants } from 'node:os';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
-import type { RenderedMessage, ReplyRoute, RunEnded, RunStart, SessionEvent, SessionLaunch, SessionScope, Tier, TuiAttach } from '@agents-io/protocol';
+import type { Attention, RenderedMessage, ReplyRoute, RunEnded, RunStart, SessionEvent, SessionLaunch, SessionScope, Tier, TuiAttach } from '@agents-io/protocol';
 import { runAttach } from './attach.js';
 import { CommandError, DaemonUnavailable, LocalClient } from './client.js';
 import { ConfigError, loadConfig, type LoadOptions } from './config.js';
@@ -26,7 +26,7 @@ local ends (as the local principal)
   aio attach    [--session <key>] [--tier full|card|headline|final] [--from <seq>] [--verbose]
   aio tui       [--session <key>]                                   (the harness's own terminal UI on the session: Codex over unix, Claude Code)
   aio input     [--session <key>] [--mode queue|steer|interrupt] [--wait] <text…>
-  aio sessions
+  aio sessions                                                        (one line each; last column: attention, what is pending now)
   aio watch     add [--session <target>] key=value… | list [--session <target>] | remove <id>
 
 host commands (authenticate with the token file next to the socket; docs/HOSTS.md §5)
@@ -321,9 +321,18 @@ async function tui(a: CliArgs): Promise<number> {
 
 async function sessions(a: CliArgs): Promise<number> {
   const client = await LocalClient.connect(socketOf(a));
-  for (const s of await client.sessions()) console.log(`${s.sessionKey}\t${s.state}\tseq ${s.head}${s.turnId ? `\tturn ${s.turnId}` : ''}${s.pendingRequests.length ? `\trequests ${s.pendingRequests.join(',')}` : ''}${s.launch?.cwd ? `\tcwd ${s.launch.cwd}` : ''}${s.launch?.envKeys.length ? `\tenv ${s.launch.envKeys.join(',')}` : ''}`);
+  for (const s of await client.sessions()) console.log(`${s.sessionKey}\t${s.state}\tseq ${s.head}${s.turnId ? `\tturn ${s.turnId}` : ''}${s.pendingRequests.length ? `\trequests ${s.pendingRequests.join(',')}` : ''}${s.launch?.cwd ? `\tcwd ${s.launch.cwd}` : ''}${s.launch?.envKeys.length ? `\tenv ${s.launch.envKeys.join(',')}` : ''}${s.attention ? `\t${attentionColumn(s.attention)}` : ''}`);
   client.close();
   return 0;
+}
+
+/**
+ * The last column of `aio sessions` (feature `attention`, LN-11): `attention <state>`, then what is
+ * pending, e.g. `attention needs_you (request r1, 2 queued)`; a daemon without the feature: no column.
+ */
+export function attentionColumn(a: Attention): string {
+  const what = a.reasons.map((r) => (r.kind === 'request' ? `request ${r.requestId}` : r.kind === 'failed' ? `failed${r.code !== undefined ? ` ${r.code}` : ''}` : r.kind === 'stalled' ? 'stalled' : `${r.inputIds.length} queued`));
+  return `attention ${a.state}${what.length ? ` (${what.join(', ')})` : ''}`;
 }
 
 async function watch(a: CliArgs): Promise<number> {

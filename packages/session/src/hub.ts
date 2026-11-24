@@ -1,4 +1,4 @@
-import { PROTOCOL_VERSION, type SessionEvent, type Tier } from '@agents-io/protocol';
+import { PROTOCOL_VERSION, type Attention, type SessionEvent, type Tier } from '@agents-io/protocol';
 import { isEphemeral, type EventDraft, type SessionLog, type SessionSnapshot, type Visibility } from './log.js';
 import { passes, project, type TierFilter } from './tier.js';
 
@@ -86,6 +86,10 @@ export class Hub {
   private frame: Frame | undefined;
   /** Subscribers made inside the outermost `batch` in progress: they start reading once it has ended (`subscribe`). */
   private deferred: Sub[] = [];
+  /** `onAttention` listeners. */
+  private readonly attentionListeners = new Set<(sessionKey: string, attention: Attention) => void>();
+  /** Per session, the `seq` of the last attention told to them. */
+  private readonly toldAttention = new Map<string, number>();
 
   constructor(
     readonly log: SessionLog,
@@ -187,6 +191,41 @@ export class Hub {
   private publish(e: SessionEvent): void {
     this.index(e);
     for (const s of this.subs.get(e.sessionKey) ?? []) s.offer(e);
+    if (this.attentionListeners.size && !isEphemeral(e)) this.tellAttention(e);
+  }
+
+  /**
+   * After `e` is published: its session's attention as the log has it now, when an event from `e`
+   * on changed it and it has not been told. Published after a commit, the log is already past the
+   * whole batch: the first of its events tells the value after all of them, the rest nothing.
+   */
+  private tellAttention(e: SessionEvent): void {
+    const a = this.attention(e.sessionKey);
+    if (!a || a.seq < e.seq || a.seq <= (this.toldAttention.get(e.sessionKey) ?? 0)) return;
+    this.toldAttention.set(e.sessionKey, a.seq);
+    for (const fn of this.attentionListeners) {
+      try {
+        fn(e.sessionKey, a);
+      } catch {
+        // a listener's failure is its own: the append has happened
+      }
+    }
+  }
+
+  /** What is pending in a session now (the snapshot's `attention`, LN-11). */
+  attention(sessionKey: string): Attention | undefined {
+    return this.log.attention ? this.log.attention(sessionKey) : this.log.snapshot(sessionKey).attention;
+  }
+
+  /**
+   * `fn` hears each change of a session's attention (LN-11), once the events that changed it are
+   * committed and published (never what a batch rolled back), in `seq` order per session; the events
+   * of one batch are told once, with the value after them all. Changes from before `fn` was added
+   * are not told. Returns the function that removes it.
+   */
+  onAttention(fn: (sessionKey: string, attention: Attention) => void): () => void {
+    this.attentionListeners.add(fn);
+    return () => this.attentionListeners.delete(fn);
   }
 
   /**

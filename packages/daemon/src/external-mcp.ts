@@ -3,6 +3,7 @@ import { Type, type Static, type TObject } from '@sinclair/typebox';
 import {
   formatAddress,
   routeKey,
+  type AttentionReason,
   type ContentBlock,
   type ExternalSender,
   type InputRecord,
@@ -305,7 +306,12 @@ export class ExternalMcp implements ExternalBackend {
   // ---- reads ------------------------------------------------------------------------------
 
   sessions(): { sessionKey: string; [k: string]: unknown }[] {
-    return this.k.sessions.list().map((s) => ({ ...s, ...(s.agent !== undefined ? { address: formatAddress({ agent: s.agent, sessionKey: s.sessionKey }) } : {}) }));
+    return this.k.sessions.list().map((s) => ({
+      ...s,
+      // U20: a checked turn's card title is withheld from external readers (session_events): its attention says only that a request waits.
+      ...(s.attention ? { attention: { ...s.attention, reasons: s.attention.reasons.map((r) => (r.kind === 'request' ? withoutTitle(r) : r)) } } : {}),
+      ...(s.agent !== undefined ? { address: formatAddress({ agent: s.agent, sessionKey: s.sessionKey }) } : {}),
+    }));
   }
 
   events(sessionKey: string, a: { fromSeq?: number; tier: Tier; limit: number }): { head: number; events: unknown[]; nextFromSeq?: number } | undefined {
@@ -529,6 +535,11 @@ function final(message: string): ToolError {
 function sent(operationId: string, r: KernelSettledSend, duplicate: boolean) {
   if (r.status !== 'delivered') throw final(`delivery to ${routeKey(r.route)} ${r.status}${r.error ? `: ${r.error}` : ''} (operationId ${operationId})`);
   return { ok: true, delivered: routeKey(r.route), operationId, ...(r.providerMessageId !== undefined ? { messageId: r.providerMessageId } : {}), ...(duplicate ? { duplicate: true } : {}) };
+}
+
+/** A request of a session's attention as sessions_list shows it: no title (U20, see `sessions`). */
+function withoutTitle({ title: _t, ...r }: Extract<AttentionReason, { kind: 'request' }>): Omit<Extract<AttentionReason, { kind: 'request' }>, 'title'> {
+  return r;
 }
 
 /** An event as session_events shows it. */

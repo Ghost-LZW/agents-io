@@ -1,11 +1,13 @@
 import {
   PROTOCOL_VERSION,
+  type Attention,
   type BodyOf,
   type ItemSummary,
   type ReplyRoute,
   type RunSpec,
   type SessionEvent,
 } from '@agents-io/protocol';
+import { attentionFromSnapshot, emptyAttention, foldAttention } from './attention.js';
 
 export type SessionState = BodyOf<'session.state'>['state'];
 export type Visibility = SessionEvent['visibility'];
@@ -58,6 +60,11 @@ export interface SessionSnapshot {
   headline: string | null;
   /** Inputs admitted but not yet started, consumed, cancelled or rejected. */
   queued: string[];
+  /**
+   * What is pending now (`foldAttention`, INVARIANTS LN-11); never changed in place, only replaced.
+   * Every snapshot of a `BaseSessionLog` has it; a log of another make may leave it out.
+   */
+  attention?: Attention;
 }
 
 export function emptySnapshot(sessionKey: string): SessionSnapshot {
@@ -74,6 +81,7 @@ export function emptySnapshot(sessionKey: string): SessionSnapshot {
     plan: null,
     headline: null,
     queued: [],
+    attention: emptyAttention(),
   };
 }
 
@@ -86,6 +94,8 @@ const SHOWN: ReadonlySet<string> = new Set(['text.delta', 'text.snapshot', 'item
  * events is left out (lifecycle and removals still apply); replay from a seq for those.
  */
 export function foldSnapshot(s: SessionSnapshot, e: SessionEvent): void {
+  // First, from the snapshot as it was (one stored before snapshots had it: from what it shows).
+  s.attention = foldAttention(s.attention ?? attentionFromSnapshot(s), e);
   if (!isEphemeral(e)) s.seq = e.seq;
   if (e.harness) s.harness = e.harness;
   if (e.generation) s.generation = e.generation;
@@ -193,6 +203,11 @@ export interface SessionLog {
   floor(sessionKey: string): number;
   /** Fold of every event so far, including ephemeral ones and trimmed history. */
   snapshot(sessionKey: string): SessionSnapshot;
+  /**
+   * The snapshot's `attention` alone (LN-11), without copying the rest. Optional for logs written
+   * elsewhere: `Hub` falls back to `snapshot(sessionKey).attention`.
+   */
+  attention?(sessionKey: string): Attention;
   /** Recent ephemeral events (bounded ring). */
   ephemeral(sessionKey: string): SessionEvent[];
   sessions(): string[];
@@ -315,6 +330,11 @@ export abstract class BaseSessionLog implements SessionLog {
 
   snapshot(sessionKey: string): SessionSnapshot {
     return structuredClone(this.metaOf(sessionKey).fold);
+  }
+
+  attention(sessionKey: string): Attention {
+    const m = this.metaOf(sessionKey);
+    return structuredClone((m.fold.attention ??= attentionFromSnapshot(m.fold)));
   }
 
   ephemeral(sessionKey: string): SessionEvent[] {

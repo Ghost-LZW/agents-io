@@ -1,0 +1,11 @@
+{
+  "description": "After a failed turn a new input waits: working (it is about to run), the failure still listed before the waiting input.",
+  "input": [
+    {"ts": 1000, "body": {"t": "input.admitted", "inputId": "i1", "disposition": "new_turn"}},
+    {"ts": 1001, "body": {"t": "turn.started", "turnId": "t1", "inputIds": ["i1"], "replyRoute": null}},
+    {"ts": 1002, "body": {"t": "session.state", "state": "running"}},
+    {"ts": 2000, "body": {"t": "turn.completed", "turnId": "t1", "status": "failed", "error": {"code": "harness_error", "retryable": false}}},
+    {"ts": 3000, "body": {"t": "input.admitted", "inputId": "i2", "disposition": "new_turn"}}
+  ],
+  "expected": {"state": "working", "reasons": [{"kind": "failed", "turnId": "t1", "code": "harness_error", "since": 2000}, {"kind": "queued", "inputIds": ["i2"], "since": 3000}], "since": 3000, "seq": 5}
+}

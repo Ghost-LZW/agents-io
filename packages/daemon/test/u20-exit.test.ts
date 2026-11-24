@@ -280,6 +280,38 @@ describe('outbound.scoped: added routes, cards, external readers', () => {
     expect(JSON.stringify(denied.events.slice(-12))).not.toContain('secret plan');
     expect(denied.events.filter((e) => e.body.t === 'text.snapshot')[2]).toMatchObject({ withheld: 'held', body: { text: '' } });
   });
+
+  it('external MCP sessions_list: a session\'s attention says a request waits for a person, never its title (a checked turn\'s card is withheld from external readers); the local sessions have it #DL-7 #LN-11', async () => {
+    const dir = tmp();
+    const tokDir = join(dir, 'ext');
+    mkdirSync(tokDir, { recursive: true, mode: 0o700 });
+    const tokenFile = join(tokDir, 'reader.token');
+    const TOKEN = 'reader-token-0123456789';
+    writeFileSync(tokenFile, TOKEN + '\n', { mode: 0o600 });
+    const w = await daemon({
+      dir,
+      script: async (t) => {
+        t.emit({ t: 'request.opened', requestId: 'r1', kind: 'tool_approval', title: 'Bash: cat secret-plan.md', risk: {}, allowedDecisions: ['allow_once', 'deny'], allowAlways: false, defaultDeny: true }, { audience: 'approval' });
+        await t.waitDecision('r1');
+      },
+      policy: { resolve: async () => ({ kind: 'human', principals: ['fake:alice'], routes: [] }) },
+      raw: { externalMcp: { listen: '127.0.0.1:0', clients: { reader: { tokenFile, scopes: ['read'] } } } },
+    });
+    const c = new Client({ name: 'outside', version: '0.0.1' });
+    await c.connect(new StreamableHTTPClientTransport(new URL(w.gw.adminStatus().externalMcp!.url), { requestInit: { headers: { authorization: `Bearer ${TOKEN}` } } }));
+    cleanups.push(() => c.close());
+    const { h } = await scopedHost(w);
+    // The card's exit check is not answered: the card is withheld (checking), the request open.
+    h.onRequest('policy', (f) => ((f as { hook: string }).hook === 'outbound' ? new Promise(() => {}) : { on: 'dispatch' }));
+    await say(w, 'om_1');
+    await until(() => w.gw.sessions().find((s) => s.sessionKey === KEY)?.attention?.state === 'needs_you');
+    expect(w.gw.sessions().find((s) => s.sessionKey === KEY)!.attention!.reasons).toEqual([expect.objectContaining({ kind: 'request', requestId: 'r1', title: 'Bash: cat secret-plan.md' })]);
+    const r = (await c.callTool({ name: 'sessions_list', arguments: {} })) as { content: { text: string }[] };
+    expect(r.content[0]!.text).not.toContain('secret-plan');
+    const mine = (JSON.parse(r.content[0]!.text) as { sessions: { sessionKey: string; attention?: { reasons: Record<string, unknown>[] } }[] }).sessions.find((s) => s.sessionKey === KEY)!;
+    expect(mine.attention).toMatchObject({ state: 'needs_you', reasons: [{ kind: 'request', requestId: 'r1', requestKind: 'tool_approval', since: expect.any(Number) }] });
+    expect(mine.attention!.reasons[0]).not.toHaveProperty('title');
+  });
 });
 
 describe('U21: a dispatch without history', () => {

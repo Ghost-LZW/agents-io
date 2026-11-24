@@ -123,6 +123,7 @@
 | `bindings.put` / `bindings.get` | 宿主 → 守护进程 | 原子替换 / 读取 Binding 表与身份映射 |
 | `run.start` / `run.cancel` | 宿主 → 守护进程 | 用 `mode: task` 的 agent 执行一轮：新的 session `run:<runId>`，结束即关闭；`env` 只进子进程环境；可带 `overrides`、`inputId`、`correlation`（见下） |
 | `run.ended` | 守护进程 → 宿主 | `{ runId, status, exitCode, error?, durationMs?, usage?, turnId?, inputId?, correlation? }`；`status` 含 `timeout`（`timeoutMs` 到期） |
+| `attention.changed` | 守护进程 → 宿主 | 一个会话现在有什么在等变了：`{ sessionKey, attention }`，不用应答；只发给 `hello` 写了 `optIn: ["attention"]` 的宿主（§4.9） |
 | `deliver` | 宿主 → 守护进程 | 推送给人，按 `operationId` 幂等；按钮点击按 `actionPrefix` 规则回到宿主。由 `route` 的 `(channel, account)` 对应的通道发出；该账号没有通道时，只有当这个通道 id 恰好一个条目才用它发，否则 `unknown_channel`（多个飞书机器人时不会以别的机器人发出，决定 8）。结果（`DeliverResult`）带平台消息 id `providerMessageId`；通道报告消息落在哪个话题时还带 `providerThreadId`（飞书：发送接口返回的 `thread_id`，例如 `reply_in_thread` 开出的新话题），重复的 `deliver` 照样带回 |
 | `deliver.update` | 宿主 → 守护进程 | 改一条 `deliver` 过的消息：`{ operationId, route, providerMessageId, message, sequence, final? }`，`sequence` 每次加一（不大于上一次的被丢掉）；`final: true` 收尾（通道的 finalize：进度卡片的最终样子、思考气泡结束、太长的回答接着发），按 `operationId` 只做一次，重复答 `duplicate: true`；中间的更新不记录，通道拒绝时答 `status: "rejected"`。通道不能改答 `unsupported`（不变量 DL-8） |
 | `message.ack` | 宿主 → 守护进程 | 给一条渠道消息打上宿主处理到哪一步的标记：`{ route, messageId, state }`，`state` 为 `working` / `done` / `failed` / `none`（去掉），由通道的 `acknowledge` 做（飞书：表情）。只是外观，不记录；通道没有标记答 `unsupported`（DL-8） |
@@ -305,6 +306,29 @@ harness 也可以是另一个进程里、任何语言写的程序：守护进程
 - **媒体**（MD-1）：程序发 `blob.stat { ref }`（答 `{ path, mime, name?, size }`，存储里没有的引用如 `lark-file:…` 答 `null`）或 `blob.get { ref }`（答 `{ base64, mime, name? }`；大于 16 MiB 的答 `too_large`，改读 `blob.stat` 给的本地文件），读的是守护进程 blob 存储的只读视图，与进程内 harness 的 `HarnessFactoryInit.blobs` 是同一个、同样的范围。
 - **写程序**：Node/TS 用 `serveHarness(adapter 或 (init) => adapter)`（同一个包）：把一个进程内的 `HarnessAdapter` 原样服务在 stdio 上，静态声明和 `detach` 自动进 hello，`init.blobs` 经连接读 blob；别的语言照帧自己写，`harness/jsonl-bridge/examples/echo_harness.py` 是一个只用标准库的 Python 例子。stdout 是协议通道，诊断写 stderr（守护进程按行记日志）或发 `log` 帧。`packages/testkit` 的 `runHarnessConformance` 对进程内的和 bridge 的适配器跑同一套检查（HC-1）。
 - **带不了的**：原生终端接管（`attach: 'takeover'`，`takeover`）和实时语音（`HarnessSession.live`）只在进程内；`ephemeralOpen` 照常声明，内核替模块跑的临时一轮的 open 选项仍是 Codex 的形状。
+
+### 4.9 会话的 attention：现在有什么在等（feature `attention`；INVARIANTS LN-11）
+
+宿主要给人看"哪个会话在等你"（角标、推送、列表里的状态），原先要自己订阅每个会话、自己 fold 一遍。守护进程替它 fold 好，只说有什么在等，不说告诉谁、怎样告诉（推不推、推给谁、角标怎么算都归宿主）：
+
+```jsonc
+{ "state": "needs_you",            // needs_you | working | failed | idle
+  "reasons": [                     // 依次：请求、失败、卡住、等着的输入
+    { "kind": "request", "requestId": "r1", "requestKind": "tool_approval", "title": "Bash: rm -rf build", "since": 1764000000000 },
+    { "kind": "queued", "inputIds": ["in_7"], "since": 1764000001000 } ],
+  "since": 1764000000000,          // 进入这个 state 的时刻（那条事件的 ts）
+  "seq": 42,                       // 最后一次改变这个值的事件的 seq
+  "turnId": "t_3" }                // 在跑的一轮
+```
+
+- **`state`**：有解答者为 `human` 的请求开着（`resolve` 回调或本地策略交给人的，审核升级给人的也算）是 `needs_you`；否则有一轮在跑、有输入在等、或 harness 报了卡住（`session.state: "stalled"`）是 `working`；否则上一轮 `failed` 是 `failed`；都没有是 `idle`。`host` 解答者的请求不算（宿主自己答，已经知道）；`interrupted`、`ambiguous` 的一轮不算失败；被拒的输入（例如 `start_failed`）只是不再等着。
+- **`reasons`**：`request`（`requestId`、`requestKind`、`title`、`since`：交给人的时刻；一轮结束时它开着的请求随之结束，与快照的 `pendingRequests` 同一规则）、`failed`（`turnId`、`code`：那一轮的 `error.code`，没给就没有；下一轮开始时结束）、`stalled`（`since`；下一个 `session.state` 或一轮开始、结束时结束）、`queued`（`inputIds`：已接纳、还没开始的输入，即快照的 `queued`；`since`：没有输入在等时来的第一条的时刻）。
+- **`seq`**：不改变它的事件不动它：`seq` 大的新，相同的就是同一个值，宿主按它去重、排序。
+- **在哪里读**：`sessions` 帧的答复（`SessionInfo.attention`，宿主连接也能发这个客户端帧）、控制台的 `GET /api/sessions`、订阅时拿到的快照（`SessionSnapshot.attention`）、`aio sessions` 每行的最后一列（`attention needs_you (request r1, 2 queued)`）。外部 MCP 的 `sessions_list` 也有，但请求不带 `title`（受检的一轮的卡片对外遮着，§4.1a）。
+- **订阅变化**：在占宿主位置的 `host.hello` 里加 `optIn: ["attention"]`（**只认结果**：结果的 `optIn` 里有 `attention` 才算拿到；不占宿主位置的 hello 得到 `optIn: []`；旧守护进程不认，结果里没有 `optIn`，`features` 里也没有 `attention`）。之后每个会话的值每变一次，守护进程发一帧 `{ "v": 1, "type": "attention.changed", "sessionKey": "…", "attention": { … } }`（`AttentionChanged`，不用应答）：改变它的事件提交、发布之后才发，同一个值只发一次（一个事务里的几条事件只发一次，是它们之后的值；回滚的什么都不发），同一会话按 `seq` 递增。
+- **断线**：宿主不在时不留，也不补发。重连（`hello` 带 `optIn`）之后列一次 `sessions` 取当前值，之后的帧按 `seq` 比较，旧的丢掉。
+- **怎么算**：规则由 `packages/session/test/fixtures/attention/*.json` 的 fixture 固定（每个是一段会话日志和它之后的值，格式见 `docs/design/core-slimming/` §3 G7/G8）；自己从事件 fold 的宿主或别的语言的实现可以拿它们自检。
+- **对严格校验的宿主可见的协议变化**（2026-11-24）：`SessionInfo.attention`（`AdminSession` 随之有）是新的可选字段；`features` 多了 `attention`；`HostEventFrame` 多了 `attention.changed`，只在 `optIn` 之后才发；快照（`agents-io.snapshot` 的 `native`）多了 `attention`；`aio sessions` 每行末尾多一列。
 
 ## 5. 命令行（给不想写 socket 客户端的宿主）
 

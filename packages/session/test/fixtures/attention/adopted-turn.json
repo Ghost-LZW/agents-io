@@ -1,0 +1,9 @@
+{
+  "description": "A turn adopted after a restart runs, and takes the inputs it names off the queue.",
+  "input": [
+    {"ts": 1000, "body": {"t": "input.admitted", "inputId": "i1", "disposition": "queued"}},
+    {"ts": 1001, "body": {"t": "input.admitted", "inputId": "i2", "disposition": "queued"}},
+    {"ts": 5000, "body": {"t": "turn.adopted", "turnId": "t1", "inputIds": ["i1"]}}
+  ],
+  "expected": {"state": "working", "reasons": [{"kind": "queued", "inputIds": ["i2"], "since": 1000}], "since": 1000, "seq": 3, "turnId": "t1"}
+}

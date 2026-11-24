@@ -1,4 +1,5 @@
 import { Type, type Static } from '@sinclair/typebox';
+import { Attention } from './attention.js';
 import { ContentBlock, V } from './common.js';
 import { InputMode } from './commands.js';
 import { Level, SessionEvent, Tier } from './events.js';
@@ -171,6 +172,8 @@ export const SessionInfo = Type.Object({
   live: Type.Boolean(),
   /** The session's pinned launch (decision 7): its cwd and env keys, never values. */
   launch: Type.Optional(Type.Object({ cwd: Type.Optional(Type.String()), envKeys: Type.Array(Type.String()) })),
+  /** Feature `attention`: what is pending in the session now (`Attention`, INVARIANTS LN-11); a daemon without it leaves it out. */
+  attention: Type.Optional(Attention),
 });
 export type SessionInfo = Static<typeof SessionInfo>;
 

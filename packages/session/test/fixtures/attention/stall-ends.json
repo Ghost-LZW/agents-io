@@ -1,0 +1,13 @@
+{
+  "description": "A stall ends with the next session.state, or with the turn: here the stalled turn fails.",
+  "input": [
+    {"ts": 1000, "body": {"t": "input.admitted", "inputId": "i1", "disposition": "new_turn"}},
+    {"ts": 1001, "body": {"t": "turn.started", "turnId": "t1", "inputIds": ["i1"], "replyRoute": null}},
+    {"ts": 1002, "body": {"t": "session.state", "state": "running"}},
+    {"ts": 1500, "body": {"t": "session.state", "state": "stalled"}},
+    {"ts": 1600, "body": {"t": "session.state", "state": "running"}},
+    {"ts": 1700, "body": {"t": "session.state", "state": "stalled"}},
+    {"ts": 2000, "body": {"t": "turn.completed", "turnId": "t1", "status": "failed", "error": {"code": "idle_timeout", "retryable": false}}}
+  ],
+  "expected": {"state": "failed", "reasons": [{"kind": "failed", "turnId": "t1", "code": "idle_timeout", "since": 2000}], "since": 2000, "seq": 7}
+}

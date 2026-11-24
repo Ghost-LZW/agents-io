@@ -12,7 +12,7 @@ const names = [
   'ChannelHostFrame', 'ChannelAdapterFrame', 'ChannelHello', 'HarnessHostFrame', 'HarnessAdapterFrame',
   // The harness bridge's answers (the probe answer is the program's hello)
   'ProbeResult', 'HarnessDeclares', 'OpenResult', 'NativeClientSpec', 'BlobStat', 'BlobBytes',
-  'ClientFrame', 'ServerFrame', 'SessionInfo', 'ProgressView', 'Watch', 'BindingTable', 'RouteExplanation', 'TurnProvenance', 'InboundItem', 'HostRequestFrame', 'HostEventFrame', 'WatchDraft',
+  'ClientFrame', 'ServerFrame', 'SessionInfo', 'Attention', 'AttentionChanged', 'ProgressView', 'Watch', 'BindingTable', 'RouteExplanation', 'TurnProvenance', 'InboundItem', 'HostRequestFrame', 'HostEventFrame', 'WatchDraft',
   // Topics (decision 6)
   'Topic', 'TopicSwitchResult',
   // Host request result values
