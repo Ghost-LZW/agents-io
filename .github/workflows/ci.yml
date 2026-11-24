@@ -1,6 +1,7 @@
 name: CI
 
-# The quality gates from docs/TESTING.md: typecheck, core + local, invariants, e2e.
+# The quality gates from docs/TESTING.md: typecheck, core + local, invariants, e2e; and the
+# core-slimming boundary guard (docs/design/core-slimming §6: its baseline only goes down).
 # The live tier (real Lark, IMAP, Claude Code, Codex) needs credentials and stays out of CI.
 on:
   pull_request:
@@ -43,6 +44,11 @@ jobs:
       - name: invariants
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm invariants:check
+
+      # Reads the sources only (no build): no core file imports a module or names a concrete one.
+      - name: boundaries
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm boundaries:check
 
       - name: test (e2e)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
