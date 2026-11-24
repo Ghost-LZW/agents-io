@@ -1,6 +1,11 @@
 import type { HarnessCaps } from '@agents-io/protocol';
 
-/** Notifications nothing in this adapter maps; suppressed per connection. */
+/**
+ * Notifications nothing in this adapter maps; suppressed per connection. Codex ignores
+ * names it does not know, so the ones a newer line adds are listed too (0.171:
+ * `thread/prediction/updated`, `thread/readState/changed`, `thread/search/partial`,
+ * `thread/section/changed`), keeping the event stream the same on every supported line.
+ */
 export const DEFAULT_OPT_OUT = [
   'account/login/completed',
   'account/rateLimits/updated',
@@ -20,6 +25,7 @@ export const DEFAULT_OPT_OUT = [
   'process/outputDelta',
   'project/changed',
   'remoteControl/status/changed',
+  'thread/prediction/updated',
   'thread/realtime/closed',
   'thread/realtime/error',
   'thread/realtime/item/completed',
@@ -31,6 +37,9 @@ export const DEFAULT_OPT_OUT = [
   'thread/realtime/started',
   'thread/realtime/transcript/delta',
   'thread/realtime/transcript/done',
+  'thread/readState/changed',
+  'thread/search/partial',
+  'thread/section/changed',
   'windows/worldWritableWarning',
   'windowsSandbox/setupCompleted',
 ];
@@ -46,7 +55,7 @@ export const LIVE_NOTIFICATIONS = [
 ];
 
 /**
- * What Codex 0.160 app-server supports, as agents-io capabilities:
+ * What Codex app-server supports (0.160 and 0.171 alike), as agents-io capabilities:
  * - steer: `turn/steer` with `expectedTurnId` injects into the running turn;
  * - interrupt: `turn/interrupt`;
  * - approvals / questions: server requests (`item/*\/requestApproval`, `item/tool/requestUserInput`);

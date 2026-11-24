@@ -273,6 +273,8 @@ function contentText(content: unknown[]): string {
 
 export function phaseAudience(phase: string | null | undefined): Audience {
   // Providers do not always set phase; unknown is treated as the answer (legacy behaviour).
+  // `partial_answer` (codex-cli 0.171: stable answer text that more output may follow) is answer
+  // text too; as with several unphased messages, the turn's last answer item is its final text.
   return phase === 'commentary' ? 'commentary' : 'answer';
 }
 

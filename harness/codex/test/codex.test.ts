@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { PrefaceMemo, type HarnessSession, type InputRecord } from '@agents-io/protocol';
 import { assertConformingStream } from '@agents-io/testkit';
 import { Hub, Lane, MemorySessionLog, defaultPolicy } from '@agents-io/session';
-import { UnsupportedCodexVersionError, renderInputs } from '../src/index.js';
-import { FakeAppServer, FakeRpcError } from './fake-app-server.js';
+import { SUPPORTED_CODEX_LINES, UnsupportedCodexVersionError, renderInputs } from '../src/index.js';
+import { FakeAppServer, FakeRpcError, turn } from './fake-app-server.js';
 import { collector, input, isCompleted, open, run, setup, tick } from './codex-helpers.js';
 
 describe('handshake and probe', () => {
@@ -34,6 +34,19 @@ describe('handshake and probe', () => {
     const bad = setup({ allowUnknownVersion: true });
     bad.fake.userAgent = 'garbage';
     await expect(bad.harness.probe()).rejects.toThrow(/could not determine/);
+  });
+
+  it('accepts every supported line: 0.160 (still deployed) and 0.171 (types generated from it) #HC-1', async () => {
+    expect(SUPPORTED_CODEX_LINES).toEqual(['0.160', '0.171']);
+    for (const v of ['0.160.1', '0.171.0', '0.171.4']) {
+      const { fake, harness } = setup();
+      fake.userAgent = `agents_io/${v} (Mac OS 26.5.0; arm64) test`;
+      expect((await harness.probe()).version).toBe(v);
+      expect(fake.sent('initialized')).toHaveLength(1);
+    }
+    const { fake, harness } = setup();
+    fake.userAgent = 'agents_io/0.172.0 (x)';
+    await expect(harness.probe()).rejects.toThrow(/0\.172\.0 is not supported by @agents-io\/harness-codex \(supported: 0\.160\.x, 0\.171\.x; types generated from 0\.171\.0\)/);
   });
 });
 
@@ -148,6 +161,54 @@ describe('turn mapping', () => {
     expect(c.of('session.state').map((b) => b.state)).toEqual(['running', 'idle']);
     const done = c.of('turn.completed')[0]!;
     expect(done).toMatchObject({ status: 'completed', usage: { total: { totalTokens: 10 } } });
+  });
+
+  it('a 0.171 turn (item lifecycle times, a partial answer, moderation, rootTurnId, contentTokenCount) maps like a 0.160 one #HC-1', async () => {
+    const { fake, harness } = setup();
+    fake.userAgent = 'agents_io/0.171.0 (Mac OS 26.5.0; arm64) test';
+    const s = await open(harness);
+    const c = collector(s);
+    fake.onTurnStart = (p, tid) => {
+      const th = p.threadId;
+      const n = (method: string, params: object) => fake.notify(method, { threadId: th, turnId: tid, ...params });
+      const times = (done: boolean) => ({ startedAtMs: 1, completedAtMs: done ? 2 : null });
+      const um = { type: 'userMessage', id: 'um', clientId: p.clientUserMessageId, content: [{ type: 'text', text: 'hi', text_elements: [] }] };
+      n('item/started', { item: { ...um, ...times(false) }, startedAtMs: 1 });
+      n('item/completed', { item: { ...um, ...times(true) }, completedAtMs: 2 });
+      const msg = (id: string, text: string, phase: string) => ({ type: 'agentMessage', id, text, phase, moderation: null, memoryCitation: null, delivery: null, questions: null });
+      n('item/started', { item: { ...msg('m1', '', 'partial_answer'), ...times(false) }, startedAtMs: 1 });
+      n('item/agentMessage/delta', { itemId: 'm1', delta: 'Part one.' });
+      n('item/completed', { item: { ...msg('m1', 'Part one.', 'partial_answer'), ...times(true) }, completedAtMs: 2, contentTokenCount: 3 });
+      const cmd = { type: 'commandExecution', id: 'c1', pluginId: null, scriptPath: null, command: "/bin/zsh -lc 'ls'", cwd: '/work', processId: null, source: 'agent', commandActions: [], aggregatedOutput: null, exitCode: null, durationMs: null };
+      n('item/started', { item: { ...cmd, status: 'inProgress', ...times(false) }, startedAtMs: 1 });
+      n('item/completed', { item: { ...cmd, status: 'completed', aggregatedOutput: 'a.ts\n', exitCode: 0, durationMs: 3, ...times(true) }, completedAtMs: 2 });
+      n('item/started', { item: { ...msg('m2', '', 'final_answer'), ...times(false) }, startedAtMs: 1 });
+      n('item/agentMessage/delta', { itemId: 'm2', delta: 'Done' });
+      n('item/completed', { item: { ...msg('m2', 'Done', 'final_answer'), ...times(true) }, completedAtMs: 2, contentTokenCount: 1 });
+      fake.notify('thread/status/changed', { threadId: th, status: { type: 'idle' } });
+      fake.notify('turn/completed', { threadId: th, turn: { ...turn(tid, 'completed'), rootTurnId: tid } });
+      fake.activeTurn.delete(th);
+    };
+    await s.startTurn('T1', [input('i1', 'go')]);
+    await c.until(isCompleted);
+    assertConformingStream(c.events, { turnInputs: { T1: ['i1'] } });
+    expect(c.of('input.consumed')).toEqual([{ t: 'input.consumed', inputIds: ['i1'], turnId: 'T1' }]);
+    expect(c.of('item.completed').map((b) => [b.item.type, b.item.title, b.item.status])).toEqual([
+      ['agent_message', 'Part one.', 'completed'],
+      ['command', 'ls', 'completed'],
+      ['agent_message', 'Done', 'completed'],
+    ]);
+    // A partial answer is answer text, as an unphased message is; the last answer item is the turn's final text.
+    expect(c.events.filter((e) => e.body.t === 'text.delta').map((e) => [e.itemId, e.audience])).toEqual([
+      ['m1', 'answer'],
+      ['m2', 'answer'],
+    ]);
+    expect(c.of('headline')).toHaveLength(0);
+    const finals = c.events.filter((e) => e.body.t === 'text.snapshot' && (e.body as any).final);
+    expect(finals).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ audience: 'answer', itemId: 'm2', body: { text: 'Done' } });
+    expect(c.of('native')).toHaveLength(0);
+    expect(c.of('turn.completed')[0]).toMatchObject({ turnId: 'T1', status: 'completed' });
   });
 
   it('a profile switch resets reviewer, approval policy and sandbox the new profile leaves unset #ID-6', async () => {

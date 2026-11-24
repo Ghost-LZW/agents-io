@@ -533,7 +533,7 @@
 
 - **承诺**：`tui.attach`（决定 15）只答本机主人（带宿主 token 的连接答 `forbidden`）。守护进程先打开该会话的 harness 绑定，再答复启动原生 TUI 的命令；TUI 作为同一原生会话的另一个客户端加入，不另开会话、不夺走 lane：渠道输入照常经 lane 进入，TUI 里输入的轮次以 foreign 轮次记进日志。从未跑过轮次的会话先注入一条上下文说明，使原生会话可续接（Codex 空 thread 没有 rollout）。harness 不能让终端加入时答 `unsupported`。
 - **实现**：`packages/protocol/src/harness.ts` `HarnessAdapter.nativeClient`、`attach`（静态声明，缺省 `'join'` 即加入；声明 `'takeover'` 的走 LN-9）；`harness/codex/src/harness.ts` `CodexHarness.nativeClient`（unix 传输）、`CODEX_DECLARATIONS.attach`（`'join'`）；`packages/session/src/lane.ts` `attachPoint`、`injectContext`；`packages/daemon/src/gateway.ts` `tuiAttach`（不看实例种类，读适配器的 `attach`）；`packages/daemon/src/local-server.ts`（`tui.attach`）；`packages/daemon/src/cli.ts` `aio tui`。
-- **测试**：标签 `#LN-8`；`packages/daemon/test/tui.test.ts`。真实 Codex（0.160.1）手工核对：TUI 恢复出历史，`aio input` 的一轮在 TUI 里实时出现（`docs/design/external-holder/` §10.1）。
+- **测试**：标签 `#LN-8`；`packages/daemon/test/tui.test.ts`。真实 Codex（0.160.1）手工核对：TUI 恢复出历史，`aio input` 的一轮在 TUI 里实时出现（`docs/design/external-holder/` §10.1）；0.171.0 上 `codex --remote … resume` 挂上后，另一个客户端开的一轮同样在 TUI 里实时出现，TUI 的 `thread/resume` 不改 thread 的审批、沙箱和模型（2026-11-24，同上 §10.1）。
 - **状态**：有测试（假 harness）。Claude Code 的终端不是加入而是接管，见 LN-9。
 
 ### LN-9 Claude Code 终端接管会话；离开后由无头续接同一会话
@@ -853,8 +853,8 @@
 ### HC-1 每个 harness 适配器的事件流通过 `checkEventStream`；不认识的版本明确拒绝
 
 - **承诺**：每个 harness 适配器发出的事件流通过 `checkEventStream`：每个事件合 `HarnessEvent` schema；turn 只开始一次、只结束一次、互不重叠（`turn.adopted` 只许接管开着的那个）；`input.consumed` 只点名交给本轮的输入；完成的 turn 里开始的 item 都结束、打开的请求都结算；易失事件只限 delta、进度、headline、snapshot、native。`probe` 遇到没写过的主版本明确拒绝（Codex 可显式放开）。
-- **实现**：`packages/testkit/src/event-stream.ts` `checkEventStream` / `assertConformingStream`；`harness/claude-code/src/adapter.ts` `assertSupported`（`SUPPORTED_SDK`、`SUPPORTED_CLI`）；`harness/codex/src/version.ts` `assertSupportedVersion`（`SUPPORTED_CODEX_LINES`、`allowUnknownVersion`）。
-- **测试**：标签 `#HC-1`；例：`packages/testkit/test/testkit.test.ts` "flags overlap, unknown inputs and unfinished items #HC-1"、"accepts turn.adopted for the open turn (a log spanning a host restart), not for another one #HC-1"；`harness/claude-code/test/claude-code.test.ts` "maps a full turn and conforms #HC-1"、"refuses unknown major versions #HC-1"；`harness/codex/test/codex.test.ts` "maps a full turn to a conforming stream #HC-1 #ID-2"、"refuses unknown versions clearly, unless allowed #HC-1"。
+- **实现**：`packages/testkit/src/event-stream.ts` `checkEventStream` / `assertConformingStream`；`harness/claude-code/src/adapter.ts` `assertSupported`（`SUPPORTED_SDK`、`SUPPORTED_CLI`）；`harness/codex/src/version.ts` `assertSupportedVersion`（`SUPPORTED_CODEX_LINES`：0.160、0.171，类型由 0.171.0 生成；`allowUnknownVersion`），`harness/codex/src/caps.ts` `DEFAULT_OPT_OUT`（0.171 新增、适配器不映射的通知也退订，两条线上的事件流相同）。
+- **测试**：标签 `#HC-1`；例：`packages/testkit/test/testkit.test.ts` "flags overlap, unknown inputs and unfinished items #HC-1"、"accepts turn.adopted for the open turn (a log spanning a host restart), not for another one #HC-1"；`harness/claude-code/test/claude-code.test.ts` "maps a full turn and conforms #HC-1"、"refuses unknown major versions #HC-1"；`harness/codex/test/codex.test.ts` "maps a full turn to a conforming stream #HC-1 #ID-2"、"refuses unknown versions clearly, unless allowed #HC-1"、"accepts every supported line: 0.160 (still deployed) and 0.171 (types generated from it) #HC-1"、"a 0.171 turn (item lifecycle times, a partial answer, moderation, rootTurnId, contentTokenCount) maps like a 0.160 one #HC-1"；真实 Codex：`harness/codex/test/codex.live.test.ts` "runs one turn with a no-approval profile and emits a conforming stream #HC-1"（0.160.1 与 0.171.0 各跑过，2026-11-24）。
 - **状态**：有测试。
 - **注意**：模块 harness（`use: 'module'`）不在仓库里，核心不检查它的事件流（另见 CF-4）。
 

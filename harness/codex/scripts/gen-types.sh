@@ -6,8 +6,8 @@
 # Runs `codex app-server generate-ts` (stable API only, no --experimental) into a
 # temp dir, then vendors only the transitive closure of the root types listed
 # below, rewriting relative imports to NodeNext-style `.js` specifiers. The codex
-# version is recorded in src/generated/version.ts; bump SUPPORTED_CODEX_VERSIONS
-# in src/version.ts after checking the diff.
+# version is recorded in src/generated/version.ts; extend SUPPORTED_CODEX_LINES
+# in src/version.ts after checking the diff (keep the lines still in use working).
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
