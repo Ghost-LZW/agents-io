@@ -1,0 +1,13 @@
+{"scenario":"queue-drains","description":"Waiting inputs stop waiting when a turn takes them (turn.started), when the harness consumes them, or when they are rejected; the session is idle once none wait and no turn runs.","invariants":["LN-11"]}
+{"emit":{"end":"log","event":{"ts":1000,"body":{"t":"input.admitted","inputId":"i1","disposition":"new_turn"}}}}
+{"emit":{"end":"log","event":{"ts":1001,"body":{"t":"turn.started","turnId":"t1","inputIds":["i1"],"replyRoute":null}}}}
+{"emit":{"end":"log","event":{"ts":1002,"body":{"t":"session.state","state":"running"}}}}
+{"emit":{"end":"log","event":{"ts":1100,"body":{"t":"input.admitted","inputId":"i2","disposition":"queued"}}}}
+{"emit":{"end":"log","event":{"ts":1200,"body":{"t":"input.admitted","inputId":"i3","disposition":"queued"}}}}
+{"emit":{"end":"log","event":{"ts":1300,"body":{"t":"input.admitted","inputId":"i4","disposition":"queued"}}}}
+{"emit":{"end":"log","event":{"ts":1400,"body":{"t":"input.consumed","inputIds":["i2"],"turnId":"t1"}}}}
+{"emit":{"end":"log","event":{"ts":2000,"body":{"t":"turn.completed","turnId":"t1","status":"completed"}}}}
+{"emit":{"end":"log","event":{"ts":2001,"body":{"t":"turn.started","turnId":"t2","inputIds":["i3"],"replyRoute":null}}}}
+{"emit":{"end":"log","event":{"ts":2500,"body":{"t":"input.rejected","inputIds":["i4"],"reason":"lane_closed: gateway stopping"}}}}
+{"emit":{"end":"log","event":{"ts":3000,"body":{"t":"turn.completed","turnId":"t2","status":"completed"}}}}
+{"expect":{"end":"attention","exact":true,"match":{"state":"idle","reasons":[],"since":3000,"seq":11}}}

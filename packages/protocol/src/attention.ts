@@ -5,7 +5,7 @@ import { V } from './common.js';
  * A session's attention (core-slimming G7, INVARIANTS LN-11): what is pending in it now, folded
  * from its log like the snapshot, so every host stops computing it for itself. Mechanism only: it
  * says what waits, never who to tell or how (badges, pushes, counts are the host's).
- * The fold is pinned by language-neutral fixtures (`packages/session/test/fixtures/attention/`).
+ * The fold is pinned by language-neutral fixtures (`packages/testkit/conformance/scenarios/attention/`).
  */
 
 /**

@@ -397,7 +397,8 @@ in the last column of `aio sessions`. A host whose role-taking `host.hello` has
 attention }` frame for each change, once the events that changed it commit, in `seq` order per
 session; nothing is kept while it is away (list `sessions` on reconnect). `host.hello` lists the
 feature. The rules are pinned by language-neutral fixtures in
-`packages/session/test/fixtures/attention/` (format: `docs/design/core-slimming/` §3 G8). For
+`packages/testkit/conformance/scenarios/attention/` (conformance scenarios, format:
+`docs/design/conformance-fixtures/` §3.6). For
 embedders: `Hub.onAttention(fn)` / `Hub.attention(key)`, `foldAttention` and `emptyAttention` from
 `@agents-io/session`; a `SessionLog` of your own may implement `attention(key)` and fill
 `SessionSnapshot.attention` (both optional: without them there is no attention and no frame).

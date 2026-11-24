@@ -100,3 +100,27 @@ follows `PATH`, and Codex updates that link by itself.
    (the first entry is the oldest version that still runs). Run `pnpm test`, then the live
    checks: `AGENTS_IO_LIVE_CODEX=1 CODEX_BIN=<bin> npx vitest run --project live harness/codex/test/codex.live.test.ts`
    and `aio-e2e --harness <codex instance>` (`docs/E2E.md` §1.1).
+4. Record the transcripts again on the new line (`scripts/record-transcripts.ts`, below) and run
+   `harness/codex/test/transcripts.test.ts`: the adapter must still write exactly what it wrote, and
+   map what the new line sends.
+
+## Recorded transcripts
+
+Real `codex app-server` exchanges, as language-neutral transcripts (`docs/design/conformance-fixtures/`
+§2): `packages/testkit/conformance/transcripts/codex/` (`plain-turn`, `steer`, `approval`,
+`interrupt`; codex 0.171, model `gpt-6-sol`). `recordTransport(transport, tap)` hands every line the
+adapter's `Transport` carries to a tap (testkit's `TranscriptRecorder`); `scripts/record-transcripts.ts`
+runs the sessions of `test/transcript-scenarios.ts` through the real adapter on a throwaway stdio
+app-server and writes them, without what is particular to the machine (home directory, host name,
+workspace, the ids Codex makes up):
+
+```sh
+CODEX_HOME=<a Codex home with a model provider> node --experimental-transform-types \
+  --disable-warning=ExperimentalWarning --import ./scripts/source-loader.mjs \
+  harness/codex/scripts/record-transcripts.ts [plain-turn|steer|approval|interrupt]…
+```
+
+It calls a real model: run it by hand, when the adapter's frames or the codex line change on purpose,
+never in CI. `test/transcripts.test.ts` replays them through `CodexHarness`, with testkit's stdio
+replay (`aio-transcript-replay`) where `codex app-server` would be: a frame the adapter writes that the
+recording does not have fails it. Never edit a recorded transcript by hand to make it pass.

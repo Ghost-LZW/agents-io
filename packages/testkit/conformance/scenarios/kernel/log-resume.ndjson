@@ -1,0 +1,38 @@
+{"scenario":"log-resume","description":"The session log is gapless and only grows, across a restart; a client resumes from fromSeq with exactly what it missed, and one ahead of the head gets a snapshot at the head first.","invariants":["LN-1","LN-10"]}
+{"note":"A local client (principal me) runs one turn in session s; head1 is the log's head once it is idle (the sessions frame says so too)."}
+{"emit":{"end":"client","frame":{"type":"command","id":"c1","command":{"type":"input","sessionKey":"s","mode":"queue","input":{"content":[{"type":"text","text":"one"}]}}}}}
+{"expect":{"end":"client","match":{"type":"result","id":"c1","ok":true,"value":{"inputId":"<$in1>","disposition":"new_turn"}}}}
+{"expect":{"end":"log","session":"s","match":{"body":{"t":"turn.completed"}}}}
+{"expect":{"end":"log","session":"s","match":{"seq":"<$head1>","body":{"t":"session.state","state":"idle"}}}}
+{"emit":{"end":"client","frame":{"type":"sessions","id":"c2"}}}
+{"expect":{"end":"client","match":{"type":"result","id":"c2","ok":true,"value":[{"sessionKey":"s","head":"<$head1>"}]}}}
+{"expect":{"end":"log","session":"s","gapless":true}}
+{"fault":{"restart":true}}
+{"note":"The next daemon appends after head1: the very next event in the log is its first, and the log stays gapless."}
+{"emit":{"end":"client","frame":{"type":"command","id":"c3","command":{"type":"input","sessionKey":"s","mode":"queue","input":{"content":[{"type":"text","text":"two"}]}}}}}
+{"expect":{"end":"client","match":{"type":"result","id":"c3","ok":true,"value":{"inputId":"<$in2>","disposition":"new_turn"}}}}
+{"expect":{"end":"log","session":"s","next":true,"match":{"seq":"<$first2>","body":{"t":"input.admitted","inputId":"<$in2>"}}}}
+{"expect":{"end":"log","session":"s","match":{"body":{"t":"turn.completed"}}}}
+{"expect":{"end":"log","session":"s","match":{"seq":"<$head2>","body":{"t":"session.state","state":"idle"}}}}
+{"emit":{"end":"client","frame":{"type":"sessions","id":"c4"}}}
+{"expect":{"end":"client","match":{"type":"result","id":"c4","ok":true,"value":[{"sessionKey":"s","head":"<$head2>"}]}}}
+{"expect":{"end":"log","session":"s","gapless":true}}
+{"note":"Resuming from head1: the answer says the head; then every durable event after head1, in order, once, nothing from before."}
+{"emit":{"end":"client","conn":"resume","frame":{"type":"command","id":"r1","command":{"type":"subscribe","sessionKey":"s","tier":"full","fromSeq":"<$head1>"}}}}
+{"expect":{"end":"client","conn":"resume","match":{"type":"result","id":"r1","ok":true,"value":{"head":"<$head2>"}}}}
+{"expect":{"end":"client","conn":"resume","none":{"type":"event","event":{"body":{"t":"input.admitted","inputId":"<$in1>"}}}}}
+{"expect":{"end":"client","conn":"resume","next":true,"match":{"type":"event","event":{"sessionKey":"s","seq":"<$first2>","body":{"t":"input.admitted","inputId":"<$in2>"}}}}}
+{"expect":{"end":"client","conn":"resume","match":{"type":"event","event":{"sessionKey":"s","seq":"<$head2>"}}}}
+{"expect":{"end":"client","conn":"resume","session":"s","gapless":true}}
+{"note":"A cursor ahead of the head (the log was rebuilt): a snapshot at the head first, then the events that follow."}
+{"emit":{"end":"client","conn":"ahead","frame":{"type":"command","id":"a1","command":{"type":"subscribe","sessionKey":"s","tier":"full","fromSeq":1000}}}}
+{"expect":{"end":"client","conn":"ahead","match":{"type":"result","id":"a1","ok":true,"value":{"head":"<$head2>"}}}}
+{"expect":{"end":"client","conn":"ahead","next":true,"match":{"type":"event","event":{"sessionKey":"s","seq":"<$head2>","durability":"ephemeral","body":{"t":"native","name":"agents-io.snapshot"}}}}}
+{"emit":{"end":"client","frame":{"type":"command","id":"c5","command":{"type":"input","sessionKey":"s","mode":"queue","input":{"content":[{"type":"text","text":"three"}]}}}}}
+{"expect":{"end":"client","match":{"type":"result","id":"c5","ok":true,"value":{"inputId":"<$in3>","disposition":"new_turn"}}}}
+{"expect":{"end":"log","session":"s","next":true,"match":{"seq":"<$first3>","body":{"t":"input.admitted","inputId":"<$in3>"}}}}
+{"expect":{"end":"log","session":"s","match":{"body":{"t":"session.state","state":"idle"},"seq":"<$head3>"}}}
+{"expect":{"end":"client","conn":"ahead","match":{"type":"event","event":{"sessionKey":"s","seq":"<$first3>","durability":"durable","body":{"t":"input.admitted","inputId":"<$in3>"}}}}}
+{"expect":{"end":"client","conn":"ahead","match":{"type":"event","event":{"sessionKey":"s","seq":"<$head3>","durability":"durable"}}}}
+{"expect":{"end":"client","conn":"ahead","session":"s","gapless":true}}
+{"expect":{"end":"log","session":"s","gapless":true}}

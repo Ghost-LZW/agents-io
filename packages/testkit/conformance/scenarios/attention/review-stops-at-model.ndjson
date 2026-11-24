@@ -1,0 +1,7 @@
+{"scenario":"review-stops-at-model","description":"A request opened for a person and then opened again with a resolver that is not human (no longer a person's) is no longer pending.","invariants":["LN-11"]}
+{"emit":{"end":"log","event":{"ts":1000,"body":{"t":"input.admitted","inputId":"i1","disposition":"new_turn"}}}}
+{"emit":{"end":"log","event":{"ts":1001,"body":{"t":"turn.started","turnId":"t1","inputIds":["i1"],"replyRoute":null}}}}
+{"emit":{"end":"log","event":{"ts":1002,"body":{"t":"session.state","state":"running"}}}}
+{"emit":{"end":"log","event":{"ts":1100,"turnId":"t1","audience":"approval","body":{"t":"request.opened","requestId":"r1","kind":"tool_approval","title":"Bash: ls","risk":{},"allowedDecisions":["allow_once","deny"],"allowAlways":false,"defaultDeny":true,"resolver":{"kind":"human","principals":["owner"],"routes":["fake:default:c1"]}}}}}
+{"emit":{"end":"log","event":{"ts":1200,"turnId":"t1","body":{"t":"request.opened","requestId":"r1","kind":"tool_approval","title":"Bash: ls","risk":{},"allowedDecisions":["allow_once","deny"],"allowAlways":false,"defaultDeny":true,"resolver":{"kind":"host"}}}}}
+{"expect":{"end":"attention","exact":true,"match":{"state":"working","reasons":[],"since":1200,"seq":5,"turnId":"t1"}}}

@@ -3,10 +3,14 @@
 //
 //   node scripts/invariants.mjs check              drift report; any drift is an error (exit 1, decision 14)
 //   node scripts/invariants.mjs affected [files…]  changed files -> invariants -> tests per tier
-//   node scripts/invariants.mjs list [ID…|--json]  the tests tagged with each id (or every test as JSON)
+//   node scripts/invariants.mjs list [ID…|--json]  the tests tagged with each id (or every test as JSON; scenarios too)
 //
 // Ids come from the `### XX-n …` headings of docs/INVARIANTS.md; tags are `#XX-n` in test names.
 // A test's tier is its file suffix: *.test.ts core, *.local.test.ts, *.e2e.test.ts, *.live.test.ts.
+// A conformance scenario (an .ndjson file whose first line is a header `{ "scenario", "description",
+// "invariants": [ids] }`, docs/design/conformance-fixtures §3) is a core test of the ids its header
+// names: a core runner plays every scenario file (packages/kernel/test/scenarios.test.ts,
+// packages/session/test/attention.test.ts).
 import { execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { basename, join, relative, sep } from 'node:path';
@@ -179,15 +183,51 @@ function parseTests(file) {
   return tests;
 }
 
+function walkNdjson(dir, out = []) {
+  for (const name of readdirSync(dir)) {
+    if (name === 'node_modules' || name === 'dist' || name.startsWith('.')) continue;
+    const p = join(dir, name);
+    const s = statSync(p);
+    if (s.isDirectory()) walkNdjson(p, out);
+    else if (name.endsWith('.ndjson')) out.push(p);
+  }
+  return out;
+}
+
+/** The conformance scenarios: one core test each, tagged with the ids of its header. */
+function parseScenario(file) {
+  const first = readFileSync(file, 'utf8').split('\n').find((l) => l.trim());
+  let h;
+  try {
+    h = JSON.parse(first ?? '');
+  } catch {
+    return [];
+  }
+  if (!h || typeof h !== 'object' || typeof h.scenario !== 'string' || !Array.isArray(h.invariants)) return [];
+  const tags = h.invariants.filter((i) => typeof i === 'string' && /^[A-Z]{2}-\d+[a-z]?$/.test(i));
+  return [{ file: relative(root, file), line: 1, name: `${h.scenario}: ${h.description ?? ''} ${tags.map((t) => `#${t}`).join(' ')}`.trim(), kind: 'it', tags, tier: 'core', scenario: true }];
+}
+
 function readTests() {
-  const files = ['packages', 'harness', 'channel', 'examples'].flatMap((d) => {
+  const dirs = ['packages', 'harness', 'channel', 'examples'];
+  const files = dirs.flatMap((d) => {
     try {
       return walk(join(root, d));
     } catch {
       return [];
     }
   });
-  return files.sort().flatMap((f) => parseTests(f).map((t) => ({ ...t, tier: tierOf(f) })));
+  const scenarios = dirs.flatMap((d) => {
+    try {
+      return walkNdjson(join(root, d));
+    } catch {
+      return [];
+    }
+  });
+  return [
+    ...files.sort().flatMap((f) => parseTests(f).map((t) => ({ ...t, tier: tierOf(f) }))),
+    ...scenarios.sort().flatMap(parseScenario),
+  ];
 }
 
 // ---------- commands ----------
@@ -238,7 +278,7 @@ function check() {
   );
   // Quoted test names in INVARIANTS.md that match no test (renamed or deleted).
   const names = tests.map((t) => t.name);
-  const describes = tests.map((t) => t.file).filter((f, i, a) => a.indexOf(f) === i)
+  const describes = tests.filter((t) => !t.scenario).map((t) => t.file).filter((f, i, a) => a.indexOf(f) === i)
     .flatMap((f) => [...readFileSync(join(root, f), 'utf8').matchAll(/\bdescribe(?:\.\w+)*\(\s*(['"`])((?:(?!\1).)*)\1/g)].map((d) => d[2]));
   const testFields = [...entries.values()].flatMap((e) =>
     Object.entries(e.fields).filter(([k]) => /^(测试|实现与测试|状态)/.test(k)).map(([, v]) => v),
@@ -287,7 +327,7 @@ function affected(args) {
   const add = (id, why) => hit.set(id, [...new Set([...(hit.get(id) ?? []), why])]);
   for (const f of files) {
     let found = false;
-    if (/\.test\.ts$/.test(f)) {
+    if (/\.test\.ts$/.test(f) || /\.ndjson$/.test(f)) {
       for (const t of tests.filter((t) => t.file === f)) for (const id of t.tags) (add(id, `tests in ${f}`), (found = true));
     } else {
       for (const e of entries.values()) {

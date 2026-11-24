@@ -1,0 +1,2 @@
+{"scenario":"empty","description":"A session nothing has happened in is idle; since and seq are 0.","invariants":["LN-11"]}
+{"expect":{"end":"attention","exact":true,"match":{"state":"idle","reasons":[],"since":0,"seq":0}}}

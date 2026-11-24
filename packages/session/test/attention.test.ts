@@ -1,17 +1,19 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { Attention, SessionEvent, errors, type Body } from '@agents-io/protocol';
+import { readScenario, runScenario, scenarioFiles, type Scenario } from '@agents-io/testkit';
 import { Hub, MemorySessionLog, SqliteSessionLog, emptyAttention, foldAttention, type EventDraft, type SessionLog } from '../src/index.js';
 import { draft } from './helpers.js';
 
 /*
- * The attention fold (core-slimming G7, INVARIANTS LN-11), pinned by language-neutral fixtures:
- * `fixtures/attention/*.json`, each `{ description, input, expected }` (format: docs/design/core-slimming
- * §3 G7/G8). `input` is a session's log as SessionEvent bodies with `ts` (and, where they matter,
- * `visibility`, `durability`, `audience`, `level`, `turnId`, `itemId`); the log stamps the rest, `seq`
- * included; `expected` is the attention after the last of them.
+ * The attention fold (core-slimming G7, INVARIANTS LN-11), pinned by language-neutral fixtures in
+ * the conformance scenario format (docs/design/conformance-fixtures §3): the files of
+ * `packages/testkit/conformance/scenarios/attention/`, each a header, a session's log as `emit` lines
+ * at the `log` end (SessionEvent bodies with `ts` and, where they matter, `visibility`, `durability`,
+ * `audience`, `level`, `turnId`, `itemId`; the log stamps the rest, `seq` included), and one exact
+ * `expect` at the `attention` end: the attention after the last of them.
  */
 
 interface FixtureEvent {
@@ -25,14 +27,26 @@ interface FixtureEvent {
   itemId?: string;
 }
 interface Fixture {
+  scenario: Scenario;
   description: string;
   input: FixtureEvent[];
   expected: Attention;
 }
 
-const DIR = join(import.meta.dirname, 'fixtures', 'attention');
-const FIXTURES = readdirSync(DIR).filter((f) => f.endsWith('.json')).sort();
-const load = (file: string) => JSON.parse(readFileSync(join(DIR, file), 'utf8')) as Fixture;
+const DIR = join(import.meta.dirname, '..', '..', 'testkit', 'conformance', 'scenarios', 'attention');
+const FILES = scenarioFiles(DIR);
+const FIXTURES = FILES.map((f) => f.slice(DIR.length + 1));
+/** The scenario as a fold fixture: its log events and the attention expected after them. */
+function load(file: string): Fixture {
+  const scenario = readScenario(join(DIR, file));
+  const input: FixtureEvent[] = [];
+  let expected: Attention | undefined;
+  for (const { step } of scenario.steps) {
+    if ('emit' in step && step.emit.end === 'log') input.push(step.emit.event as unknown as FixtureEvent);
+    else if ('expect' in step && step.expect.end === 'attention') expected = step.expect.match as Attention;
+  }
+  return { scenario, description: scenario.header.description, input, expected: expected! };
+}
 const KEY = 's';
 const ENTRY_KEYS = new Set(['ts', 'body', 'visibility', 'durability', 'audience', 'level', 'turnId', 'itemId']);
 
@@ -56,19 +70,22 @@ function draftOf(e: FixtureEvent): EventDraft {
 const appendAll = (log: SessionLog, f: Fixture) => f.input.map((e) => log.append(KEY, draftOf(e)));
 
 describe('attention fixtures', () => {
-  it('every fixture is a description, a log of valid session events and a valid attention, nothing else #LN-11', () => {
+  it('every fixture is a scenario of LN-11: a description, a log of valid session events in its one session, then one exact expectation of a valid attention, nothing else #LN-11', () => {
     expect(FIXTURES.length).toBeGreaterThanOrEqual(20);
     for (const file of FIXTURES) {
       const f = load(file);
-      expect(Object.keys(f).sort(), file).toEqual(['description', 'expected', 'input']);
+      expect(Object.keys(f.scenario.header).sort(), file).toEqual(['description', 'invariants', 'scenario']);
+      expect(f.scenario.header.invariants, file).toEqual(['LN-11']);
       expect(f.description.length, file).toBeGreaterThan(10);
+      const kinds = f.scenario.steps.map(({ step }) => ('emit' in step ? `emit:${step.emit.end}:${(step.emit as { session?: string }).session ?? KEY}` : 'expect' in step ? `expect:${step.expect.end}:${step.expect.session ?? KEY}:${step.expect.exact}` : Object.keys(step)[0]));
+      expect(kinds, file).toEqual([...f.input.map(() => `emit:log:${KEY}`), `expect:attention:${KEY}:true`]);
       for (const e of f.input) expect(Object.keys(e).filter((k) => !ENTRY_KEYS.has(k)), file).toEqual([]);
       for (const e of appendAll(new MemorySessionLog(), f)) expect(errors(SessionEvent, e), `${file} seq ${e.seq}`).toEqual([]);
       expect(errors(Attention, f.expected), file).toEqual([]);
     }
   });
 
-  it.each(FIXTURES)('%s: folded from its events, through a log, and from a SQLite log reopened and compacted, the attention is the expected one #LN-11', (file) => {
+  it.each(FIXTURES)('%s: folded from its events, through a log, from a SQLite log reopened and compacted, and run as a scenario, the attention is the expected one #LN-11', async (file) => {
     const f = load(file);
     // The fold alone, over the events as the log stamps them.
     const events = appendAll(new MemorySessionLog(), f);
@@ -92,6 +109,9 @@ describe('attention fixtures', () => {
       expect(r.snapshot(KEY).attention, `${file}, compacted keeping ${keep}`).toStrictEqual(f.expected);
       r.close();
     }
+    // And as a scenario, by the conformance runner, over a log with nothing else in it.
+    const log = new MemorySessionLog();
+    await runScenario(f.scenario, { start: async () => ({ log: (k) => log.read(k, 0), attention: (k) => log.attention(k), append: (k, e) => void log.append(k, draftOf(e as unknown as FixtureEvent)), stop: async () => {} }) }, { settleMs: 0 });
   });
 
   it('a snapshot stored before snapshots had an attention gives one from what it shows: its human requests, queued inputs and turn, with since unknown #LN-11', () => {

@@ -25,3 +25,4 @@ export {
   versionFromUserAgent,
   type CodexVersionPolicy,
 } from './version.js';
+export { recordTransport, type TranscriptTap } from './record.js';

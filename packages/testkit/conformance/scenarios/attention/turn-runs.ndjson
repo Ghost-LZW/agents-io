@@ -1,0 +1,8 @@
+{"scenario":"turn-runs","description":"An input admitted for a new turn waits (working from its admission); once the turn starts it runs. What the turn says and does (state, text, items) changes nothing: seq stays at the turn.started.","invariants":["LN-11"]}
+{"emit":{"end":"log","event":{"ts":1000,"body":{"t":"input.admitted","inputId":"i1","disposition":"new_turn"}}}}
+{"emit":{"end":"log","event":{"ts":1001,"body":{"t":"turn.started","turnId":"t1","inputIds":["i1"],"replyRoute":null}}}}
+{"emit":{"end":"log","event":{"ts":1002,"body":{"t":"session.state","state":"running"}}}}
+{"emit":{"end":"log","event":{"ts":1010,"body":{"t":"text.delta","delta":"Hel","stream":"answer"}}}}
+{"emit":{"end":"log","event":{"ts":1011,"body":{"t":"item.started","item":{"itemId":"c1","type":"command","title":"ls","status":"running"}}}}}
+{"emit":{"end":"log","event":{"ts":1012,"body":{"t":"text.snapshot","text":"Hello","final":true}}}}
+{"expect":{"end":"attention","exact":true,"match":{"state":"working","reasons":[],"since":1000,"seq":2,"turnId":"t1"}}}

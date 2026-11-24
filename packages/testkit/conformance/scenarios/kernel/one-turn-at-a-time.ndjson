@@ -1,0 +1,19 @@
+{"scenario":"one-turn-at-a-time","description":"One writer lane per session and at most one turn at a time: inputs arriving during a turn queue behind it and run together in the next.","invariants":["LN-2"]}
+{"note":"The harness holds the first turn's answer (gate finish-first) until the queued inputs are in."}
+{"harness":{"transcript":"../../transcripts/jsonl-harness/queue-behind-turn.ndjson","gate":["finish-first"]}}
+{"emit":{"end":"client","conn":"a","frame":{"type":"command","id":"a1","command":{"type":"input","sessionKey":"s","mode":"queue","input":{"content":[{"type":"text","text":"first"}]}}}}}
+{"expect":{"end":"client","conn":"a","match":{"type":"result","id":"a1","ok":true,"value":{"disposition":"new_turn"}}}}
+{"expect":{"end":"log","session":"s","label":"started-1","match":{"body":{"t":"turn.started","turnId":"<$turn1>"}}}}
+{"expect":{"end":"log","session":"s","none":{"body":{"t":"turn.started"}},"until":"done-1"}}
+{"emit":{"end":"client","conn":"b","frame":{"type":"command","id":"b1","command":{"type":"input","sessionKey":"s","mode":"queue","input":{"content":[{"type":"text","text":"second"}]}}}}}
+{"expect":{"end":"client","conn":"b","match":{"type":"result","id":"b1","ok":true,"value":{"inputId":"<$in2>","disposition":"queued"}}}}
+{"emit":{"end":"client","conn":"a","frame":{"type":"command","id":"a2","command":{"type":"input","sessionKey":"s","mode":"queue","input":{"content":[{"type":"text","text":"third"}]}}}}}
+{"expect":{"end":"client","conn":"a","match":{"type":"result","id":"a2","ok":true,"value":{"inputId":"<$in3>","disposition":"queued"}}}}
+{"harness":{"release":"finish-first"}}
+{"expect":{"end":"log","session":"s","match":{"body":{"t":"text.snapshot","text":"echo: first"}}}}
+{"expect":{"end":"log","session":"s","label":"done-1","match":{"body":{"t":"turn.completed","turnId":"<$turn1>"}}}}
+{"note":"Then one turn for both queued inputs, on the same harness session (the transcript has one open)."}
+{"expect":{"end":"log","session":"s","match":{"body":{"t":"turn.started","turnId":"<$turn2>","inputIds":["<$in2>","<$in3>"]}}}}
+{"expect":{"end":"log","session":"s","none":{"body":{"t":"turn.started"}}}}
+{"expect":{"end":"log","session":"s","match":{"body":{"t":"text.snapshot","text":"echo: second+third"}}}}
+{"expect":{"end":"log","session":"s","match":{"body":{"t":"turn.completed","turnId":"<$turn2>","status":"completed"}}}}

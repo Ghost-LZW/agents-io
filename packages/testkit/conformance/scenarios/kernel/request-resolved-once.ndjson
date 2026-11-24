@@ -1,0 +1,20 @@
+{"scenario":"request-resolved-once","description":"A request is opened once and resolved once: the first answer wins, a second is refused.","invariants":["RQ-1"]}
+{"harness":{"transcript":"../../transcripts/jsonl-harness/approval.ndjson"}}
+{"note":"The host answers who resolves requests (callout resolve): the person me, who is the local client."}
+{"emit":{"end":"host","conn":"xwo","frame":{"type":"host.hello","id":"h1","name":"xwo","callouts":["resolve"]}}}
+{"expect":{"end":"host","conn":"xwo","match":{"type":"result","id":"h1","ok":true}}}
+{"emit":{"end":"client","frame":{"type":"command","id":"c1","command":{"type":"input","sessionKey":"s","mode":"queue","input":{"content":[{"type":"text","text":"go"}]}}}}}
+{"expect":{"end":"client","match":{"type":"result","id":"c1","ok":true,"value":{"disposition":"new_turn"}}}}
+{"expect":{"end":"host","conn":"xwo","match":{"type":"policy","id":"<$ask>","hook":"resolve","args":{"request":{"requestId":"r1","kind":"tool_approval"}}}}}
+{"emit":{"end":"host","conn":"xwo","frame":{"type":"result","id":"<$ask>","ok":true,"value":{"kind":"human","principals":["me"],"routes":[]}}}}
+{"expect":{"end":"log","session":"s","match":{"body":{"t":"request.opened","requestId":"r1","resolver":{"kind":"human","principals":["me"]}}}}}
+{"expect":{"end":"log","session":"s","none":{"body":{"t":"request.opened"}}}}
+{"note":"The person answers allow_once; a second answer (deny) is refused; the harness gets the first."}
+{"emit":{"end":"client","frame":{"type":"command","id":"c2","command":{"type":"resolve","sessionKey":"s","requestId":"r1","decision":{"kind":"allow_once"}}}}}
+{"expect":{"end":"client","match":{"type":"result","id":"c2","ok":true}}}
+{"emit":{"end":"client","frame":{"type":"command","id":"c3","command":{"type":"resolve","sessionKey":"s","requestId":"r1","decision":{"kind":"deny"}}}}}
+{"expect":{"end":"client","match":{"type":"result","id":"c3","ok":false,"error":{"code":"already_resolved"}}}}
+{"expect":{"end":"log","session":"s","match":{"body":{"t":"request.resolved","requestId":"r1","decision":{"kind":"allow_once"},"by":{"kind":"human","id":"me"}}}}}
+{"expect":{"end":"log","session":"s","none":{"body":{"t":"request.resolved"}}}}
+{"expect":{"end":"log","session":"s","match":{"body":{"t":"text.snapshot","text":"got allow_once"}}}}
+{"expect":{"end":"log","session":"s","match":{"body":{"t":"turn.completed","status":"completed"}}}}

@@ -1,0 +1,9 @@
+{"scenario":"request-not-for-a-person","description":"Requests no person answers are not pending for anyone: auto (settled at once), host (the host answers it), and one with no resolver.","invariants":["LN-11"]}
+{"emit":{"end":"log","event":{"ts":1000,"body":{"t":"input.admitted","inputId":"i1","disposition":"new_turn"}}}}
+{"emit":{"end":"log","event":{"ts":1001,"body":{"t":"turn.started","turnId":"t1","inputIds":["i1"],"replyRoute":null}}}}
+{"emit":{"end":"log","event":{"ts":1002,"body":{"t":"session.state","state":"running"}}}}
+{"emit":{"end":"log","event":{"ts":1100,"turnId":"t1","body":{"t":"request.opened","requestId":"r1","kind":"tool_approval","title":"Read file","risk":{},"allowedDecisions":["allow_once","deny"],"allowAlways":false,"defaultDeny":true,"resolver":{"kind":"auto","decision":{"kind":"allow_once"}}}}}}
+{"emit":{"end":"log","event":{"ts":1101,"turnId":"t1","body":{"t":"request.resolved","requestId":"r1","decision":{"kind":"allow_once"},"by":{"kind":"auto"}}}}}
+{"emit":{"end":"log","event":{"ts":1200,"turnId":"t1","body":{"t":"request.opened","requestId":"r2","kind":"tool_approval","title":"Write file","risk":{},"allowedDecisions":["allow_once","deny"],"allowAlways":false,"defaultDeny":true,"resolver":{"kind":"host"}}}}}
+{"emit":{"end":"log","event":{"ts":1300,"turnId":"t1","body":{"t":"request.opened","requestId":"r3","kind":"tool_approval","title":"Network","risk":{},"allowedDecisions":["allow_once","deny"],"allowAlways":false,"defaultDeny":true}}}}
+{"expect":{"end":"attention","exact":true,"match":{"state":"working","reasons":[],"since":1000,"seq":2,"turnId":"t1"}}}

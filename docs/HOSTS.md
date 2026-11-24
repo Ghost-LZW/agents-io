@@ -333,7 +333,7 @@ harness 也可以是另一个进程里、任何语言写的程序：守护进程
 - **在哪里读**：`sessions` 帧的答复（`SessionInfo.attention`，宿主连接也能发这个客户端帧）、控制台的 `GET /api/sessions`、订阅时拿到的快照（`SessionSnapshot.attention`）、`aio sessions` 每行的最后一列（`attention needs_you (request r1, 2 queued)`）。外部 MCP 的 `sessions_list` 也有，但请求不带 `title`（受检的一轮的卡片对外遮着，§4.1a）。
 - **订阅变化**：在占宿主位置的 `host.hello` 里加 `optIn: ["attention"]`（**只认结果**：结果的 `optIn` 里有 `attention` 才算拿到；不占宿主位置的 hello 得到 `optIn: []`；旧守护进程不认，结果里没有 `optIn`，`features` 里也没有 `attention`）。之后每个会话的值每变一次，守护进程发一帧 `{ "v": 1, "type": "attention.changed", "sessionKey": "…", "attention": { … } }`（`AttentionChanged`，不用应答）：改变它的事件提交、发布之后才发，同一个值只发一次（一个事务里的几条事件只发一次，是它们之后的值；回滚的什么都不发），同一会话按 `seq` 递增。
 - **断线**：宿主不在时不留，也不补发。重连（`hello` 带 `optIn`）之后列一次 `sessions` 取当前值，之后的帧按 `seq` 比较，旧的丢掉。
-- **怎么算**：规则由 `packages/session/test/fixtures/attention/*.json` 的 fixture 固定（每个是一段会话日志和它之后的值，格式见 `docs/design/core-slimming/` §3 G7/G8）；自己从事件 fold 的宿主或别的语言的实现可以拿它们自检。
+- **怎么算**：规则由 `packages/testkit/conformance/scenarios/attention/*.ndjson` 的 fixture 固定（每个是一段会话日志和它之后的值，一致性场景的格式，见 `docs/design/conformance-fixtures/` §3.6）；自己从事件 fold 的宿主或别的语言的实现可以拿它们自检。
 - **对严格校验的宿主可见的协议变化**（2026-11-24）：`SessionInfo.attention`（`AdminSession` 随之有）是新的可选字段；`features` 多了 `attention`；`HostEventFrame` 多了 `attention.changed`，只在 `optIn` 之后才发；快照（`agents-io.snapshot` 的 `native`）多了 `attention`；`aio sessions` 每行末尾多一列。
 
 ## 5. 命令行（给不想写 socket 客户端的宿主）

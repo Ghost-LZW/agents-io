@@ -1,0 +1,8 @@
+{"scenario":"next-turn-clears-failure","description":"The next turn starting ends the last one's failure.","invariants":["LN-11"]}
+{"emit":{"end":"log","event":{"ts":1000,"body":{"t":"input.admitted","inputId":"i1","disposition":"new_turn"}}}}
+{"emit":{"end":"log","event":{"ts":1001,"body":{"t":"turn.started","turnId":"t1","inputIds":["i1"],"replyRoute":null}}}}
+{"emit":{"end":"log","event":{"ts":1002,"body":{"t":"session.state","state":"running"}}}}
+{"emit":{"end":"log","event":{"ts":2000,"body":{"t":"turn.completed","turnId":"t1","status":"failed","error":{"code":"harness_error","retryable":false}}}}}
+{"emit":{"end":"log","event":{"ts":3000,"body":{"t":"input.admitted","inputId":"i2","disposition":"new_turn"}}}}
+{"emit":{"end":"log","event":{"ts":3005,"body":{"t":"turn.started","turnId":"t2","inputIds":["i2"],"replyRoute":null}}}}
+{"expect":{"end":"attention","exact":true,"match":{"state":"working","reasons":[],"since":3000,"seq":6,"turnId":"t2"}}}

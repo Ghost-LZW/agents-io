@@ -1,0 +1,7 @@
+{"scenario":"human-request","description":"A request whose resolver is human needs a person, from the moment it opens; the lane's requires_action after it changes nothing.","invariants":["LN-11"]}
+{"emit":{"end":"log","event":{"ts":1000,"body":{"t":"input.admitted","inputId":"i1","disposition":"new_turn"}}}}
+{"emit":{"end":"log","event":{"ts":1001,"body":{"t":"turn.started","turnId":"t1","inputIds":["i1"],"replyRoute":null}}}}
+{"emit":{"end":"log","event":{"ts":1002,"body":{"t":"session.state","state":"running"}}}}
+{"emit":{"end":"log","event":{"ts":1100,"turnId":"t1","audience":"approval","body":{"t":"request.opened","requestId":"r1","kind":"tool_approval","title":"Bash: rm -rf build","risk":{},"allowedDecisions":["allow_once","deny"],"allowAlways":false,"defaultDeny":true,"resolver":{"kind":"human","principals":["owner"],"routes":["fake:default:c1"]}}}}}
+{"emit":{"end":"log","event":{"ts":1101,"body":{"t":"session.state","state":"requires_action"}}}}
+{"expect":{"end":"attention","exact":true,"match":{"state":"needs_you","reasons":[{"kind":"request","requestId":"r1","requestKind":"tool_approval","title":"Bash: rm -rf build","since":1100}],"since":1100,"seq":4,"turnId":"t1"}}}

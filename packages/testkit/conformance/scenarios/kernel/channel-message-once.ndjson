@@ -1,0 +1,29 @@
+{"scenario":"channel-message-once","description":"A channel message is admitted, consumed by one turn and answered on its route; the same message again enters once, also after a restart.","invariants":["IN-1","IN-5"]}
+{"note":"The owner fake:alice says hi in the default conversation (fake:default:c1, a dm): one input, one turn of the reference harness, its answer on the reply card."}
+{"emit":{"end":"channel","frame":{"type":"inbound","envelope":{"id":"m1","sender":{"channelUserId":"alice","evidence":"platform_signed"},"text":"hi"}}}}
+{"expect":{"end":"channel","match":{"type":"result","ok":true,"value":{"accepted":true,"inputId":"<$in1>"}}}}
+{"expect":{"end":"channel","match":{"type":"finalize","route":{"channel":"fake","account":"default","conversationId":"c1"},"msg":{"text":"echo: hi"}}}}
+{"expect":{"end":"log","session":"fake:default:c1","match":{"body":{"t":"input.admitted","inputId":"<$in1>","disposition":"new_turn"}}}}
+{"expect":{"end":"log","session":"fake:default:c1","match":{"body":{"t":"turn.started","turnId":"<$turn1>","inputIds":["<$in1>"]}}}}
+{"expect":{"end":"log","session":"fake:default:c1","match":{"body":{"t":"input.consumed","inputIds":["<$in1>"],"turnId":"<$turn1>"}}}}
+{"expect":{"end":"log","session":"fake:default:c1","match":{"body":{"t":"turn.completed","turnId":"<$turn1>","status":"completed"}}}}
+{"note":"From here no input is admitted or consumed until the next message's (labelled admitted-2, consumed-2)."}
+{"expect":{"end":"log","session":"fake:default:c1","none":{"body":{"t":"input.admitted"}},"until":"admitted-2"}}
+{"expect":{"end":"log","session":"fake:default:c1","none":{"body":{"t":"input.consumed"}},"until":"consumed-2"}}
+{"note":"The channel delivers m1 again: it is not a second input."}
+{"emit":{"end":"channel","frame":{"type":"inbound","envelope":{"id":"m1","sender":{"channelUserId":"alice","evidence":"platform_signed"},"text":"hi"}}}}
+{"expect":{"end":"channel","match":{"type":"result","ok":true}}}
+{"fault":{"restart":true}}
+{"note":"And again after a restart; then a new message m2, which runs its own turn."}
+{"emit":{"end":"channel","frame":{"type":"inbound","envelope":{"id":"m1","sender":{"channelUserId":"alice","evidence":"platform_signed"},"text":"hi"}}}}
+{"expect":{"end":"channel","match":{"type":"result","ok":true}}}
+{"emit":{"end":"channel","frame":{"type":"inbound","envelope":{"id":"m2","sender":{"channelUserId":"alice","evidence":"platform_signed"},"text":"again"}}}}
+{"expect":{"end":"channel","match":{"type":"result","ok":true,"value":{"accepted":true,"inputId":"<$in2>"}}}}
+{"expect":{"end":"log","session":"fake:default:c1","label":"admitted-2","match":{"body":{"t":"input.admitted","inputId":"<$in2>","disposition":"new_turn"}}}}
+{"expect":{"end":"log","session":"fake:default:c1","match":{"body":{"t":"turn.started","turnId":"<$turn2>","inputIds":["<$in2>"]}}}}
+{"expect":{"end":"log","session":"fake:default:c1","label":"consumed-2","match":{"body":{"t":"input.consumed","inputIds":["<$in2>"],"turnId":"<$turn2>"}}}}
+{"expect":{"end":"log","session":"fake:default:c1","match":{"body":{"t":"turn.completed","turnId":"<$turn2>","status":"completed"}}}}
+{"expect":{"end":"channel","match":{"type":"finalize","msg":{"text":"echo: again"}}}}
+{"note":"Two inputs in all, each with its terminal event."}
+{"expect":{"end":"log","session":"fake:default:c1","none":{"body":{"t":"input.admitted"}}}}
+{"expect":{"end":"log","session":"fake:default:c1","none":{"body":{"t":"input.consumed"}}}}

@@ -1,0 +1,35 @@
+{"scenario":"delivery-once","description":"Every delivery settles once: the reply card's and a host delivery; the same operationId again is not sent again, also after a restart; explain traces the card to its turn and input.","invariants":["DL-1","DL-2","EX-2"]}
+{"emit":{"end":"channel","frame":{"type":"inbound","envelope":{"id":"d1","sender":{"channelUserId":"alice","evidence":"platform_signed"},"text":"hi"}}}}
+{"expect":{"end":"channel","match":{"type":"result","ok":true,"value":{"accepted":true,"inputId":"<$in1>"}}}}
+{"note":"No delivery of the conversation settles other than delivered, from its first event to the end."}
+{"expect":{"end":"log","session":"fake:default:c1","none":{"body":{"t":"delivery.settled","result":"rejected"}}}}
+{"expect":{"end":"log","session":"fake:default:c1","none":{"body":{"t":"delivery.settled","result":"unknown"}}}}
+{"expect":{"end":"log","session":"fake:default:c1","none":{"body":{"t":"delivery.settled","result":"held"}}}}
+{"note":"The reply card: opened (its operationId is the card's), then finished on the message the channel answered with."}
+{"expect":{"end":"channel","match":{"type":"send","route":{"channel":"fake","account":"default","conversationId":"c1"},"op":{"operationId":"<$open>"}}}}
+{"expect":{"end":"channel","match":{"type":"finalize","providerMessageId":"<$card>","msg":{"text":"echo: hi"}}}}
+{"expect":{"end":"log","session":"fake:default:c1","match":{"body":{"t":"turn.started","turnId":"<$turn>","inputIds":["<$in1>"]}}}}
+{"note":"Each of the card's deliveries settles once, delivered."}
+{"expect":{"end":"log","session":"fake:default:c1","match":{"body":{"t":"delivery.settled","operationId":"<$open>","result":"delivered","providerMessageId":"<$card>"}}}}
+{"expect":{"end":"log","session":"fake:default:c1","none":{"body":{"t":"delivery.settled","operationId":"<$open>"}}}}
+{"expect":{"end":"log","session":"fake:default:c1","match":{"body":{"t":"delivery.settled","operationId":"<$final>","result":"delivered","providerMessageId":"<$card>"}}}}
+{"expect":{"end":"log","session":"fake:default:c1","none":{"body":{"t":"delivery.settled","operationId":"<$final>"}}}}
+{"note":"explain by the card's operationId: the turn that made it and that turn's input."}
+{"emit":{"end":"host","conn":"xwo","frame":{"type":"explain","id":"x1","inputId":"<$open>"}}}
+{"expect":{"end":"host","conn":"xwo","match":{"type":"result","id":"x1","ok":true,"value":{"operationId":"<$open>","sessionKey":"fake:default:c1","turnId":"<$turn>","inputIds":["<$in1>"],"result":"delivered","providerMessageId":"<$card>"}}}}
+{"note":"A host delivery: sent once; the same operationId again answers duplicate and sends nothing; it settles once in the host's session."}
+{"emit":{"end":"host","conn":"xwo","frame":{"type":"deliver","id":"d1","operationId":"op-1","route":{"channel":"fake","account":"default","conversationId":"dm-alice"},"message":{"text":"from the host"}}}}
+{"expect":{"end":"host","conn":"xwo","match":{"type":"result","id":"d1","ok":true,"value":{"operationId":"op-1","status":"delivered","duplicate":false}}}}
+{"expect":{"end":"channel","match":{"type":"send","route":{"channel":"fake","account":"default","conversationId":"dm-alice"},"msg":{"text":"from the host"}}}}
+{"expect":{"end":"channel","none":{"type":"send"}}}
+{"emit":{"end":"host","conn":"xwo","frame":{"type":"deliver","id":"d2","operationId":"op-1","route":{"channel":"fake","account":"default","conversationId":"dm-alice"},"message":{"text":"from the host"}}}}
+{"expect":{"end":"host","conn":"xwo","match":{"type":"result","id":"d2","ok":true,"value":{"operationId":"op-1","status":"delivered","duplicate":true}}}}
+{"expect":{"end":"log","session":"host:xwo","match":{"body":{"t":"delivery.settled","route":{"conversationId":"dm-alice"},"result":"delivered"}}}}
+{"expect":{"end":"log","session":"host:xwo","none":{"body":{"t":"delivery.settled"}}}}
+{"note":"A channel the daemon does not have is refused, and nothing is sent."}
+{"emit":{"end":"host","conn":"xwo","frame":{"type":"deliver","id":"d3","operationId":"op-2","route":{"channel":"nope","account":"default","conversationId":"dm-alice"},"message":{"text":"from the host"}}}}
+{"expect":{"end":"host","conn":"xwo","match":{"type":"result","id":"d3","ok":false,"error":{"code":"unknown_channel"}}}}
+{"fault":{"restart":true}}
+{"note":"After a restart the same operationId is still a duplicate: nothing is sent, nothing settles again."}
+{"emit":{"end":"host","conn":"xwo","frame":{"type":"deliver","id":"d4","operationId":"op-1","route":{"channel":"fake","account":"default","conversationId":"dm-alice"},"message":{"text":"from the host"}}}}
+{"expect":{"end":"host","conn":"xwo","match":{"type":"result","id":"d4","ok":true,"value":{"operationId":"op-1","status":"delivered","duplicate":true}}}}
