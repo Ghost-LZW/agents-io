@@ -7,11 +7,9 @@ import { bridgeChannelModule } from '@agents-io/channel-jsonl-bridge';
 import { larkBotChannelModule } from '@agents-io/channel-lark-bot';
 import { FakeChannel, FakeHarness } from '@agents-io/testkit';
 import { builtinChannels, builtinHarnesses } from '../src/bundle.js';
-import { ChannelRegistry, CORE_CHANNEL_IDS } from '../src/channel-registry.js';
-import { ConfigError, ConfigFile, configFileSchema, RESERVED_CHANNEL_IDS, resolveConfig, type HarnessInstance } from '../src/config.js';
+import { ChannelRegistry, ConfigError, CORE_CHANNEL_IDS, type HarnessInstance } from '@agents-io/kernel';
+import { ConfigFile, configFileSchema, ConfigStore, Gateway, InstanceHarness, isCredential, RESERVED_CHANNEL_IDS, resolveConfig } from '../src/defaults.js';
 import { exitCodeFor } from '../src/cli.js';
-import { ConfigStore, isCredential } from '../src/console-config.js';
-import { Gateway, InstanceHarness } from '../src/gateway.js';
 import { cleanups, tmp } from './helpers.js';
 
 /*

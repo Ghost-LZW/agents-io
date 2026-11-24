@@ -4,12 +4,8 @@ import { join } from 'node:path';
 import { afterEach } from 'vitest';
 import type { HarnessAdapter, Policy } from '@agents-io/protocol';
 import { FakeChannel, FakeHarness, type FakeTurnScript } from '@agents-io/testkit';
-import { LocalClient } from '../src/client.js';
-import type { ChannelRegistry } from '../src/channel-registry.js';
-import type { ModuleRegistry } from '../src/modules.js';
-import { resolveConfig, type Config, type HarnessInstance } from '../src/config.js';
-import { Gateway, InstanceHarness, type GatewayOptions } from '../src/gateway.js';
-import { readTokenFile, tokenPath } from '../src/token.js';
+import { type ChannelRegistry, type GatewayOptions, type HarnessInstance, LocalClient, type ModuleRegistry, readTokenFile, tokenPath } from '@agents-io/kernel';
+import { type Config, Gateway, InstanceHarness, resolveConfig } from '../src/defaults.js';
 import type { HarnessDeclares } from './declares.js';
 
 export const cleanups: (() => Promise<void> | void)[] = [];

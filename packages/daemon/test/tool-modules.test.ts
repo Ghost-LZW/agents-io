@@ -4,7 +4,7 @@ import type { HarnessOpenArgs, InputRecord, LiveEndpoint, Origin } from '@agents
 import { KERNEL_TOOL_NAMES, TOOL_GROUPS, TOOL_NAMES } from '@agents-io/host-mcp';
 import { TOPIC_TOOLS_HINT } from '@agents-io/session';
 import { FakeChannel, type FakeHarness } from '@agents-io/testkit';
-import { resolveConfig } from '../src/config.js';
+import { resolveConfig } from '../src/defaults.js';
 import { daemon, until, type World } from './helpers.js';
 import { bridge, live } from './live-channels-helpers.js';
 import { mcpCall } from './output-tools-helpers.js';

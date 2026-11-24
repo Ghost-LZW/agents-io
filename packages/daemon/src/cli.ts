@@ -8,15 +8,23 @@ import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import type { Attention, RenderedMessage, ReplyRoute, RunEnded, RunStart, SessionEvent, SessionLaunch, SessionScope, Tier, TuiAttach } from '@agents-io/protocol';
 import { runAttach } from './attach.js';
-import { CommandError, DaemonUnavailable, LocalClient } from './client.js';
-import { ConfigError, loadConfig, type LoadOptions, type ModuleLaunch } from './config.js';
-import { loadConfigModules } from './config-modules.js';
-import { harnessModuleCommands } from './module-loader.js';
-import { consoleProof } from './console.js';
-import { Gateway } from './gateway.js';
-import { testHooksFromEnv } from './test-hooks.js';
-import { TokenError, consoleUrlPath, readTokenFile, tokenPath } from './token.js';
+import {
+  CommandError,
+  ConfigError,
+  DaemonUnavailable,
+  LocalClient,
+  TokenError,
+  consoleProof,
+  consoleUrlPath,
+  harnessModuleCommands,
+  readTokenFile,
+  testHooksFromEnv,
+  tokenPath,
+  type LoadOptions,
+  type ModuleLaunch,
+} from '@agents-io/kernel';
 import { builtinHarnesses } from './bundle.js';
+import { Gateway, loadConfig, loadConfigModules } from './defaults.js';
 import { WATCH_SPEC_HELP, formatWatch, parseDuration, parseWatchSpec } from './watch-spec.js';
 
 const USAGE = `aio: the agents-io daemon and its CLI

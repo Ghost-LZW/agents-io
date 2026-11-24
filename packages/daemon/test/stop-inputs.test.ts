@@ -5,8 +5,7 @@ import { SqliteSessionLog, rejectionNotice } from '@agents-io/session';
 import { CodexHarness } from '@agents-io/harness-codex';
 import { FakeChannel, fakeEnvelope } from '@agents-io/testkit';
 import { FakeAppServer } from '../../../harness/codex/test/fake-app-server.js';
-import { resolveConfig } from '../src/config.js';
-import { Gateway, InstanceHarness } from '../src/gateway.js';
+import { Gateway, InstanceHarness, resolveConfig } from '../src/defaults.js';
 import { cleanups, daemon, tmp, until } from './helpers.js';
 
 const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };

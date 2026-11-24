@@ -3,7 +3,7 @@ import { chmodSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, re
 import { dirname, join } from 'node:path';
 import { Value } from '@sinclair/typebox/value';
 import { ADMIN_REDACTED, type AdminConfigDocument, type AdminConfigPutResult, type AdminConfigValidation, type ChannelModule, type ConfigAccess, type ConfigIssue } from '@agents-io/protocol';
-import { builtinChannels, builtinHarnesses, builtinModules } from './bundle.js';
+import { NO_REGISTRIES } from './core.js';
 import type { ChannelRegistry } from './channel-registry.js';
 import { ConfigError, configFileSchema, findEnvFile, resolveConfig, type Config } from './config.js';
 import { loadEnvFile } from './env-file.js';
@@ -85,11 +85,11 @@ function channelAt(doc: Json, at: Path, channels: ChannelRegistry): { module: Ch
 /**
  * Whether the string at `at` in `doc` is a credential, by where the config
  * schema (config.ts) puts it. A channel entry's type says for its own keys
- * (`channels`: the registry the document's types come from, default the
- * built-in one; several: what any of their types for it marks): its
+ * (`channels`: the registry the document's types come from, default none,
+ * `@agents-io/daemon`'s the built-in one; several: what any of their types for it marks): its
  * `x-credential` marks and `isCredential`.
  */
-export function isCredential(doc: Json, at: Path, channels: CredentialMarks = builtinChannels): boolean {
+export function isCredential(doc: Json, at: Path, channels: CredentialMarks = NO_REGISTRIES.channelRegistry): boolean {
   const s = at.map(String);
   const leaf = s.at(-1);
   // `host.tokenFile` is a path, not the token.
@@ -143,7 +143,7 @@ function get(v: Json, at: Path): Json {
 const literalCredential = (doc: Json, value: string, at: Path, channels: CredentialMarks) => value !== '' && envRef(value) === undefined && isCredential(doc, at, channels);
 
 /** The document with every literal credential replaced by ADMIN_REDACTED (`channels`: as for `isCredential`). */
-export function redact(raw: Json, channels: CredentialMarks = builtinChannels): Json {
+export function redact(raw: Json, channels: CredentialMarks = NO_REGISTRIES.channelRegistry): Json {
   return walk(raw, [], (value, at) => (literalCredential(raw, value, at, channels) ? ADMIN_REDACTED : undefined));
 }
 
@@ -163,7 +163,7 @@ export function envRefs(raw: Json): string[] {
  * (`ChannelModule.implicitEnv` of each entry's type, in entry order), each once, none of `skip`.
  * A type's answer that is no array of strings (or that throws: the document may not validate) gives none.
  */
-export function implicitEnv(raw: Json, channels: ChannelRegistry = builtinChannels, skip: readonly string[] = []): string[] {
+export function implicitEnv(raw: Json, channels: ChannelRegistry = NO_REGISTRIES.channelRegistry, skip: readonly string[] = []): string[] {
   const out = new Set<string>();
   const entries = raw && typeof raw === 'object' ? (raw as { channels?: unknown }).channels : undefined;
   for (const entry of Array.isArray(entries) ? entries : []) {
@@ -187,7 +187,7 @@ export function implicitEnv(raw: Json, channels: ChannelRegistry = builtinChanne
  * literal at its path, or in a field that is not a credential (GET would show
  * the stored value there), is an issue (`channels`: as for `isCredential`).
  */
-export function unredact(next: Json, stored: Json, channels: CredentialMarks = builtinChannels): { doc: Json; kept: Set<string>; issues: ConfigIssue[] } {
+export function unredact(next: Json, stored: Json, channels: CredentialMarks = NO_REGISTRIES.channelRegistry): { doc: Json; kept: Set<string>; issues: ConfigIssue[] } {
   const kept = new Set<string>();
   const issues: ConfigIssue[] = [];
   const doc = walk(next, [], (value, at) => {
@@ -263,11 +263,11 @@ export interface ConfigStoreOptions {
   /** Process environment (default process.env); wins over the env file, as at startup. */
   env?: NodeJS.ProcessEnv;
   cwd?: string;
-  /** The harness kinds the file may name (default the built-in ones): the daemon's (`Gateway.harnessRegistry`). */
+  /** The harness kinds the file may name (default none; `@agents-io/daemon`'s: the built-in ones): the daemon's (`Gateway.harnessRegistry`). */
   harnessRegistry?: HarnessRegistry;
-  /** The channel types the file may name, and what they mark as credentials (default the built-in ones): the daemon's (`Gateway.channelRegistry`). */
+  /** The channel types the file may name, and what they mark as credentials (default none; `@agents-io/daemon`'s: the built-in ones): the daemon's (`Gateway.channelRegistry`). */
   channelRegistry?: ChannelRegistry;
-  /** The feature modules whose config sections the file may have (default the built-in ones): the daemon's (`Gateway.moduleRegistry`). */
+  /** The feature modules whose config sections the file may have (default none; `@agents-io/daemon`'s: the built-in ones): the daemon's (`Gateway.moduleRegistry`). */
   moduleRegistry?: ModuleRegistry;
   /**
    * How the daemon imports the module files a config file names (`ConfigModules.importModules`):
@@ -311,8 +311,8 @@ export class ConfigStore implements ConfigAccess {
   private readonly daemon: Registries;
 
   constructor(private readonly o: ConfigStoreOptions) {
-    const channels = o.channelRegistry ?? builtinChannels;
-    this.daemon = { harnesses: o.harnessRegistry ?? builtinHarnesses, channels, modules: o.moduleRegistry ?? builtinModules, marks: [channels] };
+    const channels = o.channelRegistry ?? NO_REGISTRIES.channelRegistry;
+    this.daemon = { harnesses: o.harnessRegistry ?? NO_REGISTRIES.harnessRegistry, channels, modules: o.moduleRegistry ?? NO_REGISTRIES.moduleRegistry, marks: [channels] };
     const raw = this.read().raw;
     this.running = raw && typeof raw === 'object' && !Array.isArray(raw) ? structuredClone(raw as Record<string, unknown>) : {};
   }

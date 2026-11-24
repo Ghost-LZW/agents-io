@@ -3,8 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { ChannelCaps, ProgressView, ReplyRoute } from '@agents-io/protocol';
 import { MemorySessionLog } from '@agents-io/session';
 import { FakeChannel, FakeHarness, defaultChannelCaps } from '@agents-io/testkit';
-import { resolveConfig } from '../src/config.js';
-import { Gateway } from '../src/gateway.js';
+import { Gateway, resolveConfig } from '../src/defaults.js';
 import { cleanups, tmp, until } from './helpers.js';
 
 /*

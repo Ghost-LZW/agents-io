@@ -4,9 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import type { HarnessOpenArgs, HarnessSession } from '@agents-io/protocol';
 import { FakeChannel, FakeHarness } from '@agents-io/testkit';
-import { LocalClient } from '../src/client.js';
-import { resolveConfig } from '../src/config.js';
-import { Gateway } from '../src/gateway.js';
+import { LocalClient } from '@agents-io/kernel';
+import { Gateway, resolveConfig } from '../src/defaults.js';
 import { tmp, until } from './helpers.js';
 
 const HANGING_CHANNEL = fileURLToPath(new URL('./fixtures/chan-hangs.mjs', import.meta.url));

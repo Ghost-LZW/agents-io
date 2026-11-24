@@ -9,14 +9,9 @@ import { MemorySessionLog, TOPIC_KEY } from '@agents-io/session';
 import { FakeChannel, FakeHarness, fakeEnvelope, type FakeTurnScript } from '@agents-io/testkit';
 import { KERNEL_TOOL_NAMES } from '@agents-io/host-mcp';
 import { builtinHarnesses, builtinModules } from '../src/bundle.js';
-import { LocalClient } from '../src/client.js';
-import { ConfigError, ConfigFile, configFileSchema, resolveConfig, type Config } from '../src/config.js';
-import { ConfigStore } from '../src/console-config.js';
-import { Gateway } from '../src/gateway.js';
-import { FEATURES } from '../src/host.js';
-import { ModuleRegistry } from '../src/modules.js';
+import { ConfigError, FEATURES, LocalClient, ModuleRegistry, readTokenFile, tokenPath } from '@agents-io/kernel';
+import { type Config, ConfigFile, configFileSchema, ConfigStore, Gateway, resolveConfig } from '../src/defaults.js';
 import { presetsModule } from '../src/presets.js';
-import { readTokenFile, tokenPath } from '../src/token.js';
 import { cleanups, until } from './helpers.js';
 import { mcpCall } from './output-tools-helpers.js';
 

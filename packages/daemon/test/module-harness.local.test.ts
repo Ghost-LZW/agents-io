@@ -4,10 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import type { SessionEvent } from '@agents-io/protocol';
 import { FakeChannel, type FakeHarness } from '@agents-io/testkit';
-import { LocalClient } from '../src/client.js';
-import { resolveConfig } from '../src/config.js';
-import { Gateway } from '../src/gateway.js';
-import { readTokenFile, tokenPath } from '../src/token.js';
+import { LocalClient, readTokenFile, tokenPath } from '@agents-io/kernel';
+import { Gateway, resolveConfig } from '../src/defaults.js';
 import { cleanups, tmp, until } from './helpers.js';
 
 /* A `use: "module"` harness gets the lifecycle calls a built-in adapter gets (HarnessAdapter detach / dispose / adopts): fixtures/harness-lifecycle.mjs. */

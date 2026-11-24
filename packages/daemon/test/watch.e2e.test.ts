@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { BodyOf, SessionEvent } from '@agents-io/protocol';
-import { CommandError } from '../src/client.js';
+import { CommandError } from '@agents-io/kernel';
 import { formatWatch } from '../src/watch-spec.js';
 import { tmp, until } from './helpers.js';
 import { config, eve, group, start } from './watch-helpers.js';

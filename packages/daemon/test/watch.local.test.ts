@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { parseAttachLine } from '../src/attach.js';
-import { ConfigError, resolveConfig } from '../src/config.js';
+import { ConfigError } from '@agents-io/kernel';
+import { resolveConfig } from '../src/defaults.js';
 import { WatchSpecError, parseDuration, parseWatchSpec } from '../src/watch-spec.js';
 
 describe('watch spec', () => {

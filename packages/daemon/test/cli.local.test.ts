@@ -2,7 +2,8 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { faultRequest, parseCli, parseEnvPairs, replayRequest, runRequest, socketOf } from '../src/cli.js';
-import { ConfigError, configTable, resolveConfig } from '../src/config.js';
+import { ConfigError, configTable } from '@agents-io/kernel';
+import { resolveConfig } from '../src/defaults.js';
 import { cli } from './cli-helpers.js';
 import { tmp } from './helpers.js';
 

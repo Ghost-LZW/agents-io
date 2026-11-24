@@ -21,7 +21,7 @@ import {
 } from '@agents-io/protocol';
 import { LaneUnavailableError, OWNER_LABEL, passes, project, withholding } from '@agents-io/session';
 import { ExternalMcpServer, ToolError, globMatch, isLoopback, parseScope, type ExternalBackend, type ExternalCaller, type ExternalClient, type ExternalScopes } from '@agents-io/host-mcp';
-import { TokenError, loadOrCreateTokenFile } from './token.js';
+import { TokenError, loadOrCreateTokenFile } from '@agents-io/kernel';
 
 /*
  * The external MCP endpoint (docs/design/external-mcp) as a built-in feature module

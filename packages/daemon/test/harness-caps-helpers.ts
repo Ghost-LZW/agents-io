@@ -3,11 +3,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { SessionEvent } from '@agents-io/protocol';
 import { FakeChannel, type FakeHarness } from '@agents-io/testkit';
-import { LocalClient } from '../src/client.js';
-import { resolveConfig } from '../src/config.js';
-import { Gateway } from '../src/gateway.js';
-import type { HarnessRegistry } from '../src/harness-registry.js';
-import { readTokenFile, tokenPath } from '../src/token.js';
+import { type HarnessRegistry, LocalClient, readTokenFile, tokenPath } from '@agents-io/kernel';
+import { Gateway, resolveConfig } from '../src/defaults.js';
 import { cleanups, tmp, until } from './helpers.js';
 
 // Shared by harness-caps.test.ts (core) and harness-caps.local.test.ts: a daemon whose instances are fixtures/harness-caps.mjs.

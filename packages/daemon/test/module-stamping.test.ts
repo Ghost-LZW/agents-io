@@ -4,11 +4,8 @@ import type { InputRecord, KernelContext, ModuleManifest, Origin, ReplyRoute, Se
 import type { FakeTurnApi } from '@agents-io/testkit';
 import { MemorySessionLog } from '@agents-io/session';
 import { FakeChannel, FakeHarness } from '@agents-io/testkit';
-import { resolveConfig } from '../src/config.js';
-import { Gateway } from '../src/gateway.js';
-import { HarnessRegistry } from '../src/harness-registry.js';
-import { ChannelRegistry } from '../src/channel-registry.js';
-import { ModuleRegistry } from '../src/modules.js';
+import { ChannelRegistry, HarnessRegistry, ModuleRegistry } from '@agents-io/kernel';
+import { Gateway, resolveConfig } from '../src/defaults.js';
 import { cleanups, tmp, until } from './helpers.js';
 
 /*

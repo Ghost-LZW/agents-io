@@ -5,8 +5,8 @@ import { describe, expect, it } from 'vitest';
 import type { AckState, ReplyRoute, SessionEvent } from '@agents-io/protocol';
 import { Ingress, MemorySessionLog, defaultPolicy } from '@agents-io/session';
 import { FakeChannel, FakeHarness, fakeEnvelope, type FakeTurnScript } from '@agents-io/testkit';
-import { resolveConfig, type HarnessInstance } from '../src/config.js';
-import { Gateway, InstanceHarness } from '../src/gateway.js';
+import type { HarnessInstance } from '@agents-io/kernel';
+import { Gateway, InstanceHarness, resolveConfig } from '../src/defaults.js';
 import { CODEX_DECLARES } from './declares.js';
 import { cleanups, until } from './gateway-helpers.js';
 

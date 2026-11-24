@@ -3,7 +3,8 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { codexStateDir, type CodexLaunch } from '@agents-io/harness-codex';
-import { ConfigError, defaultInstance, findEnvFile, loadConfig, resolveConfig, substituteEnv } from '../src/config.js';
+import { ConfigError, defaultInstance, findEnvFile, substituteEnv } from '@agents-io/kernel';
+import { loadConfig, resolveConfig } from '../src/defaults.js';
 
 const dirs: string[] = [];
 afterEach(() => {

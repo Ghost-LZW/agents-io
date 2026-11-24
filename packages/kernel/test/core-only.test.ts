@@ -15,10 +15,11 @@ import { readTokenFile, tokenPath } from '../src/token.js';
 import { cleanups, closeAndWait, tmp, until } from './helpers.js';
 
 /*
- * The kernel without modules is a product of its own (core-slimming §5): registries with nothing
- * registered (`coreRegistries`, no module package and not bundle.ts), and the channel and harness
- * the embedder passes (here testkit's FakeChannel and FakeHarness). The kernel's promises hold end
- * to end, and nothing a module adds is there. This file imports no module package either.
+ * The kernel without modules is a product of its own (core-slimming §5): the kernel package alone
+ * (`@agents-io/kernel`: no module package, not `@agents-io/daemon`), registries with nothing
+ * registered (`coreRegistries`), and the channel and harness the embedder passes (here testkit's
+ * FakeChannel and FakeHarness). The kernel's promises hold end to end, and nothing a module adds is
+ * there. This file imports no module package either.
  */
 
 const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };

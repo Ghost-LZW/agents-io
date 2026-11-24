@@ -1,7 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, rmSync } from 'node:fs';
 import { dirname, join, resolve as resolvePath } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import {
   PROTOCOL_VERSION,
   formatAddress,
@@ -128,7 +127,7 @@ import {
   withholding,
 } from '@agents-io/session';
 import { HostMcpServer, HostTools, ToolError, agentIdentity, agentOrigin, scheduleRouteRefusal, toolCatalog, type TopicHandover } from '@agents-io/host-mcp';
-import { builtinChannels, builtinHarnesses, builtinModules } from './bundle.js';
+import { NO_REGISTRIES } from './core.js';
 import { badChannelAdapter, declaredInner, loadHarnessModule } from './module-loader.js';
 import { descriptorAdmin } from './module-channel.js';
 import { ConfigError, EMBEDDED_HARNESS, UNGRANTED_EVIDENCE, agentSpec, configTable, consoleSettings, resolveModules, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type ResolvedChannel } from './config.js';
@@ -174,17 +173,17 @@ export interface GatewayOptions {
   harness?: HarnessAdapter;
   /** Build instance adapters with this instead of `buildHarness` (tests). */
   buildHarness?: (instance: HarnessInstance) => HarnessAdapter;
-  /** The harness kinds instances are built from (default the built-in ones, `bundle.ts`): the registry the config was resolved with. */
+  /** The harness kinds instances are built from (default none; `@agents-io/daemon`'s: the built-in ones): the registry the config was resolved with. */
   harnessRegistry?: HarnessRegistry;
   /**
-   * The channel types configured channels are built from (`ChannelModule.create`; default the
-   * built-in ones, `bundle.ts`): the registry the config was resolved with. It also says who owns
+   * The channel types configured channels are built from (`ChannelModule.create`; default none;
+   * `@agents-io/daemon`'s: the built-in ones): the registry the config was resolved with. It also says who owns
    * an entry's channel id and the evidence an entry gives without a grant.
    */
   channelRegistry?: ChannelRegistry;
   /**
-   * The feature modules (`ModuleManifest`; default the built-in ones, `bundle.ts`, none yet): the
-   * registry the config was resolved with (`Config.modules` names exactly its modules).
+   * The feature modules (`ModuleManifest`; default none; `@agents-io/daemon`'s: the built-in ones):
+   * the registry the config was resolved with (`Config.modules` names exactly its modules).
    */
   moduleRegistry?: ModuleRegistry;
   /**
@@ -241,6 +240,12 @@ export interface GatewayOptions {
   testHooks?: boolean;
   /** One outbox attempt's upper bound (default 60 s; tests). */
   outboxAttemptTimeoutMs?: number;
+  /**
+   * The CLI a terminal UI's helpers run as, a script for `node` (`TakeoverServices.cli`: the
+   * commands a harness kind adds, `HarnessModule.cli`, such as Claude Code's `tui-bridge`): the
+   * composition root's (`@agents-io/daemon` gives its `aio`). Without it a takeover is refused.
+   */
+  cli?: string;
 }
 
 /** Outcome of a local command, mapped 1:1 onto a `result` frame. */
@@ -466,7 +471,7 @@ export class Gateway {
   /** Parked topic sessions whose lane closes when this fires (`topics.parkedIdleMs`). */
   private readonly parkedTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-  private constructor(
+  protected constructor(
     private readonly o: GatewayOptions,
     modules: ModuleHost,
   ) {
@@ -474,9 +479,9 @@ export class Gateway {
     // The default harness is built below and captures its media resolvers now.
     this.blobs = new FsBlobStore(c.blobs);
     this.harnessBlobs = readOnlyBlobs(this.blobs);
-    this.harnessRegistry = o.harnessRegistry ?? builtinHarnesses;
-    this.channelRegistry = o.channelRegistry ?? builtinChannels;
-    this.moduleRegistry = o.moduleRegistry ?? builtinModules;
+    this.harnessRegistry = o.harnessRegistry ?? NO_REGISTRIES.harnessRegistry;
+    this.channelRegistry = o.channelRegistry ?? NO_REGISTRIES.channelRegistry;
+    this.moduleRegistry = o.moduleRegistry ?? NO_REGISTRIES.moduleRegistry;
     this.modules = modules;
     this.commandTable = modules.commandTable();
     // What each preset gives names a configured instance (the config checked it; a value written since, or a config built by hand, is checked here).
@@ -944,7 +949,7 @@ export class Gateway {
     // Module lifecycle step 2 (step 1 ran in loadConfig): set up before the gateway builds its
     // ingress, so their tools and commands are assembled with the kernel's. Their kernel context is
     // late-bound: it works once the gateway exists.
-    const registry = o.moduleRegistry ?? builtinModules;
+    const registry = o.moduleRegistry ?? NO_REGISTRIES.moduleRegistry;
     // A `modules` entry's module runs only when it was imported before the config was resolved, into the registry given here.
     for (const [i, e] of (o.config.moduleEntries ?? []).entries()) {
       if (!registry.fromEntry(e))
@@ -3715,6 +3720,8 @@ ${a.summary}` }],
    * instance (`harnessFor`) until the terminal leaves, and the lane's turns go to it meanwhile.
    */
   private async takeOver(key: string, lane: Lane, instance: string, adapter: TakingOver, model: string | undefined): Promise<Outcome> {
+    const cli = this.o.cli;
+    if (cli === undefined) return { ok: false, code: 'unsupported', message: `${key}: harness ${instance}'s terminal UI takes the session over, and this daemon has no CLI for its helpers (GatewayOptions.cli)` };
     const held = this.takeovers.get(key);
     if (held?.takeover.connected) return { ok: false, code: 'conflict', message: `${key}: a terminal UI is already attached` };
     if (held) this.endTakeover(held, 'replaced by a new attach');
@@ -3733,8 +3740,8 @@ ${a.summary}` }],
       ...(model ? { model } : {}),
       services: {
         dir: join(this.o.config.dataDir, 'tui'),
-        // A helper the terminal starts runs as this CLI (`aio <command>`, a kind's `HarnessModule.cli`), next to this module in dist/.
-        cli: fileURLToPath(new URL('./cli.js', import.meta.url)),
+        // A helper the terminal starts runs as the composition root's CLI (`aio <command>`, a kind's `HarnessModule.cli`).
+        cli,
         // Where the CLI finds a `use: "module"` instance's commands (its descriptor's `cli`).
         ...(this.o.config.source?.path ? { config: this.o.config.source.path } : {}),
         fileOf: (ref) => this.blobs.stat(ref),
@@ -4538,8 +4545,8 @@ export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
   readonly id: string;
   /**
    * Every open's `options.profiles` is the instance's `profiles` (`HarnessModule.profilesInOpen`):
-   * a module instance's, and a registered kind's that takes them there (Claude Code). Default: what
-   * the built-in registry says of the instance's kind.
+   * a module instance's, and a registered kind's that takes them there (Claude Code). Default: a
+   * module instance's only (`@agents-io/daemon`'s: also what the built-in registry says of its kind).
    */
   readonly profilesInOpen: boolean;
   constructor(
@@ -4553,7 +4560,7 @@ export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
   ) {
     super();
     this.id = instance.name;
-    this.profilesInOpen = profilesInOpen ?? (instance.kind === 'module' || builtinHarnesses.get(instance.kind)?.profilesInOpen === true);
+    this.profilesInOpen = profilesInOpen ?? instance.kind === 'module';
   }
 
   // Read through when asked: an adapter that learns them from its harness (`HarnessModule.probeAtStart`, a bridge) has them only after its first probe.
@@ -4610,7 +4617,7 @@ export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
 
 /**
  * The adapter for one instance of a registered kind, built by the kind's module (`HarnessModule.create`;
- * default registry: the built-in kinds). Environment values are handed to the child process only, never
+ * default registry: none; `@agents-io/daemon`'s: the built-in kinds). Environment values go to the child process only, never
  * logged. `blobs` is the store media inputs point at: the adapter resolves them itself. `log` and
  * `harness` are what the adapter gets as `HarnessFactoryInit` (outside a gateway: no log, no other instances).
  */
@@ -4621,7 +4628,7 @@ export function buildHarness(
 ): InstanceHarness {
   if (i.unavailable) throw new Error(`harness instance ${i.name} is unavailable: ${i.unavailable}`);
   if (i.kind === 'module') throw new Error(`harness instance ${i.name} is a module harness; the gateway loads it at start`);
-  const registry = o.registry ?? builtinHarnesses;
+  const registry = o.registry ?? NO_REGISTRIES.harnessRegistry;
   const kind = registry.get(i.kind);
   if (!kind) throw new Error(`harness instance ${i.name}: harness kind ${JSON.stringify(i.kind)} is not registered (registered: ${registry.kinds.join(', ')})`);
   const adapter = kind.create({

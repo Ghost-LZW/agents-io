@@ -8,9 +8,8 @@ import { LARK_BOT_ADMIN_ENDPOINTS } from '@agents-io/channel-lark-bot';
 import { mailChannelModule } from '@agents-io/channel-mail';
 import { FakeChannel } from '@agents-io/testkit';
 import { builtinChannels } from '../src/bundle.js';
-import { ChannelRegistry } from '../src/channel-registry.js';
-import { adminEndpoints } from '../src/console.js';
-import { ConfigStore } from '../src/console-config.js';
+import { adminEndpoints, ChannelRegistry } from '@agents-io/kernel';
+import { ConfigStore } from '../src/defaults.js';
 import { consoleDaemon } from './console-helpers.js';
 
 /*

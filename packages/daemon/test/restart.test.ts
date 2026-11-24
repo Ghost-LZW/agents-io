@@ -6,8 +6,7 @@ import type { HarnessAdapter, SessionEvent } from '@agents-io/protocol';
 import { CodexHarness } from '@agents-io/harness-codex';
 import { FakeChannel } from '@agents-io/testkit';
 import { FakeAppServer } from '../../../harness/codex/test/fake-app-server.js';
-import { resolveConfig } from '../src/config.js';
-import { Gateway } from '../src/gateway.js';
+import { Gateway, resolveConfig } from '../src/defaults.js';
 import { cleanups, tmp, until } from './helpers.js';
 
 const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };

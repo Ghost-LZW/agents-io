@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { FakeTurnScript } from '@agents-io/testkit';
-import type { LocalClient } from '../src/client.js';
+import type { LocalClient } from '@agents-io/kernel';
 import { withholding } from '@agents-io/session';
 import { cleanups, closeAndWait, daemon, tmp, until, type World } from './helpers.js';
 import { mcpCall } from './output-tools-helpers.js';

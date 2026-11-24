@@ -16,6 +16,7 @@ const alias = [
   { find: /^@agents-io\/testkit$/, replacement: src('packages/testkit') },
   { find: /^@agents-io\/session$/, replacement: src('packages/session') },
   { find: /^@agents-io\/host-mcp$/, replacement: src('packages/host-mcp') },
+  { find: /^@agents-io\/kernel$/, replacement: src('packages/kernel') },
   { find: /^@agents-io\/daemon$/, replacement: src('packages/daemon') },
   { find: /^@agents-io\/channel-jsonl-bridge$/, replacement: src('channel/jsonl-bridge') },
   { find: /^@agents-io\/channel-lark-bot$/, replacement: src('channel/lark-bot') },

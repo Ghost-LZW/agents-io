@@ -23,7 +23,7 @@ import {
   type WatchSource,
 } from '@agents-io/protocol';
 import { DEFAULT_BLOB_MAX_BYTES, Router, RouterError, checkIdentities, ownerIdentities, ownersTable, type AgentContactRule, type AgentSpec, type LoopGuardOptions } from '@agents-io/session';
-import { builtinChannels, builtinHarnesses, builtinModules, type BuiltinChannelEntry, type BuiltinChannelSettings, type BuiltinModuleSections, type ExternalMcpConfig, type PresetConfig } from './bundle.js';
+import { NO_REGISTRIES } from './core.js';
 import type { ChannelRegistry } from './channel-registry.js';
 import { ConfigError } from './config-error.js';
 import { loadEnvFile } from './env-file.js';
@@ -45,7 +45,7 @@ import { KERNEL_TOOL_NAMES } from '@agents-io/host-mcp';
  * `env_key` / `env_vars`); where that is impossible "env:" is refused. Each
  * harness kind's module does that for its own keys (`HarnessModule.resolve`,
  * through `HarnessChildSecrets`); the kinds are the ones a `HarnessRegistry`
- * holds (`bundle.ts` registers Claude Code and Codex).
+ * holds (`@agents-io/daemon`'s `bundle.ts` registers Claude Code and Codex).
  *
  * Agents (`agents: { <name>: { harness | preset, model?, effort?, profile?, cwd?,
  * mode?, tools?, instructionsFile? } }`) are named run configurations over the
@@ -182,17 +182,17 @@ const ChannelCommon = {
   evidence: Type.Optional(Type.Array(Evidence)),
 };
 
-type ChannelCommonFields = Static<TObject<typeof ChannelCommon>>;
+export type ChannelCommonFields = Static<TObject<typeof ChannelCommon>>;
 
 /** The keys of a channel entry the host owns (`type` and `ChannelCommon`): what a type's `resolve` returns for them does not count. */
 const HOST_CHANNEL_KEYS: ReadonlySet<string> = new Set(['type', ...Object.keys(ChannelCommon)]);
 
-/**
- * Channel ids of the built-in adapters, local ends and agent addresses (`agent:<agent>:<sessionKey>`
- * routes, the `agent` identity namespace the daemon stamps, ID-7): no bridge or module channel may use them.
- * The ones the built-in types declare (`ChannelModule.ids`), then the daemon's own (`CORE_CHANNEL_IDS`).
+/*
+ * The channel ids no bridge or module channel may use are a registry's (`ChannelRegistry.reservedIds`:
+ * the ids its types declare, `ChannelModule.ids`, then the daemon's own, `CORE_CHANNEL_IDS`: local
+ * ends and agent addresses, `agent:<agent>:<sessionKey>` routes, the `agent` identity namespace the
+ * daemon stamps, ID-7); `RESERVED_CHANNEL_IDS` is `@agents-io/daemon`'s, over the built-in types.
  */
-export const RESERVED_CHANNEL_IDS: readonly string[] = builtinChannels.reservedIds;
 /** Evidence a channel of a type registered `ungranted` (bridge, module) may give without an `evidence` grant. */
 export const UNGRANTED_EVIDENCE: readonly Evidence[] = ['device_only', 'none'];
 
@@ -212,9 +212,9 @@ function channelEntrySchema(registry: ChannelRegistry): TSchema {
   return s;
 }
 
-/** A `channels[]` entry of a built-in type, as written. */
-export type ChannelEntry = ChannelCommonFields & BuiltinChannelEntry;
-const ChannelEntry = channelEntrySchema(builtinChannels) as TSchema & { static: ChannelEntry };
+/** A `channels[]` entry as written: `type` (a registered one), the keys every entry has and the type's own (`@agents-io/daemon`'s `ChannelEntry` is typed for the built-in types). */
+export type ChannelEntry = ChannelCommonFields & { type: string; [key: string]: unknown };
+const ChannelEntry = channelEntrySchema(NO_REGISTRIES.channelRegistry) as TSchema & { static: ChannelEntry };
 
 /** The `console` section's own keys before the modules' ones: the console server's. */
 const ConsoleServerKeys = {
@@ -357,8 +357,8 @@ const ModuleFileEntry = Type.Object(
 export type ModuleFileEntry = Static<typeof ModuleFileEntry>;
 
 /**
- * The config file's own keys (the kernel's) over the built-in harness kinds and channel types:
- * `ConfigFile` without the modules' sections (`configFileSchema` adds a registry's).
+ * The config file's own keys (the kernel's), with no harness kind or channel type registered:
+ * `configFileSchema` puts a registry's in their places and adds its modules' sections.
  */
 const KernelFile = Type.Object(
   {
@@ -377,11 +377,11 @@ const KernelFile = Type.Object(
     /** Working directory for harness sessions (default: the current directory). */
     cwd: Type.Optional(Type.String()),
     /** Named harness instances; `RunSpec.harness` is the name. Each entry is checked against its `use` (a registered kind, or `module`). */
-    harnesses: harnessesSchema(builtinHarnesses),
+    harnesses: harnessesSchema(NO_REGISTRIES.harnessRegistry),
     /** Instance the default policy plans (default: the only one, else the first). */
     defaultHarness: Type.Optional(Type.String()),
     /** Older single-harness form; each section becomes an instance named after its kind. */
-    harness: legacyBlockSchema(builtinHarnesses),
+    harness: legacyBlockSchema(NO_REGISTRIES.harnessRegistry),
     // (The presets module's section `presets` comes here: `ModuleFields.sectionAfter`.)
     /** Named run configurations (agents); see AgentEntry. */
     agents: Type.Optional(Type.Record(Type.String(), AgentEntry)),
@@ -526,7 +526,7 @@ const KernelFile = Type.Object(
      * `aio serve`, on 127.0.0.1:7464. A non-loopback `host` is refused unless
      * `allowRemote` is true (then every request still needs a token).
      */
-    console: Type.Optional(consoleSchema(builtinChannels)),
+    console: Type.Optional(consoleSchema(NO_REGISTRIES.channelRegistry)),
     /**
      * The host connection. `tokenFile`: an operator-set host token, stable across restarts
      * (relative paths are relative to the config file). Read when the file exists (it must be
@@ -552,8 +552,8 @@ const KernelFile = Type.Object(
   Closed,
 );
 
-/** The config file as written, over the built-in harness kinds, channel types and modules. */
-export type ConfigFile = Static<typeof KernelFile> & BuiltinModuleSections;
+/** The config file as written: the kernel's keys (`@agents-io/daemon`'s `ConfigFile` adds the built-in modules' sections). */
+export type ConfigFile = Static<typeof KernelFile>;
 
 const fileSchemas = new WeakMap<HarnessRegistry, WeakMap<ChannelRegistry, WeakMap<ModuleRegistry, TObject>>>();
 
@@ -585,14 +585,14 @@ function moduleSections(modules: ModuleRegistry): { key: string; schema: TSchema
 /**
  * The config file's schema over a registry's harness kinds (`harnesses.<name>.use`, the older
  * `harness` block), a registry's channel types (`channels[].type` and the settings they add to
- * `console`; default the built-in ones) and a registry's modules (their config sections; default
- * the built-in ones); the rest is the kernel's own keys. The modules' sections come before `local`,
+ * `console`; default none) and a registry's modules (their config sections; default none); the
+ * rest is the kernel's own keys. The modules' sections come before `local`,
  * where `externalMcp` was before it was a module, unless the registry places one after a key of
  * the file's own, where it was before it was a module's (`ModuleFields.sectionAfter`: `presets`
  * after `harness`), so a file's schema errors come in the order they always did. Built once per set
- * of registries (`ConfigFile` is the built-in ones').
+ * of registries (`@agents-io/daemon`'s `ConfigFile` is the built-in ones').
  */
-export function configFileSchema(registry: HarnessRegistry, channels: ChannelRegistry = builtinChannels, modules: ModuleRegistry = builtinModules): TObject {
+export function configFileSchema(registry: HarnessRegistry, channels: ChannelRegistry = NO_REGISTRIES.channelRegistry, modules: ModuleRegistry = NO_REGISTRIES.moduleRegistry): TObject {
   let byChannels = fileSchemas.get(registry);
   if (!byChannels) fileSchemas.set(registry, (byChannels = new WeakMap()));
   let byModules = byChannels.get(channels);
@@ -620,12 +620,6 @@ export function configFileSchema(registry: HarnessRegistry, channels: ChannelReg
   }
   return s;
 }
-
-/**
- * The config file's schema over the built-in harness kinds, channel types and modules (`bundle.ts`):
- * the kernel's keys and the built-in modules' sections (`externalMcp`).
- */
-export const ConfigFile: TObject = configFileSchema(builtinHarnesses, builtinChannels, builtinModules);
 
 interface InstanceBase {
   /** Instance name: `RunSpec.harness`, and the `harness` of its session events. */
@@ -702,9 +696,6 @@ export interface SessionParams {
   envPathRoots: Record<string, string[]>;
 }
 
-/** Variables naming a built-in harness's config dir (`HarnessModule.defaults.configDirEnv`): in `envKeys` only with roots in `envPathRoots`. */
-export const CONFIG_DIR_KEYS: string[] = builtinHarnesses.configDirKeys();
-
 export interface Config {
   /** Not fatal, logged at start (e.g. a lark-bot account with ':'). */
   warnings?: string[];
@@ -718,13 +709,6 @@ export interface Config {
   harnesses: Record<string, HarnessInstance>;
   /** The instance the default policy plans. */
   defaultHarness: string;
-  /**
-   * Deprecated, kept for one release: the presets (section `presets`: harness instance + model +
-   * effort, in config order), the same object as the presets module's settings in `modules`
-   * (`ModuleFields.config`, set by `bundle.ts`), while it is on (absent in a build without it).
-   * Given another value or removed before `Gateway.start`, it still decides what the runs take.
-   */
-  presets?: Record<string, PresetConfig>;
   /** Named agents (without `agents` in the file: one, `default`, on the default instance). */
   agents: Record<string, AgentConfig>;
   /** Agent of the default table and of rules naming none; undefined when there is no interactive agent. */
@@ -777,15 +761,10 @@ export interface Config {
   /** The host connection: `tokenFile` is an absolute path when set. */
   host?: { tokenFile?: string };
   /**
-   * Deprecated, kept for one release: the external MCP endpoint's settings (section `externalMcp`),
-   * when it is on; the same object as its module's in `modules` (`ModuleFields.config`, set by
-   * `bundle.ts`). Given another value or removed before `Gateway.start`, it still turns the
-   * endpoint on, changes or off.
-   */
-  externalMcp?: ExternalMcpConfig;
-  /**
    * The registered feature modules, on or off, with their settings (`resolveModules`), in
    * registration order (a module of a `modules` entry where its entry is); absent when there are none.
+   * A module's settings may also be on a field of the config its registry names (`ModuleFields.config`:
+   * `@agents-io/daemon`'s deprecated `Config.presets` and `Config.externalMcp`).
    */
   modules?: ResolvedModule[];
   /**
@@ -889,9 +868,9 @@ function resolveConsole(c: ConfigFile['console'], channels: ChannelRegistry): Co
 /**
  * A `channels[]` entry as resolved: `type`, the keys every entry has, `account` (default `default`)
  * and what the type's module made of the rest (`ChannelModule.resolve`; a `module` entry's `module`
- * is the resolved file to import). Typed for the built-in types; another registry's resolve the same way.
+ * is the resolved file to import). `@agents-io/daemon`'s `ResolvedChannel` is typed for the built-in types.
  */
-export type ResolvedChannel = ChannelCommonFields & { account: string } & BuiltinChannelSettings;
+export type ResolvedChannel = ChannelCommonFields & { type: string; account: string; [key: string]: unknown };
 
 /** `topics.parkedIdleMs` default: a parked topic's lane closes after 30 idle minutes. */
 export const DEFAULT_PARKED_IDLE_MS = 30 * 60_000;
@@ -941,11 +920,11 @@ export interface LoadOptions {
   cwd?: string;
   /** Resolve `channels` (default true). Clients and e2e leave them out, so they need no channel secrets. */
   channels?: boolean;
-  /** The harness kinds `use` may name (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
+  /** The harness kinds `use` may name (default none, as `coreRegistries`; `@agents-io/daemon`'s: the built-in ones); give `Gateway.start` the same. */
   harnessRegistry?: HarnessRegistry;
-  /** The channel types `channels[].type` may name (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
+  /** The channel types `channels[].type` may name (default none; `@agents-io/daemon`'s: the built-in ones); give `Gateway.start` the same. */
   channelRegistry?: ChannelRegistry;
-  /** The feature modules whose config sections the file may have (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
+  /** The feature modules whose config sections the file may have (default none; `@agents-io/daemon`'s: the built-in ones); give `Gateway.start` the same. */
   moduleRegistry?: ModuleRegistry;
 }
 
@@ -999,11 +978,11 @@ export interface ResolveContext {
   harness?: string;
   cwd?: string;
   channels?: boolean;
-  /** The harness kinds `use` may name (default the built-in ones, `bundle.ts`). */
+  /** The harness kinds `use` may name (default none, as `coreRegistries`; `@agents-io/daemon`'s: the built-in ones). */
   harnessRegistry?: HarnessRegistry;
-  /** The channel types `channels[].type` may name (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
+  /** The channel types `channels[].type` may name (default none; `@agents-io/daemon`'s: the built-in ones); give `Gateway.start` the same. */
   channelRegistry?: ChannelRegistry;
-  /** The feature modules whose config sections the file may have (default the built-in ones, `bundle.ts`); give `Gateway.start` the same. */
+  /** The feature modules whose config sections the file may have (default none; `@agents-io/daemon`'s: the built-in ones); give `Gateway.start` the same. */
   moduleRegistry?: ModuleRegistry;
 }
 
@@ -1029,9 +1008,9 @@ export function resolveModuleEntry(e: ModuleFileEntry, index: number, path: (p: 
 
 /** Validate a parsed config file and fill defaults. Error messages name keys, never values. */
 export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
-  const registry = ctx.harnessRegistry ?? builtinHarnesses;
-  const channelRegistry = ctx.channelRegistry ?? builtinChannels;
-  const moduleRegistry = ctx.moduleRegistry ?? builtinModules;
+  const registry = ctx.harnessRegistry ?? NO_REGISTRIES.harnessRegistry;
+  const channelRegistry = ctx.channelRegistry ?? NO_REGISTRIES.channelRegistry;
+  const moduleRegistry = ctx.moduleRegistry ?? NO_REGISTRIES.moduleRegistry;
   const schema = configFileSchema(registry, channelRegistry, moduleRegistry);
   const errs = errors(schema, raw);
   if (errs.length) throw new ConfigError(`invalid config: ${[...errs.slice(0, 5), ...unregistered(raw, schema, registry, channelRegistry)].join('; ')}`);

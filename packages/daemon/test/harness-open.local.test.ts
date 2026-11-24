@@ -5,10 +5,8 @@ import { describe, expect, it, vi } from 'vitest';
 import type { BlobAccess } from '@agents-io/protocol';
 import { CodexHarness, type CodexHarnessOptions } from '@agents-io/harness-codex';
 import { FakeChannel, type FakeHarness } from '@agents-io/testkit';
-import { LocalClient } from '../src/client.js';
-import { resolveConfig } from '../src/config.js';
-import { Gateway, InstanceHarness } from '../src/gateway.js';
-import { readTokenFile, tokenPath } from '../src/token.js';
+import { LocalClient, readTokenFile, tokenPath } from '@agents-io/kernel';
+import { Gateway, InstanceHarness, resolveConfig } from '../src/defaults.js';
 import { cleanups, tmp, until } from './helpers.js';
 
 /*

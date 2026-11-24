@@ -6,8 +6,7 @@ import type { InputRecord } from '@agents-io/protocol';
 import { FsBlobStore, MemorySessionLog } from '@agents-io/session';
 import { CLAUDE_IMAGE_MAX_BYTES, blobResolvers as claudeBlobResolvers, toUserMessage } from '@agents-io/harness-claude-code';
 import { blobMediaResolver, renderInputs } from '@agents-io/harness-codex';
-import { resolveConfig } from '../src/config.js';
-import { Gateway, InstanceHarness } from '../src/gateway.js';
+import { Gateway, InstanceHarness, resolveConfig } from '../src/defaults.js';
 
 /** What each built-in adapter resolves media with, given the daemon's blob store (`HarnessFactoryInit.blobs`). */
 const blobResolvers = (store: FsBlobStore) => ({ ...claudeBlobResolvers(store), resolveMedia: blobMediaResolver(store) });

@@ -1,5 +1,5 @@
 import type { KernelContext, KernelSessionRun, ModuleCommandDef, ModuleCommandHandler, ModuleManifest } from '@agents-io/protocol';
-import { FIXED_SESSION } from './commands.js';
+import { FIXED_SESSION } from '@agents-io/kernel';
 
 /*
  * The owner's run-config chat commands, as a built-in feature module (core-slimming G6 step 5;

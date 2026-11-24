@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { TokenError, loadOrCreateTokenFile, tokenPath } from '../src/token.js';
+import { loadOrCreateTokenFile, TokenError, tokenPath } from '@agents-io/kernel';
 import { daemon, tmp } from './helpers.js';
 
 describe('operator-set host token (host.tokenFile / --token-file)', () => {

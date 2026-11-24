@@ -1,6 +1,6 @@
 import { dirname } from 'node:path';
 import type { AdminContribution } from '@agents-io/protocol';
-import { builtinChannels, builtinModules } from './bundle.js';
+import { NO_REGISTRIES } from './core.js';
 import { badChannelModule, type ChannelAdminContribution, type ChannelRegistry } from './channel-registry.js';
 import { ConfigError, configPath, readConfigFile, resolveModuleEntry, type LoadOptions, type ModuleFileEntry } from './config.js';
 import { ChannelModuleFiles, isModuleChannelType, isModulePath, moduleChannelType, moduleSpec } from './module-channel.js';
@@ -23,9 +23,9 @@ import type { ModuleRegistry, RegisteredModule } from './modules.js';
 
 /** The registries a config is resolved with and a gateway runs, with what a config file's modules add. */
 export interface ConfigModules {
-  /** The given feature modules (default the built-in ones), then those of the file's `modules` entries (origin `module`). */
+  /** The given feature modules (default none; `@agents-io/daemon`'s: the built-in ones), then those of the file's `modules` entries (origin `module`). */
   moduleRegistry: ModuleRegistry;
-  /** The given channel types (default the built-in ones); their `module` type reads the descriptors the file's module channel entries export. */
+  /** The given channel types (default none; `@agents-io/daemon`'s: the built-in ones); their `module` type reads the descriptors the file's module channel entries export. */
   channelRegistry: ChannelRegistry;
   /**
    * The same import of another version of the file, over the registries this one was given (not
@@ -60,7 +60,7 @@ export async function loadConfigModules(o: LoadOptions = {}): Promise<ConfigModu
  * answer imports another version of the file over the same given registries.
  */
 export async function importConfigModules(raw: unknown, o: { baseDir: string; moduleRegistry?: ModuleRegistry; channelRegistry?: ChannelRegistry }): Promise<ConfigModules> {
-  const base = { moduleRegistry: o.moduleRegistry ?? builtinModules, channelRegistry: o.channelRegistry ?? builtinChannels };
+  const base = { moduleRegistry: o.moduleRegistry ?? NO_REGISTRIES.moduleRegistry, channelRegistry: o.channelRegistry ?? NO_REGISTRIES.channelRegistry };
   const importModules: ImportConfigModules = (next, at) => importConfigModules(next, { baseDir: at.baseDir, ...base });
   let { moduleRegistry, channelRegistry } = base;
   const file = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};

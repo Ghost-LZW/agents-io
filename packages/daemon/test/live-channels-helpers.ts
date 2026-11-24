@@ -4,7 +4,7 @@ import { expect } from 'vitest';
 import { AdminLarkBotJob } from '@agents-io/channel-lark-bot';
 import { AdminConfigPutResult, check, type AdminConfigDocument } from '@agents-io/protocol';
 import { FakeChannel, type FakeTurnScript } from '@agents-io/testkit';
-import type { ResolvedChannel } from '../src/config.js';
+import type { ResolvedChannel } from '../src/defaults.js';
 import { SOURCE_LOADER, daemon, until } from './helpers.js';
 
 export const RAW_CHILD = fileURLToPath(new URL('../../../channel/jsonl-bridge/test/fixtures/raw_child.mjs', import.meta.url));

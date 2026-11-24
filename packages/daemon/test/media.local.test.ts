@@ -5,8 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { ChannelContext, InputRecord } from '@agents-io/protocol';
 import { MemorySessionLog } from '@agents-io/session';
 import { FakeChannel, FakeHarness } from '@agents-io/testkit';
-import { resolveConfig } from '../src/config.js';
-import { Gateway } from '../src/gateway.js';
+import { Gateway, resolveConfig } from '../src/defaults.js';
 
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {

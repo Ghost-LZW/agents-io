@@ -3,9 +3,8 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { FakeTurnScript } from '@agents-io/testkit';
 import { exitCodeFor, main } from '../src/cli.js';
-import { CommandError, DaemonUnavailable } from '../src/client.js';
-import { ConfigError, configTable, resolveConfig } from '../src/config.js';
-import { TokenError, tokenPath } from '../src/token.js';
+import { CommandError, ConfigError, configTable, DaemonUnavailable, TokenError, tokenPath } from '@agents-io/kernel';
+import { resolveConfig } from '../src/defaults.js';
 import { cli } from './cli-helpers.js';
 import { daemon, tmp } from './helpers.js';
 

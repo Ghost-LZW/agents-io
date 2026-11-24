@@ -7,6 +7,14 @@ output tools, watches, the durable host inbound queue, and a local Unix socket
 that speaks both the client frames (`packages/protocol/src/client.ts`) and the
 host frames (`packages/protocol/src/host.ts`, spec in `docs/HOSTS.md`).
 
+This package is the composition root: `src/bundle.ts` registers the built-in channel types,
+harness kinds and feature modules (the module packages under `channel/` and `harness/`, and the
+feature modules in `src/`), on the kernel, `@agents-io/kernel` (`packages/kernel`: the gateway,
+config resolution, the module host and registries, the local socket, the host and client
+protocol, records, the console's core), which depends on no module package. The package's API is
+the kernel's, with the built-in registries as the defaults where the kernel's are empty
+(`src/defaults.ts`), and the built-in modules ("Library" below).
+
 It grew out of `examples/dev-gateway`; that example is now a thin `aio-dev`
 wrapper around this CLI.
 
@@ -112,7 +120,7 @@ see `docs/E2E.md` §0). New:
   are credentials (`x-credential`, `isCredential`; the console's advice about a literal one,
   `credentialHint`), who owns its channel ids and how its
   adapter is built. `lark-bot`, `mail` and `bridge` are in their packages
-  (`channel/*/src/module.ts`); `module` is the daemon's own (`src/module-channel.ts`).
+  (`channel/*/src/module.ts`); `module` is the kernel's (`packages/kernel/src/module-channel.ts`, `moduleChannelModule`).
   The bundle also says which types' adapters are trusted with their caps' evidence
   without an `evidence` grant (lark-bot, mail). The daemon's config code, its gateway and
   its console name no type: what a type adds to the console (lark-bot's `/api/bots/lark`
@@ -918,7 +926,7 @@ where it always was in the file schema, after `harness`; its `resolve` checks th
 digits, `.`, `_`, `-`, at most 64; `default` is reserved) and that each `harness` is a configured
 instance (`ctx.harnesses`), with the errors as before. On whenever registered (there is no
 `enabled`); nothing runs (its `setup` returns an empty instance). The daemon asks it what a preset
-gives through `NamedRuns` (`src/run-defaults.ts`; `Gateway.namedRuns`), for an agent's `preset`,
+gives through `NamedRuns` (the kernel's `run-defaults.ts`; `Gateway.namedRuns`), for an agent's `preset`,
 `run.start` `overrides.preset`, the preset set for a session (each turn: one no longer given is
 `stalePreset`, the agent's own runs) and `/preset`'s list. `Config.presets` (deprecated, one
 release) is its settings. A registry without it (`coreRegistries()`, an embedder's own) has no
@@ -938,6 +946,16 @@ secret-looking key); `x-credential` marks in a module's schema are not read yet.
 `Gateway.start({ config, … })` starts everything in-process (tests and e2e use
 `harness` / `buildHarness` / `channels` to inject fakes); `LocalClient` speaks both
 client and host frames (`hello`, `runStart`, `runEndedOf`, `inboundRead`, `onRequest('inbound' | 'policy', …)`, …).
+Everything `@agents-io/kernel` exports is exported here too; where a kernel function or class
+takes registries and defaults to none, this package's (`src/defaults.ts`) defaults to the built-in
+ones (`builtinHarnesses`, `builtinChannels`, `builtinModules`): `Gateway` (`start`; it also
+gives the kernel this package's `aio` as `GatewayOptions.cli`), `resolveConfig`, `loadConfig`,
+`loadConfigModules`, `importConfigModules`, `configFileSchema`, `ConfigStore`, `InstanceHarness`
+(without `profilesInOpen`, what the built-in registry says of the kind), `buildHarness`,
+`isCredential`, `redact`, `unredact`, `implicitEnv`. `ConfigFile`, `RESERVED_CHANNEL_IDS` and
+`CONFIG_DIR_KEYS` are the built-in registries', and `Config`, `ConfigFile`, `ChannelEntry`,
+`ResolvedChannel` are typed for the built-in channel types and modules. The classes are the
+kernel's with these defaults: `instanceof` either one holds for the instances of both.
 
 A config naming module files (`modules` entries, module channel files exporting a descriptor) is
 loaded as `aio serve` does: `const r = await loadConfigModules({ path })` (or
@@ -953,15 +971,17 @@ names none gives the registries back unchanged.
 
 ### The kernel without modules (core-only)
 
-`coreRegistries()` (`src/core.ts`) gives a harness, channel and module registry with nothing
-registered: no harness kind (no Claude Code, no Codex), no channel type (no lark-bot, mail,
-bridge or `module` entry), no feature module (no topic titles, owner commands, presets, stranger
-approval, watch / live / topic tools or external MCP endpoint). `core.ts` imports no module package and not
-the composition root (`bundle.ts`). Give the same registries to the config and the gateway, and
-pass the channel and the harness yourself:
+The kernel alone is its own package, `@agents-io/kernel` (`packages/kernel`): it depends on no
+module package (no channel or harness package, not this one), and a registry it is not given is an
+empty one. `coreRegistries()` (`packages/kernel/src/core.ts`) gives a harness, channel and module
+registry with nothing registered: no harness kind (no Claude Code, no Codex), no channel type (no
+lark-bot, mail, bridge or `module` entry), no feature module (no topic titles, owner commands,
+presets, stranger approval, watch / live / topic tools or external MCP endpoint). Give the same
+registries to the config and the gateway (or none to either), and pass the channel and the
+harness yourself:
 
 ```ts
-import { Gateway, coreRegistries, resolveConfig } from '@agents-io/daemon';
+import { Gateway, coreRegistries, resolveConfig } from '@agents-io/kernel';
 
 const registries = coreRegistries();
 const config = resolveConfig({ dataDir, policy: { owners: ['chat:alice'] } }, { env: process.env, baseDir, ...registries });
@@ -992,14 +1012,15 @@ const gw = await Gateway.start({
   the six kernel model tools (`KERNEL_TOOL_NAMES`) for an agent with `tools`; the kernel's
   `host.hello` features (`FEATURES`); the console's core endpoints (`/api/bots/lark` is an
   unknown route, 404). The session log, lanes, outbox, requests, host inbound queue, explain and
-  the host protocol are the same as in the bundled `aio`: `test/core-only.test.ts` runs the
-  kernel's promises (IN-1, IN-5, LN-1, LN-2, LN-10, DL-1, DL-2, EX-2, RQ-1, HQ-1) on it with
-  testkit's `FakeChannel` and `FakeHarness`.
-- Not yet a build without the module packages: `gateway.ts`, `config.ts` and
-  `console-config.ts` still import `bundle.ts` for their defaults (the built-in registries when
-  none is given, `ConfigFile`, `RESERVED_CHANNEL_IDS`, `CONFIG_DIR_KEYS`), so
-  `@agents-io/daemon` still depends on them and loads them; with `coreRegistries()` none of
-  their code runs.
+  the host protocol are the same as in the bundled `aio`: `packages/kernel/test/core-only.test.ts`
+  runs the kernel's promises (IN-1, IN-5, LN-1, LN-2, LN-10, DL-1, DL-2, EX-2, RQ-1, HQ-1) on it
+  with testkit's `FakeChannel` and `FakeHarness`, importing nothing but the kernel.
+- A harness whose terminal UI takes a session over (`HarnessAdapter.takeover`) gets the CLI its
+  helpers run as from `GatewayOptions.cli` (`TakeoverServices.cli`); the kernel has none of its
+  own, so without it `aio tui` / `tui.attach` on such a session is answered `unsupported`.
+  This package's `Gateway.start` gives its `aio` (`dist/cli.js`).
+- `@agents-io/daemon` still works this way too (`coreRegistries()` given to both), and loads the
+  module packages without running their code.
 
 What changed for embedders with core-slimming §4 P2 item 5 (the kernel without modules):
 
@@ -1525,3 +1546,32 @@ What changed for embedders with the presets module (core-slimming §4, 2026-11-2
   (start from `builtinModules.modules`) or a module of its own with `runDefaults`: without one, a config naming
   `agents.<name>.preset` fails to load (`unknown preset "p" (no registered module provides
   presets)`), `overrides.preset` is answered `bad_override` and `/preset` says there are none.
+
+What changed for embedders with the kernel package (core-slimming §4 "不含模块包的构建", 2026-11-25):
+
+- The kernel is its own package, `@agents-io/kernel` (`packages/kernel`): everything of this
+  package but the composition root (`bundle.ts`, `cli.ts` and the files it alone uses: `attach.ts`,
+  `render.ts`, `watch-spec.ts`) and the built-in feature modules (`external-mcp.ts`,
+  `owner-commands.ts`, `presets.ts`, `strangers.ts`, `tool-modules.ts`, `topic-title.ts`) moved
+  there, under the same file names. It depends on no module package, and nothing in it imports
+  this one; `pnpm boundaries:check` now also counts a core package's package.json dependencies.
+- `@agents-io/daemon`'s exports are as before (the same names, the same defaults; `dist/index.js`,
+  `dist/cli.js` and `aio` are where they were), plus `isModuleChannelType`, `moduleChannelModule`,
+  `FIXED_SESSION`, `ephemeralTurn`, `EPHEMERAL_TURN_MS`, `harnessModuleCommands`,
+  `testHooksFromEnv` and `TEST_HOOKS_ENV` (what the composition root's own modules and CLI use).
+- `@agents-io/kernel`'s are the same names, but a registry not given is an empty one where this
+  package's is the built-in one (`ResolveContext`, `LoadOptions`, `GatewayOptions`,
+  `ConfigStoreOptions`, `importConfigModules`, `buildHarness`, the console's credential marks), an
+  `InstanceHarness` without `profilesInOpen` takes the profiles in its opens only for a module
+  instance, and it has no `ConfigFile` schema value, `RESERVED_CHANNEL_IDS` or `CONFIG_DIR_KEYS`
+  (they are the built-in registries': `configFileSchema(...)`, `ChannelRegistry.reservedIds` and
+  `HarnessRegistry.configDirKeys()` give a registry's). Its `Config` has no `presets` or
+  `externalMcp` field (this package's adds them, deprecated as before), and its `ChannelEntry`,
+  `ResolvedChannel` and `ConfigFile` are typed for any channel type (`type: string` and the type's
+  own keys as `unknown`); `ChannelCommonFields` (the keys every entry has) is new.
+- New: `GatewayOptions.cli`, the CLI a terminal UI's helpers run as (`TakeoverServices.cli`); the
+  gateway used to take the `cli.js` next to its own module. This package's `Gateway.start` gives
+  its own, so nothing changes here; the kernel's refuses a takeover without one (`unsupported`).
+- The gateway's constructor is `protected` (it was `private`) so that this package's `Gateway` can
+  extend it; `Gateway.start` is still the way to make one. `GET /api/status` `version` is the
+  kernel package's version (`0.1.0`, as the daemon's).

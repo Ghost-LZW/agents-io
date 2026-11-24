@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ClaudeLaunch } from '@agents-io/harness-claude-code';
 import { launchFlags, type CodexLaunch } from '@agents-io/harness-codex';
-import { ConfigError, defaultInstance, findEnvFile, loadConfig, resolveConfig } from '../src/config.js';
+import { ConfigError, defaultInstance, findEnvFile } from '@agents-io/kernel';
+import { loadConfig, resolveConfig } from '../src/defaults.js';
 
 const dirs: string[] = [];
 afterEach(() => {

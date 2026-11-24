@@ -1,12 +1,14 @@
 {
-  "$comment": "Classification for scripts/boundaries.mjs (docs/design/core-slimming §6). role: core = the kernel every host gets; module = an adapter the kernel reaches only through protocol interfaces; test = test support, never imported by production code; example = may import anything. `may` lists the workspace packages (by directory) a package's src may import. `bundle` names the files of a core package allowed to import modules: the composition root that registers the built-in modules.",
+  "$comment": "Classification for scripts/boundaries.mjs (docs/design/core-slimming §6). role: core = the kernel every host gets; module = an adapter the kernel reaches only through protocol interfaces; test = test support, never imported by production code; example = may import anything. `may` lists the workspace packages (by directory) a package's src may import and its package.json may depend on. `root: true` marks the composition root, the one core package that registers the built-in modules: it may depend on module packages, and its `bundle` files (no other package has any) may import them.",
   "packages": {
     "packages/protocol": { "role": "core", "may": [] },
     "packages/session": { "role": "core", "may": ["packages/protocol"] },
     "packages/host-mcp": { "role": "core", "may": ["packages/protocol", "packages/session"] },
+    "packages/kernel": { "role": "core", "may": ["packages/protocol", "packages/session", "packages/host-mcp"] },
     "packages/daemon": {
       "role": "core",
-      "may": ["packages/protocol", "packages/session", "packages/host-mcp"],
+      "root": true,
+      "may": ["packages/protocol", "packages/session", "packages/host-mcp", "packages/kernel"],
       "bundle": ["src/bundle.ts"]
     },
     "packages/testkit": { "role": "test", "may": ["packages/protocol"] },

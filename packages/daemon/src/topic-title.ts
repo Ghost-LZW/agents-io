@@ -1,6 +1,6 @@
 import type { HarnessAdapter, KernelContext, ModuleManifest, RunSpec, SessionEvent } from '@agents-io/protocol';
 import { withholding } from '@agents-io/session';
-import { ephemeralTurn } from './ephemeral-turn.js';
+import { ephemeralTurn } from '@agents-io/kernel';
 
 /*
  * Topic titles made by the model, as a built-in feature module (core-slimming G4, G6 step 2;

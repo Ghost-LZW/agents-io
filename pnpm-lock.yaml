@@ -158,6 +158,9 @@ importers:
       '@agents-io/host-mcp':
         specifier: workspace:*
         version: link:../host-mcp
+      '@agents-io/kernel':
+        specifier: workspace:*
+        version: link:../kernel
       '@agents-io/protocol':
         specifier: workspace:*
         version: link:../protocol
@@ -167,9 +170,6 @@ importers:
       '@sinclair/typebox':
         specifier: ^0.34.0
         version: 0.34.52
-      ws:
-        specifier: ^8.22.0
-        version: 8.22.0
     devDependencies:
       '@agents-io/testkit':
         specifier: workspace:*
@@ -180,6 +180,9 @@ importers:
       '@types/ws':
         specifier: ^8.18.2
         version: 8.18.2
+      ws:
+        specifier: ^8.22.0
+        version: 8.22.0
 
   packages/daemon-e2e:
     dependencies:
@@ -220,6 +223,31 @@ importers:
       '@agents-io/testkit':
         specifier: workspace:*
         version: link:../testkit
+
+  packages/kernel:
+    dependencies:
+      '@agents-io/host-mcp':
+        specifier: workspace:*
+        version: link:../host-mcp
+      '@agents-io/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@agents-io/session':
+        specifier: workspace:*
+        version: link:../session
+      '@sinclair/typebox':
+        specifier: ^0.34.0
+        version: 0.34.52
+      ws:
+        specifier: ^8.22.0
+        version: 8.22.0
+    devDependencies:
+      '@agents-io/testkit':
+        specifier: workspace:*
+        version: link:../testkit
+      '@types/ws':
+        specifier: ^8.18.2
+        version: 8.18.2
 
   packages/protocol:
     dependencies:

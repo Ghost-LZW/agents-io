@@ -1,8 +1,7 @@
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { isCredential } from '../src/console-config.js';
-import { resolveConfig } from '../src/config.js';
+import { isCredential, resolveConfig } from '../src/defaults.js';
 import { daemon, tmp } from './helpers.js';
 
 describe('operator-set host token (host.tokenFile / --token-file)', () => {
@@ -28,7 +27,7 @@ describe('operator-set host token (host.tokenFile / --token-file)', () => {
     const b = join(dir, 'b.token');
     writeFileSync(a, 'a'.repeat(32), { mode: 0o600 });
     writeFileSync(b, 'b'.repeat(32), { mode: 0o600 });
-    const { Gateway } = await import('../src/gateway.js');
+    const { Gateway } = await import('../src/defaults.js');
     const config = resolveConfig({ dataDir: dir, logPath: ':memory:', host: { tokenFile: a } }, { env: {}, baseDir: dir, cwd: dir });
     const gw = await Gateway.start({ config, listen: false, tokenFile: b, logger: () => {} });
     expect(gw.token).toBe('b'.repeat(32));

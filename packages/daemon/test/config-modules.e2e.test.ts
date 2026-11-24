@@ -3,8 +3,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, 
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { LocalClient } from '../src/client.js';
-import { readTokenFile, tokenPath } from '../src/token.js';
+import { LocalClient, readTokenFile, tokenPath } from '@agents-io/kernel';
 import { SOURCE_LOADER, cleanups, tmp, until } from './helpers.js';
 
 /*

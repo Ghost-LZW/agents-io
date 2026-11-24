@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CommandError } from '../src/client.js';
+import { CommandError } from '@agents-io/kernel';
 import { until } from './helpers.js';
 import { alice, CONV, of, read, turnsIn, world } from './topics-helpers.js';
 

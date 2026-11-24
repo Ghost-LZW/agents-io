@@ -4,8 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import type { InputRecord } from '@agents-io/protocol';
 import { FakeChannel, FakeHarness } from '@agents-io/testkit';
-import { ConfigError, resolveConfig, type HarnessInstance } from '../src/config.js';
-import { Gateway, InstanceHarness, type ExtraChannel } from '../src/gateway.js';
+import { ConfigError, type ExtraChannel, type HarnessInstance } from '@agents-io/kernel';
+import { Gateway, InstanceHarness, resolveConfig } from '../src/defaults.js';
 import { SOURCE_LOADER, cleanups, tmp, until } from './helpers.js';
 
 /*

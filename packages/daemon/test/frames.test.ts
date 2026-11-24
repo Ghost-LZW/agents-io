@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { Command, PROTOCOL_VERSION, check } from '@agents-io/protocol';
-import { ClientCommand, ServerFrame, parseClientFrame } from '../src/frames.js';
+import { ClientCommand, parseClientFrame, ServerFrame } from '../../kernel/src/frames.js';
 
 const origin = { kind: 'human', principal: null, evidence: 'none', via: 'x', adapter: 'x' } as const;
 

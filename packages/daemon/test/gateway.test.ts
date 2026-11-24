@@ -6,9 +6,8 @@ import { describe, expect, it } from 'vitest';
 import { FrameDecoder, encodeFrame, type Policy, type SessionEvent } from '@agents-io/protocol';
 import { MemorySessionLog, SqliteSessionLog, isSnapshotEvent } from '@agents-io/session';
 import { FakeChannel, FakeHarness, assertConformingStream } from '@agents-io/testkit';
-import { CommandError, LocalClient } from '../src/client.js';
-import { resolveConfig, type HarnessInstance } from '../src/config.js';
-import { Gateway, InstanceHarness, buildHarness as buildRealHarness } from '../src/gateway.js';
+import { CommandError, type HarnessInstance, LocalClient } from '@agents-io/kernel';
+import { buildHarness as buildRealHarness, Gateway, InstanceHarness, resolveConfig } from '../src/defaults.js';
 import { cleanups, setup, until } from './gateway-helpers.js';
 import { daemon, until as untilD } from './helpers.js';
 

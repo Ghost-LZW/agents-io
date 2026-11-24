@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { FakeHarness } from '@agents-io/testkit';
-import { resolveConfig } from '../src/config.js';
-import { FEATURES } from '../src/host.js';
+import { FEATURES } from '@agents-io/kernel';
+import { resolveConfig } from '../src/defaults.js';
 import { until } from './helpers.js';
 import { completed, mcpCall, mcpTools, setup } from './output-tools-helpers.js';
 

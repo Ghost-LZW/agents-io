@@ -3,11 +3,8 @@ import { describe, expect, it } from 'vitest';
 import type { KernelContext, ModuleManifest, Origin, ReplyRoute, ScheduleView } from '@agents-io/protocol';
 import { MemorySessionLog } from '@agents-io/session';
 import { FakeChannel, FakeHarness } from '@agents-io/testkit';
-import { resolveConfig } from '../src/config.js';
-import { Gateway } from '../src/gateway.js';
-import { HarnessRegistry } from '../src/harness-registry.js';
-import { ChannelRegistry } from '../src/channel-registry.js';
-import { ModuleRegistry, type ModuleFields } from '../src/modules.js';
+import { ChannelRegistry, HarnessRegistry, type ModuleFields, ModuleRegistry } from '@agents-io/kernel';
+import { Gateway, resolveConfig } from '../src/defaults.js';
 import { cleanups, tmp } from './helpers.js';
 
 /*

@@ -7,9 +7,8 @@ import { CREATE_LARK_BOT, larkBotChannelModule } from '@agents-io/channel-lark-b
 import { mailChannelModule } from '@agents-io/channel-mail';
 import { FakeChannel, FakeHarness } from '@agents-io/testkit';
 import { builtinChannels, builtinHarnesses, CREATE_LARK_BOT as DEPRECATED_CREATE_LARK_BOT } from '../src/bundle.js';
-import { ChannelRegistry } from '../src/channel-registry.js';
-import { ConfigError, ConfigFile, configFileSchema, consoleSettings, resolveConfig, type HarnessInstance } from '../src/config.js';
-import { Gateway, InstanceHarness } from '../src/gateway.js';
+import { ChannelRegistry, ConfigError, consoleSettings, type HarnessInstance } from '@agents-io/kernel';
+import { ConfigFile, configFileSchema, Gateway, InstanceHarness, resolveConfig } from '../src/defaults.js';
 import { cleanups, tmp } from './helpers.js';
 
 /*

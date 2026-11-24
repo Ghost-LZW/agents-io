@@ -5,10 +5,8 @@ import { describe, expect, it } from 'vitest';
 import { ADMIN_REDACTED, type ChannelModule } from '@agents-io/protocol';
 import { FakeChannel, FakeHarness } from '@agents-io/testkit';
 import { builtinChannels } from '../src/bundle.js';
-import { ChannelRegistry } from '../src/channel-registry.js';
-import { resolveConfig, type HarnessInstance } from '../src/config.js';
-import { ConfigStore } from '../src/console-config.js';
-import { Gateway, InstanceHarness, type GatewayOptions } from '../src/gateway.js';
+import { ChannelRegistry, type GatewayOptions, type HarnessInstance } from '@agents-io/kernel';
+import { ConfigStore, Gateway, InstanceHarness, resolveConfig } from '../src/defaults.js';
 import { cleanups, tmp, until } from './helpers.js';
 
 /*

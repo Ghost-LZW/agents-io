@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ConfigStore } from '../src/console-config.js';
+import { ConfigStore } from '../src/defaults.js';
 import { tmp } from './helpers.js';
 
 /*

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { resolveConfig } from '../src/config.js';
+import { resolveConfig } from '../src/defaults.js';
 import { tmp } from './helpers.js';
 
 describe('/ws heartbeat (console.heartbeat)', () => {

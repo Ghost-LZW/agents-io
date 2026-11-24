@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { PROTOCOL_VERSION } from '@agents-io/protocol';
-import { FrameConn, type FrameTransport } from '../src/local-server.js';
+import { FrameConn, type FrameTransport } from '@agents-io/kernel';
 
 describe('FrameConn after it ended', () => {
   it('a connection replaced by a takeover acts on no more frames, even if its transport still delivers them #HQ-6', async () => {

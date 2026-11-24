@@ -4,11 +4,8 @@ import { mailChannelModule, type MailChannelEntry } from '@agents-io/channel-mai
 import { claudeCodeHarnessModule } from '@agents-io/harness-claude-code';
 import { codexHarnessModule } from '@agents-io/harness-codex';
 import { bridgeHarnessModule } from '@agents-io/harness-jsonl-bridge';
-import { ChannelRegistry } from './channel-registry.js';
+import { ChannelRegistry, HarnessRegistry, ModuleRegistry, moduleChannelModule, type ModuleChannelEntry, type ModuleChannelSettings } from '@agents-io/kernel';
 import { externalMcpModule, type ExternalMcpSection } from './external-mcp.js';
-import { HarnessRegistry } from './harness-registry.js';
-import { moduleChannelModule, type ModuleChannelEntry, type ModuleChannelSettings } from './module-channel.js';
-import { ModuleRegistry } from './modules.js';
 import { ownerCommandsModule, type OwnerCommandsSection } from './owner-commands.js';
 import { presetsModule, type PresetsSection } from './presets.js';
 import { strangersModule, type StrangersSection } from './strangers.js';
@@ -17,7 +14,8 @@ import { topicTitleModule, type TopicTitleSection } from './topic-title.js';
 
 /*
  * The composition root (docs/design/core-slimming §6): the built-in modules register here, and
- * only here does the daemon import a module package (`scripts/boundaries.json` `bundle`).
+ * only here does the daemon import a module package (`scripts/boundaries.json` `bundle`). The
+ * kernel (`@agents-io/kernel`) depends on none; `defaults.ts` gives these registries as its defaults.
  */
 
 /**

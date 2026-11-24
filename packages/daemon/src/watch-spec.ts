@@ -1,5 +1,5 @@
 import type { Watch, WatchDraft } from '@agents-io/protocol';
-import { ConfigError } from './config.js';
+import { ConfigError } from '@agents-io/kernel';
 
 /*
  * `key=value` watch specs shared by `aio-dev watch add` and the attach `/watch add`:

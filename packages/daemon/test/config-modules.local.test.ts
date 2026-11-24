@@ -3,9 +3,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { builtinChannels, builtinModules } from '../src/bundle.js';
-import { loadConfig } from '../src/config.js';
-import { loadConfigModules } from '../src/config-modules.js';
-import { isModuleChannelType, moduleChannelModule } from '../src/module-channel.js';
+import { isModuleChannelType, moduleChannelModule } from '@agents-io/kernel';
+import { loadConfig, loadConfigModules } from '../src/defaults.js';
 import { cli } from './cli-helpers.js';
 import { tmp } from './helpers.js';
 
