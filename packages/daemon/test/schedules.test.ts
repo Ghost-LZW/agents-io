@@ -115,7 +115,7 @@ interface Asked {
 
 describe("an agent's message schedule and the host's outbound checks", () => {
   // INVARIANTS DL-7 / DL-5 / SC-3 不成立 (2026-11-24): schedule_add is not asked of an outbound + outbound.content host, and its firing is not checked.
-  it.fails('outbound + outbound.content host without a scope: schedule_add is asked with the content, as send_message is, and refused where the host denies; what it allowed is asked again as it fires, as the agent\'s send then: held there, not sent #DL-7 #DL-5 #SC-3', async () => {
+  it('outbound + outbound.content host without a scope: schedule_add is asked with the content, as send_message is, and refused where the host denies; what it allowed is asked again as it fires, as the agent\'s send then: held there, not sent #DL-7 #DL-5 #SC-3', async () => {
     const results: { isError: boolean; text: string }[] = [];
     const holder: { w?: Awaited<ReturnType<typeof daemon>> } = {};
     const script: FakeTurnScript = async (t) => {
@@ -185,7 +185,7 @@ describe("an agent's message schedule and the host's outbound checks", () => {
   });
 
   // INVARIANTS DL-7 / SC-3 不成立 (2026-11-24): an agent's scheduled message into a chat in the scope goes out unchecked.
-  it.fails("outbound.scoped host: an agent's scheduled message into a chat in its scope is asked with its content as it fires; held, it is not sent. The owner's own schedule there is not asked, and says what it was #DL-7 #SC-3", async () => {
+  it("outbound.scoped host: an agent's scheduled message into a chat in its scope is asked with its content as it fires; held, it is not sent. The owner's own schedule there is not asked, and says what it was #DL-7 #SC-3", async () => {
     const results: { isError: boolean; text: string }[] = [];
     const holder: { w?: Awaited<ReturnType<typeof daemon>> } = {};
     const script: FakeTurnScript = async (t) => {

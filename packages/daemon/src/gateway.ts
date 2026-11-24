@@ -298,6 +298,8 @@ const DAEMON_VERSION: string = (() => {
 const GATEWAY_STOPPING = 'gateway stopping';
 /** U20: why a scoped send was held when the host could not answer. */
 const HOST_UNAVAILABLE = 'host_unavailable';
+/** `Schedule.createdBy` of a schedule a session's agent set: `session:<key>` (`agentIdentity`). */
+const AGENT_CREATOR = agentIdentity('');
 /** U20: the largest text-like attachment whose text the exit check gets. */
 const MAX_ATTACHMENT_TEXT = 64 * 1024;
 /** U20: attachments whose text the exit check gets (`text/*`, JSON, Markdown, CSV). */
@@ -373,6 +375,11 @@ export class Gateway {
    * `external`): who, taken into the in-flight mark (`sendTime`) for the outbound record.
    */
   private readonly externalSends = new Map<string, ExternalSender>();
+  /**
+   * An agent's scheduled messages while they are sent (`sendScheduled`): the firing as the turn they
+   * come from, for the exit check only (`exitCheck`), as the agent's send_message's turn is for its.
+   */
+  private readonly firings = new Map<string, TurnContext>();
   /** The durable host inbound queue (`on: "host"` rules), in the log's database. */
   readonly hostQueue: HostQueue;
   /** Sessions a harness's own terminal UI holds (`HarnessAdapter.takeover`, decision 15): the instance it stands in for. */
@@ -2801,9 +2808,13 @@ ${a.summary}` }],
    * `Outbox.exit`: with a scope declared, a checked turn's answer (`kind: reply`, checked as the turn
    * started) and anything else sent to a route in scope now are asked of the scoped host with their
    * content. The host away, slow, failing or answering badly: held (`host_unavailable`), the turn's own
-   * reply route too. No scope: nothing applies.
+   * reply route too. No scope: only an agent's send (`from`) to an `outbound` + `outbound.content` host.
+   * An agent's scheduled message as it fires (`firings`) is an agent's send, from the firing.
    */
-  private exitCheck(d: Delivery): Promise<ExitVerdict | undefined> | undefined {
+  private exitCheck(sent: Delivery): Promise<ExitVerdict | undefined> | undefined {
+    // An agent's scheduled message as it fires: checked as its send_message would be now, the firing as its turn.
+    const firing = sent.from === undefined ? this.firings.get(sent.operationId) : undefined;
+    const d = firing ? { ...sent, from: firing } : sent;
     if (d.kind === undefined) return undefined;
     // A send of a turn checked as it started, on a route it is checked on: checked whatever the scope is
     // now. A scope cleared meanwhile does not let it out unchecked (fail closed: no scoped host, held).
@@ -3422,20 +3433,51 @@ ${a.summary}` }],
     }
   }
 
-  /** A `message` schedule: one message through the outbox (once per firing, DL-2), checked like an output tool's. */
+  /**
+   * A `message` schedule: one message through the outbox (once per firing, DL-2). A module's client's
+   * (the external MCP endpoint's) goes out as that client, through its send_message's checks (DL-6).
+   * An agent's (`createdBy` a `session:` key) is the agent's message (`kind: tool`, as the agent, DL-4b):
+   * its route passed the outbound check when it was set (SC-3), and as it goes out the exit check sees
+   * it as it would the agent's send_message then (DL-7), the firing as its turn (`firingTurn`). Anyone
+   * else's (the owner's config, a host's `schedule.put`, the local principal's) is theirs, not checked
+   * again: `kind: host` for a host's, otherwise the daemon's own `notice`.
+   */
   private async sendScheduled(s: Schedule, operationId: string): Promise<void> {
     const route = s.route!;
-    // A module's client's schedule (the external MCP endpoint's) sends as that client, through the same checks as its send_message (DL-6).
     if (await this.modules.scheduledMessage({ schedule: s, operationId })) return;
     const ch = this.channelFor(route);
     if (!ch) throw new Error(this.noChannelMessage(route));
-    const rec = await this.outbox.send(ch.adapter, {
-      operationId,
-      sessionKey: `schedule:${s.id}`,
-      route: { ...route, account: ch.account },
-      msg: { text: s.text },
-    });
+    const d = { operationId, sessionKey: `schedule:${s.id}`, route: { ...route, account: ch.account }, msg: { text: s.text } };
+    const agentSession = s.createdBy.startsWith(AGENT_CREATOR) ? s.createdBy.slice(AGENT_CREATOR.length) : undefined;
+    let rec: DeliveryRecord;
+    if (agentSession === undefined) {
+      rec = await this.outbox.send(ch.adapter, { ...d, kind: s.createdBy.startsWith('host:') ? 'host' : 'notice', exitChecked: true });
+    } else {
+      this.firings.set(operationId, this.firingTurn(s, agentSession, operationId));
+      try {
+        rec = await this.outbox.send(ch.adapter, { ...d, kind: 'tool', as: agentIdentity(agentSession) });
+      } finally {
+        this.firings.delete(operationId);
+      }
+    }
     if (rec.status === 'rejected') throw new Error(`not sent: ${rec.error ?? 'rejected'}`);
+  }
+
+  /**
+   * The turn an agent's scheduled message comes from as it fires (the exit check's `from`): the agent's
+   * session, the firing as the turn (`turnId` the operationId) with one system input (the schedule's,
+   * as a firing that starts a turn has), and no reply route of its own: nobody is being answered, so
+   * while the host that decides is away it is not let out as a turn's own reply would be (DL-5).
+   */
+  private firingTurn(s: Schedule, sessionKey: string, operationId: string): TurnContext {
+    const input: InputRecord = {
+      inputId: operationId,
+      origin: { kind: 'system', principal: null, evidence: 'none', via: `schedule:${s.id}`, adapter: 'schedule' },
+      content: [{ type: 'text', text: s.text }],
+      replyRoute: null,
+      channelContext: { schedule: s.id, createdBy: s.createdBy },
+    };
+    return { sessionKey, turnId: operationId, run: { harness: 'schedule', model: 'schedule', profile: 'restricted' }, inputs: [input], replyRoute: null, deliveries: [] };
   }
 
   /** A `host` schedule: one item into the host inbound queue (the host decides what to do). */
@@ -3799,15 +3841,30 @@ ${a.summary}` }],
   /**
    * A schedule set by a session's agent (`KernelContext.schedules.add`, the schedule tools): as the
    * session's agent, under `putSchedule`'s rules (SC-3). One with a route only from the session's
-   * running turn `turnId`, and only where that turn may send (`toolsOutbound`), whoever asks.
+   * running turn `turnId`, and only where that turn may send its text now (`scheduleOutbound`), whoever asks.
    */
   async agentSchedule(sessionKey: string, draft: ScheduleDraft, turnId?: string): Promise<{ ok: true; schedule: Schedule } | { ok: false; code: string; message: string }> {
     if (draft.route) {
       const turn = this.lanes.get(sessionKey)?.currentTurn();
       if (!turn || turnId === undefined || turn.turnId !== turnId) return { ok: false, code: 'forbidden', message: 'a route can only be given while you are answering a message ("current" is that conversation)' };
-      if ((await this.toolsOutbound({ from: turn, to: draft.route })) !== 'allow') return { ok: false, code: 'forbidden', message: scheduleRouteRefusal(draft.route) };
+      const v = await this.scheduleOutbound(turn, draft.route, draft.text);
+      if (v.verdict === 'hold') return { ok: false, code: 'forbidden', message: `the host took this message; the schedule was not set${v.reason ? ` (${v.reason})` : ''}. Do not set it again` };
+      if (v.verdict !== 'allow') return { ok: false, code: 'forbidden', message: `${scheduleRouteRefusal(draft.route)}${v.reason ? ` (${v.reason})` : ''}` };
     }
     return this.putSchedule(agentOrigin(sessionKey, this.agentOfSession(sessionKey)), draft);
+  }
+
+  /**
+   * SC-3: the route of a message schedule an agent sets, checked as its send_message there would be
+   * now (`toolsOutbound`), except that an `outbound` + `outbound.content` host without a scope, which
+   * send_message asks with the content as the message goes out, is asked here with the text (`kind:
+   * tool`, DL-5, DL-7): there is no message going out yet. Its firing is checked again (`exitCheck`).
+   */
+  private async scheduleOutbound(turn: TurnContext, route: ReplyRoute, text: string): Promise<ExitVerdict> {
+    if (this.host.outboundScope() === undefined && this.host.outboundContentDeclared()) {
+      return this.askContent({ operationId: `schedule_add:${turn.turnId}`, sessionKey: turn.sessionKey, turnId: turn.turnId, route, kind: 'tool', content: { text } }, turn);
+    }
+    return { verdict: await this.toolsOutbound({ from: turn, to: route }) };
   }
 
   /**
