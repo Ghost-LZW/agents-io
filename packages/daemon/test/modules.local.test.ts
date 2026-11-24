@@ -479,6 +479,39 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     expect(w.gw.adminStatus().modules).toEqual([{ id: 'probe', origin: 'module', enabled: false }]);
   });
 
+  it('offeredTools: asked at every request to the endpoint, a module offers only those of its tools it names then (other names ignored), agents.tools too; a throw is logged and offers none; live.channels names the running channels that can open a live (none here)', async () => {
+    let now: string[] = [];
+    let boom = false;
+    const logs: string[] = [];
+    const kernels: KernelContext[] = [];
+    const offered: string[][] = [];
+    const holder: { h?: FakeHarness } = {};
+    const offeredTools = () => {
+      if (boom) throw new Error('boom');
+      return now;
+    };
+    const registry = new ModuleRegistry([probe('probe', [], { instance: (k) => (kernels.push(k), { offeredTools }) })]);
+    const w = await daemon(registry, {}, async (t) => {
+      offered.push(await listed(holder.h!.sessions.at(-1)!.args.mcp));
+      t.emit({ t: 'text.snapshot', text: 'ok', final: true }, { audience: 'answer' });
+    }, undefined, (level, msg) => logs.push(`${level} ${msg}`));
+    holder.h = w.harness;
+    await w.chat.inject({ sender: alice, text: 'hi' });
+    await until(() => offered.length === 1);
+    const k = kernels[0]!;
+    const mcp = w.harness.sessions[0]!.args.mcp;
+    expect(offered[0]).toEqual(KERNEL_TOOL_NAMES);
+    expect(k.agents.tools(undefined)).toEqual(KERNEL_TOOL_NAMES);
+    expect(await mcpCall(mcp, 'probe_echo', { text: 'x' }, 'toolu_1')).toEqual({ isError: true, text: 'MCP error -32602: Tool probe_echo not found' });
+    now = ['probe_echo', 'send_message', 'nope'];
+    expect(await listed(mcp)).toEqual([...KERNEL_TOOL_NAMES, 'probe_echo']);
+    expect(k.agents.tools(undefined)).toEqual([...KERNEL_TOOL_NAMES, 'probe_echo']);
+    boom = true;
+    expect(await listed(mcp)).toEqual(KERNEL_TOOL_NAMES);
+    expect(logs).toContain('warn module probe: offeredTools failed: boom');
+    expect(k.live.channels()).toEqual([]);
+  });
+
   it('a module an alias turns off (console: { enabled: false }, policy.strangers: "drop") is never set up: no features, no status of its own', async () => {
     const seen: string[] = [];
     const registry = new ModuleRegistry([probe('panel', seen, { aliases: ['console'] }), probe('guests', seen, { aliases: ['policy.strangers'], aliasEnabled: (v) => v !== 'drop' })]);
@@ -958,10 +991,11 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     // A config error (or a token file's) names its setting itself: thrown as it is, so `aio serve` exits 2.
     const bad = new ConfigError('probe.greeting: the token file is not ours');
     await expect(start([probe('probe', seen, { instance: () => ({ start: async () => { throw bad; } }) })])).rejects.toBe(bad);
-    // A module stamps only peers' inputs; features is a function.
+    // A module stamps only peers' inputs; features and offeredTools are functions.
     const stamp = (k: KernelContext) => ({ start: () => k.lanes.input('S1', { inputId: 'i1', origin: { kind: 'human', principal: null, evidence: 'none' }, content: [], replyRoute: null } as never).then(() => undefined) });
     await expect(start([probe('probe', seen, { instance: stamp })])).rejects.toThrow('module probe: start failed: module probe: lanes.input takes a peer\'s input (origin.kind "peer", not "human")');
     await expect(start([probe('probe', seen, { instance: () => ({ features: ['probe.v1'] as never }) })])).rejects.toThrow(new ConfigError('module probe: features must be a function'));
+    await expect(start([probe('probe', seen, { instance: () => ({ offeredTools: ['probe_echo'] as never }) })])).rejects.toThrow(new ConfigError('module probe: offeredTools must be a function'));
     // The config and the gateway must have the same registry.
     const dir = mkdtempSync(join(tmpdir(), 'aio-mod-'));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));

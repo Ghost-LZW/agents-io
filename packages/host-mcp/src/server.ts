@@ -24,11 +24,12 @@ export interface ToolEntry {
 }
 
 /**
- * The tools an endpoint over `tools` offers, in the order it lists them: the kernel's in
+ * The tools an endpoint over `tools` may offer, in the order it lists them: the kernel's in
  * `TOOL_DEFS` order (`watch_*`, `schedule_*`, `session_*`, `live_*` only when the host passed their control),
  * then the active modules' (`HostToolsOptions.modules`; a module may offer one of those groups,
  * `TOOL_GROUP_DEFS`, when the host passed no control for it). A token limited to some tools (the
- * agent's `tools` list) gets those of these it names.
+ * agent's `tools` list) gets those of these it names. At each request the endpoint leaves out the
+ * modules' tools they do not offer at the moment (`HostTools.withheld`).
  */
 export function toolCatalog(tools: HostTools): ToolEntry[] {
   const kernel: ToolEntry[] = [];
@@ -81,7 +82,7 @@ export class HostMcpServer {
   /** Tokens limited to some tools (the agent's `tools` list). */
   private readonly allowed = new Map<string, ReadonlySet<string>>();
   private readonly endpoint: McpHttpEndpoint<{ b: ToolBinding; allow?: ReadonlySet<string> }>;
-  /** What every token may be offered (`toolCatalog`). */
+  /** What every token may be offered (`toolCatalog`); each request leaves out what the modules withhold then. */
   private readonly catalog: readonly ToolEntry[];
 
   constructor(private readonly o: HostMcpServerOptions) {
@@ -163,10 +164,14 @@ export class HostMcpServer {
 
   private build(b: ToolBinding, allow?: ReadonlySet<string>): McpServer {
     const server = new McpServer({ name: SERVER_NAME, version: '0.1.0' }, { capabilities: { tools: {} } });
+    // Asked now, for this request: a module's tool it does not offer at the moment (the live tools
+    // while no running channel can open a live) is neither listed nor callable in it (CF-6).
+    const withheld = this.o.tools.withheld();
     for (const def of this.catalog) {
       const name = def.name;
       // Per-agent tool list (CF-6): a tool not listed is neither offered nor callable.
       if (allow && !allow.has(name)) continue;
+      if (withheld.has(name)) continue;
       server.registerTool(
         name,
         {

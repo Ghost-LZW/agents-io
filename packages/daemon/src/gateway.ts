@@ -828,6 +828,7 @@ export class Gateway {
       joinLive: (key, turnId, a) => gw().joinLive(key, gw().runningTurn(key, turnId), a),
       sayLive: (key, text, a) => gw().sayLive(key, text, a),
       leaveLive: (key) => gw().leaveLive(key, 'left by the agent'),
+      liveChannels: () => gw().liveChannels(),
       agentTools: (agent) => gw().agentTools(agent),
       agentNames: () => gw().chatAgents(),
       identify: (a) => gw().router.identify(a),
@@ -2406,16 +2407,18 @@ export class Gateway {
   }
 
   /**
-   * The model tools an agent's sessions are offered (`KernelContext.agents.tools`): its tools list,
-   * or the endpoint's whole catalog for `tools: true`; none without tools.
+   * The model tools an agent's sessions are offered now (`KernelContext.agents.tools`): its tools
+   * list, or the endpoint's whole catalog for `tools: true`, but those a module withholds at the
+   * moment (`HostTools.withheld`: the live tools while no running channel can open a live); none
+   * without tools.
    */
   private agentTools(agent: string | undefined): string[] {
     const c = this.o.config;
     const a = c.agents[agent ?? c.defaultAgent ?? ''];
     if (!a?.tools) return [];
-    if (a.toolNames) return [...a.toolNames];
-    this.catalogNames ??= this.tools ? toolCatalog(this.tools).map((t) => t.name) : [];
-    return [...this.catalogNames];
+    const names = a.toolNames ?? (this.catalogNames ??= this.tools ? toolCatalog(this.tools).map((t) => t.name) : []);
+    const withheld = this.tools?.withheld();
+    return names.filter((n) => !withheld?.has(n));
   }
 
   // ---- live (decision 11) ----------------------------------------------------
@@ -2528,6 +2531,15 @@ export class Gateway {
     }
     const v = await this.policy.outbound({ from: turn, to }).catch(() => 'deny' as const);
     if (v !== 'allow') throw new ToolError(`live_join: ${routeKey(to)} is not an allowed destination (Policy.outbound; preregister it in policy.routes)`);
+  }
+
+  /**
+   * The running channels that can open a live (`KernelContext.live.channels`; the live tools are
+   * offered only while there is one): `id:account`, in the order they started. One counts until its
+   * `start` ends or it is removed, also while it reconnects.
+   */
+  private liveChannels(): string[] {
+    return this.channels.filter((c) => !c.ended && typeof c.adapter.openLive === 'function').map((c) => `${c.adapter.id}:${c.account}`);
   }
 
   /** The channel a live opens on: `spec` (id or id:account), else the turn's reply channel. */

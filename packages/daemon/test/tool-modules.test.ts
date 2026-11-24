@@ -1,20 +1,33 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import type { HarnessOpenArgs, InputRecord, Origin } from '@agents-io/protocol';
+import type { HarnessOpenArgs, InputRecord, LiveEndpoint, Origin } from '@agents-io/protocol';
 import { KERNEL_TOOL_NAMES, TOOL_GROUPS, TOOL_NAMES } from '@agents-io/host-mcp';
 import { TOPIC_TOOLS_HINT } from '@agents-io/session';
-import type { FakeHarness } from '@agents-io/testkit';
+import { FakeChannel, type FakeHarness } from '@agents-io/testkit';
 import { resolveConfig } from '../src/config.js';
 import { daemon, until, type World } from './helpers.js';
+import { bridge, live } from './live-channels-helpers.js';
 import { mcpCall } from './output-tools-helpers.js';
 
 /*
  * The watch, schedule, live and topic tools are built-in feature modules (core-slimming G6 step 3,
  * `tool-modules.ts`; the schedule tools since the merge of origin/main): the bundled aio offers what
- * it offered before, and a group that is off is not there at all.
+ * it offered before, and a group that is off is not there at all. The live tools are offered only
+ * while a running channel can open a live (ROADMAP §1 principle 2).
  */
 
 const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };
+
+/** The `tools/list` answers captured before the tools were modules: with the live tools, and without them. */
+const FIXTURE = new URL('../../host-mcp/test/fixtures/tools-list.json', import.meta.url);
+const FIXTURE_NO_LIVE = new URL('../../host-mcp/test/fixtures/tools-list-no-live.json', import.meta.url);
+
+/** A FakeChannel that can open a live (`ChannelAdapter.openLive`); these tests never join one. */
+class LiveChannel extends FakeChannel {
+  async openLive(): Promise<LiveEndpoint> {
+    throw new Error('no live in these tests');
+  }
+}
 
 /** The raw `tools/list` answer a harness binding gets. */
 async function toolsList(mcp: HarnessOpenArgs['mcp']): Promise<{ tools: { name: string }[] }> {
@@ -26,12 +39,16 @@ async function toolsList(mcp: HarnessOpenArgs['mcp']): Promise<{ tools: { name: 
   return ((await res.json()) as { result: { tools: { name: string }[] } }).result;
 }
 
-/** A daemon whose agent sees one message: what it is offered over MCP and the input's channelContext. */
-async function offered(raw: Record<string, unknown>) {
+/**
+ * A daemon whose agent sees one message: what it is offered over MCP and the input's channelContext.
+ * `canLive`: its channel `fake` can open a live.
+ */
+async function offered(raw: Record<string, unknown>, o: { canLive?: boolean } = {}) {
   const holder: { h?: FakeHarness } = {};
   const got: { listed?: { tools: { name: string }[] }; input?: InputRecord } = {};
   const w = await daemon({
     raw,
+    ...(o.canLive ? { chat: new LiveChannel('fake') } : {}),
     script: async (t) => {
       const mcp = holder.h!.sessions.at(-1)!.args.mcp;
       got.listed = mcp ? await toolsList(mcp) : { tools: [] };
@@ -46,11 +63,16 @@ async function offered(raw: Record<string, unknown>) {
 }
 
 describe('the watch, live and topic tools as modules', () => {
-  it('the bundled aio offers them, on by default: an agent with tools: true lists the 18 tools byte for byte as before they were modules (the live tools also with no channel that can open a live), and its inputs of a current topic carry the hint #CF-6', async () => {
-    const { w, listed, input } = await offered({ outputTools: true });
+  it('the bundled aio offers them, on by default: an agent with tools: true lists the 18 tools byte for byte as before they were modules where a channel can open a live, the same without live_* where none can, and its inputs of a current topic carry the hint #CF-6', async () => {
+    const { w, listed, input } = await offered({ outputTools: true }, { canLive: true });
     // The `tools/list` answer captured from the code before the tool catalog existed (packages/host-mcp/test/catalog.test.ts).
-    expect(JSON.stringify(listed, null, 2) + '\n').toBe(readFileSync(new URL('../../host-mcp/test/fixtures/tools-list.json', import.meta.url), 'utf8'));
+    expect(JSON.stringify(listed, null, 2) + '\n').toBe(readFileSync(FIXTURE, 'utf8'));
     expect(listed.tools.map((t) => t.name)).toEqual(TOOL_NAMES);
+    // No running channel can open a live (a plain FakeChannel, as the public lark-bot): the same answer without the three.
+    const none = await offered({ outputTools: true });
+    expect(JSON.stringify(none.listed, null, 2) + '\n').toBe(readFileSync(FIXTURE_NO_LIVE, 'utf8'));
+    expect(none.listed.tools.map((t) => t.name)).toEqual(TOOL_NAMES.filter((n) => !n.startsWith('live_')));
+    expect(none.w.gw.adminStatus().modules.find((m) => m.id === 'tools.live')).toEqual({ id: 'tools.live', origin: 'builtin', enabled: true });
     expect(input.channelContext.topic).toBeDefined();
     expect(input.channelContext.topicTools).toBe(TOPIC_TOOLS_HINT);
     expect(w.gw.adminStatus().modules.filter((m) => m.id.startsWith('tools.'))).toEqual([
@@ -117,7 +139,8 @@ describe('the watch, live and topic tools as modules', () => {
       ['topicTools', 'tools.topics', TOOL_GROUPS.topics],
     ] as const;
     for (const [section, id, names] of groups) {
-      const { w, listed, input } = await offered({ outputTools: true, [section]: { enabled: false } });
+      // Its channel can open a live: only the group that is off is missing.
+      const { w, listed, input } = await offered({ outputTools: true, [section]: { enabled: false } }, { canLive: true });
       expect(listed.tools.map((t) => t.name)).toEqual(TOOL_NAMES.filter((n) => !(names as readonly string[]).includes(n)));
       expect(w.gw.adminStatus().modules.find((m) => m.id === id)).toEqual({ id, origin: 'builtin', enabled: false });
       if (section === 'topicTools') expect(input.channelContext).not.toHaveProperty('topicTools');
@@ -129,8 +152,48 @@ describe('the watch, live and topic tools as modules', () => {
       expect(() => resolve(['nope'])).toThrow(`agents.chat.tools: unknown tool "nope" (tools: ${TOOL_NAMES.filter((n) => !(names as readonly string[]).includes(n)).join(', ')})`);
     }
     // All four off: the kernel's own six, nothing else.
-    const { listed, input } = await offered({ outputTools: true, watchTools: { enabled: false }, scheduleTools: { enabled: false }, liveTools: { enabled: false }, topicTools: { enabled: false } });
+    const { listed, input } = await offered({ outputTools: true, watchTools: { enabled: false }, scheduleTools: { enabled: false }, liveTools: { enabled: false }, topicTools: { enabled: false } }, { canLive: true });
     expect(listed.tools.map((t) => t.name)).toEqual(KERNEL_TOOL_NAMES);
     expect(input.channelContext).not.toHaveProperty('topicTools');
+  });
+
+  it('the live tools are offered only while a running channel can open a live, asked at each tools/list: one started later (console.liveChannels) brings them on the next tools/list of the same binding, removing it takes them away; while none can, calling one answers it is not there; get_channel_context abilities follow #CF-6', async () => {
+    const holder: { w?: World } = {};
+    const contexts: { abilities: { tools: string[] } }[] = [];
+    const { w, doc, put } = await live({
+      raw: { outputTools: true },
+      channelAdapter: (ch) => (ch.type === 'bridge' ? new LiveChannel('meet') : undefined),
+      script: async (t) => {
+        const mcp = holder.w!.harness.sessions.at(-1)!.args.mcp;
+        contexts.push(JSON.parse((await mcpCall(mcp, 'get_channel_context', {}, `ctx${contexts.length}`)).text));
+        t.emit({ t: 'text.snapshot', text: 'ok', final: true }, { audience: 'answer' });
+      },
+    });
+    holder.w = w;
+    const liveNames = TOOL_GROUPS.live as readonly string[];
+    await w.chat.inject({ sender: alice, text: 'hello' });
+    await until(() => contexts.length === 1);
+    const mcp = w.harness.sessions.at(-1)!.args.mcp;
+    const listed = async () => JSON.stringify(await toolsList(mcp), null, 2) + '\n';
+    expect(await listed()).toBe(readFileSync(FIXTURE_NO_LIVE, 'utf8'));
+    expect(contexts[0]!.abilities.tools).toEqual(TOOL_NAMES.filter((n) => !liveNames.includes(n)));
+    expect(await mcpCall(mcp, 'live_join', { target: '42' }, 'j1')).toEqual({ isError: true, text: 'MCP error -32602: Tool live_join not found' });
+
+    // A channel that can open a live comes up: the same binding lists them on its next tools/list.
+    expect(await put({ ...(await doc()).config, channels: [bridge('x1')] })).toMatchObject({ applied: 'live', channels: { started: [{ type: 'bridge', account: 'x1' }] } });
+    expect(await listed()).toBe(readFileSync(FIXTURE, 'utf8'));
+    await w.chat.inject({ sender: alice, text: 'again' });
+    await until(() => contexts.length === 2);
+    expect(contexts[1]!.abilities.tools).toEqual(TOOL_NAMES);
+
+    // Removed again: gone from the next tools/list.
+    expect(await put({ ...(await doc()).config, channels: [] })).toMatchObject({ applied: 'live', channels: { stopped: [{ type: 'bridge', account: 'x1' }] } });
+    expect(await listed()).toBe(readFileSync(FIXTURE_NO_LIVE, 'utf8'));
+  });
+
+  it('an agent whose tools list names a live tool is offered it only while a channel can open a live #CF-6', async () => {
+    const raw = { outputTools: true, agents: { chat: { harness: 'claude-code', tools: ['send_message', 'live_join'] } }, defaultAgent: 'chat' };
+    expect((await offered(raw, { canLive: true })).listed.tools.map((t) => t.name)).toEqual(['send_message', 'live_join']);
+    expect((await offered(raw)).listed.tools.map((t) => t.name)).toEqual(['send_message']);
   });
 });

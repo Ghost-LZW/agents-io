@@ -423,7 +423,7 @@ function badInstance(m: ModuleManifest<any>, i: ModuleInstance): string | undefi
     }
   }
   if (i.localFrames !== undefined && (!isObject(i.localFrames) || Object.keys(i.localFrames).length)) return 'localFrames are not served yet';
-  for (const k of ['features', 'status', 'start', 'stop'] as const) if (i[k] !== undefined && !isFn(i[k])) return `${k} must be a function`;
+  for (const k of ['offeredTools', 'features', 'status', 'start', 'stop'] as const) if (i[k] !== undefined && !isFn(i[k])) return `${k} must be a function`;
   return undefined;
 }
 
@@ -589,11 +589,27 @@ export class ModuleHost {
     return undefined;
   }
 
-  /** The set-up modules' tools, for the host MCP endpoint (`HostToolsOptions.modules`); modules without tools are left out. */
+  /**
+   * The set-up modules' tools, for the host MCP endpoint (`HostToolsOptions.modules`); modules
+   * without tools are left out. A module whose instance has `offeredTools` says at every request
+   * which it offers then (a throw is logged and offers none of them).
+   */
   tools(): ModuleTools[] {
     return this.active()
       .filter((m) => m.r.manifest.mcpTools?.length)
-      .map((m) => ({ module: m.r.manifest.id, tools: m.r.manifest.mcpTools!, handlers: m.instance!.tools ?? {} }));
+      .map((m) => {
+        const id = m.r.manifest.id;
+        const instance = m.instance!;
+        const offered = (): string[] => {
+          try {
+            return [...instance.offeredTools!()];
+          } catch (e) {
+            this.o.log('warn', `module ${id}: offeredTools failed: ${(e as Error).message}`);
+            return [];
+          }
+        };
+        return { module: id, tools: m.r.manifest.mcpTools!, handlers: instance.tools ?? {}, ...(instance.offeredTools ? { offered } : {}) };
+      });
   }
 
   /** The chat command table: the kernel's commands, then the set-up modules'. */
@@ -851,6 +867,8 @@ export interface KernelBackend {
   joinLive(sessionKey: string, turnId: string, a: { target: string; channel?: string; instructions?: string; voice?: string }): Promise<{ liveId: string; title: string; route: string }>;
   sayLive(sessionKey: string, text: string, a: { operationId: string; turnId: string }): Promise<void>;
   leaveLive(sessionKey: string): Promise<boolean>;
+  /** The running channels that can open a live (`KernelContext.live.channels`). */
+  liveChannels(): string[];
   /** The tools an agent's sessions are offered (`KernelContext.agents.tools`). */
   agentTools(agent: string | undefined): string[];
   /** The agents a chat may talk to (`KernelContext.agents.names`). */
@@ -968,6 +986,7 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
       },
       say: async (sessionKey, said, a) => live().sayLive(sessionKey, said, { operationId: text(a?.operationId, 'live.say: operationId'), turnId: text(a?.turnId, 'live.say: turnId') }),
       leave: async (sessionKey) => live().leaveLive(sessionKey),
+      channels: () => [...live().liveChannels()],
     },
     agents: {
       names: () => [...live().agentNames()],

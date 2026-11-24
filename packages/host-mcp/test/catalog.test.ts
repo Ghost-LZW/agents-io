@@ -23,7 +23,12 @@ import {
  * active what an endpoint offers is exactly what it offered before the catalog existed: the fixture
  * is the `tools/list` answer captured from the code before the change, byte for byte (since the
  * merge of origin/main b9b35ed: that code's, with every control, the schedule tools included).
+ * `tools-list-no-live.json` is the same answer without the three live tools: what a deployment
+ * where no running channel can open a live lists (the daemon's `tools.live` withholds them then).
  */
+
+const FIXTURE = new URL('./fixtures/tools-list.json', import.meta.url);
+const FIXTURE_NO_LIVE = new URL('./fixtures/tools-list-no-live.json', import.meta.url);
 
 const servers: HostMcpServer[] = [];
 afterEach(async () => {
@@ -64,7 +69,7 @@ describe('the host MCP tool catalog', () => {
     const s = new HostMcpServer({ tools: hostTools() });
     servers.push(s);
     const listed = await toolsList(s);
-    expect(JSON.stringify(listed, null, 2) + '\n').toBe(readFileSync(new URL('./fixtures/tools-list.json', import.meta.url), 'utf8'));
+    expect(JSON.stringify(listed, null, 2) + '\n').toBe(readFileSync(FIXTURE, 'utf8'));
     expect(listed.tools.map((t) => t.name)).toEqual(TOOL_NAMES);
     expect(TOOL_NAMES).toHaveLength(18);
   });
@@ -95,7 +100,7 @@ describe('the host MCP tool catalog', () => {
     ]);
     const s = new HostMcpServer({ tools });
     servers.push(s);
-    expect(JSON.stringify(await toolsList(s), null, 2) + '\n').toBe(readFileSync(new URL('./fixtures/tools-list.json', import.meta.url), 'utf8'));
+    expect(JSON.stringify(await toolsList(s), null, 2) + '\n').toBe(readFileSync(FIXTURE, 'utf8'));
     // The definitions are what TOOL_DEFS says; the watch and schedule tools and session_list need no turn.
     expect(Object.values(TOOL_GROUP_DEFS).flat().map((d) => [d.name, d.needsTurn])).toEqual([
       ['watch_add', false], ['watch_remove', false], ['watch_list', false],
@@ -111,5 +116,64 @@ describe('the host MCP tool catalog', () => {
     await expect(tools.call(b, 'live_leave', {})).rejects.toThrow('no turn is running in this session');
     // With the host's control for a group, a module offering it clashes with the kernel's.
     expect(() => toolCatalog(hostTools({ watches: { add: refuse, remove: refuse, list: () => [] }, modules: [groups[0]!] }))).toThrow('module tools.watch: tool "watch_add" is a kernel tool');
+  });
+
+  it('a module that offers some of its tools only at times (ModuleTools.offered) is asked at every request: what it withholds then is neither listed nor callable, the next tools/list of the same token lists it once offered; without the live tools the answer is the 18 without them, byte for byte; an offered that throws withholds all of its tools #CF-6', async () => {
+    let canLive = false;
+    let broken = false;
+    let asked = 0;
+    const groups: ModuleTools[] = [
+      { module: 'tools.watch', tools: TOOL_GROUP_DEFS.watch, handlers: watchToolHandlers(undefined) },
+      { module: 'tools.schedules', tools: TOOL_GROUP_DEFS.schedules, handlers: scheduleToolHandlers(undefined) },
+      {
+        module: 'tools.live',
+        tools: TOOL_GROUP_DEFS.live,
+        handlers: liveToolHandlers(undefined),
+        offered: () => {
+          asked++;
+          if (broken) throw new Error('boom');
+          // A name that is not the module's is ignored.
+          return canLive ? [...TOOL_GROUPS.live, 'send_message', 'nope'] : ['nope'];
+        },
+      },
+      { module: 'tools.topics', tools: TOOL_GROUP_DEFS.topics, handlers: topicToolHandlers(undefined) },
+    ];
+    const tools = hostTools({ modules: groups });
+    // What may be offered is the whole catalog; what is withheld is asked each time.
+    expect(toolCatalog(tools).map((t) => t.name)).toEqual(TOOL_NAMES);
+    expect([...tools.withheld()]).toEqual([...TOOL_GROUPS.live]);
+    const s = new HostMcpServer({ tools });
+    servers.push(s);
+    const url = await s.listen();
+    const rpc = async (token: string, method: string, params: Record<string, unknown>) => {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${token}` },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      });
+      return ((await res.json()) as { result: Record<string, unknown> }).result;
+    };
+    const b = { sessionKey: 's1', generation: 1, harnessId: 'fake' };
+    const { token } = s.mcpFor(b);
+    const listed = async (t = token) => JSON.stringify(await rpc(t, 'tools/list', {}), null, 2) + '\n';
+    const call = async (name: string) => (await rpc(token, 'tools/call', { name, arguments: {} })) as { isError?: boolean; content: { text: string }[] };
+
+    expect(await listed()).toBe(readFileSync(FIXTURE_NO_LIVE, 'utf8'));
+    expect(await call('live_leave')).toMatchObject({ isError: true, content: [{ text: 'MCP error -32602: Tool live_leave not found' }] });
+    canLive = true;
+    expect(await listed()).toBe(readFileSync(FIXTURE, 'utf8'));
+    // Offered: the call reaches the tool (which asks for a running turn first).
+    expect(await call('live_leave')).toMatchObject({ isError: true, content: [{ text: 'no turn is running in this session: output tools only work while you are answering a message' }] });
+    // An agent's list naming a live tool gets it only while it is offered.
+    const named = s.mcpFor(b, ['send_message', 'live_join']).token;
+    expect(JSON.parse(await listed(named)).tools.map((t: { name: string }) => t.name)).toEqual(['send_message', 'live_join']);
+    canLive = false;
+    expect(JSON.parse(await listed(named)).tools.map((t: { name: string }) => t.name)).toEqual(['send_message']);
+    canLive = true;
+    broken = true;
+    expect(await listed()).toBe(readFileSync(FIXTURE_NO_LIVE, 'utf8'));
+    expect([...tools.withheld()]).toEqual([...TOOL_GROUPS.live]);
+    // Asked once per request (seven) and per withheld() (two), never cached.
+    expect(asked).toBe(9);
   });
 });

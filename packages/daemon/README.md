@@ -195,8 +195,11 @@ see `docs/E2E.md` §0). New:
 - **Live (realtime voice, decision 11)**: a Codex instance with `"live": true` opts
   its app-server connection into Codex's experimental realtime API. Agents on it
   (with `tools`) get `live_join { target, channel?, instructions?, voice? }`,
-  `live_say { text }` and `live_leave`: a channel that implements
-  `ChannelAdapter.openLive` (e.g. a meeting) provides the media peer, the session's
+  `live_say { text }` and `live_leave` while some running channel implements
+  `ChannelAdapter.openLive` (none of the public lark-bot, mail and bridge does: a deployment
+  with only those has no `live_*`; checked at every request to the tool endpoint, so a channel
+  that comes up later brings them on the harness's next `tools/list`). That channel
+  (e.g. a meeting) provides the media peer, the session's
   Codex thread answers it with realtime v3 over WebRTC, and the audio flows between
   them, never through the daemon. What people say there is delegated by the voice
   into turns of the same session (same permissions as its text turns; inputs carry
@@ -651,7 +654,11 @@ party's module has the same shape (origin `module`). The manifest says, without 
   handler's call has `compact()`, which queues the session harness's own compaction command as
   the command's message, the one text the kernel marks `nativeCommand`);
 - `setup(kernel, config)`, which returns the `ModuleInstance`: a handler per tool and per
-  command, `features()` (which of its features it advertises now; default all while it runs),
+  command, `offeredTools()` (which of its tools the endpoint offers now; default all; asked at
+  every request a harness sends it, a tool left out being neither listed nor callable in that
+  request; a throw is logged as `module <id>: offeredTools failed: …` and offers none; the live
+  tools offer theirs only while `KernelContext.live.channels()` is not empty),
+  `features()` (which of its features it advertises now; default all while it runs),
   `status()`, `start()`, `stop()`, and the hooks `onTurnCompleted({ sessionKey, turnId, status })`:
   called for every turn of a session (not a task run's) right after its `turn.completed` is
   logged, whatever its status (a turn an `outbound.scoped` host checks, U20: once its checked
@@ -1319,3 +1326,23 @@ What changed for embedders with the harness bridge (core-slimming G9's gap, 2026
 - `InstanceHarness.detach` / `dispose` / `ownProcess` / `takeover` are accessors that look at the
   kind's adapter when read (they were taken once, when the wrapper was built), so an adapter that
   learns them from its harness has them once it has: the same values for every other adapter.
+
+What changed for embedders with the live tools offered only where a live can be opened (2026-11-24):
+
+- A behaviour change (ROADMAP §1 principle 2): `tools.live` offers `live_join`, `live_say` and
+  `live_leave` only while some running channel can open a live (its adapter has
+  `ChannelAdapter.openLive`; a channel counts until its `start` ends or it is removed, also while
+  it reconnects). Without one an agent with `tools: true` lists 15 tools (the fixture
+  `packages/host-mcp/test/fixtures/tools-list-no-live.json`), one whose `tools` list names a live
+  tool does not list it then (still no config error), a call answers MCP's
+  `Tool live_join not found`, and `get_channel_context`'s `abilities.tools` leaves them out. It is
+  asked at every request to the host MCP endpoint, so a channel started later (`console.liveChannels`,
+  a module channel) brings them on the next `tools/list`, and one stopped or removed takes them
+  away. When they are offered they are listed byte for byte as before.
+- New: `ModuleInstance.offeredTools?()` (`@agents-io/protocol`; not a function fails the setup as
+  for `features`), `KernelContext.live.channels()`, `KernelBackend.liveChannels` (required, so this
+  breaks an embedder that implements it); in `@agents-io/host-mcp`, `ModuleTools.offered?()` and
+  `HostTools.withheld()` (`HostMcpServer` asks it at every request; `toolCatalog` is still all the
+  endpoint may offer). `KernelContext.agents.tools` is what an agent's sessions are offered now
+  (without what a module withholds at the moment). An embedder that passes
+  `HostToolsOptions.live` itself keeps the kernel's `live_*` listed always.
