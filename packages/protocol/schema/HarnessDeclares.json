@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/HarnessDeclares",
+  "type": "object",
+  "properties": {
+    "displayName": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "compact": {
+      "type": "object",
+      "required": [
+        "command"
+      ],
+      "properties": {
+        "command": {
+          "minLength": 1,
+          "type": "string"
+        }
+      }
+    },
+    "modes": {
+      "type": "array",
+      "items": {
+        "const": "plan",
+        "type": "string"
+      }
+    },
+    "ownerProfileSwitch": {
+      "type": "boolean"
+    },
+    "ephemeralOpen": {
+      "type": "boolean"
+    },
+    "adopts": {
+      "type": "boolean"
+    },
+    "attach": {
+      "anyOf": [
+        {
+          "const": "join",
+          "type": "string"
+        },
+        {
+          "const": "takeover",
+          "type": "string"
+        }
+      ]
+    },
+    "sessionEnv": {
+      "anyOf": [
+        {
+          "const": "open",
+          "type": "string"
+        },
+        {
+          "const": "own-process",
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "required": [
+            "refused"
+          ],
+          "properties": {
+            "refused": {
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

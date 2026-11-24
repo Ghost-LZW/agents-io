@@ -31,7 +31,7 @@ describe('harness capabilities', () => {
   });
 
   it('each built-in kind declares without an adapter what its adapters declare (the names /plan and /bypass give when no configured instance has them) #CT-2', () => {
-    expect(builtinHarnesses.kinds).toEqual(['claude-code', 'codex']);
+    expect(builtinHarnesses.kinds).toEqual(['claude-code', 'codex', 'bridge']);
     const adapters: Record<string, HarnessAdapter> = { 'claude-code': new ClaudeCodeHarness({ claudePath: '/nonexistent' }), codex: new CodexHarness({ bin: '/nonexistent', transport: { kind: 'stdio' } }) };
     for (const m of builtinHarnesses.modules) {
       for (const [k, v] of Object.entries(m.declares ?? {})) expect((adapters[m.kind] as unknown as Record<string, unknown>)[k], `${m.kind} ${k}`).toEqual(v);

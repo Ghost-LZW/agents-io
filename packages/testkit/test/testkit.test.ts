@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { assertConformingStream, checkEventStream, FakeChannel, FakeHarness, runChannelConformance, runHarnessEnvConformance } from '../src/index.js';
+import { assertConformingStream, checkEventStream, FakeChannel, FakeHarness, runChannelConformance, runHarnessConformance, runHarnessEnvConformance } from '../src/index.js';
 import type { HarnessEvent, InputRecord } from '@agents-io/protocol';
 
 const input = (id: string, text: string): InputRecord => ({
@@ -111,5 +111,31 @@ describe('runHarnessEnvConformance', () => {
     const { adapter, lastSpawn } = adapterOf(true);
     const r = await runHarnessEnvConformance({ adapter, open, lastSpawn });
     expect(r.failed.map((f) => f.check)).toEqual(['env.not_in_argv']);
+  });
+});
+
+describe('runHarnessConformance', () => {
+  const open = { sessionKey: 's', generation: 1, cwd: '/tmp', run: { harness: 'fake', model: 'm', profile: 'p' } };
+  const long = { turnId: 't-long', inputs: [input('i-long', 'long')] };
+  const waiting = new FakeHarness(async (t) => {
+    if (t.inputs.some((i) => i.content.some((c) => c.type === 'text' && c.text === 'long'))) await new Promise((_, reject) => t.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
+    else t.emit({ t: 'text.snapshot', text: 'ok', final: true }, { audience: 'answer' });
+  });
+
+  it('passes FakeHarness: probe, declarations, a turn, steer, interrupt, close and the stream #HC-1', async () => {
+    const r = await runHarnessConformance({ adapter: waiting, open, longTurn: long });
+    expect(r.failed).toEqual([]);
+    expect(r.passed).toEqual(['probe.schema', 'declares.schema', 'methods.functions', 'open', 'turn.completes', 'steer.result', 'interrupt.ends_turn', 'close.ends_stream', 'stream.conforms']);
+  });
+
+  it('fails an adapter with declarations of the wrong type, and one whose turn never completes #HC-1', async () => {
+    const bad = Object.assign(new FakeHarness(), { modes: ['fast'], sessionEnv: 'own-process', attach: 'takeover', detach: 'yes' });
+    const r = await runHarnessConformance({ adapter: bad, open });
+    expect(r.failed.map((f) => f.check)).toEqual(['declares.schema', 'methods.functions']);
+    expect(r.failed[0]!.message).toMatch(/\/modes\/0.*'own-process' needs ownProcess.*'takeover' needs takeover/);
+
+    const stuck = new FakeHarness(async (t) => void (await new Promise((_, reject) => t.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }))));
+    const s = await runHarnessConformance({ adapter: stuck, open, timeoutMs: 200 });
+    expect(s.failed.map((f) => f.check)).toEqual(['turn.completes', 'stream.conforms']);
   });
 });

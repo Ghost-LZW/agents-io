@@ -1,0 +1,10 @@
+{
+  "name": "@agents-io/harness-jsonl-bridge",
+  "version": "0.1.0",
+  "description": "Attach out-of-process harness adapters (any language) over JSONL stdio: the bridge harness kind, and serveHarness for the program side",
+  "type": "module",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist", "examples"],
+  "dependencies": { "@agents-io/protocol": "workspace:*", "@sinclair/typebox": "^0.34.0" },
+  "devDependencies": { "@agents-io/testkit": "workspace:*" }
+}

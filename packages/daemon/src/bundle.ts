@@ -3,6 +3,7 @@ import { larkBotChannelModule, type LarkBotChannelEntry, type LarkBotChannelSett
 import { mailChannelModule, type MailChannelEntry } from '@agents-io/channel-mail';
 import { claudeCodeHarnessModule } from '@agents-io/harness-claude-code';
 import { codexHarnessModule } from '@agents-io/harness-codex';
+import { bridgeHarnessModule } from '@agents-io/harness-jsonl-bridge';
 import { ChannelRegistry } from './channel-registry.js';
 import { externalMcpModule, type ExternalMcpSection } from './external-mcp.js';
 import { HarnessRegistry } from './harness-registry.js';
@@ -19,10 +20,13 @@ import { topicTitleModule, type TopicTitleSection } from './topic-title.js';
  */
 
 /**
- * The built-in harness kinds; Claude Code first, the default kind. `launchAliases` (deprecated, one
- * release): the `HarnessInstance` fields their launch settings were under before `launch`.
+ * The built-in harness kinds; Claude Code first, the default kind. Then Codex, and the bridge: a
+ * harness in another process, any language, over JSONL stdio (`use: "bridge"`), which says what it
+ * declares in its hello, so its instances are probed at start (`HarnessModule.probeAtStart`).
+ * `launchAliases` (deprecated, one release): the `HarnessInstance` fields their launch settings
+ * were under before `launch`.
  */
-export const builtinHarnesses = new HarnessRegistry([claudeCodeHarnessModule, codexHarnessModule], {
+export const builtinHarnesses = new HarnessRegistry([claudeCodeHarnessModule, codexHarnessModule, bridgeHarnessModule], {
   launchAliases: { [claudeCodeHarnessModule.kind]: 'claude', [codexHarnessModule.kind]: 'codex' },
 });
 

@@ -43,11 +43,12 @@ alias aio-e2e="node $PWD/packages/daemon-e2e/dist/cli.js"   # §1.1 的自动场
 
 - `RunSpec.harness` 是实例名；`Policy.plan` 每轮选实例，默认策略用 `defaultHarness`（缺省为第一个）。会话事件的 `harness` 字段、续接用的原生 id（`session.bound`）都按实例名记，所以不同 `configDir` / `CODEX_HOME` 的会话不会互相 `--resume`。同一 session 的下一轮换了实例时，lane 关掉旧绑定、开新一代（`notice runtime_restart: switching harness a → b`）。适配器在第一次用到时才建。
 - 共有字段：`use`、`env`、`cwd`（该实例会话的工作目录）、`run`、`profiles`（权限 profile → 原生设置，同以前）、`options`（原样作为 `HarnessOpenArgs.options`）。
-- `use` 的取值是注册了的 harness 种类加上 `module`。`claude-code`、`codex` 由守护进程的组合根 `packages/daemon/src/bundle.ts` 注册，各自是所在包里的一个 `HarnessModule`（`harness/claude-code/src/module.ts`、`harness/codex/src/module.ts`，类型在 `packages/protocol/src/harness-module.ts`）：下面这些专有字段、旧 `harness` 块里该种类的一节、缺省模型和 `AGENTS_IO_LIVE_*_MODEL`、配置目录变量（`CLAUDE_CONFIG_DIR` / `CODEX_HOME`，见 `sessionParams.envPathRoots`）、跨实例的规则（codex 的 `stateDir` 不得共用）和适配器怎么建，都由它说了算；守护进程的配置代码不认识具体种类。
+- `use` 的取值是注册了的 harness 种类加上 `module`。`claude-code`、`codex`、`bridge` 由守护进程的组合根 `packages/daemon/src/bundle.ts` 注册，各自是所在包里的一个 `HarnessModule`（`harness/claude-code/src/module.ts`、`harness/codex/src/module.ts`、`harness/jsonl-bridge/src/module.ts`，类型在 `packages/protocol/src/harness-module.ts`）：下面这些专有字段、旧 `harness` 块里该种类的一节、缺省模型和 `AGENTS_IO_LIVE_*_MODEL`、配置目录变量（`CLAUDE_CONFIG_DIR` / `CODEX_HOME`，见 `sessionParams.envPathRoots`）、跨实例的规则（codex 的 `stateDir` 不得共用）和适配器怎么建，都由它说了算；守护进程的配置代码不认识具体种类。
 - claude-code：`configDir` → `CLAUDE_CONFIG_DIR`（登录态、用户 settings、用户级 skills/agents/commands、会话记录都在这里；用户级 skills 从 `<configDir>/skills` 发现，且只在 `settingSources` 含 `user` 或缺省时加载——已用 system/init 的 skills 列表实测；e2e 用 `settingSources: []`，所以 e2e 里不加载用户 skills）；`executable`（`claude` 路径）；`settings`（settings.json 路径或内联对象，即 Agent SDK `settings` = CLI `--settings` 的 flag 层，`settingSources: []` 时也生效）；`settingSources`（`user`/`project`/`local`，`[]` 表示都不加载，缺省全加载）；`mcpServers`；`plugins`（本地插件目录，SDK `plugins: [{type:'local', path}]` → `--plugin-dir`，插件可带 skills/agents/commands/hooks）；`skills`（`"all"` 或名字列表，SDK `skills`）；`extraArgs`（额外 CLI 参数，`null` 为无值 flag）；`additionalDirectories`（与 profile 的合并）。
 - codex：`home` → `CODEX_HOME`；`executable`；`config`（点分键 → 值，作为 `codex app-server -c key=<TOML>` 传入）；`enable` / `disable`（`--enable/--disable <feature>`）；`transport`（`stdio` | `unix` + `spawn: own/daemon/none`）。`config/enable/disable` 只对网关自己起的服务（stdio、unix own）有效，`daemon/none` 时报错。**没有 `profile`**：`codex app-server` 不接受 `--profile`（codex-cli 0.160 报错 "--profile only applies to runtime commands"，0.171 报 "unexpected argument '--profile' found"），`-c profile=…` 也已废弃，写了会报错，请用 `config` 或单独的 `home`。
 - codex 支持的版本：codex-cli **0.160.x 与 0.171.x**（`harness/codex/src/version.ts` `SUPPORTED_CODEX_LINES`，类型由 0.171.0 生成；两条线由同一份代码驱动，见 `harness/codex/README.md`）。别的版本在第一次用到实例时报 `codex app-server <版本> is not supported …`（HC-1）。较新的模型可能只在新版本上可用：ChatGPT 登录下 `gpt-6.2-sol` 在 0.160.1 上答 400 `model_not_found`，0.171.0 正常（2026-11-24）。`transport.spawn: "daemon"` 连的是 Codex 自己管理、自动升级的 app-server daemon，版本不由 `executable` 决定（本机 2026-11-24 已是 0.172.0，不在支持范围内）。
 - 换 codex 版本（改实例的 `executable`）：stdio 实例改完重启 `aio serve` 即可。unix `spawn: "own"` 的 app-server 比守护进程活得久，`server.json` 的启动指纹含二进制路径，所以先停掉 `aio serve`（正在跑的轮次最好先等它结束：旧 app-server 停掉后它不能被新的接管，下次启动时结算），再停旧 app-server（pid 在 `<stateDir>/server.json`，默认 `~/.agents-io/codex.<实例名>/`），改 `executable`，再启动；不先停旧的，启动时报 `codex app-server <pid> on <socket> was started with other settings …`。thread 存在 `CODEX_HOME` 里，0.160 写的 thread 在 0.171 上 `thread/resume` 后照常续聊，反过来也一样（2026-11-24 实测），所以会话不断、换回旧版本也行。
+- bridge（`use: "bridge"`）：另一个进程里、任何语言写的 harness，经 stdio 说 JSONL harness 帧（HOSTS §4.8）。专有字段 `command`、`args`（原样上命令行，不放机密）、`config`（在 `probe` 里交给程序，`"env:NAME"` 替换）；`env` 是程序的环境，`cwd` 是它和它的会话的工作目录，`profiles` 随每次 `open` 交给程序。守护进程启动时就拉起程序、问它声明什么（`probe` 的回答：`caps`、`declares`、`methods`），声明与进程内的 harness 一样起作用（`/plan`、`/compact`、停止时 `detach` 与否、重启时 `adopts`），回答形状不对、声明 `attach: 'takeover'` 或程序起不来都让启动失败（退出码 2，错误里有实例名和成员）。程序退出后下一轮再拉起它。只答 `version` 和 `caps` 的旧程序什么都不声明。例子：`{ "use": "bridge", "command": "python3", "args": ["harness/jsonl-bridge/examples/echo_harness.py"] }`。
 - module（`use: "module"`，决定 11 补记）：`module`（同通道模块的解析）、`export`、`config`（`"env:NAME"` 替换）加上共有字段；模块导出一个 `HarnessFactory`（`@agents-io/protocol`），在守护进程里运行。也可以导出一个 `HarnessModule` 描述对象（有 `create` 函数的对象）：有 `schema` 时启动时用它检查 `config`（封闭，没写 `config` 按 `{}` 查，不对就启动失败，错误里有实例名，CF-4），`create` 拿到与工厂相同的 init，外加 `launch`（即这份 `config`）、实例的 `env` 和 `profiles`；它的其他成员在这里不用，实例的种类仍是 `module`，声明从返回的适配器读。工厂返回的适配器由该实例的所有会话（包括任务 run）共用。它可以声明与内建适配器同一套生命周期成员（`packages/protocol/src/harness.ts` `HarnessAdapter`）。停止时每个加载了的 module 实例都拿到这些调用，不论有没有会话、任务 run 用过它；几个实例的工厂返回同一个适配器对象时，每种调用只调一次：
   - `detach()`：harness 比守护进程活得久时用。停止时这个实例的 lane 改为 detach（不打断、不关会话，正在跑的 turn 在日志里保持未结束），然后调一次 `detach()`，由适配器自己结束会话、关连接，不打断也不退订。没有它时停止就逐个关会话（`close`）。
   - `adopts: true`：静态声明，不起进程就能读：重启后 `open({ resume })` 能接管上个进程留下的 turn（发 `turn.adopted`）。守护进程启动时重开这些会话，harness 没接管的，在打开之后结算。不声明时，遗留 turn 在启动时直接结算为 ambiguous `host_restarted`，不打开 harness。
@@ -221,6 +222,21 @@ attach 里直接输入文字就是 queue 输入；`/steer <text>`、`/interrupt 
 5. Ctrl-C 停 serve 再启动，两个会话各发一句"刚才的口令是什么"。
    - [ ] 各自用原生 id 续接（同一 cwd 与配置目录下），答出自己的口令。
 6. （可选）在租户 a 的对话里 `/new` → 新话题仍在 `/srv/t/ws/a`、仍用 `/srv/t/homes/a`。
+
+### 1.5 手动：进程外 harness（`use: "bridge"`）
+
+自动测试（`harness/jsonl-bridge/test/`、`packages/daemon/test/harness-bridge.test.ts`；Python 例子在 e2e 层）用的是假程序；下面在真的守护进程上核对一遍，不需要外部账号。
+
+1. 配置一个 bridge 实例并设为默认：`"harnesses": { "py": { "use": "bridge", "command": "python3", "args": ["<仓库>/harness/jsonl-bridge/examples/echo_harness.py"] } }, "defaultHarness": "py"`，`aio serve`。
+   - [ ] 启动日志里没有错误；`ps` 里有 `echo_harness.py` 进程（启动时就拉起，问它声明什么）。
+2. `aio attach`，说一句 hello。
+   - [ ] 回答 `echo: hello`；`aio tail` 的 `turn.started` 里 `harness` 是 `py`。
+3. 主人在对话里发 `/plan on`、`/compact`。
+   - [ ] `/plan on` 答 `/plan is available only on Codex (this session runs bridge).`（例子没声明 Plan 模式）；`/compact` 答 `Compacting (queued behind anything running).`，随后一轮的回答是 `compacted`（例子声明了 `compact: { command: "/compact" }`）。
+4. Ctrl-C 停 serve。
+   - [ ] `echo_harness.py` 进程退出（例子没有 `detach`：先关会话，再 `shutdown`）。
+5. 把 `command` 改成不存在的路径再 `aio serve`。
+   - [ ] 启动失败，退出码 2，错误是 `harnesses.py (bridge): spawn … ENOENT`。
 
 ## Tier 3：多端 + 重启
 

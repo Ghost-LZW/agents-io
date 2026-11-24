@@ -22,6 +22,7 @@ const alias = [
   { find: /^@agents-io\/channel-mail$/, replacement: src('channel/mail') },
   { find: /^@agents-io\/harness-claude-code$/, replacement: src('harness/claude-code') },
   { find: /^@agents-io\/harness-codex$/, replacement: src('harness/codex') },
+  { find: /^@agents-io\/harness-jsonl-bridge$/, replacement: src('harness/jsonl-bridge') },
 ];
 
 export default defineConfig({

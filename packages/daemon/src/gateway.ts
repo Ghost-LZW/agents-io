@@ -938,6 +938,7 @@ export class Gateway {
       // The modules' identities (the stranger approval's guests) before any input is identified.
       modules.identities((id, entries) => gw.setExtraIdentities(`module:${id}`, entries));
       await gw.loadHarnessModules();
+      await gw.probeHarnesses();
       gw.harness();
       if (gw.mcp) {
         const url = await gw.mcp.listen();
@@ -1278,6 +1279,25 @@ export class Gateway {
     }
   }
 
+  /**
+   * Probe the instances of kinds whose adapters learn what they declare from their harness
+   * (`HarnessModule.probeAtStart`: the bridge, whose program says it in its hello), in config order,
+   * before anything reads a declaration (`adopts` below, commands, launches). A failure fails the
+   * start, a config error naming the instance (CF-4), as a `use: "module"` factory's does. Kept from
+   * now on: stop gives each its lifecycle calls (its program is shut down).
+   */
+  private async probeHarnesses(): Promise<void> {
+    if (this.o.harness || this.o.buildHarness) return;
+    for (const inst of Object.values(this.o.config.harnesses)) {
+      if (inst.unavailable || inst.kind === 'module' || this.harnessRegistry.get(inst.kind)?.probeAtStart !== true) continue;
+      await this.harness(inst.name)
+        .probe()
+        .catch((e: Error) => {
+          throw new ConfigError(`harnesses.${inst.name} (${inst.kind}): ${e.message}`);
+        });
+    }
+  }
+
   private instanceOf(harnessId: string | undefined): HarnessInstance | undefined {
     return this.o.harness || harnessId === undefined ? undefined : this.o.config.harnesses[harnessId];
   }
@@ -1328,9 +1348,10 @@ export class Gateway {
   /**
    * Why a launched session's env cannot reach the instance `name`, if it cannot: what its adapter
    * declares (`HarnessAdapter.sessionEnv`; built when asked, nothing started), also while it is
-   * unavailable for now (`declaredUnavailable`). One whose adapter cannot be built even so (a module
-   * whose factory never ran) cannot say, so it takes no session env: pinned, the launch might never
-   * run there. The answer then is why the instance cannot run (which names variables, never values).
+   * unavailable for now (`declaredUnavailable`). One whose adapter cannot say even so (a module
+   * whose factory never ran, a bridge whose program was never asked) takes no session env: pinned,
+   * the launch might never run there. The answer then is why the instance cannot run (which names
+   * variables, never values).
    */
   private sessionEnvRefusal(name: string): string | undefined {
     try {
@@ -1345,12 +1366,13 @@ export class Gateway {
    * The adapter of an instance that is unavailable for now (an `env:` reference is not set), for
    * what it declares as it will once it is available: its kind's adapter built from the config as
    * it stands, only to read the declarations or take a session over (never opened, not kept).
-   * Nothing for one that is available, or whose adapter cannot be built even so (a module whose
-   * factory never ran).
+   * Nothing for one that is available, or whose adapter cannot say even so: a module whose factory
+   * never ran, a kind whose adapters learn it from their harness, which was never asked
+   * (`HarnessModule.probeAtStart`: the bridge).
    */
   private declaredUnavailable(name: string): HarnessAdapter | undefined {
     const inst = this.instanceOf(name);
-    if (inst?.unavailable === undefined) return undefined;
+    if (inst?.unavailable === undefined || this.harnessRegistry.get(inst.kind)?.probeAtStart === true) return undefined;
     try {
       return this.build({ ...inst, unavailable: undefined });
     } catch {
@@ -4442,13 +4464,6 @@ export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
    * the built-in registry says of the instance's kind.
    */
   readonly profilesInOpen: boolean;
-  /** The kind's lifecycle calls, present only when its adapter has them (the gateway reads their presence). */
-  readonly detach?: () => Promise<void>;
-  readonly dispose?: () => Promise<void>;
-  /** The same instance on the kind's adapter's own process (`HarnessAdapter.ownProcess`), present only when it has one. */
-  readonly ownProcess?: (o: { env: Record<string, string>; cwd?: string }) => InstanceHarness;
-  /** The kind's takeover by its terminal UI (`HarnessAdapter.takeover`), present only when its adapter has one. */
-  readonly takeover?: (a: HarnessTakeoverArgs) => Promise<HarnessTakeover>;
   constructor(
     readonly instance: HarnessInstance,
     readonly inner: HarnessAdapter,
@@ -4461,10 +4476,31 @@ export class InstanceHarness extends WrappedHarness implements HarnessAdapter {
     super();
     this.id = instance.name;
     this.profilesInOpen = profilesInOpen ?? (instance.kind === 'module' || builtinHarnesses.get(instance.kind)?.profilesInOpen === true);
-    if (typeof inner.detach === 'function') this.detach = () => inner.detach!();
-    if (typeof inner.dispose === 'function') this.dispose = () => inner.dispose!();
-    if (typeof inner.ownProcess === 'function') this.ownProcess = (o) => new InstanceHarness(instance, inner.ownProcess!(o), undefined, instructions, this.profilesInOpen);
-    if (typeof inner.takeover === 'function') this.takeover = (a) => inner.takeover!(a);
+  }
+
+  // Read through when asked: an adapter that learns them from its harness (`HarnessModule.probeAtStart`, a bridge) has them only after its first probe.
+
+  /** The kind's lifecycle calls, present only when its adapter has them (the gateway reads their presence). */
+  get detach(): (() => Promise<void>) | undefined {
+    const inner = this.inner;
+    return typeof inner.detach === 'function' ? () => inner.detach!() : undefined;
+  }
+
+  get dispose(): (() => Promise<void>) | undefined {
+    const inner = this.inner;
+    return typeof inner.dispose === 'function' ? () => inner.dispose!() : undefined;
+  }
+
+  /** The same instance on the kind's adapter's own process (`HarnessAdapter.ownProcess`), present only when it has one. */
+  get ownProcess(): ((o: { env: Record<string, string>; cwd?: string }) => InstanceHarness) | undefined {
+    const inner = this.inner;
+    return typeof inner.ownProcess === 'function' ? (o) => new InstanceHarness(this.instance, inner.ownProcess!(o), undefined, this.instructions, this.profilesInOpen) : undefined;
+  }
+
+  /** The kind's takeover by its terminal UI (`HarnessAdapter.takeover`), present only when its adapter has one. */
+  get takeover(): ((a: HarnessTakeoverArgs) => Promise<HarnessTakeover>) | undefined {
+    const inner = this.inner;
+    return typeof inner.takeover === 'function' ? (a) => inner.takeover!(a) : undefined;
   }
 
   probe(): Promise<{ version: string; caps: HarnessCaps }> {

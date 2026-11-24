@@ -99,9 +99,9 @@ see `docs/E2E.md` §0). New:
   without an `evidence` grant (lark-bot, mail). The daemon's config code, its gateway and
   its console name no type: what a type adds to the console (lark-bot's `/api/bots/lark`
   and `console.larkBotCommand`) is its own `ChannelModule.admin` contribution.
-- **Harness instances** (`harnesses.<name>`, `use`: `claude-code`, `codex` or `module`;
-  see `docs/E2E.md` §0). `claude-code` and `codex` are the harness kinds the daemon's
-  composition root registers (`src/bundle.ts`): each is a `HarnessModule`
+- **Harness instances** (`harnesses.<name>`, `use`: `claude-code`, `codex`, `bridge` or
+  `module`; see `docs/E2E.md` §0). `claude-code`, `codex` and `bridge` are the harness kinds the
+  daemon's composition root registers (`src/bundle.ts`): each is a `HarnessModule`
   (`@agents-io/protocol`, `harness-module.ts`) in its own package (`harness/*/src/module.ts`)
   that owns its keys, its section of the older `harness` block, its default model and
   `AGENTS_IO_LIVE_*_MODEL` variable, its config-dir variable (`sessionParams.envPathRoots`),
@@ -180,6 +180,18 @@ see `docs/E2E.md` §0). New:
   takeover gets a directory for its files (`<dataDir>/tui`), the CLI's path for helpers its
   terminal starts (`aio <command>` runs a command a built-in kind adds, `HarnessModule.cli`:
   Claude Code's `tui-bridge`) and local paths of stored files.
+  A `bridge` instance (`command`, `args`, `config`; `@agents-io/harness-jsonl-bridge`) is a
+  harness in another process, any language, spoken to over JSONL stdio (`docs/HOSTS.md` §4.8).
+  Its program says what it declares in its answer to `probe` (`declares`: the static members
+  above; `methods`: `detach`), so the daemon starts it and probes it at start, before it reads any
+  declaration (`HarnessModule.probeAtStart`); a hello of the wrong shape, one declaring
+  `attach: 'takeover'` (the bridge carries no takeover) or a program that cannot be run fails the
+  start, naming the instance and the member. From then on it is treated as any adapter: its
+  declarations reach the commands, `detach` / `adopts` decide stop and restart (without `detach`
+  its sessions are closed and the program shut down), its program reads the blob store
+  (`blob.stat` / `blob.get`, the same read-only view), `sessionEnv: 'own-process'` gives a
+  launched session a copy of the program of its own, and a task run always runs on one. An
+  instance unavailable for now is not started and declares nothing.
 - **Live (realtime voice, decision 11)**: a Codex instance with `"live": true` opts
   its app-server connection into Codex's experimental realtime API. Agents on it
   (with `tools`) get `live_join { target, channel?, instructions?, voice? }`,
@@ -1264,3 +1276,20 @@ After the review of the merge, a peer's schedules (2026-11-24; INVARIANTS SC-3, 
   `ScheduleDispatcherOptions.onFailed` gets a fourth argument, `kept` (the gateway's notice then
   says `not tried again until the next start`). A route out of the client's scope, held, denied or
   no channel still delete a one-shot.
+
+What changed for embedders with the harness bridge (core-slimming G9's gap, 2026-11-24):
+
+- A third built-in harness kind, `bridge` (`bridgeHarnessModule` from the new package
+  `@agents-io/harness-jsonl-bridge`, which also has `spawnHarness`, `serveHarness` and
+  `HarnessBridgeError`): `builtinHarnesses.kinds` is `claude-code`, `codex`, `bridge`, and the
+  config file's `harnesses.<name>.use` admits `"bridge"`.
+- New in `@agents-io/protocol`: `HarnessModule.probeAtStart` (`Gateway.start` builds and probes
+  each available instance of such a kind after loading the module harnesses, a failure being a
+  `ConfigError`; such an instance unavailable for now declares nothing), and the harness bridge's
+  wire additions (`HarnessDeclares`, `NativeClientSpec`, `OpenResult`, `BlobStat`, `BlobBytes`,
+  `BLOB_GET_MAX_BYTES`, `HARNESS_BRIDGE_FEATURES`; new optional fields and frames in
+  `HarnessHostFrame` / `HarnessAdapterFrame` / `ProbeResult`, `v` still 1). New in
+  `@agents-io/testkit`: `runHarnessConformance` (`HarnessSuiteDriver`) and `conformanceInput`.
+- `InstanceHarness.detach` / `dispose` / `ownProcess` / `takeover` are accessors that look at the
+  kind's adapter when read (they were taken once, when the wrapper was built), so an adapter that
+  learns them from its harness has them once it has: the same values for every other adapter.

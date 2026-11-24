@@ -20,6 +20,7 @@
     "@agents-io/host-mcp": "workspace:*",
     "@agents-io/harness-claude-code": "workspace:*",
     "@agents-io/harness-codex": "workspace:*",
+    "@agents-io/harness-jsonl-bridge": "workspace:*",
     "@agents-io/protocol": "workspace:*",
     "@agents-io/session": "workspace:*",
     "@sinclair/typebox": "^0.34.0",

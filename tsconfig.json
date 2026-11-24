@@ -10,6 +10,7 @@
     { "path": "channel/mail" },
     { "path": "harness/claude-code" },
     { "path": "harness/codex" },
+    { "path": "harness/jsonl-bridge" },
     { "path": "packages/daemon" },
     { "path": "packages/daemon-e2e" },
     { "path": "examples/dev-gateway" }

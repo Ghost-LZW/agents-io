@@ -16,6 +16,7 @@
     },
     "harness/claude-code": { "role": "module", "may": ["packages/protocol"] },
     "harness/codex": { "role": "module", "may": ["packages/protocol"] },
+    "harness/jsonl-bridge": { "role": "module", "may": ["packages/protocol"] },
     "channel/lark-bot": { "role": "module", "may": ["packages/protocol"] },
     "channel/mail": { "role": "module", "may": ["packages/protocol"] },
     "channel/jsonl-bridge": { "role": "module", "may": ["packages/protocol"] },

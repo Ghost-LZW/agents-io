@@ -122,6 +122,19 @@ importers:
         specifier: ^8.18.2
         version: 8.18.2
 
+  harness/jsonl-bridge:
+    dependencies:
+      '@agents-io/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
+      '@sinclair/typebox':
+        specifier: ^0.34.0
+        version: 0.34.52
+    devDependencies:
+      '@agents-io/testkit':
+        specifier: workspace:*
+        version: link:../../packages/testkit
+
   packages/daemon:
     dependencies:
       '@agents-io/channel-jsonl-bridge':
@@ -139,6 +152,9 @@ importers:
       '@agents-io/harness-codex':
         specifier: workspace:*
         version: link:../../harness/codex
+      '@agents-io/harness-jsonl-bridge':
+        specifier: workspace:*
+        version: link:../../harness/jsonl-bridge
       '@agents-io/host-mcp':
         specifier: workspace:*
         version: link:../host-mcp

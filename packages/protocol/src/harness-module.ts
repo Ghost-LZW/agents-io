@@ -13,6 +13,9 @@ import type { HarnessAdapter, HarnessFactoryInit } from './harness.js';
  */
 export type HarnessDeclarations = Pick<HarnessAdapter, 'displayName' | 'compact' | 'modes' | 'ownerProfileSwitch' | 'ephemeralOpen' | 'adopts' | 'sessionEnv' | 'attach'>;
 
+/** `HarnessDeclarations`' members, in one order (as a bridged harness's program declares them in its hello, `ProbeResult.declares`). */
+export const HARNESS_DECLARATION_KEYS = ['displayName', 'compact', 'modes', 'ownerProfileSwitch', 'ephemeralOpen', 'adopts', 'attach', 'sessionEnv'] as const satisfies readonly (keyof HarnessDeclarations)[];
+
 /**
  * A command a harness kind adds to the host's CLI (`HarnessModule.cli`): `argv` is what follows
  * its name, `env` the process's environment; it answers the exit code. Such commands are for the
@@ -121,9 +124,19 @@ export interface HarnessModule<L = unknown> {
   readonly declares?: HarnessDeclarations;
   /**
    * Its adapters take the instance's `profiles` in every open's `options.profiles` (over any the
-   * instance's `options` set), besides `create`'s `profiles`. Claude Code.
+   * instance's `options` set), besides `create`'s `profiles`. Claude Code; the bridge.
    */
   readonly profilesInOpen?: boolean;
+  /**
+   * Its adapters learn what they declare (`HarnessDeclarations`, and which of the optional methods
+   * `detach` / `ownProcess` they have) from the harness itself, in the answer to their first
+   * `probe`: an out-of-process harness, whose program says it in its hello (the bridge kind,
+   * `@agents-io/harness-jsonl-bridge`). The host builds each available instance's adapter at start
+   * and awaits its `probe` before it reads any of them, as it runs a `use: "module"` factory at
+   * start; a rejection fails the start, naming the instance (CF-4). An adapter of the kind built
+   * later (a task run's) is probed when its lane opens, as any other.
+   */
+  readonly probeAtStart?: boolean;
   /**
    * Commands it adds to the host's CLI, by name (lowercase letters, digits and `-`, starting with a
    * letter): `aio <name> …` runs it. Only the kinds of the CLI's own bundle are reachable there (it
