@@ -294,6 +294,26 @@ before any host frame; after it, the connection's client frames carry the origin
   `agent_unavailable`.
 - `explain { inputId }`: the persisted routing record.
 
+## Client op ids (`client.opId`)
+
+A client frame whose retry would act twice (a `command` frame with an `input` or `interrupt`
+command, `topic.switch`, `watch.add`) may carry `opId` next to `id`: the client's id for that one
+command, unique per principal (a UUID; 1-256 characters). The first time the command acts as
+without it, and its answer, a refusal too, is kept in the `client_ops` table of the log's database
+in the same transaction as the event that decided it (an input's `input.admitted` / `input.rejected`,
+an interrupt's `input.cancelled`, the topic change and its `topic.changed`, the stored watch), or on
+its own when it wrote none. The same `(principal, opId)` again (another connection, after a restart,
+after the log was compacted; a retry while the first still acts waits for it) is answered with that
+answer verbatim plus `replayed: true`, and nothing acts; the same `opId` on another frame type or
+another session (a `topic.switch`'s conversation, a watch's target) is `op_id_conflict`. Answers to
+such frames carry `opId`, and `seq` when the command wrote an event with its answer (for
+`topic.switch`, in the session of `value.topic`): a subscription past it shows the command's effect.
+An `interrupt` without `turnId` keeps the turn it resolved the first time before it acts; a retry
+acts on that turn only (`stale_turn` once it ended), never on a later one. `stopped` and `internal`
+answers are not kept. Receipts are never deleted. Frames without `opId` are unchanged; on other
+frames and commands `opId` is an unknown field. `host.hello` lists the feature; `LocalClient.exchange`
+sends a frame and returns its whole result frame. Spec: `docs/HOSTS.md` §4.7, INVARIANTS PR-3.
+
 ## Console API (for web UIs)
 
 `aio serve` also serves the console API of `packages/protocol/src/admin.ts`

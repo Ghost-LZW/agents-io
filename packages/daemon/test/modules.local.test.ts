@@ -332,13 +332,14 @@ async function features(socketPath: string): Promise<string[]> {
 
 /**
  * The kernel's features as `host.hello` listed them before the registry (origin/main b9b35ed's), without
- * `resolve.onBehalfOf` and `test.hooks` (off) and `external.mcp` (the endpoint off).
+ * `resolve.onBehalfOf` and `test.hooks` (off) and `external.mcp` (the endpoint off), then the kernel's
+ * `client.opId` (core-slimming G11, after the registry).
  */
 const KERNEL_HELLO = [
   'session.launch', 'callouts.resolve', 'callouts.review', 'resolve.native', 'resolver.human.extras', 'callouts.outbound', 'callouts.contact',
   'inbound.redispatch', 'host.takeover', 'explain.chain', 'run.overrides', 'run.ended.usage', 'run.correlation', 'callouts.external', 'session.compact',
   'session.prewarm', 'callouts.outbound.content', 'callouts.outbound.scope', 'reply.check', 'callout.history', 'item.tool', 'deliver.update',
-  'conversation.create', 'message.ack', 'schedules', 'history', 'host-mcp.send_file.blob_scoped',
+  'conversation.create', 'message.ack', 'schedules', 'history', 'host-mcp.send_file.blob_scoped', 'client.opId',
 ];
 
 describe('modules in the daemon (lifecycle steps 2-4)', () => {
@@ -347,7 +348,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
       'session.launch', 'callouts.resolve', 'callouts.review', 'resolve.native', 'resolver.human.extras', 'callouts.outbound', 'callouts.contact', 'resolve.onBehalfOf',
       'inbound.redispatch', 'host.takeover', 'explain.chain', 'run.overrides', 'run.ended.usage', 'run.correlation', 'callouts.external', 'session.compact',
       'session.prewarm', 'test.hooks', 'callouts.outbound.content', 'callouts.outbound.scope', 'reply.check', 'callout.history', 'item.tool', 'deliver.update',
-      'conversation.create', 'message.ack', 'schedules', 'history', 'host-mcp.send_file.blob_scoped',
+      'conversation.create', 'message.ack', 'schedules', 'history', 'host-mcp.send_file.blob_scoped', 'client.opId',
     ]);
     const w = await daemon(new ModuleRegistry([]));
     expect(await features(w.socketPath)).toEqual(KERNEL_HELLO);

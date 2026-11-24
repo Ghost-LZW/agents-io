@@ -362,6 +362,23 @@ describe('session launch: restarts, parked topics and new topics (§8.8–8.9)',
     expect(reopened).toHaveLength(2);
     expect(reopened[1]!.args).toMatchObject({ cwd: w.fx.a, env: { TOKEN: SECRET }, resume: native });
   });
+
+  it('a new topic made by a topic.switch with an op id keeps the conversation\'s launch too: pinned in the transaction that keeps its answer #LA-1 #PR-3', async () => {
+    const w = await world();
+    const launch = { cwd: w.fx.a, env: { TOKEN: SECRET } };
+    await calloutHost(w, () => ({ on: 'dispatch', session: 'topic', launch }));
+    const first = 'dev:fake:default:g1';
+    await w.chat.inject({ sender: alice, conversation: group(), text: 'start' });
+    await completed(w, first);
+    const c = await w.client();
+    const made = await c.exchange({ type: 'topic.switch', opId: 'op-second', conversation: 'fake:default:g1', new: { title: 'second' } });
+    expect(made).toMatchObject({ ok: true, opId: 'op-second', value: { created: true } });
+    const second = (made.value as { topic: { sessionKey: string } }).topic.sessionKey;
+    expect(w.gw.records.launchOf(second)).toEqual(launch);
+    expect(w.gw.records.agentOf(second)).toBe('dev');
+    expect(await c.exchange({ type: 'topic.switch', opId: 'op-second', conversation: 'fake:default:g1', new: { title: 'second' } })).toMatchObject({ replayed: true, value: made.value });
+    expect(await c.topicList({ conversation: 'fake:default:g1' })).toHaveLength(2);
+  });
 });
 
 describe('session launch: Codex (§8.10)', () => {

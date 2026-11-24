@@ -481,9 +481,10 @@ export class WatchDispatcher {
   /**
    * Create or replace a watch on behalf of `by`, checked by `Policy.watch`. The
    * hook the host MCP tools use for agents (`by.kind === 'agent'`), and the local
-   * client / config path for the owner.
+   * client / config path for the owner. `store`: how the checked watch is written (default
+   * `registry.put`): a client's `watch.add` with an op id commits its receipt with it.
    */
-  async add(by: Origin, draft: WatchDraft): Promise<AddWatchResult> {
+  async add(by: Origin, draft: WatchDraft, store?: (put: () => void, watch: Watch) => void): Promise<AddWatchResult> {
     const watch: Watch = {
       ...draft,
       id: draft.id?.trim() || this.newId('w'),
@@ -512,7 +513,8 @@ export class WatchDispatcher {
       await this.flush(existing.id);
       this.cancelTimer(existing.id);
     }
-    this.registry.put(watch);
+    if (store) store(() => this.registry.put(watch), watch);
+    else this.registry.put(watch);
     if (watch.mode === 'digest' && this.registry.bufferedCount(watch.id)) this.schedule(watch.id);
     return { ok: true, watch };
   }

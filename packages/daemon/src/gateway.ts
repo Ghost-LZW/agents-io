@@ -104,6 +104,8 @@ import {
   parseQuestionActionId,
   questionTextAnswer,
   type AddWatchResult,
+  type CommandHooks,
+  type CommandResult,
   type Delivery,
   type DeliveryRecord,
   type ExitVerdict,
@@ -134,6 +136,7 @@ import type { ChannelRegistry, DefaultEvidence } from './channel-registry.js';
 import type { HarnessRegistry } from './harness-registry.js';
 import { ConfigStore, canonical } from './console-config.js';
 import type { ClientCommand, SessionInfo } from './frames.js';
+import { ClientOps, type Op, type OpFrame, type OpOutcome } from './client-ops.js';
 import { HostService, isHostOrigin, type CalloutHook } from './host.js';
 import { LocalServer } from './local-server.js';
 import { privateDb, privateDir } from './private.js';
@@ -385,8 +388,10 @@ export class Gateway {
   readonly hostQueue: HostQueue;
   /** Sessions a harness's own terminal UI holds (`HarnessAdapter.takeover`, decision 15): the instance it stands in for. */
   private readonly takeovers = new Map<string, { instance: string; takeover: HarnessTakeover }>();
-  /** Who sent each channel message (`input.verify`), settled deliveries, session → agent. */
+  /** Who sent each channel message (`input.verify`), settled deliveries, session → agent, client op receipts. */
   readonly records: DaemonRecords;
+  /** Client frames with an op id (feature `client.opId`, INVARIANTS PR-3): their receipts are in `records`. */
+  private readonly clientOps: ClientOps;
   /** The host protocol on the local socket. */
   readonly host: HostService;
   /** Test hooks (`GatewayOptions.testHooks`), when on. */
@@ -478,6 +483,8 @@ export class Gateway {
     }
     this.hub = new Hub(log);
     this.records = new DaemonRecords(db);
+    // PR-3: a receipt commits with the event that decided it (records share the log's connection).
+    this.clientOps = new ClientOps({ store: this.records, hub: this.hub, log: (msg) => this.log('warn', msg) });
     this.hostQueue = new HostQueue(db);
     // Every topic change is recorded (topic.changed) in the session left and the one now current.
     this.topics = new TopicRegistry({ ...db, hub: this.hub, onChange: (ch) => this.topicChanged(ch) });
@@ -2249,12 +2256,15 @@ export class Gateway {
    * A session refused an input because its agent is gone (`agent_unavailable`): a
    * notice and `input.rejected` in its log, a warning, and — given a route (a
    * dispatched channel message) — one short message there (local ends read their stream).
+   * `decided`: a client's op id (PR-3) keeps its answer with the `input.rejected`, in one transaction.
    */
-  private async refuseUnavailable(sessionKey: string, code: string, message: string, inputId: string, route: ReplyRoute | null): Promise<void> {
+  private async refuseUnavailable(sessionKey: string, code: string, message: string, inputId: string, route: ReplyRoute | null, decided?: (e: SessionEvent) => void): Promise<void> {
     this.log('warn', `${code}: ${message}`);
     const ev = { ts: Date.now(), level: 'primary' as const, audience: 'status' as const, durability: 'durable' as const, visibility: 'participants' as const };
     this.hub.append(sessionKey, { ...ev, body: { t: 'notice', code: 'other', message: `${code}: ${message}` } });
-    this.hub.append(sessionKey, { ...ev, body: { t: 'input.rejected', inputIds: [inputId], reason: code } });
+    const rejected = { ...ev, body: { t: 'input.rejected' as const, inputIds: [inputId], reason: code } };
+    if (decided) this.hub.batch(() => decided(this.hub.append(sessionKey, rejected)));
+    else this.hub.append(sessionKey, rejected);
     if (route && route.channel !== 'local') {
       const text =
         code === 'agent_unavailable'
@@ -2751,8 +2761,11 @@ ${a.summary}` }],
     return this.topics.list({ ...(f.conversation !== undefined ? { conversation: f.conversation } : {}), ...(f.sessionKey !== undefined ? { sessionKey: f.sessionKey } : {}) }).map(topicView);
   }
 
-  /** `topic.switch` from a client or the host, checked by `Policy.control` as a `reset` of the conversation's current topic session. */
-  async topicSwitch(f: TopicSwitchFrame, origin: Origin): Promise<Outcome> {
+  /**
+   * `topic.switch` from a client or the host, checked by `Policy.control` as a `reset` of the conversation's current topic session.
+   * `op` (an op id, PR-3): the change and its kept answer commit together, `seq` the `topic.changed` in the now-current topic's session.
+   */
+  async topicSwitch(f: TopicSwitchFrame, origin: Origin, op?: Op): Promise<Outcome> {
     if (this.stopped) return fail('stopped', 'daemon is stopping');
     const hasId = 'topicId' in f && f.topicId !== undefined;
     const hasNew = 'new' in f && f.new !== undefined;
@@ -2766,9 +2779,13 @@ ${a.summary}` }],
     const verdict = await this.policy.control({ sessionKey: cur?.sessionKey ?? all[0]!.sessionKey, op: 'reset', origin });
     if (verdict !== 'allow') return fail('forbidden', 'not allowed to change the topics of this conversation');
     const reason = isHostOrigin(origin) ? 'system' : 'user';
+    // Switching to the current topic changes nothing and writes no event.
+    const changes = target?.state !== 'current';
+    const change = () => (target ? this.topics.switchTo(target.id, reason) : this.router.newTopic(agent, f.conversation, (f as { new: { title?: string } }).new, reason));
+    const answer = (r: ReturnType<typeof change>): Outcome => ({ ok: true, value: { topic: topicView(r.topic), ...(r.previous ? { previous: topicView(r.previous) } : {}), created: r.created } });
     try {
-      const r = target ? this.topics.switchTo(target.id, reason) : this.router.newTopic(agent, f.conversation, (f as { new: { title?: string } }).new, reason);
-      return { ok: true, value: { topic: topicView(r.topic), ...(r.previous ? { previous: topicView(r.previous) } : {}), created: r.created } };
+      const r = op ? op.commit(change, (r) => ({ outcome: answer(r), ...(changes ? { seq: this.hub.log.head(r.topic.sessionKey) } : {}) })) : change();
+      return answer(r);
     } catch (e) {
       if (e instanceof TopicError) return fail(e.code, e.message);
       throw e;
@@ -4000,6 +4017,23 @@ ${a.summary}` }],
     return this.watches.add(by, watch);
   }
 
+  /** A client's `watch.add` with an op id (PR-3): the stored watch and its kept answer commit together. */
+  private async addWatchOp(by: Origin, draft: WatchDraft, op: Op): Promise<Outcome> {
+    const r = await this.watches.add(by, draft, (put, watch) => op.commit(put, () => ({ outcome: { ok: true, value: watch } })));
+    return r.ok ? { ok: true, value: r.watch } : fail(r.code, r.message);
+  }
+
+  /**
+   * A client frame with an op id (feature `client.opId`, INVARIANTS PR-3): it acts once per
+   * (principal, opId); a retry, also after a restart, gets the first answer back (`replayed`).
+   */
+  clientOp(f: OpFrame, origin: Origin): Promise<OpOutcome> {
+    const principal = origin.principal?.id ?? `${origin.kind}:${origin.adapter}`;
+    if (f.type === 'command') return this.clientOps.run({ principal, opId: f.opId, frameType: f.command.type, sessionKey: f.command.sessionKey }, (op) => this.command(f.command, origin, op));
+    if (f.type === 'watch.add') return this.clientOps.run({ principal, opId: f.opId, frameType: 'watch.add', sessionKey: f.watch.target.sessionKey }, (op) => this.addWatchOp(origin, f.watch, op));
+    return this.clientOps.run({ principal, opId: f.opId, frameType: 'topic.switch', sessionKey: f.conversation }, (op) => this.topicSwitch(f, origin, op));
+  }
+
   removeWatch(by: Origin, id: string): Promise<RemoveWatchResult> {
     return this.watches.remove(by, id);
   }
@@ -4019,8 +4053,11 @@ ${a.summary}` }],
     };
   }
 
-  /** Apply a command from a local client (subscriptions are the server's business). */
-  async command(cmd: ClientCommand, origin: Origin): Promise<Outcome> {
+  /**
+   * Apply a command from a local client (subscriptions are the server's business). `op` (an input or
+   * interrupt with an op id, PR-3): its answer is kept with the event that decides it.
+   */
+  async command(cmd: ClientCommand, origin: Origin, op?: Op): Promise<Outcome> {
     if (this.stopped) return fail('stopped', 'gateway is stopping');
     // An input's id is fixed before the lane: a refused input is recorded under it.
     const inputId = cmd.type === 'input' ? (cmd.input.inputId ?? `in_${randomUUID()}`) : undefined;
@@ -4032,7 +4069,7 @@ ${a.summary}` }],
     } catch (e) {
       if (e instanceof LaneUnavailableError) {
         // Only a refused input is written to the session log; other commands just fail.
-        if (inputId !== undefined) await this.refuseUnavailable(cmd.sessionKey, e.code, e.message, inputId, null);
+        if (inputId !== undefined) await this.refuseUnavailable(cmd.sessionKey, e.code, e.message, inputId, null, op && ((ev) => op.settle(fail(e.code, e.message), ev.seq)));
         return fail(e.code, e.message);
       }
       return fail('no_agent', (e as Error).message);
@@ -4056,11 +4093,14 @@ ${a.summary}` }],
           // Field by field: a client never sets origin, cause or channelRef; `loopGuard` is the lane's label.
           channelContext: { channel: 'local', ...withoutKey(withoutKey(cmd.input.channelContext, 'loopGuard'), 'nativeCommand') },
         };
+        const answer = (r: CommandResult): Outcome => (r.ok ? { ok: true, value: { inputId: input.inputId, disposition: r.disposition } } : fail(r.reason));
+        // PR-3: the answer is kept with the admission (or rejection) that decides it.
+        const hooks = op && { decided: (r: CommandResult, e: SessionEvent) => op.settle(answer(r), e.seq) };
         const r =
           cmd.mode === 'observe'
-            ? await lane.observe(input)
-            : await lane.command({ type: 'input', sessionKey: cmd.sessionKey, input, mode: cmd.mode, ...(cmd.expectedTurnId ? { expectedTurnId: cmd.expectedTurnId } : {}) });
-        return r.ok ? { ok: true, value: { inputId: input.inputId, disposition: r.disposition } } : fail(r.reason);
+            ? await lane.observe(input, hooks)
+            : await lane.command({ type: 'input', sessionKey: cmd.sessionKey, input, mode: cmd.mode, ...(cmd.expectedTurnId ? { expectedTurnId: cmd.expectedTurnId } : {}) }, hooks);
+        return answer(r);
       }
       case 'resolve':
         // Answering on someone's behalf is the host's (its connection is authenticated with the token).
@@ -4070,8 +4110,9 @@ ${a.summary}` }],
       // falls through
       case 'interrupt':
       case 'control': {
-        const r = await lane.command({ ...cmd, origin });
-        return r.ok ? { ok: true, value: {} } : fail(r.reason);
+        const answer = (r: CommandResult): Outcome => (r.ok ? { ok: true, value: {} } : fail(r.reason));
+        const r = await lane.command({ ...cmd, origin }, cmd.type === 'interrupt' && op ? interruptHooks(op, answer) : undefined);
+        return answer(r);
       }
       case 'subscribe':
       case 'unsubscribe':
@@ -4186,6 +4227,18 @@ ${a.summary}` }],
     this.topics.close();
     this.hub.log.close?.();
   }
+}
+
+/**
+ * PR-3: an interrupt with an op id. Without `turnId` it acts on the turn it resolves the first time
+ * (kept `pending` before it acts), a retry on that one (or on none) only; an `input.cancelled` it
+ * writes commits with its kept answer.
+ */
+function interruptHooks(op: Op, answer: (r: CommandResult) => Outcome): CommandHooks {
+  return {
+    ...(op.pinned !== undefined ? { pinned: op.pinned } : { resolved: (turnId: string | null) => op.pin(turnId) }),
+    decided: (r, e) => op.settle(answer(r), e.seq),
+  };
 }
 
 /** `topicTools` of an input handed to a topic by session_rotate / session_switch. */

@@ -260,16 +260,11 @@ export class TopicRegistry {
       lastActiveAt: at,
     };
     const summary = previous ? opts.summaryOfPrevious?.trim() : undefined;
-    this.db.exec('BEGIN');
-    try {
+    this.atomically(() => {
       if (previous) this.q.state.run('parked', previous.lastActiveAt, previous.id);
       if (previous && summary) this.q.summary.run(summary, previous.id);
       this.q.insert.run(t.id, conversation, agent, key, t.title ?? null, draft.titleSource ?? (t.title ? 'explicit' : 'auto'), null, null, 'current', at, at);
-      this.db.exec('COMMIT');
-    } catch (e) {
-      this.db.exec('ROLLBACK');
-      throw e;
-    }
+    });
     if (previous) previous.state = 'parked';
     if (previous && summary) previous.summary = summary;
     this.remember(t);
@@ -285,15 +280,10 @@ export class TopicRegistry {
     const previous = this.current(t.conversation, t.agent);
     if (previous === t) return { topic: t, created: false };
     const at = this.now();
-    this.db.exec('BEGIN');
-    try {
+    this.atomically(() => {
       if (previous) this.q.state.run('parked', previous.lastActiveAt, previous.id);
       this.q.state.run('current', at, t.id);
-      this.db.exec('COMMIT');
-    } catch (e) {
-      this.db.exec('ROLLBACK');
-      throw e;
-    }
+    });
     if (previous) previous.state = 'parked';
     t.state = 'current';
     t.lastActiveAt = at;
@@ -340,6 +330,31 @@ export class TopicRegistry {
 
   close(): void {
     if (this.ownsDb) this.db.close();
+  }
+
+  /**
+   * `fn`'s writes as one transaction: its own, or a savepoint of one already open on this database
+   * (a `Hub.batch` of the session log it shares: a client's `topic.switch` with an op id commits
+   * its receipt with the change).
+   */
+  private atomically(fn: () => void): void {
+    const nested = this.db.isTransaction;
+    this.db.exec(nested ? 'SAVEPOINT topics_write' : 'BEGIN');
+    try {
+      fn();
+      this.db.exec(nested ? 'RELEASE topics_write' : 'COMMIT');
+    } catch (e) {
+      if (!nested) {
+        this.db.exec('ROLLBACK');
+        throw e;
+      }
+      try {
+        this.db.exec('ROLLBACK TO topics_write; RELEASE topics_write');
+      } catch {
+        // a failed statement may have ended the enclosing transaction already: its error is the one to report
+      }
+      throw e;
+    }
   }
 
   private changed(c: TopicChange): void {

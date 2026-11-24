@@ -5,6 +5,7 @@ import {
   PROTOCOL_VERSION,
   encodeFrame,
   type BindingTable,
+  type ClientResultFrame,
   type ContentBlock,
   type InboundItem,
   type InboundRedispatchResult,
@@ -165,6 +166,14 @@ export class LocalClient {
       this.pending.set(id, resolve);
       this.socket.write(encodeFrame({ v: PROTOCOL_VERSION, id, ...frame }));
     });
+  }
+
+  /**
+   * Send any client frame (an `id` is added) and resolve with its whole result frame, `ok: false` too:
+   * for a frame with `opId` (feature `client.opId`) the answer's `opId`, `seq` and `replayed`.
+   */
+  exchange(frame: Record<string, unknown>): Promise<ClientResultFrame> {
+    return this.request(frame) as Promise<ClientResultFrame>;
   }
 
   /** Send a command; resolves with the result value, rejects with CommandError when `ok` is false. */

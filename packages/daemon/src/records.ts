@@ -1,14 +1,16 @@
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import type { ExternalSender, InboundEnvelope, InputCause, InputVerifyResult, LoopGuardTrip, Origin, ReplyRoute, SessionLaunch, TurnProvenance, VerifiedInput } from '@agents-io/protocol';
 import { channelRefOf, type DeliveryRecord, type InFlightDelivery, type OutboxStore } from '@agents-io/session';
+import type { OpReceipt, OpStore } from './client-ops.js';
 
 /*
  * Daemon-side records next to the session log (same SQLite file when the log is
  * SQLite): who sent each channel message as the channel reported it (for
  * `input.verify`), settled and in-flight deliveries (outbox idempotency across
  * restarts; an in-flight row is written before the adapter is called),
- * which agent each session belongs to, and how a session is launched (decision 7:
- * its cwd and env, kept in this 0600 database like the transcripts).
+ * which agent each session belongs to, how a session is launched (decision 7:
+ * its cwd and env, kept in this 0600 database like the transcripts), and what client
+ * frames with an op id answered (`client_ops`, feature `client.opId`).
  */
 
 const DAY = 86_400_000;
@@ -56,13 +58,14 @@ export type { VerifiedInput };
 /** `input.verify` answer (protocol `InputVerifyResult`). */
 export type VerifyResult = InputVerifyResult;
 
-export class DaemonRecords implements OutboxStore {
+export class DaemonRecords implements OutboxStore, OpStore {
   readonly db: DatabaseSync;
   private readonly ownsDb: boolean;
   private q: Record<
     | 'inPut' | 'inGet' | 'inPrune' | 'outGet' | 'outPut' | 'outPrune' | 'flyPut' | 'flyGet' | 'flyAll' | 'flyDel' | 'agentGet' | 'agentPut' | 'launchGet' | 'launchPut' | 'launchKeys'
     | 'flagGet' | 'flagPut' | 'flagDel'
-    | 'obPut' | 'obByOp' | 'obByMsg' | 'obAnyMsg' | 'obAnyPart' | 'obPrune' | 'obPartPut' | 'obByPart' | 'obPartPrune' | 'causePut' | 'causeGet' | 'causeAll' | 'causePrune',
+    | 'obPut' | 'obByOp' | 'obByMsg' | 'obAnyMsg' | 'obAnyPart' | 'obPrune' | 'obPartPut' | 'obByPart' | 'obPartPrune' | 'causePut' | 'causeGet' | 'causeAll' | 'causePrune'
+    | 'opGet' | 'opPut',
     StatementSync
   >;
   /** Tests: called between the agent row and the launch row of `pin` (a throw rolls both back). */
@@ -82,6 +85,7 @@ export class DaemonRecords implements OutboxStore {
       CREATE TABLE IF NOT EXISTS daemon_outbound (operation_id TEXT PRIMARY KEY, channel TEXT NOT NULL, provider_message_id TEXT, sent_message_id TEXT, at INTEGER NOT NULL, json TEXT NOT NULL) WITHOUT ROWID;
       CREATE INDEX IF NOT EXISTS daemon_outbound_msg ON daemon_outbound (channel, provider_message_id);
       CREATE TABLE IF NOT EXISTS daemon_outbound_parts (channel TEXT NOT NULL, provider_message_id TEXT NOT NULL, operation_id TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (channel, provider_message_id, operation_id)) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS client_ops (principal TEXT NOT NULL, op_id TEXT NOT NULL, frame_type TEXT NOT NULL, session_key TEXT NOT NULL, status TEXT NOT NULL, result TEXT, seq INTEGER, turn_id TEXT, at INTEGER NOT NULL, PRIMARY KEY (principal, op_id)) WITHOUT ROWID;
     `);
     // `sent_message_id` (any delivered message, `sentByUs`) came later: added to an older table and filled
     // from what it already records.
@@ -143,6 +147,10 @@ export class DaemonRecords implements OutboxStore {
       causeGet: p('SELECT json FROM daemon_causes WHERE input_id = ? AND session_key = ?'),
       causeAll: p('SELECT json FROM daemon_causes WHERE input_id = ? ORDER BY at, session_key'),
       causePrune: p('DELETE FROM daemon_causes WHERE at < ?'),
+      // Receipts are never deleted, by the retention below or with the log (like the outbox's settled rows, DL-2):
+      // an op id is answered the same way whenever it comes again.
+      opGet: p('SELECT frame_type, session_key, status, result, seq, turn_id, at FROM client_ops WHERE principal = ? AND op_id = ?'),
+      opPut: p('INSERT INTO client_ops (principal, op_id, frame_type, session_key, status, result, seq, turn_id, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(principal, op_id) DO UPDATE SET status = excluded.status, result = excluded.result, seq = excluded.seq, turn_id = excluded.turn_id, at = excluded.at'),
     };
     const retain = o.retainMs ?? 30 * DAY;
     this.q.inPrune.run(Date.now() - retain);
@@ -272,6 +280,29 @@ export class DaemonRecords implements OutboxStore {
     return (this.q.flyAll.all() as { json: string }[]).map((r) => JSON.parse(r.json) as InFlightDelivery);
   }
 
+  // ---- client op receipts (feature client.opId) ----------------------------
+
+  getOp(principal: string, opId: string): OpReceipt | undefined {
+    const r = this.q.opGet.get(principal, opId) as { frame_type: string; session_key: string; status: string; result: string | null; seq: number | null; turn_id: string | null; at: number } | undefined;
+    if (!r) return undefined;
+    return {
+      principal,
+      opId,
+      frameType: r.frame_type as OpReceipt['frameType'],
+      sessionKey: r.session_key,
+      status: r.status as OpReceipt['status'],
+      ...(r.result !== null ? { result: JSON.parse(r.result) as OpReceipt['result'] } : {}),
+      ...(r.seq !== null ? { seq: r.seq } : {}),
+      ...(r.status === 'pending' ? { turnId: r.turn_id } : {}),
+      at: r.at,
+    };
+  }
+
+  /** One statement: inside the transaction of the event it is written with (`Hub.batch`), or its own. */
+  putOp(r: OpReceipt): void {
+    this.q.opPut.run(r.principal, r.opId, r.frameType, r.sessionKey, r.status, r.result !== undefined ? JSON.stringify(r.result) : null, r.seq ?? null, r.turnId ?? null, r.at);
+  }
+
   // ---- session → agent ----------------------------------------------------
 
   agentOf(sessionKey: string): string | undefined {
@@ -316,11 +347,27 @@ export class DaemonRecords implements OutboxStore {
    * Fails if the session already has a launch.
    */
   pin(sessionKey: string, agent: string, launch: SessionLaunch): void {
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
+    const write = () => {
       this.q.agentPut.run(sessionKey, agent);
       this.betweenPinWrites?.();
       this.q.launchPut.run(sessionKey, launch.cwd ?? null, JSON.stringify(launch.env ?? {}), Date.now());
+    };
+    // Inside a transaction already (a new topic made by a client's topic.switch with an op id, in the
+    // batch that commits its receipt): a savepoint of it.
+    if (this.db.isTransaction) {
+      this.db.exec('SAVEPOINT session_pin');
+      try {
+        write();
+        this.db.exec('RELEASE session_pin');
+      } catch (e) {
+        rollbackTo(this.db, 'session_pin');
+        throw e;
+      }
+      return;
+    }
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      write();
       this.db.exec('COMMIT');
     } catch (e) {
       this.db.exec('ROLLBACK');

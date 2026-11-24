@@ -502,8 +502,10 @@ export class HostService implements HostFrames {
  * MCP tool items carry `tool { server, name }` while the host declared `outbound.scoped`, `outbound` + `outbound.content`,
  * or asked `optIn: ["item.tool"]` (granted in the result's `optIn`). `host-mcp.send_file.blob_scoped` (SE-7): `send_file`
  * sends a `blob` ref only when it appeared in the calling session (an input's content block, an attachment it sent);
- * any other ref is refused like a missing one. These are the kernel's own; `host.hello` adds the features of the modules
- * that run (`ModuleManifest.features`) after them.
+ * any other ref is refused like a missing one. `client.opId` (PR-3): client frames (input and interrupt commands,
+ * `topic.switch`, `watch.add`) may carry `opId`; the answer is kept with the event that decided it and a retry gets it
+ * back (`replayed: true`, `seq`), an op id reused for another frame type or session is `op_id_conflict`. These are the
+ * kernel's own; `host.hello` adds the features of the modules that run (`ModuleManifest.features`) after them.
  */
 export const FEATURES = [
   'session.launch',
@@ -535,6 +537,7 @@ export const FEATURES = [
   'schedules',
   'history',
   'host-mcp.send_file.blob_scoped',
+  'client.opId',
 ];
 
 /** `DaemonRecords` flag: the name of the host that declared the `outbound` hook. */
