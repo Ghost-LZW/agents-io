@@ -4,6 +4,7 @@ import {
   type ChannelCaps,
   type ChannelContext,
   type ContentBlock,
+  type ConversationSpec,
   type Decision,
   type HarnessAdapter,
   type HarnessCaps,
@@ -116,6 +117,30 @@ export class FakeChannel implements ChannelAdapter {
     const rec = this.find(id);
     rec.edits.push(msg);
     rec.finalized = true;
+  }
+
+  /** What `history` answers (set by tests); calls are recorded. */
+  historyAnswer: InboundEnvelope[] = [];
+  readonly historyCalls: { id: string; scope: string }[] = [];
+
+  async history(env: InboundEnvelope, scope: string): Promise<InboundEnvelope[]> {
+    this.historyCalls.push({ id: env.id, scope });
+    return this.historyAnswer;
+  }
+
+  /** Marks put by `acknowledge`, in order. */
+  readonly acks: { messageId: string; state: string }[] = [];
+
+  async acknowledge(_route: ReplyRoute, messageId: string, state: string) {
+    this.acks.push({ messageId, state });
+  }
+
+  /** Conversations made by `createConversation`, in order. */
+  readonly created: ConversationSpec[] = [];
+
+  async createConversation(_account: string, spec: ConversationSpec) {
+    this.created.push(spec);
+    return { conversationId: `oc_new${this.created.length}` };
   }
 
   private find(id: string): SentRecord {

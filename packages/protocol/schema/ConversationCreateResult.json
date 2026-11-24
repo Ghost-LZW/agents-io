@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/ConversationCreateResult",
+  "type": "object",
+  "required": [
+    "operationId",
+    "channel",
+    "account",
+    "conversationId",
+    "duplicate"
+  ],
+  "properties": {
+    "operationId": {
+      "type": "string"
+    },
+    "channel": {
+      "type": "string"
+    },
+    "account": {
+      "type": "string"
+    },
+    "conversationId": {
+      "type": "string"
+    },
+    "duplicate": {
+      "type": "boolean"
+    }
+  }
+}

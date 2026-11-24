@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/OutboundContentCalloutAnswer",
+  "type": "object",
+  "required": [
+    "verdict"
+  ],
+  "properties": {
+    "verdict": {
+      "anyOf": [
+        {
+          "const": "allow",
+          "type": "string"
+        },
+        {
+          "const": "deny",
+          "type": "string"
+        },
+        {
+          "const": "hold",
+          "type": "string"
+        }
+      ]
+    },
+    "reason": {
+      "type": "string"
+    }
+  }
+}

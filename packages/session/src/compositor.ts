@@ -21,7 +21,12 @@ import type { Outbox } from './outbox.js';
 /** What one turn looks like to a rendering end. */
 export interface TurnView {
   turnId: string;
+  /** All answer text so far (also what the model said before a tool call), or the latest snapshot. */
   text: string;
+  /**
+   * The final snapshot's text (`text.snapshot` with `final`): the answer as the harness gave it.
+   * Null while there is none; the end does not fill it in (renders fall back to `text`).
+   */
   finalText: string | null;
   currentTool: string | null;
   headline: string | null;
@@ -126,6 +131,12 @@ function toolStep(v: TurnView, item: ItemSummary, parentItemId: string | undefin
   pushStep(v, { kind: 'tool', itemId: item.itemId, ...fields, ...(parentItemId ? { parentItemId } : {}) });
 }
 
+/** The turn called a tool of its own (a subagent's calls are under one). */
+const hasTool = (v: TurnView) => v.steps.some((s) => s.kind === 'tool' && !s.parentItemId);
+/** Something a reply card can show: answer text, a tool call, or thinking/narration text. */
+const hasProcessOrAnswer = (v: TurnView) =>
+  !!v.answer.trim() || v.steps.some((s) => s.kind === 'tool' || !!s.text.trim());
+
 function reasoningItem(v: TurnView, item: ItemSummary, completed: boolean): boolean {
   const known = v.steps.find((s): s is Extract<ProgressStep, { kind: 'reasoning' }> => s.kind === 'reasoning' && s.id === item.itemId);
   if (known) {
@@ -213,9 +224,10 @@ export function foldTurn(v: TurnView, e: SessionEvent): boolean {
       v.status = b.status;
       v.currentTool = null;
       v.pending = [];
-      if (v.finalText === null && v.text) v.finalText = v.text;
       closeReasoning(v);
-      if (v.finalText !== null && !v.answer) v.answer = v.finalText;
+      // Ends that show text so far keep it (`text` when there was no final snapshot); `finalText`
+      // stays the harness's, so `progressOf` can tell an answer from what was said along the way.
+      if (!v.answer) v.answer = v.finalText ?? v.text;
       v.answerFinal = true;
       v.endedAt = e.ts;
       return true;
@@ -223,6 +235,13 @@ export function foldTurn(v: TurnView, e: SessionEvent): boolean {
       return false;
   }
 }
+
+/**
+ * The turn has a final answer (`ProgressView.finalAnswer`): a final snapshot, while it runs or once it
+ * completed. One that failed, was interrupted or has an unknown outcome has none: a harness's final
+ * snapshot there is what it said so far (Codex's last message; HC-3b's, with the stall notice).
+ */
+const hasFinalAnswer = (v: TurnView) => v.finalText !== null && (v.status === null || v.status === 'completed');
 
 /** The cumulative structured view of a turn (`RenderedMessage.progress`). */
 export function progressOf(v: TurnView): ProgressView {
@@ -234,6 +253,7 @@ export function progressOf(v: TurnView): ProgressView {
     ...(v.plan ? { plan: v.plan.map((p) => ({ ...p })) } : {}),
     answer: v.answer,
     answerFinal: v.answerFinal,
+    ...(hasFinalAnswer(v) ? { finalAnswer: true } : {}),
     ...(v.startedAt !== undefined ? { startedAt: v.startedAt } : {}),
     ...(v.endedAt !== undefined ? { endedAt: v.endedAt } : {}),
   };
@@ -287,7 +307,9 @@ export function renderTurn(v: TurnView, tier: Tier, o: RenderOptions = {}): Rend
   for (const r of v.pending) {
     // A human resolver's `note` (why it is asked; what "always" would keep) goes with the ask.
     const note = r.resolver?.kind === 'human' ? r.resolver.note : undefined;
-    asks.push(`${r.kind === 'question' ? 'Answer needed' : 'Approval needed'}: ${r.title}${note ? `\n${note}` : ''}`);
+    // The host may say how the ask reads for its people (`heading`, e.g. not in English).
+    const heading = (r.resolver?.kind === 'human' ? r.resolver.heading : undefined) || (r.kind === 'question' ? 'Answer needed: ' : 'Approval needed: ');
+    asks.push(`${heading}${r.title}${note ? `\n${note}` : ''}`);
     const routes = r.resolver?.kind === 'human' ? r.resolver.routes : [];
     // Buttons only where the resolver said people answer; elsewhere just say it is waiting.
     if (o.caps?.buttons === false || (routes.length && here && !routes.includes(here))) continue;
@@ -302,7 +324,7 @@ export function renderTurn(v: TurnView, tier: Tier, o: RenderOptions = {}): Rend
     const line = clip(`→ Moved to topic ${v.movedTo.title !== undefined ? `"${v.movedTo.title}"` : v.movedTo.topicId}`);
     if (tier === 'headline' || tier === 'final') return { text: line, ...(tier === 'headline' ? { spokenText: line } : {}) };
     const topic: TopicCardData | undefined = o.title ? { title: o.title } : undefined;
-    return { text: line, sections: [], progress: { ...progressOf(v), steps: [], answer: line }, ...(topic ? { channelData: { [TOPIC_KEY]: topic } } : {}) };
+    return { text: line, sections: [], progress: { ...progressOf(v), steps: [], answer: line, finalAnswer: true }, ...(topic ? { channelData: { [TOPIC_KEY]: topic } } : {}) };
   }
   const done = v.status !== null;
   const statusLine = asks[0] ?? (done ? STATUS_LABEL[v.status!] : v.currentTool ? `▶ ${v.currentTool}` : (v.headline ?? 'Working…'));
@@ -340,6 +362,11 @@ export interface CompositorOptions {
   sessionKey: string;
   adapter: ChannelAdapter;
   outbox: Outbox;
+  /**
+   * U20: an `outbound.scoped` host's scope covers this route now. A topic title edit there goes through
+   * the outbox (`kind: title`, past the exit check). Unset or false: edited directly as before.
+   */
+  inScope?: (route: ReplyRoute) => boolean;
   /** Override the adapter's default tier. */
   tier?: Tier;
   /**
@@ -367,6 +394,12 @@ export interface CompositorOptions {
   /** Once the delay expires, wait for answer text instead of opening an empty working card. */
   requireAnswerToOpen?: boolean;
   /**
+   * Open the first message at the turn's first tool call, before the delay; once the delay
+   * expired, open it as soon as there is any process or answer to show (not an empty card).
+   * Wins over `requireAnswerToOpen`: the person sees the steps while the tools run.
+   */
+  openOnProcess?: boolean;
+  /**
    * Acknowledge inbound messages on this channel (`ChannelAdapter.acknowledge`): `working` once
    * admitted; when their turn ends the mark goes away if the turn replied on their route within
    * `doneAfterMs` of the message, else it becomes `done` (a long task, a steer folded into
@@ -381,6 +414,8 @@ export interface CompositorOptions {
 interface RouteState {
   route: ReplyRoute;
   view: TurnView;
+  /** U20: the turn is checked on this route: no streaming, no process; one answer after the turn, past the exit check. */
+  checked: boolean;
   caps: ChannelCaps;
   tier: Tier;
   streaming: boolean;
@@ -423,6 +458,11 @@ export class Compositor {
   private notices: Promise<void> = Promise.resolve();
   /** Acknowledged inbound messages, by input id, until their turn ends. */
   private readonly acks = new Map<string, { route: ReplyRoute; messageId: string; at: number; steer: boolean; turnId?: string }>();
+  /** U20: per turn, the checked answers being sent (until they settle). */
+  private readonly checkedSends = new Map<string, Promise<void>[]>();
+  /** Last seq this compositor has folded, and who waits for it to reach a seq. */
+  private seenSeq = 0;
+  private seqWaiters: { seq: number; resolve: () => void }[] = [];
 
   constructor(private readonly o: CompositorOptions) {}
 
@@ -472,9 +512,30 @@ export class Compositor {
     const view = newTurnView(turnId, start.ts);
     for (const e of events) if (e.turnId === turnId || (e.body.t === 'turn.completed' && e.body.turnId === turnId)) foldTurn(view, e);
     const caps = this.o.adapter.caps(route.account);
-    const msg = renderTurn(view, this.o.tier ?? caps.defaultTier, { route, caps, title });
+    const checked = start.body.checked === true;
+    const msg = renderTurn(view, checked ? 'final' : (this.o.tier ?? caps.defaultTier), { route, caps, title });
     if (!msg.channelData) return;
+    if (checked || this.o.inScope?.(route)) {
+      // U20: a title where an outbound.scoped host checks is asked of it first (`kind: title`); held: the card keeps its title.
+      const edit = this.o.adapter.edit.bind(this.o.adapter);
+      const operationId = `${base}:title:${Date.now()}`;
+      await this.o.outbox.deliver({ operationId, sessionKey: this.o.sessionKey, turnId, route, kind: 'title', content: msg, ...(checked ? { checked: true } : {}) }, async () => {
+        await edit(route, id, msg, { operationId, sequence: Date.now() });
+        return { providerMessageId: id };
+      });
+      return;
+    }
     await this.o.adapter.edit(route, id, msg, { operationId: `${base}:title`, sequence: Date.now() });
+  }
+
+  /**
+   * U20: resolves when every checked answer of `turnId` this compositor sends has settled (at once when
+   * it sends none). Catches up with the log first, so a turn that just ended is seen.
+   */
+  async checkedSettled(turnId: string): Promise<void> {
+    const head = this.o.hub.log.head(this.o.sessionKey);
+    if (this.sub && !this.stopped && this.seenSeq < head) await new Promise<void>((resolve) => this.seqWaiters.push({ seq: head, resolve }));
+    await Promise.all(this.checkedSends.get(turnId) ?? []);
   }
 
   private key(turnId: string, route: ReplyRoute) {
@@ -482,14 +543,27 @@ export class Compositor {
   }
 
   private onEvent(e: SessionEvent): void {
+    try {
+      this.onEvent$(e);
+    } finally {
+      if (e.seq > this.seenSeq) this.seenSeq = e.seq;
+      if (this.seqWaiters.length) {
+        const ready = this.seqWaiters.filter((w) => w.seq <= this.seenSeq);
+        this.seqWaiters = this.seqWaiters.filter((w) => w.seq > this.seenSeq);
+        for (const w of ready) w.resolve();
+      }
+    }
+  }
+
+  private onEvent$(e: SessionEvent): void {
     if (this.o.ack && this.o.adapter.acknowledge) this.ackEvent(e);
     const b = e.body;
     if (b.t === 'turn.started') {
-      if (b.replyRoute) this.track(b.turnId, b.replyRoute, e.ts);
+      if (b.replyRoute) this.track(b.turnId, b.replyRoute, e.ts, undefined, b.checked === true);
       return;
     }
     if (b.t === 'turn.delivery_added') {
-      this.track(b.turnId, b.route, e.ts);
+      this.track(b.turnId, b.route, e.ts, undefined, b.checked === true);
       return;
     }
     if (b.t === 'input.rejected') {
@@ -562,7 +636,7 @@ export class Compositor {
   private notifyRejected(b: BodyOf<'input.rejected'>, route: ReplyRoute): void {
     const msg: RenderedMessage = { text: rejectionNotice(b.reason) };
     // A system notice, not the agent's words: no `as` (an echo must not read as agent output).
-    const op = { operationId: `${this.o.sessionKey}:rejected:${b.inputIds[0] ?? ''}:${routeKey(route)}`, sessionKey: this.o.sessionKey, route, msg };
+    const op = { operationId: `${this.o.sessionKey}:rejected:${b.inputIds[0] ?? ''}:${routeKey(route)}`, sessionKey: this.o.sessionKey, route, msg, kind: 'notice' as const, exitChecked: true };
     this.notices = this.notices.then(async () => {
       await this.o.outbox.send(this.o.adapter, op);
     }).catch((err) => this.o.onError?.(err));
@@ -578,12 +652,17 @@ export class Compositor {
     const data: QuestionData = { actionId, title: req.title, questions: req.questions?.length ? req.questions : [{ id: '0', text: req.title }] };
     const msg: RenderedMessage = { text: questionPrompt(req, actionId), channelData: { [QUESTION_KEY]: data } };
     this.enqueue(r, async () => {
+      // U20: answered before its card went out (the host's resolve callout): no card.
+      if (r.checked && !r.questions.has(req.requestId)) return;
       await this.o.outbox.send(this.o.adapter, {
         operationId: `${this.base(r)}:question:${req.requestId}`,
         sessionKey: this.o.sessionKey,
         turnId: r.view.turnId,
         route: r.route,
         msg,
+        kind: 'question',
+        requestId: req.requestId,
+        ...(r.checked ? { checked: true } : {}),
         ...(this.o.as !== undefined ? { as: this.o.as } : {}),
       });
     });
@@ -599,7 +678,7 @@ export class Compositor {
       if (sent?.status !== 'delivered' || !sent.providerMessageId || !this.o.adapter.edit) return;
       const data: QuestionData = { actionId: questionActionId(this.o.sessionKey, requestId), title: req.title, questions: req.questions?.length ? req.questions : [{ id: '0', text: req.title }], state };
       const msg: RenderedMessage = { text: questionPrompt(req, data.actionId), channelData: { [QUESTION_KEY]: data } };
-      await this.o.outbox.deliver({ operationId: `${this.base(r)}:question:${requestId}:closed`, sessionKey: this.o.sessionKey, route: r.route }, async () => {
+      await this.o.outbox.deliver({ operationId: `${this.base(r)}:question:${requestId}:closed`, sessionKey: this.o.sessionKey, turnId: r.view.turnId, route: r.route, kind: 'question', requestId, exitChecked: true }, async () => {
         await this.o.adapter.edit!(r.route, sent.providerMessageId!, msg, { operationId: `${this.base(r)}:question:${requestId}:closed`, sequence: ++r.editSeq });
         return { providerMessageId: sent.providerMessageId };
       });
@@ -624,7 +703,8 @@ export class Compositor {
     }
     for (const route of routes) {
       const messageId = anchors.get(routeKey(route));
-      this.track(turn.turnId, route, Date.now(), messageId ?? null);
+      // U20: which of its routes made the turn checked is not in the snapshot: all of them are (fail closed).
+      this.track(turn.turnId, route, Date.now(), messageId ?? null, turn.checked === true);
       const r = this.routes.get(this.key(turn.turnId, route));
       if (!r) continue;
       for (const e of this.o.hub.log.read(this.o.sessionKey, 0)) {
@@ -640,18 +720,20 @@ export class Compositor {
   }
 
   /** `restored`: the turn's message from an earlier process (null: none was sent); undefined for a new turn. */
-  private track(turnId: string, route: ReplyRoute, startedAt: number, restored?: string | null): void {
+  private track(turnId: string, route: ReplyRoute, startedAt: number, restored?: string | null, checked = false): void {
     if (!this.owns(route)) return;
     const k = this.key(turnId, route);
     if (this.routes.has(k)) return;
     const caps = this.o.adapter.caps(route.account);
-    const tier = this.o.tier ?? caps.defaultTier;
+    // U20: a checked route gets the answer alone (the `final` tier: no process, no buttons but a request's).
+    const tier = checked ? 'final' : (this.o.tier ?? caps.defaultTier);
     const r: RouteState = {
       route,
       view: newTurnView(turnId, startedAt),
+      checked,
       caps,
       tier,
-      streaming: caps.edit && !!this.o.adapter.edit && tier !== 'final',
+      streaming: !checked && caps.edit && !!this.o.adapter.edit && tier !== 'final',
       opened: restored !== undefined,
       openReady: false,
       previewDue: false,
@@ -672,7 +754,7 @@ export class Compositor {
     else r.openTimer = setTimeout(() => {
       r.openTimer = undefined;
       r.openReady = true;
-      if (!this.o.requireAnswerToOpen || r.view.answer.trim()) this.open(r);
+      if (this.o.openOnProcess ? hasProcessOrAnswer(r.view) : !this.o.requireAnswerToOpen || r.view.answer.trim()) this.open(r);
     }, delay);
     const previewDelay = this.o.previewDelayMs;
     if (previewDelay !== undefined && this.o.adapter.previewProgress && previewDelay < delay) {
@@ -726,6 +808,7 @@ export class Compositor {
       turnId: r.view.turnId,
       route: r.route,
       msg,
+      kind: 'reply',
       ...(this.o.as !== undefined ? { as: this.o.as } : {}),
     });
     r.lastEditAt = Date.now();
@@ -751,12 +834,17 @@ export class Compositor {
         r.sentRequests.add(req.requestId);
         const msg = renderTurn({ ...r.view, pending: [req] }, 'final', { route: r.route, caps: r.caps });
         this.enqueue(r, async () => {
+          // U20: settled before its card went out (the host's resolve callout answered it): no card.
+          if (r.checked && !r.view.pending.some((p) => p.requestId === req.requestId)) return;
           await this.o.outbox.send(this.o.adapter, {
             operationId: `${this.base(r)}:req:${req.requestId}`,
             sessionKey: this.o.sessionKey,
             turnId: r.view.turnId,
             route: r.route,
             msg,
+            kind: 'request',
+            requestId: req.requestId,
+            ...(r.checked ? { checked: true } : {}),
             ...(this.o.as !== undefined ? { as: this.o.as } : {}),
           });
         });
@@ -765,9 +853,11 @@ export class Compositor {
     }
     if (!r.opened) {
       // Still holding the first message: an approval opens it; answer text may do so.
-      if (openedRequest || (this.o.requireAnswerToOpen
-        ? r.openReady && !!r.view.answer.trim()
-        : !this.o.holdAnswerUntilOpen && !!(r.view.answer || r.view.text))) this.open(r);
+      if (openedRequest || (this.o.openOnProcess
+        ? hasTool(r.view) || (r.openReady && hasProcessOrAnswer(r.view))
+        : this.o.requireAnswerToOpen
+          ? r.openReady && !!r.view.answer.trim()
+          : !this.o.holdAnswerUntilOpen && !!(r.view.answer || r.view.text))) this.open(r);
       else if (r.previewDue) this.preview(r, false);
       return;
     }
@@ -821,9 +911,14 @@ export class Compositor {
     if (r.previewTimer) clearTimeout(r.previewTimer);
     r.previewTimer = undefined;
     if (!r.opened && r.previewDue) this.preview(r, true);
+    let settled!: () => void;
+    if (r.checked) {
+      const p = new Promise<void>((res) => (settled = res));
+      this.checkedSends.set(r.view.turnId, [...(this.checkedSends.get(r.view.turnId) ?? []), p]);
+    }
     this.enqueue(r, async () => {
       const msg = this.render(r);
-      const d = { operationId: `${this.base(r)}:final`, sessionKey: this.o.sessionKey, turnId: r.view.turnId, route: r.route };
+      const d = { operationId: `${this.base(r)}:final`, sessionKey: this.o.sessionKey, turnId: r.view.turnId, route: r.route, kind: 'reply' as const, ...(r.checked ? { checked: true } : {}) };
       const id = r.messageId;
       const adapter = this.o.adapter;
       // A turn that moved to another topic, with nothing sent yet (final-only channels): no message at all.
@@ -840,6 +935,11 @@ export class Compositor {
     });
     this.enqueue(r, async () => {
       this.routes.delete(this.key(r.view.turnId, r.route));
+      if (r.checked) {
+        settled();
+        // Kept a little while for a gate that asks late, then dropped.
+        setTimeout(() => this.checkedSends.delete(r.view.turnId), 60_000).unref?.();
+      }
     });
   }
 }

@@ -1,15 +1,17 @@
 import type { KernelContext, ModuleConfig, ModuleManifest } from '@agents-io/protocol';
-import { TOOL_GROUP_DEFS, liveToolHandlers, topicToolHandlers, watchToolHandlers } from '@agents-io/host-mcp';
+import { TOOL_GROUP_DEFS, liveToolHandlers, scheduleToolHandlers, topicToolHandlers, watchToolHandlers } from '@agents-io/host-mcp';
 import { TOPIC_TOOLS_HINT } from '@agents-io/session';
 
 /*
  * The model tools beyond the kernel's own six, as built-in feature modules (core-slimming G6 step 3;
  * `bundle.ts` registers them, nothing else in the daemon imports them): the watch tools
- * (`watch_add`, `watch_remove`, `watch_list`), the live tools (`live_join`, `live_say`,
- * `live_leave`) and the topic tools (`session_rotate`, `session_list`, `session_switch`). Each
- * offers its group of host-mcp's tool definitions (`TOOL_GROUP_DEFS`: listed exactly as before)
- * and runs it with host-mcp's handlers over the kernel's mechanism, which stays the kernel's:
- * watches and their routing (`KernelContext.watches`, `Policy.watch`), the live (decision 16:
+ * (`watch_add`, `watch_remove`, `watch_list`), the schedule tools (`schedule_add`,
+ * `schedule_remove`, `schedule_list`), the live tools (`live_join`, `live_say`, `live_leave`) and
+ * the topic tools (`session_rotate`, `session_list`, `session_switch`). Each offers its group of
+ * host-mcp's tool definitions (`TOOL_GROUP_DEFS`: listed exactly as before) and runs it with
+ * host-mcp's handlers over the kernel's mechanism, which stays the kernel's: watches and their
+ * routing (`KernelContext.watches`, `Policy.watch`), schedules and their firing (SC-1..SC-3:
+ * `KernelContext.schedules`, the owner's limits and the route check behind `add`), the live (decision 16:
  * `KernelContext.live`; its protocol, events and LN invariants are core) and the topic handover
  * (TP-1: `KernelContext.topics.rotate` / `switch`). The topic tools also give the hint inputs of a
  * current topic carry (`inputHint`), to the agents offered them. Each is on unless its section
@@ -18,7 +20,7 @@ import { TOPIC_TOOLS_HINT } from '@agents-io/session';
  * a live, as before.
  */
 
-/** The section of one of the tool modules (`watchTools`, `liveTools`, `topicTools`): only `enabled` (the daemon's). */
+/** The section of one of the tool modules (`watchTools`, `scheduleTools`, `liveTools`, `topicTools`): only `enabled` (the daemon's). */
 export interface ToolModuleSection {
   enabled?: boolean;
 }
@@ -37,6 +39,26 @@ export const watchToolsModule: ModuleManifest<ToolModuleConfig> = {
   config: section('watchTools'),
   mcpTools: TOOL_GROUP_DEFS.watch,
   setup: (k) => ({ tools: watchToolHandlers(k.watches) }),
+};
+
+/**
+ * `schedule_*`: an agent sets times for its own session (a turn then, or a message to a route it may
+ * send to), within the owner's limits (SC-3: `policy.scheduleLimit`, `policy.scheduleMinMinutes`).
+ */
+export const scheduleToolsModule: ModuleManifest<ToolModuleConfig> = {
+  id: 'tools.schedules',
+  kind: 'feature',
+  needs: ['kernel:schedules'],
+  config: section('scheduleTools'),
+  mcpTools: TOOL_GROUP_DEFS.schedules,
+  setup: (k) => ({
+    tools: scheduleToolHandlers({
+      // A route only from the running turn: the kernel checks that turn may send there.
+      add: (sessionKey, draft, turn) => k.schedules.add(sessionKey, draft, turn?.turnId),
+      remove: (sessionKey, id) => k.schedules.remove(sessionKey, id),
+      list: (sessionKey) => k.schedules.list(sessionKey),
+    }),
+  }),
 };
 
 /** `live_*`: the agent joins a live (realtime voice) on a channel that can open one, speaks there, leaves. */

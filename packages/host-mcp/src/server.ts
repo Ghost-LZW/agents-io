@@ -25,7 +25,7 @@ export interface ToolEntry {
 
 /**
  * The tools an endpoint over `tools` offers, in the order it lists them: the kernel's in
- * `TOOL_DEFS` order (`watch_*`, `session_*`, `live_*` only when the host passed their control),
+ * `TOOL_DEFS` order (`watch_*`, `schedule_*`, `session_*`, `live_*` only when the host passed their control),
  * then the active modules' (`HostToolsOptions.modules`; a module may offer one of those groups,
  * `TOOL_GROUP_DEFS`, when the host passed no control for it). A token limited to some tools (the
  * agent's `tools` list) gets those of these it names.
@@ -34,6 +34,7 @@ export function toolCatalog(tools: HostTools): ToolEntry[] {
   const kernel: ToolEntry[] = [];
   for (const name of TOOL_NAMES) {
     if (name.startsWith('watch_') && !tools.hasWatches) continue;
+    if (name.startsWith('schedule_') && !tools.hasSchedules) continue;
     if (name.startsWith('session_') && !tools.hasTopics) continue;
     if (name.startsWith('live_') && !tools.hasLive) continue;
     const def = TOOL_DEFS[name];

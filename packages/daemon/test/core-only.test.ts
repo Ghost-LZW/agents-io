@@ -290,9 +290,9 @@ describe('the kernel with no modules (coreRegistries, the embedder\'s channel an
     // The kernel's tools only (no watch_*, live_*, session_*), and no topic hint on the inputs.
     expect(listed).toEqual(said.map(() => [...KERNEL_TOOL_NAMES]));
     expect(inputs.every((i) => !('topicTools' in i.channelContext))).toBe(true);
-    // host.hello: the kernel's features (onBehalfOf is off by default), no module's.
+    // host.hello: the kernel's features (onBehalfOf and the test hooks are off by default), no module's.
     const probe = await w.client();
-    expect((await probe.hello({ token: w.gw.token, name: 'probe' })).features).toEqual(FEATURES.filter((f) => f !== 'resolve.onBehalfOf'));
+    expect((await probe.hello({ token: w.gw.token, name: 'probe' })).features).toEqual(FEATURES.filter((f) => f !== 'resolve.onBehalfOf' && f !== 'test.hooks'));
     expect(w.gw.adminStatus().externalMcp).toBeUndefined();
     // The console serves the core endpoints only: lark-bot's provisioning is an unknown route.
     const api = async (path: string, init: RequestInit = {}) => {

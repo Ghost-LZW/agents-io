@@ -1,5 +1,5 @@
-export { LarkBotAdapter, LarkApiError, type CardLevel, type LarkBotOptions } from './adapter.js';
-export { resolveConfig, type LarkBotConfig, type ProcessMode, type ResolvedConfig } from './config.js';
+export { LarkBotAdapter, LarkApiError, receiveIdType, type CardLevel, type LarkBotOptions } from './adapter.js';
+export { PROCESS_STRICTEST_FIRST, resolveConfig, unknownChatProcess, type LarkBotConfig, type ProcessMode, type ResolvedConfig } from './config.js';
 export { CHANNEL_ID, larkFileRef, mapCardAction, mapMessageEvent, messageText, senderId } from './inbound.js';
 export { InboundEnricher, dispositionName, sniffMime } from './enrich.js';
 export { buildCard, fitCard, isLarkCard, splitText, uuidFor } from './render.js';

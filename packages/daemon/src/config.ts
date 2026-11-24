@@ -6,6 +6,7 @@ import {
   Binding,
   Evidence,
   IdentityEntry,
+  ScheduleDraft,
   Tier,
   WatchDraft,
   errors,
@@ -149,6 +150,15 @@ const ChannelCommon = {
    * default to 0 and answer text opens early.
    */
   openDelayMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 60_000 })),
+  /**
+   * With `openDelayMs`: the first message opens at the turn's first tool call, or once the delay
+   * passed with something to show (a tool, thinking, answer text), instead of with the first
+   * answer text. Default: what the adapter declares (`ChannelCaps.pacing.openOnProcess`: on for
+   * Lark bots, whose card lists the steps), off elsewhere. A module channel that edits its message
+   * (open-lark's personal account on the `card` tier) sets it to show one progress line early and
+   * edit it into the answer.
+   */
+  openOnProcess: Type.Optional(Type.Boolean()),
   /** Lark native process preview delay (ms), before the reply card. Default 2000. */
   previewDelayMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 60_000 })),
   /**
@@ -426,6 +436,10 @@ const KernelFile = Type.Object(
            * approval (decision 12) will sit behind it too.
            */
           answerOnBehalf: Type.Optional(Type.Boolean()),
+          /** Schedules an agent may keep for its session (schedule_add), default 20. */
+          scheduleLimit: Type.Optional(Type.Integer({ minimum: 0 })),
+          /** The shortest period of an agent's schedule, in minutes, default 5. */
+          scheduleMinMinutes: Type.Optional(Type.Number({ minimum: 1 })),
           /**
            * Sources an agent may watch without asking (defaultPolicy `watchAllowlist`):
            * each entry matches when every field it sets equals the watch source's.
@@ -484,6 +498,13 @@ const KernelFile = Type.Object(
      * the config takes effect on restart.
      */
     watches: Type.Optional(Type.Array(Type.Intersect([WatchDraft, Type.Object({ id: Type.String() })]))),
+    /**
+     * Schedules the owner sets up (docs/design/schedules): each needs an `id`; loaded at start
+     * (an existing one with that id is replaced, its next time recomputed). `timeZone` is the
+     * default for cron schedules without `tz` (default the system's).
+     */
+    schedules: Type.Optional(Type.Array(Type.Object({ ...ScheduleDraft.properties, id: Type.String() }, { additionalProperties: false }))),
+    timeZone: Type.Optional(Type.String()),
     /**
      * The console API (HTTP + WebSocket for web UIs; protocol admin.ts). Default on for
      * `aio serve`, on 127.0.0.1:7464. A non-loopback `host` is refused unless
@@ -700,6 +721,10 @@ export interface Config {
     strangers: 'drop' | 'ask';
     routes: string[];
     watchAllowlist: Partial<Pick<WatchSource, 'channel' | 'account' | 'conversation' | 'conversationKind'>>[];
+    /** Schedules an agent may keep for its session. */
+    scheduleLimit: number;
+    /** The shortest period of an agent's schedule, in minutes. */
+    scheduleMinMinutes: number;
     /** `policy.answerOnBehalf` (default false): `resolve { onBehalfOf }` is allowed. */
     answerOnBehalf: boolean;
     /** `policy.loopGuard` (defaults in `LOOP_GUARD_DEFAULTS`). */
@@ -709,6 +734,10 @@ export interface Config {
   };
   /** Owner watches from the config file. */
   watches: (WatchDraft & { id: string })[];
+  /** Owner schedules from the config file. */
+  schedules: (ScheduleDraft & { id: string })[];
+  /** Default time zone of cron schedules. */
+  timeZone: string;
   /** The config's `outputTools` (default false): the default of every agent's `tools`. */
   outputTools: boolean;
   /** How long a parked topic's lane stays open while idle (0: until the daemon stops). */
@@ -996,11 +1025,15 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
       strangers: c.policy?.strangers ?? 'drop',
       routes: c.policy?.routes ?? [],
       watchAllowlist: c.policy?.watchAllowlist ?? [],
+      scheduleLimit: c.policy?.scheduleLimit ?? 20,
+      scheduleMinMinutes: c.policy?.scheduleMinMinutes ?? 5,
       answerOnBehalf: c.policy?.answerOnBehalf ?? false,
       loopGuard: c.policy?.loopGuard ?? {},
       agentContacts: (c.policy?.agentContacts ?? []) as AgentContactRule[],
     },
     watches: c.watches ?? [],
+    schedules: c.schedules ?? [],
+    timeZone: c.timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
     local: {
       principal: { id: c.local?.principal ?? owners[0] ?? 'local:owner', labels: c.local?.labels ?? ['owner'] },
       session: localSession,

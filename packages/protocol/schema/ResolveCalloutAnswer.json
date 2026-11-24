@@ -263,6 +263,11 @@
                   "maxLength": 500,
                   "type": "string"
                 },
+                "heading": {
+                  "minLength": 1,
+                  "maxLength": 40,
+                  "type": "string"
+                },
                 "allowSessionAs": {
                   "const": "allow_once",
                   "type": "string"
@@ -303,6 +308,11 @@
         },
         "note": {
           "maxLength": 500,
+          "type": "string"
+        },
+        "heading": {
+          "minLength": 1,
+          "maxLength": 40,
           "type": "string"
         },
         "allowSessionAs": {

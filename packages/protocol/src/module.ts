@@ -6,11 +6,12 @@ import type { ClientCommand, WatchDraft } from './client.js';
 import type { ReplyRoute } from './common.js';
 import type { Audience, Level, SessionEvent } from './events.js';
 import type { HarnessAdapter } from './harness.js';
-import type { ExternalCallout, ExternalCalloutAnswer, ExternalSender, IdentityEntry, InboundItem, RouteExplanation, SessionScope } from './host.js';
+import type { ExternalCallout, ExternalCalloutAnswer, ExternalSender, IdentityEntry, InboundItem, RouteExplanation, ScheduleView, SessionScope } from './host.js';
 import type { InboundEnvelope, InputRecord, Origin } from './inbound.js';
 import type { IdentifyArgs, Identity, Policy, TurnContext, TurnDraft } from './policy.js';
 import type { Resolver } from './requests.js';
 import type { RunSpec } from './run.js';
+import type { ScheduleDraft } from './schedule.js';
 import type { Topic } from './topic.js';
 import type { Watch } from './watch.js';
 
@@ -27,7 +28,7 @@ import type { Watch } from './watch.js';
  * In progress: the daemon reads the manifest (`id`, `kind`, `needs`, `config`, `features`,
  * `mcpTools`, `commands`, `setup`) and, of the instance, `tools`, `commands`, `features`,
  * `status`, `start`, `stop` and the hooks `onTurnCompleted`, `inputHint`, `onUndispatched`,
- * `onAction`, `resolver`, `identities` and `statusLines`. `admin`, the other `hooks` and
+ * `onAction`, `resolver`, `identities`, `statusLines` and `scheduledMessage`. `admin`, the other `hooks` and
  * `localFrames` were sketched for the Claude Code terminal (G6 step 6), which became a harness
  * capability instead (`HarnessAdapter.takeover`); they are served when a module needs them. Until
  * the daemon serves one, a module that sets it fails to register (`admin`) or to set up
@@ -127,7 +128,7 @@ export interface ModuleToolDef {
 export interface ModuleToolCall {
   /** The session of the harness binding that called. */
   sessionKey: string;
-  /** The running turn; always set for a tool that needs one (`ModuleToolDef.needsTurn`). */
+  /** The running turn, when one runs in the session; always set for a tool that needs one (`ModuleToolDef.needsTurn`). */
   turn?: TurnContext;
   /** The arguments, valid against the tool's `input`. */
   args: Record<string, unknown>;
@@ -223,13 +224,19 @@ export type KernelWatchResult = { ok: true; watch: Watch } | { ok: false; code: 
 /** How a watch the kernel was asked to remove ended (`KernelContext.watches.remove`). */
 export type KernelUnwatchResult = { ok: true; removed: boolean } | { ok: false; code: string; message: string };
 
+/** How a schedule the kernel was asked to set ended (`KernelContext.schedules.add` / `addAs`). */
+export type KernelScheduleResult = { ok: true; schedule: ScheduleView } | { ok: false; code: string; message: string };
+
+/** How a schedule the kernel was asked to remove ended (`KernelContext.schedules.remove` / `removeAs`). */
+export type KernelUnscheduleResult = { ok: true; removed: boolean } | { ok: false; code: string; message: string };
+
 /** How a turn ended (`turn.completed.status`). */
 export type ModuleTurnStatus = Extract<SessionEvent['body'], { t: 'turn.completed' }>['status'];
 
 /**
  * What a module hooks into. The daemon serves `onTurnCompleted`, `inputHint`, `onUndispatched`,
- * `onAction`, `resolver`, `identities` and `statusLines`; a module that sets any other fails to set
- * up, naming it (see the file comment). Each says which feature it is for.
+ * `onAction`, `resolver`, `identities`, `statusLines` and `scheduledMessage`; a module that sets any
+ * other fails to set up, naming it (see the file comment). Each says which feature it is for.
  */
 export interface ModuleHooks {
   /**
@@ -257,8 +264,10 @@ export interface ModuleHooks {
   /**
    * A turn of a session ended, whatever its status (not a task run's turn): called right after its
    * `turn.completed` is in the session's log, from when the daemon runs until it stops its modules,
-   * for every module in registration order. Return at once (start the work, don't await it): a
-   * throw or a rejected promise is logged, nothing else. Topic titles.
+   * for every module in registration order; a turn an `outbound.scoped` host checks (U20, its
+   * `turn.started.checked`) once its checked answers settled (past the host's exit check, or held),
+   * at most the host's outbound timeout and 5 s later. Return at once (start the work, don't await
+   * it): a throw or a rejected promise is logged, nothing else. Topic titles.
    */
   onTurnCompleted?(a: { sessionKey: string; turnId: string; status: ModuleTurnStatus }): void;
   /** A conversation's current topic changed. */
@@ -296,6 +305,16 @@ export interface ModuleHooks {
    * commands: its Plan mode and the owner's profile switch.
    */
   statusLines?(sessionKey: string): string[];
+  /**
+   * A `message` schedule fires (`KernelContext.schedules`; SC-1: once per firing): `true` when the
+   * module sent it itself, as one of its own principals (the external MCP endpoint: a client's
+   * schedule, `schedule.createdBy` its principal, goes out as that client's `send_message`, through
+   * its checks); `false` for a schedule that is not its own. Asked of every module in registration
+   * order until one answers `true`; when none does, the kernel sends it as the daemon's message. A
+   * throw or a rejected promise is the firing's failure: it is redone with the same operationId
+   * (SC-1). Served from when the daemon runs (also before the module's `start`) until it stops.
+   */
+  scheduledMessage?(a: { schedule: ScheduleView; operationId: string }): Promise<boolean> | boolean;
   /**
    * The module's identity map entries when the daemon starts (`KernelContext.router.setExtraIdentities`
    * replaces them later): asked once, when the kernel is ready and before any input is identified
@@ -368,10 +387,19 @@ export type KernelOutcome = { ok: true; value: unknown } | { ok: false; code: st
 
 /** How a send through the kernel's outbox ended. */
 export interface KernelSendResult {
-  status: 'delivered' | 'rejected' | 'unknown';
+  /** `held`: the host's check took it (U20); never sent, final. */
+  status: 'delivered' | 'rejected' | 'unknown' | 'held';
   /** The platform's message id, when delivered. */
   providerMessageId?: string;
   error?: string;
+  /** `held` (and a send the host's exit check denied): why, as the host said (never content). */
+  reason?: string;
+}
+
+/** The outbound check's answer that the host took the send (`KernelContext.outbound` with `content`, U20): settle it with `KernelContext.hold`. */
+export interface KernelHold {
+  hold: true;
+  reason?: string;
 }
 
 /** A send through the kernel's outbox that has settled: how it ended, and the route it went to. */
@@ -554,9 +582,12 @@ export interface KernelContext {
      * still `expected` (what the module read before it made one: a title given or made meanwhile
      * wins), so a result that comes back late never overwrites a name. Then the latest card of the
      * topic's session is edited on each channel to carry it (a card header: Lark). False when
-     * nothing changed (also for the same title).
+     * nothing changed (also for the same title). U20: where an `outbound.scoped` host checks the
+     * topic (its conversation is in scope, or its session had a checked turn), the title is asked of
+     * that host first (`kind: title`, for `turnId`, the turn it was made after), and kept only when
+     * it answers `allow`; the host away is a hold.
      */
-    setAutoTitle(topicId: string, expected: string | undefined, title: string): boolean;
+    setAutoTitle(topicId: string, expected: string | undefined, title: string, turnId?: string): Promise<boolean>;
     /**
      * Hand the running turn `turnId` of a topic session to a new topic of its conversation
      * (`title`; current from now on), `summary` (what the new topic should know) saved on the topic
@@ -590,6 +621,37 @@ export interface KernelContext {
     remove(sessionKey: string, id: string): Promise<KernelUnwatchResult>;
     /** The watches delivering into the session. */
     list(sessionKey: string): Watch[];
+  };
+  /**
+   * Schedules (docs/design/schedules; SC-1..SC-3): the kernel keeps and fires them (a turn in a
+   * session, a message through the outbox, an item for the host); a module sets them as a session's
+   * agent (the schedule tools) or as a peer (an external MCP client), never as the owner or a host.
+   */
+  readonly schedules: {
+    /**
+     * Set or replace a schedule as the session's agent (kind `agent`, `session:<sessionKey>`): a turn
+     * only into the session itself, never one for the host, at most `policy.scheduleLimit` of them,
+     * none firing more often than `policy.scheduleMinMinutes`, only its own replaced (SC-3). One with a
+     * `route` (a message's destination, or where the turn's answer goes) only while the session's
+     * turn `turnId` runs and may send there (`Policy.outbound`, as for an output tool's message);
+     * otherwise `forbidden`.
+     */
+    add(sessionKey: string, draft: ScheduleDraft, turnId?: string): Promise<KernelScheduleResult>;
+    /** Remove a schedule as the session's agent: only one it set (`forbidden` otherwise). */
+    remove(sessionKey: string, id: string): Promise<KernelUnscheduleResult>;
+    /** The schedules of a session: turns into it, and the ones its agent set. */
+    list(sessionKey: string): ScheduleView[];
+    /**
+     * Set or replace a schedule as a peer (`origin.kind: "peer"`, an agent outside this daemon: an
+     * external MCP client): messages, and wakes handed to the host (`action: "host"` with
+     * `meta.wake`), never a turn here; only its own replaced. Any other origin, a principal with the
+     * `owner` label and one of the owners throw. A message fires through `ModuleHooks.scheduledMessage`.
+     */
+    addAs(origin: Origin, draft: ScheduleDraft): Promise<KernelScheduleResult>;
+    /** Remove a schedule as a peer: only one it set. Throws for the origins `addAs` refuses. */
+    removeAs(origin: Origin, id: string): Promise<KernelUnscheduleResult>;
+    /** The schedules `origin`'s principal set. */
+    listAs(origin: Origin): ScheduleView[];
   };
   /**
    * The live (realtime voice) mechanism of a session's harness (decision 11): its protocol, events
@@ -699,7 +761,10 @@ export interface KernelContext {
    * Send a message on a route through the outbox: once per `operationId` (also across restarts),
    * settled in `sessionKey`'s log. Undefined when no running channel sends to the route.
    * `external`: the client outside the daemon it sends for; the outbound record and `explain`
-   * name it, also when the send settles after a restart (EX-8).
+   * name it, also when the send settles after a restart (EX-8). U20: the kernel says what the send is
+   * (`delivery.settled.kind`): a client's message is `tool` (an `outbound.scoped` host checks it with
+   * its content where its scope is: `held` or `rejected` then, never sent), any other the module's own
+   * `notice` (the daemon's, not an agent's: no exit check).
    */
   send(route: ReplyRoute, msg: RenderedMessage, a: { operationId: string; sessionKey: string; turnId?: string; external?: ExternalSender }): Promise<KernelSendResult | undefined>;
   /** A send through the outbox by `operationId`, once it has settled (also before a restart). */
@@ -708,9 +773,17 @@ export interface KernelContext {
    * The outbound check of a send that is no turn's own reply (DL-6; `from`: who asks, as a
    * one-input turn of the module's own log): a host that declared `outbound` decides, and while it
    * is away nothing goes; else the embedder's `Policy.outbound`; else it is allowed (the module's
-   * own bounds, checked before, are the local allowance).
+   * own bounds, checked before, are the local allowance). U20: with `content`, a host that also
+   * declared `outbound.content` gets it (`kind: tool`) and may take it: `{ hold: true }`, which the
+   * module settles with `hold` (never sent). Without `content` the answer is never a hold.
    */
-  outbound(from: TurnContext, to: ReplyRoute): Promise<'allow' | 'deny'>;
+  outbound(from: TurnContext, to: ReplyRoute, content?: RenderedMessage): Promise<'allow' | 'deny' | KernelHold>;
+  /**
+   * Settle a send the outbound check held (U20, `outbound`'s `{ hold: true }`) as `held` without
+   * sending it: once per `operationId` (an earlier outcome is answered as it was), in `sessionKey`'s
+   * log (`delivery.settled`, `result: "held"`, `kind: tool` when `external` names the client).
+   */
+  hold(route: ReplyRoute, a: { operationId: string; sessionKey: string; external?: ExternalSender; reason?: string }): KernelSendResult;
   /**
    * The deployment's owner: the principals that are it (`policy.owners`, and `AGENTS_IO_OWNERS`),
    * and the one session every owner DM goes to (`policy.ownerSessionKey`), when the deployment fixes one.

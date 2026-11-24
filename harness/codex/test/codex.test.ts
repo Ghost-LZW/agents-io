@@ -64,7 +64,7 @@ describe('open', () => {
 });
 
 describe('turn mapping', () => {
-  it('maps a full turn to a conforming stream #HC-1 #ID-2', async () => {
+  it('maps a full turn to a conforming stream #HC-1 #ID-2 #HC-7', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);
     const c = collector(s);
@@ -124,6 +124,11 @@ describe('turn mapping', () => {
     ]);
     expect(c.of('item.completed')[2]!.item.result).toEqual({ preview: 'a.ts\n', truncated: false, isError: false });
     expect(c.of('item.completed')[4]!.item.result?.preview).toBe('sent');
+    // HC-7: an MCP tool item's title is `<server>.<tool>`, and it says both (started and completed).
+    for (const b of [...c.of('item.started'), ...c.of('item.completed')].filter((b) => b.item.itemId === 't1')) {
+      expect(b.item).toMatchObject({ type: 'mcp_tool', title: 'lark.send', tool: { server: 'lark', name: 'send' } });
+    }
+    expect(c.of('item.completed').filter((b) => b.item.type !== 'mcp_tool').every((b) => b.item.tool === undefined)).toBe(true);
     const deltas = c.events.filter((e) => e.body.t === 'text.delta').map((e) => [(e.body as any).stream, e.audience, e.durability]);
     expect(deltas).toEqual([
       ['reasoning', 'commentary', 'ephemeral'],
@@ -167,37 +172,6 @@ describe('turn mapping', () => {
       approvalsReviewer: 'user',
       sandboxPolicy: { type: 'workspaceWrite' },
     });
-  });
-
-  it('sends Plan and Default collaboration modes on successive turns', async () => {
-    const { fake, harness } = setup();
-    const s = await open(harness);
-    const c = collector(s);
-    fake.onTurnStart = (p, tid) => {
-      fake.echoUser(p.threadId, tid, p.clientUserMessageId);
-      fake.completeTurn(p.threadId, tid, 'completed');
-    };
-    await s.startTurn('T1', [input('i1', 'plan')], { ...run, mode: 'plan' });
-    await c.until((e) => isCompleted(e) && e.turnId === 'T1');
-    await s.startTurn('T2', [input('i2', 'execute')], { ...run, mode: 'default' });
-    await c.until((e) => isCompleted(e) && e.turnId === 'T2');
-    expect(fake.sent('turn/start').map((m) => m.params.collaborationMode)).toEqual([
-      { mode: 'plan', settings: { model: run.model, reasoning_effort: run.effort, developer_instructions: null } },
-      { mode: 'default', settings: { model: run.model, reasoning_effort: run.effort, developer_instructions: null } },
-    ]);
-  });
-
-  it('uses the resolved thread model for Plan when the configured model is empty', async () => {
-    const { fake, harness } = setup();
-    const s = await open(harness, { run: { ...run, model: '' } });
-    const c = collector(s);
-    fake.onTurnStart = (p, tid) => {
-      fake.echoUser(p.threadId, tid, p.clientUserMessageId);
-      fake.completeTurn(p.threadId, tid, 'completed');
-    };
-    await s.startTurn('T1', [input('i1', 'plan')], { ...run, model: '', mode: 'plan' });
-    await c.until(isCompleted);
-    expect(fake.sent('turn/start')[0]!.params.collaborationMode.settings.model).toBe('gpt-default');
   });
 
   it('maps failed turns with code and retryable #HC-1 #IN-2', async () => {

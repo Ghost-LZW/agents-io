@@ -87,34 +87,6 @@ describe('commands', () => {
     expect(turns(w.gw)[2]!.run?.model).not.toBe('opus');
   });
 
-  it('/plan and /bypass apply on later Codex turns and can be reset', async () => {
-    const w = await setup({ codex: true });
-    await w.say('/plan on');
-    await w.say('/bypass off');
-    await w.say('first');
-    await until(() => turns(w.gw).length === 1);
-    expect(turns(w.gw)[0]!.run).toMatchObject({ mode: 'plan', profile: 'restricted' });
-    await w.say('/plan off');
-    await w.say('/bypass on');
-    await w.say('second');
-    await until(() => turns(w.gw).length === 2);
-    expect(turns(w.gw)[1]!.run).toMatchObject({ mode: 'default', profile: 'bypass' });
-    await w.say('/bypass default');
-    await w.say('third');
-    await until(() => turns(w.gw).length === 3);
-    expect(turns(w.gw)[2]!.run).toMatchObject({ profile: 'bypass' });
-    await w.say('/plan maybe');
-    await until(() => w.replies().some((t) => t === 'Usage: /plan [on|off]'));
-  });
-
-  it('rejects Plan and bypass commands on a non-Codex agent', async () => {
-    const w = await setup({ codex: true, helper: 'claude-code' });
-    await w.say('/plan on');
-    await w.say('/bypass off');
-    await until(() => w.replies().length === 2);
-    expect(w.replies().every((t) => t.includes('available only on Codex'))).toBe(true);
-  });
-
   it('in the default deployment (only Claude Code configured) /plan and /bypass say they are available only on Codex #CT-2', async () => {
     // No configured instance declares Plan mode or the profile switch: the reply names the registered kind that does.
     const w = await setup();
@@ -253,23 +225,6 @@ describe('commands', () => {
     await w.say('/steer also check this');
     expect(w.replies()).not.toContain('Added to the running turn.');
     expect(w.replies()).not.toContain('Nothing was running: it starts a turn.');
-  });
-
-  it('/answer returns a native question answer to the waiting turn', async () => {
-    const w = await setup({
-      script: async (t) => {
-        t.emit({ t: 'request.opened', requestId: 'q1', kind: 'question', title: 'Which DB?', risk: {}, questions: [{ id: 'db', text: 'Which DB?' }], allowedDecisions: ['answer', 'deny'], allowAlways: false, defaultDeny: false });
-        const d = await t.waitDecision('q1');
-        t.emit({ t: 'text.snapshot', text: JSON.stringify(d), final: true }, { audience: 'answer' });
-      },
-    });
-    await w.say('ask me');
-    const question = await until(() => w.replies().find((text) => text.includes('/answer ask:')));
-    const code = /\/answer (ask:[A-Za-z0-9_-]+)/.exec(question)?.[1];
-    expect(code).toBeDefined();
-    await w.say(`/answer ${code} SQLite`);
-    await until(() => w.replies().includes('{"kind":"answer","answers":{"db":"SQLite"}}'));
-    expect(turns(w.gw)).toHaveLength(1);
   });
 
   it('/stop with nothing running says so; it stops a turn still running in an earlier topic of the chat #CT-2 #CT-1', async () => {

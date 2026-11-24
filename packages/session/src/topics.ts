@@ -39,6 +39,8 @@ export interface TopicChange {
   turn?: TurnRef;
   /** `to` is a new topic (`create`), not a switch to an existing one. */
   created?: true;
+  /** U20: how the exit check answered the agent's session_rotate (`topic.changed.check`). */
+  check?: 'allowed' | 'held';
 }
 
 export interface TopicRegistryOptions {
@@ -75,6 +77,8 @@ export interface TopicChangeOptions {
 export interface TopicCreateOptions extends TopicChangeOptions {
   /** What the topic being parked was about (session_rotate's summary): saved on that topic, the one it describes. */
   summaryOfPrevious?: string;
+  /** U20: the session_rotate's title and summary were asked of the scoped host (`topic.changed.check`). */
+  check?: 'allowed' | 'held';
 }
 
 /** Spells the session key of a new topic: `first` when the conversation has none yet. */
@@ -270,7 +274,7 @@ export class TopicRegistry {
     if (previous && summary) previous.summary = summary;
     this.remember(t);
     this.sources.set(t.id, draft.titleSource ?? (t.title ? 'explicit' : 'auto'));
-    this.changed({ conversation, agent, ...(previous ? { from: previous } : {}), to: t, reason, ...(opts.turn ? { turn: opts.turn } : {}), created: true });
+    this.changed({ conversation, agent, ...(previous ? { from: previous } : {}), to: t, reason, ...(opts.turn ? { turn: opts.turn } : {}), created: true, ...(opts.check ? { check: opts.check } : {}) });
     return { topic: t, ...(previous ? { previous } : {}), created: true };
   }
 
@@ -341,7 +345,7 @@ export class TopicRegistry {
   private changed(c: TopicChange): void {
     const hub = this.o.hub;
     if (hub) {
-      const body = { t: 'topic.changed' as const, conversation: c.conversation, ...(c.from ? { from: c.from.id } : {}), to: c.to.id, ...(c.to.title !== undefined ? { title: c.to.title } : {}), reason: c.reason };
+      const body = { t: 'topic.changed' as const, conversation: c.conversation, ...(c.from ? { from: c.from.id } : {}), to: c.to.id, ...(c.to.title !== undefined ? { title: c.to.title } : {}), reason: c.reason, ...(c.check ? { check: c.check } : {}) };
       for (const key of new Set([...(c.from ? [c.from.sessionKey] : []), c.to.sessionKey])) {
         const turnId = c.turn?.sessionKey === key ? { turnId: c.turn.turnId } : {};
         hub.append(key, { ts: this.now(), ...turnId, level: 'detail', audience: 'status', durability: 'durable', visibility: 'participants', body });

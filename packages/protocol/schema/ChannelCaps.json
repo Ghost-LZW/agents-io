@@ -221,6 +221,9 @@
         "requireAnswerToOpen": {
           "type": "boolean"
         },
+        "openOnProcess": {
+          "type": "boolean"
+        },
         "interruptButton": {
           "type": "boolean"
         }

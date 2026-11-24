@@ -186,7 +186,7 @@ describe('process card: degradation', () => {
       openDelayMs: 5000,
       previewDelayMs: 2000,
       holdAnswerUntilOpen: true,
-      requireAnswerToOpen: true,
+      openOnProcess: true,
       interruptButton: false,
     });
   });

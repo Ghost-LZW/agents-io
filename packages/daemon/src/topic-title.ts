@@ -1,4 +1,5 @@
 import type { HarnessAdapter, KernelContext, ModuleManifest, RunSpec, SessionEvent } from '@agents-io/protocol';
+import { withholding } from '@agents-io/session';
 import { ephemeralTurn } from './ephemeral-turn.js';
 
 /*
@@ -11,7 +12,10 @@ import { ephemeralTurn } from './ephemeral-turn.js';
  * topic while the topic's title is still the generated one it read
  * (`KernelContext.topics.setAutoTitle`, which also edits the latest card). A host-level feature
  * (decision 16): on by default; `topicTitles: { enabled: false }` turns it off, and a host names
- * its topics itself (docs/HOSTS.md §4.4).
+ * its topics itself (docs/HOSTS.md §4.6). Where an `outbound.scoped` host checks (U20), the prompt
+ * leaves out what a reader outside the host may not read yet (`withholding`: a checked turn's answer
+ * not past the exit check, or held; the kernel calls `onTurnCompleted` for a checked turn once its
+ * answer settled), and the kernel asks that host about the title before it keeps it (`setAutoTitle`).
  */
 
 /** The `topicTitles` section of the config file: only `enabled` (the daemon's). */
@@ -61,13 +65,15 @@ async function titleTopic(k: KernelContext, jobs: Set<string>, sessionKey: strin
   const completed = events.filter((e) => e.body.t === 'turn.completed' && e.body.status === 'completed' && eligible.has(e.body.turnId)).length;
   if (completed !== 1 && completed % 3 !== 1) return;
   const expected = topic.title;
-  const prompt = topicTitlePrompt(events, expected);
+  // U20: an answer an external reader would read withheld (not past the check, held, denied) is left out.
+  const withheld = withholding(events);
+  const prompt = topicTitlePrompt(events, expected, withheld.none ? undefined : (e) => e.body.t === 'text.snapshot' && withheld.of(e) !== undefined);
   if (!prompt) return;
   jobs.add(topic.id);
   try {
     const title = titleOf(await lane.ephemeralTurn({ turnId, prompt, instructions: TITLE_INSTRUCTIONS }));
-    // A name given meanwhile wins (setAutoTitle checks it is still auto and still `expected`).
-    if (!k.stopping() && title) k.topics.setAutoTitle(topic.id, expected, title);
+    // A name given meanwhile wins (setAutoTitle checks it is still auto and still `expected`, and asks a scoped host first).
+    if (!k.stopping() && title) await k.topics.setAutoTitle(topic.id, expected, title, turnId);
   } finally {
     jobs.delete(topic.id);
   }
@@ -76,10 +82,15 @@ async function titleTopic(k: KernelContext, jobs: Set<string>, sessionKey: strin
 const MAX_CONTEXT = 4000;
 const MAX_TITLE = 36;
 
-/** Only human messages and final answers enter the title prompt; no tool output or request answers. */
-export function topicTitlePrompt(events: SessionEvent[], current?: string): string | undefined {
+/**
+ * Only human messages and final answers enter the title prompt; no tool output or request answers.
+ * `skip` (U20, a session an `outbound.scoped` host checks): events left out, e.g. the answers of
+ * checked turns not past the exit check (what `withholding` withholds: checking, held or denied).
+ */
+export function topicTitlePrompt(events: SessionEvent[], current?: string, skip?: (e: SessionEvent) => boolean): string | undefined {
   const lines: string[] = [];
   for (const e of events) {
+    if (skip?.(e)) continue;
     if (e.body.t === 'input.admitted' && e.body.input?.origin.kind === 'human') {
       const value = e.body.input.content.filter((c): c is Extract<typeof c, { type: 'text' }> => c.type === 'text').map((c) => c.text).join(' ').trim();
       if (value) lines.push(`User: ${value}`);

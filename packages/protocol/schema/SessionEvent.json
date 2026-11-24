@@ -801,6 +801,9 @@
             },
             "owner": {
               "type": "string"
+            },
+            "checked": {
+              "type": "boolean"
             }
           }
         },
@@ -861,6 +864,9 @@
                   "type": "string"
                 }
               }
+            },
+            "checked": {
+              "type": "boolean"
             }
           }
         },
@@ -924,6 +930,9 @@
                   "type": "string"
                 }
               ]
+            },
+            "checked": {
+              "type": "boolean"
             }
           }
         },
@@ -1162,6 +1171,21 @@
                       "type": "boolean"
                     }
                   }
+                },
+                "tool": {
+                  "type": "object",
+                  "required": [
+                    "server",
+                    "name"
+                  ],
+                  "properties": {
+                    "server": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    }
+                  }
                 }
               }
             }
@@ -1293,6 +1317,21 @@
                       "type": "boolean"
                     }
                   }
+                },
+                "tool": {
+                  "type": "object",
+                  "required": [
+                    "server",
+                    "name"
+                  ],
+                  "properties": {
+                    "server": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    }
+                  }
                 }
               }
             }
@@ -1411,6 +1450,82 @@
               "type": "string"
             },
             "nativeId": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "t"
+          ],
+          "properties": {
+            "t": {
+              "const": "session.ready",
+              "type": "string"
+            },
+            "nativeId": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "t",
+            "from",
+            "to",
+            "trigger"
+          ],
+          "properties": {
+            "t": {
+              "const": "model.fallback",
+              "type": "string"
+            },
+            "from": {
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            },
+            "trigger": {
+              "type": "string"
+            },
+            "scope": {
+              "type": "string"
+            },
+            "timeoutMs": {
+              "type": "number"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "t",
+            "mode",
+            "previous",
+            "model",
+            "trigger"
+          ],
+          "properties": {
+            "t": {
+              "const": "permission.mode",
+              "type": "string"
+            },
+            "mode": {
+              "type": "string"
+            },
+            "previous": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "trigger": {
               "type": "string"
             }
           }
@@ -1835,6 +1950,11 @@
                               "maxLength": 500,
                               "type": "string"
                             },
+                            "heading": {
+                              "minLength": 1,
+                              "maxLength": 40,
+                              "type": "string"
+                            },
                             "allowSessionAs": {
                               "const": "allow_once",
                               "type": "string"
@@ -1875,6 +1995,11 @@
                     },
                     "note": {
                       "maxLength": 500,
+                      "type": "string"
+                    },
+                    "heading": {
+                      "minLength": 1,
+                      "maxLength": 40,
                       "type": "string"
                     },
                     "allowSessionAs": {
@@ -2199,11 +2324,30 @@
                 {
                   "const": "unknown",
                   "type": "string"
+                },
+                {
+                  "const": "held",
+                  "type": "string"
                 }
               ]
             },
             "providerMessageId": {
               "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "turnId": {
+              "type": "string"
+            },
+            "requestId": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "denied": {
+              "type": "boolean"
             }
           }
         },
@@ -2293,6 +2437,18 @@
                 },
                 {
                   "const": "system",
+                  "type": "string"
+                }
+              ]
+            },
+            "check": {
+              "anyOf": [
+                {
+                  "const": "allowed",
+                  "type": "string"
+                },
+                {
+                  "const": "held",
                   "type": "string"
                 }
               ]

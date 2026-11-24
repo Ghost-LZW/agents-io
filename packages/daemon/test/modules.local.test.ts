@@ -79,9 +79,9 @@ function probe(
 }
 
 /** The watch, live and topic tools as a file without their sections resolves them (on). */
-const TOOL_MODULES_RESOLVED = [{ id: 'tools.watch', enabled: true, config: {} }, { id: 'tools.live', enabled: true, config: {} }, { id: 'tools.topics', enabled: true, config: {} }];
+const TOOL_MODULES_RESOLVED = [{ id: 'tools.watch', enabled: true, config: {} }, { id: 'tools.schedules', enabled: true, config: {} }, { id: 'tools.live', enabled: true, config: {} }, { id: 'tools.topics', enabled: true, config: {} }];
 /** The watch, live and topic tools in `GET /api/status` `modules`, on. */
-const TOOL_MODULES = [{ id: 'tools.watch', origin: 'builtin', enabled: true }, { id: 'tools.live', origin: 'builtin', enabled: true }, { id: 'tools.topics', origin: 'builtin', enabled: true }];
+const TOOL_MODULES = [{ id: 'tools.watch', origin: 'builtin', enabled: true }, { id: 'tools.schedules', origin: 'builtin', enabled: true }, { id: 'tools.live', origin: 'builtin', enabled: true }, { id: 'tools.topics', origin: 'builtin', enabled: true }];
 /** The stranger approval as a file without `policy.strangers` (or its section) resolves it, and in `GET /api/status` `modules`: off. */
 const STRANGERS_RESOLVED = { id: 'strangers', enabled: false };
 const STRANGERS = { id: 'strangers', origin: 'builtin', enabled: false };
@@ -102,9 +102,9 @@ const thrown = (f: () => unknown): string => {
 
 describe('the module registry', () => {
   it('the built-in ones are the topic titles and the watch, live and topic tools, on by default, the stranger approval, off by default, the owner\'s run-config commands, on, and the external MCP endpoint, off: their sections are in ConfigFile where externalMcp always was; an empty registry has no modules', () => {
-    expect(builtinModules.modules.map((m) => [m.manifest.id, m.origin])).toEqual([['topic-title', 'builtin'], ['tools.watch', 'builtin'], ['tools.live', 'builtin'], ['tools.topics', 'builtin'], ['strangers', 'builtin'], ['owner-commands', 'builtin'], ['external-mcp', 'builtin']]);
+    expect(builtinModules.modules.map((m) => [m.manifest.id, m.origin])).toEqual([['topic-title', 'builtin'], ['tools.watch', 'builtin'], ['tools.schedules', 'builtin'], ['tools.live', 'builtin'], ['tools.topics', 'builtin'], ['strangers', 'builtin'], ['owner-commands', 'builtin'], ['external-mcp', 'builtin']]);
     expect(configFileSchema(builtinHarnesses)).toBe(ConfigFile);
-    expect(Object.keys(ConfigFile.properties).slice(-9)).toEqual(['host', 'topicTitles', 'watchTools', 'liveTools', 'topicTools', 'strangers', 'ownerCommands', 'externalMcp', 'local']);
+    expect(Object.keys(ConfigFile.properties).slice(-10)).toEqual(['host', 'topicTitles', 'watchTools', 'scheduleTools', 'liveTools', 'topicTools', 'strangers', 'ownerCommands', 'externalMcp', 'local']);
     expect(resolve({}).modules).toEqual([{ id: 'topic-title', enabled: true, config: {} }, ...TOOL_MODULES_RESOLVED, STRANGERS_RESOLVED, OWNER_COMMANDS_RESOLVED, { id: 'external-mcp', enabled: false }]);
     expect(resolve({}).externalMcp).toBeUndefined();
     // On: its settings are the module's, and (deprecated) Config.externalMcp is the same object.
@@ -116,7 +116,7 @@ describe('the module registry', () => {
       OWNER_COMMANDS_RESOLVED,
       { id: 'external-mcp', enabled: true, config: { host: '127.0.0.1', port: 7465, clients: [], limits: { maxBodyBytes: 262144, maxTextChars: 16000, requestsPerMinute: 120, writesPerMinute: 20 } } },
     ]);
-    expect(on.externalMcp).toBe(on.modules![6]!.config);
+    expect(on.externalMcp).toBe(on.modules!.find((m) => m.id === 'external-mcp')!.config);
     // Without the module, the section is an unknown key (as any other); an empty registry gives no modules.
     const none = new ModuleRegistry([]);
     expect(resolve({}, none).modules).toBeUndefined();
@@ -321,10 +321,15 @@ async function features(socketPath: string): Promise<string[]> {
   return (await c.hello({ token: readTokenFile(tokenPath(socketPath)), name: 'probe' })).features;
 }
 
-/** The kernel's features as `host.hello` listed them before the registry, without `resolve.onBehalfOf` (off) and `external.mcp` (the endpoint off). */
+/**
+ * The kernel's features as `host.hello` listed them before the registry (origin/main b9b35ed's), without
+ * `resolve.onBehalfOf` and `test.hooks` (off) and `external.mcp` (the endpoint off).
+ */
 const KERNEL_HELLO = [
   'session.launch', 'callouts.resolve', 'callouts.review', 'resolve.native', 'resolver.human.extras', 'callouts.outbound', 'callouts.contact',
   'inbound.redispatch', 'host.takeover', 'explain.chain', 'run.overrides', 'run.ended.usage', 'run.correlation', 'callouts.external', 'session.compact',
+  'session.prewarm', 'callouts.outbound.content', 'callouts.outbound.scope', 'reply.check', 'callout.history', 'item.tool', 'deliver.update',
+  'conversation.create', 'message.ack', 'schedules', 'history', 'host-mcp.send_file.blob_scoped',
 ];
 
 describe('modules in the daemon (lifecycle steps 2-4)', () => {
@@ -332,6 +337,8 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     expect(FEATURES).toEqual([
       'session.launch', 'callouts.resolve', 'callouts.review', 'resolve.native', 'resolver.human.extras', 'callouts.outbound', 'callouts.contact', 'resolve.onBehalfOf',
       'inbound.redispatch', 'host.takeover', 'explain.chain', 'run.overrides', 'run.ended.usage', 'run.correlation', 'callouts.external', 'session.compact',
+      'session.prewarm', 'test.hooks', 'callouts.outbound.content', 'callouts.outbound.scope', 'reply.check', 'callout.history', 'item.tool', 'deliver.update',
+      'conversation.create', 'message.ack', 'schedules', 'history', 'host-mcp.send_file.blob_scoped',
     ]);
     const w = await daemon(new ModuleRegistry([]));
     expect(await features(w.socketPath)).toEqual(KERNEL_HELLO);
@@ -516,10 +523,10 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     const topic = k.topics.bySession(sessionKey)!;
     expect(k.topics.titleSource(topic.id)).toBe('auto');
     expect(k.topics.titleSource('tp_nope')).toBeUndefined();
-    expect(k.topics.setAutoTitle(topic.id, 'not its title', 'Named')).toBe(false);
-    expect(k.topics.setAutoTitle(topic.id, topic.title, 'Named')).toBe(true);
+    expect(await k.topics.setAutoTitle(topic.id, 'not its title', 'Named')).toBe(false);
+    expect(await k.topics.setAutoTitle(topic.id, topic.title, 'Named')).toBe(true);
     expect(k.topics.bySession(sessionKey)).toMatchObject({ title: 'Named' });
-    expect(k.topics.setAutoTitle(topic.id, 'Named', 'Named')).toBe(false);
+    expect(await k.topics.setAutoTitle(topic.id, 'Named', 'Named')).toBe(false);
     // The latest card is edited to carry it.
     await until(() => w.chat.sent.some((x) => x.edits.some((m) => ((m.channelData as Record<string, unknown> | undefined)?.[TOPIC_KEY] as { title?: string } | undefined)?.title === 'Named')));
 

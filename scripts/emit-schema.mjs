@@ -16,7 +16,11 @@ const names = [
   // Host request result values
   'HostHelloResult', 'BindingsPutResult', 'BindingsGetResult', 'RunStartResult', 'RunCancelResult', 'RunEnded', 'DeliverResult',
   'InputVerifyResult', 'InboundReadResult', 'InboundAckResult', 'InboundAnswer', 'RouteCalloutAnswer', 'SessionPrepareResult',
-  'ResolveCalloutAnswer', 'ReviewCalloutAnswer', 'OutboundCalloutAnswer', 'TurnContextView', 'InboundRedispatchResult', 'SessionCompactResult',
+  'ResolveCalloutAnswer', 'ReviewCalloutAnswer', 'OutboundCalloutAnswer', 'TurnContextView', 'InboundRedispatchResult', 'SessionCompactResult', 'DeliverUpdateResult', 'ConversationCreateResult', 'MessageAckResult', 'ScheduleDraft', 'ScheduleView', 'SchedulePutResult', 'ScheduleRemoveResult', 'ScheduleListResult', 'HistoryReadResult',
+  // Test hooks (AIO_TEST_HOOKS=1 only; HOSTS §4.3)
+  'TestReplayResult', 'TestFaultResult',
+  // U20: the exit check of an outbound.scoped host
+  'OutboundContentCalloutAnswer', 'OutboundKind', 'OutboundScopeRoute', 'HostOutboundScopeResult',
   // Agent messaging: cause chain and explain of side effects / chains
   'InputCause', 'EffectExplanation', 'ChainExplanation', 'ExplainResult', 'ContactCalloutAnswer',
   // External MCP endpoint (docs/design/external-mcp)

@@ -19,10 +19,10 @@ export const TOOL_DEFS = {
   },
   send_file: {
     description:
-      'Send a file or image to the user in the current conversation, as a real attachment (on Lark an uploaded file/image message, on mail an attachment, in the terminal a file notice). Give `path` (absolute, or relative to your working directory) OR `blob` (a blob ref such as sha256:… from an earlier input), not both. `name` overrides the file name shown; `caption` is an optional short text sent with it. Use this instead of pasting a file\'s contents when the user asks you to send/share/attach a file. Returns once delivered.',
+      'Send a file or image to the user in the current conversation, as a real attachment (on Lark an uploaded file/image message, on mail an attachment, in the terminal a file notice). Give `path` (absolute, or relative to your working directory) OR `blob` (a blob ref such as sha256:… of a file you were sent, or sent yourself, in this session), not both. `name` overrides the file name shown; `caption` is an optional short text sent with it. Use this instead of pasting a file\'s contents when the user asks you to send/share/attach a file. Returns once delivered.',
     input: {
       path: z.string().optional().describe('File on disk: absolute, or relative to your working directory'),
-      blob: z.string().optional().describe('Blob ref (e.g. sha256:…) of a file the host already holds'),
+      blob: z.string().optional().describe('Blob ref (e.g. sha256:…) of a file you were sent, or sent yourself, in this session'),
       name: z.string().optional().describe('File name to show (default: the file\'s own name)'),
       caption: z.string().optional().describe('Short text sent with the file'),
     },
@@ -91,6 +91,31 @@ export const TOOL_DEFS = {
     input: {},
     readOnly: true,
   },
+  schedule_add: {
+    description:
+      'Set a time for YOUR OWN session: at that time you get an input "[schedule <id>] <text>" and answer it then (a reminder you promised, a daily check). `when` is { at } (once: ISO 8601 with offset, or Unix ms), { cron, tz? } (five fields: minute hour day month weekday; tz like Asia/Shanghai) or { every_minutes }. action "turn" (default) starts a turn for you at that time; "message" just sends `text` to `route` ("current" or an allowed route key) without a turn. The turn\'s answer goes where you are talked to (or to route). Missed while the daemon was down: fired once when it is back (missed "skip" drops it). Do not poll with short periods: there is a minimum period and a limit per session. Reuse an id of yours to replace it.',
+    input: {
+      when: z
+        .object({ at: z.union([z.string(), z.number()]).optional(), cron: z.string().optional(), tz: z.string().optional(), every_minutes: z.number().optional() })
+        .describe('{ at } | { cron, tz? } | { every_minutes }'),
+      text: z.string().describe('What you will be told at that time (or the message to send)'),
+      action: z.enum(['turn', 'message']).optional().describe('turn (default): a turn for you; message: send text to route'),
+      route: z.string().optional().describe('"current" or a route key: where a message goes, or where the turn\'s answer goes'),
+      missed: z.enum(['once', 'skip']).optional(),
+      until: z.string().optional().describe('ISO 8601: remove it after this time'),
+      note: z.string().optional().describe('Why it exists; shown with the input'),
+      id: z.string().optional().describe('Schedule id; reuse one of yours to replace it'),
+    },
+  },
+  schedule_remove: {
+    description: 'Remove a schedule you created (by id, from schedule_add or schedule_list). You cannot remove schedules the owner, the host or another session set.',
+    input: { id: z.string().describe('Schedule id') },
+  },
+  schedule_list: {
+    description: 'List the schedules of your session (mine=true for the ones you created and may remove), with what they do and when each fires next.',
+    input: {},
+    readOnly: true,
+  },
   live_join: {
     description:
       'Join a live voice session (e.g. a meeting) yourself, as a realtime voice: you hear everyone there and speak with your own voice; it carries this conversation\'s history. `target` is the channel\'s own: on a channel with meetings a meeting number, or "new" to start a meeting (the result names it, with a link to share). `channel` picks another channel than the current one (a channel id, or channel:account). `instructions` tells the voice how to behave there (language, role, when to stay quiet). Use it only when the user asks you to join or call in. While in it, what people say comes to you as turns; those answers are spoken. Leave with live_leave.',
@@ -137,11 +162,12 @@ export const KERNEL_TOOL_NAMES = ['get_channel_context', 'send_file', 'ask_choic
 
 /**
  * The tool groups of `TOOL_DEFS` beyond the kernel's own, each in `TOOL_DEFS` order (the groups
- * too: watch, live, topics). A group is offered when the host passes its control
- * (`HostToolsOptions.watches`, `live`, `topics`) or a module offers it (`TOOL_GROUP_DEFS`).
+ * too: watch, schedules, live, topics). A group is offered when the host passes its control
+ * (`HostToolsOptions.watches`, `schedules`, `live`, `topics`) or a module offers it (`TOOL_GROUP_DEFS`).
  */
 export const TOOL_GROUPS = {
   watch: ['watch_add', 'watch_remove', 'watch_list'],
+  schedules: ['schedule_add', 'schedule_remove', 'schedule_list'],
   live: ['live_join', 'live_say', 'live_leave'],
   topics: ['session_rotate', 'session_list', 'session_switch'],
 } as const satisfies Record<string, readonly ToolName[]>;

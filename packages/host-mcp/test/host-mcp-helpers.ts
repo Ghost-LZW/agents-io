@@ -1,7 +1,7 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ChannelCaps, InputRecord, ReplyRoute, TurnContext } from '@agents-io/protocol';
+import type { ChannelCaps, ContentBlock, InputRecord, ReplyRoute, TurnContext } from '@agents-io/protocol';
 import { Hub, MemorySessionLog, Outbox, WatchDispatcher, WatchRegistry, defaultPolicy, type Participant } from '@agents-io/session';
 import { FakeChannel, defaultChannelCaps } from '@agents-io/testkit';
 import { HostTools, MemoryBlobStore, OUTPUT_EVENT, type OutputRecord } from '../src/index.js';
@@ -28,8 +28,8 @@ export function turnOf(r: ReplyRoute | null, profile = 'bypass'): TurnContext {
 
 const NO_MEDIA: ChannelCaps = { ...defaultChannelCaps, buttons: false, media: { in: [], out: [] } };
 
-export function world(o: { turn?: TurnContext | undefined; routes?: string[]; cwd?: string; participants?: Participant[] } = {}) {
-  const hub = new Hub(new MemorySessionLog());
+export function world(o: { turn?: TurnContext | undefined; routes?: string[]; cwd?: string; participants?: Participant[]; retain?: number } = {}) {
+  const hub = new Hub(new MemorySessionLog(o.retain ? { retain: o.retain } : {}));
   const policy = defaultPolicy({ owners: ['fake:alice'], routes: o.routes ?? [] });
   const outbox = new Outbox({ hub, policy, sleep: async () => {} });
   const fake = new FakeChannel('fake', defaultChannelCaps);
@@ -51,6 +51,17 @@ export function world(o: { turn?: TurnContext | undefined; routes?: string[]; cw
   const events = () => hub.log.read(SK, 0);
   const outputs = () => events().filter((e) => e.body.t === 'native' && e.body.name === OUTPUT_EVENT).map((e) => e.native as OutputRecord);
   return { hub, outbox, fake, mail, blobs, cwd, tools, events, outputs, setTurn: (t: TurnContext | undefined) => (turn = t) };
+}
+
+/** An input the log of session `sk` admitted, carrying `content` (e.g. a file block). */
+export function admit(w: { hub: Hub }, sk: string, content: ContentBlock[]) {
+  w.hub.append(sk, {
+    ts: Date.now(),
+    level: 'primary',
+    audience: 'status',
+    durability: 'durable',
+    body: { t: 'input.admitted', inputId: `in-${sk}`, disposition: 'new_turn', input: { ...input(route()), content } },
+  });
 }
 
 export const B = { sessionKey: SK, generation: 1 };

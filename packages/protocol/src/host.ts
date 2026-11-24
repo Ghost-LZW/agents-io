@@ -5,6 +5,7 @@ import { Decision, Resolver } from './requests.js';
 import { RunSpec } from './run.js';
 import { ConversationKind, InboundEnvelope, InputCause, InputRecord, OriginKind } from './inbound.js';
 import { RenderedMessage } from './channel.js';
+import { ScheduleDraft } from './schedule.js';
 import { ResultFrame } from './wire.js';
 
 /*
@@ -243,6 +244,20 @@ export type TurnProvenance = Static<typeof TurnProvenance>;
 
 const Req = <K extends string>(type: K) => ({ v: V, type: Type.Literal(type), id: Type.String() });
 
+/**
+ * What an `outbound` callout is about (`outbound.content` / `outbound.scoped` hosts): `reply` the turn's
+ * answer on a checked route, `tool` an output tool's message, `question` a native question card, `request`
+ * an approval card's title, `title` a topic title; settlements only: `notice` a notice of the daemon's
+ * own (a rejection, a stranger asking in), `host` a host's own `deliver`, `live` what a live said
+ * (`live_say`: never asked, a live does not open where a scoped host checks).
+ */
+export const OutboundKind = Type.Union([Type.Literal('reply'), Type.Literal('tool'), Type.Literal('question'), Type.Literal('request'), Type.Literal('title'), Type.Literal('notice'), Type.Literal('host'), Type.Literal('live')]);
+export type OutboundKind = Static<typeof OutboundKind>;
+
+/** One conversation of an `outbound.scoped` host's scope: every thread of it is in scope (U20). */
+export const OutboundScopeRoute = Type.Object({ channel: Type.String(), account: Type.String(), conversationId: Type.String() });
+export type OutboundScopeRoute = Static<typeof OutboundScopeRoute>;
+
 export const HostHello = Type.Object({
   ...Req('host.hello'),
   /** Daemon-generated secret, read from a 0600 file next to the socket. */
@@ -257,8 +272,21 @@ export const HostHello = Type.Object({
    * asks it yet), `external` (may a client of the external MCP endpoint send or queue an
    * input). Unknown names are ignored; the result's
    * `callouts` lists what was granted. Any hook (or `consumer`) makes this connection the host.
+   * `outbound.content` (feature `callouts.outbound.content`): `outbound` callouts carry `content`,
+   * `turnId`, `kind` and may answer `hold`. `outbound.scoped` (feature `callouts.outbound.scope`):
+   * the `outbound` hook only for the routes of `outboundScope`, with content (U20); naming it with
+   * `outbound` fails `invalid_frame`. A daemon without these features ignores the names.
    */
   callouts: Type.Optional(Type.Union([Type.Boolean(), Type.Array(Type.String())])),
+  /** With `callouts: [..., "outbound.scoped"]`: the conversations the host checks (every thread of each). */
+  outboundScope: Type.Optional(Type.Object({ routes: Type.Array(OutboundScopeRoute) })),
+  /**
+   * What this host asks to see in the session logs, by the name of the result's `features`; only a
+   * hello that makes this connection the host counts (kept while it is away, cleared by a host hello
+   * without it). `item.tool`: an MCP tool item keeps `tool { server, name }` (HC-7), and nothing else
+   * changes. Unknown names are ignored; the result's `optIn` lists what was granted.
+   */
+  optIn: Type.Optional(Type.Array(Type.String())),
   /**
    * When another connection holds the host role (`consumer` / `callouts`),
    * replace it instead of failing with `host_connected`: the daemon closes the
@@ -322,6 +350,83 @@ export const RunCancel = Type.Object({ ...Req('run.cancel'), runId: Type.String(
 export const Deliver = Type.Object({ ...Req('deliver'), operationId: Type.String(), route: ReplyRoute, message: RenderedMessage });
 export type Deliver = Static<typeof Deliver>;
 
+/**
+ * Edit a message the host delivered (feature `deliver.update`): `providerMessageId` as its
+ * `deliver` answered. `sequence` grows with each update of that message (a lower or equal one
+ * is stale and skipped). `final` settles it (a channel's finalize: a process card's last layout,
+ * its thinking bubble closed, an answer too long for the card continued in more messages); a
+ * final update is idempotent per operationId, others are not recorded. A channel that cannot
+ * edit answers `unsupported`.
+ */
+export const DeliverUpdate = Type.Object({
+  ...Req('deliver.update'),
+  operationId: Type.String(),
+  route: ReplyRoute,
+  providerMessageId: Type.String(),
+  message: RenderedMessage,
+  sequence: Type.Integer({ minimum: 1 }),
+  final: Type.Optional(Type.Boolean()),
+});
+export type DeliverUpdate = Static<typeof DeliverUpdate>;
+
+/**
+ * Schedules (feature `schedules`, docs/design/schedules): the host sets, removes and lists them.
+ * A host may point a turn at any session, send to any route (still past the outbound check) or
+ * have the item handed back to itself (`action: "host"`, through its inbound queue). The same id
+ * again replaces it. Set by `host:<name>`.
+ */
+export const SchedulePut = Type.Object({ ...Req('schedule.put'), schedule: Type.Object({ ...ScheduleDraft.properties, id: Type.String() }, { additionalProperties: false }) });
+export type SchedulePut = Static<typeof SchedulePut>;
+export const ScheduleRemove = Type.Object({ ...Req('schedule.remove'), scheduleId: Type.String() });
+export const ScheduleList = Type.Object({ ...Req('schedule.list'), sessionKey: Type.Optional(Type.String()) });
+
+/**
+ * Earlier messages of the conversation a channel message is in (feature `history`): the channel's
+ * own `history` (CHANNELS §1c) for a host that hands context to an agent of its own. `scope`
+ * `thread`: the topic it is in; `chat`: the recent messages of its chat. Answers envelopes of
+ * that channel and account sent before it, oldest first (at most `limit`, default 50); [] when
+ * the channel cannot. `item` is an inbound item's cursor (the message the host received).
+ */
+export const HistoryRead = Type.Object({
+  ...Req('history.read'),
+  cursor: Type.Number(),
+  scope: Type.Union([Type.Literal('thread'), Type.Literal('chat')]),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+});
+export type HistoryRead = Static<typeof HistoryRead>;
+
+/**
+ * Mark a channel message with how the host's handling of it stands (feature `message.ack`): the
+ * channel's `acknowledge` (Lark: a reaction on it). `working` once taken, then `done` or
+ * `failed`, or `none` to take the mark away. Cosmetic: a channel without marks answers
+ * `unsupported`, a platform error `channel_error`; nothing is recorded.
+ */
+export const MessageAck = Type.Object({
+  ...Req('message.ack'),
+  route: ReplyRoute,
+  messageId: Type.String(),
+  state: Type.Union([Type.Literal('working'), Type.Literal('done'), Type.Literal('failed'), Type.Literal('none')]),
+});
+export type MessageAck = Static<typeof MessageAck>;
+
+/**
+ * Create a conversation on a channel (feature `conversation.create`), e.g. a Lark group with
+ * the bot in it: `members` are channel user ids (the namespace of `sender.channelUserId`),
+ * `owner` one of them. At most one conversation per operationId (the channel's own dedup,
+ * where it has one, and the daemon's while it runs). A channel that cannot answers `unsupported`.
+ */
+export const ConversationCreate = Type.Object({
+  ...Req('conversation.create'),
+  operationId: Type.String(),
+  channel: Type.String(),
+  account: Type.String(),
+  name: Type.String(),
+  description: Type.Optional(Type.String()),
+  owner: Type.Optional(Type.String()),
+  members: Type.Optional(Type.Array(Type.String())),
+});
+export type ConversationCreate = Static<typeof ConversationCreate>;
+
 /** Platform author and evidence of a channel message, e.g. to verify who confirmed something. */
 export const InputVerify = Type.Object({ ...Req('input.verify'), channelRef: Type.String() });
 
@@ -365,6 +470,8 @@ export const InboundRedispatch = Type.Object({
   agent: Type.Optional(Type.String()),
   session: Type.Optional(SessionScope),
   launch: Type.Optional(SessionLaunch),
+  /** `false` (feature `callout.history`): this dispatch hands no channel history (IN-9), whatever the channel's config. */
+  history: Type.Optional(Type.Boolean()),
 });
 export type InboundRedispatch = Static<typeof InboundRedispatch>;
 
@@ -381,7 +488,57 @@ export type InboundRedispatch = Static<typeof InboundRedispatch>;
 export const SessionCompact = Type.Object({ ...Req('session.compact'), sessionKey: Type.String(), inputId: Type.Optional(Type.String()) });
 export type SessionCompact = Static<typeof SessionCompact>;
 
-export const HostRequestFrame = Type.Union([HostHello, BindingsPut, BindingsGet, RunStart, RunCancel, Deliver, InputVerify, InboundRead, InboundAck, Explain, SessionPrepare, InboundRedispatch, SessionCompact]);
+/**
+ * Open a session's harness now, without a turn (feature `session.prewarm`): the host expects input
+ * soon (a reminder or a routine coming due) and the first turn should not wait for the harness to
+ * boot (Claude Code: the CLI process, its MCP servers and plugins). Nothing is admitted, recorded
+ * or sent to a model. A session with a harness open already answers `opened: false`. Only a session
+ * the daemon has run or registered (its log, a lane, a pinned agent or launch: else `not_found`),
+ * never a task run.
+ */
+export const SessionPrewarm = Type.Object({ ...Req('session.prewarm'), sessionKey: Type.String() });
+export type SessionPrewarm = Static<typeof SessionPrewarm>;
+
+/**
+ * Test hook (feature `test.hooks`, HOSTS §4.3; off unless the daemon was started with
+ * `AIO_TEST_HOOKS=1`, else `test_hooks_off`): hand a channel message this process accepted
+ * earlier (by the input id it became) to the gateway again, `times` times (default 1, at most
+ * 10), as the platform redelivering it would: the original envelope, stamped against the same
+ * running channel. The envelopes are kept in memory only while test hooks are on (bounded, gone
+ * on restart): one not kept answers `not_found`. Fault injection only; logged at warn.
+ */
+export const TestReplay = Type.Object({ ...Req('test.replay'), inputId: Type.String(), times: Type.Optional(Type.Number()) });
+export type TestReplay = Static<typeof TestReplay>;
+
+/**
+ * Test hook (feature `test.hooks`, same gate as `test.replay`): `drop-response` makes the next
+ * `next` sends (1–100) through `channel` (and `account`, `conversation` — the reply route's
+ * `conversationId`, e.g. a Lark chat_id — when given) go out to the platform as usual while their
+ * response is thrown away: the attempt never answers, so the outbox settles it on its attempt
+ * timeout as `unknown` and does not retry (DL-1). Only `send` calls count (`edit`, `finalize`,
+ * `previewProgress` neither drop nor use one up), across sessions: `conversation` narrows it to one
+ * chat. `clear` removes every
+ * injection; `list` changes nothing. Every action answers the injections in effect. In memory
+ * only: a restart clears them. Logged at warn.
+ */
+export const TestFault = Type.Object({
+  ...Req('test.fault'),
+  action: Type.Union([Type.Literal('drop-response'), Type.Literal('clear'), Type.Literal('list')]),
+  channel: Type.Optional(Type.String()),
+  account: Type.Optional(Type.String()),
+  conversation: Type.Optional(Type.String()),
+  next: Type.Optional(Type.Number()),
+});
+export type TestFault = Static<typeof TestFault>;
+
+/**
+ * Replace the connected `outbound.scoped` host's scope as a whole (feature `callouts.outbound.scope`);
+ * in effect when answered. `not_scoped`: this connection is not the host that declared `outbound.scoped`.
+ */
+export const HostOutboundScope = Type.Object({ ...Req('host.outboundScope'), routes: Type.Array(OutboundScopeRoute) });
+export type HostOutboundScope = Static<typeof HostOutboundScope>;
+
+export const HostRequestFrame = Type.Union([HostHello, BindingsPut, BindingsGet, RunStart, RunCancel, Deliver, DeliverUpdate, MessageAck, ConversationCreate, SchedulePut, ScheduleRemove, ScheduleList, HistoryRead, InputVerify, InboundRead, InboundAck, Explain, SessionPrepare, InboundRedispatch, SessionCompact, SessionPrewarm, TestReplay, TestFault, HostOutboundScope]);
 export type HostRequestFrame = Static<typeof HostRequestFrame>;
 
 // ---- daemon → host --------------------------------------------------------
@@ -511,7 +668,20 @@ export const ReviewCallout = Type.Object({
 export const OutboundCallout = Type.Object({
   ...Req('policy'),
   hook: Type.Literal('outbound'),
-  args: Type.Object({ from: Type.Union([TurnContextView, Type.Null()]), to: ReplyRoute }),
+  args: Type.Object({
+    from: Type.Union([TurnContextView, Type.Null()]),
+    to: ReplyRoute,
+    /**
+     * Only for an `outbound.scoped` host (U20), whose answer is `OutboundContentCalloutAnswer`
+     * (`hold` too): what is sent and what it is. `attachmentText`: the text of text-like attachments
+     * (`text/*`, JSON, Markdown, CSV; at most 64 KiB each) by blob ref.
+     */
+    kind: Type.Optional(OutboundKind),
+    content: Type.Optional(RenderedMessage),
+    attachmentText: Type.Optional(Type.Record(Type.String(), Type.String())),
+    turnId: Type.Optional(Type.String()),
+    requestId: Type.Optional(Type.String()),
+  }),
 });
 
 const AgentAddressView = Type.Object({ agent: Type.String(), sessionKey: Type.String() });
@@ -585,7 +755,7 @@ export type ContactCalloutAnswer = Static<typeof ContactCalloutAnswer>;
 export const HostEventFrame = Type.Union([InboundFrame, RouteCallout, ResolveCallout, ReviewCallout, OutboundCallout, ContactCallout, ExternalCallout, RunEnded, ResultFrame]);
 export type HostEventFrame = Static<typeof HostEventFrame>;
 
-export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare', 'inbound.redispatch', 'session.compact'] as const;
+export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'deliver.update', 'message.ack', 'conversation.create', 'schedule.put', 'schedule.remove', 'schedule.list', 'history.read', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare', 'inbound.redispatch', 'session.compact', 'session.prewarm', 'test.replay', 'test.fault', 'host.outboundScope'] as const;
 export const HOST_EVENT_FRAME_TYPES = ['inbound', 'policy', 'run.ended', 'result'] as const;
 
 // ---- result values --------------------------------------------------------
@@ -626,8 +796,16 @@ export const HostHelloResult = Type.Object({
   features: Type.Optional(Type.Array(Type.String())),
   /** The `policy` hooks this connection answers (from the hello's `callouts`). */
   callouts: Type.Optional(Type.Array(Type.String())),
+  /** With `outbound.scoped` granted: the scope's revision and how many conversations it has. */
+  outboundScope: Type.Optional(Type.Object({ revision: Type.Number(), routes: Type.Number() })),
+  /** The hello's `optIn` this connection was granted (empty unless it is the host). */
+  optIn: Type.Optional(Type.Array(Type.String())),
 });
 export type HostHelloResult = Static<typeof HostHelloResult>;
+
+/** `host.outboundScope`: the new scope's revision. */
+export const HostOutboundScopeResult = Type.Object({ revision: Type.Number() });
+export type HostOutboundScopeResult = Static<typeof HostOutboundScopeResult>;
 
 /** `bindings.put`. The same version and content again is a no-op (`changed: false`). */
 export const BindingsPutResult = Type.Object({
@@ -683,6 +861,51 @@ export const DeliverResult = Type.Object({
   duplicate: Type.Boolean(),
 });
 export type DeliverResult = Static<typeof DeliverResult>;
+
+/** `deliver.update`. `duplicate`: a final update with this operationId was applied before. */
+export const DeliverUpdateResult = Type.Object({
+  operationId: Type.String(),
+  providerMessageId: Type.String(),
+  status: Type.Union([Type.Literal('delivered'), Type.Literal('rejected'), Type.Literal('unknown')]),
+  error: Type.Optional(Type.String()),
+  duplicate: Type.Boolean(),
+});
+export type DeliverUpdateResult = Static<typeof DeliverUpdateResult>;
+
+/** A schedule as the daemon keeps it: the draft, who set it, and when it fires next (Unix ms; null: never again). */
+export const ScheduleView = Type.Object({
+  ...ScheduleDraft.properties,
+  id: Type.String(),
+  action: Type.String(),
+  createdBy: Type.String(),
+  createdAt: Type.Number(),
+  nextAt: Type.Union([Type.Number(), Type.Null()]),
+  lastFiredAt: Type.Optional(Type.Number()),
+});
+export type ScheduleView = Static<typeof ScheduleView>;
+/** `schedule.put`. */
+export const SchedulePutResult = Type.Object({ schedule: ScheduleView });
+/** `schedule.remove`. */
+export const ScheduleRemoveResult = Type.Object({ scheduleId: Type.String(), removed: Type.Boolean() });
+/** `schedule.list`. */
+export const ScheduleListResult = Type.Object({ schedules: Type.Array(ScheduleView) });
+
+/** `history.read`: earlier messages, oldest first. */
+export const HistoryReadResult = Type.Object({ messages: Type.Array(InboundEnvelope) });
+
+/** `message.ack`. */
+export const MessageAckResult = Type.Object({ messageId: Type.String(), state: Type.String() });
+export type MessageAckResult = Static<typeof MessageAckResult>;
+
+/** `conversation.create`: the new conversation's id (a route's `conversationId`). */
+export const ConversationCreateResult = Type.Object({
+  operationId: Type.String(),
+  channel: Type.String(),
+  account: Type.String(),
+  conversationId: Type.String(),
+  duplicate: Type.Boolean(),
+});
+export type ConversationCreateResult = Static<typeof ConversationCreateResult>;
 
 /** What the daemon recorded about one channel message for one receiving account. Never a guess. */
 export const VerifiedInput = Type.Object({
@@ -749,7 +972,7 @@ export const EffectExplanation = Type.Object({
   turnId: Type.Optional(Type.String()),
   inputIds: Type.Array(Type.String()),
   route: ReplyRoute,
-  result: Type.Union([Type.Literal('delivered'), Type.Literal('rejected'), Type.Literal('unknown')]),
+  result: Type.Union([Type.Literal('delivered'), Type.Literal('rejected'), Type.Literal('unknown'), Type.Literal('held')]),
   providerMessageId: Type.Optional(Type.String()),
   at: Type.Number(),
   /** A send by a client of the external MCP endpoint: which client, the principal it was stamped with, whom it declared it acts for. */
@@ -799,7 +1022,14 @@ export type InboundAnswer = Static<typeof InboundAnswer>;
  * `launch` (feature `session.launch`) applies to the session the input lands in;
  * only with an `on` that targets a session.
  */
-export const RouteCalloutAnswer = Type.Object({ on: BindingAction, agent: Type.Optional(Type.String()), session: Type.Optional(SessionScope), launch: Type.Optional(SessionLaunch) });
+export const RouteCalloutAnswer = Type.Object({
+  on: BindingAction,
+  agent: Type.Optional(Type.String()),
+  session: Type.Optional(SessionScope),
+  launch: Type.Optional(SessionLaunch),
+  /** `false` (feature `callout.history`): this dispatch hands no channel history (IN-9). */
+  history: Type.Optional(Type.Boolean()),
+});
 
 /** `session.prepare`: the pinned agent and launch (env keys only, never values). */
 export const SessionPrepareResult = Type.Object({
@@ -819,6 +1049,17 @@ export type ResolveCalloutAnswer = Resolver;
 /** The host's answer to an `outbound` callout. */
 export const OutboundCalloutAnswer = Type.Object({ verdict: Type.Union([Type.Literal('allow'), Type.Literal('deny')]) });
 export type OutboundCalloutAnswer = Static<typeof OutboundCalloutAnswer>;
+
+
+/**
+ * The answer of an `outbound.content` / `outbound.scoped` host: `hold` = not sent, the host takes it
+ * (settles `held`, final, never retried). `reason` is shown to the agent: it must not carry content.
+ */
+export const OutboundContentCalloutAnswer = Type.Object({
+  verdict: Type.Union([Type.Literal('allow'), Type.Literal('deny'), Type.Literal('hold')]),
+  reason: Type.Optional(Type.String()),
+});
+export type OutboundContentCalloutAnswer = Static<typeof OutboundContentCalloutAnswer>;
 
 /** `inbound.redispatch`: where the item went. `duplicate`: this cursor was redispatched before (nothing was sent now). */
 export const InboundRedispatchResult = Type.Object({
@@ -855,6 +1096,43 @@ export const SessionCompactResult = Type.Object({
 });
 export type SessionCompactResult = Static<typeof SessionCompactResult>;
 
+/** `session.prewarm`: `opened` when this request opened the harness (false: it was open already). */
+export const SessionPrewarmResult = Type.Object({ sessionKey: Type.String(), opened: Type.Boolean() });
+export type SessionPrewarmResult = Static<typeof SessionPrewarmResult>;
+
+/** `test.replay`: the channel message replayed and what the gateway made of each copy. */
+export const TestReplayResult = Type.Object({
+  inputId: Type.String(),
+  /** `channel:<channel>/<message id>` of the replayed message (what `input.verify` takes). */
+  channelRef: Type.String(),
+  channel: Type.String(),
+  account: Type.String(),
+  /** One per copy, in order: `duplicate` = the gateway recognised it (nothing new was admitted). */
+  results: Type.Array(
+    Type.Object({
+      action: Type.Union([Type.Literal('accepted'), Type.Literal('duplicate'), Type.Literal('refused')]),
+      inputId: Type.Optional(Type.String()),
+      error: Type.Optional(Type.String()),
+    }),
+  ),
+});
+export type TestReplayResult = Static<typeof TestReplayResult>;
+
+/** `test.fault`: the injections in effect after the action. */
+export const TestFaultResult = Type.Object({
+  faults: Type.Array(
+    Type.Object({
+      kind: Type.Literal('drop-response'),
+      channel: Type.String(),
+      account: Type.Optional(Type.String()),
+      conversation: Type.Optional(Type.String()),
+      remaining: Type.Number(),
+      at: Type.Number(),
+    }),
+  ),
+});
+export type TestFaultResult = Static<typeof TestFaultResult>;
+
 /** Result value schema per host request type. */
 export const HOST_RESULT_VALUES = {
   'host.hello': HostHelloResult,
@@ -863,6 +1141,13 @@ export const HOST_RESULT_VALUES = {
   'run.start': RunStartResult,
   'run.cancel': RunCancelResult,
   deliver: DeliverResult,
+  'deliver.update': DeliverUpdateResult,
+  'message.ack': MessageAckResult,
+  'schedule.put': SchedulePutResult,
+  'schedule.remove': ScheduleRemoveResult,
+  'schedule.list': ScheduleListResult,
+  'history.read': HistoryReadResult,
+  'conversation.create': ConversationCreateResult,
   'input.verify': InputVerifyResult,
   'inbound.read': InboundReadResult,
   'inbound.ack': InboundAckResult,
@@ -870,4 +1155,8 @@ export const HOST_RESULT_VALUES = {
   'session.prepare': SessionPrepareResult,
   'inbound.redispatch': InboundRedispatchResult,
   'session.compact': SessionCompactResult,
+  'session.prewarm': SessionPrewarmResult,
+  'test.replay': TestReplayResult,
+  'test.fault': TestFaultResult,
+  'host.outboundScope': HostOutboundScopeResult,
 } as const satisfies Record<(typeof HOST_REQUEST_FRAME_TYPES)[number], TSchema>;

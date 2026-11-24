@@ -505,6 +505,10 @@
             {
               "const": "unknown",
               "type": "string"
+            },
+            {
+              "const": "held",
+              "type": "string"
             }
           ]
         },

@@ -1,0 +1,49 @@
+name: CI
+
+# The quality gates from docs/TESTING.md: typecheck, core + local, invariants, e2e.
+# The live tier (real Lark, IMAP, Claude Code, Codex) needs credentials and stays out of CI.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Version comes from "packageManager" in package.json.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - id: install
+        run: pnpm install --frozen-lockfile
+
+      - name: typecheck
+        run: pnpm typecheck
+
+      # Each gate reports even when an earlier one failed; the job fails if any did.
+      - name: test (core + local)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm test
+
+      - name: invariants
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm invariants:check
+
+      - name: test (e2e)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm test:e2e

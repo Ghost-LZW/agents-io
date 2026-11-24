@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { FakeHarness, assertConformingStream, fakeHarnessCaps } from '@agents-io/testkit';
 import type { BodyOf, Decision, HarnessOpenArgs, InputRecord, RunSpec } from '@agents-io/protocol';
 import { Lane, settleLeftoverInputs, type ModelReviewer } from '../src/index.js';
+import { STALL_REQUEUE_CODE } from '../src/lane.js';
 import { ManualHarness, ManualSession, RUN, SteerableHarness, bodies, gate, input, origin, policy, route, setup, until } from './helpers.js';
 
 const turnsOf = (evs: ReturnType<ReturnType<typeof setup>['events']>) =>
@@ -91,6 +92,24 @@ describe('Lane: turns and queue', () => {
     await until(() => bodies(events(), 'input.rejected').length === 1);
     expect(bodies(events(), 'input.rejected')[0]).toEqual({ t: 'input.rejected', inputIds: ['x'], reason: 'not_consumed' });
     expect(bodies(events(), 'input.admitted').map((b) => (b as BodyOf<'input.admitted'>).disposition)).toEqual(['new_turn', 'queued']);
+    await lane.whenIdle();
+  });
+
+  it('a turn the idle deadline ended (failed, idle_timeout) re-queues what it did not consume: the follow-up runs next #HC-3b', async () => {
+    const h = new ManualHarness();
+    const { lane, events } = setup({ harness: h });
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('x', { id: 'x' }), mode: 'queue' });
+    await until(() => h.session?.starts.length === 1);
+    // The harness withdrew `x` (a follow-up the CLI never started) and left it unconsumed.
+    const turnId = h.session!.starts[0]!.turnId;
+    h.session!.push(
+      { t: 'turn.completed', turnId, status: 'failed', error: { code: STALL_REQUEUE_CODE, retryable: false } },
+      { turnId },
+    );
+    await until(() => h.session!.starts.length === 2);
+    expect(h.session!.starts[1]!.inputs.map((i) => i.inputId)).toEqual(['x']);
+    expect(bodies(events(), 'input.rejected')).toEqual([]);
+    h.session!.complete(h.session!.starts[1]!.turnId, ['x']);
     await lane.whenIdle();
   });
 

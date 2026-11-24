@@ -2,7 +2,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { routeKey, type ReplyRoute } from '@agents-io/protocol';
+import { type ScheduleWhen, routeKey, type ReplyRoute } from '@agents-io/protocol';
 import { McpHttpEndpoint, type McpRefusal } from './http.js';
 import { ToolError } from './tools.js';
 
@@ -26,14 +26,16 @@ export interface ExternalScopes {
   send: string[];
   /** Session keys it may queue an input into. */
   input: string[];
+  /** Route keys its schedules may send to (`schedule:<route pattern>`); empty: no schedule tools. */
+  schedule: string[];
 }
 
 /** One scope string → its kind and pattern; undefined when it is not a scope. */
-export function parseScope(scope: string): { kind: 'read' | 'send' | 'input'; pattern: string } | undefined {
+export function parseScope(scope: string): { kind: 'read' | 'send' | 'input' | 'schedule'; pattern: string } | undefined {
   if (scope === 'read') return { kind: 'read', pattern: '*' };
-  const m = /^(read|send|input):(.+)$/.exec(scope);
+  const m = /^(read|send|input|schedule):(.+)$/.exec(scope);
   if (!m || /\s/.test(m[2]!)) return undefined;
-  return { kind: m[1] as 'read' | 'send' | 'input', pattern: m[2]! };
+  return { kind: m[1] as 'read' | 'send' | 'input' | 'schedule', pattern: m[2]! };
 }
 
 /** Whether `s` matches the glob `pattern`: `*` matches any run of characters (`:` and `/` included), the rest is literal. */
@@ -76,6 +78,10 @@ export interface ExternalBackend {
   status(): unknown;
   send(caller: ExternalCaller, a: { route: ReplyRoute; text: string; operationId?: string }): Promise<unknown>;
   input(caller: ExternalCaller, a: { sessionKey: string; text: string }): Promise<unknown>;
+  /** A schedule of the client's: it sends `text` to `route` at its times (docs/design/schedules). */
+  schedulePut(caller: ExternalCaller, a: { id?: string; when: ScheduleWhen; route: ReplyRoute; text: string; action?: 'message' | 'wake'; mode?: 'resume' | 'fresh'; missed?: 'once' | 'skip'; until?: number; note?: string }): Promise<unknown>;
+  scheduleRemove(caller: ExternalCaller, id: string): Promise<unknown>;
+  scheduleList(caller: ExternalCaller): unknown;
 }
 
 export interface ExternalLimits {
@@ -148,7 +154,7 @@ export const EXTERNAL_TOOL_DEFS = {
       route: ROUTE_KEY,
       text: z.string().min(1).describe('Message text'),
       operation_id: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/).optional().describe('Idempotency key: the same one never sends twice'),
-      reply_to_message_id: z.string().optional().describe('Platform message id to reply to'),
+      reply_to_message_id: z.string().optional().describe('Platform message id to reply to (in a thread route: the message it answers there; default the thread root)'),
     },
   },
   session_input: {
@@ -157,6 +163,37 @@ export const EXTERNAL_TOOL_DEFS = {
     description:
       "Queue a message as an input into a session: it starts a turn of the session's agent when the session is idle, else waits its turn. The agent sees it as from your client (kind=peer), never as from a person, and the turn runs restricted. The answer stays in the session log (read it with session_events, tier final); it is not sent to any channel. The loop guard limits how often you can start turns in one session without a person writing there (then inputs are kept as context only).",
     input: { session: z.string().describe('Session key (from sessions_list)'), text: z.string().min(1).describe('The message') },
+  },
+  schedule_add: {
+    scope: 'schedule',
+    readOnly: false,
+    description:
+      'Do something at set times: `when` is { at } (once: ISO 8601 with offset, or Unix ms), { cron, tz? } (five fields: minute hour day month weekday; tz like Asia/Shanghai) or { every_minutes }. action "message" (default): the daemon sends `text` to `route` (a route key your schedule scope allows), recorded as sent by your client. action "wake": at each time `text` is handed to the host that runs you (with `mode`: "resume" = you, the same session, are woken with it; "fresh" = a new agent starts on it), and the answer goes to `route`. Missed while the daemon was down: once when it is back (missed "skip" drops it). Reuse an id of yours to replace it.',
+    input: {
+      when: z
+        .object({ at: z.union([z.string(), z.number()]).optional(), cron: z.string().optional(), tz: z.string().optional(), every_minutes: z.number().optional() })
+        .describe('{ at } | { cron, tz? } | { every_minutes }'),
+      route: ROUTE_KEY,
+      text: z.string().min(1).describe('message: what is sent; wake: what you (or the new agent) are told at that time'),
+      action: z.enum(['message', 'wake']).optional().describe('message (default): send text to route; wake: have the host wake an agent with text'),
+      mode: z.enum(['resume', 'fresh']).optional().describe('wake: resume = you (the same session); fresh = a new agent each time (default resume)'),
+      missed: z.enum(['once', 'skip']).optional(),
+      until: z.string().optional().describe('ISO 8601: remove it after this time'),
+      note: z.string().optional(),
+      id: z.string().regex(/^[A-Za-z0-9._:-]{1,64}$/).optional().describe('Schedule id; reuse one of yours to replace it'),
+    },
+  },
+  schedule_remove: {
+    scope: 'schedule',
+    readOnly: false,
+    description: 'Remove a schedule your client set (by id).',
+    input: { id: z.string().describe('Schedule id') },
+  },
+  schedule_list: {
+    scope: 'schedule',
+    readOnly: true,
+    description: 'List the schedules your client set, with when each sends next.',
+    input: {},
   },
 } as const;
 
@@ -218,9 +255,10 @@ function clip(v: unknown): unknown {
 /** `channel:account:conversation[:thread]` → a route (the rest after the third part is the conversation id, as host tools read it). */
 export function parseRouteKey(spec: string): ReplyRoute | undefined {
   const parts = spec.split(':');
-  if (parts.length < 3 || parts.some((p) => !p)) return undefined;
-  const [channel, account, ...rest] = parts;
-  return { channel: channel!, account: account!, conversationId: rest.join(':') };
+  if (parts.length < 3 || parts.length > 4 || parts.some((p) => !p)) return undefined;
+  // `channel:account:conversation[:thread]`, as `routeKey` writes it: a fourth part is the thread (topic).
+  const [channel, account, conversationId, threadId] = parts;
+  return { channel: channel!, account: account!, conversationId: conversationId!, ...(threadId ? { threadId } : {}) };
 }
 
 /**
@@ -316,6 +354,8 @@ export class ExternalMcpServer {
         return s.send.length > 0;
       case 'input':
         return s.input.length > 0;
+      case 'schedule':
+        return s.schedule.length > 0;
     }
   }
 
@@ -399,7 +439,8 @@ export class ExternalMcpServer {
         if (!matchesAny(s.send, key)) throw new ToolError(`route ${key} is not in your send scope`);
         const text = this.text(args.text);
         this.write(caller);
-        const mid = typeof args.reply_to_message_id === 'string' && args.reply_to_message_id ? args.reply_to_message_id : undefined;
+        // In a thread, a reply anchors there (its root by default) so channels that need an anchor place it in the thread.
+        const mid = typeof args.reply_to_message_id === 'string' && args.reply_to_message_id ? args.reply_to_message_id : route.threadId;
         return b.send(caller, { route: mid ? { ...route, replyToMessageId: mid } : route, text, ...(typeof args.operation_id === 'string' ? { operationId: args.operation_id } : {}) });
       }
       case 'session_input': {
@@ -409,6 +450,41 @@ export class ExternalMcpServer {
         this.write(caller);
         return b.input(caller, { sessionKey: key, text });
       }
+      case 'schedule_add': {
+        const spec = String(args.route ?? '');
+        const route = parseRouteKey(spec);
+        if (!route) throw new ToolError(`route must be a route key channel:account:conversation[:thread], got ${JSON.stringify(spec)}`);
+        if (!matchesAny(s.schedule, routeKey(route))) throw new ToolError(`route ${routeKey(route)} is not in your schedule scope`);
+        const w = (args.when ?? {}) as Record<string, unknown>;
+        const when =
+          typeof w.cron === 'string'
+            ? { cron: w.cron, ...(typeof w.tz === 'string' ? { tz: w.tz } : {}) }
+            : typeof w.every_minutes === 'number'
+              ? { everyMinutes: w.every_minutes }
+              : w.at !== undefined
+                ? { at: w.at as string | number }
+                : undefined;
+        if (!when) throw new ToolError('when is { at } (once), { cron, tz? } or { every_minutes }');
+        const until = typeof args.until === 'string' ? Date.parse(args.until) : undefined;
+        if (until !== undefined && !Number.isFinite(until)) throw new ToolError('until is an ISO 8601 time');
+        this.write(caller);
+        return b.schedulePut(caller, {
+          ...(typeof args.id === 'string' ? { id: args.id } : {}),
+          when,
+          route,
+          text: this.text(args.text),
+          ...(args.action === 'wake' ? { action: 'wake' as const } : {}),
+          ...(args.mode === 'resume' || args.mode === 'fresh' ? { mode: args.mode } : {}),
+          ...(args.missed === 'once' || args.missed === 'skip' ? { missed: args.missed } : {}),
+          ...(until !== undefined ? { until } : {}),
+          ...(typeof args.note === 'string' ? { note: args.note } : {}),
+        });
+      }
+      case 'schedule_remove':
+        this.write(caller);
+        return b.scheduleRemove(caller, String(args.id ?? ''));
+      case 'schedule_list':
+        return b.scheduleList(caller);
     }
   }
 

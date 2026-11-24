@@ -9,9 +9,9 @@ import { daemon, until, type World } from './helpers.js';
 import { mcpCall } from './output-tools-helpers.js';
 
 /*
- * The watch, live and topic tools are built-in feature modules (core-slimming G6 step 3,
- * `tool-modules.ts`): the bundled aio offers what it offered before, and a group that is off is
- * not there at all.
+ * The watch, schedule, live and topic tools are built-in feature modules (core-slimming G6 step 3,
+ * `tool-modules.ts`; the schedule tools since the merge of origin/main): the bundled aio offers what
+ * it offered before, and a group that is off is not there at all.
  */
 
 const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };
@@ -46,7 +46,7 @@ async function offered(raw: Record<string, unknown>) {
 }
 
 describe('the watch, live and topic tools as modules', () => {
-  it('the bundled aio offers them, on by default: an agent with tools: true lists the 15 tools byte for byte as before they were modules (the live tools also with no channel that can open a live), and its inputs of a current topic carry the hint #CF-6', async () => {
+  it('the bundled aio offers them, on by default: an agent with tools: true lists the 18 tools byte for byte as before they were modules (the live tools also with no channel that can open a live), and its inputs of a current topic carry the hint #CF-6', async () => {
     const { w, listed, input } = await offered({ outputTools: true });
     // The `tools/list` answer captured from the code before the tool catalog existed (packages/host-mcp/test/catalog.test.ts).
     expect(JSON.stringify(listed, null, 2) + '\n').toBe(readFileSync(new URL('../../host-mcp/test/fixtures/tools-list.json', import.meta.url), 'utf8'));
@@ -55,6 +55,7 @@ describe('the watch, live and topic tools as modules', () => {
     expect(input.channelContext.topicTools).toBe(TOPIC_TOOLS_HINT);
     expect(w.gw.adminStatus().modules.filter((m) => m.id.startsWith('tools.'))).toEqual([
       { id: 'tools.watch', origin: 'builtin', enabled: true },
+      { id: 'tools.schedules', origin: 'builtin', enabled: true },
       { id: 'tools.live', origin: 'builtin', enabled: true },
       { id: 'tools.topics', origin: 'builtin', enabled: true },
     ]);
@@ -111,6 +112,7 @@ describe('the watch, live and topic tools as modules', () => {
   it('a group whose section says enabled: false is not there: its tools are not offered (the others are, in order), the topic tools give no hint; naming one of its tools in agents.<name>.tools fails the config, naming the module #CF-6', async () => {
     const groups = [
       ['watchTools', 'tools.watch', TOOL_GROUPS.watch],
+      ['scheduleTools', 'tools.schedules', TOOL_GROUPS.schedules],
       ['liveTools', 'tools.live', TOOL_GROUPS.live],
       ['topicTools', 'tools.topics', TOOL_GROUPS.topics],
     ] as const;
@@ -126,8 +128,8 @@ describe('the watch, live and topic tools as modules', () => {
       // An unknown name's error lists the tools there are: the kernel's, then the groups that are on.
       expect(() => resolve(['nope'])).toThrow(`agents.chat.tools: unknown tool "nope" (tools: ${TOOL_NAMES.filter((n) => !(names as readonly string[]).includes(n)).join(', ')})`);
     }
-    // All three off: the kernel's own six, nothing else.
-    const { listed, input } = await offered({ outputTools: true, watchTools: { enabled: false }, liveTools: { enabled: false }, topicTools: { enabled: false } });
+    // All four off: the kernel's own six, nothing else.
+    const { listed, input } = await offered({ outputTools: true, watchTools: { enabled: false }, scheduleTools: { enabled: false }, liveTools: { enabled: false }, topicTools: { enabled: false } });
     expect(listed.tools.map((t) => t.name)).toEqual(KERNEL_TOOL_NAMES);
     expect(input.channelContext).not.toHaveProperty('topicTools');
   });

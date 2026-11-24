@@ -12,6 +12,7 @@ import { CommandError, DaemonUnavailable, LocalClient } from './client.js';
 import { ConfigError, loadConfig, type LoadOptions } from './config.js';
 import { consoleProof } from './console.js';
 import { Gateway } from './gateway.js';
+import { testHooksFromEnv } from './test-hooks.js';
 import { TokenError, consoleUrlPath, readTokenFile, tokenPath } from './token.js';
 import { builtinHarnesses } from './bundle.js';
 import { WATCH_SPEC_HELP, formatWatch, parseDuration, parseWatchSpec } from './watch-spec.js';
@@ -38,10 +39,20 @@ host commands (authenticate with the token file next to the socket; docs/HOSTS.m
   aio ack       --consumer <name> <cursor>
   aio redispatch <cursor> [--agent <name>] [--session main|per-conversation|per-thread|topic|<key json>]
                 [--cwd <dir>] [--env K=V …]                           (a queued item to a session, original sender kept)
+  aio schedule  add --id <id> (--cron "<m h dom mon dow>" [--tz <zone>] | --at <time> | --every <minutes>)
+                [--session <key> | --route <route json> | --to-host] --text <text>  | list [--session <key>] | remove <id>
+                                                                      (docs/design/schedules)
   aio bindings  put [--file table.json|-] | get
   aio explain   <inputId | operationId> [--chain]                    (routing record; a delivery's turn and inputs;
                                                                        --chain: an agent input back to the root of its chain)
   aio verify    <channelRef>                                          (channel:<channel>/<message id>)
+
+test hooks (fault injection; only when \`aio serve\` runs with AIO_TEST_HOOKS=1, host token as above; docs/HOSTS.md §4.3)
+  aio replay    --input <inputId> [--times N]                         (a channel message accepted earlier, to the gateway again;
+                                                                       prints each copy's accepted / duplicate and its channelRef)
+  aio fault     [list] | drop-response --channel <id> [--account <a>] [--conversation <c>] --next <N> | clear
+                                                                      (the next N sends go out, their responses are dropped: unknown;
+                                                                       --conversation: only sends to that chat, e.g. a Lark chat_id)
 
 console (HTTP + WebSocket API for web UIs, on 127.0.0.1:7464 by default; config \`console\`)
   aio console-link                                                    (prints a one-time login URL, valid 5 min)
@@ -83,6 +94,13 @@ export function parseCli(argv: string[]): CliArgs {
         only: { type: 'string' },
         'data-dir': { type: 'string' },
         wait: { type: 'boolean' },
+        id: { type: 'string' },
+        cron: { type: 'string' },
+        tz: { type: 'string' },
+        at: { type: 'string' },
+        every: { type: 'string' },
+        missed: { type: 'string' },
+        'to-host': { type: 'boolean' },
         verbose: { type: 'boolean', short: 'v' },
         'no-color': { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
@@ -108,6 +126,12 @@ export function parseCli(argv: string[]): CliArgs {
         profile: { type: 'string' },
         'input-id': { type: 'string' },
         correlation: { type: 'string' },
+        input: { type: 'string' },
+        times: { type: 'string' },
+        channel: { type: 'string' },
+        account: { type: 'string' },
+        conversation: { type: 'string' },
+        next: { type: 'string' },
       },
     });
   } catch (e) {
@@ -119,6 +143,8 @@ export function parseCli(argv: string[]): CliArgs {
   if (values.from !== undefined && !/^\d+$/.test(values.from)) throw new ConfigError(cmd === 'tail' ? '--from must be a cursor number' : '--from must be a seq number');
   if (values.mode !== undefined && !['queue', 'steer', 'interrupt'].includes(values.mode)) throw new ConfigError('--mode must be queue, steer or interrupt');
   if (values.limit !== undefined && !/^[1-9]\d*$/.test(values.limit)) throw new ConfigError('--limit must be a positive number');
+  if (values.times !== undefined && !/^[1-9]\d*$/.test(values.times)) throw new ConfigError('--times must be a positive number');
+  if (values.next !== undefined && !/^[1-9]\d*$/.test(values.next)) throw new ConfigError('--next must be a positive number');
   return { cmd: values.help ? 'help' : cmd, values, rest };
 }
 
@@ -189,7 +215,8 @@ async function serve(a: CliArgs): Promise<number> {
   const tokenFile = str(a, 'token-file');
   let gw: Gateway;
   try {
-    gw = await Gateway.start({ config: c, console: c.console.enabled, ...(tokenFile ? { tokenFile: resolve(tokenFile) } : {}), logger: (level, msg) => console.error(`[aio] ${level}: ${msg}`) });
+    // Test hooks only from the daemon's own environment, never from the config file (SE-6).
+    gw = await Gateway.start({ config: c, console: c.console.enabled, ...(tokenFile ? { tokenFile: resolve(tokenFile) } : {}), ...(testHooksFromEnv(process.env) ? { testHooks: true } : {}), logger: (level, msg) => console.error(`[aio] ${level}: ${msg}`) });
   } catch (e) {
     // A bad operator token file is a configuration error, not "daemon not running".
     if (e instanceof TokenError) throw new ConfigError(e.message);
@@ -453,6 +480,54 @@ async function send(a: CliArgs): Promise<number> {
   }
 }
 
+async function schedule(a: CliArgs): Promise<number> {
+  const [sub = 'list', ...tokens] = a.rest;
+  const client = await hostClient(a);
+  try {
+    switch (sub) {
+      case 'add': {
+        const cron = str(a, 'cron');
+        const at = str(a, 'at');
+        const every = str(a, 'every');
+        const when = cron !== undefined ? { cron, ...(str(a, 'tz') ? { tz: str(a, 'tz')! } : {}) } : at !== undefined ? { at } : every !== undefined ? { everyMinutes: Number(every) } : undefined;
+        if (!when) throw new ConfigError('aio schedule add needs --cron, --at or --every');
+        const route = str(a, 'route');
+        const session = str(a, 'session');
+        const action = a.values['to-host'] === true ? 'host' : route !== undefined && session === undefined ? 'message' : 'turn';
+        const r = await client.schedulePut({
+          id: need(a, 'id'),
+          when,
+          action,
+          ...(action === 'turn' ? { target: { sessionKey: session ?? 'main' } } : {}),
+          ...(route !== undefined ? { route: JSON.parse(route) } : {}),
+          text: need(a, 'text'),
+          ...(str(a, 'missed') ? { missed: str(a, 'missed') as 'once' | 'skip' } : {}),
+        });
+        console.log(JSON.stringify(r.schedule));
+        return 0;
+      }
+      case 'list':
+      case 'ls': {
+        const r = await client.scheduleList(str(a, 'session'));
+        for (const x of r.schedules) console.log(`${x.id}\t${x.action}\t${x.nextAt === null ? 'never' : new Date(x.nextAt).toISOString()}\t${x.createdBy}\t${x.text}`);
+        if (!r.schedules.length) console.error('no schedules');
+        return 0;
+      }
+      case 'remove':
+      case 'rm': {
+        if (!tokens[0]) throw new ConfigError('usage: aio schedule remove <id>');
+        const r = await client.scheduleRemove(tokens[0]);
+        console.log(r.removed ? `removed ${tokens[0]}` : `no schedule ${tokens[0]}`);
+        return r.removed ? 0 : 1;
+      }
+      default:
+        throw new ConfigError(`unknown schedule command ${sub} (add, list, remove)`);
+    }
+  } finally {
+    client.close();
+  }
+}
+
 async function tail(a: CliArgs): Promise<number> {
   const consumer = need(a, 'consumer');
   const once = a.values.once === true;
@@ -576,6 +651,57 @@ async function verify(a: CliArgs): Promise<number> {
   }
 }
 
+/** The `test.replay` request `aio replay` sends, from its arguments. */
+export function replayRequest(a: CliArgs): { inputId: string; times?: number } {
+  const inputId = str(a, 'input') ?? a.rest[0];
+  if (!inputId) throw new ConfigError('usage: aio replay --input <inputId> [--times N]');
+  const times = str(a, 'times');
+  return { inputId, ...(times !== undefined ? { times: Number(times) } : {}) };
+}
+
+async function replay(a: CliArgs): Promise<number> {
+  const req = replayRequest(a);
+  const client = await hostClient(a);
+  try {
+    print(await client.testReplay(req));
+    return 0;
+  } finally {
+    client.close();
+  }
+}
+
+/** The `test.fault` request `aio fault` sends, from its arguments. */
+export function faultRequest(a: CliArgs): { action: 'drop-response' | 'clear' | 'list'; channel?: string; account?: string; conversation?: string; next?: number } {
+  const [sub = 'list', ...more] = a.rest;
+  const usage = 'usage: aio fault [list] | aio fault drop-response --channel <id> [--account <a>] [--conversation <c>] --next <N> | aio fault clear';
+  if (more.length) throw new ConfigError(usage);
+  if (sub === 'list' || sub === 'clear') return { action: sub };
+  if (sub !== 'drop-response') throw new ConfigError(usage);
+  const channel = need(a, 'channel');
+  const next = str(a, 'next');
+  if (next === undefined) throw new ConfigError(`${usage}\n(--next is required: how many sends)`);
+  const account = str(a, 'account');
+  const conversation = str(a, 'conversation');
+  return {
+    action: 'drop-response',
+    channel,
+    ...(account !== undefined ? { account } : {}),
+    ...(conversation !== undefined ? { conversation } : {}),
+    next: Number(next),
+  };
+}
+
+async function fault(a: CliArgs): Promise<number> {
+  const req = faultRequest(a);
+  const client = await hostClient(a);
+  try {
+    print(await client.testFault(req));
+    return 0;
+  } finally {
+    client.close();
+  }
+}
+
 /**
  * `aio console-link`: ask the running daemon's console (with the host token)
  * for a one-time login link and print it. The console first proves it knows
@@ -613,7 +739,7 @@ async function consoleLink(a: CliArgs): Promise<number> {
   return 0;
 }
 
-const COMMANDS: Record<string, (a: CliArgs) => Promise<number>> = { serve, attach, tui, input, sessions, watch, run: runCmd, send, tail, ack, redispatch, bindings, explain, verify, 'console-link': consoleLink, console: consoleLink };
+const COMMANDS: Record<string, (a: CliArgs) => Promise<number>> = { serve, attach, tui, input, sessions, watch, run: runCmd, send, tail, ack, redispatch, schedule, bindings, explain, verify, replay, fault, 'console-link': consoleLink, console: consoleLink };
 
 /**
  * A command a built-in harness kind adds (`HarnessModule.cli`; Claude Code's `tui-bridge`, which its

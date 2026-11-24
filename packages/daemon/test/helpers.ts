@@ -72,6 +72,8 @@ export async function daemon(
     channelRegistry?: ChannelRegistry;
     /** The feature modules the config is resolved with and the daemon runs (default the built-in ones). */
     moduleRegistry?: ModuleRegistry;
+    /** GatewayOptions.testHooks, outboxAttemptTimeoutMs and logger. */
+    gateway?: Pick<GatewayOptions, 'testHooks' | 'outboxAttemptTimeoutMs' | 'logger'>;
   } = {},
 ): Promise<World> {
   const dir = o.dir ?? tmp();
@@ -105,6 +107,7 @@ export async function daemon(
     ...(o.channelStartGraceMs !== undefined ? { channelStartGraceMs: o.channelStartGraceMs } : {}),
     ...(o.channelRegistry ? { channelRegistry: o.channelRegistry } : {}),
     ...(o.moduleRegistry ? { moduleRegistry: o.moduleRegistry } : {}),
+    ...o.gateway,
   });
   let stopped = false;
   const stop = async () => {

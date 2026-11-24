@@ -56,6 +56,13 @@ export const ChannelCaps = Type.Object({
        */
       requireAnswerToOpen: Type.Optional(Type.Boolean()),
       /**
+       * With a delay above 0: the first message opens at the turn's first tool call, or once the
+       * delay expired with something to show (a tool, thinking or answer text), and lists the steps
+       * until the answer streams in; wins over `requireAnswerToOpen`. A channel entry's
+       * `openOnProcess` overrides it (a module channel that edits its message into the answer sets it there).
+       */
+      openOnProcess: Type.Optional(Type.Boolean()),
+      /**
        * A Stop control on the streaming reply (default true); off where the preview carries it. Only
        * an adapter with `previewProgress` can turn it off; a JSONL bridge's peer cannot.
        */
@@ -113,6 +120,15 @@ export const ProgressView = Type.Object({
   /** Answer text so far; final when `answerFinal`. */
   answer: Type.String(),
   answerFinal: Type.Boolean(),
+  /**
+   * `answer` (and, once the turn ended, the message's `text`) is the turn's final answer: its
+   * harness's final `text.snapshot`, in a turn that has not ended or that completed (or a line of
+   * the compositor's own, e.g. where a moved turn went). Absent: there is none — they are text so
+   * far, which can be what the model said before a tool call; a turn that failed, was interrupted
+   * or has an unknown outcome has none, even with a final snapshot (an idle-deadline stop's is what
+   * it said so far and a notice, HC-3b). An end that shows only answers says how the turn ended.
+   */
+  finalAnswer: Type.Optional(Type.Boolean()),
   startedAt: Type.Optional(Type.Number()),
   endedAt: Type.Optional(Type.Number()),
 });
@@ -176,6 +192,15 @@ export const SendResult = Type.Object({
   providerThreadId: Type.Optional(Type.String()),
 });
 export type SendResult = Static<typeof SendResult>;
+
+/** What `ChannelAdapter.createConversation` makes. */
+export interface ConversationSpec {
+  operationId: string;
+  name: string;
+  description?: string;
+  owner?: string;
+  members: string[];
+}
 
 /** Host-provided blob storage, so adapters never inline large payloads. */
 export interface BlobStore {
@@ -252,6 +277,12 @@ export interface ChannelAdapter {
    * (a missing permission, a timeout): the message goes on without history.
    */
   history?(env: InboundEnvelope, scope: HistoryScope): Promise<InboundEnvelope[]>;
+  /**
+   * Create a conversation with the bot in it (a Lark group): `members` and `owner` are channel
+   * user ids of this channel. Resolves with its id. `operationId` must never make two (the
+   * platform's dedup where it has one). Rejects for platform errors (a missing permission).
+   */
+  createConversation?(account: string, spec: ConversationSpec): Promise<{ conversationId: string }>;
   /** After restart: is a previously sent (streaming) message still editable? */
   reconcile?(route: ReplyRoute, providerMessageId: string): Promise<'alive' | 'gone'>;
   /**

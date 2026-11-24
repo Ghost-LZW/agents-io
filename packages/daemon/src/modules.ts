@@ -15,14 +15,17 @@ import type {
   InputRecord,
   KernelContext,
   KernelDatabase,
+  KernelHold,
   KernelInputResult,
   KernelLaneHarness,
   KernelOutcome,
   KernelPreset,
   KernelRunOverrides,
+  KernelScheduleResult,
   KernelSendResult,
   KernelSessionRun,
   KernelSettledSend,
+  KernelUnscheduleResult,
   KernelUnwatchResult,
   KernelWatchResult,
   ModuleActionResult,
@@ -38,6 +41,8 @@ import type {
   ReplyRoute,
   Resolver,
   RouteExplanation,
+  ScheduleDraft,
+  ScheduleView,
   SessionEvent,
   SessionScope,
   Topic,
@@ -127,7 +132,8 @@ export interface ModuleRegistryOptions {
 /** What `kernel:<capability>` may name in `ModuleManifest.needs`: the members of `KernelContext`. */
 export const KERNEL_CAPABILITIES: readonly string[] = [
   'log', 'events', 'head', 'appendNative', 'sessions', 'status', 'stopping', 'policy', 'records', 'db', 'topics', 'watches', 'live', 'agents',
-  'router', 'lanes', 'runConfig', 'channelFor', 'resolveRoute', 'send', 'settled', 'outbound', 'owner', 'ownerRoute', 'redispatch', 'explain', 'host',
+  'router', 'lanes', 'runConfig', 'channelFor', 'resolveRoute', 'send', 'settled', 'outbound', 'hold', 'owner', 'ownerRoute', 'redispatch', 'explain', 'host',
+  'schedules',
 ];
 
 const MODULE_ID = /^[a-z0-9][a-z0-9._-]*$/;
@@ -376,7 +382,7 @@ interface Running {
 }
 
 /** Hook members the daemon serves (functions, but `onAction`: `{ prefix, handle }`): any other a module sets fails its setup. */
-const SERVED_HOOKS: readonly string[] = ['onTurnCompleted', 'inputHint', 'onUndispatched', 'onAction', 'resolver', 'identities', 'statusLines'];
+const SERVED_HOOKS: readonly string[] = ['onTurnCompleted', 'inputHint', 'onUndispatched', 'onAction', 'resolver', 'identities', 'statusLines', 'scheduledMessage'];
 
 /** What is wrong with what `setup` returned (the first thing), or undefined. */
 function badInstance(m: ModuleManifest<any>, i: ModuleInstance): string | undefined {
@@ -710,6 +716,23 @@ export class ModuleHost {
     return lines;
   }
 
+  /**
+   * A `message` schedule fires (`ModuleHooks.scheduledMessage`): the first set-up module, in
+   * registration order, whose hook answers true sent it (as its client); false when none did (the
+   * kernel sends it). A hook's throw or rejection is the firing's failure (redone, SC-1). Served from
+   * when the daemon runs; while it stops, none is asked (the kernel's own send refuses then too).
+   */
+  async scheduledMessage(a: { schedule: ScheduleView; operationId: string }): Promise<boolean> {
+    if (this.stopping) return false;
+    for (const m of this.active()) {
+      const hook = m.instance!.hooks?.scheduledMessage;
+      if (!hook) continue;
+      const got: unknown = await hook({ schedule: { ...a.schedule }, operationId: a.operationId });
+      if (got === true) return true;
+    }
+    return false;
+  }
+
   /** Step 4: stop the started modules in reverse order, each bounded (`MODULE_STOP_MS`); failures are logged. Their hooks are no longer called. */
   async stop(): Promise<void> {
     this.stopping = true;
@@ -754,12 +777,21 @@ export interface KernelBackend {
   topic(sessionKey: string): Topic | undefined;
   siblings(sessionKey: string): Topic[];
   titleSource(topicId: string): 'auto' | 'explicit' | undefined;
-  /** Set while still auto and `expected`, then the cards that show it refreshed (`KernelContext.topics.setAutoTitle`). */
-  setAutoTitle(topicId: string, expected: string | undefined, title: string): boolean;
+  /** Set while still auto and `expected` (U20: once the scoped host allowed it), then the cards that show it refreshed (`KernelContext.topics.setAutoTitle`). */
+  setAutoTitle(topicId: string, expected: string | undefined, title: string, turnId: string | undefined): Promise<boolean>;
   /** A watch as the session's agent, delivering into the session (`KernelContext.watches.add`). */
   addWatch(sessionKey: string, draft: WatchDraft): Promise<KernelWatchResult>;
   removeWatch(sessionKey: string, id: string): Promise<KernelUnwatchResult>;
   listWatches(sessionKey: string): Watch[];
+  /** A schedule as the session's agent (`KernelContext.schedules.add`): a route only from its running turn `turnId`, where it may send. */
+  addSchedule(sessionKey: string, draft: ScheduleDraft, turnId: string | undefined): Promise<KernelScheduleResult>;
+  removeSchedule(sessionKey: string, id: string): Promise<KernelUnscheduleResult>;
+  listSchedules(sessionKey: string): ScheduleView[];
+  /** A schedule as a peer (`KernelContext.schedules.addAs`; the origin is checked before). */
+  addScheduleAs(origin: Origin, draft: ScheduleDraft): Promise<KernelScheduleResult>;
+  removeScheduleAs(origin: Origin, id: string): Promise<KernelUnscheduleResult>;
+  /** The schedules the origin set (`creatorOf`). */
+  listSchedulesAs(origin: Origin): ScheduleView[];
   /** The kernel's handover of the running turn `turnId` under TP-1 (`KernelContext.topics.rotate` / `switch`). */
   rotateTopic(sessionKey: string, turnId: string, a: { title: string; summary: string; operationId: string }): Promise<ModuleTopicHandover>;
   switchTopic(sessionKey: string, turnId: string, a: { topicId: string; operationId: string }): Promise<ModuleTopicHandover>;
@@ -796,7 +828,9 @@ export interface KernelBackend {
   resolveRoute(route: ReplyRoute): { ok: true; route: ReplyRoute } | { ok: false; message: string };
   send(route: ReplyRoute, msg: RenderedMessage, a: { operationId: string; sessionKey: string; turnId?: string; external?: ExternalSender }): Promise<KernelSendResult | undefined>;
   settled(operationId: string): KernelSettledSend | undefined;
-  outbound(from: TurnContext, to: ReplyRoute): Promise<'allow' | 'deny'>;
+  outbound(from: TurnContext, to: ReplyRoute, content: RenderedMessage | undefined): Promise<'allow' | 'deny' | KernelHold>;
+  /** Settle a send held at the outbound check (`KernelContext.hold`). */
+  hold(route: ReplyRoute, a: { operationId: string; sessionKey: string; external?: ExternalSender; reason?: string }): KernelSendResult;
   /** The owner's principals and fixed session (`KernelContext.owner`). */
   owner(): { principals: string[]; sessionKey?: string };
   ownerRoute(): ReplyRoute | null;
@@ -847,7 +881,7 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
       bySession: (sessionKey) => live().topic(sessionKey),
       siblings: (sessionKey) => live().siblings(sessionKey),
       titleSource: (topicId) => live().titleSource(topicId),
-      setAutoTitle: (topicId, expected, title) => live().setAutoTitle(topicId, expected, title),
+      setAutoTitle: async (topicId, expected, title, turnId) => live().setAutoTitle(topicId, expected, title, typeof turnId === 'string' ? turnId : undefined),
       // Only what the module may say (strings): its untyped code passes nothing else on.
       rotate: async (sessionKey, turnId, a) =>
         live().rotateTopic(sessionKey, turnId, { title: text(a?.title, 'topics.rotate: title'), summary: text(a?.summary, 'topics.rotate: summary'), operationId: text(a?.operationId, 'topics.rotate: operationId') }),
@@ -857,6 +891,23 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
       add: async (sessionKey, draft) => live().addWatch(sessionKey, draft),
       remove: async (sessionKey, wid) => live().removeWatch(sessionKey, wid),
       list: (sessionKey) => live().listWatches(sessionKey),
+    },
+    schedules: {
+      add: async (sessionKey, draft, turnId) => live().addSchedule(sessionKey, draft, typeof turnId === 'string' ? turnId : undefined),
+      remove: async (sessionKey, sid) => live().removeSchedule(sessionKey, sid),
+      list: (sessionKey) => live().listSchedules(sessionKey),
+      // As lanes.input: a module sets schedules for someone else only as a peer, never as a person, a host, the kernel or an owner.
+      addAs: async (origin, draft) => {
+        const refused = peerRefusal(origin, live().owner().principals);
+        if (refused) throw new Error(`module ${id}: schedules.addAs takes a peer's origin (${refused})`);
+        return live().addScheduleAs(origin, draft);
+      },
+      removeAs: async (origin, sid) => {
+        const refused = peerRefusal(origin, live().owner().principals);
+        if (refused) throw new Error(`module ${id}: schedules.removeAs takes a peer's origin (${refused})`);
+        return live().removeScheduleAs(origin, sid);
+      },
+      listAs: (origin) => live().listSchedulesAs(origin),
     },
     live: {
       join: async (sessionKey, turnId, a) => {
@@ -924,7 +975,14 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
     resolveRoute: (route) => live().resolveRoute(route),
     send: (route, msg, a) => live().send(route, msg, a),
     settled: (operationId) => live().settled(operationId),
-    outbound: (from, to) => live().outbound(from, to),
+    outbound: (from, to, content) => live().outbound(from, to, content),
+    hold: (route, a) =>
+      live().hold(route, {
+        operationId: text(a?.operationId, 'hold: operationId'),
+        sessionKey: text(a?.sessionKey, 'hold: sessionKey'),
+        ...(a?.external !== undefined ? { external: a.external } : {}),
+        ...(a?.reason !== undefined ? { reason: text(a.reason, 'hold: reason') } : {}),
+      }),
     owner: () => {
       const o = live().owner();
       return { principals: [...o.principals], ...(o.sessionKey !== undefined ? { sessionKey: o.sessionKey } : {}) };

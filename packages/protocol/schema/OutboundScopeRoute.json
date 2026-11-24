@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/OutboundScopeRoute",
+  "type": "object",
+  "required": [
+    "channel",
+    "account",
+    "conversationId"
+  ],
+  "properties": {
+    "channel": {
+      "type": "string"
+    },
+    "account": {
+      "type": "string"
+    },
+    "conversationId": {
+      "type": "string"
+    }
+  }
+}

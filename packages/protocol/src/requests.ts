@@ -31,6 +31,12 @@ const HumanResolver = Type.Object({
   /** One line shown with the request wherever it renders (why it is asked, what "always" would keep). */
   note: Type.Optional(Type.String({ maxLength: 500 })),
   /**
+   * What the request's line starts with, before its title, wherever it renders: the host knows
+   * its people's language, agents-io does not (default `Approval needed: ` / `Answer needed: `;
+   * e.g. `需要批准：`).
+   */
+  heading: Type.Optional(Type.String({ minLength: 1, maxLength: 40 })),
+  /**
    * `allow_once`: a person's `allow_session` reaches the harness as `allow_once` (the host keeps
    * the "always" itself, revocably, rather than the harness's own permission rules); the recorded
    * decision stays `allow_session`.

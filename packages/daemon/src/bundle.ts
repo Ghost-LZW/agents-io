@@ -10,7 +10,7 @@ import { moduleChannelModule, type ModuleChannelEntry } from './module-channel.j
 import { ModuleRegistry } from './modules.js';
 import { ownerCommandsModule, type OwnerCommandsSection } from './owner-commands.js';
 import { strangersModule, type StrangersSection } from './strangers.js';
-import { liveToolsModule, topicToolsModule, watchToolsModule, type ToolModuleSection } from './tool-modules.js';
+import { liveToolsModule, scheduleToolsModule, topicToolsModule, watchToolsModule, type ToolModuleSection } from './tool-modules.js';
 import { topicTitleModule, type TopicTitleSection } from './topic-title.js';
 
 /*
@@ -44,7 +44,8 @@ export const builtinChannels = new ChannelRegistry([larkBotChannelModule, mailCh
  * Topic titles made by the model (on unless `topicTitles: { enabled: false }`; a host-level
  * feature, decision 16) come first. Then the model tools beyond the kernel's six, each group on
  * unless its section says `enabled: false`, in the order the tools were always listed: the watch
- * tools (`watchTools`), the live tools (`liveTools`), the topic tools (`topicTools`). Then the
+ * tools (`watchTools`), the schedule tools (`scheduleTools`), the live tools (`liveTools`), the
+ * topic tools (`topicTools`). Then the
  * stranger approval (a host-level feature, decision 16): off unless `policy.strangers: "ask"`,
  * where it always was (or its section `strangers`); `Config.policy.strangers` still says, and
  * written before the start still decides, whether it is on (deprecated, one release). Then the
@@ -59,7 +60,7 @@ export const builtinChannels = new ChannelRegistry([larkBotChannelModule, mailCh
  * kind's adapter does (`HarnessAdapter.takeover`, with the `tui-bridge` command its kind adds to the
  * CLI), and the gateway's part of it names no harness.
  */
-export const builtinModules = new ModuleRegistry([topicTitleModule, watchToolsModule, liveToolsModule, topicToolsModule, strangersModule, ownerCommandsModule, externalMcpModule], {
+export const builtinModules = new ModuleRegistry([topicTitleModule, watchToolsModule, scheduleToolsModule, liveToolsModule, topicToolsModule, strangersModule, ownerCommandsModule, externalMcpModule], {
   origin: 'builtin',
   fields: {
     [strangersModule.id]: { switch: { path: 'policy.strangers', on: 'ask', off: 'drop' } },
@@ -71,6 +72,7 @@ export const builtinModules = new ModuleRegistry([topicTitleModule, watchToolsMo
 export interface BuiltinModuleSections {
   topicTitles?: TopicTitleSection;
   watchTools?: ToolModuleSection;
+  scheduleTools?: ToolModuleSection;
   liveTools?: ToolModuleSection;
   topicTools?: ToolModuleSection;
   strangers?: StrangersSection;
@@ -81,7 +83,7 @@ export interface BuiltinModuleSections {
 /** The topic titles' section (`topicTitles`: only `enabled`). */
 export type { TopicTitleSection } from './topic-title.js';
 
-/** The section of the watch, live and topic tools (`watchTools`, `liveTools`, `topicTools`: only `enabled`). */
+/** The section of the watch, schedule, live and topic tools (`watchTools`, `scheduleTools`, `liveTools`, `topicTools`: only `enabled`). */
 export type { ToolModuleSection } from './tool-modules.js';
 
 /** The stranger approval's section (`strangers`: only `enabled`; `policy.strangers` is its older place). */

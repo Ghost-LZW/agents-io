@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/TestReplayResult",
+  "type": "object",
+  "required": [
+    "inputId",
+    "channelRef",
+    "channel",
+    "account",
+    "results"
+  ],
+  "properties": {
+    "inputId": {
+      "type": "string"
+    },
+    "channelRef": {
+      "type": "string"
+    },
+    "channel": {
+      "type": "string"
+    },
+    "account": {
+      "type": "string"
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "anyOf": [
+              {
+                "const": "accepted",
+                "type": "string"
+              },
+              {
+                "const": "duplicate",
+                "type": "string"
+              },
+              {
+                "const": "refused",
+                "type": "string"
+              }
+            ]
+          },
+          "inputId": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

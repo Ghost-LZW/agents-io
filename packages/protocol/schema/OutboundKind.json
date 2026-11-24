@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/OutboundKind",
+  "anyOf": [
+    {
+      "const": "reply",
+      "type": "string"
+    },
+    {
+      "const": "tool",
+      "type": "string"
+    },
+    {
+      "const": "question",
+      "type": "string"
+    },
+    {
+      "const": "request",
+      "type": "string"
+    },
+    {
+      "const": "title",
+      "type": "string"
+    },
+    {
+      "const": "notice",
+      "type": "string"
+    },
+    {
+      "const": "host",
+      "type": "string"
+    },
+    {
+      "const": "live",
+      "type": "string"
+    }
+  ]
+}

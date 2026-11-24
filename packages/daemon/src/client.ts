@@ -9,6 +9,15 @@ import {
   type InboundItem,
   type InboundRedispatchResult,
   type SessionCompactResult,
+  type SessionPrewarmResult,
+  type TestFaultResult,
+  type TestReplayResult,
+  type DeliverUpdateResult,
+  type ConversationCreateResult,
+  type MessageAckResult,
+  type InboundEnvelope,
+  type ScheduleDraft,
+  type ScheduleView,
   type SessionLaunch,
   type SessionScope,
   type RenderedMessage,
@@ -259,6 +268,39 @@ export class LocalClient {
     return this.call('deliver', o);
   }
 
+  /** Edit (with `final`, finalize) a message a `deliver` sent (`deliver.update`). */
+  deliverUpdate(o: { operationId: string; route: ReplyRoute; providerMessageId: string; message: RenderedMessage; sequence: number; final?: boolean }): Promise<DeliverUpdateResult> {
+    return this.call('deliver.update', o);
+  }
+
+  /** Earlier messages of the conversation a queued item is in (`history.read`). */
+  historyRead(o: { cursor: number; scope: 'thread' | 'chat'; limit?: number }): Promise<{ messages: InboundEnvelope[] }> {
+    return this.call('history.read', o);
+  }
+
+  /** Set (or replace) a schedule (`schedule.put`). */
+  schedulePut(schedule: ScheduleDraft & { id: string }): Promise<{ schedule: ScheduleView }> {
+    return this.call('schedule.put', { schedule });
+  }
+
+  scheduleRemove(scheduleId: string): Promise<{ scheduleId: string; removed: boolean }> {
+    return this.call('schedule.remove', { scheduleId });
+  }
+
+  scheduleList(sessionKey?: string): Promise<{ schedules: ScheduleView[] }> {
+    return this.call('schedule.list', sessionKey !== undefined ? { sessionKey } : {});
+  }
+
+  /** The channel's mark on a message, e.g. a reaction (`message.ack`). */
+  messageAck(o: { route: ReplyRoute; messageId: string; state: 'working' | 'done' | 'failed' | 'none' }): Promise<MessageAckResult> {
+    return this.call('message.ack', o);
+  }
+
+  /** A conversation made by a channel, e.g. a Lark group (`conversation.create`). */
+  conversationCreate(o: { operationId: string; channel: string; account: string; name: string; description?: string; owner?: string; members?: string[] }): Promise<ConversationCreateResult> {
+    return this.call('conversation.create', o);
+  }
+
   verify(channelRef: string): Promise<VerifyResult> {
     return this.call('input.verify', { channelRef });
   }
@@ -279,6 +321,21 @@ export class LocalClient {
   /** Compact a quiet live session's harness context as a turn of its own (`session.compact`, CT-3). */
   sessionCompact(o: { sessionKey: string; inputId?: string }): Promise<SessionCompactResult> {
     return this.call('session.compact', o);
+  }
+
+  /** Open a known session's harness without a turn, ahead of input (`session.prewarm`). */
+  sessionPrewarm(o: { sessionKey: string }): Promise<SessionPrewarmResult> {
+    return this.call('session.prewarm', o);
+  }
+
+  /** Test hook (feature `test.hooks`): hand a channel message accepted earlier to the gateway again, `times` times. */
+  testReplay(o: { inputId: string; times?: number }): Promise<TestReplayResult> {
+    return this.call('test.replay', o);
+  }
+
+  /** Test hook (feature `test.hooks`): drop the responses of a channel's next sends; clear; list. */
+  testFault(o: { action: 'drop-response' | 'clear' | 'list'; channel?: string; account?: string; conversation?: string; next?: number }): Promise<TestFaultResult> {
+    return this.call('test.fault', o);
   }
 
   /**

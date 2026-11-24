@@ -429,6 +429,9 @@
                 "answerFinal": {
                   "type": "boolean"
                 },
+                "finalAnswer": {
+                  "type": "boolean"
+                },
                 "startedAt": {
                   "type": "number"
                 },
@@ -875,6 +878,9 @@
                   "type": "string"
                 },
                 "answerFinal": {
+                  "type": "boolean"
+                },
+                "finalAnswer": {
                   "type": "boolean"
                 },
                 "startedAt": {
@@ -1326,6 +1332,9 @@
                   "type": "string"
                 },
                 "answerFinal": {
+                  "type": "boolean"
+                },
+                "finalAnswer": {
                   "type": "boolean"
                 },
                 "startedAt": {

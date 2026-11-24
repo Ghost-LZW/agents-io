@@ -20,11 +20,25 @@ import {
   type ModuleToolDef,
   type ModuleToolHandler,
   type Watch,
+  type ScheduleDraft,
+  type ScheduleView,
   type WatchDraft,
 } from '@agents-io/protocol';
 import { z } from 'zod';
 import { TOOL_DEFS, TOOL_GROUPS, type ToolGroup } from './defs.js';
-import { TOPIC_ALREADY_HERE, TOPIC_HANDED_ALREADY, handoverRefusal, type DeliveryRecord, type Hub, type InboundRewrite, type Outbox, type Participant } from '@agents-io/session';
+import {
+  TOPIC_ALREADY_HERE,
+  TOPIC_HANDED_ALREADY,
+  handoverRefusal,
+  type Delivery,
+  type DeliveryRecord,
+  type ExitVerdict,
+  type Hub,
+  type InboundRewrite,
+  type Outbox,
+  type Participant,
+  type Schedule,
+} from '@agents-io/session';
 import {
   CHOICE_KEY,
   MENTIONS_KEY,
@@ -51,6 +65,21 @@ export interface ParticipantView {
 
 /** Most entries get_channel_context lists as participants. */
 export const MAX_PARTICIPANTS = 50;
+
+/** Session log events send_file reads at a time while it catches up on the blob refs a session saw (SE-7). */
+const SEEN_PAGE = 256;
+
+/** SE-7: the blob refs one session's log shows it saw, each with the name it carried last; read up to `head`. */
+interface SeenRefs {
+  floor: number;
+  head: number;
+  refs: Map<string, string | undefined>;
+}
+
+/** The blocks that carry a blob: another block with a stray top-level `ref` (the schema does not forbid one) does not count. */
+function blobBlocks(content: ContentBlock[] | undefined): Extract<ContentBlock, { ref: string }>[] {
+  return (content ?? []).filter((c): c is Extract<ContentBlock, { ref: string }> => c.type === 'image' || c.type === 'file' || c.type === 'audio');
+}
 
 /** What a token authenticates: one harness binding (run) of one session. */
 export interface ToolBinding {
@@ -94,6 +123,12 @@ export interface HostToolsOptions {
   hub: Hub;
   outbox: Outbox;
   policy: Required<Pick<Policy, 'outbound'>>;
+  /**
+   * U20: the exit check of an output tool's message (`kind: tool`, with its content), before it is recorded
+   * as `agents-io.output`: `hold` = the host took it (settled `held`, nothing recorded, the agent is told
+   * not to send it again), `deny` = refused like the outbound policy. `undefined`: no check applies.
+   */
+  exit?: (d: Delivery) => Promise<ExitVerdict | undefined> | undefined;
   /** The running turn of a session (`Lane.currentTurn()`), undefined when idle. */
   turn(sessionKey: string): TurnContext | undefined;
   /** The adapter that sends to a route: its channel and account (several Lark bots share the channel id). */
@@ -121,6 +156,19 @@ export interface HostToolsOptions {
    * the kernel's (a module may offer them: `TOOL_GROUP_DEFS.watch`, `watchToolHandlers`).
    */
   watches?: WatchControl;
+  /**
+   * Schedule control; absent = no schedule tools of the kernel's (a module may offer them:
+   * `TOOL_GROUP_DEFS.schedules`, `scheduleToolHandlers`).
+   */
+  schedules?: ScheduleControl;
+  /** The tools a session's agent has (its `tools` setting), for get_channel_context. */
+  toolNames?(sessionKey: string): readonly string[] | undefined;
+  /**
+   * How many watches and schedules the session's agent keeps (created as `agentIdentity`), for
+   * get_channel_context's `abilities` while a module offers those tools (the host passed no control
+   * for them); with the control the count comes from its `list`.
+   */
+  kept?(sessionKey: string): { watches: number; schedules: number };
   /** Provenance of a session's turn (`Lane.provenance`), attached to every write the turn makes. */
   provenance?(sessionKey: string, turnId: string): TurnProvenance | undefined;
   /**
@@ -215,6 +263,13 @@ export interface WatchControl {
   list(sessionKey: string): Watch[];
 }
 
+/** What the schedule tools need from the host; `Policy.schedule` (limits) is applied behind `put`. */
+export interface ScheduleControl {
+  put(by: Origin, draft: ScheduleDraft): Promise<{ ok: true; schedule: Schedule } | { ok: false; code: string; message: string }>;
+  remove(by: Origin, id: string): Promise<{ ok: true; removed: boolean } | { ok: false; code: string; message: string }>;
+  list(sessionKey: string): Schedule[];
+}
+
 /** Declared identity of a session's agent: what its watches are created by. */
 export const agentIdentity = (sessionKey: string) => `session:${sessionKey}`;
 
@@ -268,6 +323,26 @@ function currentRoute(turn: TurnContext): ReplyRoute | null {
   return first && routes.every((r) => r && routeKey(r) === routeKey(first)) ? first : null;
 }
 
+/** The routes a turn knows: its reply route, the routes added to it, its inputs' reply routes. */
+function knownRoutes(turn: TurnContext): ReplyRoute[] {
+  return [turn.replyRoute, ...turn.deliveries, ...turn.inputs.map((i) => i.replyRoute)].filter((r): r is ReplyRoute => !!r);
+}
+
+/** A tool's `route` argument: "current" (or nothing) = the turn's reply route; otherwise a route key. */
+function parseRoute(turn: TurnContext, spec: string | undefined): ReplyRoute {
+  if (spec === undefined || spec === 'current' || spec === 'reply') {
+    const r = currentRoute(turn);
+    if (!r) throw new ToolError('this turn has no reply route; name a destination route key');
+    return r;
+  }
+  const known = knownRoutes(turn).find((r) => routeKey(r) === spec);
+  if (known) return known;
+  const parts = spec.split(':');
+  if (parts.length < 3 || parts.some((p) => !p)) throw new ToolError(`route must be "current" or a route key channel:account:conversation[:thread], got ${JSON.stringify(spec)}`);
+  const [channel, account, ...rest] = parts;
+  return { channel: channel!, account: account!, conversationId: rest.join(':') };
+}
+
 /**
  * The output tools, independent of MCP. Every call resolves the session's running
  * turn, checks the destination against `Policy.outbound`, delivers through the
@@ -278,6 +353,8 @@ function currentRoute(turn: TurnContext): ReplyRoute | null {
  */
 export class HostTools {
   private readonly choices = new Map<string, ChoiceRecord>();
+  /** SE-7: per session, the refs its log showed so far, so a send by blob reads only what the log gained since. */
+  private readonly seen = new Map<string, SeenRefs>();
   private readonly eventOnly: Set<string>;
   /** The active modules' tools by name, in catalog order (`HostToolsOptions.modules`). */
   private readonly moduleTools = new Map<string, { entry: ModuleToolEntry; def: ModuleToolDef; handler: ModuleToolHandler }>();
@@ -292,6 +369,7 @@ export class HostTools {
     this.eventOnly = new Set(o.eventOnlyChannels ?? ['local']);
     const groups: { readonly [G in ToolGroup]: [Record<string, ModuleToolHandler>, boolean] } = {
       watch: [watchToolHandlers(o.watches ? sessionWatches(o.watches, o.agentOf) : undefined), !!o.watches],
+      schedules: [scheduleToolHandlers(o.schedules ? sessionSchedules(o.schedules, o.agentOf, o.policy) : undefined), !!o.schedules],
       live: [liveToolHandlers(o.live), !!o.live],
       topics: [topicToolHandlers(o.topics), !!o.topics],
     };
@@ -330,6 +408,10 @@ export class HostTools {
   get hasWatches(): boolean {
     return !!this.o.watches;
   }
+  /** Whether the schedule tools are offered as the kernel's (the host passed `schedules`; a module may offer them otherwise). */
+  get hasSchedules(): boolean {
+    return !!this.o.schedules;
+  }
 
   /** Whether the live_* tools are offered as the kernel's (the host passed `live`; a module may offer them otherwise). */
   get hasLive(): boolean {
@@ -347,8 +429,12 @@ export class HostTools {
     const g = this.groupTools.get(name);
     const mod = g?.offered ? undefined : this.moduleTools.get(name);
     const group = mod ? undefined : g;
-    if (group && !group.needsTurn) return json(await group.handler({ sessionKey: b.sessionKey, args }));
-    if (mod && mod.def.needsTurn === false) return json(await this.moduleTool(mod.handler, { sessionKey: b.sessionKey, args }));
+    if ((group && !group.needsTurn) || (mod && mod.def.needsTurn === false)) {
+      // A tool that needs no turn still gets the one running, if any (schedule_add: a route is "current" of it).
+      const running = this.o.turn(b.sessionKey);
+      const c = { sessionKey: b.sessionKey, args, ...(running ? { turn: running } : {}) };
+      return json(group ? await group.handler(c) : await this.moduleTool(mod!.handler, c));
+    }
     const turn = this.o.turn(b.sessionKey);
     if (!turn) throw new ToolError('no turn is running in this session: output tools only work while you are answering a message');
     const key = meta.toolCallId ?? `g${b.generation}:${turn.turnId}:rpc${meta.requestId ?? Math.random().toString(36).slice(2)}`;
@@ -446,6 +532,12 @@ export class HostTools {
         approvals: caps.approvals,
       },
       participants: this.participants(turn, b.sessionKey),
+      // What you can do besides answering: the tools you have (send_message, schedule_add, watch_add, …).
+      abilities: {
+        tools: this.o.toolNames?.(b.sessionKey) ?? null,
+        schedules: this.offers('schedule_list') ? { mine: this.o.schedules ? this.o.schedules.list(b.sessionKey).filter((x) => x.createdBy === agentIdentity(b.sessionKey)).length : (this.o.kept?.(b.sessionKey).schedules ?? 0) } : null,
+        watches: this.offers('watch_list') ? { mine: this.o.watches ? this.o.watches.list(b.sessionKey).filter((x) => x.createdBy === agentIdentity(b.sessionKey)).length : (this.o.kept?.(b.sessionKey).watches ?? 0) } : null,
+      },
       allowedDestinations: {
         current: routeKey(r),
         alsoThisTurn: turn.deliveries.map(routeKey),
@@ -456,25 +548,16 @@ export class HostTools {
     };
   }
 
-  // ---- destinations -----------------------------------------------------------------------
-
-  private knownRoutes(turn: TurnContext): ReplyRoute[] {
-    return [turn.replyRoute, ...turn.deliveries, ...turn.inputs.map((i) => i.replyRoute)].filter((r): r is ReplyRoute => !!r);
+  /** The endpoint offers this group tool: over the host's control, or a module's. */
+  private offers(name: string): boolean {
+    return this.groupTools.get(name)?.offered === true || this.moduleTools.has(name);
   }
+
+  // ---- destinations -----------------------------------------------------------------------
 
   /** "current" (or nothing) = the turn's reply route; otherwise a route key. */
   private parseRoute(turn: TurnContext, spec: string | undefined): ReplyRoute {
-    if (spec === undefined || spec === 'current' || spec === 'reply') {
-      const r = currentRoute(turn);
-      if (!r) throw new ToolError('this turn has no reply route; name a destination route key');
-      return r;
-    }
-    const known = this.knownRoutes(turn).find((r) => routeKey(r) === spec);
-    if (known) return known;
-    const parts = spec.split(':');
-    if (parts.length < 3 || parts.some((p) => !p)) throw new ToolError(`route must be "current" or a route key channel:account:conversation[:thread], got ${JSON.stringify(spec)}`);
-    const [channel, account, ...rest] = parts;
-    return { channel: channel!, account: account!, conversationId: rest.join(':') };
+    return parseRoute(turn, spec);
   }
 
   private async allowed(b: ToolBinding, turn: TurnContext, tool: string, route: ReplyRoute): Promise<void> {
@@ -500,6 +583,18 @@ export class HostTools {
   private async deliver(b: ToolBinding, turn: TurnContext, tool: string, route: ReplyRoute, msg: RenderedMessage, operationId: string, choice?: ChoiceData): Promise<DeliveryRecord> {
     const prior = this.o.outbox.get(operationId);
     const body: RenderedMessage = { ...msg, channelData: { ...(msg.channelData as object | undefined), [OUTPUT_KEY]: { tool } } };
+    if (!prior && this.o.exit) {
+      // U20: asked before anything is recorded; the same operationId again (a retried call) is not asked again.
+      const d = { operationId, sessionKey: b.sessionKey, turnId: turn.turnId, route, from: turn, kind: 'tool' as const, content: body };
+      const p = this.o.exit(d);
+      const v = p === undefined ? undefined : await p;
+      if (v?.verdict === 'hold') {
+        this.o.outbox.hold(d, v.reason);
+        throw new ToolError(`宿主拿走了这条，没有发出${v.reason ? `（${v.reason}）` : ''}。不要再发。`);
+      }
+      if (v && v.verdict !== 'allow') throw new ToolError(`destination ${routeKey(route)} is not allowed by the host's outbound policy${v.reason ? ` (${v.reason})` : ''}. Do not retry with another destination unless the user asks for it.`);
+    }
+    if (prior?.status === 'held') throw new ToolError(`the host took this message; it was not sent${prior.reason ? ` (${prior.reason})` : ''}. Do not send it again.`);
     if (!prior) {
       const provenance = this.o.provenance?.(b.sessionKey, turn.turnId);
       const rec: OutputRecord = { tool, operationId, route, msg: body, ...(choice ? { choice } : {}), ...(provenance ? { provenance } : {}) };
@@ -515,7 +610,7 @@ export class HostTools {
       });
     }
     let rec: DeliveryRecord;
-    const d = { operationId, sessionKey: b.sessionKey, turnId: turn.turnId, route };
+    const d = { operationId, sessionKey: b.sessionKey, turnId: turn.turnId, route, kind: 'tool' as const, exitChecked: true };
     if (this.eventOnly.has(route.channel)) {
       // The terminal and other stream ends render the output event themselves.
       rec = await this.o.outbox.deliver(d, async () => ({ providerMessageId: operationId }));
@@ -569,6 +664,10 @@ export class HostTools {
       size = bytes.byteLength;
       ref = await this.o.blobs.put(bytes, { mime, name });
     } else {
+      // SE-7: the store is shared by every session, so a ref is only this session's to send when it saw it.
+      // One it did not reads like a missing one: the answer does not say whether the store has it.
+      const seen = this.seenBlob(b.sessionKey, turn, blob!);
+      if (!seen) throw new ToolError(`unknown blob ${blob}`);
       let got;
       try {
         got = await this.o.blobs.get(blob!);
@@ -577,7 +676,9 @@ export class HostTools {
       }
       ref = blob!;
       mime = got.mime;
-      name ??= got.name ?? 'file';
+      // The name this session saw, not the store's: the store keeps the name the bytes first came
+      // with, which may be another session's (the same statement under its private name).
+      name ??= seen.name ?? 'file';
       size = got.bytes.byteLength;
     }
     const caps = this.caps(route);
@@ -589,6 +690,55 @@ export class HostTools {
     const msg: RenderedMessage = { text: caption ?? '', attachments: [{ ref, mime: sendMime, name }] };
     const rec = await this.deliver(b, turn, 'send_file', route, msg, operationId);
     return this.sent(rec, { name, mime: sendMime, bytes: size, ref });
+  }
+
+  /**
+   * SE-7: where a blob ref appeared in this session, newest first: a content block of one of its
+   * inputs (this turn's, or any its log admitted, context and handed-over inputs included) or an
+   * attachment it sent (`agents-io.output`, a send_file by path too). Answers the name it carried
+   * there, undefined when the session never saw the ref. Log history trimmed away no longer counts.
+   */
+  private seenBlob(sessionKey: string, turn: TurnContext, ref: string): { name?: string } | undefined {
+    const named = (name: string | undefined) => (name ? { name } : {});
+    for (const i of [...turn.inputs].reverse()) {
+      const hit = blobBlocks(i.content).find((c) => c.ref === ref);
+      if (hit) return named(hit.name);
+    }
+    const refs = this.seenRefs(sessionKey);
+    return refs.has(ref) ? named(refs.get(ref)) : undefined;
+  }
+
+  /**
+   * SE-7: the refs this session's log shows it saw, read once and from then on only the events the
+   * log gained since, a page at a time: a long-lived session's log is long, and a ref it never saw
+   * would otherwise read all of it on every call. A later event's name replaces an earlier one's (the
+   * newest wins); a floor that moved means trimmed history, so what is left is read again.
+   */
+  private seenRefs(sessionKey: string): Map<string, string | undefined> {
+    const log = this.o.hub.log;
+    const floor = log.floor(sessionKey);
+    let s = this.seen.get(sessionKey);
+    if (!s || s.floor !== floor) this.seen.set(sessionKey, (s = { floor, head: floor, refs: new Map() }));
+    const head = log.head(sessionKey);
+    while (s.head < head) {
+      const page = log.read(sessionKey, s.head, SEEN_PAGE);
+      if (!page.length) break;
+      for (const e of page) {
+        const body = e.body;
+        // An output only as deliver wrote it (participants): the lane writes a harness's own native events as
+        // operators or internal (visibilityOf), so one a harness happens to name agents-io.output does not count.
+        const found =
+          body.t === 'input.admitted'
+            ? blobBlocks(body.input?.content)
+            : body.t === 'native' && body.name === OUTPUT_EVENT && e.visibility === 'participants'
+              ? ((e.native as OutputRecord | undefined)?.msg.attachments ?? [])
+              : [];
+        // Backwards, so that within one event the first block's name stands, as for this turn's inputs.
+        for (const a of [...found].reverse()) s.refs.set(a.ref, a.name);
+      }
+      s.head = page[page.length - 1]!.seq;
+    }
+    return s.refs;
   }
 
   private async askChoice(b: ToolBinding, turn: TurnContext, args: Record<string, unknown>, operationId: string) {
@@ -763,9 +913,10 @@ export class HostTools {
   }
 }
 
-// ---- the tool groups: watches, live (decision 11), topics (decision 6) -------------------------
+// ---- the tool groups: watches, schedules, live (decision 11), topics (decision 6) --------------
 
 type WatchToolName = (typeof TOOL_GROUPS.watch)[number];
+type ScheduleToolName = (typeof TOOL_GROUPS.schedules)[number];
 type LiveToolName = (typeof TOOL_GROUPS.live)[number];
 type TopicToolName = (typeof TOOL_GROUPS.topics)[number];
 
@@ -773,7 +924,7 @@ type TopicToolName = (typeof TOOL_GROUPS.topics)[number];
 const GROUP_SHAPES = new Map<ModuleToolDef, z.ZodRawShape>();
 
 /** A group tool of `TOOL_DEFS` as a module tool definition (`TOOL_GROUP_DEFS`): its `input` the JSON Schema of its zod shape. */
-function groupDef(name: WatchToolName | LiveToolName | TopicToolName, needsTurn: boolean): ModuleToolDef {
+function groupDef(name: WatchToolName | ScheduleToolName | LiveToolName | TopicToolName, needsTurn: boolean): ModuleToolDef {
   const def = TOOL_DEFS[name];
   const { $schema: _s, ...input } = z.toJSONSchema(z.object(def.input), { target: 'draft-7', io: 'input' });
   const out: ModuleToolDef = Object.freeze({ name, description: def.description, input: input as unknown as ModuleToolDef['input'], ...('readOnly' in def && def.readOnly ? { readOnly: true } : {}), needsTurn });
@@ -784,14 +935,16 @@ function groupDef(name: WatchToolName | LiveToolName | TopicToolName, needsTurn:
 /**
  * The tool groups of `TOOL_DEFS` beyond the kernel's own (`TOOL_GROUPS`) as module tool definitions
  * (core-slimming G6), for a module that offers a group: it declares these objects as its
- * `mcpTools` and runs them with `watchToolHandlers` / `liveToolHandlers` / `topicToolHandlers`
- * (the daemon's `tools.watch`, `tools.live`, `tools.topics`). An endpoint lists and checks a
- * module's tool that is one of these objects (the same object) exactly as `TOOL_DEFS` has it, so
- * what a model is offered does not depend on who offers the group. `input` is the JSON Schema of
- * the zod shape, for what reads a manifest. The watch tools and `session_list` need no turn.
+ * `mcpTools` and runs them with `watchToolHandlers` / `scheduleToolHandlers` / `liveToolHandlers` /
+ * `topicToolHandlers` (the daemon's `tools.watch`, `tools.schedules`, `tools.live`, `tools.topics`).
+ * An endpoint lists and checks a module's tool that is one of these objects (the same object)
+ * exactly as `TOOL_DEFS` has it, so what a model is offered does not depend on who offers the
+ * group. `input` is the JSON Schema of the zod shape, for what reads a manifest. The watch and
+ * schedule tools and `session_list` need no turn (`schedule_add` gets the running one, if any).
  */
 export const TOOL_GROUP_DEFS: { readonly [G in ToolGroup]: readonly ModuleToolDef[] } = Object.freeze({
   watch: Object.freeze(TOOL_GROUPS.watch.map((n) => groupDef(n, false))),
+  schedules: Object.freeze(TOOL_GROUPS.schedules.map((n) => groupDef(n, false))),
   live: Object.freeze(TOOL_GROUPS.live.map((n) => groupDef(n, true))),
   topics: Object.freeze(TOOL_GROUPS.topics.map((n) => groupDef(n, n !== 'session_list'))),
 });
@@ -823,6 +976,54 @@ export function sessionWatches(w: WatchControl, agentOf?: (sessionKey: string) =
 export function watchToolHandlers(w: SessionWatches | undefined): Record<WatchToolName, ModuleToolHandler> {
   const tool = (name: WatchToolName): ModuleToolHandler => (c) => watchTool(w, c.sessionKey, name, c.args);
   return { watch_add: tool('watch_add'), watch_remove: tool('watch_remove'), watch_list: tool('watch_list') };
+}
+
+/**
+ * What the schedule tools need: the schedules of a session as its agent (the daemon's
+ * `KernelContext.schedules`). The owner's limits (`policy.scheduleLimit`, `scheduleMinMinutes`) and
+ * whose a schedule is (SC-3) are applied behind `add` and `remove`; so is the route: a schedule that
+ * names one is set only while a turn of the session runs that may send there (`Policy.outbound`).
+ */
+export interface SessionSchedules {
+  /** Set or replace a schedule as the session's agent (`agentOrigin`); `turn` is the session's running turn, when one runs. */
+  add(sessionKey: string, draft: ScheduleDraft, turn: TurnContext | undefined): Promise<{ ok: true; schedule: ScheduleView } | { ok: false; code: string; message: string }>;
+  /** Remove a schedule as the session's agent (one it set). */
+  remove(sessionKey: string, id: string): Promise<{ ok: true; removed: boolean } | { ok: false; code: string; message: string }>;
+  /** The schedules of the session: turns into it, and the ones it set. */
+  list(sessionKey: string): ScheduleView[];
+}
+
+/** The refusal of a schedule's route the session's turn may not send to (SC-3). */
+export const scheduleRouteRefusal = (route: ReplyRoute) => `the host policy does not let you send to ${routeKey(route)}; use "current" or a preregistered route`;
+
+/**
+ * A host's `ScheduleControl` as `SessionSchedules`: the session's agent acts as
+ * `agentOrigin(sessionKey, agentOf(sessionKey))`, and a schedule's route is checked with `policy`
+ * for the running turn first.
+ */
+export function sessionSchedules(c: ScheduleControl, agentOf: ((sessionKey: string) => string | undefined) | undefined, policy: Required<Pick<Policy, 'outbound'>>): SessionSchedules {
+  const by = (sessionKey: string) => agentOrigin(sessionKey, agentOf?.(sessionKey));
+  return {
+    add: async (key, d, turn) => {
+      if (d.route) {
+        if (!turn) return { ok: false, code: 'forbidden', message: 'a route can only be given while you are answering a message ("current" is that conversation)' };
+        if ((await policy.outbound({ from: turn, to: d.route })) !== 'allow') return { ok: false, code: 'forbidden', message: scheduleRouteRefusal(d.route) };
+      }
+      return c.put(by(key), d);
+    },
+    remove: (key, id) => c.remove(by(key), id),
+    list: (key) => c.list(key),
+  };
+}
+
+/**
+ * The schedule tools (`schedule_add`, `schedule_remove`, `schedule_list`) over `s`: a schedule's turn
+ * always goes to the calling session, a route is "current" (the running turn's) or a route key, and
+ * an agent removes only schedules it set. Without `s` each says schedules are not available.
+ */
+export function scheduleToolHandlers(s: SessionSchedules | undefined): Record<ScheduleToolName, ModuleToolHandler> {
+  const tool = (name: ScheduleToolName): ModuleToolHandler => (c) => scheduleTool(s, c.sessionKey, name, c.args, c.turn);
+  return { schedule_add: tool('schedule_add'), schedule_remove: tool('schedule_remove'), schedule_list: tool('schedule_list') };
 }
 
 /** The live tools (`live_join`, `live_say`, `live_leave`) over `live`; without it each says live sessions are not available. */
@@ -927,6 +1128,57 @@ async function watchTool(w: SessionWatches | undefined, sessionKey: string, name
     throw new ToolError(r.message);
   }
   return { ok: true, watch: view(r.watch) };
+}
+
+async function scheduleTool(s: SessionSchedules | undefined, sessionKey: string, name: ScheduleToolName, args: Record<string, unknown>, turn: TurnContext | undefined) {
+  if (!s) throw new ToolError('schedules are not available on this host');
+  const me = agentIdentity(sessionKey);
+  const view = (x: ScheduleView) => ({ ...x, nextAt: x.nextAt === null ? null : new Date(x.nextAt).toISOString(), mine: x.createdBy === me });
+  if (name === 'schedule_list') return { ok: true, session: sessionKey, schedules: s.list(sessionKey).map(view) };
+  if (name === 'schedule_remove') {
+    const id = str(args.id, 'id')!;
+    const r = await s.remove(sessionKey, id);
+    if (!r.ok) throw new ToolError(r.message);
+    return { ok: true, removed: r.removed, id };
+  }
+  // schedule_add: a turn goes to the caller's own session; a route is "current" or one this turn may use.
+  if (args.target !== undefined || args.sessionKey !== undefined) throw new ToolError('schedule_add has no target: a schedule always belongs to your own session; remove the target argument');
+  const w = (args.when ?? {}) as Record<string, unknown>;
+  const when =
+    w.cron !== undefined
+      ? { cron: str(w.cron, 'when.cron')!, ...(w.tz !== undefined ? { tz: str(w.tz, 'when.tz')! } : {}) }
+      : w.every_minutes !== undefined
+        ? { everyMinutes: Number(w.every_minutes) }
+        : w.at !== undefined
+          ? { at: typeof w.at === 'number' ? w.at : str(w.at, 'when.at')! }
+          : undefined;
+  if (!when) throw new ToolError('when is { at } (once), { cron, tz? } or { every_minutes }');
+  const action = str(args.action, 'action', true) ?? 'turn';
+  if (action !== 'turn' && action !== 'message') throw new ToolError('action is turn or message');
+  const spec = str(args.route, 'route', true);
+  let route: ReplyRoute | undefined;
+  if (spec !== undefined || action === 'message') {
+    if (!turn) throw new ToolError('a route can only be given while you are answering a message ("current" is that conversation)');
+    // Whether this turn may send there is checked behind `add` (SC-3), for every caller.
+    route = parseRoute(turn, spec);
+  }
+  const until = str(args.until, 'until', true);
+  const untilMs = until !== undefined ? Date.parse(until) : undefined;
+  if (untilMs !== undefined && !Number.isFinite(untilMs)) throw new ToolError('until is an ISO 8601 time');
+  const draft: ScheduleDraft = {
+    ...(args.id !== undefined ? { id: str(args.id, 'id')! } : {}),
+    when,
+    action,
+    ...(action === 'turn' ? { target: { sessionKey } } : {}),
+    ...(route ? { route } : {}),
+    text: str(args.text, 'text')!,
+    ...(args.missed !== undefined ? { missed: str(args.missed, 'missed') as 'once' | 'skip' } : {}),
+    ...(untilMs !== undefined ? { until: untilMs } : {}),
+    ...(args.note !== undefined ? { note: str(args.note, 'note')! } : {}),
+  };
+  const r = await s.add(sessionKey, draft, turn);
+  if (!r.ok) throw new ToolError(r.message);
+  return { ok: true, schedule: view(r.schedule) };
 }
 
 function topicsOf(control: TopicControl | undefined, sessionKey: string): { control: TopicControl; topics: Topic[] } {

@@ -20,7 +20,7 @@
     },
     {
       "name": "send_file",
-      "description": "Send a file or image to the user in the current conversation, as a real attachment (on Lark an uploaded file/image message, on mail an attachment, in the terminal a file notice). Give `path` (absolute, or relative to your working directory) OR `blob` (a blob ref such as sha256:… from an earlier input), not both. `name` overrides the file name shown; `caption` is an optional short text sent with it. Use this instead of pasting a file's contents when the user asks you to send/share/attach a file. Returns once delivered.",
+      "description": "Send a file or image to the user in the current conversation, as a real attachment (on Lark an uploaded file/image message, on mail an attachment, in the terminal a file notice). Give `path` (absolute, or relative to your working directory) OR `blob` (a blob ref such as sha256:… of a file you were sent, or sent yourself, in this session), not both. `name` overrides the file name shown; `caption` is an optional short text sent with it. Use this instead of pasting a file's contents when the user asks you to send/share/attach a file. Returns once delivered.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
@@ -30,7 +30,7 @@
             "type": "string"
           },
           "blob": {
-            "description": "Blob ref (e.g. sha256:…) of a file the host already holds",
+            "description": "Blob ref (e.g. sha256:…) of a file you were sent, or sent yourself, in this session",
             "type": "string"
           },
           "name": {
@@ -328,6 +328,129 @@
     {
       "name": "watch_list",
       "description": "List the watches delivering into your session (mine=true for the ones you created and may remove), with their source, mode and expiry.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {}
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "schedule_add",
+      "description": "Set a time for YOUR OWN session: at that time you get an input \"[schedule <id>] <text>\" and answer it then (a reminder you promised, a daily check). `when` is { at } (once: ISO 8601 with offset, or Unix ms), { cron, tz? } (five fields: minute hour day month weekday; tz like Asia/Shanghai) or { every_minutes }. action \"turn\" (default) starts a turn for you at that time; \"message\" just sends `text` to `route` (\"current\" or an allowed route key) without a turn. The turn's answer goes where you are talked to (or to route). Missed while the daemon was down: fired once when it is back (missed \"skip\" drops it). Do not poll with short periods: there is a minimum period and a limit per session. Reuse an id of yours to replace it.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "when": {
+            "type": "object",
+            "properties": {
+              "at": {
+                "type": [
+                  "string",
+                  "number"
+                ]
+              },
+              "cron": {
+                "type": "string"
+              },
+              "tz": {
+                "type": "string"
+              },
+              "every_minutes": {
+                "type": "number"
+              }
+            },
+            "description": "{ at } | { cron, tz? } | { every_minutes }"
+          },
+          "text": {
+            "type": "string",
+            "description": "What you will be told at that time (or the message to send)"
+          },
+          "action": {
+            "description": "turn (default): a turn for you; message: send text to route",
+            "type": "string",
+            "enum": [
+              "turn",
+              "message"
+            ]
+          },
+          "route": {
+            "description": "\"current\" or a route key: where a message goes, or where the turn's answer goes",
+            "type": "string"
+          },
+          "missed": {
+            "type": "string",
+            "enum": [
+              "once",
+              "skip"
+            ]
+          },
+          "until": {
+            "description": "ISO 8601: remove it after this time",
+            "type": "string"
+          },
+          "note": {
+            "description": "Why it exists; shown with the input",
+            "type": "string"
+          },
+          "id": {
+            "description": "Schedule id; reuse one of yours to replace it",
+            "type": "string"
+          }
+        },
+        "required": [
+          "when",
+          "text"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "schedule_remove",
+      "description": "Remove a schedule you created (by id, from schedule_add or schedule_list). You cannot remove schedules the owner, the host or another session set.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Schedule id"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "schedule_list",
+      "description": "List the schedules of your session (mine=true for the ones you created and may remove), with what they do and when each fires next.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",

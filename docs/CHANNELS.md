@@ -208,7 +208,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 
 ### agent 的输出怎么处理
 
-- **回复卡片（CardKit 流式卡片）**：默认至少等 5 秒，且已有答案正文时才出现；需要审批时立即出现，之后依次是：
+- **回复卡片（CardKit 流式卡片）**：默认在第一次调用工具时出现，或等满 5 秒后、已有可显示的内容（思考、工具调用或答案正文）时出现；需要审批时立即出现。答案开始之前，卡片正文列出到目前为止的工具调用（每个一行简短说明，最近 5 个），答案开始后换成答案。之后依次是：
   - 需要审批或失败等情况时的状态行；
   - 答案，用打字机效果流式写出，约 1.2s 刷新一次；
   - 正文后面的计划与过程面板（只在思维链气泡不可用时出现），约 1.5s 刷新一次；
@@ -223,13 +223,16 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
   - 不显示 diff 和 token 用量。
 - **装饰**：`config.style` 可选 `emoji`（默认，带状态和面板图标）或 `plain`（只用文字，状态由标题颜色表示）。
 - **像人一样回复**（守护进程的飞书通道默认启用，配置见 `channel/lark-bot/README.md` "Reply timing in the daemon"）：
-  - 通道条目上的 `openDelayMs` 默认 5000、`previewDelayMs` 默认 2000：短回复完成后直接发最终消息；5 秒后仍没有答案正文时继续只显示过程预览，正文开始后再开卡片。这些默认值由飞书适配器在 `ChannelCaps.pacing` 里声明（同时声明回复卡不带停止按钮，停止按钮在思维链气泡上），守护进程不认具体通道；其他通道不声明，就不采用；"不带停止按钮"和"没有正文时不开卡片"只对有过程预览（`previewProgress`）的适配器生效，JSONL 桥没有预览，对端声明了也照旧带停止按钮、照常开卡片；
+  - 通道条目上的 `openDelayMs` 默认 5000、`previewDelayMs` 默认 2000：短回复完成后直接发最终消息；第一次调用工具就开卡片并列出步骤，没有工具时等满 5 秒、有思考或正文再开卡片。这些默认值由飞书适配器在 `ChannelCaps.pacing` 里声明（`openDelayMs`、`previewDelayMs`、`holdAnswerUntilOpen`、`openOnProcess`，同时声明回复卡不带停止按钮，停止按钮在思维链气泡上），守护进程不认具体通道；其他通道不声明，就不采用这些默认值（条目上设 `openOnProcess: true` 并给 `openDelayMs` 时，同样在第一次调用工具或满延迟且有东西可显示时开第一条消息：open-lark 个人号的 `card` 档用它先发一行进度、再编辑成答案；条目上的 `openOnProcess` 也盖过适配器的声明）。"不带停止按钮"和 `requireAnswerToOpen`（没有正文时不开卡片）只对有过程预览（`previewProgress`）的适配器生效，JSONL 桥没有预览，对端声明了也照旧带停止按钮、照常开卡片；
   - `config.look: "chat"` 默认启用：卡片以答案为主体，不留空的状态行和页脚；话题标题用蓝色标题栏，只有在等审批、失败、中断时才显示一行状态；
   - `config.cotOn: "tool"`：第一次调用工具时才打开思维链气泡，只思考、直接回答的轮次没有气泡；
-  - `config.processByChat`：私聊和群分别设置 `process`，例如群里设 `"off"`。
+  - `config.processByChat`：私聊和群分别设置 `process`，例如群里设 `"off"`。还没从消息里学到类型的对话（还没收到它的消息就发、重启后）按配置里最严的那一档：`process`、`dm`、`group`（没设的按 `process`）里有一个是 `off` 就是 `off`，否则依次取 `panels`、`cot`、`auto`；所以群里设了 `"off"`，没学到类型的群也不显示过程。过程是 `off` 的对话（这样设了的群、`processDmUsers` 名单外的私聊、没学到类型的对话）用平卡片：一轮在跑时卡片只写「处理中…」，不放到目前为止的正文（模型调工具前说的话也在正文里，要等最终快照才被换掉），不写工具标题，也不写 headline（以后的工具摘要、Codex 的旁白都会进 headline），不带计划；答案在这一轮结束时才出现。等审批（那一行和按钮）、等回答照常显示。这一轮结束时只放**最终答案**：harness 的最终快照，而且这一轮是完成的（`progress.finalAnswer`）。没有最终答案时卡片只写这一轮怎么结束的（正文和会话列表里的摘要都是这一句）：失败写「没答完」，被打断写「被打断了」，结果未知写「不确定答完没有」，完成了却没有最终快照写「已完成」（英文 `Did not finish`、`Interrupted`、`Outcome unknown`、`Done`），不带到这时说过的话——那是中间话，可能转述了替别人查到的私聊。失败、被打断的一轮就算有最终快照也不放：空闲期限停住的一轮（HC-3b）最终快照是「到这时说过的话＋停住的说明」，说明也一起不显示；Codex 被打断的一轮最终快照是它最后一段话。Claude Code 的一轮完成、result 却没有字时（最后一步是调工具，比如调完 `send_message` 就结束），最终快照只取最后一次调工具之后说的话；调工具之前说的话不算答案，后面没再说话就没有最终快照，卡片写「已完成」。一轮在第一条消息发出前就结束的，那一条也照此。名单内的私聊（显示过程的对话）不变：失败、被打断时卡片照旧带到这时说过的话和状态。没有 `progress` 的消息（`final` 档，例如出口检查过的一轮）照旧发 `text`。
+  - `config.processDmUsers`：私聊里谁能看到过程（失败关闭）。设了以后，只有名单上的人的私聊显示过程（按 `processByChat.dm` / `process`）；名单按飞书给这个人的任一 id 认（union_id、open_id 或 user_id，以他发来的消息里带的为准）。名单外的人、启动以来还没收到过消息因而认不出是谁的私聊、还没学到类型的对话一律 `off`。群不受影响。`[]`：所有私聊都不显示过程。不设：和以前一样。过程里有思考、工具的标题和参数、结果预览，也就是 agent 读到的东西，包括替别人查到的。
   - 通道条目上的 `ack`：收到的消息上点一个表情（默认 `OnIt`），这一轮及时回复了就撤掉；回复晚于 `doneAfterMs`（默认 60 秒）或消息作为 steer 并入正在运行的一轮时换成 `DONE`；没完成或被拒换成 `CrossMark`。启用了 `ack` 且支持消息表情的通道，成功的 `/steer` 不另发确认消息；其他通道仍用文字确认。表情类型可用 `config.ackEmoji` 改，需要 `im:message.reactions:write_only` 权限。
   - `look: "chat"` 时，第一次发送就已完成、没有按钮，且答案不超过一条消息的上限（默认 4000 字符）、不含代码围栏或表格的回复发普通文本，有 Markdown 时发富文本（post）；其他回复使用卡片。
 - **降级**：流式更新失败时退到整卡替换，再失败退到普通消息编辑。失败记录按会话保留 30 分钟，权限类错误对整个应用生效。
+- **宿主的进度消息**：宿主 `deliver` 一条带 `progress` 的消息时和一轮的回复卡片一样渲染。`status` 还在 `running` / `requires_action` 时开思考气泡，之后用 `deliver.update` 更新、`final: true` 收尾（气泡结束，回答太长时余下的接着发成几条卡片）。发出时已经是完成状态的，不开气泡（之后不会再有人收尾），过程放在卡片的折叠面板里，回答太长的部分同样接着发出。
+- **建群**（`createConversation`，宿主的 `conversation.create`）：`POST /im/v1/chats` 建私有群，机器人为管理员，`owner`、`members` 按 id 前缀认作 union_id（`on_`）、open_id（`ou_`）或 user_id，混用时拒绝。请求带由 operationId 算出的 `uuid`，一小时内同一个只建一个群。需要 `im:chat:create`（或 `im:chat`）权限，缺权限时把飞书的错误码原样报给宿主。
 - **发送结果**：飞书的发送、回复接口返回 `thread_id`（消息在话题里，包括 `reply_in_thread` 刚开出的话题）时，`SendResult` 带 `providerThreadId`，宿主 `deliver` 的结果里也有（HOSTS §4）。
 
 ### 对话里的命令（主人）
@@ -432,13 +435,14 @@ aio-dev watch remove team-digest
 
 | 工具 | 做什么 | 目的地 |
 |---|---|---|
-| `get_channel_context()` | 返回当前路由、通道、会话类型、档位、通道能力摘要（markdown 程度、长度上限、按钮、能发哪些媒体）、参与者（可用于 mention 的 id 和名字，见下）、允许的目的地 | — |
-| `send_file(path \| blob, name?, caption?)` | 读文件（相对路径按 session 的 cwd）存进 blob 存储，作为附件发出。上限 30MB；`restricted` 档的轮次只能发 cwd 里的文件 | 本轮回复路由 |
+| `get_channel_context()` | 返回当前路由、通道、会话类型、档位、通道能力摘要（markdown 程度、长度上限、按钮、能发哪些媒体）、参与者（可用于 mention 的 id 和名字，见下）、允许的目的地，以及 `abilities`（这个 agent 有哪些工具、自己设了几条定时任务和监听） | — |
+| `send_file(path \| blob, name?, caption?)` | 读文件（相对路径按 session 的 cwd）存进 blob 存储，作为附件发出。上限 30MB；`restricted` 档的轮次只能发 cwd 里的文件。`blob` 只认本 session 见过的引用（它的输入里的附件，或它自己发过的），别的引用和不存在的一样答 `unknown blob`；不给 `name` 时用本 session 见到它时的文件名（INVARIANTS SE-7） | 本轮回复路由 |
 | `ask_choice(question, options[], multi?)` | 发一个选择题，**立即返回** `choiceId`。用户的选择作为**下一条输入**回来（见下），工具说明里要求模型发完就结束这一轮 | 本轮回复路由 |
 | `mention(user_ids[], text)` | 发一条 @ 某些人的消息 | 本轮回复路由 |
 | `reply_to(route, text, message_id?)` | 另发一条回复（默认回复发起本轮的那条消息） | `"current"` 或允许的路由键 |
 | `send_message(route, text)` | 另发一条独立消息（不是回复） | `"current"` 或允许的路由键 |
 | `watch_add / watch_remove / watch_list` | 见下面"agent 自己建监听" | 永远是自己的 session |
+| `schedule_add / schedule_remove / schedule_list` | 给自己约时间：到点收到一条 `[schedule <id>] <text>` 输入、开一轮（或只往允许的路由发一条消息）；`when` 写 `{ at }`、`{ cron, tz? }` 或 `{ every_minutes }`。每个会话至多 `policy.scheduleLimit` 条、间隔不短于 `policy.scheduleMinMinutes` 分钟（`docs/design/schedules`，SC-3） | 永远是自己的 session |
 | `live_join / live_say / live_leave` | 以语音进出会议或通话，见 §7a | 通道的媒体对端 |
 
 **参与者**（`participants`，`mention` 可以 @ 其中任何人）：先是本轮输入的发送者，再是这个 session 在**当前对话**（同一通道、同一会话 id）里见过的其他人，按最近说话排序，合计至多 50 个。"见过"指这个 session 收到过他们的消息：开轮的、只记录的上下文、§1c 取来的历史都算；本部署自己的回流不算。每项 `{ userId, name?, principal?, channel, isBot? }`，`userId` 是通道里的用户 id（飞书是 union_id 或 open_id），机器人标 `isBot: true`。session 记最近 50 个不同的发送者，重启后从日志里的输入记录重建。只在消息里被 @ 过、自己没说过话的人不在其中。`mention` 照旧接受任何 id（也接受 `lark-bot:on_x` 这样的主体），对参与者补上名字；适配器认不出的 id 写成 `@名字` 文字（下表）。

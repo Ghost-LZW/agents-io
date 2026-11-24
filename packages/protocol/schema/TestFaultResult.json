@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/TestFaultResult",
+  "type": "object",
+  "required": [
+    "faults"
+  ],
+  "properties": {
+    "faults": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "kind",
+          "channel",
+          "remaining",
+          "at"
+        ],
+        "properties": {
+          "kind": {
+            "const": "drop-response",
+            "type": "string"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "account": {
+            "type": "string"
+          },
+          "conversation": {
+            "type": "string"
+          },
+          "remaining": {
+            "type": "number"
+          },
+          "at": {
+            "type": "number"
+          }
+        }
+      }
+    }
+  }
+}

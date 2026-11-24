@@ -13,12 +13,13 @@ import {
   type Origin,
   type Principal,
   type ReplyRoute,
+  type ScheduleDraft,
   type SessionEvent,
   type Tier,
   type TurnContext,
 } from '@agents-io/protocol';
-import { LaneUnavailableError, OWNER_LABEL, passes, project } from '@agents-io/session';
-import { ExternalMcpServer, ToolError, isLoopback, parseScope, type ExternalBackend, type ExternalCaller, type ExternalClient, type ExternalScopes } from '@agents-io/host-mcp';
+import { LaneUnavailableError, OWNER_LABEL, passes, project, withholding } from '@agents-io/session';
+import { ExternalMcpServer, ToolError, globMatch, isLoopback, parseScope, type ExternalBackend, type ExternalCaller, type ExternalClient, type ExternalScopes } from '@agents-io/host-mcp';
 import { TokenError, loadOrCreateTokenFile } from './token.js';
 
 /*
@@ -72,8 +73,8 @@ const Closed = { additionalProperties: false } as const;
  * send through it, each as its own client. Off unless the section is present (and `enabled` is
  * not false). Loopback only. Every client has its own token (`token: "env:NAME"`, or `tokenFile`:
  * read, or generated 0600 like `host.tokenFile`) and the scopes it may use; nothing else is
- * allowed (`read`, `read:<session pattern>`, `send:<route pattern>`, `input:<session pattern>`;
- * `*` matches any run of characters).
+ * allowed (`read`, `read:<session pattern>`, `send:<route pattern>`, `input:<session pattern>`,
+ * `schedule:<route pattern>`; `*` matches any run of characters).
  */
 const ExternalMcpKeys = {
   /** `host:port` (default `127.0.0.1:7465`; port 0: any free port). Only loopback addresses. */
@@ -164,10 +165,10 @@ export function resolveExternalMcp(c: Omit<ExternalMcpSection, 'enabled'>, ctx: 
       token = ctx.substitute(e.token, `${at}.token`) as string;
       if (token.length < 16 || /\s/.test(token)) fail(`${at}.token: the variable ${e.token.slice(4)} must hold at least 16 characters and no whitespace`);
     }
-    const scopes: ExternalScopes = { read: [], readAll: false, send: [], input: [] };
+    const scopes: ExternalScopes = { read: [], readAll: false, send: [], input: [], schedule: [] };
     e.scopes.forEach((x, i) => {
       const p = parseScope(x);
-      if (!p) fail(`${at}.scopes[${i}]: ${JSON.stringify(x)} is not a scope (read, read:<session pattern>, send:<route pattern>, input:<session pattern>)`);
+      if (!p) fail(`${at}.scopes[${i}]: ${JSON.stringify(x)} is not a scope (read, read:<session pattern>, send:<route pattern>, input:<session pattern>, schedule:<route pattern>)`);
       scopes[p!.kind].push(p!.pattern);
       if (x === 'read') scopes.readAll = true;
     });
@@ -204,7 +205,9 @@ const FEATURE = 'external.mcp';
 /**
  * The external MCP endpoint as a module: section `externalMcp` (off unless present, `enabled: false`
  * turns it off), feature `external.mcp` while it listens, status `{ url, clients }` while it listens
- * (`bundle.ts` keeps it at `GET /api/status` `externalMcp` too). It starts after the daemon's
+ * (`bundle.ts` keeps it at `GET /api/status` `externalMcp` too). A client's schedules are the
+ * kernel's (`KernelContext.schedules`, as the client); when one of its message schedules fires, the
+ * `scheduledMessage` hook sends it as the client (through `send`'s checks). It starts after the daemon's
  * channels, local socket and console; a bad client token or token file fails the start, a port that
  * is taken is logged, not fatal (as for the console). It stops before anything else (`bundle.ts`
  * registers it last): no new external writes while the daemon stops.
@@ -237,6 +240,16 @@ export const externalMcpModule: ModuleManifest<ExternalMcpConfig> = {
       },
       features: () => (listening ? [FEATURE] : []),
       status: () => (listening ? { url: listening.url, clients: cfg.clients.map((x) => x.name) } : undefined),
+      hooks: {
+        // A client's message schedule fires as that client's send, through its send_message checks (DL-6).
+        scheduledMessage: async ({ schedule, operationId }) => {
+          const client = cfg.clients.find((x) => x.principal.id === schedule.createdBy);
+          if (!client) return false;
+          if (!listening) throw new Error(`the external endpoint is not running, so ${client.name}'s schedule cannot send as it`);
+          await listening.endpoint.sendAs(client.name, { route: schedule.route!, text: schedule.text, operationId });
+          return true;
+        },
+      },
       // No new external writes while stopping (the tools also answer "stopping").
       stop: async () => {
         await listening?.endpoint.close();
@@ -252,7 +265,7 @@ export class ExternalMcp implements ExternalBackend {
 
   constructor(
     private readonly k: KernelContext,
-    config: ExternalMcpConfig,
+    private readonly config: ExternalMcpConfig,
   ) {
     const clients = config.clients.map((c): ExternalClient => {
       const token = c.token ?? tokenFromFile(c.name, c.tokenFile!, k);
@@ -288,7 +301,9 @@ export class ExternalMcp implements ExternalBackend {
     if (head === 0 && !this.k.sessions.known(sessionKey)) return undefined;
     const all = this.k.events(sessionKey, a.fromSeq ?? 0).filter((e) => passes(e, a.tier));
     const picked = a.fromSeq === undefined ? all.slice(-a.limit) : all.slice(0, a.limit);
-    const events = picked.map((e) => view(project(e, a.tier)));
+    // U20: a checked turn's answer, cards and native payloads are not read here before they are past the exit check.
+    const w = withholding(this.k.events(sessionKey, 0));
+    const events = picked.map((e) => (w.none ? view(project(e, a.tier)) : w.apply(e, view(project(e, a.tier)))));
     // Paging forward: the next call passes the last seq seen (or the same from_seq when nothing new came).
     const next = picked.at(-1)?.seq ?? a.fromSeq;
     return { head, events, ...(next !== undefined ? { nextFromSeq: next } : {}) };
@@ -350,11 +365,17 @@ export class ExternalMcp implements ExternalBackend {
         replyRoute: null,
         deliveries: [],
       };
-      let verdict: 'allow' | 'deny';
+      let verdict: 'allow' | 'deny' | { hold: true; reason?: string };
       try {
-        verdict = await this.k.outbound(from, route);
+        verdict = await this.k.outbound(from, route, { text: a.text });
       } catch {
         verdict = 'deny';
+      }
+      if (typeof verdict === 'object') {
+        // U20: an outbound.content host took it: settled held, never sent, not recorded as sent.
+        this.k.hold(route, { operationId, sessionKey: externalLog(name), external: senderOf(caller), ...(verdict.reason !== undefined ? { reason: verdict.reason } : {}) });
+        this.k.log('info', `external MCP: ${name} send to ${routeKey(route)} held by the host`);
+        throw new ToolError(`the host took this message; it was not sent${verdict.reason ? ` (${verdict.reason})` : ''}. Do not send it again (operationId ${operationId})`);
       }
       if (verdict !== 'allow') {
         this.k.log('warn', `external MCP: ${name} send to ${routeKey(route)} denied by the outbound policy`);
@@ -363,7 +384,8 @@ export class ExternalMcp implements ExternalBackend {
       const by = senderOf(caller);
       const rec: ExternalSendRecord = { ...by, tool: 'send_message', operationId, route, text: a.text };
       this.k.appendNative(externalLog(name), { name: EXTERNAL_EVENT, native: rec, level: 'primary', audience: 'answer', visibility: 'participants' });
-      // The kernel keeps who sends it while the delivery runs (its outbound record names them, also when it settles after a restart).
+      // The kernel keeps who sends it while the delivery runs (its outbound record names them, also when it
+      // settles after a restart), and says what it is (U20: an outbound.scoped host checks it where its scope is).
       const d = await this.k.send(route, { text: a.text }, { operationId, sessionKey: externalLog(name), external: by });
       // The channel stopped since the route was resolved.
       if (!d) throw new ToolError(`delivery to ${routeKey(route)} rejected: no running channel sends it (operationId ${operationId})`);
@@ -372,6 +394,52 @@ export class ExternalMcp implements ExternalBackend {
     } finally {
       this.inFlight.delete(operationId);
     }
+  }
+
+  /** A firing of a client's schedule: sent as that client, through the checks of its send_message. */
+  async sendAs(client: string, a: { route: ReplyRoute; text: string; operationId: string }): Promise<void> {
+    const c = this.config.clients.find((x) => x.name === client);
+    if (!c) throw new Error(`no external client ${client}`);
+    const caller: ExternalCaller = { client: { name: c.name, principal: c.principal, scopes: c.scopes, declare: c.declare } };
+    // Its scope may have changed since it was set: a route it may no longer use is not sent to.
+    if (!c.scopes.schedule.some((p) => globMatch(p, routeKey(a.route)))) throw new Error(`route ${routeKey(a.route)} is no longer in ${client}'s schedule scope`);
+    await this.send(caller, { route: a.route, text: a.text, operationId: a.operationId });
+  }
+
+  async schedulePut(caller: ExternalCaller, a: { id?: string; when: ScheduleDraft['when']; route: ReplyRoute; text: string; action?: 'message' | 'wake'; mode?: 'resume' | 'fresh'; missed?: 'once' | 'skip'; until?: number; note?: string }): Promise<unknown> {
+    const to = this.k.resolveRoute(a.route);
+    if (!to.ok) throw new ToolError(to.message);
+    const id = a.id ?? `ext_${randomUUID().slice(0, 8)}`;
+    const content: ContentBlock[] = [{ type: 'text', text: a.text }];
+    // Setting it is a write the host may decide; each firing then goes out as the client's send.
+    await this.hostAllows(caller, { op: 'send', route: a.route, content, id: `schedule:${id}` });
+    // A wake goes to the host (it runs the agent): who asked (`declared`) and how travel with it.
+    const wake = a.action === 'wake';
+    const r = await this.k.schedules.addAs(externalOrigin(caller.client, caller.declared), {
+      id: `${caller.client.name}:${id}`,
+      when: a.when,
+      action: wake ? 'host' : 'message',
+      route: a.route,
+      text: a.text,
+      ...(wake ? { meta: { wake: a.mode ?? 'resume', client: caller.client.name, ...(caller.declared ? { declared: caller.declared } : {}) } } : {}),
+      ...(a.missed ? { missed: a.missed } : {}),
+      ...(a.until !== undefined ? { until: a.until } : {}),
+      ...(a.note ? { note: a.note } : {}),
+    });
+    if (!r.ok) throw new ToolError(r.message);
+    return { ok: true, schedule: { ...r.schedule, nextAt: r.schedule.nextAt === null ? null : new Date(r.schedule.nextAt).toISOString() } };
+  }
+
+  async scheduleRemove(caller: ExternalCaller, id: string): Promise<unknown> {
+    const full = id.startsWith(`${caller.client.name}:`) ? id : `${caller.client.name}:${id}`;
+    const r = await this.k.schedules.removeAs(externalOrigin(caller.client, caller.declared), full);
+    if (!r.ok) throw new ToolError(r.message);
+    return { ok: true, removed: r.removed, id: full };
+  }
+
+  scheduleList(caller: ExternalCaller): unknown {
+    const mine = this.k.schedules.listAs(externalOrigin(caller.client, caller.declared));
+    return { schedules: mine.map((s) => ({ ...s, nextAt: s.nextAt === null ? null : new Date(s.nextAt).toISOString() })) };
   }
 
   async input(caller: ExternalCaller, a: { sessionKey: string; text: string }): Promise<unknown> {
@@ -440,6 +508,6 @@ function sent(operationId: string, r: KernelSettledSend, duplicate: boolean) {
 }
 
 /** An event as session_events shows it. */
-function view(e: SessionEvent): unknown {
+function view(e: SessionEvent): { body: unknown; native?: unknown; [k: string]: unknown } {
   return { seq: e.seq, ts: e.ts, ...(e.turnId !== undefined ? { turnId: e.turnId } : {}), level: e.level, audience: e.audience, body: e.body, ...(e.native !== undefined ? { native: e.native } : {}) };
 }
