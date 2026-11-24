@@ -17,10 +17,11 @@
 |---|---|
 | `transcripts/codex/` | 真实 Codex 0.171 的录制（`codex.app-server`）：`plain-turn`、`steer`、`approval`、`interrupt` |
 | `transcripts/jsonl-harness/` | 内核场景用的 harness（`aio.jsonl-harness`）：`approval`、`queue-behind-turn`，手写 |
+| `transcripts/acp/` | 真实 ACP agent 的录制（`acp`；Claude Code 的 ACP agent 0.110.1）：`plain-turn`、`permission`、`cancel`、`load` |
 | `scenarios/kernel/` | 内核场景，由 `packages/kernel/test/scenarios.test.ts` 在没有模块的内核上跑 |
 | `scenarios/attention/` | G7 的 attention fixture，同一场景格式（§3.6），由 `packages/session/test/attention.test.ts` 跑 |
 
-代码：`packages/testkit/src/conformance/`（`match.ts` 匹配，`transcript.ts` 格式、录制与去本机值，`replay.ts` 回放，`transcript-harness.ts` 进程内的 bridge harness，`scenario.ts` 场景格式与运行器），`packages/testkit/src/transcript-replay.ts`（stdio 回放程序，bin `aio-transcript-replay`）；录制的接头在适配器包里：`harness/codex/src/record.ts` `recordTransport`、`harness/jsonl-bridge` 的 `HarnessBridgeOptions.record`。
+代码：`packages/testkit/src/conformance/`（`match.ts` 匹配，`transcript.ts` 格式、录制与去本机值，`replay.ts` 回放，`transcript-harness.ts` 进程内的 bridge harness，`scenario.ts` 场景格式与运行器），`packages/testkit/src/transcript-replay.ts`（stdio 回放程序，bin `aio-transcript-replay`）；录制的接头在适配器包里：`harness/codex/src/record.ts` `recordTransport`、`harness/jsonl-bridge` 的 `HarnessBridgeOptions.record`、`harness/acp/src/record.ts` `recordStream`（`AcpHarnessOptions.record`）。
 
 ## 2. L1：harness transcript
 
@@ -36,7 +37,7 @@
 ```
 
 - **方向按适配器看**：`expect_outbound` 是适配器（或 bridge 的宿主端）写给 harness 程序的帧，`emit_inbound` 是程序发来的帧，`afterMs` 是它在上一行之后多久发（可省，缺省立刻）；`runtime_exit`（`success` / `error` / `cancelled`，可带 `error`）是程序自己退出了。
-- **`protocol`** 说是哪种线：`codex.app-server`（Codex 的 JSON-RPC，即 Codex 适配器的 `Transport` 上走的那些行）、`aio.jsonl-harness`（`@agents-io/protocol` `wire.ts` 的 harness bridge 帧）。`version` 是 harness 的版本（Codex 从 `initialize` 的 `userAgent` 读出）。
+- **`protocol`** 说是哪种线：`codex.app-server`（Codex 的 JSON-RPC，即 Codex 适配器的 `Transport` 上走的那些行）、`aio.jsonl-harness`（`@agents-io/protocol` `wire.ts` 的 harness bridge 帧）、`acp`（Agent Client Protocol v1 的 JSON-RPC，即 ACP 适配器的连接上走的那些消息，带 `jsonrpc: "2.0"`）。`version` 是 harness 的版本（Codex 从 `initialize` 的 `userAgent` 读出，ACP 是 `initialize` 答的 `agentInfo.version`，`metadata.agent` 是它的 `agentInfo.name`）。
 - **`metadata`** 随意，下面两个键有意义：`match` 为 `exact`（缺省，录下的就是这样）或 `subset`（手写的：outbound 帧只写要紧的字段，§3.4 的规则）；`description` 说它是什么。
 - **`label`**：给人看，也给 gate 用（§2.3）。录制时自动给：JSON-RPC 是 method，应答是它所答请求的 method；bridge 帧是 `type`，`result` 是它所答请求的 `type`，`event` 是 `event:<body.t>`。手写时可以起自己的名字（如 `finish-first`）。
 - **帧里的占位符**与场景的相同（§3.4）：`"<$name>"` 是绑定，`"<any>"` 是任意值；占位符可以嵌在字符串里（`"<$workspace>/a.txt"`）。
@@ -53,6 +54,7 @@
 
   模型是情形自己的 `run.model`（`gpt-6-sol`）；`AIO_RECORD_OUT` 改输出目录，`CODEX_BIN` 改执行文件。录的是真模型，会花钱、结果每次不同，所以只在要换录制（Codex 升级、情形变了）时手动跑，CI 从不跑。
 - **harness bridge**：`spawnHarness({ …, record })` 的 `record(direction, frame)` 收到宿主与程序之间的每一帧。
+- **ACP**：`new AcpHarness({ …, record })` 的 `record(direction, frame)` 收到适配器与 agent 之间的每一条 JSON-RPC 消息（`harness/acp/src/record.ts` `recordStream` 包住 SDK 的 `Stream`）。`harness/acp/scripts/record-transcripts.ts` 用它录 `harness/acp/test/transcript-scenarios.ts` 的四个情形：每个起一个一次性的 agent 进程（`load` 先在另一个进程上建好要续的会话，那一段不录），经真实的 `AcpHarness` 跑一遍；agent 是 `AIO_ACP_COMMAND`，它的模型与凭据在环境里，装法和跑法见 `harness/acp/README.md`。去掉的值：agent 编出来的 `sessionId`、`toolCallId`、`messageId`（`<$session-1>` 等）、家目录、主机名、工作目录。
 - **testkit 的 `TranscriptRecorder`** 收这些 `tap`，给每行 label，`transcript()` 得到一段 transcript；`exit(status)` 记下程序自己退出。
 - **`scrubTranscript(t, o)`** 去掉本机与本次运行的值（照 t3code 的 `codexReplayRecordingOutputRecords`）：家目录换成 `/home/replay-user`；等于主机名的字符串换成 `replay-host`；工作目录换成绑定 `<$workspace>`（回放时由被测的一侧给，如 `thread/start` 的 `cwd`）；录制时编出来的 id（Codex 的 thread、turn、item id，由 `o.ids(key, value, path)` 认）每个换成 `<$前缀-N>`，在别的字符串里出现也换；outbound 里每次都不同、又不会被回显的值（`o.volatile`，如 token）换成 `<any>`。
 
@@ -76,9 +78,11 @@ aio-transcript-replay <transcript.ndjson> [--bind name=value]... [--after-end er
 
 放在真实程序的位置（Codex 适配器的 stdio 传输里的 `codex app-server`，一个 `bridge` 实例的 `command`），任何语言的适配器或内核都能 spawn 它。stdin 上读到的帧对照 `expect_outbound`，`emit_inbound` 写到 stdout。退出码：`runtime_exit` 的（success 0、error 1、cancelled 130）；最后一行之后 stdin 关了为 0；帧不同、或 `--after-end error`（缺省）时最后一行之后又来帧为 3；最后一行之前 stdin 就关了为 4；参数不对为 2。原因写到 stderr。`--after-end answer` 时最后一行之后的请求答成功，bridge 的 `shutdown` 让它退出。它没有 gate：一行一行照序放（gate 只在进程内，`TranscriptReplay.release`）。在仓库里从源码跑：`node --experimental-transform-types --import scripts/source-loader.mjs packages/testkit/src/transcript-replay.ts …`。
 
-### 2.5 录下的 Codex 0.171
+### 2.5 录下的 Codex 0.171 与 ACP agent
 
 `harness/codex/test/transcripts.test.ts` 用 `aio-transcript-replay` 当 app-server，经真实 `CodexHarness` 把四段各回放一遍，会话做录制时做的事（`transcript-scenarios.ts`：输入固定，所以适配器写出的帧一字不差；每个动作等一个在 transcript 里先于它所产生的帧的事件）。回放程序以 0 退出（每行都放了、没有不同），事件流过 `checkEventStream`（HC-1），再查各自的结果：普通一轮的回答与录下的相同、0.171 不告警；steer 的输入由同一轮消费；审批的决定作为录下的那个答复回到 Codex（HC-9）；打断后这一轮是 `interrupted`。
+
+`harness/acp/test/transcripts.test.ts` 同样用 `aio-transcript-replay` 当 agent，经真实 `AcpHarness` 回放四段（Claude Code 的 ACP agent `@agentclientprotocol/claude-agent-acp` 0.110.1，模型 `gpt-6-sol`，2026-11-25）：普通一轮写出的帧与录下的一字不差（`initialize` 里没有 `fs`、`terminal`）、回答相同；审批先按 profile 设 session mode（`session/set_mode`），`allow_once` 作为 agent 给的那个选项回去；取消后这一轮 `interrupted`、输入记消费；`session/load` 时 agent 先重放对话再回答，重放的不成为事件，下一轮照常（HC-1、RQ-1、IN-1、RS-1）。
 
 录下的 steer 查出 HC-1 的一条不成立：Codex 0.171 在 steer 时放弃正在写的回答（`agentMessage` 有 `item/started`，没有 `item/completed`），适配器把这个 item 一直开着。由同一文件的 `it.fails` 复现，没修（INVARIANTS HC-1 不成立 1）。
 
@@ -177,7 +181,7 @@ G7 的 fixture 用的是同一格式：每行一条 `emit` 到 `log` 端（`even
 
 ## 6. 还没有的
 
-- 别的 harness 的录制：Claude Code（t3code 在 Agent SDK 的消息层录，不是 stream-json 的线）、ACP agent（G9：录真实 agent 的 transcript 作为 fixture，`protocol` 另起一个名字）。
+- 别的 harness 的录制：Claude Code（t3code 在 Agent SDK 的消息层录，不是 stream-json 的线）。ACP agent 已录（`transcripts/acp/`，§2.5），只录了一个 agent（Claude Code 的 ACP agent）。
 - 通道一侧的 transcript（channel bridge 的帧）和真实平台的录制。
 - 内核场景只移了六条 TS 测试（十个编号）；其余承诺仍只有 TS 测试。
 - TS 运行器的 `clock` 是真的等：网关没有可换的时钟。

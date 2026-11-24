@@ -193,13 +193,15 @@ export class TranscriptReplay {
 
 /**
  * What a peer of `protocol` answers to frames after the transcript ended: requests get an empty
- * success, everything else nothing (harness bridge: a result `ok`; JSON-RPC: `result: {}`).
+ * success, everything else nothing (harness bridge: a result `ok`; JSON-RPC: `result: {}`, with
+ * `jsonrpc: "2.0"` for `acp`, whose peers require it).
  */
 export function teardownAnswers(protocol: string): (frame: unknown) => unknown[] {
   return (frame) => {
     const f = frame as Record<string, unknown> | null;
     if (!f || typeof f !== 'object' || f.id === undefined) return [];
     if (protocol === 'aio.jsonl-harness') return typeof f.type === 'string' && f.type !== 'result' ? [{ v: f.v ?? 1, type: 'result', id: f.id, ok: true }] : [];
+    if (protocol === 'acp') return typeof f.method === 'string' ? [{ jsonrpc: '2.0', id: f.id, result: {} }] : [];
     return typeof f.method === 'string' ? [{ id: f.id, result: {} }] : [];
   };
 }

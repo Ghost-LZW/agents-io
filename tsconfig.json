@@ -8,6 +8,7 @@
     { "path": "channel/jsonl-bridge" },
     { "path": "channel/lark-bot" },
     { "path": "channel/mail" },
+    { "path": "harness/acp" },
     { "path": "harness/claude-code" },
     { "path": "harness/codex" },
     { "path": "harness/jsonl-bridge" },

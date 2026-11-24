@@ -8,12 +8,13 @@ import { readFileSync } from 'node:fs';
  * view: outbound frames go from the adapter (or the bridge host) to the harness program.
  *
  * `protocol` names the wire: `codex.app-server` (Codex's JSON-RPC, as the Codex adapter's
- * `Transport` carries it) or `aio.jsonl-harness` (the harness bridge frames of
- * `@agents-io/protocol` `wire.ts`). `metadata.match` is `exact` (default: what a recording is) or
- * `subset` (a hand-written transcript names only the fields that matter, `match.ts`).
+ * `Transport` carries it), `aio.jsonl-harness` (the harness bridge frames of
+ * `@agents-io/protocol` `wire.ts`) or `acp` (the Agent Client Protocol's JSON-RPC on stdio, v1, as
+ * the ACP adapter's connection carries it). `metadata.match` is `exact` (default: what a recording
+ * is) or `subset` (a hand-written transcript names only the fields that matter, `match.ts`).
  */
 
-export const TRANSCRIPT_PROTOCOLS = ['codex.app-server', 'aio.jsonl-harness'] as const;
+export const TRANSCRIPT_PROTOCOLS = ['codex.app-server', 'aio.jsonl-harness', 'acp'] as const;
 export type TranscriptProtocol = (typeof TRANSCRIPT_PROTOCOLS)[number];
 
 export interface TranscriptStart {
@@ -115,7 +116,7 @@ export const matchModeOf = (t: Transcript): 'exact' | 'subset' => (t.header.meta
 // ---- labels -------------------------------------------------------------------
 
 /**
- * A line's label: what the frame is, for people and for gates. JSON-RPC (`codex.app-server`): the
+ * A line's label: what the frame is, for people and for gates. JSON-RPC (`codex.app-server`, `acp`): the
  * method, a response the method of the request it answers. Harness bridge frames: the frame type,
  * a result the type of the request it answers, an event `event:<body.t>`.
  */

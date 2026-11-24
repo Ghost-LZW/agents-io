@@ -138,8 +138,8 @@ see `docs/E2E.md` §0). New:
   not read in the file). See "Feature modules". A config resolved without importing them (a
   client reading the file: `aio send`, `aio attach`) loads, an agent's `tools` list then being
   taken as written, but `Gateway.start` refuses it, naming the entry.
-- **Harness instances** (`harnesses.<name>`, `use`: `claude-code`, `codex`, `bridge` or
-  `module`; see `docs/E2E.md` §0). `claude-code`, `codex` and `bridge` are the harness kinds the
+- **Harness instances** (`harnesses.<name>`, `use`: `claude-code`, `codex`, `bridge`, `acp` or
+  `module`; see `docs/E2E.md` §0). `claude-code`, `codex`, `bridge` and `acp` are the harness kinds the
   daemon's composition root registers (`src/bundle.ts`): each is a `HarnessModule`
   (`@agents-io/protocol`, `harness-module.ts`) in its own package (`harness/*/src/module.ts`)
   that owns its keys, its section of the older `harness` block, its default model and
@@ -235,6 +235,16 @@ see `docs/E2E.md` §0). New:
   (`blob.stat` / `blob.get`, the same read-only view), `sessionEnv: 'own-process'` gives a
   launched session a copy of the program of its own, and a task run always runs on one. An
   instance unavailable for now is not started and declares nothing.
+  An `acp` instance (`command`, `args`, `mcp`, `flavor`, `planMode`, `compact`, `displayName`,
+  `elicitation`, `authMethod`; `profiles` whose entries name only a session `mode`;
+  `@agents-io/harness-acp`) is any Agent Client Protocol agent, the daemon its ACP client over
+  stdio (`docs/HOSTS.md` §4.10, `harness/acp/README.md`). It is started on first use, not at the
+  daemon's start; what it can do comes from its `initialize` answer and each session's
+  `session/new` / `session/load` answer (no steer, `session/cancel`, permission requests, form
+  questions, `session/load` to resume, Plan mode from its session modes, compaction from the
+  commands it advertises); it never adopts a turn, so at stop its sessions close and the next input
+  resumes with `session/load`. One process serves the instance's sessions; a launched session's
+  env and a task run get one of their own (`sessionEnv: 'own-process'`).
 - **Live (realtime voice, decision 11)**: a Codex instance with `"live": true` opts
   its app-server connection into Codex's experimental realtime API. Agents on it
   (with `tools`) get `live_join { target, channel?, instructions?, voice? }`,
@@ -1633,3 +1643,16 @@ G5, 2026-11-25):
   and `loadConfigModules` take an optional `harnessRegistry` (`LoadOptions.harnessRegistry`; this
   package's default to the built-in kinds), and `ImportConfigModules` an optional
   `harnessRegistry` in its options (the console's `ConfigStore` gives the daemon's).
+
+What changed for embedders with the ACP harness (core-slimming G9, south, 2026-11-25):
+
+- A fourth built-in harness kind, `acp` (`acpHarnessModule` from the new package
+  `@agents-io/harness-acp`, which also has `AcpHarness`, `AcpSession`, `MCP_STDIO_BRIDGE`, the
+  flavors `ACP_FLAVORS` / `genericFlavor` / `claudeFlavor` and the mapping functions of
+  `src/map.ts`): `builtinHarnesses.kinds` is `claude-code`, `codex`, `bridge`, `acp`, and the
+  config file's `harnesses.<name>.use` admits `"acp"`. The kind declares nothing at kind level, so
+  replies naming the kinds that have Plan mode or the profile switch are as before. Nothing else
+  changes for a deployment without an `acp` instance.
+- `@agents-io/testkit`: transcripts may be of `protocol: "acp"` (`TRANSCRIPT_PROTOCOLS`);
+  `teardownAnswers("acp")` answers with `jsonrpc: "2.0"`. The recorded ACP transcripts are in
+  `conformance/transcripts/acp/`.

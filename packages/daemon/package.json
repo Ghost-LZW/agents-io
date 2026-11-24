@@ -19,6 +19,7 @@
     "@agents-io/channel-mail": "workspace:*",
     "@agents-io/console": "workspace:*",
     "@agents-io/host-mcp": "workspace:*",
+    "@agents-io/harness-acp": "workspace:*",
     "@agents-io/harness-claude-code": "workspace:*",
     "@agents-io/harness-codex": "workspace:*",
     "@agents-io/harness-jsonl-bridge": "workspace:*",

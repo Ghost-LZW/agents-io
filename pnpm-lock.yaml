@@ -84,6 +84,25 @@ importers:
         specifier: workspace:*
         version: link:../../packages/daemon
 
+  harness/acp:
+    dependencies:
+      '@agentclientprotocol/sdk':
+        specifier: ^2.9.1
+        version: 2.9.1(zod@4.6.5)
+      '@agents-io/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
+      '@sinclair/typebox':
+        specifier: ^0.34.0
+        version: 0.34.52
+      zod:
+        specifier: ^4.0.0
+        version: 4.6.5
+    devDependencies:
+      '@agents-io/testkit':
+        specifier: workspace:*
+        version: link:../../packages/testkit
+
   harness/claude-code:
     dependencies:
       '@agents-io/protocol':
@@ -168,6 +187,9 @@ importers:
       '@agents-io/console':
         specifier: workspace:*
         version: link:../console
+      '@agents-io/harness-acp':
+        specifier: workspace:*
+        version: link:../../harness/acp
       '@agents-io/harness-claude-code':
         specifier: workspace:*
         version: link:../../harness/claude-code
@@ -288,6 +310,15 @@ importers:
         version: link:../protocol
 
 packages:
+
+  '@agentclientprotocol/sdk@2.9.1':
+    resolution: {integrity: sha512-8iJdxGa3SunLfzqLLb3RfQFmr4hnmWeAyeAK6MbkJiXJbrRlMRgKsVnDl/7Hu48yu/30gAlytNDzh5W77rv5SA==}
+    peerDependencies:
+      '@modelcontextprotocol/server': ^2.4.0
+      zod: ^3.25.76 || ^4.0.0
+    peerDependenciesMeta:
+      '@modelcontextprotocol/server':
+        optional: true
 
   '@anthropic-ai/claude-agent-sdk-darwin-arm64@0.3.291':
     resolution: {integrity: sha512-i+BSETc+SE77PZ7uaIqlxODsLdWukB2AwXEEjzih+D2C3S7AKTZTL2trJs1kealZJHLVRWq5utuQjxr9u/ZwAQ==}
@@ -1770,6 +1801,10 @@ packages:
     resolution: {integrity: sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q==}
 
 snapshots:
+
+  '@agentclientprotocol/sdk@2.9.1(zod@4.6.5)':
+    dependencies:
+      zod: 4.6.5
 
   '@anthropic-ai/claude-agent-sdk-darwin-arm64@0.3.291':
     optional: true

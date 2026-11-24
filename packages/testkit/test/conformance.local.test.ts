@@ -275,9 +275,10 @@ describe('scenarios', () => {
     }
     for (const f of transcripts) {
       const t = readTranscript(f);
-      expect(t.header.protocol, f).toBe(f.includes('/codex/') ? 'codex.app-server' : 'aio.jsonl-harness');
+      expect(t.header.protocol, f).toBe(f.includes('/codex/') ? 'codex.app-server' : f.includes('/acp/') ? 'acp' : 'aio.jsonl-harness');
     }
     expect(transcripts.filter((f) => f.includes('/codex/')).map((f) => f.split('/').pop()).sort()).toEqual(['approval.ndjson', 'interrupt.ndjson', 'plain-turn.ndjson', 'steer.ndjson']);
+    expect(transcripts.filter((f) => f.includes('/acp/')).map((f) => f.split('/').pop()).sort()).toEqual(['cancel.ndjson', 'load.ndjson', 'permission.ndjson', 'plain-turn.ndjson']);
   });
 
   it('every scenario under conformance/scenarios is one a core runner plays (the top level of kernel/ or attention/), and those are exactly the scenarios invariants.mjs counts', () => {

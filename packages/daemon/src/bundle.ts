@@ -1,6 +1,7 @@
 import { bridgeChannelModule, type BridgeChannelEntry } from '@agents-io/channel-jsonl-bridge';
 import { larkBotChannelModule, type LarkBotChannelEntry, type LarkBotChannelSettings } from '@agents-io/channel-lark-bot';
 import { mailChannelModule, type MailChannelEntry } from '@agents-io/channel-mail';
+import { acpHarnessModule } from '@agents-io/harness-acp';
 import { claudeCodeHarnessModule } from '@agents-io/harness-claude-code';
 import { codexHarnessModule } from '@agents-io/harness-codex';
 import { bridgeHarnessModule } from '@agents-io/harness-jsonl-bridge';
@@ -21,11 +22,12 @@ import { topicTitleModule, type TopicTitleSection } from './topic-title.js';
 /**
  * The built-in harness kinds; Claude Code first, the default kind. Then Codex, and the bridge: a
  * harness in another process, any language, over JSONL stdio (`use: "bridge"`), which says what it
- * declares in its hello, so its instances are probed at start (`HarnessModule.probeAtStart`).
+ * declares in its hello, so its instances are probed at start (`HarnessModule.probeAtStart`). Then
+ * any Agent Client Protocol agent (`use: "acp"`, core-slimming G9), started on its first turn.
  * `launchAliases` (deprecated, one release): the `HarnessInstance` fields their launch settings
  * were under before `launch`.
  */
-export const builtinHarnesses = new HarnessRegistry([claudeCodeHarnessModule, codexHarnessModule, bridgeHarnessModule], {
+export const builtinHarnesses = new HarnessRegistry([claudeCodeHarnessModule, codexHarnessModule, bridgeHarnessModule, acpHarnessModule], {
   launchAliases: { [claudeCodeHarnessModule.kind]: 'claude', [codexHarnessModule.kind]: 'codex' },
 });
 
