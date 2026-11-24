@@ -175,7 +175,9 @@ export interface CommandHooks {
    * Called once, inside the transaction (`Hub.batch`) of the event that decides the command, with
    * what the command then answers: an input's `input.admitted` (or its `input.rejected` when a
    * policy hook threw), an interrupt's `input.cancelled`. A throw rolls the event back and fails the
-   * command. Not called when the command writes no such event (a duplicate, a refusal).
+   * command; but a steered input, which the harness already has, is admitted all the same (without
+   * the answer) before the command fails. Not called when the command writes no such event (a
+   * duplicate, a refusal).
    */
   decided?(r: CommandResult, e: SessionEvent): void;
   /**
@@ -497,9 +499,10 @@ export class Lane {
 
   /** `decided`: the command this records answers `observe_only` (`observe`, a loop-guard stop). */
   private recordContext(input: InputRecord, decided?: CommandHooks['decided']): void {
-    this.observedInputs.set(input.inputId, input);
     this.notePerson(input);
     const e = this.decide({ body: { t: 'input.admitted', inputId: input.inputId, disposition: 'observe_only', ...pid(input), input } }, { ok: true, disposition: 'observe_only' }, decided);
+    // Known once written (with `decided`, it may roll back): the same message again is not a duplicate then.
+    this.observedInputs.set(input.inputId, input);
     this.addContext(input, e.seq);
   }
 
@@ -1050,12 +1053,7 @@ export class Lane {
     this.indexCause(input);
 
     if (mode === 'steer') {
-      let r: CommandResult | undefined;
-      try {
-        r = await this.trySteer(input, expectedTurnId, decided);
-      } catch (err) {
-        return this.hookFailed(input, err, decided);
-      }
+      const r = await this.trySteer(input, expectedTurnId, decided);
       if (r) return r;
     } else if (mode === 'interrupt' && this.turn) {
       const t = this.turn;
@@ -1098,7 +1096,11 @@ export class Lane {
     return { ok: true, disposition };
   }
 
-  /** Returns a result when steered; undefined to fall back to queue. */
+  /**
+   * Returns a result when steered (or rejected: `policy.plan` threw, `hookFailed`); undefined to fall
+   * back to queue. Only the policy hook's throw is a rejection: once the harness has the input, a
+   * failure to keep its answer (`decided`) does not make it one.
+   */
   private async trySteer(input: InputRecord, expectedTurnId?: string, decided?: CommandHooks['decided']): Promise<CommandResult | undefined> {
     const t = this.turn;
     const degrade = (why: string) => {
@@ -1112,7 +1114,12 @@ export class Lane {
     if (p === undefined || p !== t.owner) return degrade('not_turn_owner');
     if (expectedTurnId && expectedTurnId !== t.turnId) return degrade('stale');
     // Steering must not change the turn's profile (permissions are never borrowed).
-    const replan = await this.policy.plan({ sessionKey: this.sessionKey, inputs: [...t.inputs, input], previous: t.run });
+    let replan: RunSpec;
+    try {
+      replan = await this.policy.plan({ sessionKey: this.sessionKey, inputs: [...t.inputs, input], previous: t.run });
+    } catch (err) {
+      return this.hookFailed(input, err, decided);
+    }
     if (replan.profile !== t.run.profile) return degrade('profile_change');
     let res: Awaited<ReturnType<HarnessSession['steer']>>;
     try {
@@ -1124,12 +1131,24 @@ export class Lane {
     t.inputs.push(input);
     this.track(t.turnId, t.inputs, t.context);
     t.attempts.set(input.inputId, 0);
-    this.decide({ turnId: t.turnId, body: { t: 'input.admitted', inputId: input.inputId, disposition: 'steer', ...pid(input), input } }, { ok: true, disposition: 'steer' }, decided);
+    const admitted: Partial<EventDraft> & Pick<EventDraft, 'body'> = { turnId: t.turnId, body: { t: 'input.admitted', inputId: input.inputId, disposition: 'steer', ...pid(input), input } };
+    let unkept: { err: unknown } | undefined;
+    try {
+      this.decide(admitted, { ok: true, disposition: 'steer' }, decided);
+    } catch (err) {
+      if (!decided) throw err;
+      // Its answer could not be kept and rolled back with the admission, but the harness has the
+      // input and a steer is not taken back: admitted all the same (its turn settles it), and the
+      // command fails once the rest is recorded.
+      this.emit(admitted);
+      unkept = { err };
+    }
     const extra = input.replyRoute;
     if (extra && !sameRoute(extra, t.replyRoute) && !t.deliveries.some((d) => sameRoute(d, extra))) {
       t.deliveries.push(extra);
       this.emit({ turnId: t.turnId, body: { t: 'turn.delivery_added', turnId: t.turnId, route: extra, reason: 'steer', ...this.addedChecked(t, extra) } });
     }
+    if (unkept) throw unkept.err;
     return { ok: true, disposition: 'steer' };
   }
 

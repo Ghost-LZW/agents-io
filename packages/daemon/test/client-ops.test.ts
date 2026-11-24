@@ -89,6 +89,77 @@ describe('client op ids (client.opId)', () => {
     expect(bodies(log(w, 's'), 'input.admitted').map((b) => b.inputId)).toEqual([(again.value as { inputId: string }).inputId]);
     expect(bodies(log(w, 's'), 'turn.started').map((b) => b.inputIds)).toEqual([[(again.value as { inputId: string }).inputId]]);
     expect(answer(await c.exchange(input('s', 'hi', 'op-a')))).toEqual({ ...answer(again), replayed: true });
+
+    // An observed input too (its own inputId): not recorded, and the retry records it once, not as a duplicate.
+    failing = true;
+    const observe = { type: 'command', opId: 'op-o', command: { type: 'input', sessionKey: 's', mode: 'observe', input: { inputId: 'in-o', content: [{ type: 'text', text: 'fyi' }] } } };
+    expect(await c.exchange(observe)).toMatchObject({ ok: false, error: { code: 'internal', message: 'disk I/O error' }, opId: 'op-o' });
+    expect(bodies(log(w, 's'), 'input.admitted').filter((b) => b.inputId === 'in-o')).toEqual([]);
+    const seen = await c.exchange(observe);
+    expect(seen).toMatchObject({ ok: true, opId: 'op-o', value: { inputId: 'in-o', disposition: 'observe_only' } });
+    expect(seen.replayed).toBeUndefined();
+    expect(bodies(log(w, 's'), 'input.admitted').filter((b) => b.inputId === 'in-o').map((b) => b.disposition)).toEqual(['observe_only']);
+    expect(answer(await c.exchange(observe))).toEqual({ ...answer(seen), replayed: true });
+    expect(inTransaction).toEqual([true, true, true, true]);
+  });
+
+  it('a steer whose answer cannot be kept is admitted all the same, since the harness has it: its turn consumes it, nothing rejects it, the command fails internal, and a retry with its inputId steers nothing more #PR-3 #IN-1', async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const steered: string[] = [];
+    const w = await daemon({
+      script: async (t) => {
+        await held;
+        if (steered.length) t.emit({ t: 'input.consumed', inputIds: steered, turnId: t.turnId });
+        t.emit({ t: 'text.snapshot', text: 'done', final: true }, { audience: 'answer' });
+      },
+    });
+    // A harness that steers.
+    const fake = w.harness as unknown as { probe(): Promise<{ version: string; caps: Record<string, unknown> }>; open(a: unknown): Promise<{ steer: unknown }> };
+    const probe = fake.probe.bind(fake);
+    fake.probe = async () => {
+      const p = await probe();
+      return { ...p, caps: { ...p.caps, steer: 'native' } };
+    };
+    const open = fake.open.bind(fake);
+    fake.open = async (a) =>
+      Object.assign(await open(a), {
+        steer: async (inputs: { inputId: string }[]) => {
+          steered.push(...inputs.map((i) => i.inputId));
+          return 'steered';
+        },
+      });
+    const c = await w.client();
+    expect(await c.exchange(input('s', 'first'))).toMatchObject({ ok: true, value: { disposition: 'new_turn' } });
+    const records = w.gw.records;
+    const put = records.putOp.bind(records);
+    let failing = true;
+    records.putOp = (r: OpReceipt) => {
+      if (failing) {
+        failing = false;
+        throw new Error('disk I/O error');
+      }
+      put(r);
+    };
+    const steer = { type: 'command', opId: 'op-s', command: { type: 'input', sessionKey: 's', mode: 'steer', input: { inputId: 'in-s', content: [{ type: 'text', text: 'also this' }] } } };
+    const lost = await c.exchange(steer);
+    expect(lost).toMatchObject({ ok: false, error: { code: 'internal', message: 'disk I/O error' }, opId: 'op-s' });
+    expect(steered).toEqual(['in-s']);
+    expect(bodies(log(w, 's'), 'input.admitted').filter((b) => b.inputId === 'in-s').map((b) => b.disposition)).toEqual(['steer']);
+    expect(records.getOp('me', 'op-s')).toBeUndefined();
+
+    // No answer was kept to give back; the lane has the input already: a duplicate (kept now), nothing steered again.
+    const again = await c.exchange(steer);
+    expect(again).toMatchObject({ ok: true, opId: 'op-s', value: { inputId: 'in-s', disposition: 'duplicate' } });
+    expect(again.replayed).toBeUndefined();
+    expect(answer(await c.exchange(steer))).toEqual({ ...answer(again), replayed: true });
+    expect(steered).toEqual(['in-s']);
+
+    release();
+    await until(() => bodies(log(w, 's'), 'turn.completed').length === 1);
+    const settled = log(w, 's').filter((e) => ['input.consumed', 'input.rejected', 'input.cancelled'].includes(e.body.t) && (e.body as { inputIds: string[] }).inputIds.includes('in-s'));
+    expect(settled.map((e) => e.body.t)).toEqual(['input.consumed']);
+    expect(bodies(log(w, 's'), 'turn.started')).toHaveLength(1);
   });
 
   it('a rejection is kept too: an interrupt answered no_active_turn, and one that stopped a turn, are answered the same when retried while the next turn runs, which goes on #PR-3', async () => {

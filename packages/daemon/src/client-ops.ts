@@ -17,6 +17,10 @@ import type { Outcome } from './gateway.js';
  *
  * An interrupt without `turnId` resolves its turn the first time and keeps it (`pending`) before it
  * acts, so a retry after a crash in between acts on that turn (or on none), never on the next one.
+ *
+ * A receipt that cannot be written rolls back the event it was kept with (the command did not act
+ * then), and the command fails (`internal`); a steered input is the one exception: the harness has
+ * it already, so the lane admits it all the same (`Lane.trySteer`) and only the answer is lost.
  */
 
 /** What the receipt names: the command type for a `command` frame, else the frame type. */

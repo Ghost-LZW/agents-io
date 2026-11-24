@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { FakeHarness, assertConformingStream, fakeHarnessCaps } from '@agents-io/testkit';
-import type { BodyOf, Decision, HarnessOpenArgs, InputRecord, RunSpec } from '@agents-io/protocol';
-import { Lane, settleLeftoverInputs, type ModelReviewer } from '../src/index.js';
+import type { BodyOf, Decision, HarnessAdapter, HarnessOpenArgs, InputRecord, RunSpec } from '@agents-io/protocol';
+import { Hub, Lane, SqliteSessionLog, settleLeftoverInputs, type CommandResult, type LaneOptions, type ModelReviewer } from '../src/index.js';
 import { STALL_REQUEUE_CODE } from '../src/lane.js';
-import { ManualHarness, ManualSession, RUN, SteerableHarness, bodies, gate, input, origin, policy, route, setup, until } from './helpers.js';
+import { ManualHarness, ManualSession, RUN, SteerableHarness, SteerableSession, bodies, gate, input, origin, policy, route, setup, until } from './helpers.js';
 
 const turnsOf = (evs: ReturnType<ReturnType<typeof setup>['events']>) =>
   bodies(evs, 'turn.started').map((b) => (b as BodyOf<'turn.started'>).inputIds);
@@ -1029,5 +1029,104 @@ describe('Lane: robustness', () => {
     await lane.whenIdle();
     expect(terminalOf(events(), 's').map((b) => b.t)).toEqual(['input.rejected']);
     expect(await lane.command({ type: 'input', sessionKey: 's1', input: more, mode: 'queue' }).catch(() => undefined)).not.toEqual({ ok: true, disposition: 'duplicate' });
+  });
+});
+
+describe('Lane: command hooks (op ids)', () => {
+  /** A lane over a log with transactions (a `decided` throw rolls its event back), and a `decided` that fails its first call. */
+  function hooked(o: Partial<LaneOptions> & { harness?: HarnessAdapter } = {}) {
+    const log = new SqliteSessionLog();
+    const hub = new Hub(log);
+    const w = setup({ hub, ...o });
+    const calls: CommandResult[] = [];
+    let failing = true;
+    const decided = (r: CommandResult) => {
+      calls.push(r);
+      if (failing) {
+        failing = false;
+        throw new Error('disk I/O error');
+      }
+    };
+    return { ...w, events: () => log.read('s1', 0), calls, hooks: { decided } };
+  }
+  const admittedOf = (evs: ReturnType<ReturnType<typeof setup>['events']>, inputId: string) =>
+    bodies(evs, 'input.admitted').filter((b) => (b as BodyOf<'input.admitted'>).inputId === inputId).map((b) => (b as BodyOf<'input.admitted'>).disposition);
+
+  it('a steer whose answer cannot be kept is admitted all the same (the harness has it) and settled once by its turn, never rejected; the command fails #PR-3 #IN-1', async () => {
+    const g = gate();
+    const h = new SteerableHarness(() => g.promise);
+    const { lane, events, calls, hooks } = hooked({ harness: h });
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('a', { id: 'a' }), mode: 'queue' });
+    await until(() => bodies(events(), 'turn.started').length === 1);
+    const s = input('s', { id: 's', route: route('web', 'web') });
+    await expect(lane.command({ type: 'input', sessionKey: 's1', input: s, mode: 'steer' }, hooks)).rejects.toThrow('disk I/O error');
+    // Not a policy error: `decided` heard the steer once, and nothing answered policy_error.
+    expect(calls).toEqual([{ ok: true, disposition: 'steer' }]);
+    expect((h.sessions[0] as SteerableSession).current!.inputs.map((i) => i.inputId)).toEqual(['a', 's']);
+    expect(admittedOf(events(), 's')).toEqual(['steer']);
+    expect(bodies(events(), 'turn.delivery_added')).toMatchObject([{ route: route('web', 'web'), reason: 'steer' }]);
+    g.open();
+    await until(() => bodies(events(), 'turn.completed').length === 1);
+    await lane.whenIdle();
+    expect(terminalOf(events(), 's').map((b) => b.t)).toEqual(['input.consumed']);
+    // Admitted: the same input again is a duplicate, never steered twice.
+    expect(await lane.command({ type: 'input', sessionKey: 's1', input: s, mode: 'steer' }, hooks)).toEqual({ ok: true, disposition: 'duplicate' });
+    expect(bodies(events(), 'turn.started')).toHaveLength(1);
+  });
+
+  it('a steer whose policy hook throws is rejected (policy_error) with that answer kept; when even that cannot be kept the rejection rolls back too #PR-3 #IN-1', async () => {
+    const g = gate();
+    let plans = 0;
+    const { lane, events, calls, hooks } = hooked({
+      harness: new SteerableHarness(() => g.promise),
+      policy: policy({
+        plan: async () => {
+          if (++plans > 1) throw new Error('plan boom');
+          return { ...RUN, profile: 'bypass' };
+        },
+      }),
+    });
+    await lane.command({ type: 'input', sessionKey: 's1', input: input('a', { id: 'a' }), mode: 'queue' });
+    await until(() => bodies(events(), 'turn.started').length === 1);
+    const s = input('s', { id: 's' });
+    await expect(lane.command({ type: 'input', sessionKey: 's1', input: s, mode: 'steer' }, hooks)).rejects.toThrow('disk I/O error');
+    expect(terminalOf(events(), 's')).toEqual([]);
+    expect(await lane.command({ type: 'input', sessionKey: 's1', input: s, mode: 'steer' }, hooks)).toEqual({ ok: false, reason: 'policy_error' });
+    expect(calls).toEqual([{ ok: false, reason: 'policy_error' }, { ok: false, reason: 'policy_error' }]);
+    expect(terminalOf(events(), 's')).toMatchObject([{ t: 'input.rejected', reason: 'policy_error: plan boom' }]);
+    expect(admittedOf(events(), 's')).toEqual([]);
+    g.open();
+    await until(() => bodies(events(), 'turn.completed').length === 1);
+    await lane.whenIdle();
+    expect(terminalOf(events(), 's').map((b) => b.t)).toEqual(['input.rejected']);
+  });
+
+  it('an observed input whose answer cannot be kept is not recorded either: the same message again is recorded once, not a duplicate #PR-3', async () => {
+    const { lane, events, calls, hooks } = hooked();
+    const o = input('fyi', { id: 'o' });
+    await expect(lane.observe(o, hooks)).rejects.toThrow('disk I/O error');
+    expect(admittedOf(events(), 'o')).toEqual([]);
+    expect(lane.pendingContext()).toEqual([]);
+    expect(await lane.observe(o, hooks)).toEqual({ ok: true, disposition: 'observe_only' });
+    expect(calls).toEqual([{ ok: true, disposition: 'observe_only' }, { ok: true, disposition: 'observe_only' }]);
+    expect(admittedOf(events(), 'o')).toEqual(['observe_only']);
+    expect(lane.pendingContext().map((i) => i.inputId)).toEqual(['o']);
+  });
+
+  it('an input the loop guard stops whose answer cannot be kept leaves neither its record nor its notice; again, it is recorded once with its notice #PR-3', async () => {
+    const { lane, events, calls, hooks } = hooked({ loopGuard: { maxHops: 3 } });
+    const agent = (id: string): InputRecord => ({
+      ...input('ping', { id }),
+      origin: { ...origin('agent:writer', ['agent'], 'agent'), evidence: 'daemon', via: 'agent:writer:writer:main', adapter: 'agent' },
+      cause: { peer: 'writer/writer:main', basis: 'internal', hop: 9, chain: 'in_root' },
+    });
+    await expect(lane.command({ type: 'input', sessionKey: 's1', input: agent('g1'), mode: 'queue' }, hooks)).rejects.toThrow('disk I/O error');
+    expect(bodies(events())).toEqual([]);
+    expect(await lane.command({ type: 'input', sessionKey: 's1', input: agent('g2'), mode: 'queue' }, hooks)).toEqual({ ok: true, disposition: 'observe_only' });
+    expect(calls).toEqual([{ ok: true, disposition: 'observe_only' }, { ok: true, disposition: 'observe_only' }]);
+    expect(bodies(events()).map((b) => b.t)).toEqual(['input.admitted', 'notice']);
+    expect(admittedOf(events(), 'g2')).toEqual(['observe_only']);
+    expect(bodies(events(), 'notice')).toMatchObject([{ code: 'loop_guard' }]);
+    expect(bodies(events(), 'turn.started')).toEqual([]);
   });
 });
