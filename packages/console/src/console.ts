@@ -9,10 +9,7 @@ import {
   ADMIN_WS_BEARER_PREFIX,
   ADMIN_WS_PATH,
   ADMIN_WS_SUBPROTOCOL,
-  type AdminChannelsApplied,
-  type AdminContext,
   type AdminEndpoint,
-  type AdminRoute,
   AdminConfigPut,
   AdminConfigValidateRequest,
   AdminLoginRequest,
@@ -20,26 +17,29 @@ import {
   check,
   errors,
   type AdminError,
-  type AdminExplain,
   type AdminLoginResult,
-  type AdminQueue,
-  type AdminSessions,
-  type AdminStatus,
-  type Origin,
 } from '@agents-io/protocol';
-import type { ChannelRegistry } from './channel-registry.js';
-import { isLoopbackHost, isWildcardHost, type ConsoleConfig } from './config.js';
-import type { ConfigStore } from './console-config.js';
-import type { LogFn } from './gateway.js';
-import { FrameConn, type FrameTransport, type LocalHost } from './local-server.js';
+import {
+  FrameConn,
+  NO_REGISTRIES,
+  adminContributions,
+  isLoopbackHost,
+  isWildcardHost,
+  type ChannelRegistry,
+  type ConsoleServerOptions,
+  type ContributedRoute,
+  type FrameTransport,
+  type HarnessRegistry,
+} from '@agents-io/kernel';
 
 /*
  * The console API (packages/protocol/src/admin.ts): HTTP endpoints under
  * `/api` and the WebSocket `/ws`, for web UIs built against the protocol only.
- * Modules add routes of their own (`AdminContribution.routes`,
+ * What it serves is the daemon's (`ConsoleHost`, `@agents-io/kernel`'s
+ * console-host.ts). Modules add routes of their own (`AdminContribution.routes`,
  * packages/protocol/src/admin-module.ts), handed in as `ConsoleHost.routes` and
  * served after the core ones with the same auth; the gateway's are its channel
- * types' (lark-bot's bot provisioning).
+ * types' (lark-bot's bot provisioning) and its harness kinds'.
  *
  * - Listens on loopback unless the config allows otherwise (config.ts refuses
  *   a non-loopback host without `console.allowRemote`).
@@ -80,21 +80,15 @@ const WS_HIGH_WATER = 4 * 1024 * 1024;
 const WS_CLOSE_GRACE_MS = 1000;
 const STATUS_TEXT: Record<number, string> = { 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found' };
 
-/** A route a module contributed (`AdminContribution.routes`), with the context its handler gets. */
-export interface ContributedRoute {
-  route: AdminRoute;
-  ctx: AdminContext;
-}
-
 /**
- * Every admin HTTP endpoint for clients and route tables of a console over `channels`: the core
- * ones (`ADMIN_ENDPOINTS`), then the routes the registered types contribute
- * (`AdminContribution.routes`, without their handlers), in registration order. The gateway's
- * console serves these over its channel registry (and `POST /api/login-link`, `POST
- * /api/console-proof` for `aio console-link`).
+ * Every admin HTTP endpoint for clients and route tables of a console over `channels` and
+ * `harnesses` (default none): the core ones (`ADMIN_ENDPOINTS`), then the routes the registered
+ * channel types contribute, then the harness kinds' (`AdminContribution.routes`, without their
+ * handlers; `adminContributions`), in registration order. The gateway's console serves these over
+ * its registries (and `POST /api/login-link`, `POST /api/console-proof` for `aio console-link`).
  */
-export function adminEndpoints(channels: ChannelRegistry): AdminEndpoint[] {
-  return [...ADMIN_ENDPOINTS, ...channels.adminContributions.flatMap(({ admin }) => (admin.routes ?? []).map(({ handle: _handle, ...endpoint }) => endpoint))];
+export function adminEndpoints(channels: ChannelRegistry, harnesses: HarnessRegistry = NO_REGISTRIES.harnessRegistry): AdminEndpoint[] {
+  return [...ADMIN_ENDPOINTS, ...adminContributions(harnesses, channels).flatMap(({ admin }) => (admin.routes ?? []).map(({ handle: _handle, ...endpoint }) => endpoint))];
 }
 
 /**
@@ -117,26 +111,6 @@ function compileRoute(r: ContributedRoute): CompiledRoute {
     })
     .join('/');
   return { ...r, pattern: new RegExp(`^${source}$`), names };
-}
-
-/** What the console needs from the daemon. */
-export interface ConsoleHost {
-  /** For `/ws` connections (the same as the local socket's). */
-  readonly local: LocalHost;
-  /** The daemon's host token. */
-  readonly token: string;
-  status(): AdminStatus;
-  queue(): AdminQueue;
-  sessions(): AdminSessions;
-  explain(inputId: string): AdminExplain | undefined;
-  /** Origin of a console connection's client frames. */
-  consoleOrigin(sessionKey: string): Origin;
-  /** Absent: the daemon was started without a config file path (`/api/config*` answer 404). */
-  readonly configStore?: ConfigStore;
-  /** What modules add (`AdminContribution.routes`), served after the core routes; a path both serve is the core's. */
-  readonly routes?: readonly ContributedRoute[];
-  /** `console.liveChannels`: apply the file's `channels` to the running daemon after a `PUT`. */
-  applyChannels?(): Promise<{ applied: 'live' | 'restart'; channels: AdminChannelsApplied } | undefined>;
 }
 
 type Role = 'host' | 'session';
@@ -211,13 +185,7 @@ class HttpError extends Error {
   }
 }
 
-export interface ConsoleServerOptions {
-  config: ConsoleConfig;
-  host: ConsoleHost;
-  log: LogFn;
-  now?: () => number;
-}
-
+/** The console API server over what the daemon gives it (`ConsoleServerOptions.host`); a `ConsoleListener` for the gateway. */
 export class ConsoleServer {
   readonly auth: ConsoleAuth;
   /** The session cookie's name: random per daemon start. */

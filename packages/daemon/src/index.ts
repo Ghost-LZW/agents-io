@@ -1,9 +1,10 @@
 /*
- * @agents-io/daemon: the composition root. The kernel's API (`@agents-io/kernel`), with the built-in
- * registries (`bundle.ts`) as the defaults where the kernel has empty ones (`defaults.ts`), and the
- * built-in modules.
+ * @agents-io/daemon: the composition root. The kernel's API (`@agents-io/kernel`) and the console's
+ * (`@agents-io/console`), with the built-in registries (`bundle.ts`) as the defaults where they have
+ * empty ones and the console package's console for the gateway (`defaults.ts`), and the built-in modules.
  */
 export * from '@agents-io/kernel';
+export * from '@agents-io/console';
 export {
   CONFIG_DIR_KEYS,
   ConfigFile,

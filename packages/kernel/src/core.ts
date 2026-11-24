@@ -38,8 +38,9 @@ export function coreRegistries(): Registries {
 
 /**
  * What the kernel takes when it is given no registry (`ResolveContext`, `LoadOptions`,
- * `GatewayOptions`, `ConfigStoreOptions`, `importConfigModules`, `buildHarness`, the console's
- * credential marks): nothing registered, one set for all of them (registries never change; `with`
- * makes new ones), so a config resolved and a gateway started without registries agree.
+ * `GatewayOptions`, `importConfigModules`, `buildHarness`; and the console package's
+ * `ConfigStoreOptions`, credential marks and `adminEndpoints`): nothing registered, one set for
+ * all of them (registries never change; `with` makes new ones), so a config resolved and a gateway
+ * started without registries agree.
  */
 export const NO_REGISTRIES: Readonly<Registries> = Object.freeze(coreRegistries());

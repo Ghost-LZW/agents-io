@@ -1,0 +1,17 @@
+{
+  "name": "@agents-io/console",
+  "version": "0.1.0",
+  "description": "The agents-io console API: admin HTTP endpoints and /ws for web UIs, login links, config editing with redacted secrets, and the admin routes modules contribute; depends on the protocol and the kernel only (@agents-io/daemon wires it into the gateway)",
+  "type": "module",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist"],
+  "dependencies": {
+    "@agents-io/kernel": "workspace:*",
+    "@agents-io/protocol": "workspace:*",
+    "@sinclair/typebox": "^0.34.0",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.2"
+  }
+}

@@ -24,6 +24,7 @@ import {
 } from '@agents-io/protocol';
 import { DEFAULT_BLOB_MAX_BYTES, Router, RouterError, checkIdentities, ownerIdentities, ownersTable, type AgentContactRule, type AgentSpec, type LoopGuardOptions } from '@agents-io/session';
 import { NO_REGISTRIES } from './core.js';
+import { adminContributions, ownerName } from './admin-contributions.js';
 import type { ChannelRegistry } from './channel-registry.js';
 import { ConfigError } from './config-error.js';
 import { loadEnvFile } from './env-file.js';
@@ -255,27 +256,30 @@ const ConsoleApplyKeys = {
 };
 
 type ConsoleSection = TObject<typeof ConsoleServerKeys & typeof ConsoleApplyKeys>;
-const consoleSections = new WeakMap<ChannelRegistry, ConsoleSection>();
+const consoleSections = new WeakMap<HarnessRegistry, WeakMap<ChannelRegistry, ConsoleSection>>();
 
 /**
- * The `console` section over a registry's channel types: the console's own keys and, between the
- * server's and `liveChannels`, the settings the types contribute (`AdminContribution.console`,
- * each optional, in registration order; lark-bot's `larkBotCommand` is where it always was).
- * Closed, so a setting no registered type declares is a config error.
+ * The `console` section over a registry's harness kinds and a registry's channel types: the
+ * console's own keys and, between the server's and `liveChannels`, the settings they contribute
+ * (`AdminContribution.console`, each optional, in the order `adminContributions` lists them: the
+ * channel types', then the harness kinds'; lark-bot's `larkBotCommand` is where it always was).
+ * Closed, so a setting no registered type or kind declares is a config error.
  */
-function consoleSchema(registry: ChannelRegistry): ConsoleSection {
-  let s = consoleSections.get(registry);
+function consoleSchema(harnesses: HarnessRegistry, channels: ChannelRegistry): ConsoleSection {
+  let byChannels = consoleSections.get(harnesses);
+  if (!byChannels) consoleSections.set(harnesses, (byChannels = new WeakMap()));
+  let s = byChannels.get(channels);
   if (!s) {
     const contributed: Record<string, TSchema> = {};
-    for (const { type, admin } of registry.adminContributions) {
-      for (const [k, schema] of Object.entries(admin.console ?? {})) {
-        if (Object.hasOwn(ConsoleServerKeys, k) || Object.hasOwn(ConsoleApplyKeys, k)) throw new Error(`channel type ${JSON.stringify(type)}: admin setting console.${k} is the console's own`);
+    for (const c of adminContributions(harnesses, channels)) {
+      for (const [k, schema] of Object.entries(c.admin.console ?? {})) {
+        if (Object.hasOwn(ConsoleServerKeys, k) || Object.hasOwn(ConsoleApplyKeys, k)) throw new Error(`${ownerName(c)}: admin setting console.${k} is the console's own`);
         contributed[k] = Type.Optional(schema);
       }
     }
     // The static type has the console's own keys only: `resolveConsole` reads the others by name.
     s = Type.Object({ ...ConsoleServerKeys, ...contributed, ...ConsoleApplyKeys }, Closed) as unknown as ConsoleSection;
-    consoleSections.set(registry, s);
+    byChannels.set(channels, s);
   }
   return s;
 }
@@ -526,7 +530,7 @@ const KernelFile = Type.Object(
      * `aio serve`, on 127.0.0.1:7464. A non-loopback `host` is refused unless
      * `allowRemote` is true (then every request still needs a token).
      */
-    console: Type.Optional(consoleSchema(NO_REGISTRIES.channelRegistry)),
+    console: Type.Optional(consoleSchema(NO_REGISTRIES.harnessRegistry, NO_REGISTRIES.channelRegistry)),
     /**
      * The host connection. `tokenFile`: an operator-set host token, stable across restarts
      * (relative paths are relative to the config file). Read when the file exists (it must be
@@ -584,8 +588,8 @@ function moduleSections(modules: ModuleRegistry): { key: string; schema: TSchema
 
 /**
  * The config file's schema over a registry's harness kinds (`harnesses.<name>.use`, the older
- * `harness` block), a registry's channel types (`channels[].type` and the settings they add to
- * `console`; default none) and a registry's modules (their config sections; default none); the
+ * `harness` block and the settings they add to `console`), a registry's channel types
+ * (`channels[].type` and the settings they add to `console`; default none) and a registry's modules (their config sections; default none); the
  * rest is the kernel's own keys. The modules' sections come before `local`,
  * where `externalMcp` was before it was a module, unless the registry places one after a key of
  * the file's own, where it was before it was a module's (`ModuleFields.sectionAfter`: `presets`
@@ -605,7 +609,7 @@ export function configFileSchema(registry: HarnessRegistry, channels: ChannelReg
       harnesses: harnessesSchema(registry),
       harness: legacyBlockSchema(registry),
       channels: Type.Optional(Type.Array(channelEntrySchema(channels))),
-      console: Type.Optional(consoleSchema(channels)),
+      console: Type.Optional(consoleSchema(registry, channels)),
     };
     const sections = moduleSections(modules);
     const props: Record<string, TSchema> = {};
@@ -792,9 +796,9 @@ export interface ConsoleConfig {
   /** Apply channel changes written through the console at once. */
   liveChannels: boolean;
   /**
-   * The settings the channel types contribute (`AdminContribution.console`; the built-in lark-bot
-   * type's `larkBotCommand`), by key, as `consoleSettings` resolves them: the value written, else
-   * the key's schema default.
+   * The settings the channel types and harness kinds contribute (`AdminContribution.console`; the
+   * built-in lark-bot type's `larkBotCommand`), by key, as `consoleSettings` resolves them: the
+   * value written, else the key's schema default.
    */
   readonly [setting: string]: unknown;
 }
@@ -829,7 +833,7 @@ export function consoleSettings(section: Readonly<Record<string, unknown>> | und
   return out;
 }
 
-function resolveConsole(c: ConfigFile['console'], channels: ChannelRegistry): ConsoleConfig {
+function resolveConsole(c: ConfigFile['console'], harnesses: HarnessRegistry, channels: ChannelRegistry): ConsoleConfig {
   const host = c?.host ?? '127.0.0.1';
   if (!isLoopbackHost(host) && c?.allowRemote !== true)
     fail(`console.host ${JSON.stringify(host)} is not a loopback address; the console only listens on loopback unless console.allowRemote is true`);
@@ -859,7 +863,7 @@ function resolveConsole(c: ConfigFile['console'], channels: ChannelRegistry): Co
     origins,
     ...(c?.uiUrl !== undefined ? { uiUrl: c.uiUrl.replace(/\/$/, '') } : {}),
     sessionTtlMs: c?.sessionTtlMs ?? 12 * 3_600_000,
-    ...Object.assign({}, ...channels.adminContributions.map(({ admin }) => consoleSettings(c, admin.console))),
+    ...Object.assign({}, ...adminContributions(harnesses, channels).map(({ admin }) => consoleSettings(c, admin.console))),
     heartbeat: { intervalMs: c?.heartbeat?.intervalMs ?? DEFAULT_WS_HEARTBEAT_MS, timeoutMs: c?.heartbeat?.timeoutMs ?? DEFAULT_WS_HEARTBEAT_TIMEOUT_MS },
     liveChannels: c?.liveChannels === true,
   };
@@ -1086,7 +1090,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
       principal: { id: c.local?.principal ?? owners[0] ?? 'local:owner', labels: c.local?.labels ?? ['owner'] },
       session: localSession,
     },
-    console: resolveConsole(c.console, channelRegistry),
+    console: resolveConsole(c.console, registry, channelRegistry),
     host: c.host?.tokenFile !== undefined ? { tokenFile: path(c.host.tokenFile) } : {},
   };
   // After everything else, where the external MCP endpoint's settings were resolved before it was a
@@ -1151,7 +1155,7 @@ function unregistered(raw: unknown, schema: TObject, harnesses: HarnessRegistry,
   }
   for (const k of Object.keys(raw)) if (!Object.hasOwn(schema.properties, k)) out.push(`${k}: not a key of the config, and no registered module has a section of that name`);
   if (isRecord(raw.console)) {
-    const settings = (consoleSchema(channels) as unknown as TObject).properties;
+    const settings = (consoleSchema(harnesses, channels) as unknown as TObject).properties;
     for (const k of Object.keys(raw.console)) if (!Object.hasOwn(settings, k)) out.push(`console.${k}: not a console setting, and no registered channel module adds one of that name`);
   }
   return out;

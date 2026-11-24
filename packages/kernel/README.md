@@ -4,8 +4,11 @@ The agents-io daemon kernel with no module in it (`docs/design/core-slimming/` Â
 gateway (ingress, the binding-table router, one lane per session, the hub, compositors and the
 outbox, watches, schedules, task runs, the host inbound queue), config resolution, the feature
 module host and the harness, channel and module registries, the module file loader, the local
-Unix socket with the client and host frames (`docs/HOSTS.md`), the daemon's records, and the
-console API's core.
+Unix socket with the client and host frames (`docs/HOSTS.md`), the daemon's records, the
+mounting of the modules' admin contributions (`ChannelModule.admin`, `HarnessModule.admin`), and
+the seam to the console (`src/console-host.ts`). The console API itself, its HTTP server and the
+config file editing, is its own package, `@agents-io/console`, which depends on this one; give its
+`consoleFactory` to `Gateway.start` to serve it (`console: true` without one fails the start).
 
 It depends on no module package: no channel (`channel/*`) or harness (`harness/*`) package, and
 not `@agents-io/daemon`, the composition root that registers the built-in ones. A registry not
@@ -22,11 +25,14 @@ const gw = await Gateway.start({
   ...registries,
   harness: myHarness, // a HarnessAdapter: every instance of the config is this one
   channels: [{ adapter: myChannel }], // ChannelAdapters: with no channel type, the only channels
+  // console: true, consoleFactory, // the console API: `import { consoleFactory } from '@agents-io/console'`
 });
 ```
 
-`@agents-io/daemon` (`aio`) re-exports this API with the built-in registries as the defaults; its
-README documents the configuration, the host connection, the console API and the library in
-full ("Library", "The kernel without modules"). `test/core-only.test.ts` runs the kernel's
-promises on this package alone, and `pnpm boundaries:check` keeps it free of modules: its source
-imports and its package.json dependencies (`scripts/boundaries.json`, `test/boundaries.local.test.ts`).
+`@agents-io/daemon` (`aio`) re-exports this API and the console's with the built-in registries as
+the defaults and the console wired in; its README documents the configuration, the host
+connection, the console API and the library in full ("Library", "The kernel without modules").
+`test/core-only.test.ts` runs the kernel's promises on this package alone (with the console
+package's `consoleFactory` for the console API), and `pnpm boundaries:check` keeps it free of
+modules and of the console: its source imports and its package.json dependencies
+(`scripts/boundaries.json`, `test/boundaries.local.test.ts`).

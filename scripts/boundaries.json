@@ -5,10 +5,11 @@
     "packages/session": { "role": "core", "may": ["packages/protocol"] },
     "packages/host-mcp": { "role": "core", "may": ["packages/protocol", "packages/session"] },
     "packages/kernel": { "role": "core", "may": ["packages/protocol", "packages/session", "packages/host-mcp"] },
+    "packages/console": { "role": "core", "may": ["packages/protocol", "packages/kernel"] },
     "packages/daemon": {
       "role": "core",
       "root": true,
-      "may": ["packages/protocol", "packages/session", "packages/host-mcp", "packages/kernel"],
+      "may": ["packages/protocol", "packages/session", "packages/host-mcp", "packages/kernel", "packages/console"],
       "bundle": ["src/bundle.ts"]
     },
     "packages/testkit": { "role": "test", "may": ["packages/protocol"] },

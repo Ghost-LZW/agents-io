@@ -2,15 +2,24 @@ import { createHash } from 'node:crypto';
 import { chmodSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { Value } from '@sinclair/typebox/value';
-import { ADMIN_REDACTED, type AdminConfigDocument, type AdminConfigPutResult, type AdminConfigValidation, type ChannelModule, type ConfigAccess, type ConfigIssue } from '@agents-io/protocol';
-import { NO_REGISTRIES } from './core.js';
-import type { ChannelRegistry } from './channel-registry.js';
-import { ConfigError, configFileSchema, findEnvFile, resolveConfig, type Config } from './config.js';
-import { loadEnvFile } from './env-file.js';
-import { credentialMark } from './schema-marks.js';
-import type { HarnessRegistry } from './harness-registry.js';
-import type { ImportConfigModules } from './config-modules.js';
-import type { ModuleRegistry } from './modules.js';
+import { ADMIN_REDACTED, type AdminConfigDocument, type AdminConfigValidation, type ChannelModule, type ConfigIssue } from '@agents-io/protocol';
+import {
+  ConfigError,
+  NO_REGISTRIES,
+  canonical,
+  configFileSchema,
+  credentialMark,
+  findEnvFile,
+  loadEnvFile,
+  resolveConfig,
+  type ChannelRegistry,
+  type Config,
+  type ConfigStoreOptions,
+  type ConsoleConfigStore,
+  type HarnessRegistry,
+  type ModuleRegistry,
+  type PutOutcome,
+} from '@agents-io/kernel';
 
 /*
  * The config file as the console sees it (`GET/PUT /api/config`,
@@ -255,32 +264,6 @@ function pathOfMessage(msg: string, file: { properties: Record<string, unknown> 
   return pointer(m[1]!.split('.').flatMap((s) => s.split(/\[(\d+)\]/).filter(Boolean)));
 }
 
-export interface ConfigStoreOptions {
-  /** The config file (may not exist yet). */
-  path: string;
-  /** The env file `env:` references resolve from (default: found next to the config, as at startup). */
-  envFile?: string;
-  /** Process environment (default process.env); wins over the env file, as at startup. */
-  env?: NodeJS.ProcessEnv;
-  cwd?: string;
-  /** The harness kinds the file may name (default none; `@agents-io/daemon`'s: the built-in ones): the daemon's (`Gateway.harnessRegistry`). */
-  harnessRegistry?: HarnessRegistry;
-  /** The channel types the file may name, and what they mark as credentials (default none; `@agents-io/daemon`'s: the built-in ones): the daemon's (`Gateway.channelRegistry`). */
-  channelRegistry?: ChannelRegistry;
-  /** The feature modules whose config sections the file may have (default none; `@agents-io/daemon`'s: the built-in ones): the daemon's (`Gateway.moduleRegistry`). */
-  moduleRegistry?: ModuleRegistry;
-  /**
-   * How the daemon imports the module files a config file names (`ConfigModules.importModules`):
-   * a document is then validated, listed and applied live with the registries this gives for it
-   * (what the next start would read it with), not with the ones above; its credentials are what
-   * either these or `channelRegistry` mark (a descriptor the daemon's start imported still marks its
-   * entries when its file is gone or resolves elsewhere now). A file that does not import is an
-   * issue of the document. Without it (a daemon that imports no module files), a `modules` entry
-   * the registries above lack is an error: the start would refuse it.
-   */
-  importModules?: ImportConfigModules;
-}
-
 /** The registries a document is read with. */
 interface Registries {
   harnesses: HarnessRegistry;
@@ -295,13 +278,11 @@ interface Registries {
   marks: readonly ChannelRegistry[];
 }
 
-export type PutOutcome =
-  | { status: 200; body: AdminConfigPutResult }
-  | { status: 409; code: 'conflict'; message: string }
-  | { status: 422; body: AdminConfigValidation };
-
-/** The config file of a daemon; the `ConfigAccess` its modules' admin contributions get (`AdminContext.config`). */
-export class ConfigStore implements ConfigAccess {
+/**
+ * The config file of a daemon (`ConsoleConfigStore`, the console's and the gateway's); the
+ * `ConfigAccess` its modules' admin contributions get (`AdminContext.config`).
+ */
+export class ConfigStore implements ConsoleConfigStore {
   /**
    * The file as the running daemon reflects it: as it started, with `channels` replaced by
    * the ones last applied live. To tell whether a change needs a restart.
@@ -540,10 +521,4 @@ export function writeFileAtomic(path: string, text: string): void {
     }
     throw e;
   }
-}
-
-export function canonical(v: Json): string {
-  const sort = (x: Json): Json =>
-    Array.isArray(x) ? x.map(sort) : x && typeof x === 'object' ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, y]) => [k, sort(y)])) : x;
-  return JSON.stringify(sort(v));
 }

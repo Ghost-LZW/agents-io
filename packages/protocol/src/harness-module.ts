@@ -1,4 +1,5 @@
 import type { TObject } from '@sinclair/typebox';
+import type { AdminContribution } from './admin-module.js';
 import type { HarnessAdapter, HarnessFactoryInit } from './harness.js';
 
 /*
@@ -149,6 +150,12 @@ export interface HarnessModule<L = unknown> {
    * and the CLI's own commands keep their names. Claude Code: `tui-bridge`, which its terminal UI starts.
    */
   readonly cli?: Readonly<Record<string, HarnessCliCommand>>;
+  /**
+   * What the kind adds to the host's admin API and console (core-slimming G5), as a channel type's
+   * `ChannelModule.admin`: console settings, schemas, routes and what runs while the console serves
+   * them. A registered kind's only (see above); served whether or not the config has an instance of it.
+   */
+  readonly admin?: AdminContribution;
   /** The adapter of one instance (or of a task run on it, its env joined to the instance's). Starts nothing: its first `probe` or `open` does. */
   create(init: HarnessModuleInit<L>): HarnessAdapter;
 }

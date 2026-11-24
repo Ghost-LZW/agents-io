@@ -1,7 +1,7 @@
 {
   "name": "@agents-io/daemon",
   "version": "0.1.0",
-  "description": "The agents-io daemon and CLI (aio): the composition root that registers the built-in modules (Claude Code, Codex, Lark, mail, JSONL bridges, feature modules) on the kernel (@agents-io/kernel) and re-exports its API",
+  "description": "The agents-io daemon and CLI (aio): the composition root that registers the built-in modules (Claude Code, Codex, Lark, mail, JSONL bridges, feature modules) on the kernel (@agents-io/kernel), wires the console (@agents-io/console), and re-exports their API",
   "type": "module",
   "bin": { "aio": "./dist/cli.js" },
   "exports": {
@@ -17,6 +17,7 @@
     "@agents-io/channel-jsonl-bridge": "workspace:*",
     "@agents-io/channel-lark-bot": "workspace:*",
     "@agents-io/channel-mail": "workspace:*",
+    "@agents-io/console": "workspace:*",
     "@agents-io/host-mcp": "workspace:*",
     "@agents-io/harness-claude-code": "workspace:*",
     "@agents-io/harness-codex": "workspace:*",

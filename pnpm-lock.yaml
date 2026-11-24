@@ -135,6 +135,25 @@ importers:
         specifier: workspace:*
         version: link:../../packages/testkit
 
+  packages/console:
+    dependencies:
+      '@agents-io/kernel':
+        specifier: workspace:*
+        version: link:../kernel
+      '@agents-io/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@sinclair/typebox':
+        specifier: ^0.34.0
+        version: 0.34.52
+      ws:
+        specifier: ^8.22.0
+        version: 8.22.0
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.18.2
+        version: 8.18.2
+
   packages/daemon:
     dependencies:
       '@agents-io/channel-jsonl-bridge':
@@ -146,6 +165,9 @@ importers:
       '@agents-io/channel-mail':
         specifier: workspace:*
         version: link:../../channel/mail
+      '@agents-io/console':
+        specifier: workspace:*
+        version: link:../console
       '@agents-io/harness-claude-code':
         specifier: workspace:*
         version: link:../../harness/claude-code
@@ -238,16 +260,10 @@ importers:
       '@sinclair/typebox':
         specifier: ^0.34.0
         version: 0.34.52
-      ws:
-        specifier: ^8.22.0
-        version: 8.22.0
     devDependencies:
       '@agents-io/testkit':
         specifier: workspace:*
         version: link:../testkit
-      '@types/ws':
-        specifier: ^8.18.2
-        version: 8.18.2
 
   packages/protocol:
     dependencies:

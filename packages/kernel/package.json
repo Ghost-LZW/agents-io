@@ -1,7 +1,7 @@
 {
   "name": "@agents-io/kernel",
   "version": "0.1.0",
-  "description": "The agents-io daemon kernel with no module in it: gateway, config resolution, module host and registries, local socket and host protocol, records, console core; registries default to empty (@agents-io/daemon registers the built-in modules)",
+  "description": "The agents-io daemon kernel with no module in it: gateway, config resolution, module host and registries, local socket and host protocol, records, the console's seam (the console is @agents-io/console); registries default to empty (@agents-io/daemon registers the built-in modules)",
   "type": "module",
   "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
   "files": ["dist"],
@@ -9,11 +9,9 @@
     "@agents-io/host-mcp": "workspace:*",
     "@agents-io/protocol": "workspace:*",
     "@agents-io/session": "workspace:*",
-    "@sinclair/typebox": "^0.34.0",
-    "ws": "^8.22.0"
+    "@sinclair/typebox": "^0.34.0"
   },
   "devDependencies": {
-    "@agents-io/testkit": "workspace:*",
-    "@types/ws": "^8.18.2"
+    "@agents-io/testkit": "workspace:*"
   }
 }

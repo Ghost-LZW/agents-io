@@ -11,9 +11,11 @@ This package is the composition root: `src/bundle.ts` registers the built-in cha
 harness kinds and feature modules (the module packages under `channel/` and `harness/`, and the
 feature modules in `src/`), on the kernel, `@agents-io/kernel` (`packages/kernel`: the gateway,
 config resolution, the module host and registries, the local socket, the host and client
-protocol, records, the console's core), which depends on no module package. The package's API is
-the kernel's, with the built-in registries as the defaults where the kernel's are empty
-(`src/defaults.ts`), and the built-in modules ("Library" below).
+protocol, records, the seam to the console), which depends on no module package, and wires in
+the console, `@agents-io/console` (`packages/console`: the admin HTTP API and `/ws`, config
+editing), which depends on the protocol and the kernel only. The package's API is the kernel's
+and the console's, with the built-in registries as the defaults where theirs are empty and the
+console served by the gateway (`src/defaults.ts`), and the built-in modules ("Library" below).
 
 It grew out of `examples/dev-gateway`; that example is now a thin `aio-dev`
 wrapper around this CLI.
@@ -149,7 +151,8 @@ see `docs/E2E.md` §0). New:
   start, its `create` gets the factory's init plus `launch` = that config, the instance's `env`
   and `profiles`; its `declares` is what its adapters declare where they say nothing themselves,
   each member the adapter's own first, checked at start like the adapter's; its `cli` adds
-  commands to the CLI, see "CLI"); the adapter it returns serves every session of the instance.
+  commands to the CLI, see "CLI"; its `admin` is not used: what a kind adds to the console is a
+  registered kind's, see "Console API"); the adapter it returns serves every session of the instance.
   Stop and restart follow what the adapter declares, built-in or module alike
   (`HarnessAdapter` in `packages/protocol/src/harness.ts`): with `detach()` its lanes are
   detached at stop (a running turn stays open in the log) and `detach()` is called once;
@@ -404,13 +407,17 @@ Spec: `docs/HOSTS.md` §4.9, INVARIANTS LN-11.
 
 `aio serve` also serves the console API of `packages/protocol/src/admin.ts`
 (HTTP under `/api`, WebSocket `/ws`), so a web UI in another repo can be built
-against the protocol alone. Channel types add to it (`ChannelModule.admin`, an
-`AdminContribution` of `packages/protocol/src/admin-module.ts`): keys of the
-`console` section, routes the console serves after its own with the same auth and
-conventions, and what runs behind them (`mount`, with an `AdminContext`: the type's
-console settings, the private directory `<dataDir>/provision`, the config file as a
-`ConfigAccess`). `adminEndpoints(registry)` lists the core endpoints
-(`ADMIN_ENDPOINTS`) and the registry's. Lark bot provisioning (`/api/bots/lark`,
+against the protocol alone. The console is its own package, `@agents-io/console`
+(`packages/console`); this package's `Gateway.start` serves it (`GatewayOptions.consoleFactory`,
+which an embedder of `@agents-io/kernel` gives itself). Channel types and harness kinds add to it
+(`ChannelModule.admin`, `HarnessModule.admin`, an `AdminContribution` of
+`packages/protocol/src/admin-module.ts`): keys of the `console` section, routes the console serves
+after its own with the same auth and conventions, and what runs behind them (`mount`, with an
+`AdminContext`: the module's console settings, the private directory `<dataDir>/provision`, the
+config file as a `ConfigAccess`). The channel types' come first, then the harness kinds', each in
+registration order; a route, console key or schema name belongs to one of them across both
+registries. `adminEndpoints(channels, harnesses)` lists the core endpoints (`ADMIN_ENDPOINTS`),
+then the channel types', then the harness kinds' (the built-in kinds contribute none). Lark bot provisioning (`/api/bots/lark`,
 `console.larkBotCommand`) is the lark-bot module's (`larkBotAdmin` in
 `channel/lark-bot/src/provision-admin.ts`): its schemas are
 `channel/lark-bot/src/admin.ts` (`LARK_BOT_ADMIN_ENDPOINTS`, JSON Schemas in
@@ -946,16 +953,19 @@ secret-looking key); `x-credential` marks in a module's schema are not read yet.
 `Gateway.start({ config, … })` starts everything in-process (tests and e2e use
 `harness` / `buildHarness` / `channels` to inject fakes); `LocalClient` speaks both
 client and host frames (`hello`, `runStart`, `runEndedOf`, `inboundRead`, `onRequest('inbound' | 'policy', …)`, …).
-Everything `@agents-io/kernel` exports is exported here too; where a kernel function or class
-takes registries and defaults to none, this package's (`src/defaults.ts`) defaults to the built-in
-ones (`builtinHarnesses`, `builtinChannels`, `builtinModules`): `Gateway` (`start`; it also
-gives the kernel this package's `aio` as `GatewayOptions.cli`), `resolveConfig`, `loadConfig`,
+Everything `@agents-io/kernel` and `@agents-io/console` export is exported here too; where a
+function or class of theirs takes registries and defaults to none, this package's
+(`src/defaults.ts`) defaults to the built-in ones (`builtinHarnesses`, `builtinChannels`,
+`builtinModules`): `Gateway` (`start`; it also gives the kernel the console package's
+`consoleFactory` as `GatewayOptions.consoleFactory` and this package's `aio` as
+`GatewayOptions.cli`, and its `console` and `configStore` are typed as the console package's
+`ConsoleServer` and `ConfigStore`), `resolveConfig`, `loadConfig`,
 `loadConfigModules`, `importConfigModules`, `configFileSchema`, `ConfigStore`, `InstanceHarness`
 (without `profilesInOpen`, what the built-in registry says of the kind), `buildHarness`,
 `isCredential`, `redact`, `unredact`, `implicitEnv`. `ConfigFile`, `RESERVED_CHANNEL_IDS` and
 `CONFIG_DIR_KEYS` are the built-in registries', and `Config`, `ConfigFile`, `ChannelEntry`,
 `ResolvedChannel` are typed for the built-in channel types and modules. The classes are the
-kernel's with these defaults: `instanceof` either one holds for the instances of both.
+kernel's and the console's with these defaults: `instanceof` either one holds for the instances of both.
 
 A config naming module files (`modules` entries, module channel files exporting a descriptor) is
 loaded as `aio serve` does: `const r = await loadConfigModules({ path })` (or
@@ -990,9 +1000,13 @@ const gw = await Gateway.start({
   ...registries,
   harness: myHarness, // a HarnessAdapter: every instance of the config is this one
   channels: [{ adapter: myChannel }], // ChannelAdapters: with no channel type, the only channels
+  // console: true, consoleFactory, // the console API: `import { consoleFactory } from '@agents-io/console'`
 });
 ```
 
+- The console API is not in the kernel: it is `@agents-io/console`, which depends on the kernel.
+  Give its `consoleFactory` (`GatewayOptions.consoleFactory`) to serve it; without one there is no
+  config store, and `console: true` fails the start with a `ConfigError` naming the option.
 - A config that configures no harness resolves, with no kind registered, to one instance,
   `embedded` (`EMBEDDED_HARNESS`; its run has `model: ''`): it stands for the adapter you pass
   (`GatewayOptions.harness`, or `buildHarness` for one adapter per instance). `Gateway.start`
@@ -1014,7 +1028,8 @@ const gw = await Gateway.start({
   unknown route, 404). The session log, lanes, outbox, requests, host inbound queue, explain and
   the host protocol are the same as in the bundled `aio`: `packages/kernel/test/core-only.test.ts`
   runs the kernel's promises (IN-1, IN-5, LN-1, LN-2, LN-10, DL-1, DL-2, EX-2, RQ-1, HQ-1) on it
-  with testkit's `FakeChannel` and `FakeHarness`, importing nothing but the kernel.
+  with testkit's `FakeChannel` and `FakeHarness`, importing nothing but the kernel (and the
+  console package for the console API).
 - A harness whose terminal UI takes a session over (`HarnessAdapter.takeover`) gets the CLI its
   helpers run as from `GatewayOptions.cli` (`TakeoverServices.cli`); the kernel has none of its
   own, so without it `aio tui` / `tui.attach` on such a session is answered `unsupported`.
@@ -1575,3 +1590,34 @@ What changed for embedders with the kernel package (core-slimming §4 "不含模
 - The gateway's constructor is `protected` (it was `private`) so that this package's `Gateway` can
   extend it; `Gateway.start` is still the way to make one. `GET /api/status` `version` is the
   kernel package's version (`0.1.0`, as the daemon's).
+
+What changed for embedders with the console package (core-slimming §4 P2 item 4 and the rest of
+G5, 2026-11-25):
+
+- The console is its own package, `@agents-io/console` (`packages/console`): `console.ts` and
+  `console-config.ts` moved there from the kernel under the same file names (`ConsoleServer`,
+  `ConsoleAuth`, `consoleProof`, `CONSOLE_COOKIE_PREFIX`, `adminEndpoints`, `ConfigStore`,
+  `isCredential`, `redact`, `unredact`, `implicitEnv`, `envRefs`, `writeFileAtomic`,
+  `CredentialMarks`), plus `consoleFactory`. It depends on the protocol and the kernel only.
+- This package's exports are as before (the same names, the same defaults): it re-exports the
+  console package too, and its `Gateway.start` serves the console as it did. The admin HTTP API
+  (paths, statuses, bodies, auth), the config file and the JSON Schema files are unchanged.
+- `@agents-io/kernel` no longer has the console's classes and functions; it has the seam
+  (`src/console-host.ts`): `ConsoleHost`, `ContributedRoute`, `ConsoleServerOptions`,
+  `ConfigStoreOptions` and `PutOutcome` as before, and new `ConsoleConfigStore` (what the gateway
+  and the console use of the config store), `ConsoleListener` (of the server), `ConsoleFactory` and
+  `GatewayOptions.consoleFactory`. `canonical` is the kernel's. A kernel gateway without a
+  `consoleFactory` has no `configStore`, and `console: true` fails its start (`ConfigError`).
+  `Gateway.console` is typed `ConsoleListener` there (this package's `Gateway` narrows it to
+  `ConsoleServer`, and `configStore` to `ConfigStore`). The kernel also exports `NO_REGISTRIES`,
+  `loadEnvFile`, `parseEnv`, `credentialMark` and `adminContributions`, and no longer depends on `ws`.
+- Harness kinds may contribute admin routes and console settings: `HarnessModule.admin` (the same
+  `AdminContribution` as `ChannelModule.admin`; a registered kind's, not a `use: "module"`
+  descriptor's). `HarnessRegistry` checks and claims it at registration as `ChannelRegistry` does
+  (`harness kind "x": bad admin…`, `harness kinds "a" and "b" both contribute admin …`) and lists
+  them (`HarnessRegistry.adminContributions`); a channel type and a harness kind contributing the
+  same route, console key or schema name fail where both registries meet (`configFileSchema`,
+  `resolveConfig`, the gateway: `channel type "a" and harness kind "b" both contribute admin …`).
+  The `console` section has the harness kinds' keys after the channel types' (before
+  `liveChannels`), the console serves their routes after the channel types', and
+  `adminEndpoints(channels, harnesses?)` lists them last. The built-in kinds contribute none.

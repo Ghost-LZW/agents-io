@@ -18,7 +18,8 @@ import {
   type Binding,
 } from '@agents-io/protocol';
 import { main } from '../src/cli.js';
-import { ConfigError, ConsoleAuth, consoleUrlPath } from '@agents-io/kernel';
+import { ConsoleAuth } from '@agents-io/console';
+import { ConfigError, consoleUrlPath } from '@agents-io/kernel';
 import { resolveConfig } from '../src/defaults.js';
 import { consoleDaemon, rawGet } from './console-helpers.js';
 import { tmp, until } from './helpers.js';

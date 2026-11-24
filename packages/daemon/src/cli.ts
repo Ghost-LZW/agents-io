@@ -14,7 +14,6 @@ import {
   DaemonUnavailable,
   LocalClient,
   TokenError,
-  consoleProof,
   consoleUrlPath,
   harnessModuleCommands,
   readTokenFile,
@@ -23,6 +22,7 @@ import {
   type LoadOptions,
   type ModuleLaunch,
 } from '@agents-io/kernel';
+import { consoleProof } from '@agents-io/console';
 import { builtinHarnesses } from './bundle.js';
 import { Gateway, loadConfig, loadConfigModules } from './defaults.js';
 import { WATCH_SPEC_HELP, formatWatch, parseDuration, parseWatchSpec } from './watch-spec.js';

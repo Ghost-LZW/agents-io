@@ -35,9 +35,16 @@ function classified(): Map<string, { role: string; root: boolean }> {
   return new Map(Object.entries(packages).map(([dir, p]) => [(JSON.parse(readFileSync(join(root, dir, 'package.json'), 'utf8')) as { name: string }).name, { role: p.role, root: p.root === true }]));
 }
 
-/** The core packages the kernel may reach: every core package but the composition root. */
+/**
+ * The core packages the kernel may reach: itself and the ones its `may` list in
+ * `scripts/boundaries.json` names. Not every core package: the console (`@agents-io/console`) is
+ * one that depends on the kernel, and the composition root is one too.
+ */
 function kernelPackages(): Set<string> {
-  return new Set([...classified()].filter(([, p]) => p.role === 'core' && !p.root).map(([name]) => name));
+  const { packages } = JSON.parse(readFileSync(join(root, 'scripts', 'boundaries.json'), 'utf8')) as { packages: Record<string, { may: string[] }> };
+  const name = (dir: string) => (JSON.parse(readFileSync(join(root, dir, 'package.json'), 'utf8')) as { name: string }).name;
+  const roles = classified();
+  return new Set(['packages/kernel', ...packages['packages/kernel']!.may].map(name).filter((n) => roles.get(n)?.role === 'core' && !roles.get(n)!.root));
 }
 
 describe('@agents-io/kernel', () => {

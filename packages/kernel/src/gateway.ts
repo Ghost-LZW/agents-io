@@ -131,11 +131,11 @@ import { NO_REGISTRIES } from './core.js';
 import { badChannelAdapter, declaredInner, loadHarnessModule } from './module-loader.js';
 import { descriptorAdmin } from './module-channel.js';
 import { ConfigError, EMBEDDED_HARNESS, UNGRANTED_EVIDENCE, agentSpec, configTable, consoleSettings, resolveModules, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type ResolvedChannel } from './config.js';
-import { ConsoleServer, type ContributedRoute } from './console.js';
+import { canonical, type ConsoleConfigStore, type ConsoleFactory, type ConsoleListener, type ContributedRoute } from './console-host.js';
+import { adminContributions } from './admin-contributions.js';
 import type { ChannelRegistry, DefaultEvidence } from './channel-registry.js';
 import type { HarnessRegistry } from './harness-registry.js';
 import type { ImportConfigModules } from './config-modules.js';
-import { ConfigStore, canonical } from './console-config.js';
 import { NamedRuns, type NamedRun } from './run-defaults.js';
 import type { ClientCommand, SessionInfo } from './frames.js';
 import { ClientOps, type Op, type OpFrame, type OpOutcome } from './client-ops.js';
@@ -223,8 +223,14 @@ export interface GatewayOptions {
   tokenFile?: string;
   /** Inbound push: how long a pushed item waits for the host's result, and the retry delay (tests). */
   hostPush?: { timeoutMs?: number; retryMs?: number };
-  /** Serve the console API per `config.console` (default false; `aio serve` turns it on unless `console.enabled` is false). */
+  /** Serve the console API per `config.console` (default false; `aio serve` turns it on unless `console.enabled` is false); it needs `consoleFactory`. */
   console?: boolean;
+  /**
+   * What serves the console API and edits the config file (`@agents-io/console`'s `consoleFactory`;
+   * `@agents-io/daemon` gives it): the composition root's. Without it there is no console:
+   * `console: true` fails the start (`ConfigError`), and there is no `configStore`.
+   */
+  consoleFactory?: ConsoleFactory;
   /** Environment of provisioning children (default process.env; tests). */
   consoleEnv?: NodeJS.ProcessEnv;
   /**
@@ -458,13 +464,16 @@ export class Gateway {
   private readonly configured = new Map<string, { id: string; account: string }>();
   private server: LocalServer | undefined;
   private tokenFile: string | undefined;
-  /** The console API server (`GatewayOptions.console`). */
-  console: ConsoleServer | undefined;
+  /** The console API server (`GatewayOptions.console`, made by `GatewayOptions.consoleFactory`). */
+  console: ConsoleListener | undefined;
   private consoleFile: string | undefined;
-  /** The config file as the console edits it (when the config came from a file). */
-  readonly configStore: ConfigStore | undefined;
-  /** What the channel types' admin contributions mounted with the console (`ChannelModule.admin`), ended with it. */
-  private readonly adminMounts: { type: string; close?(): void }[] = [];
+  /** The config file as the console edits it (when the config came from a file and there is a `consoleFactory`). */
+  readonly configStore: ConsoleConfigStore | undefined;
+  /**
+   * What the channel types' and harness kinds' admin contributions mounted with the console
+   * (`ChannelModule.admin`, `HarnessModule.admin`), ended with it; `who` names the owner in the log.
+   */
+  private readonly adminMounts: { who: string; close?(): void }[] = [];
   readonly startedAt = Date.now();
   private readonly log: LogFn;
   private stopped = false;
@@ -782,8 +791,8 @@ export class Gateway {
           }
         : {}),
     });
-    if (c.source) {
-      this.configStore = new ConfigStore({
+    if (c.source && o.consoleFactory) {
+      this.configStore = o.consoleFactory.configStore({
         path: c.source.path,
         ...(c.source.envFile ? { envFile: c.source.envFile } : {}),
         ...(o.consoleEnv ? { env: o.consoleEnv } : {}),
@@ -946,6 +955,8 @@ export class Gateway {
   }
 
   static async start(o: GatewayOptions): Promise<Gateway> {
+    // Before anything runs: the kernel has no console of its own (the composition root gives `@agents-io/console`'s).
+    if (o.console && !o.consoleFactory) throw new ConfigError('console: the console API needs a console implementation (GatewayOptions.consoleFactory: @agents-io/console\'s consoleFactory); this gateway has none');
     // Module lifecycle step 2 (step 1 ran in loadConfig): set up before the gateway builds its
     // ingress, so their tools and commands are assembled with the kernel's. Their kernel context is
     // late-bound: it works once the gateway exists.
@@ -996,7 +1007,7 @@ export class Gateway {
         gw.tokenFile = tokenPath(o.config.socketPath);
         writeTokenFile(gw.tokenFile, gw.token);
       }
-      if (o.console) await gw.startConsole();
+      if (o.console) await gw.startConsole(o.consoleFactory!);
       // Step 3: after the channels, the local socket and the console (the external MCP endpoint last).
       await gw.modules.start();
       // Schedules fire once what they send through runs: the channels, and the modules that send a
@@ -1017,10 +1028,10 @@ export class Gateway {
    * The console API. A port that is taken is logged, not fatal: the daemon's
    * channels and sockets keep working without it.
    */
-  private async startConsole(): Promise<void> {
+  private async startConsole(factory: ConsoleFactory): Promise<void> {
     const c = this.o.config;
     const routes = this.mountAdmin();
-    const server = new ConsoleServer({
+    const server = factory.server({
       config: c.console,
       host: {
         local: this,
@@ -1056,18 +1067,20 @@ export class Gateway {
   }
 
   /**
-   * Mount what the channel types add to the console (`ChannelModule.admin`, in registration order):
-   * each contribution gets a context of its own (its console settings, the private work directory
-   * `<dataDir>/provision`, the config file when the daemon has one) for its `mount` and every call
-   * of its routes. A `mount` that throws fails the start.
+   * Mount what the channel types and harness kinds add to the console (`ChannelModule.admin`,
+   * `HarnessModule.admin`, in the order `adminContributions` lists them: the channel types', then
+   * the harness kinds', each in registration order): each contribution gets a context of its own
+   * (its console settings, the private work directory `<dataDir>/provision`, the config file when
+   * the daemon has one) for its `mount` and every call of its routes. A `mount` that throws fails the start.
    */
   private mountAdmin(): ContributedRoute[] {
     const c = this.o.config;
-    const contributions = this.channelRegistry.adminContributions;
+    const contributions = adminContributions(this.harnessRegistry, this.channelRegistry);
     const dir = join(c.dataDir, 'provision');
     if (contributions.some(({ admin }) => admin.mount)) privateDir(dir, (msg) => this.log('warn', msg));
     const routes: ContributedRoute[] = [];
-    for (const { type, admin } of contributions) {
+    for (const contribution of contributions) {
+      const { admin } = contribution;
       const ctx: AdminContext = {
         console: consoleSettings(c.console, admin.console),
         dir,
@@ -1077,7 +1090,7 @@ export class Gateway {
         ...(this.configStore && c.console.liveChannels ? { applyChannels: () => this.applyChannels() } : {}),
       };
       const mounted = admin.mount?.(ctx);
-      if (mounted) this.adminMounts.push({ type, ...(mounted.close ? { close: () => mounted.close!() } : {}) });
+      if (mounted) this.adminMounts.push({ who: `${contribution.owner} ${contribution.name}`, ...(mounted.close ? { close: () => mounted.close!() } : {}) });
       for (const route of admin.routes ?? []) routes.push({ route, ctx });
     }
     return routes;
@@ -1089,7 +1102,7 @@ export class Gateway {
       try {
         m.close?.();
       } catch (e) {
-        this.log('warn', `channel type ${m.type}: closing its console part failed: ${(e as Error).message}`);
+        this.log('warn', `${m.who}: closing its console part failed: ${(e as Error).message}`);
       }
     }
   }

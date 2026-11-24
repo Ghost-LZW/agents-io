@@ -2,26 +2,30 @@ import { fileURLToPath } from 'node:url';
 import type { TObject } from '@sinclair/typebox';
 import type { BlobAccess, HarnessAdapter } from '@agents-io/protocol';
 import {
-  ConfigStore as KernelConfigStore,
+  ConfigStore as ConfigStoreBase,
+  consoleFactory,
+  implicitEnv as consoleImplicitEnv,
+  isCredential as consoleIsCredential,
+  redact as consoleRedact,
+  unredact as consoleUnredact,
+  type ConsoleServer,
+  type CredentialMarks,
+} from '@agents-io/console';
+import {
   Gateway as KernelGateway,
   InstanceHarness as KernelInstanceHarness,
   buildHarness as kernelBuildHarness,
   configFileSchema as kernelConfigFileSchema,
-  implicitEnv as kernelImplicitEnv,
   importConfigModules as kernelImportConfigModules,
-  isCredential as kernelIsCredential,
   loadConfig as kernelLoadConfig,
   loadConfigModules as kernelLoadConfigModules,
-  redact as kernelRedact,
   resolveConfig as kernelResolveConfig,
-  unredact as kernelUnredact,
   type ChannelCommonFields,
   type ChannelRegistry,
   type Config as KernelConfig,
   type ConfigFile as KernelConfigFile,
   type ConfigModules,
   type ConfigStoreOptions,
-  type CredentialMarks,
   type GatewayOptions,
   type HarnessInstance,
   type HarnessRegistry,
@@ -35,11 +39,11 @@ import type { ExternalMcpConfig } from './external-mcp.js';
 import type { PresetConfig } from './presets.js';
 
 /*
- * The kernel's API (`@agents-io/kernel`) as `@agents-io/daemon` always had it: a registry not given
- * is the built-in one (`bundle.ts`), where the kernel's is empty. These names shadow the kernel's in
- * the package's index; the types are the kernel's, typed for the built-in channel types and modules.
- * The classes are the kernel's with these defaults: `instanceof` either class is true for the
- * instances of both.
+ * The kernel's API (`@agents-io/kernel`) and the console's (`@agents-io/console`) as
+ * `@agents-io/daemon` always had them: a registry not given is the built-in one (`bundle.ts`), where
+ * theirs is empty, and the gateway serves the console package's console. These names shadow theirs
+ * in the package's index; the types are theirs, typed for the built-in channel types and modules.
+ * The classes are theirs with these defaults: `instanceof` either class is true for the instances of both.
  */
 
 /** `o` with the built-in registry for each it does not give. */
@@ -119,33 +123,39 @@ export function loadConfigModules(o: LoadOptions = {}): Promise<ConfigModules> {
   return kernelLoadConfigModules({ ...o, moduleRegistry: o.moduleRegistry ?? builtinModules, channelRegistry: o.channelRegistry ?? builtinChannels });
 }
 
-/** The kernel's `isCredential`, by the built-in channel types' marks unless `channels` says. */
+/** The console's `isCredential`, by the built-in channel types' marks unless `channels` says. */
 export function isCredential(doc: unknown, at: (string | number)[], channels: CredentialMarks = builtinChannels): boolean {
-  return kernelIsCredential(doc, at, channels);
+  return consoleIsCredential(doc, at, channels);
 }
 
-/** The kernel's `redact`, by the built-in channel types' marks unless `channels` says. */
+/** The console's `redact`, by the built-in channel types' marks unless `channels` says. */
 export function redact(raw: unknown, channels: CredentialMarks = builtinChannels): unknown {
-  return kernelRedact(raw, channels);
+  return consoleRedact(raw, channels);
 }
 
-/** The kernel's `implicitEnv`, by the built-in channel types unless `channels` says. */
+/** The console's `implicitEnv`, by the built-in channel types unless `channels` says. */
 export function implicitEnv(raw: unknown, channels: ChannelRegistry = builtinChannels, skip: readonly string[] = []): string[] {
-  return kernelImplicitEnv(raw, channels, skip);
+  return consoleImplicitEnv(raw, channels, skip);
 }
 
-/** The kernel's `unredact`, by the built-in channel types' marks unless `channels` says. */
-export function unredact(next: unknown, stored: unknown, channels: CredentialMarks = builtinChannels): ReturnType<typeof kernelUnredact> {
-  return kernelUnredact(next, stored, channels);
+/** The console's `unredact`, by the built-in channel types' marks unless `channels` says. */
+export function unredact(next: unknown, stored: unknown, channels: CredentialMarks = builtinChannels): ReturnType<typeof consoleUnredact> {
+  return consoleUnredact(next, stored, channels);
 }
 
 /**
- * The kernel's `Gateway`: `start` takes the built-in registries where `o` gives none, and this
- * package's `aio` as the CLI a terminal UI's helpers run (`GatewayOptions.cli`, next to this module).
+ * The kernel's `Gateway`: `start` takes the built-in registries where `o` gives none, the console
+ * package's console (`GatewayOptions.consoleFactory`: its `ConsoleServer` and `ConfigStore`), and
+ * this package's `aio` as the CLI a terminal UI's helpers run (`GatewayOptions.cli`, next to this module).
  */
 export class Gateway extends KernelGateway {
+  /** The console API server (`GatewayOptions.console`): the console package's. */
+  declare console: ConsoleServer | undefined;
+  /** The config file as the console edits it (when the config came from a file): the console package's. */
+  declare readonly configStore: ConfigStoreBase | undefined;
+
   static override start(o: GatewayOptions): Promise<Gateway> {
-    return KernelGateway.start({ ...builtin(o), cli: o.cli ?? fileURLToPath(new URL('./cli.js', import.meta.url)) });
+    return KernelGateway.start({ ...builtin(o), consoleFactory: o.consoleFactory ?? consoleFactory, cli: o.cli ?? fileURLToPath(new URL('./cli.js', import.meta.url)) }) as Promise<Gateway>;
   }
 
   static [Symbol.hasInstance](v: unknown): boolean {
@@ -169,13 +179,13 @@ export function buildHarness(i: HarnessInstance, blobs?: BlobAccess, o: NonNulla
   return kernelBuildHarness(i, blobs, { ...o, registry: o.registry ?? builtinHarnesses });
 }
 
-/** The kernel's `ConfigStore`: the built-in registries where `o` gives none. */
-export class ConfigStore extends KernelConfigStore {
+/** The console's `ConfigStore`: the built-in registries where `o` gives none. */
+export class ConfigStore extends ConfigStoreBase {
   constructor(o: ConfigStoreOptions) {
     super(builtin(o));
   }
 
   static [Symbol.hasInstance](v: unknown): boolean {
-    return v instanceof KernelConfigStore;
+    return v instanceof ConfigStoreBase;
   }
 }

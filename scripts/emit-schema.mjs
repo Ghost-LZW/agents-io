@@ -1,6 +1,7 @@
 // Writes JSON Schemas for non-TypeScript implementers: the protocol's to packages/protocol/schema/,
 // and each built-in module's own wire types into its package: the `schemas` of its admin
-// contribution (`ChannelModule.admin`; channel/lark-bot/schema/: its console endpoints).
+// contribution (`ChannelModule.admin` or `HarnessModule.admin`; channel/lark-bot/schema/: its
+// console endpoints; the built-in harness kinds contribute none).
 // Every `$id` is `agents-io/v<PROTOCOL_VERSION>/<name>`, wherever the file lives.
 import { mkdirSync, writeFileSync } from 'node:fs';
 import * as lark from '../channel/lark-bot/dist/index.js';

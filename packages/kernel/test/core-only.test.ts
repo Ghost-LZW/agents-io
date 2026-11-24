@@ -12,14 +12,17 @@ import { coreRegistries } from '../src/core.js';
 import { Gateway } from '../src/gateway.js';
 import { FEATURES } from '../src/host.js';
 import { readTokenFile, tokenPath } from '../src/token.js';
+// The console is its own core package, which depends on the kernel: reached by path, not as a dependency.
+import { consoleFactory } from '../../console/src/index.js';
 import { cleanups, closeAndWait, tmp, until } from './helpers.js';
 
 /*
  * The kernel without modules is a product of its own (core-slimming §5): the kernel package alone
  * (`@agents-io/kernel`: no module package, not `@agents-io/daemon`), registries with nothing
  * registered (`coreRegistries`), and the channel and harness the embedder passes (here testkit's
- * FakeChannel and FakeHarness). The kernel's promises hold end to end, and nothing a module adds is
- * there. This file imports no module package either.
+ * FakeChannel and FakeHarness); its console API is the console package's (`@agents-io/console`,
+ * `GatewayOptions.consoleFactory`), as an embedder would give it. The kernel's promises hold end to
+ * end, and nothing a module adds is there. This file imports no module package either.
  */
 
 const alice = { channelUserId: 'alice', evidence: 'platform_signed' as const };
@@ -58,7 +61,7 @@ async function core(o: { dir?: string; raw?: Record<string, unknown>; script?: F
     ...(o.policy ? { policy: o.policy } : {}),
     hostPush: { timeoutMs: 300, retryMs: 20 },
     logger: () => {},
-    ...(o.console ? { console: true, consoleEnv: {} } : {}),
+    ...(o.console ? { console: true, consoleFactory, consoleEnv: {} } : {}),
   });
   let stopped = false;
   const stop = async () => {
