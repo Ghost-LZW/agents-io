@@ -8,7 +8,7 @@ import { DEFAULT_IDLE_TIMEOUT_MS, IDLE_CONTINUE } from '../src/watchdog.js';
 import { bodies, collectUntil, input, isTurnCompleted, sdk } from './fake-query.js';
 import { setup, uuidOf } from './claude-code-helpers.js';
 
-// HC-3b: the idle deadline within a turn (after its first output). Timeouts are tens of
+// HC-8: the idle deadline within a turn (after its first output). Timeouts are tens of
 // milliseconds; "never fires" waits a few times that. The first-byte watchdog is off here unless said.
 
 const MS = 25;
@@ -38,11 +38,11 @@ const finals = (evs: HarnessEvent[]) =>
   evs.flatMap((e) => (e.body.t === 'text.snapshot' && e.body.final ? [e.body.text] : []));
 
 describe('idle deadline', () => {
-  it('defaults to 90 s #HC-3b', () => {
+  it('defaults to 90 s #HC-8', () => {
     expect(DEFAULT_IDLE_TIMEOUT_MS).toBe(90_000);
   });
 
-  it('a request after read-only tools that sends nothing goes on on the next fallback model; nothing is run or written twice #HC-3b', async () => {
+  it('a request after read-only tools that sends nothing goes on on the next fallback model; nothing is run or written twice #HC-8', async () => {
     const { s, q, it, give, conform } = await open();
     give('t1', 'a');
     await s.startTurn('t1', [input('a', 'what is in the readme')]);
@@ -68,7 +68,7 @@ describe('idle deadline', () => {
     conform(evs);
   });
 
-  it('after a tool that may have changed something, the turn ends failed (idle_timeout), says so, and nothing runs again #HC-3b', async () => {
+  it('after a tool that may have changed something, the turn ends failed (idle_timeout), says so, and nothing runs again #HC-8', async () => {
     const { s, q, it, give, conform } = await open();
     give('t1', 'a');
     await s.startTurn('t1', [input('a', 'restart the service')]);
@@ -86,7 +86,7 @@ describe('idle deadline', () => {
     conform(evs);
   });
 
-  it('a follow-up queued behind a turn it ends after a side effect is not cancelled: withdrawn, left unconsumed for the next turn #HC-3b', async () => {
+  it('a follow-up queued behind a turn it ends after a side effect is not cancelled: withdrawn, left unconsumed for the next turn #HC-8', async () => {
     const { s, q, it, give, conform } = await open();
     give('t1', 'a', 'b');
     await s.startTurn('t1', [input('a', 'restart the service')]);
@@ -106,7 +106,7 @@ describe('idle deadline', () => {
     conform(evs);
   });
 
-  it('a follow-up the CLI took for a run of its own (not withdrawn, not named) is carried: not consumed, never written again; the next turn given it owns that run #HC-3b', async () => {
+  it('a follow-up the CLI took for a run of its own (not withdrawn, not named) is carried: not consumed, never written again; the next turn given it owns that run #HC-8', async () => {
     const { s, q, it, give, conform } = await open();
     give('t1', 'a', 'b');
     await s.startTurn('t1', [input('a', 'restart the service')]);
@@ -136,7 +136,7 @@ describe('idle deadline', () => {
     conform();
   });
 
-  it('a result that comes before the interrupt receipt waits for the withdraw: the follow-up is withdrawn, unconsumed, and runs once as the next turn #HC-3b', async () => {
+  it('a result that comes before the interrupt receipt waits for the withdraw: the follow-up is withdrawn, unconsumed, and runs once as the next turn #HC-8', async () => {
     const { s, q, it, give, conform } = await open();
     give('t1', 'a', 'b');
     await s.startTurn('t1', [input('a', 'restart the service')]);
@@ -165,7 +165,7 @@ describe('idle deadline', () => {
     conform();
   });
 
-  it('a withdraw answered late: carried meanwhile, so the adopting turn writes the follow-up again only once the CLI gave it back #HC-3b', async () => {
+  it('a withdraw answered late: carried meanwhile, so the adopting turn writes the follow-up again only once the CLI gave it back #HC-8', async () => {
     const { s, q, it, give, conform } = await open(undefined, { idleWithdrawWaitMs: MS });
     give('t1', 'a', 'b');
     await s.startTurn('t1', [input('a', 'restart the service')]);
@@ -198,7 +198,7 @@ describe('idle deadline', () => {
     conform();
   });
 
-  it('a withdraw answered late that the CLI kept: the adopting turn owns the CLI\'s run of it, nothing written twice #HC-3b', async () => {
+  it('a withdraw answered late that the CLI kept: the adopting turn owns the CLI\'s run of it, nothing written twice #HC-8', async () => {
     const { s, q, it, give, conform } = await open(undefined, { idleWithdrawWaitMs: MS });
     give('t1', 'a', 'b');
     await s.startTurn('t1', [input('a', 'restart the service')]);
@@ -228,7 +228,7 @@ describe('idle deadline', () => {
     conform();
   });
 
-  it('a withdraw answered late while the CLI already runs the follow-up: that run is not the stalled turn\'s; carried, the next turn owns its run and answer #HC-3b', async () => {
+  it('a withdraw answered late while the CLI already runs the follow-up: that run is not the stalled turn\'s; carried, the next turn owns its run and answer #HC-8', async () => {
     const { s, q, it, give, conform } = await open(undefined, { idleWithdrawWaitMs: MS * 6 });
     give('t1', 'a', 'b');
     await s.startTurn('t1', [input('a', 'restart the service')]);
@@ -268,7 +268,7 @@ describe('idle deadline', () => {
     conform();
   });
 
-  it('the CLI runs the follow-up the interrupt receipt listed, with no result for the stalled run first: that run is still not the stalled turn\'s #HC-3b', async () => {
+  it('the CLI runs the follow-up the interrupt receipt listed, with no result for the stalled run first: that run is still not the stalled turn\'s #HC-8', async () => {
     const { s, q, it, give, conform } = await open(undefined, { idleWithdrawWaitMs: MS * 6 });
     give('t1', 'a', 'b');
     await s.startTurn('t1', [input('a', 'restart the service')]);
@@ -304,7 +304,7 @@ describe('idle deadline', () => {
     conform();
   });
 
-  it('an interrupt receipt that never comes after the result came: the stalled turn still ends, its follow-up carried #HC-3b', async () => {
+  it('an interrupt receipt that never comes after the result came: the stalled turn still ends, its follow-up carried #HC-8', async () => {
     const { s, q, it, give, conform } = await open();
     give('t1', 'a', 'b');
     await s.startTurn('t1', [input('a', 'restart the service')]);
@@ -330,7 +330,7 @@ describe('idle deadline', () => {
     conform();
   }, 10_000);
 
-  it('a stalled run\'s result that comes after the interrupt\'s 5 s ended the turn is not the next turn\'s end #HC-3b', async () => {
+  it('a stalled run\'s result that comes after the interrupt\'s 5 s ended the turn is not the next turn\'s end #HC-8', async () => {
     const { s, q, it, give, conform } = await open();
     give('t1', 'a', 'b');
     await s.startTurn('t1', [input('a', 'restart the service')]);
@@ -354,7 +354,7 @@ describe('idle deadline', () => {
     conform();
   }, 10_000);
 
-  it('an interrupted result that names no uuid: the stalled turn counts its own input consumed (it is not run again) #HC-3b', async () => {
+  it('an interrupted result that names no uuid: the stalled turn counts its own input consumed (it is not run again) #HC-8', async () => {
     const { s, q, it, give, conform } = await open();
     give('t1', 'a', 'b');
     await s.startTurn('t1', [input('a', 'restart the service')]);
@@ -371,7 +371,7 @@ describe('idle deadline', () => {
     conform(evs);
   });
 
-  it('a result that arrives while the follow-up is being withdrawn waits for it: withdrawn stays unconsumed, the rest consumed #HC-3b', async () => {
+  it('a result that arrives while the follow-up is being withdrawn waits for it: withdrawn stays unconsumed, the rest consumed #HC-8', async () => {
     const { s, q, it, give, conform } = await open();
     give('t1', 'a', 'b');
     await s.startTurn('t1', [input('a', 'restart the service')]);
@@ -397,7 +397,7 @@ describe('idle deadline', () => {
     conform(evs);
   });
 
-  it('a Bash call that runs while the interrupt is on its way: no model switch, no "go on"; the turn ends failed and says so #HC-3b', async () => {
+  it('a Bash call that runs while the interrupt is on its way: no model switch, no "go on"; the turn ends failed and says so #HC-8', async () => {
     const { s, q, it, give, conform } = await open();
     give('t1', 'a');
     await s.startTurn('t1', [input('a', 'what is in the readme')]);
@@ -422,7 +422,7 @@ describe('idle deadline', () => {
     conform(evs);
   });
 
-  it('a Bash call cut off by the interrupt (no result) counts as a side effect too #HC-3b', async () => {
+  it('a Bash call cut off by the interrupt (no result) counts as a side effect too #HC-8', async () => {
     const { s, q, it, give, conform } = await open();
     give('t1', 'a');
     await s.startTurn('t1', [input('a', 'hi')]);
@@ -446,7 +446,7 @@ describe('idle deadline', () => {
     conform(evs);
   });
 
-  it('not while a tool runs (its permission prompt included), nor while the CLI compacts #HC-3b', async () => {
+  it('not while a tool runs (its permission prompt included), nor while the CLI compacts #HC-8', async () => {
     const { s, q, it, give, conform } = await open();
     give('t1', 'a');
     await s.startTurn('t1', [input('a', 'build it')]);
@@ -462,7 +462,7 @@ describe('idle deadline', () => {
     conform(evs);
   });
 
-  it('every CLI message starts it again: a slow but streaming answer is never cut #HC-3b', async () => {
+  it('every CLI message starts it again: a slow but streaming answer is never cut #HC-8', async () => {
     const { s, q, it, give, conform } = await open();
     give('t1', 'a');
     await s.startTurn('t1', [input('a', 'tell me a story')]);
@@ -476,7 +476,7 @@ describe('idle deadline', () => {
     conform(await collectUntil(it, isTurnCompleted));
   });
 
-  it('each model at most once per turn: the chain used up ends the turn with the notice #HC-3b', async () => {
+  it('each model at most once per turn: the chain used up ends the turn with the notice #HC-8', async () => {
     const { s, q, it, give, conform } = await open(['claude-opus-5-5']);
     give('t1', 'a');
     await s.startTurn('t1', [input('a', 'hi')]);
@@ -497,7 +497,7 @@ describe('idle deadline', () => {
     conform(evs);
   });
 
-  it('idleTimeoutMs: 0 turns it off #HC-3b', async () => {
+  it('idleTimeoutMs: 0 turns it off #HC-8', async () => {
     const { s, q, it, give, conform } = await open(undefined, { idleTimeoutMs: 0 });
     give('t1', 'a');
     await s.startTurn('t1', [input('a', 'x')]);

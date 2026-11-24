@@ -972,7 +972,7 @@ export class LarkBotAdapter implements ChannelAdapter {
    *
    * When the turn ended: its final answer (`progress.finalAnswer`), how it ended and the buttons;
    * no plan. Without a final answer — it failed or was interrupted (also with a final snapshot: an
-   * idle-deadline stop's is what it said so far and a notice, HC-3b), its outcome is unknown, or it
+   * idle-deadline stop's is what it said so far and a notice, HC-8), its outcome is unknown, or it
    * completed saying nothing a harness took as its answer — `text` is what was said along the way:
    * the card says only how it ended (「没答完」, 「被打断了」…), as its body and summary.
    *

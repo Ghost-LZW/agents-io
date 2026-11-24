@@ -126,7 +126,7 @@ export const ProgressView = Type.Object({
    * the compositor's own, e.g. where a moved turn went). Absent: there is none — they are text so
    * far, which can be what the model said before a tool call; a turn that failed, was interrupted
    * or has an unknown outcome has none, even with a final snapshot (an idle-deadline stop's is what
-   * it said so far and a notice, HC-3b). An end that shows only answers says how the turn ended.
+   * it said so far and a notice, HC-8). An end that shows only answers says how the turn ended.
    */
   finalAnswer: Type.Optional(Type.Boolean()),
   startedAt: Type.Optional(Type.Number()),

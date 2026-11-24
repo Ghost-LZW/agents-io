@@ -94,7 +94,7 @@ describe('ProgressView folding', () => {
       expect(progressOf(cut), status).toMatchObject({ status, answer: 'Found: they', answerFinal: true });
       expect(progressOf(cut).finalAnswer, status).toBeUndefined();
       expect(cut.finalText, status).toBeNull();
-      // A final snapshot of a turn that did not complete is not its answer (HC-3b: what it said so far and a notice).
+      // A final snapshot of a turn that did not complete is not its answer (HC-8: what it said so far and a notice).
       const stalled = turnOf(...said, snapshot('Found: they\n\n(This turn stopped.)'), end(status));
       expect(renderTurn(stalled, 'card').text, status).toBe('Found: they\n\n(This turn stopped.)');
       expect(progressOf(stalled).finalAnswer, status).toBeUndefined();

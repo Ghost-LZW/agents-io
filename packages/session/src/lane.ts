@@ -1721,7 +1721,7 @@ export class Lane {
     this.o.onTurnCompleted?.(t.turnId, status, t.checked === true);
 
     const unconsumed = t.inputs.filter((i) => !t.consumed.has(i.inputId));
-    // A turn the idle deadline ended (HC-3b) ran its own inputs; follow-ups it never started go on
+    // A turn the idle deadline ended (HC-8) ran its own inputs; follow-ups it never started go on
     // as the next turn instead of being rejected with it.
     const retry =
       status === 'completed' || (status === 'failed' && (b.error?.retryable === true || b.error?.code === STALL_REQUEUE_CODE));
@@ -1949,7 +1949,7 @@ function visibilityOf(e: HarnessEvent): Visibility {
  * Principal of an admitted input; inputs that arrived via a watch also carry the
  * record itself, so the target session's log shows what arrived and from where.
  */
-/** `turn.completed` error code of a turn the harness's idle deadline ended (HC-3b): its unconsumed inputs are re-queued. */
+/** `turn.completed` error code of a turn the harness's idle deadline ended (HC-8): its unconsumed inputs are re-queued. */
 export const STALL_REQUEUE_CODE = 'idle_timeout';
 /** `input.rejected` reason prefix: the lane closed (stop, restart, detach) with the input still queued. */
 export const LANE_CLOSED = 'lane_closed';
