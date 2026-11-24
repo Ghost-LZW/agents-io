@@ -560,8 +560,8 @@ aio console-link                                              (one-time console 
 
 A feature of the daemon can be a module: a `ModuleManifest` (`@agents-io/protocol`,
 `module.ts`) registered in a `ModuleRegistry` by the composition root (`bundle.ts`
-`builtinModules`, origin `builtin`; so far the topic titles, `topic-title`, the watch, live and
-topic tools, `tools.watch`, `tools.live`, `tools.topics`, the stranger approval, `strangers`, the
+`builtinModules`, origin `builtin`; so far the topic titles, `topic-title`, the watch, schedule,
+live and topic tools, `tools.watch`, `tools.schedules`, `tools.live`, `tools.topics`, the stranger approval, `strangers`, the
 owner's run-config chat commands, `owner-commands`, and the external MCP endpoint,
 `external-mcp`). A third
 party's module has the same shape (origin `module`). The manifest says, without running anything:
@@ -590,7 +590,8 @@ party's module has the same shape (origin `module`). The manifest says, without 
   command, `features()` (which of its features it advertises now; default all while it runs),
   `status()`, `start()`, `stop()`, and the hooks `onTurnCompleted({ sessionKey, turnId, status })`:
   called for every turn of a session (not a task run's) right after its `turn.completed` is
-  logged, whatever its status, for each module in registration order, from when the gateway is
+  logged, whatever its status (a turn an `outbound.scoped` host checks, U20: once its checked
+  answers settled), for each module in registration order, from when the gateway is
   built until step 4; it returns at once (a throw or a rejected promise is logged as
   `module <id>: onTurnCompleted failed: …`); and `inputHint(agent)`: the line an input routed to a
   conversation's current topic carries for the agent it goes to (`channelContext.topicTools`;
@@ -613,7 +614,12 @@ party's module has the same shape (origin `module`). The manifest says, without 
   and `statusLines(sessionKey)`: lines `/status` shows right after the line of what the session
   runs (agent, harness, model), before its working directory, the modules' in registration
   order (a throw or anything but an array is logged as `module <id>: statusLines failed: …` and
-  gives none; entries that are not strings are left out), served to the end.
+  gives none; entries that are not strings are left out), served to the end; and
+  `scheduledMessage({ schedule, operationId })`: a `message` schedule fires, asked of each module
+  in registration order until one answers `true` (it sent it, as one of its own principals: the
+  external MCP endpoint sends a client's schedule as that client's `send_message`); with none the
+  kernel sends it as the daemon's message; a throw is the firing's failure (redone, SC-1), and
+  while the modules stop every firing fails that way.
 
 The registry checks every manifest and what they claim together (ids; config sections and
 aliases; tools, commands and features are each one module's and never the kernel's). Its option
@@ -665,14 +671,21 @@ daemon (INVARIANTS ID-3 boundary 2): the views keep it to the kernel's rules, th
 `appendNative` (a durable native event in a log of the module's own, such as
 `external:<client>`), `sessions` (`list`, `known`, `agentOf`), `status`, `stopping`, `policy`,
 `records` (values under `module:<id>:`), `db` (the log's database, unrestricted; name your tables `module_<id>_…` and leave the host's alone),
-`topics` (`bySession`, `siblings`, `titleSource`, `setAutoTitle`: a generated title, set only
-while the topic's title is still generated and still the one the module read, then the latest
-card edited to carry it; `rotate(sessionKey, turnId, { title, summary, operationId })` and
+`topics` (`bySession`, `siblings`, `titleSource`, `setAutoTitle(topicId, expected, title, turnId?)`:
+a generated title, set only while the topic's title is still generated and still the one the
+module read, then the latest card edited to carry it; it answers a promise: where an
+`outbound.scoped` host checks the topic (U20) the title is asked of it first and kept only when
+it answers `allow`; `rotate(sessionKey, turnId, { title, summary, operationId })` and
 `switch(sessionKey, turnId, { topicId, operationId })`: the kernel's handover of the turn running
 in the session, refused for any other turn, under TP-1 whoever calls: once per turn, the same
 `operationId` again answering what that one did, only from the conversation's current topic,
 never a message just handed here, never to the turn's own topic), `watches` (`add`, `remove`, `list`: as the session's agent,
-`agentOrigin`, a watch always delivering into the session; `Policy.watch` decides), `live`
+`agentOrigin`, a watch always delivering into the session; `Policy.watch` decides), `schedules`
+(`add(sessionKey, draft, turnId?)`, `remove`, `list`: as the session's agent, a turn only into
+the session, nothing for the host, the owner's limits, a route only from its running turn
+`turnId` and only where that turn may send; `addAs(origin, draft)`, `removeAs`, `listAs`: as a
+peer, never a person, a host, the kernel or an owner, messages and wakes for the host only, its
+own only; SC-3), `live`
 (`join(sessionKey, turnId, a)`, `say`, `leave`: the kernel's live mechanism, decision 16; a join
 only for the turn running in the session), `agents` (`names()`: the agents a chat may talk to,
 not task agents; `tools(agent)`: the tools an agent's
@@ -696,19 +709,23 @@ configured instances declaring Plan mode or the profile switch, by display name,
 registered kinds that do. The daemon keeps what is set (its records, `run:<sessionKey>`) and
 applies it over the agent's policy's plan whether or not a module is on), `channelFor`, `resolveRoute`, `send`
 (through the outbox; `external` names the client outside the daemon it sends for, kept in the
-in-flight mark, EX-8), `settled`, `outbound` (the outbound check of a send that is no turn's
-reply, DL-6), `owner` (the owner's principals, `policy.owners` and `AGENTS_IO_OWNERS`, and the
+in-flight mark, EX-8; the kernel says what it is, U20: a client's message is `tool`, which an
+`outbound.scoped` host checks where its scope is, any other the daemon's own `notice`), `settled`,
+`outbound(from, to, content?)` (the outbound check of a send that is no turn's reply, DL-6; with
+`content`, an `outbound` + `outbound.content` host may answer `{ hold: true, reason? }`), `hold`
+(settle such a send `held`, never sent), `owner` (the owner's principals, `policy.owners` and `AGENTS_IO_OWNERS`, and the
 fixed `policy.ownerSessionKey`, if any), `ownerRoute`, `redispatch`, `explain` and `host`
 (`connected`, `answers`, `heldBy`, `external`: the `external` callout, `isToken`: a module never
 gets the host token).
 
-The watch, live and topic tools (`src/tool-modules.ts`) are such modules over host-mcp's library:
+The watch, schedule, live and topic tools (`src/tool-modules.ts`) are such modules over host-mcp's library:
 each declares its group of `TOOL_GROUP_DEFS` (`@agents-io/host-mcp`; a module tool that is one of
 these definition objects is listed and checked exactly as `TOOL_DEFS` has it, so the tools a
 harness is offered are byte for byte what the kernel offered) and runs it with
-`watchToolHandlers(k.watches)`, `liveToolHandlers(…)` over `k.live`, `topicToolHandlers(…)` over
-`k.topics`; the topic tools add the hint (`inputHint`) for an agent offered one of them. The
-watches and their routing, the live mechanism (its protocol, events and LN invariants) and the
+`watchToolHandlers(k.watches)`, `scheduleToolHandlers(…)` over `k.schedules`, `liveToolHandlers(…)`
+over `k.live`, `topicToolHandlers(…)` over `k.topics`; the topic tools add the hint (`inputHint`)
+for an agent offered one of them. The watches and their routing, the schedules and their firing
+(SC-1..SC-3), the live mechanism (its protocol, events and LN invariants) and the
 topic handover with its rules (TP-1: the kernel checks them for every caller; the tools check the
 same ones first, `handoverRefusal` from `@agents-io/session`) stay the kernel's. The live tools are offered also when no channel can open a
 live, as before (dropping them then would change the tool list: a later change).
@@ -1138,3 +1155,33 @@ What changed for embedders with core-slimming G3's native terminal takeover (G6 
   kind's CLI command now, the MCP config the takeover writes runs it as before
   (`node <daemon dist/cli.js> tui-bridge`). Each takeover listens on a local port of its own,
   closed when it ends (before, all of them shared one until the daemon stopped).
+
+What changed for embedders with the merge of origin/main (b9b35ed, 2026-11-24):
+
+- Origin's features are in: `deliver.update`, `conversation.create`, `message.ack`,
+  `history.read`, `session.prewarm`, `host.hello` `optIn` (`item.tool`), the test hooks
+  (`test.replay`, `test.fault`, `GatewayOptions.testHooks`), the U20 exit checks of an
+  `outbound.scoped` host, schedules (`Gateway.schedules`, `putSchedule`, `removeSchedule`,
+  `listSchedules`; config `schedules`, `timeZone`, `policy.scheduleLimit`,
+  `policy.scheduleMinMinutes`; `aio schedule`), `DaemonRecords.sentByUs`. They are the kernel's,
+  and so are their `host.hello` features (`FEATURES`, in origin's order; `external.mcp` is still
+  the external MCP module's, after them).
+- The schedule tools (`schedule_*`) are the built-in module `tools.schedules`
+  (`scheduleToolsModule`, registered after `tools.watch`, section `scheduleTools`, only `enabled`,
+  absent means on): the tool list a harness gets is origin's byte for byte. An embedder with a
+  `ModuleRegistry` of its own has them only when it registers the module.
+- `KernelContext`: new `schedules` and `hold`; `outbound` takes an optional `content` and may
+  answer `KernelHold`; `send` stamps the send's U20 kind; `topics.setAutoTitle` answers a
+  promise and takes the `turnId` the title was made after; `ModuleHooks.scheduledMessage` is
+  served; `ModuleToolCall.turn` is set also for a tool that needs no turn while one runs;
+  `KernelSendResult` may be `held` (with `reason`). `KERNEL_CAPABILITIES` has `schedules` and
+  `hold`. `KernelBackend` gains `addSchedule`, `removeSchedule`, `listSchedules`, `addScheduleAs`,
+  `removeScheduleAs`, `listSchedulesAs` and `hold`, its `outbound` takes `content` and its
+  `setAutoTitle` is async with `turnId` (required, so this breaks an embedder that implements it;
+  one that only uses `Gateway` changes nothing). `ModuleHost.scheduledMessage` is new.
+- `@agents-io/session`: `LaneOptions.onTurnCompleted` gets a third argument, `checked`.
+  `@agents-io/host-mcp`: `TOOL_GROUPS.schedules`, `TOOL_GROUP_DEFS.schedules`,
+  `scheduleToolHandlers`, `sessionSchedules`, `SessionSchedules`, `scheduleRouteRefusal`;
+  `HostToolsOptions.schedules` (`ScheduleControl`), `toolNames`, `kept`, `exit`.
+- `ChannelCaps.pacing.openOnProcess` is new; the Lark adapter declares it (and no longer
+  `requireAnswerToOpen`); a channel entry's `openOnProcess` overrides it.

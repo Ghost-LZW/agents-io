@@ -1,6 +1,6 @@
 # 定时任务：`schedules`
 
-> 状态：已实现（2026-10-27）：核心、配置、agent 工具、宿主请求、对外 MCP、`aio schedule`。
+> 状态：已实现（2026-10-27）：核心、配置、agent 工具、宿主请求、对外 MCP、`aio schedule`。2026-11-24 并进 core-slimming 的新结构（决定 16，`docs/design/core-slimming/` §2、§4）：机制（时间表、到点、跨重启、主人的配置、宿主请求与 feature `schedules`）照旧在内核，与监听同形；给 agent 的 `schedule_*` 工具是内建工具模块 `tools.schedules`（`packages/daemon/src/tool-modules.ts`，配置段 `scheduleTools`，缺省开），经 `KernelContext.schedules` 以会话的 agent 身份设，带路由的由内核查这一轮能不能发到那里；对外 MCP 端点（功能模块 `external-mcp`）经同一处以客户端身份设，客户端的定时消息到点经 `ModuleHooks.scheduledMessage` 由它以客户端身份发出。行为不变。
 > 依据：`docs/POSITIONING.md` §2（机制与策略的判据）；`docs/CHANNELS.md` §6（监听：digest 的持久化与到点触发）、§7（输出工具）；`docs/HOSTS.md` §4（宿主请求、`session.prewarm` 里"提醒、例行快到点"的用途）；决定 13（扩展冻结时只加有真实出处的能力）。
 > 出处：主人 2026-10-27：「加自定义消息监控和定时任务……特定时间推送什么的，感觉像是一个通用能力」；同日「怎么让别的 agent 知道怎么用这个定时任务的能力呢？以及发消息的能力呢？」。
 
