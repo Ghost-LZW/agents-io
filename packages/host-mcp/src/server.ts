@@ -167,11 +167,13 @@ export class HostMcpServer {
     // Asked now, for this request: a module's tool it does not offer at the moment (the live tools
     // while no running channel can open a live) is neither listed nor callable in it (CF-6).
     const withheld = this.o.tools.withheld();
+    let registered = 0;
     for (const def of this.catalog) {
       const name = def.name;
       // Per-agent tool list (CF-6): a tool not listed is neither offered nor callable.
       if (allow && !allow.has(name)) continue;
       if (withheld.has(name)) continue;
+      registered++;
       server.registerTool(
         name,
         {
@@ -204,6 +206,11 @@ export class HostMcpServer {
         },
       );
     }
+    // Nothing offered now (an agent's list naming only tools withheld at the moment): the SDK installs
+    // its tools/list and tools/call handlers only with the first tool, so without one tools/list would
+    // answer "Method not found". A tool registered and removed installs them: tools/list answers an empty
+    // list, tools/call `Tool <name> not found`, and initialize says what it says with tools (CF-6).
+    if (registered === 0) server.registerTool('none', { description: '' }, () => ({ content: [] })).remove();
     return server;
   }
 }

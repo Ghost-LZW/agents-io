@@ -196,4 +196,12 @@ describe('the watch, live and topic tools as modules', () => {
     expect((await offered(raw, { canLive: true })).listed.tools.map((t) => t.name)).toEqual(['send_message', 'live_join']);
     expect((await offered(raw)).listed.tools.map((t) => t.name)).toEqual(['send_message']);
   });
+
+  it('an agent whose tools list names only live tools keeps its endpoint where no channel can open a live: tools/list answers an empty list, not an error #CF-6', async () => {
+    const raw = { agents: { voice: { harness: 'claude-code', tools: ['live_join', 'live_say', 'live_leave'] } }, defaultAgent: 'voice' };
+    const none = await offered(raw);
+    expect(none.w.harness.sessions.at(-1)!.args.mcp).toBeDefined();
+    expect(none.listed).toEqual({ tools: [] });
+    expect((await offered(raw, { canLive: true })).listed.tools.map((t) => t.name)).toEqual(['live_join', 'live_say', 'live_leave']);
+  });
 });

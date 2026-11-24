@@ -176,4 +176,30 @@ describe('the host MCP tool catalog', () => {
     // Asked once per request (seven) and per withheld() (two), never cached.
     expect(asked).toBe(9);
   });
+
+  it('a token whose list names only tools withheld now gets an empty tools/list (not a -32601 error), the same initialize answer as one with tools, and a call answers the tool is not there; once offered they are listed #CF-6', async () => {
+    let canLive = false;
+    const tools = hostTools({ modules: [{ module: 'tools.live', tools: TOOL_GROUP_DEFS.live, handlers: liveToolHandlers(undefined), offered: () => (canLive ? TOOL_GROUPS.live : []) }] });
+    const s = new HostMcpServer({ tools });
+    servers.push(s);
+    const url = await s.listen();
+    const rpc = async (token: string, method: string, params: Record<string, unknown>) => {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${token}` },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      });
+      return (await res.json()) as { result?: Record<string, unknown>; error?: unknown };
+    };
+    const b = { sessionKey: 's1', generation: 1, harnessId: 'fake' };
+    const onlyLive = s.mcpFor(b, ['live_join', 'live_say', 'live_leave']).token;
+    const withTools = s.mcpFor(b, ['send_message', 'live_join']).token;
+    const init = { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '0' } };
+
+    expect(await rpc(onlyLive, 'tools/list', {})).toEqual({ jsonrpc: '2.0', id: 1, result: { tools: [] } });
+    expect((await rpc(onlyLive, 'tools/call', { name: 'live_join', arguments: {} })).result).toEqual({ isError: true, content: [{ type: 'text', text: 'MCP error -32602: Tool live_join not found' }] });
+    expect((await rpc(onlyLive, 'initialize', init)).result).toEqual((await rpc(withTools, 'initialize', init)).result);
+    canLive = true;
+    expect(((await rpc(onlyLive, 'tools/list', {})).result!.tools as { name: string }[]).map((t) => t.name)).toEqual([...TOOL_GROUPS.live]);
+  });
 });

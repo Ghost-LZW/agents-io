@@ -1334,8 +1334,9 @@ What changed for embedders with the live tools offered only where a live can be 
   `ChannelAdapter.openLive`; a channel counts until its `start` ends or it is removed, also while
   it reconnects). Without one an agent with `tools: true` lists 15 tools (the fixture
   `packages/host-mcp/test/fixtures/tools-list-no-live.json`), one whose `tools` list names a live
-  tool does not list it then (still no config error), a call answers MCP's
-  `Tool live_join not found`, and `get_channel_context`'s `abilities.tools` leaves them out. It is
+  tool does not list it then (still no config error; one naming only live tools gets an empty
+  `tools/list`, not an error), a call answers MCP's `Tool live_join not found`, and
+  `get_channel_context`'s `abilities.tools` leaves them out. It is
   asked at every request to the host MCP endpoint, so a channel started later (`console.liveChannels`,
   a module channel) brings them on the next `tools/list`, and one stopped or removed takes them
   away. When they are offered they are listed byte for byte as before.
