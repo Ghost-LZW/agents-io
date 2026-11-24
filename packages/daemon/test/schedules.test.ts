@@ -105,6 +105,131 @@ describe('schedule tools', () => {
   });
 });
 
+/** What an `outbound` callout was asked: what, to where, with which text, from which session and turn. */
+interface Asked {
+  kind?: string;
+  to: { conversationId: string };
+  content?: { text?: string };
+  from: { sessionKey: string; turnId: string; replyRoute: unknown; inputs: { inputId: string; origin: { kind: string; via: string } }[] } | null;
+}
+
+describe("an agent's message schedule and the host's outbound checks", () => {
+  // INVARIANTS DL-7 / DL-5 / SC-3 不成立 (2026-11-24): schedule_add is not asked of an outbound + outbound.content host, and its firing is not checked.
+  it.fails('outbound + outbound.content host without a scope: schedule_add is asked with the content, as send_message is, and refused where the host denies; what it allowed is asked again as it fires, as the agent\'s send then: held there, not sent #DL-7 #DL-5 #SC-3', async () => {
+    const results: { isError: boolean; text: string }[] = [];
+    const holder: { w?: Awaited<ReturnType<typeof daemon>> } = {};
+    const script: FakeTurnScript = async (t) => {
+      const mcp = holder.w!.harness.sessions.at(-1)!.args.mcp;
+      if (t.inputs.some((i) => text(i).includes('go'))) {
+        const at = Date.now() + 700;
+        results.push(await mcpCall(mcp, 'schedule_add', { id: 'leak', action: 'message', route: 'fake:default:ops', when: { at }, text: 'the secret, to ops' }, 'c1'));
+        results.push(await mcpCall(mcp, 'send_message', { route: 'fake:default:ops', text: 'the secret, direct' }, 'c2'));
+        results.push(await mcpCall(mcp, 'schedule_add', { id: 'later', action: 'message', route: 'fake:default:team', when: { at }, text: 'fine for now' }, 'c3'));
+        results.push(await mcpCall(mcp, 'schedule_add', { id: 'here', action: 'message', when: { at }, text: 'back here' }, 'c4'));
+      }
+      t.emit({ t: 'text.snapshot', text: 'ok', final: true }, { audience: 'answer' });
+    };
+    const w = await daemon({ raw: { agents: { chat: { harness: 'claude-code', tools: true } }, policy: { owners: ['fake:alice'] } }, script });
+    holder.w = w;
+    const h = await w.client();
+    await h.hello({ token: w.gw.token, name: 'lb', callouts: ['route', 'outbound', 'outbound.content'] } as never);
+    const asked: Asked[] = [];
+    let firing = false;
+    h.onRequest('policy', (f) => {
+      if ((f as { hook: string }).hook !== 'outbound') return { on: 'dispatch' };
+      const a = (f as { args: Asked }).args;
+      asked.push(a);
+      if (a.to.conversationId === 'ops') return { verdict: 'deny', reason: 'never to ops' };
+      // The host changed its mind about the team chat after the schedule was set.
+      return firing && a.to.conversationId === 'team' ? { verdict: 'hold', reason: 'not any more' } : { verdict: 'allow' };
+    });
+    await w.chat.inject({ sender: { channelUserId: 'alice', evidence: 'platform_signed' }, text: 'go' });
+    await until(() => results.length === 4, 5000);
+    firing = true;
+    const [leak, direct, later, here] = results;
+    // Where the host denies the agent's send_message, its schedule_add is refused the same way: nothing is set.
+    expect(direct).toMatchObject({ isError: true, text: expect.stringMatching(/never to ops/) });
+    expect(leak).toMatchObject({ isError: true, text: expect.stringMatching(/does not let you send to fake:default:ops/) });
+    expect(w.gw.schedules.registry.get('leak')).toBeUndefined();
+    expect([later!.isError, here!.isError]).toEqual([false, false]);
+    const session = 'fake:default:c1';
+    // Each was asked as it was set: kind tool, with the text, from the agent's turn.
+    const set = asked.filter((a) => a.from?.turnId !== undefined && !a.from.turnId.startsWith('schedule:'));
+    expect(set.map((a) => [a.kind, a.to.conversationId, a.content?.text, a.from?.sessionKey])).toEqual([
+      ['tool', 'ops', 'the secret, to ops', session],
+      ['tool', 'ops', 'the secret, direct', session],
+      ['tool', 'team', 'fine for now', session],
+      ['tool', 'c1', 'back here', session],
+    ]);
+    const nextAt = (id: string) => w.gw.schedules.registry.get(id)!.nextAt!;
+    const ops = { later: `schedule:later:${nextAt('later')}`, here: `schedule:here:${nextAt('here')}` };
+    const settled = (id: string) => w.gw.hub.log.read(`schedule:${id}`, 0).find((e) => e.body.t === 'delivery.settled')?.body as Record<string, unknown> | undefined;
+    await until(() => settled('later') && settled('here'), 5000);
+    // As each fired it was asked again, as the agent's send_message would be then: its session, the firing as its turn
+    // (one system input, no reply route of its own), kind tool, the text.
+    const fired = asked.filter((a) => a.from?.turnId.startsWith('schedule:'));
+    expect(fired.map((a) => [a.kind, a.to.conversationId, a.content?.text, a.from?.sessionKey, a.from?.turnId, a.from?.replyRoute])).toEqual(
+      expect.arrayContaining([
+        ['tool', 'team', 'fine for now', session, ops.later, null],
+        ['tool', 'c1', 'back here', session, ops.here, null],
+      ]),
+    );
+    expect(fired).toHaveLength(2);
+    expect(fired[0]!.from!.inputs).toEqual([expect.objectContaining({ inputId: fired[0]!.from!.turnId, origin: expect.objectContaining({ kind: 'system', via: expect.stringMatching(/^schedule:/) }) })]);
+    // Held at its time: never sent. Allowed: sent, as the agent (DL-4b), and its settlement says it was the agent's message.
+    expect(settled('later')).toMatchObject({ operationId: ops.later, result: 'held', reason: 'not any more', kind: 'tool' });
+    expect(settled('here')).toMatchObject({ operationId: ops.here, result: 'delivered', kind: 'tool' });
+    expect(w.chat.sent.filter((s) => ['ops', 'team'].includes(s.route.conversationId))).toEqual([]);
+    const back = w.chat.sent.filter((s) => s.msg.text === 'back here');
+    expect(back.map((s) => [s.route.conversationId, s.op.as])).toEqual([['c1', `session:${session}`]]);
+  });
+
+  // INVARIANTS DL-7 / SC-3 不成立 (2026-11-24): an agent's scheduled message into a chat in the scope goes out unchecked.
+  it.fails("outbound.scoped host: an agent's scheduled message into a chat in its scope is asked with its content as it fires; held, it is not sent. The owner's own schedule there is not asked, and says what it was #DL-7 #SC-3", async () => {
+    const results: { isError: boolean; text: string }[] = [];
+    const holder: { w?: Awaited<ReturnType<typeof daemon>> } = {};
+    const script: FakeTurnScript = async (t) => {
+      const mcp = holder.w!.harness.sessions.at(-1)!.args.mcp;
+      if (t.inputs.some((i) => text(i).includes('go'))) {
+        results.push(await mcpCall(mcp, 'schedule_add', { id: 'leak', action: 'message', when: { at: Date.now() + 600 }, text: 'the secret, scheduled' }, 'c1'));
+      }
+      t.emit({ t: 'text.snapshot', text: 'the secret, said', final: true }, { audience: 'answer' });
+    };
+    const g1 = { channel: 'fake', account: 'default', conversationId: 'g1' };
+    const raw = {
+      agents: { chat: { harness: 'claude-code', tools: true } },
+      policy: { owners: ['fake:alice'] },
+      schedules: [{ id: 'owners', when: { at: Date.now() + 1500 }, action: 'message', route: g1, text: 'the weekly note' }],
+    };
+    const w = await daemon({ raw, script });
+    holder.w = w;
+    const h = await w.client();
+    await h.hello({ token: w.gw.token, name: 'lb', callouts: ['route', 'outbound.scoped'], outboundScope: { routes: [g1] } } as never);
+    const asked: Asked[] = [];
+    h.onRequest('policy', (f) => {
+      if ((f as { hook: string }).hook !== 'outbound') return { on: 'dispatch' };
+      asked.push((f as { args: Asked }).args);
+      return { verdict: 'hold', reason: 'not for this group' };
+    });
+    await w.chat.inject({ id: 'om_1', sender: { channelUserId: 'alice', evidence: 'platform_signed' }, conversation: { id: 'g1', kind: 'group' }, text: 'go', admission: 'dispatch' });
+    await until(() => results.length === 1, 5000);
+    expect(results[0]!.isError).toBe(false);
+    const op = `schedule:leak:${w.gw.schedules.registry.get('leak')!.nextAt}`;
+    const settled = (id: string) => w.gw.hub.log.read(`schedule:${id}`, 0).find((e) => e.body.t === 'delivery.settled')?.body as Record<string, unknown> | undefined;
+    await until(() => settled('leak') && settled('owners'), 5000);
+    // The turn's answer and the scheduled message were each asked with their content; both held, neither sent.
+    expect(asked.map((a) => [a.kind, a.content?.text])).toEqual([
+      ['reply', 'the secret, said'],
+      ['tool', 'the secret, scheduled'],
+    ]);
+    expect(asked[1]!.from).toMatchObject({ sessionKey: 'fake:default:g1', turnId: op, replyRoute: null });
+    expect(settled('leak')).toMatchObject({ operationId: op, result: 'held', reason: 'not for this group', kind: 'tool' });
+    // The owner's configured message is not the agent's: not asked (as before), sent, and its settlement says what it was.
+    expect(settled('owners')).toMatchObject({ result: 'delivered', kind: 'notice' });
+    expect(w.chat.sent.filter((s) => s.route.conversationId === 'g1').map((s) => s.msg.text)).toEqual(['the weekly note']);
+  });
+});
+
 describe('host schedule requests', () => {
   it('a host sets, lists and removes schedules; a bad one is invalid_frame; features list schedules #SC-3', async () => {
     const w = await daemon({});
