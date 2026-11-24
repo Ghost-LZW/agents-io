@@ -132,7 +132,7 @@ describe('schedules', () => {
   });
 
   // INVARIANTS SC-1 不成立 (2026-11-24): a failed firing keeps its time, and the timer re-arms at once: it is retried in a busy loop.
-  it.fails('a firing that fails is tried again later, after a delay that grows, never at once; each try is the same firing (its operation id) #SC-1', async () => {
+  it('a firing that fails is tried again later, after a delay that grows, never at once; each try is the same firing (its operation id) #SC-1', async () => {
     const now = { t: T0 };
     const w = world(now);
     const tried: string[] = [];
@@ -179,7 +179,7 @@ describe('schedules', () => {
   });
 
   // INVARIANTS SC-1 不成立 (2026-11-24): a firing that can never succeed (held, denied, out of scope, no channel) is retried forever.
-  it.fails('a firing that fails for good (an error with final: true) is over: recorded as failed, not tried again; the schedule moves to its next time, a one-shot is gone #SC-1', async () => {
+  it('a firing that fails for good (an error with final: true) is over: recorded as failed, not tried again; the schedule moves to its next time, a one-shot is gone #SC-1', async () => {
     const now = { t: T0 };
     const w = world(now);
     const tried: string[] = [];

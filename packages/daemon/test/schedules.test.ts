@@ -45,7 +45,7 @@ describe('config schedules', () => {
   });
 
   // INVARIANTS SC-1 不成立 (2026-11-24): the schedules stop after the modules; a firing due meanwhile fails (the modules are stopping) and is redone at once, again and again.
-  it.fails('a schedule due while the daemon stops is not fired then (the schedules stop before the modules); the next start fires it, once #SC-1', async () => {
+  it('a schedule due while the daemon stops is not fired then (the schedules stop before the modules); the next start fires it, once #SC-1', async () => {
     // A module that takes a while to stop: the daemon stops its modules for 800 ms.
     const slow: ModuleManifest<undefined> = { id: 'slow', kind: 'feature', setup: () => ({ stop: () => new Promise<void>((r) => setTimeout(r, 800)) }) };
     const moduleRegistry = new ModuleRegistry([slow]);

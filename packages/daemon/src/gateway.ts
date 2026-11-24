@@ -90,6 +90,7 @@ import {
   TOPIC_HANDED_ALREADY,
   TopicError,
   TopicRegistry,
+  FinalFiringError,
   ScheduleDispatcher,
   ScheduleError,
   ScheduleRegistry,
@@ -657,7 +658,8 @@ export class Gateway {
       replyRoute: (key) => this.homeRoute(key),
       send: (s, operationId) => this.sendScheduled(s, operationId),
       toHost: (s, input) => this.scheduledToHost(s, input),
-      onError: (err, id) => this.log('warn', `schedule ${id}: ${(err as Error).message}`),
+      onError: (err, id, retryInMs) => this.log('warn', `schedule ${id}: ${(err as Error).message}${retryInMs !== undefined ? `; tried again in ${Math.round(retryInMs / 1000)} s` : ''}`),
+      onFailed: (s, scheduledAt, err) => this.scheduleFailed(s, scheduledAt, err),
     });
     // Built when some agent has tools (agents.<name>.tools, default `outputTools`, off); only those agents' harnesses mount them.
     if (Object.values(c.agents).some((a) => a.tools)) {
@@ -941,7 +943,6 @@ export class Gateway {
       gw.settleLeftoverInputs();
       await gw.loadConfigWatches();
       gw.loadConfigSchedules();
-      gw.schedules.start();
       await gw.startChannels();
       await gw.adoptRunningTurns();
       if (o.listen !== false) {
@@ -954,6 +955,9 @@ export class Gateway {
       if (o.console) await gw.startConsole();
       // Step 3: after the channels, the local socket and the console (the external MCP endpoint last).
       await gw.modules.start();
+      // Schedules fire once what they send through runs: the channels, and the modules that send a
+      // client's schedule as that client (SC-1: a firing that found none would be over, failed).
+      gw.schedules.start();
     } catch (e) {
       await gw.stop().catch(() => undefined);
       throw e;
@@ -3446,7 +3450,8 @@ ${a.summary}` }],
     const route = s.route!;
     if (await this.modules.scheduledMessage({ schedule: s, operationId })) return;
     const ch = this.channelFor(route);
-    if (!ch) throw new Error(this.noChannelMessage(route));
+    // What cannot go out by trying again ends the firing (SC-1): no channel, held, denied, rejected.
+    if (!ch) throw new FinalFiringError(this.noChannelMessage(route));
     const d = { operationId, sessionKey: `schedule:${s.id}`, route: { ...route, account: ch.account }, msg: { text: s.text } };
     const agentSession = s.createdBy.startsWith(AGENT_CREATOR) ? s.createdBy.slice(AGENT_CREATOR.length) : undefined;
     let rec: DeliveryRecord;
@@ -3460,7 +3465,22 @@ ${a.summary}` }],
         this.firings.delete(operationId);
       }
     }
-    if (rec.status === 'rejected') throw new Error(`not sent: ${rec.error ?? 'rejected'}`);
+    if (rec.status === 'held') throw new FinalFiringError(`held by the host${rec.reason !== undefined ? ` (${rec.reason})` : ''}; not sent`);
+    if (rec.status === 'rejected') throw new FinalFiringError(rec.denied ? `denied by the host${rec.reason !== undefined ? ` (${rec.reason})` : ''}; not sent` : `not sent: ${rec.error ?? 'rejected'}`);
+  }
+
+  /**
+   * A firing that failed for good (SC-1): over, not tried again. Logged, and recorded in the schedule's
+   * log (`schedule:<id>`, where its sends settle) as a notice; recording it is best effort.
+   */
+  private scheduleFailed(s: Schedule, scheduledAt: number, err: unknown): void {
+    const message = `schedule ${s.id}: the firing due ${new Date(scheduledAt).toISOString()} was not delivered, not tried again: ${(err as Error)?.message ?? String(err)}`;
+    this.log('warn', message);
+    try {
+      this.hub.append(`schedule:${s.id}`, { ts: Date.now(), level: 'detail', audience: 'status', durability: 'durable', visibility: 'operators', body: { t: 'notice', code: 'other', message } });
+    } catch (e) {
+      this.log('warn', `schedule ${s.id}: could not record the failed firing: ${(e as Error).message}`);
+    }
   }
 
   /**
@@ -4086,8 +4106,11 @@ ${a.summary}` }],
     this.stopped = true;
     for (const t of this.parkedTimers.values()) clearTimeout(t);
     this.parkedTimers.clear();
+    // No firing from here (SC-1): one due now waits for the next start; one running ends before the modules stop.
+    this.schedules.stop();
+    await within(this.schedules.idle(), 3000);
     this.host.close();
-    // Step 4: the modules stop first, in reverse order (each bounded), while what they use still runs.
+    // Step 4: then the modules stop, in reverse order (each bounded), while what they use still runs.
     // The external MCP endpoint is the last registered: it closes first, so no new external write comes in.
     await this.modules.stop();
     // Terminals holding sessions leave: the sessions go on headless (their lanes close below).
@@ -4102,7 +4125,6 @@ ${a.summary}` }],
     if (this.tokenFile) removeTokenFile(this.tokenFile, this.token);
     if (this.consoleFile && this.console) removeTokenFile(this.consoleFile, this.console.url);
     this.watches.stop();
-    this.schedules.stop();
     // A live channel apply in progress finishes (it sees `stopped` and launches nothing more)
     // before the channels are aborted, so none starts after the snapshot below.
     await within(this.applying, 5000);

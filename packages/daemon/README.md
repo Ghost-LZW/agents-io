@@ -1185,3 +1185,16 @@ What changed for embedders with the merge of origin/main (b9b35ed, 2026-11-24):
   `HostToolsOptions.schedules` (`ScheduleControl`), `toolNames`, `kept`, `exit`.
 - `ChannelCaps.pacing.openOnProcess` is new; the Lark adapter declares it (and no longer
   `requireAnswerToOpen`); a channel entry's `openOnProcess` overrides it.
+
+After the review of that merge (2026-11-24; INVARIANTS SC-1, DL-7):
+
+- A schedule firing that fails for good is over: `@agents-io/session` exports `FinalFiringError`
+  and `isFinalFiring` (any error with `final: true` counts); `ScheduleDispatcherOptions` gains
+  `onFailed(schedule, scheduledAt, err)` and `retry { minMs, maxMs }` (default 10 s doubling to
+  15 min for the other failures, which are no longer retried at once), `onError` gets a third
+  argument `retryInMs`, and `ScheduleRegistry` gains `fail` and `nearest(except)`. A module's
+  `ModuleHooks.scheduledMessage` throws an error with `final: true` to end the firing.
+- `Gateway.start` starts the schedules after the modules; `Gateway.stop` stops them first.
+- An agent's message schedule fires as the agent's message (`kind: "tool"`, `SendOp.as`) and the
+  exit check sees it as that agent's `send_message`; the others go out with `kind` `notice`
+  (`host` for a host's) and, as before, are not exit checked.

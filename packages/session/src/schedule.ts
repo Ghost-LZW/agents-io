@@ -11,7 +11,8 @@ import type { CommandResult, Lane } from './lane.js';
  * the log), plus a pending marker per firing so a firing cut off by a crash is redone
  * with the same input id (SC-1). `ScheduleDispatcher` runs one timer for the nearest
  * `nextAt`, fires what is due, and on start handles what was missed while stopped
- * (`missed`: once or skip, SC-2).
+ * (`missed`: once or skip, SC-2). A firing that fails for good (`FinalFiringError`) is over;
+ * one that fails otherwise is tried again after a growing delay (SC-1).
  */
 
 export type { ScheduleDraft, ScheduleWhen };
@@ -42,6 +43,22 @@ export class ScheduleError extends Error {
   ) {
     super(message);
   }
+}
+
+/**
+ * A firing that trying again cannot deliver: held or denied by the host, a route no longer in an
+ * external client's scope, no running channel, a send the channel rejected. Thrown by `send`,
+ * `toHost` or a lane, it ends the firing (`ScheduleDispatcherOptions.onFailed`); any error with
+ * `final: true` counts the same (a module's, which does not import this class).
+ */
+export class FinalFiringError extends Error {
+  override name = 'FinalFiringError';
+  readonly final = true;
+}
+
+/** The error ends its firing (`FinalFiringError`, or any error with `final: true`). */
+export function isFinalFiring(e: unknown): boolean {
+  return typeof e === 'object' && e !== null && (e as { final?: unknown }).final === true;
 }
 
 // ---- cron -------------------------------------------------------------------------------------
@@ -286,9 +303,10 @@ export class ScheduleRegistry {
     return n === null || (s.until !== undefined && n > s.until) ? null : n;
   }
 
-  /** The nearest `nextAt` of all, or undefined. */
-  nearest(): number | undefined {
-    const r = this.db.prepare('SELECT MIN(next_at) AS t FROM schedules WHERE next_at IS NOT NULL').get() as { t: number | null };
+  /** The nearest `nextAt` of all but `except` (ids), or undefined. */
+  nearest(except: readonly string[] = []): number | undefined {
+    const not = except.length ? ` AND id NOT IN (${except.map(() => '?').join(', ')})` : '';
+    const r = this.db.prepare(`SELECT MIN(next_at) AS t FROM schedules WHERE next_at IS NOT NULL${not}`).get(...except) as { t: number | null };
     return r.t === null ? undefined : Number(r.t);
   }
 
@@ -307,14 +325,24 @@ export class ScheduleRegistry {
 
   /** The firing is delivered: its marker goes and the schedule moves to its next time (or is removed). */
   end(id: string, scheduledAt: number, firedAt: number): void {
+    this.over(id, scheduledAt, firedAt, true);
+  }
+
+  /** The firing failed for good: over as `end`, except that the schedule keeps its last firing (this one did not fire). */
+  fail(id: string, scheduledAt: number, now: number): void {
+    this.over(id, scheduledAt, now, false);
+  }
+
+  private over(id: string, scheduledAt: number, at: number, fired: boolean): void {
     this.db.exec('SAVEPOINT sc_end');
     try {
       this.db.prepare('DELETE FROM schedule_firing WHERE id = ? AND scheduled_at = ?').run(id, scheduledAt);
       const s = this.get(id);
       if (s) {
-        const next = this.upcoming(s, Math.max(scheduledAt, firedAt));
+        const next = this.upcoming(s, Math.max(scheduledAt, at));
         if (next === null) this.db.prepare('DELETE FROM schedules WHERE id = ?').run(id);
-        else this.db.prepare('UPDATE schedules SET next_at = ?, last_fired_at = ? WHERE id = ?').run(next, firedAt, id);
+        else if (fired) this.db.prepare('UPDATE schedules SET next_at = ?, last_fired_at = ? WHERE id = ?').run(next, at, id);
+        else this.db.prepare('UPDATE schedules SET next_at = ? WHERE id = ?').run(next, id);
       }
       this.db.exec('RELEASE sc_end');
     } catch (e) {
@@ -346,11 +374,29 @@ export interface ScheduleDispatcherOptions {
   /** action host: hand it to the host (its inbound queue). */
   toHost?: (s: Schedule, input: InputRecord) => Promise<void>;
   now?: () => number;
-  onError?: (err: unknown, id: string) => void;
+  /**
+   * A firing failed and is tried again (in `retryInMs`, and at the next start; `id` `*` with no
+   * delay: the dispatcher's own failure).
+   */
+  onError?: (err: unknown, id: string, retryInMs?: number) => void;
+  /** A firing failed for good (`isFinalFiring`): it is over, not tried again; record it here. */
+  onFailed?: (s: Schedule, scheduledAt: number, err: unknown) => void;
+  /** The wait before a failed firing is tried again: `minMs` (default 10 s), doubled each time, at most `maxMs` (default 15 min). */
+  retry?: { minMs?: number; maxMs?: number };
 }
 
 /** A firing older than this at start counts as missed (a timer a little late is not). */
 const LATE_MS = 60_000;
+const RETRY_MIN_MS = 10_000;
+const RETRY_MAX_MS = 15 * 60_000;
+
+/** A firing that failed and waits to be tried again (in this process; its marker is kept for the next one). */
+interface Retry {
+  scheduledAt: number;
+  missed: boolean;
+  failures: number;
+  at: number;
+}
 
 export class ScheduleDispatcher {
   readonly registry: ScheduleRegistry;
@@ -358,6 +404,8 @@ export class ScheduleDispatcher {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private running: Promise<void> | undefined;
   private stopped = true;
+  /** Failed firings by schedule id: tried again at `at`, never at once (SC-1). */
+  private readonly retries = new Map<string, Retry>();
 
   constructor(private readonly o: ScheduleDispatcherOptions) {
     this.registry = o.registry;
@@ -367,10 +415,17 @@ export class ScheduleDispatcher {
   /** Redoes firings a crash cut off, handles what was missed while stopped, arms the timer. */
   start(): void {
     this.stopped = false;
+    this.retries.clear();
     this.running = (async () => {
-      for (const p of this.registry.pending()) await this.fireOnce(p.id, p.scheduledAt, false);
+      for (const p of this.registry.pending()) {
+        if (this.stopped) return;
+        await this.fireOnce(p.id, p.scheduledAt, false);
+      }
       const now = this.now();
       for (const s of this.registry.due(now - LATE_MS)) {
+        if (this.stopped) return;
+        // A cut-off firing of it that failed again above waits for its retry: that one is its firing.
+        if (this.retries.has(s.id)) continue;
         if (s.missed === 'skip') this.registry.skip(s.id, now);
         else await this.fireOnce(s.id, this.latestMissed(s, now), true);
       }
@@ -382,6 +437,7 @@ export class ScheduleDispatcher {
       });
   }
 
+  /** No more firings: the timer goes, and a tick under way fires nothing more after the one it is on (`idle` waits for that). */
   stop(): void {
     this.stopped = true;
     if (this.timer) clearTimeout(this.timer);
@@ -398,12 +454,25 @@ export class ScheduleDispatcher {
     if (!this.running) this.arm();
   }
 
-  /** Fires everything due now (the timer's job; tests call it with a moved clock). */
+  /** Fires everything due now, and the failed firings whose wait is over (the timer's job; tests call it with a moved clock). */
   tick(): Promise<void> {
     if (this.running) return this.running;
     this.running = (async () => {
       const now = this.now();
-      for (const s of this.registry.due(now)) await this.fireOnce(s.id, s.nextAt!, now - s.nextAt! > LATE_MS);
+      if (this.retries.size) {
+        // A retry whose marker went (its schedule was removed) is not tried again.
+        const marked = new Set(this.registry.pending().map((p) => `${p.id}\u0000${p.scheduledAt}`));
+        for (const [id, r] of [...this.retries]) {
+          if (this.stopped) return;
+          if (!marked.has(`${id}\u0000${r.scheduledAt}`)) this.retries.delete(id);
+          else if (r.at <= now) await this.fireOnce(id, r.scheduledAt, r.missed);
+        }
+      }
+      for (const s of this.registry.due(now)) {
+        // Stopped meanwhile: what is left fires at the next start.
+        if (this.stopped) return;
+        if (!this.retries.has(s.id)) await this.fireOnce(s.id, s.nextAt!, now - s.nextAt! > LATE_MS);
+      }
     })()
       .catch((e) => this.o.onError?.(e, '*'))
       .finally(() => {
@@ -417,8 +486,10 @@ export class ScheduleDispatcher {
     if (this.stopped) return;
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
-    const next = this.registry.nearest();
-    if (next === undefined) return;
+    // A schedule whose firing failed waits for its retry, not for its (past) time.
+    const times = [this.registry.nearest([...this.retries.keys()]), ...[...this.retries.values()].map((r) => r.at)].filter((t): t is number => t !== undefined);
+    if (!times.length) return;
+    const next = Math.min(...times);
     const delay = Math.max(0, Math.min(next - this.now(), 2 ** 31 - 1));
     this.timer = setTimeout(() => {
       this.timer = undefined;
@@ -438,21 +509,41 @@ export class ScheduleDispatcher {
     return at;
   }
 
+  /**
+   * One firing, at most once (SC-1): marked, delivered, then over. Failed for good (`isFinalFiring`):
+   * over all the same, recorded (`onFailed`), never tried again. Failed otherwise (or not recorded):
+   * the marker stays and it is tried again with the same id after a growing wait, and at the next start.
+   */
   private async fireOnce(id: string, scheduledAt: number, missed: boolean): Promise<void> {
-    const s = this.registry.get(id);
-    if (!s) {
-      this.registry.end(id, scheduledAt, this.now());
-      return;
-    }
-    this.registry.begin(id, scheduledAt);
     try {
-      await this.deliver(s, scheduledAt, missed);
+      const s = this.registry.get(id);
+      if (!s) {
+        this.registry.end(id, scheduledAt, this.now());
+        this.retries.delete(id);
+        return;
+      }
+      this.registry.begin(id, scheduledAt);
+      try {
+        await this.deliver(s, scheduledAt, missed);
+      } catch (e) {
+        if (!isFinalFiring(e)) throw e;
+        this.registry.fail(id, scheduledAt, this.now());
+        this.retries.delete(id);
+        try {
+          this.o.onFailed?.(s, scheduledAt, e);
+        } catch {
+          // recording it is best effort: the firing is over either way
+        }
+        return;
+      }
+      this.registry.end(id, scheduledAt, this.now());
+      this.retries.delete(id);
     } catch (e) {
-      // Not delivered: the marker stays, the next start redoes it with the same id (SC-1).
-      this.o.onError?.(e, id);
-      return;
+      const failures = (this.retries.get(id)?.failures ?? 0) + 1;
+      const wait = Math.min(this.o.retry?.maxMs ?? RETRY_MAX_MS, (this.o.retry?.minMs ?? RETRY_MIN_MS) * 2 ** (failures - 1));
+      this.retries.set(id, { scheduledAt, missed, failures, at: this.now() + wait });
+      this.o.onError?.(e, id, wait);
     }
-    this.registry.end(id, scheduledAt, this.now());
   }
 
   private async deliver(s: Schedule, scheduledAt: number, missed: boolean): Promise<void> {
@@ -468,14 +559,14 @@ export class ScheduleDispatcher {
       ...Object.fromEntries(Object.entries(s.meta ?? {}).map(([k, v]) => [`schedule.${k}`, v])),
     };
     if (s.action === 'message') {
-      if (!this.o.send) throw new Error('this host cannot send scheduled messages');
+      if (!this.o.send) throw new FinalFiringError('this host cannot send scheduled messages');
       await this.o.send(s, inputId);
       return;
     }
     const replyRoute = s.route ?? (s.target ? ((await this.o.replyRoute?.(s.target.sessionKey)) ?? null) : null);
     const input: InputRecord = { inputId, origin, content: [{ type: 'text', text }], replyRoute, channelContext };
     if (s.action === 'host') {
-      if (!this.o.toHost) throw new Error('no host takes scheduled items');
+      if (!this.o.toHost) throw new FinalFiringError('no host takes scheduled items');
       await this.o.toHost(s, input);
       return;
     }

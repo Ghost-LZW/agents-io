@@ -337,7 +337,7 @@ export class ExternalMcp implements ExternalBackend {
       this.k.log('warn', `external MCP: host external callout for ${caller.client.name} ${a.op} failed (${(e as Error).message}); denied`);
       throw new ToolError('denied: the host did not answer whether this is allowed; try again later');
     }
-    if (v.verdict !== 'allow') throw new ToolError(`denied by the host${v.reason ? `: ${v.reason}` : ''}`);
+    if (v.verdict !== 'allow') throw final(`denied by the host${v.reason ? `: ${v.reason}` : ''}`);
   }
 
   async send(caller: ExternalCaller, a: { route: ReplyRoute; text: string; operationId?: string }): Promise<unknown> {
@@ -348,7 +348,7 @@ export class ExternalMcp implements ExternalBackend {
     if (settled) return sent(operationId, settled, true);
     if (this.inFlight.has(operationId)) throw new ToolError(`operation ${operationId} is being sent now; explain it later to see how it ended`);
     const to = this.k.resolveRoute(a.route);
-    if (!to.ok) throw new ToolError(to.message);
+    if (!to.ok) throw final(to.message);
     // A single-entry fallback sends as that entry's account (as a host deliver does).
     const route = to.route;
     const content: ContentBlock[] = [{ type: 'text', text: a.text }];
@@ -375,11 +375,11 @@ export class ExternalMcp implements ExternalBackend {
         // U20: an outbound.content host took it: settled held, never sent, not recorded as sent.
         this.k.hold(route, { operationId, sessionKey: externalLog(name), external: senderOf(caller), ...(verdict.reason !== undefined ? { reason: verdict.reason } : {}) });
         this.k.log('info', `external MCP: ${name} send to ${routeKey(route)} held by the host`);
-        throw new ToolError(`the host took this message; it was not sent${verdict.reason ? ` (${verdict.reason})` : ''}. Do not send it again (operationId ${operationId})`);
+        throw final(`the host took this message; it was not sent${verdict.reason ? ` (${verdict.reason})` : ''}. Do not send it again (operationId ${operationId})`);
       }
       if (verdict !== 'allow') {
         this.k.log('warn', `external MCP: ${name} send to ${routeKey(route)} denied by the outbound policy`);
-        throw new ToolError(`destination ${routeKey(route)} is not allowed by the outbound policy`);
+        throw final(`destination ${routeKey(route)} is not allowed by the outbound policy`);
       }
       const by = senderOf(caller);
       const rec: ExternalSendRecord = { ...by, tool: 'send_message', operationId, route, text: a.text };
@@ -388,21 +388,25 @@ export class ExternalMcp implements ExternalBackend {
       // settles after a restart), and says what it is (U20: an outbound.scoped host checks it where its scope is).
       const d = await this.k.send(route, { text: a.text }, { operationId, sessionKey: externalLog(name), external: by });
       // The channel stopped since the route was resolved.
-      if (!d) throw new ToolError(`delivery to ${routeKey(route)} rejected: no running channel sends it (operationId ${operationId})`);
-      if (d.status !== 'delivered') throw new ToolError(`delivery to ${routeKey(route)} ${d.status}${d.error ? `: ${d.error}` : ''} (operationId ${operationId})`);
+      if (!d) throw final(`delivery to ${routeKey(route)} rejected: no running channel sends it (operationId ${operationId})`);
+      if (d.status !== 'delivered') throw final(`delivery to ${routeKey(route)} ${d.status}${d.error ? `: ${d.error}` : ''} (operationId ${operationId})`);
       return sent(operationId, { ...d, route }, false);
     } finally {
       this.inFlight.delete(operationId);
     }
   }
 
-  /** A firing of a client's schedule: sent as that client, through the checks of its send_message. */
+  /**
+   * A firing of a client's schedule: sent as that client, through the checks of its send_message.
+   * What trying again cannot change (out of scope, denied, held, no channel, settled other than
+   * delivered) throws with `final: true`: the firing is over (SC-1); the rest is tried again later.
+   */
   async sendAs(client: string, a: { route: ReplyRoute; text: string; operationId: string }): Promise<void> {
     const c = this.config.clients.find((x) => x.name === client);
-    if (!c) throw new Error(`no external client ${client}`);
+    if (!c) throw final(`no external client ${client}`);
     const caller: ExternalCaller = { client: { name: c.name, principal: c.principal, scopes: c.scopes, declare: c.declare } };
     // Its scope may have changed since it was set: a route it may no longer use is not sent to.
-    if (!c.scopes.schedule.some((p) => globMatch(p, routeKey(a.route)))) throw new Error(`route ${routeKey(a.route)} is no longer in ${client}'s schedule scope`);
+    if (!c.scopes.schedule.some((p) => globMatch(p, routeKey(a.route)))) throw final(`route ${routeKey(a.route)} is no longer in ${client}'s schedule scope`);
     await this.send(caller, { route: a.route, text: a.text, operationId: a.operationId });
   }
 
@@ -501,9 +505,17 @@ function tokenFromFile(client: string, file: string, k: KernelContext): string {
   }
 }
 
+/**
+ * A send's failure that trying again cannot change (denied, held, out of scope, no channel, settled
+ * other than delivered): `final: true` ends a schedule's firing (`ModuleHooks.scheduledMessage`).
+ */
+function final(message: string): ToolError {
+  return Object.assign(new ToolError(message), { final: true as const });
+}
+
 /** What a send answers: where it went and the operationId to explain. */
 function sent(operationId: string, r: KernelSettledSend, duplicate: boolean) {
-  if (r.status !== 'delivered') throw new ToolError(`delivery to ${routeKey(r.route)} ${r.status}${r.error ? `: ${r.error}` : ''} (operationId ${operationId})`);
+  if (r.status !== 'delivered') throw final(`delivery to ${routeKey(r.route)} ${r.status}${r.error ? `: ${r.error}` : ''} (operationId ${operationId})`);
   return { ok: true, delivered: routeKey(r.route), operationId, ...(r.providerMessageId !== undefined ? { messageId: r.providerMessageId } : {}), ...(duplicate ? { duplicate: true } : {}) };
 }
 

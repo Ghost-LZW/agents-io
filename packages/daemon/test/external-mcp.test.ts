@@ -442,7 +442,7 @@ describe('external schedules', () => {
   });
 
   // INVARIANTS SC-1 不成立 (2026-11-24): the firing throws, keeps its time, and is redone at once: about 500 tries a second, each logged.
-  it.fails("a client's message schedule whose route its scope no longer has fails once as it fires and is over: recorded in the schedule's log, not tried again, nothing sent #SC-1 #SC-3", async () => {
+  it("a client's message schedule whose route its scope no longer has fails once as it fires and is over: recorded in the schedule's log, not tried again, nothing sent #SC-1 #SC-3", async () => {
     const dir = tmp();
     const f = tokenFiles(dir);
     const raw = (scope: string) => ({ externalMcp: { listen: '127.0.0.1:0', clients: { timer: { tokenFile: f.ops, scopes: [scope] } } } });
