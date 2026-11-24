@@ -1,8 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
 import { PrefaceMemo, type HarnessSession, type InputRecord } from '@agents-io/protocol';
 import { assertConformingStream } from '@agents-io/testkit';
 import { Hub, Lane, MemorySessionLog, defaultPolicy } from '@agents-io/session';
-import { SUPPORTED_CODEX_LINES, UnsupportedCodexVersionError, renderInputs } from '../src/index.js';
+import { CodexHarness, CodexSession, RpcClient, SUPPORTED_CODEX_LINES, UnsupportedCodexVersionError, codexHarnessModule, renderInputs } from '../src/index.js';
 import { FakeAppServer, FakeRpcError, turn } from './fake-app-server.js';
 import { collector, input, isCompleted, open, run, setup, tick } from './codex-helpers.js';
 
@@ -20,33 +23,140 @@ describe('handshake and probe', () => {
     expect(idx).toBeGreaterThan(fake.received.indexOf(init));
   });
 
-  it('refuses unknown versions clearly, unless allowed #HC-1', async () => {
+  it('refuses a version older than the oldest verified line clearly, unless allowed #HC-1', async () => {
     const { fake, harness } = setup();
-    fake.userAgent = 'agents_io/0.170.0 (x)';
+    fake.userAgent = 'agents_io/0.150.0 (x)';
     await expect(harness.probe()).rejects.toBeInstanceOf(UnsupportedCodexVersionError);
-    await expect(harness.probe()).rejects.toThrow(/0\.170\.0 is not supported.*0\.160\.x/);
+    await expect(harness.probe()).rejects.toThrow(/0\.150\.0 is not supported.*0\.160\.x/);
+    await expect(open(harness)).rejects.toThrow(/0\.150\.0 is not supported/);
     expect(fake.sent('initialized')).toHaveLength(0);
 
-    const ok = setup({ allowUnknownVersion: true });
-    ok.fake.userAgent = 'agents_io/0.170.0 (x)';
-    expect((await ok.harness.probe()).version).toBe('0.170.0');
-
-    const bad = setup({ allowUnknownVersion: true });
-    bad.fake.userAgent = 'garbage';
-    await expect(bad.harness.probe()).rejects.toThrow(/could not determine/);
+    // allowUnknownVersion: anything runs, unchecked and without a warning (also an unreadable version).
+    for (const ua of ['agents_io/0.150.0 (x)', 'agents_io/0.172.0 (x)', 'garbage']) {
+      const logs: string[] = [];
+      const ok = setup({ allowUnknownVersion: true, log: (_l, m) => logs.push(m) });
+      ok.fake.userAgent = ua;
+      expect((await ok.harness.probe()).version).toBe(ua.match(/\/(\S+)/)?.[1] ?? 'unknown');
+      const c = collector(await open(ok.harness));
+      await tick();
+      expect(logs).toEqual([]);
+      expect(c.of('notice')).toEqual([]);
+    }
   });
 
-  it('accepts every supported line: 0.160 (still deployed) and 0.171 (types generated from it) #HC-1', async () => {
+  it('accepts every supported line silently: 0.160 (still deployed) and 0.171 (types generated from it) #HC-1', async () => {
     expect(SUPPORTED_CODEX_LINES).toEqual(['0.160', '0.171']);
     for (const v of ['0.160.1', '0.171.0', '0.171.4']) {
-      const { fake, harness } = setup();
+      const logs: string[] = [];
+      const { fake, harness } = setup({ log: (_l, m) => logs.push(m) });
       fake.userAgent = `agents_io/${v} (Mac OS 26.5.0; arm64) test`;
       expect((await harness.probe()).version).toBe(v);
       expect(fake.sent('initialized')).toHaveLength(1);
+      const c = collector(await open(harness));
+      await tick();
+      expect(logs).toEqual([]);
+      expect(c.of('notice')).toEqual([]);
     }
-    const { fake, harness } = setup();
-    fake.userAgent = 'agents_io/0.172.0 (x)';
-    await expect(harness.probe()).rejects.toThrow(/0\.172\.0 is not supported by @agents-io\/harness-codex \(supported: 0\.160\.x, 0\.171\.x; types generated from 0\.171\.0\)/);
+  });
+
+  it('runs a newer unverified version (0.172, 1.0) with exactly one warning: the log at probe, a notice on the first session, a conforming stream #HC-1', async () => {
+    for (const v of ['0.172.0', '1.0.0']) {
+      const logs: [string, string][] = [];
+      const { fake, harness } = setup({ log: (l, m) => logs.push([l, m]) });
+      fake.userAgent = `agents_io/${v} (Mac OS 26.5.0; arm64) test`;
+      expect((await harness.probe()).version).toBe(v);
+      expect(fake.sent('initialized')).toHaveLength(1);
+      expect(logs).toHaveLength(1);
+      expect(logs[0]![0]).toBe('warn');
+      expect(logs[0]![1]).toContain(`codex app-server ${v} has not been verified with @agents-io/harness-codex (verified: 0.160.x, 0.171.x; types generated from 0.171.0); running it anyway`);
+      expect(logs[0]![1]).toContain('scripts/gen-types.sh');
+
+      const s = await open(harness);
+      const c = collector(s);
+      fake.onTurnStart = (p, tid) => {
+        fake.echoUser(p.threadId, tid, p.clientUserMessageId);
+        fake.notify('item/completed', { threadId: p.threadId, turnId: tid, item: { type: 'agentMessage', id: 'm1', text: 'pong', phase: 'final_answer', memoryCitation: null, delivery: null, questions: null }, completedAtMs: 1 });
+        fake.completeTurn(p.threadId, tid, 'completed');
+      };
+      await s.startTurn('T1', [input('i1', 'ping')]);
+      await c.until(isCompleted);
+      assertConformingStream(c.events, { turnInputs: { T1: ['i1'] } });
+      expect(c.of('turn.completed')[0]).toMatchObject({ status: 'completed' });
+      const notices = c.events.filter((e) => e.body.t === 'notice' && /has not been verified/.test((e.body as any).message));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toMatchObject({ level: 'detail', body: { code: 'other' } });
+      expect((notices[0]!.body as any).message).toContain(`codex app-server ${v} has not been verified`);
+
+      // Once per adapter: a second session, and a session on an adapter its ownProcess made, get none; the log has no second line.
+      const c2 = collector(await open(harness, { sessionKey: 's2' }));
+      const c3 = collector(await open(harness.ownProcess({ env: { K: 'v' } }), { sessionKey: 's3' }));
+      await tick();
+      expect(c2.of('notice')).toEqual([]);
+      expect(c3.of('notice')).toEqual([]);
+      expect(logs).toHaveLength(1);
+    }
+  });
+
+  it('the codex harness kind gives its adapter the daemon log: an unverified version is warned of there #HC-1', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'aio-codex-kind-'));
+    try {
+      // A stand-in for `codex app-server` on stdio: answers initialize (request 1) as 0.172.0 would, then idles.
+      const bin = join(dir, 'codex');
+      const init = JSON.stringify({ id: 1, result: { userAgent: 'agents_io/0.172.0 (Mac OS 26.5.0; arm64) test', codexHome: dir, platformFamily: 'unix', platformOs: 'macos' } });
+      writeFileSync(bin, `#!/bin/sh\nread -r _\nprintf '%s\\n' '${init}'\ncat >/dev/null\n`, { mode: 0o755 });
+      const logs: [string, string][] = [];
+      const adapter = codexHarnessModule.create({
+        name: 'cx',
+        config: undefined,
+        log: (level, msg) => logs.push([level, msg]),
+        harness: () => {
+          throw new Error('none');
+        },
+        launch: { bin, transport: { kind: 'stdio' } },
+        env: {},
+        profiles: {},
+      });
+      expect((await adapter.probe()).version).toBe('0.172.0');
+      expect(logs).toEqual([['warn', expect.stringMatching(/^codex app-server 0\.172\.0 has not been verified with @agents-io\/harness-codex/)]]);
+      await (adapter as CodexHarness).dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('runs a codex whose version cannot be read (no userAgent) with one warning #HC-1', async () => {
+    for (const ua of [undefined, 'garbage']) {
+      const logs: string[] = [];
+      const { fake, harness } = setup({ log: (_l, m) => logs.push(m) });
+      fake.userAgent = ua as unknown as string;
+      expect((await harness.probe()).version).toBe('unknown');
+      expect(fake.sent('initialized')).toHaveLength(1);
+      expect(logs).toHaveLength(1);
+      expect(logs[0]).toMatch(/could not determine the codex app-server version from the initialize response \(userAgent\); running it unverified \(verified: 0\.160\.x, 0\.171\.x/);
+      const c = collector(await open(harness));
+      await tick();
+      expect(c.of('notice').map((n) => n.message)).toEqual([expect.stringMatching(/^could not determine the codex app-server version/)]);
+    }
+  });
+
+  it('strictVersion refuses every unverified version and an unreadable one, as before decision 17 #HC-1', async () => {
+    for (const v of ['0.172.0', '0.170.0', '1.0.0', '0.150.0']) {
+      const { fake, harness } = setup({ strictVersion: true });
+      fake.userAgent = `agents_io/${v} (x)`;
+      await expect(harness.probe()).rejects.toBeInstanceOf(UnsupportedCodexVersionError);
+      await expect(harness.probe()).rejects.toThrow(new RegExp(`${v.replace(/\./g, '\\.')} is not supported by @agents-io/harness-codex \\(supported: 0\\.160\\.x, 0\\.171\\.x; types generated from 0\\.171\\.0\\)`));
+      expect(fake.sent('initialized')).toHaveLength(0);
+    }
+    const missing = setup({ strictVersion: true });
+    missing.fake.userAgent = 'garbage';
+    await expect(missing.harness.probe()).rejects.toThrow(/could not determine/);
+    const ok = setup({ strictVersion: true });
+    ok.fake.userAgent = 'agents_io/0.171.0 (x)';
+    expect((await ok.harness.probe()).version).toBe('0.171.0');
+    // allowUnknownVersion wins.
+    const both = setup({ strictVersion: true, allowUnknownVersion: true });
+    both.fake.userAgent = 'agents_io/0.172.0 (x)';
+    expect((await both.harness.probe()).version).toBe('0.172.0');
   });
 });
 
@@ -559,6 +669,237 @@ describe('approvals', () => {
     expect(r.error.code).toBe(-32601);
     const r2 = await fake.request('account/chatgptAuthTokens/refresh', {});
     expect(r2.error.code).toBe(-32601);
+  });
+});
+
+describe('protocol it does not know (decision 17)', () => {
+  const cmdParams = (th: string, tid: string, extra: object = {}) => ({
+    kind: 'command', threadId: th, turnId: tid, itemId: 'c1', startedAtMs: 1, environmentId: 'local',
+    command: "/bin/zsh -lc 'make'", cwd: '/work', commandActions: [], ...extra,
+  });
+
+  it('answers a server request it does not implement at once and records it as native: on a session, and without a thread #HC-9', async () => {
+    const logs: string[] = [];
+    const { fake, harness } = setup({ log: (_l, m) => logs.push(m) });
+    const s = await open(harness);
+    const c = collector(s);
+    const onSession = await fake.request('item/tool/call', { threadId: 'thr-1', turnId: 'x', callId: 'c', tool: 't', arguments: {} });
+    expect(onSession.error).toMatchObject({ code: -32601, message: '@agents-io/harness-codex does not handle item/tool/call' });
+    const noThread = await fake.request('account/chatgptAuthTokens/refresh', { reason: 'unauthorized' });
+    expect(noThread.error).toMatchObject({ code: -32601, message: '@agents-io/harness-codex does not handle account/chatgptAuthTokens/refresh' });
+    const again = await fake.request('account/chatgptAuthTokens/refresh', { reason: 'unauthorized' });
+    expect(again.error.code).toBe(-32601);
+    const approvalNoThread = await fake.request('item/commandExecution/requestApproval', { itemId: 'c1', command: 'ls' });
+    expect(approvalNoThread.error).toMatchObject({ code: -32602, message: expect.stringMatching(/without a threadId/) });
+    const nullParams = await fake.request('some/future/request', null);
+    expect(nullParams.error.code).toBe(-32601);
+    await tick();
+    expect(c.of('native').map((b) => b.name)).toEqual([
+      'item/tool/call',
+      'account/chatgptAuthTokens/refresh',
+      'account/chatgptAuthTokens/refresh',
+      'item/commandExecution/requestApproval',
+      'some/future/request',
+    ]);
+    expect(c.of('request.opened')).toEqual([]);
+    // Logged once per method, not once per request.
+    expect(logs.filter((m) => m.includes('account/chatgptAuthTokens/refresh'))).toHaveLength(1);
+    expect(c.ended).toBe(false);
+  });
+
+  it('answers with an error the requests for a thread no session took within 10 s, unless another client answered them; never drops one #HC-9', async () => {
+    const logs: string[] = [];
+    const { fake, harness } = setup({ log: (_l, m) => logs.push(m) });
+    await open(harness); // the connection, with thr-1 registered; thr-x never is
+    vi.useFakeTimers();
+    try {
+      const answers: unknown[] = [];
+      const first = fake.request('item/commandExecution/requestApproval', cmdParams('thr-x', 't1')).then((m) => answers.push(['first', m.error?.code, m.error?.message]));
+      const second = fake.request('item/fileChange/requestApproval', { threadId: 'thr-x', turnId: 't1', itemId: 'f1', startedAtMs: 1 });
+      void second.then(() => answers.push(['second']));
+      fake.notify('serverRequest/resolved', { threadId: 'thr-x', requestId: 1 }); // the second, answered by another client
+      const third = fake.request('mcpServer/elicitation/request', { threadId: 'thr-x', turnId: null, serverName: 's', mode: 'form', message: 'm', requestedSchema: { type: 'object', properties: {} } })
+        .then((m) => answers.push(['third', m.error?.code]));
+      await vi.advanceTimersByTimeAsync(9_000);
+      expect(answers).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await first;
+      await third;
+      expect(answers).toEqual([
+        ['first', -32603, '@agents-io/harness-codex cannot answer item/commandExecution/requestApproval: no session took thread thr-x within 10s'],
+        ['third', -32603],
+      ]);
+      expect(fake.received.filter((m) => m.id === 1 && m.method === undefined)).toEqual([]); // the one answered elsewhere: not answered again
+      expect(logs.filter((m) => /no session took thread thr-x/.test(m))).toHaveLength(2);
+
+      // More than the buffer holds: the request that does not fit is answered at once.
+      for (let i = 0; i < 256; i++) fake.notify('item/agentMessage/delta', { threadId: 'thr-y', turnId: 't', itemId: 'm', delta: 'x' });
+      const over = await fake.request('item/tool/requestUserInput', { threadId: 'thr-y', turnId: 't', itemId: 'q', questions: [] });
+      expect(over.error).toMatchObject({ code: -32603, message: expect.stringMatching(/more than 256 messages waiting/) });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a request for a thread whose session registers in time reaches that session #HC-9', async () => {
+    const { fake, harness } = setup();
+    const orig = fake.handlers['thread/start']!;
+    // Codex can send a thread's first request before (or with) the thread/start answer.
+    fake.handlers['thread/start'] = (p, f) => {
+      const res = orig(p, f) as { thread: { id: string } };
+      void f.request('item/tool/requestUserInput', { threadId: res.thread.id, turnId: null, itemId: 'q1', questions: [{ id: 'a', header: '', question: 'Go?', isOther: false, isSecret: false, options: null }] });
+      return res;
+    };
+    const s = await open(harness);
+    const c = collector(s);
+    await c.until((e) => e.body.t === 'request.opened');
+    expect(c.of('request.opened')[0]).toMatchObject({ kind: 'question', title: 'Go?' });
+  });
+
+  it('an approval with fields and decision kinds it does not know still opens, offering the decisions that map back #HC-9', async () => {
+    const { fake, harness } = setup();
+    const s = await open(harness);
+    const c = collector(s);
+    const answers: unknown[] = [];
+    fake.onTurnStart = async (p, tid) => {
+      fake.echoUser(p.threadId, tid, p.clientUserMessageId);
+      // 0.171's humanCommand takes only a one-time decision; a newer codex may add decision kinds and fields.
+      const future = cmdParams(p.threadId, tid, {
+        kind: 'humanCommand',
+        availableDecisions: ['accept', { acceptWithFutureScope: { scope: 'repo' } }, 'acceptForSession', 'decline', 'futureKind'],
+        futureField: { nested: [1, 2] },
+      });
+      answers.push((await fake.request('item/commandExecution/requestApproval', future)).result);
+      answers.push((await fake.request('item/commandExecution/requestApproval', cmdParams(p.threadId, tid, { kind: 'humanCommand' }))).result);
+      fake.completeTurn(p.threadId, tid, 'completed');
+    };
+    await s.startTurn('T1', [input('i1', 'build')]);
+    await c.until((e) => e.body.t === 'request.opened');
+    expect(c.of('request.opened')[0]).toMatchObject({ kind: 'tool_approval', title: 'Run: make', allowedDecisions: ['allow_once', 'deny', 'native'], allowAlways: false });
+    await s.respond('0', { kind: 'allow_once' });
+    await c.until((e) => e.body.t === 'request.opened' && c.of('request.opened').length === 2);
+    expect(c.of('request.opened')[1]).toMatchObject({ allowedDecisions: ['allow_once', 'deny', 'native'], allowAlways: false });
+    await s.respond('1', { kind: 'deny' });
+    await c.until(isCompleted);
+    expect(answers).toEqual([{ decision: 'accept' }, { decision: 'decline' }]);
+    expect(c.of('turn.completed')[0]!.status).toBe('completed');
+    assertConformingStream(c.events, { turnInputs: { T1: ['i1'] } });
+  });
+
+  it('an approval whose params cannot be read is declined, recorded with a notice, and the turn completes #HC-9', async () => {
+    const { fake, harness } = setup();
+    const s = await open(harness);
+    const c = collector(s);
+    const answers: unknown[] = [];
+    fake.onTurnStart = async (p, tid) => {
+      fake.echoUser(p.threadId, tid, p.clientUserMessageId);
+      const base = { threadId: p.threadId, turnId: tid, itemId: 'x1', startedAtMs: 1 };
+      answers.push((await fake.request('item/permissions/requestApproval', { ...base, permissions: null })).result);
+      answers.push((await fake.request('item/tool/requestUserInput', { ...base, questions: 'which one?' })).result);
+      answers.push((await fake.request('mcpServer/elicitation/request', { ...base, serverName: 's', message: 'm', mode: 'form', requestedSchema: { properties: { a: null } } })).result);
+      answers.push((await fake.request('item/commandExecution/requestApproval', { ...base, command: "/bin/zsh -lc 'ls'", proposedNetworkPolicyAmendments: 7 })).result);
+      fake.notify('item/completed', { threadId: p.threadId, turnId: tid, item: { type: 'agentMessage', id: 'm1', text: 'done anyway', phase: 'final_answer', memoryCitation: null, delivery: null, questions: null }, completedAtMs: 1 });
+      fake.completeTurn(p.threadId, tid, 'completed');
+    };
+    await s.startTurn('T1', [input('i1', 'x')]);
+    await c.until(isCompleted);
+    expect(answers).toEqual([
+      { permissions: {}, scope: 'turn' },
+      { answers: {} },
+      { action: 'decline', content: null, _meta: null },
+      { decision: 'decline' },
+    ]);
+    expect(c.of('request.opened')).toEqual([]);
+    const notices = c.events.filter((e) => e.body.t === 'notice');
+    expect(notices.map((e) => (e.body as any).message)).toEqual([
+      expect.stringMatching(/^codex item\/permissions\/requestApproval could not be read \(.+\); declined so the turn goes on$/),
+      expect.stringMatching(/^codex item\/tool\/requestUserInput could not be read/),
+      expect.stringMatching(/^codex mcpServer\/elicitation\/request could not be read/),
+      expect.stringMatching(/^codex item\/commandExecution\/requestApproval could not be read/),
+    ]);
+    expect(notices.every((e) => e.level === 'detail' && e.turnId === 'T1')).toBe(true);
+    expect(c.of('native').map((b) => b.name)).toEqual(['item/permissions/requestApproval', 'item/tool/requestUserInput', 'mcpServer/elicitation/request', 'item/commandExecution/requestApproval']);
+    expect(c.of('turn.completed')[0]).toMatchObject({ status: 'completed' });
+    expect(c.events.find((e) => e.body.t === 'text.snapshot' && (e.body as any).final)?.body).toMatchObject({ text: 'done anyway' });
+    assertConformingStream(c.events, { turnInputs: { T1: ['i1'] } });
+  });
+
+  it('a decision whose answer cannot be built from the params Codex replayed is sent as a decline; respond says so #HC-9', async () => {
+    const sent: unknown[] = [];
+    const host = { rpc: { respond: (id: unknown, r: unknown) => sent.push([id, r]), respondError: (id: unknown, code: number) => sent.push([id, code]), request: async () => ({}), closed: undefined }, detach: () => {} };
+    const s = new CodexSession(host as never, 'thr', { sessionKey: 'k', generation: 1, cwd: '/work', run }, {}, { profile: 'bypass' });
+    const c = collector(s);
+    s.onServerRequest(5, 'item/permissions/requestApproval', { threadId: 'thr', turnId: null, itemId: 'p1', reason: 'net', permissions: { network: { enabled: true }, fileSystem: null } });
+    // Replayed (a new connection) with params the answer cannot be built from.
+    s.onServerRequest(5, 'item/permissions/requestApproval', { threadId: 'thr', turnId: null, itemId: 'p1', permissions: null });
+    await expect(s.respond('5', { kind: 'allow_once' })).rejects.toThrow(/could not answer allow_once .*declined instead/);
+    expect(sent).toEqual([[5, { permissions: {}, scope: 'turn' }]]);
+    await tick();
+    expect(c.of('request.resolved')).toEqual([{ t: 'request.resolved', requestId: '5', decision: { kind: 'deny', message: expect.stringMatching(/declined instead/) }, by: { kind: 'host' } }]);
+    await expect(s.respond('5', { kind: 'allow_once' })).rejects.toThrow(/unknown or already resolved/);
+  });
+
+  it('an approval reaching a session while it closes is answered with an error #HC-9', async () => {
+    const { fake, harness } = setup();
+    const s = await open(harness);
+    const closing = s.close('bye'); // closed now; still on the server until thread/unsubscribe answers
+    const r = await fake.request('item/commandExecution/requestApproval', cmdParams('thr-1', 'turn-x'));
+    expect(r.error).toMatchObject({ code: -32603, message: '@agents-io/harness-codex cannot answer item/commandExecution/requestApproval: the session is closed' });
+    await closing;
+  });
+
+  it('a notification of a shape it does not expect is recorded as native with a notice, and the session goes on #HC-9', async () => {
+    const { fake, harness } = setup();
+    const s = await open(harness);
+    const c = collector(s);
+    fake.onTurnStart = (p, tid) => {
+      const th = p.threadId;
+      fake.echoUser(th, tid, p.clientUserMessageId);
+      fake.notify('turn/plan/updated', { threadId: th, turnId: tid, plan: 'not a list' });
+      fake.notify('item/started', { threadId: th, turnId: tid, item: null });
+      fake.notify('thread/status/changed', { threadId: th, status: null });
+      fake.notify('turn/diff/updated', { threadId: th, turnId: tid, diff: { files: [] } });
+      fake.notify('turn/completed', { threadId: th, turn: null });
+      fake.completeTurn(th, tid, 'completed');
+    };
+    await s.startTurn('T1', [input('i1', 'x')]);
+    await c.until(isCompleted);
+    expect(c.of('turn.completed')[0]).toMatchObject({ turnId: 'T1', status: 'completed' });
+    expect(c.of('native').map((b) => b.name)).toEqual(['turn/plan/updated', 'item/started', 'thread/status/changed', 'turn/diff/updated', 'turn/completed']);
+    const notices = c.events.filter((e) => e.body.t === 'notice');
+    expect(notices).toHaveLength(5);
+    expect(notices.every((e) => e.level === 'detail' && /has a shape this adapter does not map/.test((e.body as any).message))).toBe(true);
+    expect(c.ended).toBe(false);
+
+    // The next turn runs; a turn status it does not know ends the turn as ambiguous.
+    fake.onTurnStart = (p, tid) => {
+      fake.echoUser(p.threadId, tid, p.clientUserMessageId);
+      fake.completeTurn(p.threadId, tid, 'cancelledByPolicy');
+    };
+    await s.startTurn('T2', [input('i2', 'y')]);
+    await c.until((e) => isCompleted(e) && e.turnId === 'T2');
+    expect(c.of('turn.completed')[1]).toMatchObject({ turnId: 'T2', status: 'ambiguous' });
+    assertConformingStream(c.events, { turnInputs: { T1: ['i1'], T2: ['i2'] } });
+    expect(c.ended).toBe(false);
+  });
+
+  it('a handler that throws never reaches the transport, and a server request it threw on is answered; a JSON line that is no message is ignored #HC-9', () => {
+    const written: any[] = [];
+    let line!: (l: string) => void;
+    const rpc = new RpcClient({ write: (l) => written.push(JSON.parse(l)), onLine: (cb) => (line = cb), onClose: () => {}, close: () => {} });
+    const errors: string[] = [];
+    rpc.onHandlerError((method) => errors.push(method));
+    rpc.onNotification(() => {
+      throw new TypeError('boom');
+    });
+    rpc.onServerRequest(() => {
+      throw new TypeError('bang');
+    });
+    expect(() => line(JSON.stringify({ method: 'turn/completed', params: { turn: null } }))).not.toThrow();
+    expect(() => line(JSON.stringify({ id: 7, method: 'item/fileChange/requestApproval', params: {} }))).not.toThrow();
+    for (const l of ['null', '42', '"text"', '[1,2]']) expect(() => line(l)).not.toThrow();
+    expect(errors).toEqual(['turn/completed', 'item/fileChange/requestApproval']);
+    expect(written).toEqual([{ id: 7, error: { code: -32603, message: '@agents-io/harness-codex failed on item/fileChange/requestApproval: bang' } }]);
   });
 });
 

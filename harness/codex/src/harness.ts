@@ -1,7 +1,17 @@
 import { createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { join } from 'node:path';
-import type { BlobAccess, HarnessAdapter, HarnessCaps, HarnessDeclarations, HarnessOpenArgs, HarnessSession, NativeClient, SessionEnvSupport } from '@agents-io/protocol';
+import type {
+  BlobAccess,
+  HarnessAdapter,
+  HarnessCaps,
+  HarnessDeclarations,
+  HarnessFactoryInit,
+  HarnessOpenArgs,
+  HarnessSession,
+  NativeClient,
+  SessionEnvSupport,
+} from '@agents-io/protocol';
 import type { ClientInfo } from './generated/ClientInfo.js';
 import type { InitializeParams } from './generated/InitializeParams.js';
 import type { InitializeResponse } from './generated/InitializeResponse.js';
@@ -28,7 +38,8 @@ import {
   stopOwnServer,
   writeJson,
 } from './unix.js';
-import { assertSupportedVersion, versionFromUserAgent } from './version.js';
+import { isApprovalMethod } from './approvals.js';
+import { checkCodexVersion, versionFromUserAgent } from './version.js';
 
 export { CODEX_CAPS, DEFAULT_OPT_OUT };
 
@@ -83,8 +94,17 @@ export interface CodexHarnessOptions {
   /** Transport (default stdio), or a factory for a custom one (tests). */
   transport?: CodexTransportOption | (() => Transport | Promise<Transport>);
   clientInfo?: ClientInfo;
-  /** Run against a codex version outside SUPPORTED_CODEX_LINES. */
+  /**
+   * Run any codex version, also one older than SUPPORTED_CODEX_LINES or whose version cannot be
+   * read, without a warning. Without it (decision 17) an older version is refused, and a newer
+   * unverified one, or an unreadable version, runs with one warning (`log`, and a notice on the
+   * first session). Wins over `strictVersion`.
+   */
   allowUnknownVersion?: boolean;
+  /** Refuse every version outside SUPPORTED_CODEX_LINES and an unreadable one (`UnsupportedCodexVersionError`), as before decision 17. */
+  strictVersion?: boolean;
+  /** Where the adapter's warnings go (the daemon log, `HarnessFactoryInit.log`). Default: nowhere. */
+  log?: HarnessFactoryInit['log'];
   requestTimeoutMs?: number;
   handshakeTimeoutMs?: number;
   /** Notification methods this connection never wants (sent in initialize). */
@@ -107,6 +127,30 @@ interface Buffered {
   id?: RequestId;
   method: string;
   params: unknown;
+  /** The connection a server request came on: an answer the AppServer gives goes back on it. */
+  rpc?: RpcClient;
+  /** A buffered server request another client answered (`serverRequest/resolved` arrived meanwhile). */
+  resolved?: boolean;
+}
+
+/** How long, and how many messages, a thread's events wait for its session to register (`AppServer.early`). */
+const EARLY_MS = 10_000;
+const EARLY_LIMIT = 256;
+
+/** What an adapter, and the adapters its `ownProcess` makes, already warned of (decision 17: once each). */
+interface VersionWarnings {
+  /** Versions whose warning went to the log. */
+  logged: Set<string>;
+  /** Versions whose warning a session got as a notice. */
+  noticed: Set<string>;
+}
+
+/** What the handshake learned: the connection, Codex's answer, its version (`unknown` when unreadable), and the warning to give once. */
+interface Handshake {
+  rpc: RpcClient;
+  init: InitializeResponse;
+  version: string;
+  warning?: string;
 }
 
 interface Connector {
@@ -229,7 +273,7 @@ function makeConnector(opts: CodexHarnessOptions): Connector {
   return connector;
 }
 
-async function handshake(transport: Transport, opts: CodexHarnessOptions): Promise<{ rpc: RpcClient; init: InitializeResponse; version: string }> {
+async function handshake(transport: Transport, opts: CodexHarnessOptions): Promise<Handshake> {
   const rpc = new RpcClient(transport, opts.requestTimeoutMs ?? 120_000);
   try {
     const params: InitializeParams = {
@@ -242,10 +286,11 @@ async function handshake(transport: Transport, opts: CodexHarnessOptions): Promi
       },
     };
     const init = await rpc.request<InitializeResponse>('initialize', params, opts.handshakeTimeoutMs ?? 30_000);
-    const version = versionFromUserAgent(init.userAgent);
-    assertSupportedVersion(version, opts.allowUnknownVersion);
+    const version = versionFromUserAgent((init as { userAgent?: unknown } | null)?.userAgent as string | undefined);
+    // Decision 17: older than the oldest verified line is refused; newer or unreadable runs with a warning.
+    const { warning } = checkCodexVersion(version, opts);
     rpc.notify('initialized');
-    return { rpc, init, version: version! };
+    return { rpc, init, version: version ?? 'unknown', ...(warning ? { warning } : {}) };
   } catch (e) {
     rpc.close();
     const tail = 'stderrTail' in transport ? (transport as { stderrTail(): string }).stderrTail().trim() : '';
@@ -261,18 +306,28 @@ class AppServer implements SessionHost {
   private early = new Map<string, Buffered[]>();
   private closing = false;
   private deadCbs: (() => void)[] = [];
+  /** Methods of server requests without a thread already logged (once each). */
+  private unroutedLogged = new Set<string>();
   rpc!: RpcClient;
   version!: string;
   init!: InitializeResponse;
+  /** The version warning of the current connection (decision 17), for the adapter's first session. */
+  warning: string | undefined;
 
   private constructor(
     private readonly connector: Connector,
     private readonly opts: CodexHarnessOptions,
     private readonly onEmpty: (s: AppServer) => void,
+    private readonly onWarning: (version: string, warning: string) => void,
   ) {}
 
-  static async start(connector: Connector, opts: CodexHarnessOptions, onEmpty: (s: AppServer) => void): Promise<AppServer> {
-    const s = new AppServer(connector, opts, onEmpty);
+  static async start(
+    connector: Connector,
+    opts: CodexHarnessOptions,
+    onEmpty: (s: AppServer) => void,
+    onWarning: (version: string, warning: string) => void = () => {},
+  ): Promise<AppServer> {
+    const s = new AppServer(connector, opts, onEmpty, onWarning);
     s.attach(await handshake(await connector.open(), opts));
     return s;
   }
@@ -282,13 +337,16 @@ class AppServer implements SessionHost {
     this.deadCbs.push(cb);
   }
 
-  private attach(h: { rpc: RpcClient; init: InitializeResponse; version: string }): void {
+  private attach(h: Handshake): void {
     this.rpc = h.rpc;
     this.init = h.init;
     this.version = h.version;
+    this.warning = h.warning;
+    if (h.warning) this.onWarning(h.version, h.warning);
     const rpc = h.rpc;
     rpc.onNotification((method, params) => this.route({ kind: 'n', method, params }));
-    rpc.onServerRequest((id, method, params) => this.route({ kind: 'r', id, method, params }));
+    rpc.onServerRequest((id, method, params) => this.route({ kind: 'r', id, method, params, rpc }));
+    rpc.onHandlerError((method, e) => this.opts.log?.('warn', `handling codex ${method} failed: ${(e as Error)?.message ?? String(e)}`));
     rpc.onClose((reason) => {
       if (this.rpc !== rpc) return;
       if (this.closing || !this.connector.reconnect) return this.fail(reason);
@@ -357,19 +415,59 @@ class AppServer implements SessionHost {
     this.rpc.close();
   }
 
+  /**
+   * Every server request is answered in bounded time (HC-9): one for a registered thread by its
+   * session; one without a thread at once (an error, recorded as `native` on every session of this
+   * connection); one for a thread not registered yet waits up to EARLY_MS for its session, then is
+   * answered with an error, unless another client answered it meanwhile (`serverRequest/resolved`).
+   */
   private route(m: Buffered): void {
-    const threadId = (m.params as { threadId?: unknown } | undefined)?.threadId;
+    const threadId = (m.params as { threadId?: unknown } | null | undefined)?.threadId;
     if (typeof threadId !== 'string') {
-      if (m.kind === 'r') this.rpc.respondError(m.id!, -32601, `@agents-io/harness-codex does not handle ${m.method}`);
+      if (m.kind === 'r') this.unrouted(m);
       return;
     }
     const s = this.sessions.get(threadId);
     if (s) return this.deliver(s, m);
     // Keep a little for a session that is about to register; Codex replays pending requests on resume anyway.
-    const buf = this.early.get(threadId) ?? [];
-    if (buf.length < 256) buf.push(m);
-    this.early.set(threadId, buf);
-    if (buf.length === 1) setTimeout(() => this.early.delete(threadId), 10_000).unref();
+    let buf = this.early.get(threadId);
+    if (!buf) {
+      const b: Buffered[] = (buf = []);
+      this.early.set(threadId, b);
+      setTimeout(() => this.expire(threadId, b), EARLY_MS).unref();
+    }
+    if (m.kind === 'n' && m.method === 'serverRequest/resolved') {
+      const answered = String((m.params as { requestId?: unknown }).requestId);
+      for (const r of buf) if (r.kind === 'r' && String(r.id) === answered) r.resolved = true;
+    }
+    if (buf.length < EARLY_LIMIT) buf.push(m);
+    else if (m.kind === 'r') this.refuse(m, `no session took thread ${threadId}: more than ${EARLY_LIMIT} messages waiting for it`);
+  }
+
+  /** A thread's buffer whose session never registered: its requests nobody answered get an error, none is dropped silently. */
+  private expire(threadId: string, buf: Buffered[]): void {
+    if (this.early.get(threadId) !== buf) return; // delivered to its session meanwhile
+    this.early.delete(threadId);
+    for (const m of buf) if (m.kind === 'r' && !m.resolved) this.refuse(m, `no session took thread ${threadId} within ${EARLY_MS / 1000}s`);
+  }
+
+  private refuse(m: Buffered, why: string): void {
+    const rpc = m.rpc ?? this.rpc;
+    if (rpc.closed !== undefined) return; // that connection is gone: Codex replays what is still pending to the next one
+    rpc.respondError(m.id!, -32603, `@agents-io/harness-codex cannot answer ${m.method}: ${why}`);
+    this.opts.log?.('warn', `answered codex ${m.method} (request ${String(m.id)}) with an error: ${why}`);
+  }
+
+  /** A server request without a thread id: nothing here can answer it, so an error now, recorded on this connection's sessions. */
+  private unrouted(m: Buffered): void {
+    const rpc = m.rpc ?? this.rpc;
+    if (isApprovalMethod(m.method)) rpc.respondError(m.id!, -32602, `@agents-io/harness-codex cannot route ${m.method} without a threadId`);
+    else rpc.respondError(m.id!, -32601, `@agents-io/harness-codex does not handle ${m.method}`);
+    for (const s of this.sessions.values()) s.recordNative(m.method, m.params);
+    if (!this.unroutedLogged.has(m.method)) {
+      this.unroutedLogged.add(m.method);
+      this.opts.log?.('info', `codex app-server request ${m.method} has no thread; answered with an error (logged once per method)`);
+    }
   }
 
   private deliver(s: CodexSession, m: Buffered): void {
@@ -423,8 +521,12 @@ export class CodexHarness implements HarnessAdapter {
   private opening = 0;
   private readonly connector: Connector;
   private readonly opts: CodexHarnessOptions;
+  /** Shared with the adapters `ownProcess` makes: their servers run the same binary, so one warning covers them. */
+  private readonly warnings: VersionWarnings;
 
-  constructor(opts: CodexHarnessOptions = {}) {
+  /** `warnings` is internal: what `ownProcess` hands the adapter it makes. */
+  constructor(opts: CodexHarnessOptions = {}, warnings?: VersionWarnings) {
+    this.warnings = warnings ?? { logged: new Set(), noticed: new Set() };
     // Media inputs resolve against the host's blob store unless the options say how.
     this.opts = opts.resolveMedia || !opts.blobs ? opts : { ...opts, resolveMedia: blobMediaResolver(opts.blobs) };
     this.connector = makeConnector(this.opts);
@@ -440,12 +542,15 @@ export class CodexHarness implements HarnessAdapter {
    * server of its own even where a launched session cannot (`sessionEnv`).
    */
   ownProcess(o: { env: Record<string, string> }): CodexHarness {
-    return new CodexHarness({
-      ...this.opts,
-      env: { ...this.opts.env, ...o.env },
-      transport: typeof this.opts.transport === 'function' ? this.opts.transport : { kind: 'stdio' },
-      ...(o.env.CODEX_HOME !== undefined ? { codexHome: o.env.CODEX_HOME } : {}),
-    });
+    return new CodexHarness(
+      {
+        ...this.opts,
+        env: { ...this.opts.env, ...o.env },
+        transport: typeof this.opts.transport === 'function' ? this.opts.transport : { kind: 'stdio' },
+        ...(o.env.CODEX_HOME !== undefined ? { codexHome: o.env.CODEX_HOME } : {}),
+      },
+      this.warnings,
+    );
   }
 
   /**
@@ -568,13 +673,27 @@ export class CodexHarness implements HarnessAdapter {
       adopt,
     );
     server.register(session);
+    // Decision 17: an unverified codex version is said once, in the first session's stream too.
+    if (server.warning && !this.warnings.noticed.has(server.version)) {
+      this.warnings.noticed.add(server.version);
+      session.notice(server.warning);
+    }
     if (adopt) await session.afterResume(res.thread.status);
     return session;
   }
 
   private connect(): Promise<AppServer> {
     if (!this.server) {
-      const p = AppServer.start(this.connector, this.opts, (s) => this.stop(s));
+      const p = AppServer.start(
+        this.connector,
+        this.opts,
+        (s) => this.stop(s),
+        (version, warning) => {
+          if (this.warnings.logged.has(version)) return;
+          this.warnings.logged.add(version);
+          this.opts.log?.('warn', warning);
+        },
+      );
       this.server = p;
       p.then(
         (s) =>

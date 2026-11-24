@@ -105,6 +105,7 @@ export class RpcClient {
   private pending = new Map<number, Pending>();
   private notificationHandlers: NotificationHandler[] = [];
   private requestHandler: ServerRequestHandler | undefined;
+  private errorHandler: ((method: string, e: unknown) => void) | undefined;
   private closeHandlers: ((reason: string) => void)[] = [];
   private closedReason: string | undefined;
 
@@ -126,6 +127,15 @@ export class RpcClient {
 
   onServerRequest(h: ServerRequestHandler): void {
     this.requestHandler = h;
+  }
+
+  /**
+   * A notification or server request handler threw. The error never reaches the transport (where
+   * it would escape a stream callback and take the process down); a server request whose handler
+   * threw is answered with an error, so Codex never waits on it.
+   */
+  onHandlerError(h: (method: string, e: unknown) => void): void {
+    this.errorHandler = h;
   }
 
   onClose(h: (reason: string) => void): void {
@@ -178,13 +188,25 @@ export class RpcClient {
     } catch {
       return; // not ours to interpret (e.g. stray log line)
     }
+    if (!msg || typeof msg !== 'object') return; // valid JSON, but not a JSON-RPC message
     if (msg.method !== undefined && msg.id !== undefined) {
-      if (this.requestHandler) this.requestHandler(msg.id, msg.method, msg.params);
-      else this.respondError(msg.id, -32601, `unsupported server request: ${msg.method}`);
+      if (!this.requestHandler) return this.respondError(msg.id, -32601, `unsupported server request: ${msg.method}`);
+      try {
+        this.requestHandler(msg.id, String(msg.method), msg.params);
+      } catch (e) {
+        this.respondError(msg.id, -32603, `@agents-io/harness-codex failed on ${msg.method}: ${(e as Error)?.message ?? String(e)}`);
+        this.errorHandler?.(msg.method, e);
+      }
       return;
     }
     if (msg.method !== undefined) {
-      for (const h of this.notificationHandlers) h(msg.method, msg.params);
+      for (const h of this.notificationHandlers) {
+        try {
+          h(String(msg.method), msg.params);
+        } catch (e) {
+          this.errorHandler?.(msg.method, e);
+        }
+      }
       return;
     }
     if (typeof msg.id !== 'number') return;

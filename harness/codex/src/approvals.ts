@@ -36,12 +36,18 @@ type WithAvailable = { availableDecisions?: unknown[] };
 
 const offersAmendment = (avail: unknown[]) => avail.some((x) => x && typeof x === 'object' && 'acceptWithExecpolicyAmendment' in x);
 
-function commandDecisions(p: WithAvailable): { allowed: DecisionKind[]; allowAlways: boolean } {
+/**
+ * What a command approval offers. Entries of `availableDecisions` this adapter cannot map back (a
+ * newer codex's decision kinds) are left out; the rest still open as a request (HC-9). A
+ * `humanCommand` approval (0.171) takes only a one-time decision, so it never offers "always".
+ */
+function commandDecisions(p: WithAvailable & { kind?: unknown }): { allowed: DecisionKind[]; allowAlways: boolean } {
   const avail = p.availableDecisions;
-  if (!Array.isArray(avail)) return { allowed: ['allow_once', 'allow_session', 'deny', 'native'], allowAlways: true };
+  const once = p.kind === 'humanCommand';
+  if (!Array.isArray(avail)) return once ? { allowed: ['allow_once', 'deny', 'native'], allowAlways: false } : { allowed: ['allow_once', 'allow_session', 'deny', 'native'], allowAlways: true };
   const has = (d: string) => avail.some((x) => x === d);
   // "Always" is either acceptForSession or accepting Codex's proposed execpolicy amendment.
-  const always = has('acceptForSession') || offersAmendment(avail);
+  const always = !once && (has('acceptForSession') || offersAmendment(avail));
   const allowed: DecisionKind[] = [];
   if (has('accept')) allowed.push('allow_once');
   if (always) allowed.push('allow_session');
@@ -176,6 +182,27 @@ function formQuestions(schema: unknown): RequestQuestion[] | undefined {
     options: opts(s),
     multiSelect: s.type === 'array' || undefined,
   }));
+}
+
+/**
+ * The answer that declines a request without stopping the turn, for one whose params this adapter
+ * cannot read (HC-9): it reads nothing from them. `undefined` for a method with no such answer.
+ */
+export function declineFor(method: ApprovalMethod): unknown {
+  switch (method) {
+    case 'item/commandExecution/requestApproval':
+      return { decision: 'decline' } satisfies CommandExecutionRequestApprovalResponse;
+    case 'item/fileChange/requestApproval':
+      return { decision: 'decline' } satisfies FileChangeRequestApprovalResponse;
+    case 'item/permissions/requestApproval':
+      return { permissions: {}, scope: 'turn' } satisfies PermissionsRequestApprovalResponse;
+    case 'item/tool/requestUserInput':
+      return { answers: {} } satisfies ToolRequestUserInputResponse;
+    case 'mcpServer/elicitation/request':
+      return { action: 'decline', content: null, _meta: null } satisfies McpServerElicitationRequestResponse;
+    default:
+      return undefined;
+  }
 }
 
 export class UnsupportedDecisionError extends Error {}
