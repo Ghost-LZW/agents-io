@@ -11,7 +11,8 @@
  *               `permission: <optionId>` (or stops `cancelled` when the outcome is cancelled)
  *   slow        streams a chunk every 30 ms until `session/cancel` (stops `cancelled`)
  *   stubborn    ignores `session/cancel`: streams `stale <i> ` every 30 ms for FAKE_ACP_STUBBORN_MS
- *               (default 1500), stopping early only at `session/close`; then stops `cancelled`
+ *               (default 1500), stopping early only at `session/close` (not even then with
+ *               FAKE_ACP_CLOSE_KEEPS_GOING=1); then stops `cancelled`
  *   plan        a plan, then `planned`
  *   think       a thought chunk, then `thought`
  *   ask         a form elicitation (when the client advertised one), answers what it got
@@ -34,6 +35,8 @@
  * `default`), FAKE_ACP_NO_COMMANDS=1 (advertise no commands). A prompt's log entry has the session
  * mode it ran in (`mode`); `prompt-end` (with its `sessionId`) is logged as it answers. `session/close`
  * stops a session's work (its prompt answers `cancelled`) and forgets it: `session/load` reopens it.
+ * FAKE_ACP_CLOSE_KEEPS_GOING=1: `session/close` is answered and forgets the session, but its prompt
+ * goes on (an agent that takes close as the `session/cancel` it ignores).
  */
 import { spawn } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -200,7 +203,7 @@ const app = agent({ name: 'fake-acp' })
   .onRequest(methods.agent.session.close, ({ params }) => {
     log({ call: 'session/close', params });
     const s = sessions.get(params.sessionId);
-    if (s) s.cancelled = s.closed = true;
+    if (s && env.FAKE_ACP_CLOSE_KEEPS_GOING !== '1') s.cancelled = s.closed = true;
     sessions.delete(params.sessionId);
     return {};
   })

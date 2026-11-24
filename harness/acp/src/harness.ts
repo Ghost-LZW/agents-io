@@ -76,9 +76,10 @@ export interface AcpHarnessOptions {
   /** Timeout of `initialize`, `session/new`, `session/load` and the other setup requests. Default 60 s. */
   requestTimeoutMs?: number;
   /**
-   * How long an interrupted turn waits for the agent to stop before it ends anyway; and how long the
+   * How long an interrupted turn waits for the agent to stop before it ends anyway; how long the
    * next turn then waits for the agent to answer that prompt before the session is closed and opened
-   * again. Default 15 s.
+   * again; and how long, `session/close` answered, the prompt still has to answer before the same
+   * session is loaded again (else a new one is started). Default 15 s.
    */
   cancelTimeoutMs?: number;
   /** How long the agent has to exit after its stdin closes (`dispose`), and then after SIGTERM, before it is killed. Default 1 s. */

@@ -292,6 +292,9 @@ describe('the ACP harness: a prompt that outlives its cancel timeout', () => {
     const at = (c: string) => t.indexOf(c);
     expect(at(`session/close:${first}`)).toBeGreaterThan(at(`session/cancel:${first}`));
     expect(at(`session/load:${first}`)).toBeGreaterThan(at(`session/close:${first}`));
+    // Loaded only once the old prompt answered (this agent stops it at session/close): nothing of it can stream into the loaded session.
+    expect(at(`prompt-end:${first}`)).toBeGreaterThan(at(`session/close:${first}`));
+    expect(at(`session/load:${first}`)).toBeGreaterThan(at(`prompt-end:${first}`));
     expect(t.filter((c) => c.startsWith('session/prompt'))).toEqual([`session/prompt:${first}`, `session/prompt:${first}`]);
     expect(t.lastIndexOf(`session/prompt:${first}`)).toBeGreaterThan(at(`session/load:${first}`));
     expect(s.nativeId()).toBe(first);
@@ -306,6 +309,43 @@ describe('the ACP harness: a prompt that outlives its cancel timeout', () => {
     expect(ev.of('text.snapshot').filter((x) => x.final).at(-1)!.text).toMatch(/^echo: [\s\S]*hello pause$/);
     // The conversation is the same: the context is not given again in full (ID-2).
     expect(prompts(f.calls())).toEqual([full('stubborn'), bare('hello pause')]);
+    await s.close('done');
+    await ev.done;
+    expect(checkEventStream(ev.all, { turnInputs: { t1: ['in-1'], t2: ['in-2'] } })).toEqual([]);
+  }, 15_000);
+
+  it('an agent that answers session/close but goes on with the prompt: the session is not loaded again (the prompt would stream into it); a new one is started, and nothing the old prompt says reaches the next turn #LN-2 #DL-3', async () => {
+    const caps = JSON.stringify({ sessionCapabilities: { systemPrompt: {}, close: {} } });
+    const { f, s, ev, first } = await interruptedThenNext({ FAKE_ACP_STUBBORN_MS: '60000', FAKE_ACP_CAPS: caps, FAKE_ACP_CLOSE_KEEPS_GOING: '1' }, 300, ctx);
+    expect(ev.of('turn.completed')[0]).toMatchObject({ turnId: 't1', status: 'interrupted', error: { code: 'cancel_timeout' } });
+    // t2 said only its own answer: nothing of the old prompt, which went on after session/close.
+    expect(said(ev.all, 't2').join('')).not.toContain('stale');
+    expect(ev.of('text.snapshot').filter((x) => x.final).at(-1)!.text).toMatch(/^echo: [\s\S]*hello pause$/);
+    const t = trail(f.calls());
+    expect(t.some((c) => c.startsWith('session/load'))).toBe(false);
+    const second = s.nativeId();
+    expect(second).not.toBe(first);
+    expect(t.lastIndexOf('session/new:')).toBeGreaterThan(t.indexOf(`session/close:${first}`));
+    expect(t.filter((c) => c.startsWith('session/prompt') || c.startsWith('prompt-end'))).toEqual([`session/prompt:${first}`, `session/prompt:${second}`, `prompt-end:${second}`]);
+    expect(ev.of('session.bound')).toEqual([
+      { t: 'session.bound', nativeId: first },
+      { t: 'session.bound', nativeId: second },
+    ]);
+    expect(ev.of('notice')).toEqual([
+      {
+        t: 'notice',
+        code: 'continuity',
+        message: `the agent did not stop turn t1: no answer to its session/prompt within 300ms of session/cancel, nor in the 300ms after: started a new ACP session ${second} (the agent answered session/close, but still not the prompt 300ms after); the conversation so far is not in it`,
+      },
+    ]);
+    // What the old prompt said before the new session was started is native, in no turn.
+    const late = ev.all.filter((e) => e.body.t === 'native' && JSON.stringify(e.native).includes('stale'));
+    expect(late.every((e) => e.turnId === undefined)).toBe(true);
+    expect(prompts(f.calls())).toEqual([full('stubborn'), full('hello pause')]);
+    // The old prompt still streams; none of it reaches this session.
+    const before = ev.all.length;
+    await new Promise((r) => setTimeout(r, 200));
+    expect(ev.all.slice(before)).toEqual([]);
     await s.close('done');
     await ev.done;
     expect(checkEventStream(ev.all, { turnInputs: { t1: ['in-1'], t2: ['in-2'] } })).toEqual([]);

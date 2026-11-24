@@ -40,7 +40,8 @@ import { AsyncQueue } from './queue.js';
  * and questions (`elicitation/create`) as requests that live only while the agent process does.
  * Updates carry no turn id, so a prompt the agent goes on with after its turn ended (the cancel timed
  * out) keeps the session: what it streams is `native`, and the next turn's prompt waits for it to
- * answer, or for the session to be closed and opened again.
+ * answer, or for the session to be closed and opened again (the same one only once the prompt has
+ * answered, else a new one).
  */
 
 /** What a session uses of its adapter's connection. */
@@ -65,8 +66,10 @@ export interface AcpLink {
    */
   open(s: AcpSession, how: 'load' | 'new'): Promise<LoadSessionResponse | NewSessionResponse>;
   /**
-   * How long `interrupt` waits for the prompt to stop before ending the turn anyway; and how long
-   * the next turn then waits for that prompt to answer before the session is closed and opened again.
+   * How long `interrupt` waits for the prompt to stop before ending the turn anyway; how long the
+   * next turn then waits for that prompt to answer before the session is closed and opened again;
+   * and how long, `session/close` answered, the prompt still has to answer before the same session
+   * is loaded again rather than a new one started.
    */
   readonly cancelTimeoutMs: number;
   /** Instance profiles: profile → its settings (`mode`: the session mode it selects). */
@@ -297,16 +300,7 @@ export class AcpSession implements HarnessSession {
    * session that cannot be opened again ends (the lane opens another).
    */
   private async outlast(t: Turn): Promise<void> {
-    let timer: NodeJS.Timeout | undefined;
-    const woken = new Promise<'woken'>((resolve) => (this.wake = () => resolve('woken')));
-    const late = new Promise<'late'>((resolve) => {
-      timer = setTimeout(() => resolve('late'), this.link.cancelTimeoutMs);
-      timer.unref?.();
-    });
-    const why = await Promise.race([t.answered.then(() => 'answered' as const), woken, late]);
-    clearTimeout(timer);
-    this.wake = undefined;
-    if (why !== 'late' || this.stale !== t || this.closed || this.link.gone) return;
+    if ((await this.answeredWithin(t, this.link.cancelTimeoutMs)) || this.stale !== t || this.closed || this.link.gone) return;
     try {
       await this.reopen(t);
     } catch (e) {
@@ -317,11 +311,30 @@ export class AcpSession implements HarnessSession {
     }
   }
 
+  /** Whether the agent answers turn `t`'s prompt within `ms`; the session closing (or the agent going) ends the wait (`wake`). */
+  private async answeredWithin(t: Turn, ms: number): Promise<boolean> {
+    if (t.isAnswered) return true;
+    if (this.closed || this.link.gone) return false;
+    let timer: NodeJS.Timeout | undefined;
+    const woken = new Promise<false>((resolve) => (this.wake = () => resolve(false)));
+    const late = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), ms);
+      timer.unref?.();
+    });
+    const answered = await Promise.race([t.answered.then(() => true), woken, late]);
+    clearTimeout(timer);
+    this.wake = undefined;
+    return answered;
+  }
+
   /**
-   * Close the ACP session, whose agent goes on with turn `t`'s prompt, and open it again: with
-   * `session/close` (the protocol has it cancel the session's work) answered, the same session is
-   * loaded again (`session/load`), keeping the conversation; else a new session is started, since
-   * the prompt may still stream into the old one. A `continuity` notice says which.
+   * Close the ACP session, whose agent goes on with turn `t`'s prompt, and open it again. The same
+   * session is loaded again (`session/load`), keeping the conversation, only once `session/close` is
+   * answered and then the prompt too, within another `cancelTimeoutMs`: the protocol has close stop
+   * the session's work as `session/cancel` does, which this agent ignored, and a prompt still running
+   * would stream into the session loaded under the same id (updates carry no turn id), or ask its
+   * permissions there. Else a new session is started and the old one forgotten, whatever it goes on
+   * streaming. A `continuity` notice says which.
    */
   private async reopen(t: Turn): Promise<void> {
     const old = this.sessionId;
@@ -337,11 +350,18 @@ export class AcpSession implements HarnessSession {
         detail = `session/close failed: ${e instanceof Error ? e.message : String(e)}`;
       }
     }
+    let load = false;
+    if (closed && !this.link.loads) detail = 'the agent cannot load sessions';
+    else if (closed) {
+      // Still stale while it is waited for: what the prompt streams meanwhile is native.
+      load = await this.answeredWithin(t, ms);
+      if (!load) detail = `the agent answered session/close, but still not the prompt ${ms}ms after`;
+    }
     // Whatever the old session still says is no session's now.
     this.stale = undefined;
     this.link.forget(this);
     if (this.closed || this.link.gone) return; // startTurn says why
-    if (closed && this.link.loads) {
+    if (load) {
       try {
         const r = await this.link.open(this, 'load');
         if (this.closed) return this.link.forget(this);
@@ -353,7 +373,7 @@ export class AcpSession implements HarnessSession {
         if (this.closed || this.link.gone) throw e;
         detail = `session/load failed: ${e instanceof Error ? e.message : String(e)}`;
       }
-    } else if (closed) detail = 'the agent cannot load sessions';
+    }
     const r = await this.link.open(this, 'new');
     if (this.closed) return this.link.forget(this);
     this.setup(r);
