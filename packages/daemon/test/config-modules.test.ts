@@ -1,5 +1,5 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { ADMIN_REDACTED, type InputRecord, type KernelContext, type Origin } from '@agents-io/protocol';
@@ -31,7 +31,8 @@ type FeatureRec = { k: KernelContext; config: Record<string, unknown>; started: 
 const feature = (key: string) => (globalThis as { __feature?: Record<string, FeatureRec> }).__feature?.[key];
 type ChanRec = { via: string; init: { account: string; config: unknown }; startConfig?: unknown; inject?: (p: object) => Promise<{ accepted: boolean }> };
 const chanRec = (key: string) => (globalThis as { __chan?: Record<string, ChanRec> }).__chan?.[key];
-const descriptorSeen = () => (globalThis as { __chanDescriptor?: { validated?: unknown[]; created?: Record<string, unknown>[] } }).__chanDescriptor ?? {};
+type DescriptorSeen = { validated?: unknown[]; created?: Record<string, unknown>[]; stateDirs?: Record<string, string> };
+const descriptorSeen = (): DescriptorSeen => (globalThis as { __chanDescriptor?: DescriptorSeen }).__chanDescriptor ?? {};
 
 const greet = (config: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({ use: 'module', module: './fixtures/feature-module.mjs', config, ...extra });
 
@@ -225,6 +226,28 @@ describe('a type: "module" channel file exporting a ChannelModule descriptor', (
     const f = file({ channels: [acme({ id: 'x', token: 'a' })] });
     const config = { ...resolveConfig(f.raw, { env: {}, baseDir: here, cwd: f.dir }), socketPath: join(f.dir, 'run', 'aio.sock') };
     await expect(Gateway.start({ config, harness: new FakeHarness(), logger: () => {}, listen: false })).rejects.toThrow(/^channels\[0\] \(module .*chan-descriptor\.mjs\): export "createChannel" \(or default\) is a ChannelModule descriptor, which is read when the config's module files are imported before it is resolved/);
+  });
+
+  it("the channels it builds get a state directory of their file and export's, under the module type's for their account, the same after a restart #RS-1", async () => {
+    // Two descriptors (one file, two exports) on the default account; the first on a second account too.
+    const f = file({ channels: [acme({ id: 'sd1', token: 'x' }), acme({ id: 'sd2', token: 'x' }, { export: 'second' }), acme({ id: 'sd1', token: 'x' }, { account: 'lan' })] });
+    const start = async () => {
+      ((globalThis as { __chanDescriptor?: DescriptorSeen }).__chanDescriptor ??= {}).stateDirs = {};
+      const registries = await importConfigModules(f.raw, { baseDir: here });
+      const config = { ...resolveConfig(f.raw, { env: {}, baseDir: here, cwd: f.dir, ...registries }), socketPath: join(f.dir, 'run', 'aio.sock') };
+      const gw = await Gateway.start({ config, ...registries, buildHarness: (i: HarnessInstance) => new InstanceHarness(i, new FakeHarness()), logger: () => {}, listen: false });
+      cleanups.push(() => gw.stop());
+      return { gw, dirs: { ...descriptorSeen().stateDirs } };
+    };
+    const first = await start();
+    const typeDir = (account: string) => join(f.dir, 'channels', `module.${account}`);
+    const [d1, d2, lan] = [first.dirs['sd1:default']!, first.dirs['sd2:default']!, first.dirs['sd1:lan']!];
+    expect([dirname(d1), dirname(d2)]).toEqual([typeDir('default'), typeDir('default')]);
+    expect([basename(d1), basename(d2)]).toEqual([expect.stringMatching(/^[0-9a-f]{16}$/), expect.stringMatching(/^[0-9a-f]{16}$/)]);
+    expect(d2).not.toBe(d1);
+    expect(lan).toBe(join(typeDir('lan'), basename(d1)));
+    await first.gw.stop();
+    expect((await start()).dirs).toEqual(first.dirs);
   });
 
   it("its resolve cannot grant evidence: what it returns is the entry's config, the entry's own keys stay as written, and without a grant its platform_signed is capped to none #ID-3 #ID-4", async () => {

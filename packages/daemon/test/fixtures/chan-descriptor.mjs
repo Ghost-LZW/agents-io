@@ -8,8 +8,10 @@ import { makeAdapter } from './chan-impl.mjs';
  * reads ACME_TOKEN (implicitEnv). Its resolve also tries to grant itself evidence (in what it
  * returns, which is the entry's `config`). validateAll refuses two entries with one id and
  * account and records what it saw at globalThis.__chanDescriptor.validated; create builds the
- * fixture adapter (globalThis.__chan[<id>:<account>], via "descriptor"). Its admin route
- * GET /api/acme/ping answers { pong: true }. The other exports are wrong in one way each.
+ * fixture adapter (globalThis.__chan[<id>:<account>], via "descriptor") and records its
+ * init.stateDir at globalThis.__chanDescriptor.stateDirs[<id>:<account>]. Its admin route
+ * GET /api/acme/ping answers { pong: true }. `second` is the same descriptor under another export
+ * (without the admin route); the other exports are wrong in one way each.
  */
 export const createChannel = {
   type: 'acme',
@@ -37,6 +39,7 @@ export const createChannel = {
   },
   create(entry, init) {
     (globalThis.__chanDescriptor ??= {}).created = [...(globalThis.__chanDescriptor.created ?? []), entry];
+    (globalThis.__chanDescriptor.stateDirs ??= {})[`${entry.id}:${entry.account}`] = init.stateDir;
     const adapter = makeAdapter({ account: entry.account, config: { id: entry.id } }, 'descriptor');
     return { adapter, config: { region: entry.region }, close: () => adapter.close() };
   },
@@ -44,6 +47,9 @@ export const createChannel = {
     routes: [{ method: 'GET', path: '/api/acme/ping', status: 200, response: Type.Object({ pong: Type.Boolean() }), handle: () => ({ status: 200, body: { pong: true } }) }],
   },
 };
+
+/** The same descriptor under another export: another adapter (its own owner and state directory). */
+export const second = { ...createChannel, admin: undefined };
 
 /** A descriptor without its entry schema. */
 export const noEntry = { type: 'acme', resolve: (c) => c, create: () => ({}) };

@@ -35,6 +35,7 @@
 > 2026-11-24：core-slimming §4 的单独一步（ROADMAP §1 原则 2：模型用不了的工具是负担）：CF-6 改了承诺：`live_*` 只在至少一个运行中的通道能开 live（`ChannelAdapter.openLive`）时挂上，每次请求宿主 MCP 端点时判断（`ModuleInstance.offeredTools`、`KernelContext.live.channels`），后来起来的通道让它们出现在下一次 `tools/list` 里，通道没了就从下一次里消失；不挂的工具在这次请求里也调不了。这是有意的行为变化：公开的 lark-bot 不能开 live，只配了它的部署（如 owner 的）不再有这三个工具。tools-list 的 fixture 多了一份不带 `live_*` 的（`tools-list-no-live.json`）；CF-6 的测试按有、没有能开 live 的通道分开，新增后来起来的通道、agent 的工具列表、`offeredTools` 的测试。`gateway.ts`、`packages/host-mcp/src/tools.ts` 的行号引用按改后的代码更新。
 > 2026-11-24：同一步评审的修复：agent 的工具列表里只有这次不提供的工具（如只列了 `live_*`、没有能开 live 的通道）时，端点照旧挂着，`tools/list` 却答 JSON-RPC `-32601 Method not found`（MCP SDK 只在注册第一个工具时装上 `tools/list`、`tools/call` 的处理），CF-6 的"不提供的只是不列出"不成立。`HostMcpServer.build` 一个都没注册时注册一个再删掉，`tools/list` 答空列表、调用答 `Tool <名字> not found`、`initialize` 与有工具时相同；CF-6 新增两条测试。承诺不变。
 > 2026-11-24：core-slimming §4"第三方走同一条契约的缺口"：打包的 `aio` 在解析配置之前导入配置指名的模块文件（`loadConfigModules`），配置的 `modules` 条目加载第三方功能模块（origin `module`），`type: "module"` 通道文件可以导出 `ChannelModule` 描述符，`use: "module"` 的 harness 描述符的 `declares`、`cli` 起作用，`ChannelModule.implicitEnv` 有了读取方（控制台的 `GET /api/config`）。CF-4 扩了承诺（这些条目和描述符写错时加载或启动失败，说出条目或实例和成员）；ID-3 的边界 2 写明配置指名的模块代码与嵌入方代码一样受信、说不了证据授予；ID-10 扩到配置加载的模块，并写明 `KernelContext.policy` 是冻结的视图（原先是网关的策略对象本身，模块能改它的钩子）；SE-1 扩到描述符的凭据标记。`gateway.ts`、`config.ts`、`cli.ts`、`module-loader.ts` 的行号引用按改后的代码更新。
+> 2026-11-24：同一步评审的修复：`type: "module"` 通道文件的描述符建出的通道原先共用一个状态目录：网关按类型和账号给 `ChannelInit.stateDir`（`<dataDir>/channels/module.<账号>`），`module` 类型原样交给描述符的 `create`，同一账号上不论哪个文件、哪个导出的通道都拿到同一个，与"这个通道账号自己的目录"不符。现在 `module` 类型按文件与导出再分一层（`module.<账号>/<文件与导出的哈希>`），同一描述符在同一账号上的几个条目仍共用一个（它的 `validateAll` 可以拒绝）；导出工厂的 module 通道不拿这个目录，不受影响。RS-1 的表多一行（这个目录各自一个、跨重启不变），由一条新的 core 测试守。
 > 用途：改动 agents-io 的人或 agent 用它判断"这个改动有没有打破某个承诺"。新增承诺先写进这里，再写测试；测试改名时同步改这里。
 
 ## 0. 怎么读
@@ -706,6 +707,7 @@
 | 待交出的 context | `lane.ts:347`、`:1319` | `context.test.ts` "context recorded but not handed before the restart goes to the next turn; handed context does not #IN-6 #RS-1" |
 | 遗留卡片收尾 | compositor restore | `e2e.test.ts` "finalizes the card of a turn that was running when the previous host stopped #RS-1 #RS-5" |
 | blob | `packages/session/src/blobs.ts:91-100`（文件系统） | `blobs.test.ts` "after a restart (a new store on the same directory) a reference reads back the same bytes, mime and name #RS-1" |
+| module 通道文件的描述符建的通道的状态目录（`ChannelInit.stateDir`，文件系统：每个文件加导出、每个账号一个） | `packages/daemon/src/module-channel.ts` `descriptorStateDir`（`moduleChannelType` 的 `create` 交给描述符） | `packages/daemon/test/config-modules.test.ts` "the channels it builds get a state directory of their file and export's, under the module type's for their account, the same after a restart #RS-1" |
 
 - **状态**：有测试。
 

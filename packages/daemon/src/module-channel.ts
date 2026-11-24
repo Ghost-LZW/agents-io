@@ -1,4 +1,5 @@
-import { isAbsolute } from 'node:path';
+import { createHash } from 'node:crypto';
+import { isAbsolute, join } from 'node:path';
 import { Type, type TObject, type TSchema } from '@sinclair/typebox';
 import { errors, type ChannelModule, type ChannelResolveContext } from '@agents-io/protocol';
 import { ConfigError } from './config-error.js';
@@ -23,8 +24,19 @@ import { credentialMark } from './schema-marks.js';
  */
 export type ModuleChannelEntry = { type: 'module'; module: string; export?: string; config?: unknown };
 
-/** A module file and export, as one key. */
+/** A module file and export, as one key (a resolved entry's: its owner, channel-stamping F4). */
 const fileKey = (module: string, exp: string | undefined) => JSON.stringify([module, exp ?? null]);
+
+/**
+ * The state directory of a channel a descriptor builds: the host's for the `module` type and the
+ * account (`<dataDir>/channels/module.<account>`, which every module file's channels on that
+ * account would share), divided by the file and export (the first 16 hex digits of the SHA-256 of
+ * the owner). The same after a restart while the file stays where it is; one descriptor's entries
+ * on one account share it (its `validateAll` can refuse two such).
+ */
+function descriptorStateDir(typeDir: string, entry: { module: string; export?: string }): string {
+  return join(typeDir, createHash('sha256').update(fileKey(entry.module, entry.export)).digest('hex').slice(0, 16));
+}
 
 /** What the module files of a config's `type: "module"` entries export (`loadConfigModules`): their descriptors, by the entry's `module` as written and as resolved. */
 export class ChannelModuleFiles {
@@ -78,8 +90,9 @@ const asObject = (v: unknown): Record<string, unknown> => (v && typeof v === 'ob
  * entry's `config` (closed; absent is `{}`), its `resolve` resolves that `config` (`ctx.where` is
  * `channels[<i>].config`), its `validateAll` gets the entries naming the same file and export, its
  * `isCredential`, `credentialHint` and `implicitEnv` answer under `config`, and its `create` gets the
- * resolved `config` with the entry's `account`. The entry's own keys (`type`, `account`, `evidence`,
- * …) stay the host's whatever it returns (`config.ts` `resolveChannels`).
+ * resolved `config` with the entry's `account`, and a `stateDir` of its file and export's
+ * (`descriptorStateDir`). The entry's own keys (`type`, `account`, `evidence`, …) stay the host's
+ * whatever it returns (`config.ts` `resolveChannels`).
  */
 export function moduleChannelType(files?: ChannelModuleFiles): ChannelModule<ModuleChannelEntry> {
   const m: ChannelModule<ModuleChannelEntry> = {
@@ -92,7 +105,7 @@ export function moduleChannelType(files?: ChannelModuleFiles): ChannelModule<Mod
     },
 
     // One module file and export is one adapter (channel-stamping F4).
-    owner: (entry) => JSON.stringify([entry.module, entry.export ?? null]),
+    owner: (entry) => fileKey(entry.module, entry.export),
 
     isCredential(path, entry) {
       const d = files?.ofWritten(entry);
@@ -146,7 +159,8 @@ export function moduleChannelType(files?: ChannelModuleFiles): ChannelModule<Mod
       if (d) {
         const where = `channels[${init.index}] (module ${entry.module})`;
         const built = await Promise.resolve()
-          .then(() => d.create({ ...asObject(entry.config), account: entry.account }, { ...init, log }))
+          // The host's stateDir is the `module` type's on this account (every module file's): its own is below it.
+          .then(() => d.create({ ...asObject(entry.config), account: entry.account }, { ...init, log, stateDir: descriptorStateDir(init.stateDir, entry) }))
           .catch((e: Error) => {
             throw new ConfigError(`${where}: create failed: ${e.message}`);
           });

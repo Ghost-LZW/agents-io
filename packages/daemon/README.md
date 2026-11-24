@@ -89,7 +89,10 @@ see `docs/E2E.md` §0). New:
   `entry` checks the entry's `config` (closed), its `resolve` resolves it (what it returns is the
   `config`, never the entry's own keys such as `evidence`), its `validateAll` gets the entries
   naming its file and export, its `isCredential` / `credentialHint` / `implicitEnv` answer for
-  paths under `config`, its `create` gets the resolved `config` with the entry's `account`, and
+  paths under `config`, its `create` gets the resolved `config` with the entry's `account` and a
+  `stateDir` of its file and export's (`<dataDir>/channels/module.<account>/<the first 16 hex
+  digits of the SHA-256 of the file and export>`, the same after a restart while the file stays
+  where it is; its entries on one account share it, which its `validateAll` can refuse), and
   its `admin` routes, schemas and `mount` are served (an `admin.console` fails the load: the
   console section is checked before module files are imported; its `type`, `ids`, `owner`,
   `idOf` are not read). A config resolved without importing them first builds a factory as
@@ -1012,7 +1015,8 @@ What changed for embedders with core-slimming G2 (channel types):
 - The gateway builds every configured channel through its type's `ChannelModule.create`
   (`GatewayOptions.channelAdapter` still wins when it returns an adapter); `init.stateDir` is
   `<dataDir>/channels/<type>.<account, URI-encoded>`, so a Lark bot's stays
-  `channels/lark-bot.<account>`. The gateway imports no channel package. An entry it cannot
+  `channels/lark-bot.<account>` (a type whose entries share an account divides it: the `module`
+  type gives a module file's descriptor `channels/module.<account>/<hash of the file and export>`). The gateway imports no channel package. An entry it cannot
   build fails `Gateway.start` with a `ConfigError` (exit 2) naming the entry and its type: a type
   the gateway's registry lacks (the config was resolved with another one), or a `create` that
   returns no `BuiltChannel` (no `adapter` with `id`, `caps`, `start` and `send`; a `close` or
