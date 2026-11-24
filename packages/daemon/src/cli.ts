@@ -509,7 +509,11 @@ async function schedule(a: CliArgs): Promise<number> {
       case 'list':
       case 'ls': {
         const r = await client.scheduleList(str(a, 'session'));
-        for (const x of r.schedules) console.log(`${x.id}\t${x.action}\t${x.nextAt === null ? 'never' : new Date(x.nextAt).toISOString()}\t${x.createdBy}\t${x.text}`);
+        // A schedule whose latest firing did not go out says why, after the rest of its line.
+        for (const x of r.schedules) {
+          const failed = x.lastFailure ? `\tlast firing (due ${new Date(x.lastFailure.scheduledAt).toISOString()}) not delivered: ${x.lastFailure.reason}` : '';
+          console.log(`${x.id}\t${x.action}\t${x.nextAt === null ? 'never' : new Date(x.nextAt).toISOString()}\t${x.createdBy}\t${x.text}${failed}`);
+        }
         if (!r.schedules.length) console.error('no schedules');
         return 0;
       }

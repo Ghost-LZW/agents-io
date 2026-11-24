@@ -39,7 +39,7 @@ const Instance = Type.Object({
   transport: Type.Optional(Transport),
   /** Realtime voice (decision 11): opt the app-server connection into Codex's experimental realtime API, so `live_join` works. Default false. */
   live: Type.Optional(Type.Boolean()),
-  /** Not supported: `codex app-server` rejects --profile (checked: codex-cli 0.160). Listed to give a clear error. */
+  /** Not supported: `codex app-server` rejects --profile (checked: codex-cli 0.160, 0.171). Listed to give a clear error. */
   profile: Type.Optional(Type.String()),
 });
 

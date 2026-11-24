@@ -872,15 +872,23 @@ export const DeliverUpdateResult = Type.Object({
 });
 export type DeliverUpdateResult = Static<typeof DeliverUpdateResult>;
 
-/** A schedule as the daemon keeps it: the draft, who set it, and when it fires next (Unix ms; null: never again). */
+/**
+ * A schedule as the daemon keeps it: the draft, who set it, and when it fires next (Unix ms; null:
+ * never again; a time already past with `lastFailure` at it: a peer's that could not go out then,
+ * kept for the next start, SC-3).
+ */
 export const ScheduleView = Type.Object({
   ...ScheduleDraft.properties,
   id: Type.String(),
   action: Type.String(),
   createdBy: Type.String(),
+  /** A peer's (an external MCP client's): the module it was set through, which alone fires it, as the peer (SC-3). */
+  module: Type.Optional(Type.String()),
   createdAt: Type.Number(),
   nextAt: Type.Union([Type.Number(), Type.Null()]),
   lastFiredAt: Type.Optional(Type.Number()),
+  /** Its latest firing failed for good and did not go out (SC-1): when it was due, when it failed (Unix ms), why. Gone once a firing is delivered. */
+  lastFailure: Type.Optional(Type.Object({ scheduledAt: Type.Number(), at: Type.Number(), reason: Type.String() })),
 });
 export type ScheduleView = Static<typeof ScheduleView>;
 /** `schedule.put`. */

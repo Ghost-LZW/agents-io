@@ -5,8 +5,14 @@ import { CODEX_GENERATED_VERSION } from './generated/version.js';
  * checked against. The app-server API is still marked experimental and renames
  * fields between minors, so anything else is refused unless the deployment opts
  * out with `allowUnknownVersion`.
+ *
+ * Types are generated from the newest line (`CODEX_GENERATED_VERSION`). Between
+ * 0.160 and 0.171 nothing the adapter sends changed and nothing it reads was
+ * removed or renamed (0.171 only adds fields, variants and notifications), so the
+ * same code drives both lines; the notifications 0.171 adds are opted out
+ * (`DEFAULT_OPT_OUT`), which 0.160 accepts as unknown names.
  */
-export const SUPPORTED_CODEX_LINES = ['0.160'] as const;
+export const SUPPORTED_CODEX_LINES = ['0.160', '0.171'] as const;
 
 export { CODEX_GENERATED_VERSION };
 

@@ -53,7 +53,7 @@ import type {
 import { AdminStatus as AdminStatusSchema, IdentityEntry as IdentityEntrySchema, Resolver as ResolverSchema } from '@agents-io/protocol';
 import { Value } from '@sinclair/typebox/value';
 import { KERNEL_TOOL_NAMES, moduleToolInput, type ModuleTools } from '@agents-io/host-mcp';
-import { OWNER_LABEL } from '@agents-io/session';
+import { FinalFiringError, OWNER_LABEL } from '@agents-io/session';
 import { CommandTable, KERNEL_COMMAND_NAMES, type ModuleCommand } from './commands.js';
 import { ConfigError } from './config-error.js';
 import { FEATURES } from './host.js';
@@ -112,6 +112,13 @@ export interface ModuleFields {
    * the module needs no other module (it is resolved alone).
    */
   switch?: ModuleSwitchField;
+  /**
+   * The start of `createdBy` of the schedules the module's peers set before a schedule recorded the
+   * module it was set through (`ScheduleView.module`; before 2026-11-24): such a schedule is the
+   * module's peer's, and fires only through the module, as for one that records it (SC-3).
+   * `bundle.ts`: the external MCP endpoint's clients, `external:`. No two modules' overlap.
+   */
+  schedules?: string;
 }
 
 /** `ModuleFields.switch`: where the old on/off field is and its two values. */
@@ -306,6 +313,14 @@ export class ModuleRegistry {
         claim(`switch field ${sw.path}`, id);
         out.switch = { path: sw.path, on: sw.on, off: sw.off };
       }
+      if (f.schedules !== undefined) {
+        const prefix = f.schedules;
+        if (typeof prefix !== 'string' || !prefix) throw new Error(`fields.${id}.schedules must be the start of a schedule's createdBy (a non-empty string)`);
+        for (const [other, g] of fields)
+          if (g.schedules !== undefined && (g.schedules.startsWith(prefix) || prefix.startsWith(g.schedules)))
+            throw new Error(`fields.${id}.schedules: ${JSON.stringify(prefix)} overlaps module ${other}'s ${JSON.stringify(g.schedules)}`);
+        out.schedules = prefix;
+      }
       fields.set(id, out);
     }
     this.fields = fields;
@@ -382,7 +397,7 @@ interface Running {
 }
 
 /** Hook members the daemon serves (functions, but `onAction`: `{ prefix, handle }`): any other a module sets fails its setup. */
-const SERVED_HOOKS: readonly string[] = ['onTurnCompleted', 'inputHint', 'onUndispatched', 'onAction', 'resolver', 'identities', 'statusLines', 'scheduledMessage'];
+const SERVED_HOOKS: readonly string[] = ['onTurnCompleted', 'inputHint', 'onUndispatched', 'onAction', 'resolver', 'identities', 'statusLines', 'scheduledMessage', 'scheduledWake'];
 
 /** What is wrong with what `setup` returned (the first thing), or undefined. */
 function badInstance(m: ModuleManifest<any>, i: ModuleInstance): string | undefined {
@@ -717,13 +732,13 @@ export class ModuleHost {
   }
 
   /**
-   * A `message` schedule fires (`ModuleHooks.scheduledMessage`): the first set-up module, in
-   * registration order, whose hook answers true sent it (as its client); false when none did (the
-   * kernel sends it). A hook's throw or rejection is the firing's failure, as it is (`final: true`
-   * ends the firing; anything else is tried again later, SC-1). Served from when the daemon runs;
-   * while the modules stop it throws (the gateway stops its schedules first, so only a stray call
-   * gets here): a module's client's schedule never goes out as the daemon's message, and the firing
-   * is redone at the next start.
+   * A `message` schedule that is no peer's (`peerModule`) fires (`ModuleHooks.scheduledMessage`): the
+   * first set-up module, in registration order, whose hook answers true sent it (as its client);
+   * false when none did (the kernel sends it). A hook's throw or rejection is the firing's failure, as
+   * it is (`final: true` ends the firing; anything else is tried again later, SC-1). Served from when
+   * the daemon runs; while the modules stop it throws (the gateway stops its schedules first, so only
+   * a stray call gets here): a module's client's schedule never goes out as the daemon's message, and
+   * the firing is redone at the next start.
    */
   async scheduledMessage(a: { schedule: ScheduleView; operationId: string }): Promise<boolean> {
     if (this.stopping) throw new Error('the daemon is stopping: the firing is redone at the next start');
@@ -734,6 +749,40 @@ export class ModuleHost {
       if (got === true) return true;
     }
     return false;
+  }
+
+  /**
+   * The module a peer's schedule fires through (SC-3): the one it was set through (`module`), or, for
+   * one set before schedules recorded it, the module whose `ModuleFields.schedules` its `createdBy`
+   * starts with (registered, on or off). Undefined for anyone else's (the owner's, a host's, an agent's).
+   */
+  peerModule(s: Pick<ScheduleView, 'module' | 'createdBy'>): string | undefined {
+    if (s.module !== undefined) return s.module;
+    for (const [id, f] of this.o.registry.fields) if (f.schedules !== undefined && s.createdBy.startsWith(f.schedules)) return id;
+    return undefined;
+  }
+
+  /**
+   * A peer's schedule fires, set through `module` (SC-3): only that module answers, as its peer. A
+   * message: its `ModuleHooks.scheduledMessage` sends it; a wake (`action: "host"`): its
+   * `ModuleHooks.scheduledWake` says it still acts for it, and the caller hands it to the host. The
+   * module not registered, off, without the hook, or answering anything but true: the firing is over
+   * (`FinalFiringError`, SC-1) and nothing goes out, never as the daemon's; the schedule is kept
+   * (`keep`: a one-shot stays at its time for the next start, when the module may act for the peer
+   * again, SC-2). A hook's throw or rejection is the firing's failure, as it is. While the modules
+   * stop it throws (redone at the next start).
+   */
+  async peerSchedule(a: { schedule: ScheduleView; operationId: string }, module: string): Promise<void> {
+    if (this.stopping) throw new Error('the daemon is stopping: the firing is redone at the next start');
+    const by = a.schedule.createdBy;
+    const wake = a.schedule.action === 'host';
+    const not = (why: string) => new FinalFiringError(`set by ${by} through module ${module}, which ${why}; ${wake ? 'not handed to the host' : 'not sent'}`, { keep: true });
+    const m = this.all.find((x) => x.r.manifest.id === module);
+    if (!m) throw not('this daemon does not have');
+    if (!m.instance) throw not('is off');
+    const hook = wake ? m.instance.hooks?.scheduledWake : a.schedule.action === 'message' ? m.instance.hooks?.scheduledMessage : undefined;
+    const got: unknown = hook ? await hook({ schedule: { ...a.schedule }, operationId: a.operationId }) : false;
+    if (got !== true) throw not(`does not act for ${by} now`);
   }
 
   /** Step 4: stop the started modules in reverse order, each bounded (`MODULE_STOP_MS`); failures are logged. Their hooks are no longer called. */
@@ -790,8 +839,8 @@ export interface KernelBackend {
   addSchedule(sessionKey: string, draft: ScheduleDraft, turnId: string | undefined): Promise<KernelScheduleResult>;
   removeSchedule(sessionKey: string, id: string): Promise<KernelUnscheduleResult>;
   listSchedules(sessionKey: string): ScheduleView[];
-  /** A schedule as a peer (`KernelContext.schedules.addAs`; the origin is checked before). */
-  addScheduleAs(origin: Origin, draft: ScheduleDraft): Promise<KernelScheduleResult>;
+  /** A schedule as a peer of `module` (`KernelContext.schedules.addAs`; the origin is checked before): it fires only through that module (SC-3). */
+  addScheduleAs(origin: Origin, draft: ScheduleDraft, module: string): Promise<KernelScheduleResult>;
   removeScheduleAs(origin: Origin, id: string): Promise<KernelUnscheduleResult>;
   /** The schedules the origin set (`creatorOf`). */
   listSchedulesAs(origin: Origin): ScheduleView[];
@@ -903,7 +952,7 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
       addAs: async (origin, draft) => {
         const refused = peerRefusal(origin, live().owner().principals);
         if (refused) throw new Error(`module ${id}: schedules.addAs takes a peer's origin (${refused})`);
-        return live().addScheduleAs(origin, draft);
+        return live().addScheduleAs(origin, draft, id);
       },
       removeAs: async (origin, sid) => {
         const refused = peerRefusal(origin, live().owner().principals);

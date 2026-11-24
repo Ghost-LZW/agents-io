@@ -28,7 +28,7 @@ import type { Watch } from './watch.js';
  * In progress: the daemon reads the manifest (`id`, `kind`, `needs`, `config`, `features`,
  * `mcpTools`, `commands`, `setup`) and, of the instance, `tools`, `commands`, `features`,
  * `status`, `start`, `stop` and the hooks `onTurnCompleted`, `inputHint`, `onUndispatched`,
- * `onAction`, `resolver`, `identities`, `statusLines` and `scheduledMessage`. `admin`, the other `hooks` and
+ * `onAction`, `resolver`, `identities`, `statusLines`, `scheduledMessage` and `scheduledWake`. `admin`, the other `hooks` and
  * `localFrames` were sketched for the Claude Code terminal (G6 step 6), which became a harness
  * capability instead (`HarnessAdapter.takeover`); they are served when a module needs them. Until
  * the daemon serves one, a module that sets it fails to register (`admin`) or to set up
@@ -235,7 +235,7 @@ export type ModuleTurnStatus = Extract<SessionEvent['body'], { t: 'turn.complete
 
 /**
  * What a module hooks into. The daemon serves `onTurnCompleted`, `inputHint`, `onUndispatched`,
- * `onAction`, `resolver`, `identities`, `statusLines` and `scheduledMessage`; a module that sets any
+ * `onAction`, `resolver`, `identities`, `statusLines`, `scheduledMessage` and `scheduledWake`; a module that sets any
  * other fails to set up, naming it (see the file comment). Each says which feature it is for.
  */
 export interface ModuleHooks {
@@ -309,9 +309,13 @@ export interface ModuleHooks {
    * A `message` schedule fires (`KernelContext.schedules`; SC-1: once per firing): `true` when the
    * module sent it itself, as one of its own principals (the external MCP endpoint: a client's
    * schedule, `schedule.createdBy` its principal, goes out as that client's `send_message`, through
-   * its checks); `false` for a schedule that is not its own. Asked of every module in registration
-   * order until one answers `true`; when none does, the kernel sends it as the daemon's message. A
-   * throw or a rejected promise is the firing's failure. An error with `final: true` (trying again
+   * its checks); `false` for a schedule that is not its own. A peer's schedule (set through
+   * `schedules.addAs`, `schedule.module` the module's id) is asked of that module only: `false`, no
+   * hook, or the module being off ends the firing (recorded as failed, SC-1; the schedule is kept, a
+   * one-shot at that time for the next start), and it is never sent as the daemon's (SC-3). Anyone
+   * else's (the owner's, a host's, an agent's) is asked of every module in registration order until
+   * one answers `true`; when none does, the kernel sends it. A throw or a rejected promise is the
+   * firing's failure. An error with `final: true` (trying again
    * cannot deliver it: held, denied, out of the client's scope, no channel) ends the firing, recorded
    * as failed, and the schedule moves to its next time; any other is tried again with the same
    * operationId after a growing wait, and at the next start (SC-1). The daemon fires schedules from
@@ -319,6 +323,18 @@ export interface ModuleHooks {
    * is redone at the next start), never sending a module's schedule as the daemon's.
    */
   scheduledMessage?(a: { schedule: ScheduleView; operationId: string }): Promise<boolean> | boolean;
+  /**
+   * A peer's wake fires (`action: "host"`, set through `schedules.addAs`, `schedule.module` the
+   * module's id; SC-3): `true` when the module still acts for it (the external MCP endpoint: the
+   * client is configured and its `schedule:` scope still has the route), and the kernel hands it to
+   * the host as usual (an item in the host inbound queue); `false`, no hook, or the module being off
+   * ends the firing (recorded as failed, SC-1; the schedule is kept as for `scheduledMessage`):
+   * nothing goes to the host. A throw is the firing's failure as for `scheduledMessage` (`final:
+   * true` ends it, anything else is tried again later).
+   * Asked only of the module the schedule was set through, from after the modules' `start` until
+   * before their `stop`.
+   */
+  scheduledWake?(a: { schedule: ScheduleView; operationId: string }): Promise<boolean> | boolean;
   /**
    * The module's identity map entries when the daemon starts (`KernelContext.router.setExtraIdentities`
    * replaces them later): asked once, when the kernel is ready and before any input is identified
@@ -649,7 +665,11 @@ export interface KernelContext {
      * Set or replace a schedule as a peer (`origin.kind: "peer"`, an agent outside this daemon: an
      * external MCP client): messages, and wakes handed to the host (`action: "host"` with
      * `meta.wake`), never a turn here; only its own replaced. Any other origin, a principal with the
-     * `owner` label and one of the owners throw. A message fires through `ModuleHooks.scheduledMessage`.
+     * `owner` label and one of the owners throw. The schedule is the module's peer's (`module` is the
+     * module's id): it fires only through this module, as the peer, a message through
+     * `ModuleHooks.scheduledMessage`, a wake through `ModuleHooks.scheduledWake`; while the module is
+     * off, or does not act for the peer, its firings fail and nothing goes out, and the schedule is
+     * kept (a one-shot at that time, fired at the next start as a missed one) (SC-3).
      */
     addAs(origin: Origin, draft: ScheduleDraft): Promise<KernelScheduleResult>;
     /** Remove a schedule as a peer: only one it set. Throws for the origins `addAs` refuses. */

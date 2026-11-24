@@ -464,6 +464,152 @@ describe('external schedules', () => {
     expect(again.gw.schedules.registry.pending()).toEqual([]);
     expect(again.chat.sent).toEqual([]);
   });
+
+  // INVARIANTS SC-3 不成立 (2026-11-24, 已修): with the client removed from the config, or the module off, its message schedule went out as the daemon's own notice (no outbound check), and its wake still reached the host.
+  it("a client's schedules fire only while it is a configured client of the running module: removed, or with the module off, a firing sends nothing (no message as the daemon, no wake for the host), fails once and is recorded; the schedules are kept and fire as the client once it is back #SC-3 #SC-1 #ID-10 #DL-7", async () => {
+    const dir = tmp();
+    const f = tokenFiles(dir);
+    const timer = { tokenFile: f.ops, scopes: ['schedule:fake:default:*'] };
+    const reader = { tokenFile: f.reader, scopes: ['read'] };
+    const ext = (clients: Record<string, unknown>, more: Record<string, unknown> = {}) => ({ externalMcp: { listen: '127.0.0.1:0', clients, ...more } });
+    const w = await daemon({ dir, raw: ext({ timer, reader }) });
+    const c = await mcp(w.gw.adminStatus().externalMcp!.url, TOKENS.ops);
+    for (const [id, action] of [['hourly', 'message'], ['nudge', 'wake']] as const) {
+      const r = await call(c, 'schedule_add', { id, action, when: { every_minutes: 60 }, route: 'fake:default:dm-alice', text: `${id} from timer` });
+      expect(r.isError).toBe(false);
+    }
+    await c.close();
+    await w.stop();
+    const ids = ['timer:hourly', 'timer:nudge'];
+    /** Both due now, fired (the timer would, an hour from now): the time they were due. */
+    const fire = async (x: World): Promise<number> => {
+      await x.gw.schedules.idle();
+      const at = Date.now() - 1000;
+      for (const id of ids) x.gw.schedules.registry.db.prepare('UPDATE schedules SET next_at = ? WHERE id = ?').run(at, id);
+      await x.gw.schedules.tick();
+      return at;
+    };
+    // The owner removes the client (another one stays); then turns the module off, or drops its section.
+    const cases: [Record<string, unknown>, string][] = [
+      [ext({ reader }), 'does not act for external:timer now'],
+      [ext({ timer, reader }, { enabled: false }), 'is off'],
+      [{}, 'is off'],
+    ];
+    const tail: Record<string, string> = { 'timer:hourly': 'not sent', 'timer:nudge': 'not handed to the host' };
+    for (const [raw, which] of cases) {
+      const logs: string[] = [];
+      const x = await daemon({ dir, raw, gateway: { logger: (_level, msg) => logs.push(msg) } });
+      const queued = x.gw.hostQueue.head();
+      const at = await fire(x);
+      // Nothing went out: no message as the daemon's, no item for the host.
+      expect(x.chat.sent).toEqual([]);
+      expect(x.gw.hostQueue.head()).toBe(queued);
+      // Each firing failed once, for good, and says why: in the log, in the schedule's log, in the listing.
+      for (const id of ids) {
+        const why = new RegExp(`set by external:timer through module external-mcp, which ${which}; ${tail[id]}$`);
+        expect(logs.filter((m) => m.startsWith(`schedule ${id}:`))).toEqual([expect.stringMatching(why)]);
+        const notes = x.gw.hub.log.read(`schedule:${id}`, 0).filter((e) => e.body.t === 'notice');
+        expect((notes.at(-1)!.body as { message: string }).message).toMatch(/not delivered, not tried again/);
+        const listed = x.gw.listSchedules().find((s) => s.id === id)!;
+        // Kept: it moved to its next time, and shows why the last one did not fire.
+        expect(listed.nextAt).toBeGreaterThan(Date.now());
+        expect(listed).toMatchObject({ module: 'external-mcp', lastFailure: { scheduledAt: at, reason: expect.stringMatching(why) } });
+      }
+      expect(x.gw.schedules.registry.pending()).toEqual([]);
+      await x.stop();
+    }
+    // The client is back: the next firings are its own again, its message sent as it (its send_message: kind tool, its principal).
+    const back = await daemon({ dir, raw: ext({ timer, reader }) });
+    const queued = back.gw.hostQueue.head();
+    const at = await fire(back);
+    expect(back.chat.sent.map((s) => s.msg.text)).toEqual(['hourly from timer']);
+    const sent = back.gw.explain(`external:timer:schedule:timer:hourly:${at}`);
+    expect(sent).toMatchObject({ ok: true, value: { result: 'delivered', external: { client: 'timer', principal: 'external:timer' } } });
+    expect(back.gw.hostQueue.head()).toBe(queued + 1);
+    expect(back.gw.hostQueue.get(queued + 1)!.input.channelContext).toMatchObject({ schedule: 'timer:nudge', 'schedule.client': 'timer', createdBy: 'external:timer' });
+    expect(back.gw.listSchedules().find((s) => s.id === 'timer:hourly')!.lastFailure).toBeUndefined();
+  });
+
+  it("a client's schedules kept before schedules recorded their module (origin's) are the module's all the same: with the client gone, or the module off, nothing goes out #SC-3 #SC-1", async () => {
+    const dir = tmp();
+    const f = tokenFiles(dir);
+    const route = { channel: 'fake', account: 'default', conversationId: 'dm-alice' };
+    for (const [raw, which] of [
+      [{ externalMcp: { listen: '127.0.0.1:0', clients: { reader: { tokenFile: f.reader, scopes: ['read'] } } } }, 'does not act for external:timer now'],
+      [{}, 'is off'],
+    ] as const) {
+      const logs: string[] = [];
+      const x = await daemon({ dir, raw, gateway: { logger: (_level, msg) => logs.push(msg) } });
+      const reg = x.gw.schedules.registry;
+      // As the client's schedule_add kept them then: its principal, no module.
+      reg.put({ id: 'timer:old', when: { everyMinutes: 60 }, action: 'message', route, text: 'old tick' }, 'external:timer');
+      reg.put({ id: 'timer:oldwake', when: { everyMinutes: 60 }, action: 'host', route, text: 'old wake', meta: { wake: 'resume', client: 'timer' } }, 'external:timer');
+      const queued = x.gw.hostQueue.head();
+      await x.gw.schedules.idle();
+      for (const id of ['timer:old', 'timer:oldwake']) reg.db.prepare('UPDATE schedules SET next_at = ? WHERE id = ?').run(Date.now() - 1000, id);
+      await x.gw.schedules.tick();
+      expect(x.chat.sent).toEqual([]);
+      expect(x.gw.hostQueue.head()).toBe(queued);
+      expect(logs.filter((m) => m.startsWith('schedule timer:old:'))).toEqual([expect.stringMatching(new RegExp(`set by external:timer through module external-mcp, which ${which}; not sent$`))]);
+      expect(logs.filter((m) => m.startsWith('schedule timer:oldwake:'))).toEqual([expect.stringMatching(new RegExp(`set by external:timer through module external-mcp, which ${which}; not handed to the host$`))]);
+      for (const id of ['timer:old', 'timer:oldwake']) reg.remove(id);
+      await x.stop();
+    }
+  });
+
+  // INVARIANTS SC-3 不成立 (2026-11-24, review of the fix; 已修): a client's one-shot due while it was removed, or while the module was off, was deleted, why and all: listed nowhere, and the client back restored nothing.
+  it("a client's one-shots (a message, a wake) due while it is removed, or the module is off, send nothing and are kept at their time, listed with why, not fired again in that run; the next start with the client back fires each once, as the client #SC-3 #SC-1 #SC-2", async () => {
+    const dir = tmp();
+    const f = tokenFiles(dir);
+    const timer = { tokenFile: f.ops, scopes: ['schedule:fake:default:*'] };
+    const reader = { tokenFile: f.reader, scopes: ['read'] };
+    const ext = (clients: Record<string, unknown>, more: Record<string, unknown> = {}) => ({ externalMcp: { listen: '127.0.0.1:0', clients, ...more } });
+    const w = await daemon({ dir, raw: ext({ timer, reader }) });
+    const c = await mcp(w.gw.adminStatus().externalMcp!.url, TOKENS.ops);
+    const at = Date.now() + 1500;
+    for (const [id, action] of [['once', 'message'], ['nudge', 'wake']] as const) {
+      const r = await call(c, 'schedule_add', { id, action, when: { at }, route: 'fake:default:dm-alice', text: `${id} from timer` });
+      expect(r.isError).toBe(false);
+    }
+    await c.close();
+    await w.stop();
+    const ids = ['timer:once', 'timer:nudge'];
+    const tail: Record<string, string> = { 'timer:once': 'not sent', 'timer:nudge': 'not handed to the host' };
+    // The owner removes the client (another one stays), then turns the module off; each time the daemon runs while they are due.
+    for (const [raw, which] of [
+      [ext({ reader }), 'does not act for external:timer now'],
+      [ext({ timer, reader }, { enabled: false }), 'is off'],
+    ] as const) {
+      const logs: string[] = [];
+      const x = await daemon({ dir, raw, gateway: { logger: (_level, msg) => logs.push(msg) } });
+      const queued = x.gw.hostQueue.head();
+      const failed = () => logs.filter((m) => /^schedule timer:(once|nudge):/.test(m));
+      await until(() => failed().length === 2, 5000);
+      await new Promise((r) => setTimeout(r, 200));
+      // Once each in this run, and nothing went out: no message as the daemon's, no item for the host.
+      expect(failed()).toHaveLength(2);
+      expect(x.chat.sent).toEqual([]);
+      expect(x.gw.hostQueue.head()).toBe(queued);
+      for (const id of ids) {
+        const why = new RegExp(`set by external:timer through module external-mcp, which ${which}; ${tail[id]}$`);
+        expect(failed().filter((m) => m.startsWith(`schedule ${id}:`))).toEqual([expect.stringMatching(why)]);
+        const notes = x.gw.hub.log.read(`schedule:${id}`, 0).filter((e) => e.body.t === 'notice');
+        expect((notes.at(-1)!.body as { message: string }).message).toMatch(/not delivered, not tried again until the next start: set by external:timer/);
+        // Kept at the time that did not go out, saying why.
+        expect(x.gw.listSchedules().find((s) => s.id === id)).toMatchObject({ module: 'external-mcp', nextAt: at, lastFailure: { scheduledAt: at, reason: expect.stringMatching(why) } });
+      }
+      expect(x.gw.schedules.registry.pending()).toEqual([]);
+      await x.stop();
+    }
+    // The client is back: each fires once, as it (its message through its send_message: kind tool, its principal); then they are done.
+    const back = await daemon({ dir, raw: ext({ timer, reader }) });
+    const queued = back.gw.hostQueue.head();
+    await until(() => back.chat.sent.length === 1 && back.gw.hostQueue.head() === queued + 1 && back.gw.listSchedules().length === 0, 5000);
+    expect(back.chat.sent.map((s) => s.msg.text)).toEqual(['once from timer']);
+    expect(back.gw.explain(`external:timer:schedule:timer:once:${at}`)).toMatchObject({ ok: true, value: { result: 'delivered', external: { client: 'timer', principal: 'external:timer' } } });
+    expect(back.gw.hostQueue.get(queued + 1)!.input.channelContext).toMatchObject({ schedule: 'timer:nudge', 'schedule.client': 'timer', createdBy: 'external:timer' });
+    expect(back.gw.schedules.registry.pending()).toEqual([]);
+  });
 });
 
 describe('external wake schedules', () => {
@@ -480,6 +626,25 @@ describe('external wake schedules', () => {
     expect(items).toHaveLength(1);
     expect(items[0]!.input.channelContext).toMatchObject({ schedule: 'timer:nudge', 'schedule.wake': 'resume', 'schedule.declared': 'spawn:abc123', createdBy: 'external:timer' });
     expect(items[0]!.input.replyRoute).toMatchObject({ conversationId: 'dm-alice' });
+  });
+
+  it("a client's wake whose route its scope no longer has is not handed to the host: the firing fails once and is over, recorded #SC-3 #SC-1", async () => {
+    const dir = tmp();
+    const f = tokenFiles(dir);
+    const raw = (scope: string) => ({ externalMcp: { listen: '127.0.0.1:0', clients: { timer: { tokenFile: f.ops, scopes: [scope] } } } });
+    const w = await daemon({ dir, raw: raw('schedule:fake:default:*') });
+    const timer = await mcp(w.gw.adminStatus().externalMcp!.url, TOKENS.ops);
+    const added = await call(timer, 'schedule_add', { id: 'nudge', action: 'wake', when: { at: Date.now() + 600 }, route: 'fake:default:dm-alice', text: 'check the build again' });
+    expect(added.isError).toBe(false);
+    await timer.close();
+    await w.stop();
+    const logs: string[] = [];
+    const again = await daemon({ dir, raw: raw('schedule:fake:default:other'), gateway: { logger: (_level, msg) => logs.push(msg) } });
+    const queued = again.gw.hostQueue.head();
+    await until(() => again.gw.schedules.registry.get('timer:nudge') === undefined, 3000);
+    expect(logs.filter((m) => m.startsWith('schedule timer:nudge:'))).toEqual([expect.stringMatching(/not tried again: route fake:default:dm-alice is no longer in timer's schedule scope$/)]);
+    expect(again.gw.hostQueue.head()).toBe(queued);
+    expect(again.gw.schedules.registry.pending()).toEqual([]);
   });
 });
 

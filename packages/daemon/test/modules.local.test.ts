@@ -193,6 +193,15 @@ describe('the module registry', () => {
     // Without the module, it is what the file says (default drop).
     expect(resolve({ policy: { strangers: 'ask' } }, new ModuleRegistry([])).policy.strangers).toBe('ask');
   });
+
+  it("a schedules field: the start of the creators of a module's peers' schedules kept before they recorded their module, a non-empty string, no two modules' overlapping; the built-in external MCP endpoint's is external:", () => {
+    const fields = (f: Record<string, unknown>) => () => new ModuleRegistry([probe('probe', []), probe('other', [])], { fields: f as never });
+    expect(fields({ probe: { schedules: '' } })).toThrow("fields.probe.schedules must be the start of a schedule's createdBy (a non-empty string)");
+    expect(fields({ probe: { schedules: 7 } })).toThrow("fields.probe.schedules must be the start of a schedule's createdBy (a non-empty string)");
+    expect(fields({ probe: { schedules: 'peer:' }, other: { schedules: 'peer:x' } })).toThrow('fields.other.schedules: "peer:x" overlaps module probe\'s "peer:"');
+    expect(fields({ probe: { schedules: 'peer:' }, other: { schedules: 'bot:' } })().fields.get('other')).toEqual({ schedules: 'bot:' });
+    expect(builtinModules.fields.get('external-mcp')).toEqual({ config: 'externalMcp', status: 'externalMcp', schedules: 'external:' });
+  });
 });
 
 describe('module config sections (lifecycle step 1)', () => {

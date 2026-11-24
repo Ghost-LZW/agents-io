@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { HarnessEvent, InputRecord } from '@agents-io/protocol';
 import { assertConformingStream } from '@agents-io/testkit';
-import { CodexHarness } from '../src/index.js';
+import { CodexHarness, SUPPORTED_CODEX_LINES } from '../src/index.js';
 
 /** Runs against the real `codex app-server` (needs a logged-in codex). AGENTS_IO_LIVE_CODEX=1 to enable. */
 const live = process.env.AGENTS_IO_LIVE_CODEX === '1';
@@ -15,7 +15,8 @@ describe.skipIf(!live)('live codex app-server', () => {
     const harness = new CodexHarness({ bin: process.env.CODEX_BIN ?? 'codex' });
     try {
       const { version, caps } = await harness.probe();
-      expect(version).toMatch(/^0\.160\./);
+      // Whichever supported line CODEX_BIN is (0.160 or 0.171).
+      expect(SUPPORTED_CODEX_LINES).toContain(version.split('.').slice(0, 2).join('.'));
       expect(caps.steer).toBe('native');
 
       const s = await harness.open({

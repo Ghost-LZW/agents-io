@@ -71,7 +71,7 @@ agents-io 要在任何通道、任何模态上给出同样的可信度，健壮�
 
 ### 下一个 session 先做
 
-- **支持 codex-cli 0.162**：本机 codex 在 2026-10-13 自动升到 0.162.1，适配器只认 0.160.x（`SUPPORTED_CODEX_LINES`），部署暂把 `executable` 钉在 0.160.1 的发布目录。按 `harness/codex/scripts/gen-types.sh` 重新生成类型、核对差异后放开；顺带核实 `codex --remote` 的 TUI 挂上时是否覆盖 thread 的审批 / 沙箱设置（external-holder §10.1 未核实项）。
+- ~~**支持 codex-cli 0.162**~~ → 已完成（2026-11-24），直接支持到 0.171：类型由 0.171.0 重新生成，`SUPPORTED_CODEX_LINES` 是 0.160、0.171，两条线由同一份代码驱动（0.171 只加字段、取值和通知，适配器发的没变；新加的通知退订），0.160.1 仍可用。起因：ChatGPT 登录下 `gpt-6.2-sol` 在 0.160.1 上答 400 `model_not_found`，0.171.0 正常。部署换执行文件的步骤见 `docs/E2E.md`（harness 实例一节）与 `harness/codex/README.md`；线上部署的 `executable` 仍钉在 0.160.1，由 owner 切换。`codex --remote` 的 TUI 挂上不覆盖 thread 的审批 / 沙箱 / 模型（0.171.0 与 0.160.1 都核实了，external-holder §10.1）。没做：0.172（Codex 自管的 app-server daemon 已自动升到它，`spawn: "daemon"` 因此会被拒）；`partial_answer` 消息照旧算作回答、一轮的最后一条回答是最终文本，模型真这样分段时最终回复只有最后一段（实测的 `gpt-6-sol`、`gpt-6.2-sol` 都只发 `commentary` / `final_answer`）。
 
 - **live 录音挂点**（下面第 8 项）：归 live 这一块。通道的媒体对端或 harness 把音轨落成 blob，挂到 `live.*` 事件上，默认关闭；同时作为宿主自己判定说话人（如按主人音色）的音频入口。
 - **测试泄漏子进程**：`console.e2e.test.ts` / `live-channels-helpers.ts` 用到的 `fake-create-lark-bot.mjs` 在测试结束后仍在运行（2026-10-13 发现两个残留进程）。补一条不变量：测试和守护进程停止后不留子进程。

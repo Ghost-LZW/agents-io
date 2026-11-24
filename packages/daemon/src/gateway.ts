@@ -659,7 +659,7 @@ export class Gateway {
       send: (s, operationId) => this.sendScheduled(s, operationId),
       toHost: (s, input) => this.scheduledToHost(s, input),
       onError: (err, id, retryInMs) => this.log('warn', `schedule ${id}: ${(err as Error).message}${retryInMs !== undefined ? `; tried again in ${Math.round(retryInMs / 1000)} s` : ''}`),
-      onFailed: (s, scheduledAt, err) => this.scheduleFailed(s, scheduledAt, err),
+      onFailed: (s, scheduledAt, err, kept) => this.scheduleFailed(s, scheduledAt, err, kept),
     });
     // Built when some agent has tools (agents.<name>.tools, default `outputTools`, off); only those agents' harnesses mount them.
     if (Object.values(c.agents).some((a) => a.tools)) {
@@ -805,8 +805,8 @@ export class Gateway {
       addSchedule: (key, draft, turnId) => gw().agentSchedule(key, draft, turnId),
       removeSchedule: (key, id) => gw().removeSchedule(agentOrigin(key, gw().agentOfSession(key)), id),
       listSchedules: (key) => gw().listSchedules(key),
-      // A peer's (an external MCP client's): messages and wakes for the host, its own only (SC-3).
-      addScheduleAs: (origin, draft) => gw().putSchedule(origin, draft),
+      // A peer's (an external MCP client's): messages and wakes for the host, its own only, fired only through its module (SC-3).
+      addScheduleAs: (origin, draft, module) => gw().putSchedule(origin, draft, module),
       removeScheduleAs: (origin, id) => gw().removeSchedule(origin, id),
       listSchedulesAs: (origin) => {
         const who = creatorOf(origin);
@@ -3438,9 +3438,11 @@ ${a.summary}` }],
   }
 
   /**
-   * A `message` schedule: one message through the outbox (once per firing, DL-2). A module's client's
-   * (the external MCP endpoint's) goes out as that client, through its send_message's checks (DL-6).
-   * An agent's (`createdBy` a `session:` key) is the agent's message (`kind: tool`, as the agent, DL-4b):
+   * A `message` schedule: one message through the outbox (once per firing, DL-2). A peer's (set through
+   * a module: an external MCP client's) goes out only through that module, as the peer, through its
+   * send_message's checks (DL-6); the module off, or not acting for the peer now, ends the firing and
+   * nothing is sent (SC-3: never as the daemon's). An agent's (`createdBy` a `session:` key) is the
+   * agent's message (`kind: tool`, as the agent, DL-4b):
    * its route passed the outbound check when it was set (SC-3), and as it goes out the exit check sees
    * it as it would the agent's send_message then (DL-7), the firing as its turn (`firingTurn`). Anyone
    * else's (the owner's config, a host's `schedule.put`, the local principal's) is theirs, not checked
@@ -3448,6 +3450,8 @@ ${a.summary}` }],
    */
   private async sendScheduled(s: Schedule, operationId: string): Promise<void> {
     const route = s.route!;
+    const peer = this.modules.peerModule(s);
+    if (peer !== undefined) return this.modules.peerSchedule({ schedule: s, operationId }, peer);
     if (await this.modules.scheduledMessage({ schedule: s, operationId })) return;
     const ch = this.channelFor(route);
     // What cannot go out by trying again ends the firing (SC-1): no channel, held, denied, rejected.
@@ -3470,11 +3474,11 @@ ${a.summary}` }],
   }
 
   /**
-   * A firing that failed for good (SC-1): over, not tried again. Logged, and recorded in the schedule's
-   * log (`schedule:<id>`, where its sends settle) as a notice; recording it is best effort.
+   * A firing that failed for good (SC-1): over, not tried again (`kept`: until the next start, SC-3).
+   * Logged, and recorded in the schedule's log (`schedule:<id>`, where its sends settle) as a notice (best effort).
    */
-  private scheduleFailed(s: Schedule, scheduledAt: number, err: unknown): void {
-    const message = `schedule ${s.id}: the firing due ${new Date(scheduledAt).toISOString()} was not delivered, not tried again: ${(err as Error)?.message ?? String(err)}`;
+  private scheduleFailed(s: Schedule, scheduledAt: number, err: unknown, kept = false): void {
+    const message = `schedule ${s.id}: the firing due ${new Date(scheduledAt).toISOString()} was not delivered, not tried again${kept ? ' until the next start' : ''}: ${(err as Error)?.message ?? String(err)}`;
     this.log('warn', message);
     try {
       this.hub.append(`schedule:${s.id}`, { ts: Date.now(), level: 'detail', audience: 'status', durability: 'durable', visibility: 'operators', body: { t: 'notice', code: 'other', message } });
@@ -3500,8 +3504,14 @@ ${a.summary}` }],
     return { sessionKey, turnId: operationId, run: { harness: 'schedule', model: 'schedule', profile: 'restricted' }, inputs: [input], replyRoute: null, deliveries: [] };
   }
 
-  /** A `host` schedule: one item into the host inbound queue (the host decides what to do). */
+  /**
+   * A `host` schedule: one item into the host inbound queue (the host decides what to do). A peer's (a
+   * wake an external MCP client set) only while the module it was set through still acts for the peer
+   * (SC-3); otherwise the firing is over and nothing goes to the host.
+   */
   private async scheduledToHost(s: Schedule, input: InputRecord): Promise<void> {
+    const peer = this.modules.peerModule(s);
+    if (peer !== undefined) await this.modules.peerSchedule({ schedule: s, operationId: input.inputId }, peer);
     const route = input.replyRoute;
     const at = Date.parse(String(input.channelContext.firedAt)) || Date.now();
     // The queue keeps it until the host reads it (HQ-1); the firing's input id is its reference, so a redo is one item (HQ-2).
@@ -3890,12 +3900,15 @@ ${a.summary}` }],
   /**
    * A schedule from someone (Policy for schedules, SC-3): the owner, the local principal and the host
    * may set any; an agent only for its own session (a turn there, or a message it may send anyway),
-   * at most `policy.scheduleLimit` of them, none firing more often than `policy.scheduleMinMinutes`.
+   * at most `policy.scheduleLimit` of them, none firing more often than `policy.scheduleMinMinutes`;
+   * a peer (an agent outside this daemon) only through the `module` it is a peer of, which alone
+   * fires it, as the peer (`Schedule.module`).
    */
-  async putSchedule(by: Origin, d: ScheduleDraft): Promise<{ ok: true; schedule: Schedule } | { ok: false; code: string; message: string }> {
+  async putSchedule(by: Origin, d: ScheduleDraft, module?: string): Promise<{ ok: true; schedule: Schedule } | { ok: false; code: string; message: string }> {
     const reg = this.schedules.registry;
     const who = creatorOf(by);
     if (by.kind === 'peer') {
+      if (module === undefined) return { ok: false, code: 'forbidden', message: "a peer's schedule is set through the module it is a peer of (KernelContext.schedules.addAs), which fires it" };
       // Messages it may send anyway, or wakes handed to the host that runs it (never a turn here).
       if (d.action !== 'message' && !(d.action === 'host' && d.meta?.wake)) return { ok: false, code: 'forbidden', message: 'an external client sets message or wake schedules only' };
       const existing = d.id !== undefined ? reg.get(d.id) : undefined;
@@ -3919,7 +3932,7 @@ ${a.summary}` }],
       }
     }
     try {
-      const s = reg.put(d, who);
+      const s = reg.put(d, who, undefined, by.kind === 'peer' ? module : undefined);
       this.schedules.changed();
       return { ok: true, schedule: s };
     } catch (e) {

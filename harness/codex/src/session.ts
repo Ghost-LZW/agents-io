@@ -253,8 +253,8 @@ export class CodexSession implements HarnessSession {
     try {
       const input = await renderInputs(inputs, { resolveMedia: this.opts.resolveMedia, preface: this.opts.preface, memo: this.memo });
       await this.settling;
-      // collaborationMode is in Codex's experimental 0.160 schema; the checked-in
-      // stable TurnStartParams generator omits that one field.
+      // collaborationMode is in Codex's experimental schema (unchanged from 0.160 to 0.171);
+      // the checked-in stable TurnStartParams generator omits that one field.
       const params: TurnStartParams & { collaborationMode?: CollaborationMode } = {
         threadId: this.threadId,
         input,

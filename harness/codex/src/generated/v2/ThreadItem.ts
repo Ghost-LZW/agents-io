@@ -10,6 +10,7 @@ import type { SleepItem } from "../SleepItem.js";
 import type { WebSearchItem } from "../WebSearchItem.js";
 import type { JsonValue } from "../serde_json/JsonValue.js";
 import type { AgentMessageDelivery } from "./AgentMessageDelivery.js";
+import type { AgentMessageModeration } from "./AgentMessageModeration.js";
 import type { AsyncUserInputQuestion } from "./AsyncUserInputQuestion.js";
 import type { CollabAgentState } from "./CollabAgentState.js";
 import type { CollabAgentTool } from "./CollabAgentTool.js";
@@ -31,7 +32,18 @@ import type { PatchApplyStatus } from "./PatchApplyStatus.js";
 import type { SubAgentActivityKind } from "./SubAgentActivityKind.js";
 import type { UserInput } from "./UserInput.js";
 
-export type ThreadItem = { "type": "userMessage", id: string, clientId: string | null, content: Array<UserInput>, } | { "type": "hookPrompt", id: string, fragments: Array<HookPromptFragment>, } | { "type": "agentMessage", id: string, text: string, phase: MessagePhase | null, memoryCitation: MemoryCitation | null, delivery: AgentMessageDelivery | null, questions: Array<AsyncUserInputQuestion> | null, } | { "type": "functionCallOutput", id: string, name: string, namespace: string | null, output: FunctionCallOutputBody, } | { "type": "plan", id: string, text: string, } | { "type": "reasoning", id: string, summary: Array<string>, content: Array<string>, } | { "type": "commandExecution", id: string,
+/**
+ * A thread item and its recorded lifecycle times. The payload stays flat on the wire.
+ */
+export type ThreadItem = {
+/**
+ * Unix timestamp in milliseconds when the item started, if recorded.
+ */
+startedAtMs?: number | null,
+/**
+ * Unix timestamp in milliseconds when the item completed, if recorded.
+ */
+completedAtMs?: number | null, } & ({ "type": "userMessage", id: string, clientId: string | null, content: Array<UserInput>, } | { "type": "hookPrompt", id: string, fragments: Array<HookPromptFragment>, } | { "type": "agentMessage", moderation: AgentMessageModeration | null, id: string, text: string, phase: MessagePhase | null, memoryCitation: MemoryCitation | null, delivery: AgentMessageDelivery | null, questions: Array<AsyncUserInputQuestion> | null, } | { "type": "functionCallOutput", id: string, name: string, namespace: string | null, output: FunctionCallOutputBody, } | { "type": "plan", id: string, text: string, } | { "type": "reasoning", id: string, summary: Array<string>, content: Array<string>, } | { "type": "commandExecution", id: string,
 /**
  * Trusted first-party plugin id when this command resolves to one plugin script.
  */
@@ -69,7 +81,11 @@ exitCode: number | null,
 /**
  * The duration of the command execution in milliseconds.
  */
-durationMs: number | null, } | { "type": "fileChange", id: string, changes: Array<FileUpdateChange>, status: PatchApplyStatus, } | { "type": "mcpToolCall", id: string, server: string, tool: string, status: McpToolCallStatus, arguments: JsonValue, appContext: McpToolCallAppContext | null,
+durationMs: number | null, } | { "type": "fileChange", id: string, changes: Array<FileUpdateChange>, status: PatchApplyStatus, } | { "type": "mcpToolCall", id: string, server: string,
+/**
+ * Registration scope, not necessarily the server's execution environment.
+ */
+environmentId: string | null, tool: string, status: McpToolCallStatus, arguments: JsonValue, appContext: McpToolCallAppContext | null,
 /**
  * Legacy compatibility field; prefer `mcpAppUi.resourceUri` when available.
  */
@@ -122,4 +138,12 @@ reasoningEffort: ReasoningEffort | null,
 /**
  * Last known status of the target agents, when available.
  */
-agentsStates: { [key in string]?: CollabAgentState }, } | { "type": "subAgentActivity", id: string, kind: SubAgentActivityKind, agentThreadId: string, agentPath: string, } | { "type": "webSearch" } & WebSearchItem | { "type": "imageView", id: string, path: LegacyAppPathString, } | { "type": "sleep" } & SleepItem | { "type": "imageGeneration" } & ImageGenerationItem | { "type": "enteredReviewMode", id: string, review: string, } | { "type": "exitedReviewMode", id: string, review: string, } | { "type": "contextCompaction", id: string, };
+agentsStates: { [key in string]?: CollabAgentState }, } | { "type": "subAgentActivity",
+/**
+ * Resolved model at sub-agent creation; absent from older records and other activities.
+ */
+model: string | null,
+/**
+ * Resolved reasoning effort at sub-agent creation, when known.
+ */
+reasoningEffort: ReasoningEffort | null, id: string, kind: SubAgentActivityKind, agentThreadId: string, agentPath: string, } | { "type": "webSearch" } & WebSearchItem | { "type": "imageView", id: string, path: LegacyAppPathString, } | { "type": "sleep" } & SleepItem | { "type": "imageGeneration" } & ImageGenerationItem | { "type": "enteredReviewMode", id: string, review: string, } | { "type": "exitedReviewMode", id: string, review: string, } | { "type": "contextCompaction", id: string, });

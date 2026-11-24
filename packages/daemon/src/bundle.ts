@@ -64,7 +64,8 @@ export const builtinModules = new ModuleRegistry([topicTitleModule, watchToolsMo
   origin: 'builtin',
   fields: {
     [strangersModule.id]: { switch: { path: 'policy.strangers', on: 'ask', off: 'drop' } },
-    [externalMcpModule.id]: { config: 'externalMcp', status: 'externalMcp' },
+    // Its clients' schedules set before a schedule recorded its module (their principals are always `external:…`).
+    [externalMcpModule.id]: { config: 'externalMcp', status: 'externalMcp', schedules: 'external:' },
   },
 });
 

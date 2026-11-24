@@ -143,6 +143,9 @@
         "createdBy": {
           "type": "string"
         },
+        "module": {
+          "type": "string"
+        },
         "createdAt": {
           "type": "number"
         },
@@ -158,6 +161,25 @@
         },
         "lastFiredAt": {
           "type": "number"
+        },
+        "lastFailure": {
+          "type": "object",
+          "required": [
+            "scheduledAt",
+            "at",
+            "reason"
+          ],
+          "properties": {
+            "scheduledAt": {
+              "type": "number"
+            },
+            "at": {
+              "type": "number"
+            },
+            "reason": {
+              "type": "string"
+            }
+          }
         }
       }
     }

@@ -88,12 +88,13 @@ type Holder =
 
 ## 10. 实测记录（2026-10-13）
 
-### 10.1 Codex（codex-cli 0.160.1）
+### 10.1 Codex（codex-cli 0.160.1；TUI 是否覆盖设置的一条在 0.171.0 上也核对过）
 
 - `codex app-server --listen unix:///abs.sock`；TUI：`codex -c check_for_update_on_startup=false --remote unix:///abs.sock resume <threadId>`（不关更新检查时，更新对话框会挡住挂接）。unix socket 没有 token，只靠文件权限（`harness/codex/src/unix.ts` `assertPrivateSocket`）。
 - **空 thread 不能 resume**：`thread/start` 之后 rollout 文件并未写出，`thread/resume` 与 TUI 都报 `no rollout found`。`thread/inject_items`（一条 developer 消息，不调模型）写出 rollout，之后 TUI 能挂上。最后一个订阅者断开约 60 秒后 thread 卸载，没有 rollout 的 thread 就丢了。所以 agents-io 在交出前要先 inject，并在持有期间一直订阅。
 - 双向可见：agents-io 的 `turn/start` 在 TUI 里显示为用户输入加回答；TUI 里敲的轮次以 `turn/started`、`item/*`、`turn/completed` 到 agents-io，`clientId` 不是我们的，走 `foreignTurn`。`turn/steer` 在 TUI 的轮次里生效（工具调用后插入），必须带 `expectedTurnId`。
-- 未核实：审批在两个客户端之间先到为准（只有假服务器测试）；TUI 自己的 `thread/resume` 是否用它的配置覆盖 thread 的审批、沙箱、模型设置（决定 11 的档位依赖它）。
+- 未核实：审批在两个客户端之间先到为准（只有假服务器测试）。
+- **已核实（2026-11-24，codex-cli 0.171.0 与 0.160.1 结果相同）：TUI 挂上不覆盖 thread 的审批、沙箱、模型设置**（决定 11 的档位依赖它）。做法：agents-io 这一侧的客户端以 `approvalPolicy: untrusted`、`sandbox: read-only`、`model: gpt-6-sol` 开 thread 并 inject 一条，TUI 经一个记录帧的代理 `--remote` 挂上（AsterGate 的 `CODEX_HOME`，其 config.toml 的缺省模型是 `gpt-6.1-sol`，与 thread 的不同）。TUI 发的 `thread/resume` 里 `approvalPolicy`、`approvalsReviewer`、`sandbox`、`permissions`、`model`、`cwd` 都是 `null`，只带 `excludeTurns` 和它自己 config.toml 的 `serviceTier`（0.160.1 另带 `config: { web_search: "cached" }`）；服务端答 TUI 的仍是 thread 原来的 `untrusted` / `readOnly` / `gpt-6-sol`，另一个客户端收不到 `thread/settings/updated`；之后另一个客户端不带覆盖开的一轮照旧为 `mkdir` 发审批请求（untrusted 生效），这一轮在 TUI 里实时显示。`serviceTier` 是服务档位，agents-io 不设；TUI 与 app-server 用同一个 `CODEX_HOME` 时它就是 thread 本来的值。
 
 ### 10.2 Claude Code（2.1.296）
 

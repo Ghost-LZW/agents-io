@@ -22,6 +22,15 @@ describe('open', () => {
   });
 });
 
+describe('handshake', () => {
+  it('opts out of the notifications codex-cli 0.171 adds and nothing here maps, so the stream is the same on 0.160 and 0.171', async () => {
+    const { fake, harness } = setup();
+    await harness.probe();
+    const out = fake.sent('initialize')[0]!.params.capabilities.optOutNotificationMethods;
+    expect(out).toEqual(expect.arrayContaining(['thread/prediction/updated', 'thread/readState/changed', 'thread/search/partial', 'thread/section/changed']));
+  });
+});
+
 describe('what the host hands over: instructions, a session env, media', () => {
   it('the agent instructions are the developer instructions, over options.developerInstructions', async () => {
     const { fake, harness } = setup();
