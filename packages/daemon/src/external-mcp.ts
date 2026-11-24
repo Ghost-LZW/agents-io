@@ -206,8 +206,11 @@ const FEATURE = 'external.mcp';
  * The external MCP endpoint as a module: section `externalMcp` (off unless present, `enabled: false`
  * turns it off), feature `external.mcp` while it listens, status `{ url, clients }` while it listens
  * (`bundle.ts` keeps it at `GET /api/status` `externalMcp` too). A client's schedules are the
- * kernel's (`KernelContext.schedules`, as the client); when one of its message schedules fires, the
- * `scheduledMessage` hook sends it as the client (through `send`'s checks). It starts after the daemon's
+ * kernel's (`KernelContext.schedules`, as the client), fired only through this module: when one of
+ * its message schedules fires, the `scheduledMessage` hook sends it as the client (through `send`'s
+ * checks), and one of its wakes goes to the host only when `scheduledWake` says it is still a
+ * configured client whose scope has the route; a client no longer configured, or this module being
+ * off, sends nothing (SC-3). It starts after the daemon's
  * channels, local socket and console; a bad client token or token file fails the start, a port that
  * is taken is logged, not fatal (as for the console). It stops before anything else (`bundle.ts`
  * registers it last): no new external writes while the daemon stops.
@@ -241,12 +244,21 @@ export const externalMcpModule: ModuleManifest<ExternalMcpConfig> = {
       features: () => (listening ? [FEATURE] : []),
       status: () => (listening ? { url: listening.url, clients: cfg.clients.map((x) => x.name) } : undefined),
       hooks: {
-        // A client's message schedule fires as that client's send, through its send_message checks (DL-6).
+        // A client's message schedule fires as that client's send, through its send_message checks (DL-6);
+        // one whose client is no longer configured is not ours to send (false: the kernel sends nothing, SC-3).
         scheduledMessage: async ({ schedule, operationId }) => {
           const client = cfg.clients.find((x) => x.principal.id === schedule.createdBy);
           if (!client) return false;
           if (!listening) throw new Error(`the external endpoint is not running, so ${client.name}'s schedule cannot send as it`);
           await listening.endpoint.sendAs(client.name, { route: schedule.route!, text: schedule.text, operationId });
+          return true;
+        },
+        // A client's wake goes to the host only while it is a configured client whose schedule scope still has the route (SC-3).
+        scheduledWake: ({ schedule }) => {
+          const client = cfg.clients.find((x) => x.principal.id === schedule.createdBy);
+          if (!client) return false;
+          const route = schedule.route;
+          if (!route || !client.scopes.schedule.some((p) => globMatch(p, routeKey(route)))) throw final(`route ${route ? routeKey(route) : '(none)'} is no longer in ${client.name}'s schedule scope`);
           return true;
         },
       },

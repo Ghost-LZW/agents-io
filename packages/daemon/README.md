@@ -619,7 +619,11 @@ party's module has the same shape (origin `module`). The manifest says, without 
   in registration order until one answers `true` (it sent it, as one of its own principals: the
   external MCP endpoint sends a client's schedule as that client's `send_message`); with none the
   kernel sends it as the daemon's message; a throw is the firing's failure (redone, SC-1), and
-  while the modules stop every firing fails that way.
+  while the modules stop every firing fails that way. A peer's schedule (set through
+  `KernelContext.schedules.addAs`, `schedule.module` the module's id) is asked of that module
+  alone: `false`, no hook, or the module off or not registered ends the firing, and nothing goes
+  out (SC-3); `scheduledWake({ schedule, operationId })` is asked the same way for a peer's wake
+  (`action: "host"`): `true` and the kernel hands it to the host, anything else ends the firing.
 
 The registry checks every manifest and what they claim together (ids; config sections and
 aliases; tools, commands and features are each one module's and never the kernel's). Its option
@@ -627,7 +631,10 @@ aliases; tools, commands and features are each one module's and never the kernel
 (`bundle.ts`: `{ 'external-mcp': { config: 'externalMcp', status: 'externalMcp' } }`):
 `Config.<config>` is the same object as its settings in `Config.modules` (deprecated, one
 release; given another value or removed before `Gateway.start`, it still decides), and
-`GET /api/status` has `<status>` holding what its `status()` returns while it runs. A `switch`
+`GET /api/status` has `<status>` holding what its `status()` returns while it runs. `schedules`
+(`bundle.ts`: `{ 'external-mcp': { schedules: 'external:' } }`) is the start of the `createdBy` of
+the schedules its peers set before a schedule recorded its module: those are its peers' too (SC-3;
+no two modules' overlap). A `switch`
 (`bundle.ts`: `{ strangers: { switch: { path: 'policy.strangers', on: 'ask', off: 'drop' } } }`)
 is an old on/off field of the resolved `Config` at a dotted path: `resolveConfig` writes `on` or
 `off` there as the module is on or off (deprecated, one release); given another value before
@@ -1198,3 +1205,24 @@ After the review of that merge (2026-11-24; INVARIANTS SC-1, DL-7):
 - An agent's message schedule fires as the agent's message (`kind: "tool"`, `SendOp.as`) and the
   exit check sees it as that agent's `send_message`; the others go out with `kind` `notice`
   (`host` for a host's) and, as before, are not exit checked.
+
+After the review of the merge, a peer's schedules (2026-11-24; INVARIANTS SC-3, ID-10, DL-7):
+
+- A peer's schedule (set through `KernelContext.schedules.addAs`) records the module it was set
+  through (`Schedule.module`, `ScheduleView.module`) and fires only through it, as the peer: a
+  message through that module's `ModuleHooks.scheduledMessage`, a wake (`action: "host"`) through
+  the new hook `ModuleHooks.scheduledWake` (true: the kernel hands it to the host). The module not
+  registered, off, without the hook, or not answering `true` ends the firing (`FinalFiringError`,
+  recorded), and nothing goes out: before, the kernel sent such a message as the daemon's own
+  (`notice`, no exit check) and handed such a wake to the host. Schedules set before this have no
+  `module`: `ModuleFields.schedules` (a `createdBy` prefix) says whose they are (`bundle.ts`:
+  `external:` for the external MCP endpoint). `ModuleHost.peerModule` and `peerSchedule` are new;
+  `ModuleHost.scheduledMessage` is asked only for schedules that are no peer's.
+- `KernelBackend.addScheduleAs` gets a third argument, the module's id; `Gateway.putSchedule` takes
+  an optional third, `module`, and refuses a peer's origin without one (`forbidden`).
+- `@agents-io/session`: `Schedule` gains `module` and `lastFailure { scheduledAt, at, reason }`
+  (`ScheduleFailure`): a firing that fails for good records why (`ScheduleRegistry.fail` takes an
+  optional `reason`; the dispatcher passes the error's message), a delivered one clears it.
+  `ScheduleRegistry.put` takes an optional fourth argument, `module`.
+- The external MCP endpoint's `scheduledWake` answers true only for a configured client whose
+  `schedule:` scope still has the route (a route out of it ends the firing, as for its messages).

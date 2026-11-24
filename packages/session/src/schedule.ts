@@ -29,10 +29,24 @@ export interface Schedule extends Required<Pick<ScheduleDraft, 'when' | 'text'>>
   meta?: Record<string, string>;
   /** `creatorOf(origin)`: a principal id, `session:<key>` for an agent, `host:<name>`, `config`. */
   createdBy: string;
+  /**
+   * A peer's (an agent outside this daemon): the module it was set through (`KernelContext.schedules.addAs`).
+   * It fires only through that module, as the peer, never as the daemon (SC-3).
+   */
+  module?: string;
   createdAt: number;
   /** Next time it fires (Unix ms); null: it will not fire again. */
   nextAt: number | null;
   lastFiredAt?: number;
+  /** Its latest firing failed for good (SC-1): when it was due, when it failed, why. Gone once a firing is delivered. */
+  lastFailure?: ScheduleFailure;
+}
+
+/** Why a firing did not go out (`Schedule.lastFailure`). */
+export interface ScheduleFailure {
+  scheduledAt: number;
+  at: number;
+  reason: string;
 }
 
 export class ScheduleError extends Error {
@@ -267,8 +281,8 @@ export class ScheduleRegistry {
     return (this.db.prepare('SELECT * FROM schedules ORDER BY id').all() as Record<string, unknown>[]).map((r) => this.row(r)!);
   }
 
-  /** Adds or replaces a schedule; returns it with its first `nextAt`. */
-  put(d: ScheduleDraft, createdBy: string, id?: string): Schedule {
+  /** Adds or replaces a schedule; returns it with its first `nextAt`. `module`: a peer's, the module it is set through (`Schedule.module`). */
+  put(d: ScheduleDraft, createdBy: string, id?: string, module?: string): Schedule {
     checkDraft(d, this.timeZone);
     const now = this.now();
     const s: Schedule = {
@@ -283,12 +297,12 @@ export class ScheduleRegistry {
       ...(d.note ? { note: d.note } : {}),
       ...(d.meta ? { meta: d.meta } : {}),
       createdBy,
+      ...(module !== undefined ? { module } : {}),
       createdAt: now,
       nextAt: null,
     };
     s.nextAt = this.upcoming(s, now);
-    const { nextAt: _n, lastFiredAt: _l, ...def } = s;
-    this.db.prepare('INSERT OR REPLACE INTO schedules (id, def, next_at, last_fired_at) VALUES (?, ?, ?, NULL)').run(s.id, JSON.stringify(def), s.nextAt);
+    this.db.prepare('INSERT OR REPLACE INTO schedules (id, def, next_at, last_fired_at) VALUES (?, ?, ?, NULL)').run(s.id, definition(s), s.nextAt);
     return s;
   }
 
@@ -323,17 +337,20 @@ export class ScheduleRegistry {
     return (this.db.prepare('SELECT id, scheduled_at FROM schedule_firing ORDER BY scheduled_at').all() as { id: string; scheduled_at: number }[]).map((r) => ({ id: r.id, scheduledAt: Number(r.scheduled_at) }));
   }
 
-  /** The firing is delivered: its marker goes and the schedule moves to its next time (or is removed). */
+  /** The firing is delivered: its marker goes and the schedule moves to its next time (or is removed); an earlier failure is forgotten. */
   end(id: string, scheduledAt: number, firedAt: number): void {
     this.over(id, scheduledAt, firedAt, true);
   }
 
-  /** The firing failed for good: over as `end`, except that the schedule keeps its last firing (this one did not fire). */
-  fail(id: string, scheduledAt: number, now: number): void {
-    this.over(id, scheduledAt, now, false);
+  /**
+   * The firing failed for good: over as `end`, except that the schedule keeps its last firing (this
+   * one did not fire) and, with `reason`, says why (`lastFailure`).
+   */
+  fail(id: string, scheduledAt: number, now: number, reason?: string): void {
+    this.over(id, scheduledAt, now, false, reason);
   }
 
-  private over(id: string, scheduledAt: number, at: number, fired: boolean): void {
+  private over(id: string, scheduledAt: number, at: number, fired: boolean, reason?: string): void {
     this.db.exec('SAVEPOINT sc_end');
     try {
       this.db.prepare('DELETE FROM schedule_firing WHERE id = ? AND scheduled_at = ?').run(id, scheduledAt);
@@ -341,8 +358,12 @@ export class ScheduleRegistry {
       if (s) {
         const next = this.upcoming(s, Math.max(scheduledAt, at));
         if (next === null) this.db.prepare('DELETE FROM schedules WHERE id = ?').run(id);
-        else if (fired) this.db.prepare('UPDATE schedules SET next_at = ?, last_fired_at = ? WHERE id = ?').run(next, at, id);
-        else this.db.prepare('UPDATE schedules SET next_at = ? WHERE id = ?').run(next, id);
+        else if (fired) {
+          const { lastFailure: _f, ...rest } = s;
+          this.db.prepare('UPDATE schedules SET next_at = ?, last_fired_at = ?, def = ? WHERE id = ?').run(next, at, definition(rest), id);
+        } else if (reason !== undefined) {
+          this.db.prepare('UPDATE schedules SET next_at = ?, def = ? WHERE id = ?').run(next, definition({ ...s, lastFailure: { scheduledAt, at, reason } }), id);
+        } else this.db.prepare('UPDATE schedules SET next_at = ? WHERE id = ?').run(next, id);
       }
       this.db.exec('RELEASE sc_end');
     } catch (e) {
@@ -360,6 +381,12 @@ export class ScheduleRegistry {
     if (next === null) this.remove(id);
     else this.db.prepare('UPDATE schedules SET next_at = ? WHERE id = ?').run(next, id);
   }
+}
+
+/** What the `def` column keeps of a schedule: all but `nextAt` and `lastFiredAt` (their own columns). */
+function definition(s: Schedule): string {
+  const { nextAt: _n, lastFiredAt: _l, ...def } = s;
+  return JSON.stringify(def);
 }
 
 // ---- dispatcher -------------------------------------------------------------------------------
@@ -527,7 +554,7 @@ export class ScheduleDispatcher {
         await this.deliver(s, scheduledAt, missed);
       } catch (e) {
         if (!isFinalFiring(e)) throw e;
-        this.registry.fail(id, scheduledAt, this.now());
+        this.registry.fail(id, scheduledAt, this.now(), (e as Error)?.message ?? String(e));
         this.retries.delete(id);
         try {
           this.o.onFailed?.(s, scheduledAt, e);

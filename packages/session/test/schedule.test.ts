@@ -221,6 +221,43 @@ describe('schedules', () => {
     w.log.close();
   });
 
+  it("a schedule whose firing failed for good says why (lastFailure), kept with it across a restart, until a firing is delivered; a peer's keeps the module it was set through #SC-1 #SC-3", async () => {
+    const now = { t: T0 };
+    const w = world(now);
+    let refuse = true;
+    const sent: string[] = [];
+    const d = new ScheduleDispatcher({
+      registry: w.registry,
+      now: () => now.t,
+      lanes: () => {
+        throw new Error('no turns here');
+      },
+      send: async (_s, op) => {
+        if (refuse) throw Object.assign(new Error('set by peer:x through module peers, which is off; not sent'), { final: true });
+        sent.push(op);
+      },
+    });
+    const route = { channel: 'fake', account: 'default', conversationId: 'c1' };
+    expect(w.registry.put({ id: 'hourly', when: { cron: '0 * * * *' }, action: 'message', route, text: 'tick' }, 'peer:x', undefined, 'peers')).toMatchObject({ module: 'peers', createdBy: 'peer:x' });
+    d.start();
+    await d.idle();
+    const at = Date.parse('2026-10-27T01:00:00Z');
+    now.t = at + 5_000;
+    await d.tick();
+    // Another registry on the same database (the next start) reads the same.
+    const again = new ScheduleRegistry({ db: w.log.db, now: () => now.t, timeZone: SH });
+    expect(again.get('hourly')).toMatchObject({ module: 'peers', nextAt: at + 3600_000, lastFailure: { scheduledAt: at, at: at + 5_000, reason: 'set by peer:x through module peers, which is off; not sent' } });
+    expect(again.list().map((s) => s.lastFailure?.scheduledAt)).toEqual([at]);
+    refuse = false;
+    now.t = at + 3600_000;
+    await d.tick();
+    expect(sent).toEqual([`schedule:hourly:${at + 3600_000}`]);
+    expect(w.registry.get('hourly')).toMatchObject({ module: 'peers', lastFiredAt: at + 3600_000, nextAt: at + 2 * 3600_000 });
+    expect(w.registry.get('hourly')!.lastFailure).toBeUndefined();
+    d.stop();
+    w.log.close();
+  });
+
   it('rejects malformed schedules #SC-1', () => {
     const r = new ScheduleRegistry({ timeZone: SH });
     expect(() => r.put({ when: { cron: '0 9 * * *' }, text: 'x' }, 'config')).toThrow(/target\.sessionKey/);

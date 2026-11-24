@@ -878,9 +878,13 @@ export const ScheduleView = Type.Object({
   id: Type.String(),
   action: Type.String(),
   createdBy: Type.String(),
+  /** A peer's (an external MCP client's): the module it was set through, which alone fires it, as the peer (SC-3). */
+  module: Type.Optional(Type.String()),
   createdAt: Type.Number(),
   nextAt: Type.Union([Type.Number(), Type.Null()]),
   lastFiredAt: Type.Optional(Type.Number()),
+  /** Its latest firing failed for good and did not go out (SC-1): when it was due, when it failed (Unix ms), why. Gone once a firing is delivered. */
+  lastFailure: Type.Optional(Type.Object({ scheduledAt: Type.Number(), at: Type.Number(), reason: Type.String() })),
 });
 export type ScheduleView = Static<typeof ScheduleView>;
 /** `schedule.put`. */
