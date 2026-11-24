@@ -98,7 +98,16 @@ export interface BuiltChannel {
  * composition root grants it when it registers the type (the daemon's `bundle.ts`: lark-bot and
  * mail their caps; every other type, bridge and module included, `device_only` only).
  *
- * In progress (core-slimming G2): the daemon reads all of it except `implicitEnv`.
+ * A `type: "module"` entry's file (the daemon's own `module` type) may export one of these instead
+ * of a `ChannelFactory` (as `createChannel`, or the entry's `export`, else default), when the
+ * daemon imported the config's module files before it resolved the config (`loadConfigModules`;
+ * `aio serve` does): its `entry` checks the entry's `config` (an absent one as `{}`; closed), its
+ * `resolve` resolves it, its `validateAll` gets the entries naming the same file and export (their
+ * `config`s), its `isCredential` / `credentialHint` / `implicitEnv` answer for paths under
+ * `config`, its `create` gets the resolved `config` with the entry's `account`, and its `admin`
+ * routes, schemas and `mount` are served (not `admin.console`: the config's `console` section is
+ * checked before module files load). Its `type`, `ids`, `owner` and `idOf` are not read there:
+ * one file and export is one owner of its channel id, as for a factory.
  */
 export interface ChannelModule<E = Record<string, unknown>, R = E> {
   /**

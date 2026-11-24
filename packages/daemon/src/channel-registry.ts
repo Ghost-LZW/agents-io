@@ -20,6 +20,12 @@ export interface ChannelRegistryOptions {
    * mail), never a module's own claim: a `ChannelModule` has no say in it.
    */
   defaultEvidence?: Readonly<Record<string, DefaultEvidence>>;
+  /**
+   * Admin contributions besides the types' own (`ChannelModule.admin`), after them, each checked and
+   * claimed as a type's is: the descriptors `type: "module"` entries' files export (`loadConfigModules`).
+   * `type` names it in messages.
+   */
+  admins?: readonly ChannelAdminContribution[];
 }
 
 /** A resolved `channels[]` entry, as far as the registry reads it. */
@@ -41,7 +47,7 @@ const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'obj
  * all are. A module may be untyped code: one without `create` would pass the config and fail the
  * gateway's start with a TypeError.
  */
-function badChannelModule(m: Partial<Record<string, unknown>>): string | undefined {
+export function badChannelModule(m: Partial<Record<string, unknown>>): string | undefined {
   if (!isObject(m.entry)) return 'entry (an object of schemas)';
   const required = (['resolve', 'create'] as const).find((k) => typeof m[k] !== 'function');
   if (required) return `${required} (a function)`;
@@ -112,8 +118,10 @@ export class ChannelRegistry {
   /** The registered types' admin contributions (`ChannelModule.admin`), in registration order. */
   readonly adminContributions: readonly ChannelAdminContribution[];
   private readonly admins: ChannelAdminContribution[] = [];
+  private readonly options: ChannelRegistryOptions;
 
   constructor(modules: readonly ChannelModule[], o: ChannelRegistryOptions = {}) {
+    this.options = o;
     const ids = new Map<string, string>();
     // What the contributions claim, by kind and name: the type that claimed it.
     const claimed = new Map<string, string>(ADMIN_ENDPOINTS.map((e) => [`route ${routeKey(e)}`, '']));
@@ -133,6 +141,11 @@ export class ChannelRegistry {
       }
       if (m.admin) this.claimAdmin(m.type, m.admin, claimed);
       this.byType.set(m.type, m);
+    }
+    for (const { type, admin } of o.admins ?? []) {
+      const bad = badAdmin(admin);
+      if (bad) throw new Error(`${type}: bad ${bad}`);
+      this.claimAdmin(type, admin, claimed);
     }
     for (const [type, ev] of Object.entries(o.defaultEvidence ?? {})) {
       if (!this.byType.has(type)) throw new Error(`defaultEvidence: channel type ${JSON.stringify(type)} is not registered`);
@@ -163,6 +176,17 @@ export class ChannelRegistry {
 
   get(type: string): ChannelModule | undefined {
     return this.byType.get(type);
+  }
+
+  /**
+   * A registry of the same types and options, `replace` in the place of the type of its name
+   * (registered here) and `admins` after the contributions this one has; checked as a new one is.
+   */
+  with(o: { replace?: ChannelModule; admins?: readonly ChannelAdminContribution[] }): ChannelRegistry {
+    const r = o.replace;
+    if (r && !this.byType.has(r.type)) throw new Error(`channel type ${JSON.stringify(r.type)} is not registered`);
+    const modules = this.modules.map((m) => (r && m.type === r.type ? r : m));
+    return new ChannelRegistry(modules, { ...this.options, admins: [...(this.options.admins ?? []), ...(o.admins ?? [])] });
   }
 
   /** In registration order. */

@@ -84,7 +84,16 @@ see `docs/E2E.md` §0). New:
   "account": "lan", "config": { "token": "env:MY_TOKEN" } }`). `module` is a path
   relative to the config file (a package directory or a `.js` / `.mjs` file) or a bare
   specifier; the module exports a `ChannelFactory` (`@agents-io/protocol`) as
-  `createChannel` (or `default`). It runs in the daemon's process with the blob
+  `createChannel` (or `default`), or a `ChannelModule` descriptor: then, as `aio serve`
+  imports the config's module files before it resolves the config (`loadConfigModules`), its
+  `entry` checks the entry's `config` (closed), its `resolve` resolves it (what it returns is the
+  `config`, never the entry's own keys such as `evidence`), its `validateAll` gets the entries
+  naming its file and export, its `isCredential` / `credentialHint` / `implicitEnv` answer for
+  paths under `config`, its `create` gets the resolved `config` with the entry's `account`, and
+  its `admin` routes, schemas and `mount` are served (an `admin.console` fails the load: the
+  console section is checked before module files are imported; its `type`, `ids`, `owner`,
+  `idOf` are not read). A config resolved without importing them first builds a factory as
+  before, and fails the start for a descriptor. It runs in the daemon's process with the blob
   store, so load only code you trust. Two channels with the same (id, account)
   fail the start. See `docs/CHANNELS.md` §5. The four are the channel types the
   composition root registers (`src/bundle.ts`): each is a `ChannelModule`
@@ -99,6 +108,17 @@ see `docs/E2E.md` §0). New:
   without an `evidence` grant (lark-bot, mail). The daemon's config code, its gateway and
   its console name no type: what a type adds to the console (lark-bot's `/api/bots/lark`
   and `console.larkBotCommand`) is its own `ChannelModule.admin` contribution.
+- **Feature modules of someone else's** (`modules[]`): `{ "use": "module", "module":
+  "./my-feature.mjs", "export": "manifest", "config": { … } }`, an ES module exporting a
+  `ModuleManifest` (`@agents-io/protocol`; `export` default `manifest`, else `default`; a named one
+  never falls back; `module` resolves like a module channel's). `aio serve` imports each before it
+  resolves the config (`loadConfigModules`) and registers it after the built-in modules, in file
+  order, with origin `module`; its settings are its entry's `config` (`enabled` and the keys of
+  its `config.schema`, closed; through its `resolve`, `ctx.where` `modules[<i>].config`;
+  `enabled: false` turns it off, no `config` leaves it on; its `config.section` and `aliases` are
+  not read in the file). See "Feature modules". A config resolved without importing them (a
+  client reading the file: `aio send`, `aio attach`) loads, an agent's `tools` list then being
+  taken as written, but `Gateway.start` refuses it, naming the entry.
 - **Harness instances** (`harnesses.<name>`, `use`: `claude-code`, `codex`, `bridge` or
   `module`; see `docs/E2E.md` §0). `claude-code`, `codex` and `bridge` are the harness kinds the
   daemon's composition root registers (`src/bundle.ts`): each is a `HarnessModule`
@@ -110,7 +130,9 @@ see `docs/E2E.md` §0). New:
   `module` entry's module exports a `HarnessFactory`
   (`@agents-io/protocol`), or a `HarnessModule` (its `schema` checks the entry's `config` at
   start, its `create` gets the factory's init plus `launch` = that config, the instance's `env`
-  and `profiles`); the adapter it returns serves every session of the instance.
+  and `profiles`; its `declares` is what its adapters declare where they say nothing themselves,
+  each member the adapter's own first, checked at start like the adapter's; its `cli` adds
+  commands to the CLI, see "CLI"); the adapter it returns serves every session of the instance.
   Stop and restart follow what the adapter declares, built-in or module alike
   (`HarnessAdapter` in `packages/protocol/src/harness.ts`): with `detach()` its lanes are
   detached at stop (a running turn stays open in the log) and `detach()` is called once;
@@ -179,7 +201,8 @@ see `docs/E2E.md` §0). New:
   that throws or rejects is logged, never thrown, like `detach` / `dispose`). The
   takeover gets a directory for its files (`<dataDir>/tui`), the CLI's path for helpers its
   terminal starts (`aio <command>` runs a command a built-in kind adds, `HarnessModule.cli`:
-  Claude Code's `tui-bridge`) and local paths of stored files.
+  Claude Code's `tui-bridge`), the daemon's config file (`config`: a `use: "module"` kind's
+  commands are found through it, `aio --config <file> <command>`) and local paths of stored files.
   A `bridge` instance (`command`, `args`, `config`; `@agents-io/harness-jsonl-bridge`) is a
   harness in another process, any language, spoken to over JSONL stdio (`docs/HOSTS.md` §4.8).
   Its program says what it declares in its answer to `probe` (`declares`: the static members
@@ -442,7 +465,9 @@ private package `@agents-io/daemon-e2e` (`packages/daemon-e2e`) now, which expor
   `accessToken`, lark-bot `appSecret` / `encryptKey` / `verificationToken`, a
   bridge argument after a secret-looking flag, and in free-form parts any string
   under a secret-looking key. `GET` shows them only as `env:NAME` references or
-  `<redacted>`, plus each referenced variable as set / unset (never its value).
+  `<redacted>`, plus each referenced variable as set / unset (never its value), then each
+  variable a channel entry's type says it reads without a reference (`ChannelModule.implicitEnv`,
+  e.g. a module file's descriptor's), marked `implicit: true`.
   `PUT` (and `validate`) run the startup validation (`resolveConfig`, with the
   env file read afresh), keep stored values where a credential field says
   `<redacted>` (elsewhere the marker is an error), refuse new literals in
@@ -606,7 +631,14 @@ aio console-link                                              (one-time console 
 
 - A built-in harness kind may add commands (`HarnessModule.cli`), for its own processes to
   start, not listed above: Claude Code's `aio tui-bridge` is what its terminal UI starts as an
-  MCP server (decision 15). The CLI's own commands come first.
+  MCP server (decision 15). The CLI's own commands come first. So may the `HarnessModule`
+  descriptor a `use: "module"` instance's module exports: the CLI finds it through the config it
+  is given (`--config`, `$AIO_CONFIG`, `./aio.config.json`; a takeover's `services.config` names
+  the daemon's), importing each such module without building anything, after its own and the
+  built-in kinds' commands. The daemon's start fails for a name that is not lowercase letters,
+  digits and `-`, a command that is not a function, a name a registered kind adds, or one
+  another instance's module adds differently; the CLI refuses the last too. A name nobody adds is
+  `unknown command` as before (with why, when the config does not load).
 - The end-to-end scenarios against the real harness are not in this package: they are
   `aio-e2e` in `packages/daemon-e2e` (`pnpm e2e` from the repo root, `docs/E2E.md` §1.1),
   with the options `aio e2e` had. `aio e2e` only says so and exits 2.
@@ -633,7 +665,11 @@ A feature of the daemon can be a module: a `ModuleManifest` (`@agents-io/protoco
 live and topic tools, `tools.watch`, `tools.schedules`, `tools.live`, `tools.topics`, the stranger approval, `strangers`, the
 owner's run-config chat commands, `owner-commands`, and the external MCP endpoint,
 `external-mcp`). A third
-party's module has the same shape (origin `module`). The manifest says, without running anything:
+party's module has the same shape (origin `module`): an embedder registers it in its own
+registry, and the bundled `aio` loads one from the config file's `modules` entries (each imported
+at `aio serve`'s start, before the config is resolved: `loadConfigModules`; registered after the
+built-in ones, in file order; its settings are its entry's `config`, its section and aliases are
+not read, see "Configuration"). The manifest says, without running anything:
 
 - `id` (`tools.watch`), `kind: 'feature'`, `needs` (`module:<id>`: another registered module,
   on whenever this one is; `kernel:<capability>`: a member of `KernelContext`);
@@ -746,12 +782,15 @@ ordinary message), the `host.hello` features, and `GET /api/status` `modules`
 (`[{ id, origin, enabled, status? }]`, every registered module). With no module the tool list,
 `/help`, the features and the error texts are byte for byte what they were before.
 
-`KernelContext` gives a module views of the daemon, each one of the gateway's own capabilities.
-A module is in-process code the composition root or the embedder registered, as trusted as the
-daemon (INVARIANTS ID-3 boundary 2): the views keep it to the kernel's rules, they are no sandbox
+`KernelContext` gives a module views of the daemon, each one of the gateway's own capabilities,
+the same whatever its origin.
+A module is in-process code the composition root, the embedder or the config file (`modules`)
+registered, as trusted as the daemon (INVARIANTS ID-3 boundary 2): the views keep it to the
+kernel's rules (a peer's origin only, ID-10; no evidence grant; `policy` is a frozen view, asked
+and never set), they are no sandbox
 (`db` is the whole records database, launched sessions' env values included). They are: `log` (prefixed `module <id>: `), `events` and `head` (a session's log),
 `appendNative` (a durable native event in a log of the module's own, such as
-`external:<client>`), `sessions` (`list`, `known`, `agentOf`), `status`, `stopping`, `policy`,
+`external:<client>`), `sessions` (`list`, `known`, `agentOf`), `status`, `stopping`, `policy` (frozen: assigning a hook throws),
 `records` (values under `module:<id>:`), `db` (the log's database, unrestricted; name your tables `module_<id>_…` and leave the host's alone),
 `topics` (`bySession`, `siblings`, `titleSource`, `setAutoTitle(topicId, expected, title, turnId?)`:
 a generated title, set only while the topic's title is still generated and still the one the
@@ -837,8 +876,8 @@ instance the other `hooks` (`onTopicChanged`, `planRun`, `harnessFor`) and `loca
 (setting one fails the setup, naming it; a hook that is not a function too). They were sketched
 for the Claude Code terminal, which became a harness capability instead (`HarnessAdapter.takeover`,
 "Harness instances" above); each is served when a module needs it. A module
-section's strings are redacted by the console's general rule (a secret-looking key); `x-credential`
-marks in a module's schema are not read yet.
+section's strings (and a `modules` entry's `config`) are redacted by the console's general rule (a
+secret-looking key); `x-credential` marks in a module's schema are not read yet.
 
 ## Library
 
@@ -846,6 +885,16 @@ marks in a module's schema are not read yet.
 `Gateway.start({ config, … })` starts everything in-process (tests and e2e use
 `harness` / `buildHarness` / `channels` to inject fakes); `LocalClient` speaks both
 client and host frames (`hello`, `runStart`, `runEndedOf`, `inboundRead`, `onRequest('inbound' | 'policy', …)`, …).
+
+A config naming module files (`modules` entries, module channel files exporting a descriptor) is
+loaded as `aio serve` does: `const r = await loadConfigModules({ path })` (or
+`importConfigModules(raw, { baseDir })`; both take a `moduleRegistry` / `channelRegistry` to
+extend, default the built-in ones), then `loadConfig({ path, ...r })` and
+`Gateway.start({ config, ...r })`, the same registries to both. The feature modules are registered
+after the given ones (`RegisteredModule.entry` names their file and export, `ModuleRegistry.fromEntry`
+finds one); the channel registry's `module` type is one bound to what the files export
+(`moduleChannelType(files)`, with their admin contributions after the types'). A config file that
+names none gives the registries back unchanged.
 
 ### The kernel without modules (core-only)
 
@@ -1352,3 +1401,22 @@ What changed for embedders with the live tools offered only where a live can be 
   endpoint may offer). `KernelContext.agents.tools` is what an agent's sessions are offered now
   (without what a module withholds at the moment). An embedder that passes
   `HostToolsOptions.live` itself keeps the kernel's `live_*` listed always.
+
+What changed for embedders with third parties' modules from the config (core-slimming §4, 2026-11-24):
+
+- The config file has a top-level `modules` (feature modules of someone else's); `Config.moduleEntries`
+  lists its entries resolved (file and export), and `Gateway.start` fails with a `ConfigError`
+  when one is not in its module registry. Import them first: `loadConfigModules` /
+  `importConfigModules` (`src/config-modules.ts`) answer `{ moduleRegistry, channelRegistry }` for
+  `loadConfig` and `Gateway.start`. New: `RegisteredModule.entry`, `ModuleRegistry.with` and
+  `fromEntry`, `ChannelRegistry.with` and `ChannelRegistryOptions.admins`, `moduleChannelType`,
+  `ChannelModuleFiles`, `readConfigFile`, `configPath`, `resolveModuleEntry`; in
+  `@agents-io/protocol`, `TakeoverServices.config` and `AdminConfigDocument.env[].implicit`.
+- `KernelContext.policy` is a frozen view of the policy (the same hooks): a module that assigned
+  one of its members changed what the lanes decide with; now that throws `TypeError`.
+- A `use: "module"` harness descriptor's `declares` and `cli` count (they were not read): a
+  descriptor that has them now gets its declarations checked and applied to its adapters where
+  they declare nothing, and its commands checked at start.
+- `moduleChannelModule` (the bundle's `module` type) is `moduleChannelType()`; a module file
+  exporting a `ChannelModule` descriptor fails the start, saying to import the config's module
+  files first, where it failed as an export that is not a function before.

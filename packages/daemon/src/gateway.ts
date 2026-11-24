@@ -923,6 +923,11 @@ export class Gateway {
     // ingress, so their tools and commands are assembled with the kernel's. Their kernel context is
     // late-bound: it works once the gateway exists.
     const registry = o.moduleRegistry ?? builtinModules;
+    // A `modules` entry's module runs only when it was imported before the config was resolved, into the registry given here.
+    for (const [i, e] of (o.config.moduleEntries ?? []).entries()) {
+      if (!registry.fromEntry(e))
+        throw new ConfigError(`modules[${i}] (module ${e.module}) is not loaded: import the config's modules before resolving it (loadConfigModules, as aio serve does) and give loadConfig and Gateway.start the registries it returns`);
+    }
     const defaults = o.config.modules === undefined ? builtinDefaults(registry) : undefined;
     const modules = new ModuleHost({
       registry,
@@ -1264,16 +1269,28 @@ export class Gateway {
   private async loadHarnessModules(): Promise<void> {
     if (this.o.harness || this.o.buildHarness) return;
     const c = this.o.config;
+    // The commands the modules' descriptors add to the CLI (`HarnessModule.cli`): each name one's, none a registered kind's.
+    const commands = new Map<string, { instance: string; run: unknown }>();
     for (const inst of Object.values(c.harnesses)) {
       if (inst.kind !== 'module' || inst.unavailable) continue;
+      const launch = inst.launch as ModuleLaunch;
       const adapter = await loadHarnessModule({
         name: inst.name,
-        module: inst.launch as ModuleLaunch,
+        module: launch,
         log: this.instanceLog(inst.name),
         harness: (name) => this.otherInstance(name),
         blobs: this.harnessBlobs,
         env: inst.env,
         profiles: inst.profiles,
+        commands: (cli) => {
+          for (const [name, run] of Object.entries(cli)) {
+            const where = `harnesses.${inst.name} (module ${launch.file}): cli ${JSON.stringify(name)}`;
+            if (this.harnessRegistry.cliCommand(name)) throw new Error(`${where}: a registered harness kind adds it too`);
+            const other = commands.get(name);
+            if (other && other.run !== run) throw new Error(`${where}: harnesses.${other.instance} adds it too`);
+            commands.set(name, { instance: inst.name, run });
+          }
+        },
       }).catch((e: Error) => {
         throw new ConfigError(e.message);
       });
@@ -3682,6 +3699,8 @@ ${a.summary}` }],
         dir: join(this.o.config.dataDir, 'tui'),
         // A helper the terminal starts runs as this CLI (`aio <command>`, a kind's `HarnessModule.cli`), next to this module in dist/.
         cli: fileURLToPath(new URL('./cli.js', import.meta.url)),
+        // Where the CLI finds a `use: "module"` instance's commands (its descriptor's `cli`).
+        ...(this.o.config.source?.path ? { config: this.o.config.source.path } : {}),
         fileOf: (ref) => this.blobs.stat(ref),
         onEnd: (reason) => {
           if (!hold) endedEarly = reason;

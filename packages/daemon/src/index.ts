@@ -1,7 +1,9 @@
 export * from './config.js';
+export * from './config-modules.js';
 export * from './harness-registry.js';
 export * from './channel-registry.js';
 export * from './modules.js';
+export { ChannelModuleFiles, moduleChannelType, type ModuleChannelEntry } from './module-channel.js';
 export * from './core.js';
 export * from './bundle.js';
 export * from './gateway.js';

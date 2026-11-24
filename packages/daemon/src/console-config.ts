@@ -1,13 +1,13 @@
 import { createHash } from 'node:crypto';
 import { chmodSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import type { TSchema } from '@sinclair/typebox';
 import { Value } from '@sinclair/typebox/value';
 import { ADMIN_REDACTED, type AdminConfigDocument, type AdminConfigPutResult, type AdminConfigValidation, type ChannelModule, type ConfigAccess, type ConfigIssue } from '@agents-io/protocol';
 import { builtinChannels, builtinHarnesses, builtinModules } from './bundle.js';
 import type { ChannelRegistry } from './channel-registry.js';
 import { ConfigError, configFileSchema, findEnvFile, resolveConfig, type Config } from './config.js';
 import { loadEnvFile } from './env-file.js';
+import { credentialMark } from './schema-marks.js';
 import type { HarnessRegistry } from './harness-registry.js';
 import type { ModuleRegistry } from './modules.js';
 
@@ -52,31 +52,6 @@ type Path = (string | number)[];
 
 /** Codex `config` keys are dotted TOML paths (`mcp_servers.x.env`); split them into segments. */
 const tomlSegs = (k: string) => (k.match(/[A-Za-z0-9_][A-Za-z0-9_-]*|"[^"\\]*"/g) ?? [k]).map((x) => x.replace(/^"|"$/g, ''));
-
-/** The `x-credential` mark (`ChannelModule.entry`). */
-const marked = (s: TSchema | undefined) => (s as { 'x-credential'?: unknown } | undefined)?.['x-credential'] === true;
-
-/**
- * Whether the schema marks the value at `path` under `s` as a credential: a schema marked
- * `x-credential` at the path or above it (a map or array of secrets). Follows object properties,
- * maps (`Type.Record`), array items and every member of a union; a part it cannot follow
- * (`Type.Unknown`, free-form) marks nothing.
- */
-function credentialMark(s: TSchema | undefined, path: readonly string[]): boolean {
-  if (!s) return false;
-  if (marked(s)) return true;
-  const [seg, ...rest] = path;
-  if (seg === undefined) return false;
-  const x = s as { anyOf?: TSchema[]; properties?: Record<string, TSchema>; patternProperties?: Record<string, TSchema>; additionalProperties?: unknown; items?: unknown };
-  if (Array.isArray(x.anyOf)) return x.anyOf.some((m) => credentialMark(m, path));
-  if (x.properties && Object.hasOwn(x.properties, seg)) return credentialMark(x.properties[seg], rest);
-  if (x.patternProperties) {
-    for (const [re, v] of Object.entries(x.patternProperties)) if (new RegExp(re).test(seg)) return credentialMark(v, rest);
-  }
-  if (x.additionalProperties && typeof x.additionalProperties === 'object') return credentialMark(x.additionalProperties as TSchema, rest);
-  if (x.items && typeof x.items === 'object' && !Array.isArray(x.items) && /^\d+$/.test(seg)) return credentialMark(x.items as TSchema, rest);
-  return false;
-}
 
 /**
  * The channel entry `at` is in (below `channels[<i>]`), when its type is registered in `channels`:
@@ -161,6 +136,29 @@ export function envRefs(raw: Json): string[] {
     if (n) out.add(n);
     return undefined;
   });
+  return [...out];
+}
+
+/**
+ * Every variable the document's channel entries read without naming it as `env:NAME`
+ * (`ChannelModule.implicitEnv` of each entry's type, in entry order), each once, none of `skip`.
+ * A type's answer that is no array of strings (or that throws: the document may not validate) gives none.
+ */
+export function implicitEnv(raw: Json, channels: ChannelRegistry = builtinChannels, skip: readonly string[] = []): string[] {
+  const out = new Set<string>();
+  const entries = raw && typeof raw === 'object' ? (raw as { channels?: unknown }).channels : undefined;
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const type = entry && typeof entry === 'object' ? (entry as { type?: unknown }).type : undefined;
+    const m = typeof type === 'string' ? channels.get(type) : undefined;
+    if (!m?.implicitEnv) continue;
+    let names: unknown;
+    try {
+      names = m.implicitEnv(entry);
+    } catch {
+      continue;
+    }
+    for (const n of Array.isArray(names) ? names : []) if (typeof n === 'string' && n && !skip.includes(n)) out.add(n);
+  }
   return [...out];
 }
 
@@ -337,7 +335,11 @@ export class ConfigStore implements ConfigAccess {
       revision,
       config: redact(raw, this.channels) as Record<string, unknown>,
       issues,
-      env: envRefs(raw).map((name) => ({ name, set: env[name] !== undefined })),
+      env: [
+        ...envRefs(raw).map((name) => ({ name, set: env[name] !== undefined })),
+        // What a channel entry reads without an `env:` reference: its type says (`ChannelModule.implicitEnv`).
+        ...implicitEnv(raw, this.channels, envRefs(raw)).map((name) => ({ name, set: env[name] !== undefined, implicit: true })),
+      ],
     };
   }
 

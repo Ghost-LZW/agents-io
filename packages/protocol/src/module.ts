@@ -22,8 +22,9 @@ import type { Watch } from './watch.js';
  * its model tool catalog and its `host.hello` features from its own entries and the active
  * modules' entries; a module that is off is not there at all (no tools, no commands, no
  * features). Built-in modules and a third party's are the same shape; `ModuleOrigin` tells them
- * apart in the host's status. Channel types and harness kinds keep their own contracts
- * (`ChannelModule`, `HarnessModule`).
+ * apart in the host's status. A third party's comes from an embedder's registry or from the
+ * deployment's config file (the daemon's `modules` entries, imported when the daemon starts).
+ * Channel types and harness kinds keep their own contracts (`ChannelModule`, `HarnessModule`).
  *
  * In progress: the daemon reads the manifest (`id`, `kind`, `needs`, `config`, `features`,
  * `mcpTools`, `commands`, `setup`) and, of the instance, `tools`, `offeredTools`, `commands`,
@@ -37,7 +38,11 @@ import type { Watch } from './watch.js';
  * approval (step 4), the owner's run-config commands (step 5) and the external MCP endpoint (step 1).
  */
 
-/** Where a registered module comes from: shipped with the host (`builtin`), or someone else's (`module`). */
+/**
+ * Where a registered module comes from: shipped with the host (`builtin`), or someone else's
+ * (`module`): an embedder's, or one the deployment's config file names (the daemon's `modules`
+ * entries). Both get the same `KernelContext`.
+ */
 export type ModuleOrigin = 'builtin' | 'module';
 
 /** What a module is. Only `feature` for now; channel types and harness kinds register as `ChannelModule` / `HarnessModule`. */
@@ -545,10 +550,12 @@ export interface KernelDatabase {
 /**
  * What a module gets of the kernel: views of the host's core objects, each an existing capability
  * of the host (nothing a built-in feature could not already do). A module is in-process code the
- * composition root (or the embedder) registered, as trusted as the daemon's own (INVARIANTS ID-3
- * boundary 2): the views keep its untyped code to the kernel's rules (what it may stamp, say or
- * set), they are no sandbox. `db` is the whole records database. Late-bound: only `id` and `log`
- * work during `setup`; every other member throws until `setup` returned.
+ * composition root, the embedder or the deployment's config file (the daemon's `modules` entries)
+ * registered, as trusted as the daemon's own (INVARIANTS ID-3 boundary 2), and gets this whatever
+ * its origin: the views keep its untyped code to the kernel's rules (what it may stamp, say or
+ * set: only a peer's origin, never an evidence grant or the policy), they are no sandbox. `db` is
+ * the whole records database. Late-bound: only `id` and `log` work during `setup`; every other
+ * member throws until `setup` returned.
  */
 export interface KernelContext {
   /** The module's id. */
@@ -578,7 +585,10 @@ export interface KernelContext {
   status(): AdminStatus;
   /** The daemon is stopping: start no new work (the module's `stop` comes next). */
   stopping(): boolean;
-  /** The deployment's policy as lanes see it (a connected host's hooks over the local ones). */
+  /**
+   * The deployment's policy as lanes see it (a connected host's hooks over the local ones), frozen:
+   * a module asks it, it never sets it (assigning a hook throws, and changes nothing the lanes use).
+   */
   readonly policy: Policy;
   /** Small values of the module's own, kept across restarts (the host's records, under `module:<id>:`). */
   readonly records: {

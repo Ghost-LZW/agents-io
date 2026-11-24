@@ -80,8 +80,12 @@ export interface HarnessModuleInit<L = unknown> extends HarnessFactoryInit {
  * `createHarness`, or the entry's `export`, or default): `schema`, when given, checks the entry's
  * `config` (an absent one as `{}`; unknown keys are errors) when the module loads, and `create`
  * gets the factory's init with `launch` = that `config`, plus the instance's `env` and `profiles`.
- * Its other members are not used there: the instance's kind stays `module`, and what its adapter
- * declares is read from the adapter.
+ * `declares` is what its adapters declare where they do not say themselves (each member: the
+ * adapter's own value when it has one, else the descriptor's), checked when the module loads like
+ * the adapter's own. `cli` adds commands to the host's CLI as a registered kind's do, found
+ * through the config the CLI is given (`--config`, `$AIO_CONFIG`; `TakeoverServices.config` names
+ * the daemon's); checked when the daemon starts (a name a registered kind or another instance's
+ * module adds too fails it). Its other members are not used there: the instance's kind stays `module`.
  */
 export interface HarnessModule<L = unknown> {
   /** The `use` that selects it, and `HarnessInstance.kind`. Never `module`. */
@@ -139,10 +143,10 @@ export interface HarnessModule<L = unknown> {
   readonly probeAtStart?: boolean;
   /**
    * Commands it adds to the host's CLI, by name (lowercase letters, digits and `-`, starting with a
-   * letter): `aio <name> …` runs it. Only the kinds of the CLI's own bundle are reachable there (it
-   * loads no config to find others); two of them adding the same name is refused when the registry
-   * is built, and the CLI's own commands keep their names. Claude Code: `tui-bridge`, which its
-   * terminal UI starts.
+   * letter): `aio <name> …` runs it. The kinds of the CLI's own bundle are reachable there as they
+   * are; a `use: "module"` instance's descriptor's through the config the CLI is given, after them
+   * (see above). Two registered kinds adding the same name is refused when the registry is built,
+   * and the CLI's own commands keep their names. Claude Code: `tui-bridge`, which its terminal UI starts.
    */
   readonly cli?: Readonly<Record<string, HarnessCliCommand>>;
   /** The adapter of one instance (or of a task run on it, its env joined to the instance's). Starts nothing: its first `probe` or `open` does. */

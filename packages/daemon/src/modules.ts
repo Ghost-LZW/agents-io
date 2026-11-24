@@ -83,7 +83,23 @@ import { TokenError } from './token.js';
 export interface RegisteredModule {
   manifest: ModuleManifest<any>;
   origin: ModuleOrigin;
+  /**
+   * Imported from a config file's `modules` entry (`loadConfigModules`, origin `module`): the
+   * module file and export the entry names. Such a module is part of a config only while its file
+   * has an entry naming them, and its settings are that entry's `config` (its `config.section` and
+   * `aliases` are claimed, never read in the file).
+   */
+  entry?: ModuleEntryRef;
 }
+
+/** A config file's `modules` entry as resolved: the module file (absolute) and the export. */
+export interface ModuleEntryRef {
+  module: string;
+  export?: string;
+}
+
+/** One key for a file and an export (`ModuleEntryRef`). */
+const entryKey = (e: ModuleEntryRef) => JSON.stringify([e.module, e.export ?? null]);
 
 /**
  * Where a module's settings and status were before it was a module (`ModuleRegistryOptions.fields`;
@@ -256,10 +272,13 @@ function fileWith(dotted: string, value: unknown): Record<string, unknown> {
  */
 export class ModuleRegistry {
   private readonly byId = new Map<string, RegisteredModule>();
+  private readonly byEntry = new Map<string, RegisteredModule>();
   /** `ModuleRegistryOptions.fields`, checked. */
   readonly fields: ReadonlyMap<string, ModuleFields>;
+  private readonly options: ModuleRegistryOptions;
 
   constructor(modules: readonly (ModuleManifest<any> | RegisteredModule)[], o: ModuleRegistryOptions = {}) {
+    this.options = o;
     const claims = new Map<string, string>();
     const claim = (what: string, by: string) => {
       const had = claims.get(what);
@@ -273,6 +292,11 @@ export class ModuleRegistry {
       if (typeof m.id !== 'string' || !MODULE_ID.test(m.id)) throw new Error(`module id ${JSON.stringify(m.id)} is not one (lower-case ASCII letters, digits, ., _ and -, starting with a letter or digit)`);
       if (this.byId.has(m.id)) throw new Error(`module ${JSON.stringify(m.id)} is registered twice`);
       if (r.origin !== 'builtin' && r.origin !== 'module') throw new Error(`module ${m.id}: origin must be "builtin" or "module"`);
+      if (r.entry !== undefined) {
+        if (r.origin !== 'module' || typeof r.entry.module !== 'string') throw new Error(`module ${m.id}: one loaded from a config file's modules entry is someone else's (origin module) and names its file`);
+        const other = this.byEntry.get(entryKey(r.entry));
+        if (other) throw new Error(`module ${m.id}: its file and export are module ${other.manifest.id}'s`);
+      }
       const bad = badManifest(m);
       if (bad) throw new Error(`module ${m.id}: ${bad}`);
       if (m.config) {
@@ -282,7 +306,9 @@ export class ModuleRegistry {
       for (const f of m.features ?? []) claim(`feature ${f}`, m.id);
       for (const t of m.mcpTools ?? []) claim(`tool ${t.name}`, m.id);
       for (const c of m.commands ?? []) for (const n of [c.name, ...(c.aliases ?? [])]) claim(`command /${n}`, m.id);
-      this.byId.set(m.id, { manifest: m, origin: r.origin });
+      const reg: RegisteredModule = { manifest: m, origin: r.origin, ...(r.entry ? { entry: { module: r.entry.module, ...(r.entry.export !== undefined ? { export: r.entry.export } : {}) } } : {}) };
+      this.byId.set(m.id, reg);
+      if (reg.entry) this.byEntry.set(entryKey(reg.entry), reg);
     }
     for (const { manifest: m } of this.byId.values()) {
       for (const n of m.needs ?? []) {
@@ -328,6 +354,16 @@ export class ModuleRegistry {
 
   get(id: string): RegisteredModule | undefined {
     return this.byId.get(id);
+  }
+
+  /** The module imported from a config file's `modules` entry naming this file and export, if one is registered. */
+  fromEntry(e: ModuleEntryRef): RegisteredModule | undefined {
+    return this.byEntry.get(entryKey(e));
+  }
+
+  /** A registry of this one's modules followed by `more`, with the same options (`fields`); checked as a new one is. */
+  with(more: readonly RegisteredModule[]): ModuleRegistry {
+    return new ModuleRegistry([...this.modules, ...more], this.options);
   }
 
   /** In registration order. */
@@ -915,6 +951,15 @@ export interface KernelBackend {
   isHostToken(token: string): boolean;
 }
 
+const frozenPolicies = new WeakMap<Policy, Policy>();
+
+/** The policy as a module sees it (`KernelContext.policy`): a frozen copy (its hooks, never a way to replace them). */
+function frozenPolicy(p: Policy): Policy {
+  let f = frozenPolicies.get(p);
+  if (!f) frozenPolicies.set(p, (f = Object.freeze({ ...p })));
+  return f;
+}
+
 /** One module's `KernelContext` over the gateway's backend: its log prefix, its records namespace, its own extra identities. */
 export function kernelContext(id: string, k: KernelBackend): KernelContext {
   const live = (): KernelBackend => {
@@ -939,8 +984,9 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
     },
     status: () => live().status(),
     stopping: () => live().stopping(),
+    // Asked, never set (a module cannot change what the lanes decide with): a frozen view, the same while the policy object is.
     get policy() {
-      return live().policy();
+      return frozenPolicy(live().policy());
     },
     records: {
       get: (name) => live().flag(flag(name)),

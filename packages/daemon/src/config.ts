@@ -28,7 +28,7 @@ import { ConfigError } from './config-error.js';
 import { loadEnvFile } from './env-file.js';
 import type { HarnessRegistry } from './harness-registry.js';
 import { resolveModuleFile } from './module-loader.js';
-import type { ModuleRegistry, ResolvedModule } from './modules.js';
+import type { ModuleEntryRef, ModuleRegistry, RegisteredModule, ResolvedModule } from './modules.js';
 import { KERNEL_TOOL_NAMES } from '@agents-io/host-mcp';
 
 /*
@@ -344,6 +344,26 @@ const AgentEntry = Type.Object(
 );
 
 /**
+ * A `modules` entry: a feature module of someone else's, from an ES module outside this repo.
+ * `module` resolves like a module channel's (relative to the config file, absolute, a package
+ * directory, or a bare specifier); `export` names the `ModuleManifest` (default `manifest`, else
+ * `default`; a named one never falls back); `config` is the module's settings, what a built-in
+ * module's section holds (`enabled` and the keys of its `config.schema`, closed; absent: `{}`).
+ */
+const ModuleFileEntry = Type.Object(
+  {
+    use: Type.Literal('module'),
+    module: Type.String(),
+    export: Type.Optional(Type.String()),
+    config: Type.Optional(Type.Unknown()),
+  },
+  Closed,
+);
+
+/** A `modules` entry as written. */
+export type ModuleFileEntry = Static<typeof ModuleFileEntry>;
+
+/**
  * The config file's own keys (the kernel's) over the built-in harness kinds and channel types:
  * `ConfigFile` without the modules' sections (`configFileSchema` adds a registry's).
  */
@@ -383,6 +403,13 @@ const KernelFile = Type.Object(
     /** Identity map entries (channel identity → principal + labels), next to the ones `policy.owners` makes. */
     identities: Type.Optional(Type.Array(IdentityEntry)),
     channels: Type.Optional(Type.Array(ChannelEntry)),
+    /**
+     * Feature modules of someone else's to load (`ModuleManifest`, `@agents-io/protocol`), each
+     * imported when the daemon starts, before the config is resolved (`loadConfigModules`; `aio
+     * serve` does): `module` resolves like a module channel's, `export` names the manifest (default
+     * `manifest`, else `default`), `config` is its settings (its section, closed).
+     */
+    modules: Type.Optional(Type.Array(ModuleFileEntry)),
     /**
      * Default of every agent's `tools`: mount the host MCP output tools (send_file,
      * ask_choice, mention, reply_to, send_message, watch_*, session_*, live_*…).
@@ -547,8 +574,9 @@ const fileSchemas = new WeakMap<HarnessRegistry, WeakMap<ChannelRegistry, WeakMa
  */
 function moduleSections(modules: ModuleRegistry): Record<string, TSchema> {
   const out: Record<string, TSchema> = {};
-  for (const { manifest: m } of modules.modules) {
-    if (!m.config) continue;
+  for (const { manifest: m, entry } of modules.modules) {
+    // A module a `modules` entry loaded has its settings in the entry (`config`), not in a section.
+    if (!m.config || entry) continue;
     const key = m.config.section;
     if (Object.hasOwn(KernelFile.properties, key)) throw new Error(`module ${m.id}: config section ${JSON.stringify(key)} is one of the config file's own keys`);
     out[key] = Type.Optional(Type.Object({ enabled: Type.Optional(Type.Boolean()), ...m.config.schema }, Closed));
@@ -758,9 +786,14 @@ export interface Config {
   externalMcp?: ExternalMcpConfig;
   /**
    * The registered feature modules, on or off, with their settings (`resolveModules`), in
-   * registration order; absent when the registry has none.
+   * registration order (a module of a `modules` entry where its entry is); absent when there are none.
    */
   modules?: ResolvedModule[];
+  /**
+   * The file's `modules` entries, resolved: the module file and export each names (absent without
+   * `modules`). `Gateway.start` needs each in its module registry (`loadConfigModules` imports them).
+   */
+  moduleEntries?: ModuleEntryRef[];
   /** Where this config came from (loadConfig): the file (it may not exist) and the env file found for it. */
   source?: { path: string; envFile?: string };
 }
@@ -917,7 +950,12 @@ export interface LoadOptions {
   moduleRegistry?: ModuleRegistry;
 }
 
-export function loadConfig(o: LoadOptions = {}): Config {
+/**
+ * The config file `loadConfig` reads (`o.path`, else `$AIO_CONFIG`, else `./aio.config.json`) and
+ * what it holds: `{}` when the default one is missing; a missing explicit one or one that is not
+ * JSON is a config error.
+ */
+export function readConfigFile(o: Pick<LoadOptions, 'path' | 'env' | 'cwd'> = {}): { path: string; raw: unknown } {
   const procEnv = o.env ?? process.env;
   const cwd = o.cwd ?? process.cwd();
   const explicit = o.path ?? procEnv.AIO_CONFIG;
@@ -930,6 +968,13 @@ export function loadConfig(o: LoadOptions = {}): Config {
       throw new ConfigError(`${path}: ${(e as Error).message}`);
     }
   } else if (explicit) throw new ConfigError(`config file not found: ${path}`);
+  return { path, raw };
+}
+
+export function loadConfig(o: LoadOptions = {}): Config {
+  const procEnv = o.env ?? process.env;
+  const cwd = o.cwd ?? process.cwd();
+  const { path, raw } = readConfigFile(o);
   const envPath = findEnvFile({ envFile: o.envFile, configDir: dirname(path), cwd });
   const fileEnv = envPath ? loadEnvFile(envPath) : {};
   const env: Record<string, string | undefined> = { ...fileEnv, ...procEnv };
@@ -963,6 +1008,26 @@ export interface ResolveContext {
   moduleRegistry?: ModuleRegistry;
 }
 
+/** Paths from a config file in `baseDir`: `~` is the home directory, a relative one is relative to `baseDir`. */
+export function configPath(baseDir: string): (p: string) => string {
+  return (p) => {
+    const home = p === '~' || p.startsWith('~/') ? join(homedir(), p.slice(1)) : p;
+    return isAbsolute(home) || home === ':memory:' ? home : resolve(baseDir, home);
+  };
+}
+
+/**
+ * A `modules` entry's file, resolved like a module channel's (`resolveModuleFile`): the entry's
+ * module file (absolute) and export; a missing one fails the config (`modules[<i>].module: …`).
+ */
+export function resolveModuleEntry(e: ModuleFileEntry, index: number, path: (p: string) => string): ModuleEntryRef {
+  const spec = e.module;
+  const rel = spec.startsWith('.') || spec.startsWith('~') || isAbsolute(spec);
+  const r = resolveModuleFile(spec, rel ? path(spec) : undefined, path('.'));
+  if ('error' in r) fail(`modules[${index}].module: ${r.error}`);
+  return { module: r.file, ...(e.export !== undefined ? { export: e.export } : {}) };
+}
+
 /** Validate a parsed config file and fill defaults. Error messages name keys, never values. */
 export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
   const registry = ctx.harnessRegistry ?? builtinHarnesses;
@@ -973,10 +1038,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
   if (errs.length) throw new ConfigError(`invalid config: ${[...errs.slice(0, 5), ...unregistered(raw, schema, registry, channelRegistry)].join('; ')}`);
   const c = raw as ConfigFile;
   const env = ctx.env;
-  const path = (p: string) => {
-    const home = p === '~' || p.startsWith('~/') ? join(homedir(), p.slice(1)) : p;
-    return isAbsolute(home) || home === ':memory:' ? home : resolve(ctx.baseDir, home);
-  };
+  const path = configPath(ctx.baseDir);
 
   const warnings: string[] = [];
   const dataDir = path(c.dataDir ?? join(homedir(), '.agents-io', 'aio'));
@@ -987,9 +1049,13 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
   // Off unless asked for (principle 2, decision 13: the default was true before 2026-10-11).
   const outputTools = c.outputTools ?? false;
   const presets = resolvePresets(c, harnesses);
+  // The modules of this config: the registry's own, then the ones its `modules` entries loaded, where the entries are.
+  const entries = (c.modules ?? []).map((e, i) => resolveModuleEntry(e, i, path));
+  const listed = listedModules(moduleRegistry, c.modules ?? [], entries);
   // Which modules are on now (the tool catalog needs it); their settings resolve last (below).
-  const switches = moduleSwitches(raw as Record<string, unknown>, moduleRegistry);
-  const { agents, defaultAgent } = resolveAgents(c, harnesses, presets, defaultHarness, outputTools, path, registry.configDirKeys(), toolCatalog(moduleRegistry, switches));
+  const switches = moduleSwitches(raw as Record<string, unknown>, listed);
+  const catalog = toolCatalog(listed, switches, entries.some((e) => !moduleRegistry.fromEntry(e)));
+  const { agents, defaultAgent } = resolveAgents(c, harnesses, presets, defaultHarness, outputTools, path, registry.configDirKeys(), catalog);
   const identities = c.identities ?? [];
   const localSession = c.local?.session ?? ownerSessionKey ?? 'local:main';
   const table: BindingTable | undefined = c.bindings ? { version: 'config', bindings: c.bindings, identities: [] } : undefined;
@@ -1061,7 +1127,8 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
   }
   return {
     ...config,
-    ...(moduleRegistry.size ? { modules } : {}),
+    ...(listed.length ? { modules } : {}),
+    ...(c.modules ? { moduleEntries: entries } : {}),
     ...(warnings.length ? { warnings } : {}),
   };
 }
@@ -1128,7 +1195,30 @@ function at(raw: Record<string, unknown>, dotted: string): unknown {
  * Whether each is on is settled first, for all of them; then the ones that are on resolve.
  */
 export function resolveModules(raw: Record<string, unknown>, registry: ModuleRegistry, env: Record<string, string | undefined>, path: (p: string) => string): ResolvedModule[] {
-  return moduleSettings(moduleSwitches(raw, registry), { raw, env, path });
+  const own = (Array.isArray(raw.modules) ? raw.modules : []) as ModuleFileEntry[];
+  return moduleSettings(moduleSwitches(raw, listedModules(registry, own, own.map((e, i) => resolveModuleEntry(e, i, path)))), { raw, env, path });
+}
+
+/** A module of a config: as registered, and for one a `modules` entry loaded, that entry. */
+interface ListedModule {
+  r: RegisteredModule;
+  from?: { index: number; entry: ModuleFileEntry };
+}
+
+/**
+ * The modules of a config, in registration order: the registry's (those no `modules` entry
+ * loaded), then, in file order, the one each entry loaded (a module of the registry an entry
+ * loaded is left out when the file has no entry naming its file and export: the entry was
+ * removed). An entry whose module the registry lacks is not loaded (`resolveConfig` then checks
+ * less of the file: the daemon needs it loaded to start).
+ */
+function listedModules(registry: ModuleRegistry, written: readonly ModuleFileEntry[], entries: readonly ModuleEntryRef[]): ListedModule[] {
+  const out: ListedModule[] = registry.modules.filter((r) => !r.entry).map((r) => ({ r }));
+  entries.forEach((e, index) => {
+    const r = registry.fromEntry(e);
+    if (r) out.push({ r, from: { index, entry: written[index]! } });
+  });
+  return out;
 }
 
 /** A module on or off, and, when on, what its `config.resolve` gets. */
@@ -1141,10 +1231,30 @@ interface ModuleSwitch {
   alias?: string;
 }
 
+const entrySchemas = new WeakMap<ModuleManifest<unknown>, TObject>();
+
+/** What a `modules` entry's `config` is checked against: `enabled` and the module's own keys (`config.schema`), closed. */
+function entryConfigSchema(m: ModuleManifest<unknown>): TObject {
+  let s = entrySchemas.get(m);
+  if (!s) entrySchemas.set(m, (s = Type.Object({ enabled: Type.Optional(Type.Boolean()), ...(m.config?.schema ?? {}) }, Closed)));
+  return s;
+}
+
 /** `resolveModules`, first half: every module on or off (and the `needs` between them). */
-function moduleSwitches(raw: Record<string, unknown>, registry: ModuleRegistry): ModuleSwitch[] {
+function moduleSwitches(raw: Record<string, unknown>, listed: readonly ListedModule[]): ModuleSwitch[] {
   const out: ModuleSwitch[] = [];
-  for (const { manifest: m } of registry.modules) {
+  for (const { r, from } of listed) {
+    const m = r.manifest as ModuleManifest<unknown>;
+    if (from) {
+      // A module a `modules` entry loaded: the entry is its section (on unless `enabled: false`).
+      const config = from.entry.config ?? {};
+      const where = `modules[${from.index}].config`;
+      const errs = errors(entryConfigSchema(m), config);
+      if (errs.length) fail(`invalid config: ${errs.slice(0, 5).map((e) => `${where}${e}`).join('; ')}`);
+      const { enabled: on, ...rest } = config as Record<string, unknown>;
+      out.push(on === false ? { m, id: m.id, enabled: false } : { m, id: m.id, enabled: true, value: rest, where });
+      continue;
+    }
     const cfg = m.config;
     if (!cfg) {
       out.push({ m, id: m.id, enabled: true });
@@ -1177,7 +1287,8 @@ function moduleSwitches(raw: Record<string, unknown>, registry: ModuleRegistry):
     out.push(enabled ? { m, id: m.id, enabled, value, where, ...(alias !== undefined ? { alias } : {}) } : { m, id: m.id, enabled });
   }
   const on = new Set(out.filter((x) => x.enabled).map((x) => x.id));
-  for (const { manifest: m } of registry.modules) {
+  for (const { r } of listed) {
+    const m = r.manifest;
     if (!on.has(m.id)) continue;
     for (const n of m.needs ?? []) if (n.startsWith('module:') && !on.has(n.slice('module:'.length))) fail(`module ${m.id} needs module ${n.slice('module:'.length)}, which is off`);
   }
@@ -1188,6 +1299,7 @@ function moduleSwitches(raw: Record<string, unknown>, registry: ModuleRegistry):
 function moduleSettings(switches: readonly ModuleSwitch[], o: { raw: Record<string, unknown>; env: Record<string, string | undefined>; path: (p: string) => string }): ResolvedModule[] {
   return switches.map((x): ResolvedModule => {
     if (!x.enabled) return { id: x.id, enabled: false };
+    // A module without settings (one a `modules` entry loaded too: its `config` may hold only `enabled`).
     if (!x.m.config) return { id: x.id, enabled: true };
     const config = x.m.config.resolve(x.value, {
       where: x.where!,
@@ -1210,14 +1322,16 @@ interface ToolCatalog {
   names: readonly string[];
   /** A tool of a registered module that is off → that module. */
   off: ReadonlyMap<string, string>;
+  /** A `modules` entry is not loaded: its module's tools are unknown here, so a name not in `names` is taken as written (the daemon's start, which loads it, checks). */
+  open?: boolean;
 }
 
-function toolCatalog(registry: ModuleRegistry, modules: readonly { id: string; enabled: boolean }[]): ToolCatalog {
+function toolCatalog(listed: readonly ListedModule[], modules: readonly { id: string; enabled: boolean }[], open = false): ToolCatalog {
   const on = new Set(modules.filter((x) => x.enabled).map((x) => x.id));
   const names: string[] = [...KERNEL_TOOL_NAMES];
   const off = new Map<string, string>();
-  for (const { manifest: m } of registry.modules) for (const t of m.mcpTools ?? []) (on.has(m.id) ? names.push(t.name) : off.set(t.name, m.id));
-  return { names, off };
+  for (const { r } of listed) for (const t of r.manifest.mcpTools ?? []) (on.has(r.manifest.id) ? names.push(t.name) : off.set(t.name, r.manifest.id));
+  return { names, off, ...(open ? { open } : {}) };
 }
 
 /** The synthesized agent of a config without `agents`: the default instance, bare route-key sessions. */
@@ -1282,7 +1396,7 @@ function resolveAgents(
     const sessionParams = a.sessionParams && resolveSessionParams(a.sessionParams, `${where}.sessionParams`, a.mode ?? 'interactive', path, configDirKeys);
     let toolNames: string[] | undefined;
     if (Array.isArray(a.tools)) {
-      const unknown = a.tools.filter((t) => !catalog.names.includes(t) && !catalog.off.has(t));
+      const unknown = catalog.open ? [] : a.tools.filter((t) => !catalog.names.includes(t) && !catalog.off.has(t));
       if (unknown.length) fail(`${where}.tools: unknown tool ${unknown.map((t) => JSON.stringify(t)).join(', ')} (tools: ${catalog.names.join(', ')})`);
       const off = a.tools.find((t) => catalog.off.has(t));
       if (off !== undefined) fail(`${where}.tools: ${JSON.stringify(off)} is a tool of module ${catalog.off.get(off)}, which is off`);
