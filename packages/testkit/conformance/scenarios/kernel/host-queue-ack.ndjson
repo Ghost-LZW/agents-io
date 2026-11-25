@@ -1,0 +1,22 @@
+{"scenario":"host-queue-ack","description":"The host inbound queue keeps what the host has not acked: reads do not move the cursor, an ack does, and the rest is there after a restart.","invariants":["HQ-1"]}
+{"note":"A host table sends the channel's messages with the keyword xwo to the host; the host keeps them queued while it is away (onHostDown keep)."}
+{"emit":{"end":"host","conn":"admin","frame":{"type":"bindings.put","id":"b1","table":{"version":"q1","bindings":[{"id":"to-host","match":{"channel":"fake","keywords":["xwo"]},"on":"host"}],"identities":[],"onHostDown":"keep"}}}}
+{"expect":{"end":"host","conn":"admin","match":{"type":"result","id":"b1","ok":true}}}
+{"emit":{"end":"channel","frame":{"type":"inbound","envelope":{"id":"p1","sender":{"channelUserId":"alice","evidence":"platform_signed"},"text":"xwo a"}}}}
+{"expect":{"end":"channel","match":{"type":"result","ok":true}}}
+{"emit":{"end":"channel","frame":{"type":"inbound","envelope":{"id":"p2","sender":{"channelUserId":"alice","evidence":"platform_signed"},"text":"xwo b"}}}}
+{"expect":{"end":"channel","match":{"type":"result","ok":true}}}
+{"note":"Reading twice gives both items twice: a read does not move the consumer's cursor."}
+{"emit":{"end":"host","conn":"tail","frame":{"type":"inbound.read","id":"r1","consumer":"xwo"}}}
+{"expect":{"end":"host","conn":"tail","match":{"type":"result","id":"r1","ok":true,"value":{"items":[{"channelRef":"channel:fake/p1","cursor":"<$c1>"},{"channelRef":"channel:fake/p2","cursor":"<$c2>"}]}}}}
+{"emit":{"end":"host","conn":"tail","frame":{"type":"inbound.read","id":"r2","consumer":"xwo"}}}
+{"expect":{"end":"host","conn":"tail","match":{"type":"result","id":"r2","ok":true,"value":{"items":[{"channelRef":"channel:fake/p1","cursor":"<$c1>"},{"channelRef":"channel:fake/p2","cursor":"<$c2>"}]}}}}
+{"note":"An ack moves it: the next read starts after the acked item."}
+{"emit":{"end":"host","conn":"tail","frame":{"type":"inbound.ack","id":"a1","consumer":"xwo","cursor":"<$c1>"}}}
+{"expect":{"end":"host","conn":"tail","match":{"type":"result","id":"a1","ok":true,"value":{"consumer":"xwo","acked":"<$c1>"}}}}
+{"emit":{"end":"host","conn":"tail","frame":{"type":"inbound.read","id":"r3","consumer":"xwo"}}}
+{"expect":{"end":"host","conn":"tail","match":{"type":"result","id":"r3","ok":true,"value":{"items":[{"channelRef":"channel:fake/p2","cursor":"<$c2>"}]}}}}
+{"fault":{"restart":true}}
+{"note":"After a restart: the ack is kept and the unacked item is still there, with its cursor."}
+{"emit":{"end":"host","conn":"tail","frame":{"type":"inbound.read","id":"r4","consumer":"xwo"}}}
+{"expect":{"end":"host","conn":"tail","match":{"type":"result","id":"r4","ok":true,"value":{"acked":"<$c1>","items":[{"channelRef":"channel:fake/p2","cursor":"<$c2>"}]}}}}

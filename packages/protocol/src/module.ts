@@ -27,8 +27,8 @@ import type { Watch } from './watch.js';
  * Channel types and harness kinds keep their own contracts (`ChannelModule`, `HarnessModule`).
  *
  * In progress: the daemon reads the manifest (`id`, `kind`, `needs`, `config`, `features`,
- * `mcpTools`, `commands`, `runDefaults`, `setup`) and, of the instance, `tools`, `offeredTools`, `commands`,
- * `features`, `status`, `start`, `stop` and the hooks `onTurnCompleted`, `inputHint`, `onUndispatched`,
+ * `mcpTools`, `commands`, `runDefaults`, `cli`, `setup`) and, of the instance, `tools`, `offeredTools`, `commands`,
+ * `features`, `status`, `connect`, `start`, `stop` and the hooks `onTurnCompleted`, `inputHint`, `onUndispatched`,
  * `onAction`, `resolver`, `identities`, `statusLines`, `scheduledMessage` and `scheduledWake`. `admin`, the other `hooks` and
  * `localFrames` were sketched for the Claude Code terminal (G6 step 6), which became a harness
  * capability instead (`HarnessAdapter.takeover`); they are served when a module needs them. Until
@@ -36,7 +36,8 @@ import type { Watch } from './watch.js';
  * (`hooks.<name>`, `localFrames`), naming it, rather than being silently ignored. The built-in
  * modules are the topic titles (step 2), the watch, live and topic tools (step 3), the stranger
  * approval (step 4), the presets (named run defaults: `runDefaults`), the owner's run-config
- * commands (step 5) and the external MCP endpoint (step 1).
+ * commands (step 5), the north projections (G9: the ACP server with its `aio acp`, and the AG-UI
+ * endpoint) and the external MCP endpoint (step 1).
  */
 
 /**
@@ -401,6 +402,57 @@ export interface ModuleHooks {
   identities?(): IdentityEntry[];
 }
 
+/**
+ * A local socket connection a module took (`ModuleInstance.connect`): from the frame's answer on,
+ * it carries the module's own protocol as JSON values both ways (one per line on the Unix socket,
+ * one per message on the console's `/ws`), until either end closes it or the daemon stops.
+ */
+export interface ModuleConnection {
+  /** Write one JSON value. False when the connection is gone, or its buffer is full (then wait for `drained`). */
+  send(value: unknown): boolean;
+  /** Resolves when writing may go on, or once the connection is gone. */
+  drained(): Promise<void>;
+  /**
+   * Hear the values the far end writes, in order (one listener; values that came before it was set
+   * are kept for it). A line that is not JSON is dropped.
+   */
+  onValue(fn: (value: unknown) => void): void;
+  /** Aborted when the connection is gone: either end closed it, or the daemon stops. */
+  readonly signal: AbortSignal;
+  /** Close it after what was written is flushed. */
+  close(): void;
+}
+
+/**
+ * A command a feature module adds to the host's CLI (`ModuleManifest.cli`): `aio <name> [options]
+ * [positionals]`. The CLI parses the options (its common `--config`, `--env-file`, `--socket` and
+ * the command's own `options`; anything else is a usage error, exit 2) and calls `run`, whose answer
+ * is the exit code.
+ */
+export interface ModuleCliCommand {
+  /** What follows `aio <name>` in the CLI's help: its options, and in a few words what it does. */
+  readonly usage: string;
+  /** Its own options (long names: lower-case letters, digits and `-`), a string value or a flag. */
+  readonly options?: Readonly<Record<string, 'string' | 'boolean'>>;
+  run(a: ModuleCliArgs): Promise<number>;
+}
+
+/** What a module's CLI command gets (`ModuleCliCommand.run`). */
+export interface ModuleCliArgs {
+  /** The options given (the common ones too), by long name. */
+  readonly options: Readonly<Record<string, string | boolean | undefined>>;
+  /** What follows the options. */
+  readonly positionals: readonly string[];
+  /** The process's environment. */
+  readonly env: Readonly<Record<string, string | undefined>>;
+  /**
+   * The daemon's local socket: `--socket`, else `$AIO_SOCKET`, else the config's `socketPath`
+   * (reading the config: `--config`, `$AIO_CONFIG`, `./aio.config.json`; a config that does not
+   * load throws, which the CLI reports as a usage error).
+   */
+  socket(): string;
+}
+
 /** A local socket frame a module answers (`tui.attach`); not served yet. */
 export type ModuleFrameHandler = (frame: Record<string, unknown>, from: { origin: Origin; host: boolean }) => Promise<KernelOutcome>;
 
@@ -430,6 +482,17 @@ export interface ModuleInstance {
   features?(): readonly string[];
   /** What the host's status (`GET /api/status` `modules[]`) shows of it; plain JSON (undefined: nothing). */
   status?(): unknown;
+  /**
+   * A local socket connection asks to be the module's (the client frame `module.connect` naming its
+   * id; `hello` as the far end sent it, unchecked JSON): answer `{ ok: true, value }` to take it
+   * (the frame's result carries `value`, and from then on the connection is `conn`), or
+   * `{ ok: false, code, message }` to leave it a client connection (`conn` unused). A throw is
+   * answered `internal`. Who may take a connection is the module's to check: anyone who can open
+   * the socket may ask (the local user, SE-2), so a module stamps nothing on its word alone. Asked
+   * from the modules' `start` until their `stop`; a connection that said `host.hello` or subscribed
+   * is refused before (`forbidden`). The daemon closes the module's connections when it stops.
+   */
+  connect?(hello: unknown, conn: ModuleConnection): Promise<KernelOutcome> | KernelOutcome;
   /** After the host's channels and local socket run; throwing fails the start. */
   start?(): Promise<void>;
   /** When the host stops, in reverse registration order, before its channels and lanes; bounded by the host. */
@@ -460,6 +523,16 @@ export interface ModuleManifest<C = unknown> {
   readonly commands?: readonly ModuleCommandDef[];
   /** Admin routes and console settings (G5's `AdminContribution`); not served for feature modules yet. */
   readonly admin?: AdminContribution;
+  /**
+   * Commands it adds to the host's CLI, by name (lower-case letters, digits and `-`, starting with a
+   * letter): `aio <name> …` runs it in its own process (no instance, no kernel: it reaches the daemon
+   * through its socket). A registered module's whether or not it is on (a command that needs it
+   * running says so when the daemon answers); the CLI's own commands and the registered harness
+   * kinds' keep their names, two modules adding the same name fail the registration, and a
+   * `use: "module"` harness adding a feature module's name fails the daemon's start (and the CLI
+   * refuses the command, exit 2) instead of one shadowing the other. The ACP server: `acp`.
+   */
+  readonly cli?: Readonly<Record<string, ModuleCliCommand>>;
   /**
    * Build the instance, before the host builds its ingress (the host assembles the handlers
    * first); `config` is what `config.resolve` returned (undefined without a section). The kernel
@@ -603,6 +676,14 @@ export interface KernelDatabase {
   prepare(sql: string): KernelStatement;
 }
 
+/** A module's subscription to a session's events (`KernelContext.subscribe`). */
+export interface KernelSubscription extends AsyncIterable<SessionEvent> {
+  /** Live ephemeral events lost because the module read too slowly (durable ones are re-read, never lost). */
+  readonly dropped: number;
+  /** End it: the iteration ends. */
+  close(): void;
+}
+
 /**
  * What a module gets of the kernel: views of the host's core objects, each an existing capability
  * of the host (nothing a built-in feature could not already do). A module is in-process code the
@@ -622,6 +703,25 @@ export interface KernelContext {
   events(sessionKey: string, fromSeq?: number): SessionEvent[];
   /** The seq of a session's last logged event (0: none yet). */
   head(sessionKey: string): number;
+  /**
+   * A session's events as they come (the hub, tier `full`, default visibility: never `internal`):
+   * without `fromSeq`, a `session.snapshot` event first (`snapshot`: the folded `SessionSnapshot`,
+   * its seq the last one folded in) and everything after it; with it, the durable events after `fromSeq` from the log, then live ones (a `fromSeq`
+   * behind the log's floor or ahead of its head: a snapshot first, LN-10). Live ephemeral events
+   * (text deltas, progress) come too, and a module that reads too slowly loses only those
+   * (`dropped`); durable ones are re-read from the log, never lost. What it reads is everything
+   * the log has: a module that shows it to someone outside the daemon applies what they may see
+   * (U20's `withholding` for an external reader, DL-7). Close it when done.
+   */
+  subscribe(sessionKey: string, o?: { fromSeq?: number }): KernelSubscription;
+  /**
+   * The host's blob store, to put media a module's client sends (an image in a prompt) where
+   * inputs point at it (`ContentBlock.ref`): content-addressed, at most the store's limit (a larger
+   * one rejects, nothing written). Write only: a module reads no blob through here.
+   */
+  readonly blobs: {
+    put(bytes: Uint8Array, meta: { mime: string; name?: string }): Promise<string>;
+  };
   /**
    * Append a durable native event (`body: { t: "native", name }`, `native` its payload) to a log of
    * the module's own: what it did that no session's log records (the external MCP endpoint's
@@ -835,6 +935,15 @@ export interface KernelContext {
      * Throws an error with a `code` when the session cannot open (its agent is gone).
      */
     input(sessionKey: string, input: InputRecord, mode?: 'queue' | 'steer' | 'interrupt'): Promise<KernelInputResult>;
+    /**
+     * Take inputs a peer queued in a session back out of its queue before a turn takes them (a
+     * prompt its client cancelled): recorded as `input.cancelled` with reason `withdrawn`, never
+     * read by the agent. Only those of `inputIds` still queued whose origin is a peer's with
+     * `origin`'s principal (CT-1: a caller cancels only what it queued itself); `origin` as for
+     * `input` (any other kind, an owner-labelled principal and one of the owners reject). The ids
+     * taken out: none when no lane is open, or a turn took them already.
+     */
+    withdraw(sessionKey: string, inputIds: string[], origin: Origin): Promise<string[]>;
     /**
      * What the module may run beside the open lane of a configured agent's session: an ephemeral
      * turn on the harness one of its turns ran on (topic titles). Undefined when no lane is open

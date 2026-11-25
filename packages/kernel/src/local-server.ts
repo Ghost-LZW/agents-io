@@ -2,7 +2,7 @@ import { chmodSync, lstatSync, mkdirSync, statSync, unlinkSync, type Stats } fro
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { FrameDecoder, HOST_REQUEST_FRAME_TYPES, HostRequestFrame, PROTOCOL_VERSION, check, encodeFrame, errors, type Origin, type ResultFrame, type Topic, type TopicSwitchFrame, type Watch, type WatchDraft } from '@agents-io/protocol';
+import { FrameDecoder, HOST_REQUEST_FRAME_TYPES, HostRequestFrame, PROTOCOL_VERSION, check, encodeFrame, errors, type ModuleConnection, type Origin, type ResultFrame, type Topic, type TopicSwitchFrame, type Watch, type WatchDraft } from '@agents-io/protocol';
 import type { AddWatchResult, RemoveWatchResult } from '@agents-io/session';
 import type { Hub, Subscription } from '@agents-io/session';
 import type { OpFrame, OpOutcome } from './client-ops.js';
@@ -53,6 +53,12 @@ export interface LocalHost {
    * a retry gets the first answer. Without it `opId` is ignored like any unknown field.
    */
   clientOp?(f: OpFrame, origin: Origin): Promise<OpOutcome>;
+  /**
+   * `module.connect`: hand the connection to the running feature module `module`
+   * (`ModuleInstance.connect`); accepted, every later value on it is the module's. Without it the
+   * frame is answered `unsupported`.
+   */
+  moduleConnect?(module: string, hello: unknown, conn: ModuleConnection): Promise<Outcome>;
 }
 
 const HOST_TYPES = new Set<string>(HOST_REQUEST_FRAME_TYPES);
@@ -93,9 +99,16 @@ export class LocalServer {
     }
     const server = createServer((socket) => {
       const c = new FrameConn(socketTransport(socket), this.host, () => this.conns.delete(c));
-      const decoder = new FrameDecoder(() => c.send({ v: PROTOCOL_VERSION, type: 'result', id: '', ok: false, error: { code: 'bad_json', message: 'line is not JSON' } }));
-      socket.on('data', (chunk) => {
-        for (const raw of decoder.push(chunk)) c.receive(raw);
+      const decoder = new FrameDecoder(() => c.badLine('line is not JSON'));
+      socket.on('data', (chunk: Buffer) => {
+        // Line by line (a newline byte is never inside a UTF-8 character): a bad line is answered
+        // in its place, after the lines before it (a `module.connect` among them takes what follows).
+        let start = 0;
+        for (let nl = chunk.indexOf(10); nl >= 0; nl = chunk.indexOf(10, start)) {
+          for (const raw of decoder.push(chunk.subarray(start, nl + 1))) c.receive(raw);
+          start = nl + 1;
+        }
+        if (start < chunk.length) for (const raw of decoder.push(chunk.subarray(start))) c.receive(raw);
       });
       socket.on('close', () => c.drop());
       socket.on('error', () => c.drop());
@@ -217,6 +230,10 @@ export class FrameConn implements Peer {
   /** Requests this side sent (inbound pushes, callouts), by id. */
   private readonly pending = new Map<string, (r: ResultFrame) => void>();
   private closed = false;
+  /** Set once a feature module took the connection (`module.connect`): every value from the far end is its. */
+  private taken: ((value: unknown) => void) | undefined;
+  /** While a `module.connect` is being answered: what came meanwhile, in order (the module's if it takes the connection, else frames). */
+  private connecting: unknown[] | undefined;
 
   constructor(
     private readonly transport: FrameTransport,
@@ -230,7 +247,15 @@ export class FrameConn implements Peer {
     // A connection ended (replaced by a host takeover, or closing) acts on nothing more:
     // a half-closed socket or a /ws in its close grace can still deliver frames.
     if (this.closed) return;
+    if (this.taken) return this.taken(raw);
+    if (this.connecting) return void this.connecting.push(raw);
     void this.onFrame(raw);
+  }
+
+  /** A line that is not JSON: answered `bad_json`, unless a module took the connection (its protocol has no such frame: dropped). */
+  badLine(message: string): void {
+    if (this.taken || this.connecting) return;
+    this.send({ v: PROTOCOL_VERSION, type: 'result', id: '', ok: false, error: { code: 'bad_json', message } });
   }
 
   get signal(): AbortSignal {
@@ -299,6 +324,7 @@ export class FrameConn implements Peer {
     }
     const f: ClientFrame = p.frame;
     if (f.type === 'sessions') return this.result(f.id, { ok: true, value: this.host.sessions() });
+    if (f.type === 'module.connect') return this.onModuleConnect(f);
     const op = this.opFrame(f);
     if (op) return this.onOp(op);
     try {
@@ -348,6 +374,54 @@ export class FrameConn implements Peer {
     } catch (e) {
       this.result(f.id, { ok: false, code: 'internal', message: (e as Error).message });
     }
+  }
+
+  /**
+   * `module.connect`: the running module answers; accepted, the connection is its from here on (its
+   * values both ways, no frames). What the module writes before the answer is sent after it; what the
+   * far end writes before it is the module's once it took the connection, else read as frames.
+   */
+  private async onModuleConnect(f: Extract<ClientFrame, { type: 'module.connect' }>): Promise<void> {
+    if (!this.host.moduleConnect) return this.result(f.id, { ok: false, code: 'unsupported', message: 'module.connect is not supported by this server' });
+    if (this.auth || this.subs.size || this.connecting) return this.result(f.id, { ok: false, code: 'forbidden', message: 'module.connect is for a connection that has not said host.hello, has no subscription and is not connecting already' });
+    const early: unknown[] = [];
+    this.connecting = early;
+    let listener: ((value: unknown) => void) | undefined;
+    const kept: unknown[] = [];
+    /** Writes before the answer went out (the result frame comes first). */
+    let held: unknown[] | undefined = [];
+    const conn: ModuleConnection = {
+      send: (v) => {
+        if (this.closed || this.transport.gone) return false;
+        if (held) return held.push(v), true;
+        return this.transport.write(v as Record<string, unknown>);
+      },
+      drained: () => (this.closed || this.transport.gone ? Promise.resolve() : this.transport.drained()),
+      onValue: (fn) => {
+        listener = fn;
+        for (const v of kept.splice(0)) fn(v);
+      },
+      signal: this.ac.signal,
+      close: () => this.end('closed by the module'),
+    };
+    let o: Outcome;
+    try {
+      o = await this.host.moduleConnect(f.module, f.hello, conn);
+    } catch (e) {
+      o = { ok: false, code: 'internal', message: (e as Error).message };
+    }
+    this.connecting = undefined;
+    if (o.ok && !this.closed) {
+      this.taken = (v) => (listener ? listener(v) : void kept.push(v));
+      this.result(f.id, o);
+      for (const v of held) this.transport.write(v as Record<string, unknown>);
+      held = undefined;
+      for (const v of early) this.taken(v);
+      return;
+    }
+    held = undefined;
+    this.result(f.id, o);
+    for (const v of early) void this.onFrame(v);
   }
 
   private subscribe(cmd: Extract<ClientCommand, { type: 'subscribe' }>): Outcome {

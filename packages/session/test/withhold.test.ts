@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { SessionEvent } from '@agents-io/protocol';
-import { withholding } from '../src/withhold.js';
+import { withholding, withholdingFold } from '../src/withhold.js';
 
 /*
  * U20 (docs/HOSTS.md §4.1a): what an external reader does not see of a checked turn before its answer,
@@ -275,5 +275,37 @@ describe('withholding the agent\'s session_rotate (its title and summary) from e
     expect(held[1]!.withheld).toBe('held');
     expect(withholding(newTopic('allowed')).none).toBe(true);
     expect(JSON.stringify(read(newTopic('allowed')))).toContain(SECRET);
+  });
+});
+
+describe('withholding folded as the log grows (a reader\'s live view)', () => {
+  it('asked between pushes, a fold answers at every point as a fold of the log up to there: what it was asked before changes nothing later #DL-7', () => {
+    const logs = [
+      turn(),
+      turn([settled('question', 'delivered', { requestId: 'r1' }), settled('reply', 'delivered')]),
+      turn([settled('question', 'held', { requestId: 'r1' }), settled('reply', 'delivered')]),
+      turn([settled('reply', 'held', { reason: 'x' })]),
+      log([
+        { turnId: 't1', body: { t: 'turn.started', turnId: 't1', inputIds: ['i1'], replyRoute: OPS, checked: false } },
+        { turnId: 't1', body: { t: 'turn.delivery_added', turnId: 't1', route: G1, reason: 'steer', checked: true } },
+        { turnId: 't1', itemId: 'q1', body: { t: 'item.started', item: { itemId: 'q1', type: 'tool', title: 'q', status: 'running' } } },
+        { turnId: 't1', itemId: 'q1', body: { t: 'request.opened', requestId: 'r1', kind: 'question', title: 'q?', risk: {}, allowedDecisions: ['answer'], allowAlways: false, defaultDeny: true } },
+        { turnId: 't1', body: { t: 'delivery.settled', operationId: 'q-g1', route: G1, result: 'delivered', kind: 'question', requestId: 'r1', turnId: 't1' } },
+        { turnId: 't1', body: { t: 'turn.completed', turnId: 't1', status: 'completed' } },
+        { turnId: 't1', body: { t: 'delivery.settled', operationId: 'a', route: G1, result: 'delivered', kind: 'reply', turnId: 't1' } },
+      ]),
+    ];
+    for (const events of logs) {
+      const fold = withholdingFold();
+      for (let n = 1; n <= events.length; n++) {
+        fold.push(events[n - 1]!);
+        const fresh = withholding(events.slice(0, n));
+        expect(fold.none).toBe(fresh.none);
+        for (const e of events.map((x) => structuredClone(x))) {
+          expect(fold.of(e)).toBe(fresh.of(e));
+          expect(fold.apply(e, view(e))).toEqual(fresh.apply(e, view(e)));
+        }
+      }
+    }
   });
 });

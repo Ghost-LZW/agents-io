@@ -257,6 +257,8 @@
 - **2026-11-25（core-slimming：预设成为功能模块）**：预设（`presets`、`agents.<n>.preset`、`run.start` 的 `overrides.preset`、`/preset`）是内建功能模块 `presets`（`@agents-io/daemon` 的 `bundle.ts` 注册，排在 `strangers` 之后、`owner-commands` 之前），注册了就开着：配置段 `presets` 的键、形状、位置和错误文字，`run.start` 的 `overrides.preset`（§4、INVARIANTS RN-2，`bad_override` 的文字不变）、`/preset` 的列表与回复（CT-2）、会话上设过的预设都与原来一样；帧与字段不变。线上可见的只有：`GET /api/status` 的 `modules` 多了 `{ id: "presets", origin: "builtin", enabled: true }`。嵌入方：内核经新的接缝 `ModuleManifest.runDefaults`（`ModuleRunDefaults`、`NamedRunDefaults`，`@agents-io/protocol`）问提供预设的模块（至多一个），不读它的段；`ModuleConfig` 多了可选的 `entries`（段是名字到条目的映射，没有 `enabled`），`ModuleResolveContext` 多了 `harnesses`（配置了的实例名），`ModuleFields` 多了 `sectionAfter`；`@agents-io/daemon` 新增 `presetsModule` 所在的 `src/presets.ts`（`PresetConfig`、`PresetsConfig`、`PresetsSection`、`DEFAULT_PRESET` 改由 `bundle.ts` 导出，包的导出名不变）、`NamedRuns`（`src/run-defaults.ts`，`Gateway.namedRuns`）、`ModuleHost.runDefaults`；`resolveModules` 多了可选的第五个参数 `harnesses`。`Config.presets` 改为可选、已弃用（保留一个版本：与 `Config.modules` 里预设模块的设置是同一个对象，在 `Gateway.start` 之前改它照旧算数）。自己给 `Gateway.start` 注册表的嵌入方要注册 `presets` 才有预设：没有时配置写了 `agents.<n>.preset` 加载即失败（`agents.<n>.preset: unknown preset "<名>" (no registered module provides presets)`，INVARIANTS CF-4），`overrides.preset` 答 `bad_override`，`/preset` 说没有预设。
 - **2026-11-25（core-slimming：内核成为自己的包）**：线上（帧、字段、配置文件、错误文字、admin HTTP API）不变，`packages/daemon/dist/index.js`、`dist/cli.js`、`aio` 和 JSON Schema 文件都在原处。嵌入方：内核是新包 `@agents-io/kernel`（`packages/kernel`：网关、配置解析、模块宿主与注册表、本地 socket、宿主与客户端协议、记录、控制台的核心部分；不依赖任何通道或 harness 包，也不依赖 `@agents-io/daemon`），`@agents-io/daemon` 是组合根：注册内建的通道类型、harness 种类和功能模块，再导出内核的全部 API，原有的名字、缺省值（不给注册表时是内建的）和类型都不变，另外多导出 `isModuleChannelType`、`moduleChannelModule`、`FIXED_SESSION`、`ephemeralTurn`、`EPHEMERAL_TURN_MS`、`harnessModuleCommands`、`testHooksFromEnv`、`TEST_HOOKS_ENV`。直接用 `@agents-io/kernel` 的嵌入方：不给注册表时是空的（同 `coreRegistries()`），没有 `ConfigFile` 值、`RESERVED_CHANNEL_IDS`、`CONFIG_DIR_KEYS`，`Config` 没有已弃用的 `presets`、`externalMcp` 字段，`ChannelEntry` / `ResolvedChannel` 不按内建类型细分；接管会话的终端（`HarnessAdapter.takeover`）要 `GatewayOptions.cli`（新的可选字段：终端的帮手用哪个 CLI 跑，`@agents-io/daemon` 给它自己的 `aio`），没有时 `tui.attach` 答 `unsupported`。见 `packages/daemon/README.md` 末尾与 `packages/kernel/README.md`。
 - **2026-11-25（core-slimming：控制台成为自己的包，harness 种类也能贡献 admin）**：线上（帧、字段、配置文件、错误文字、admin HTTP API 的路径、状态、答复体与鉴权）不变，`packages/daemon/dist/index.js`、`dist/cli.js`、`aio` 和 JSON Schema 文件都在原处。嵌入方：控制台是新包 `@agents-io/console`（`packages/console`，只依赖 `@agents-io/protocol` 与 `@agents-io/kernel`）：`ConsoleServer`、`ConsoleAuth`、`consoleProof`、`CONSOLE_COOKIE_PREFIX`、`adminEndpoints`、`ConfigStore`、`isCredential`、`redact`、`unredact`、`implicitEnv`、`envRefs`、`writeFileAtomic`、`CredentialMarks` 从内核搬到这里，另有给网关用的 `consoleFactory`；`@agents-io/daemon` 照旧导出这些名字（也再导出控制台包），它的 `Gateway.start` 照旧服务控制台。直接用 `@agents-io/kernel` 的嵌入方：内核没有控制台的类与函数，只留接缝（`ConsoleHost`、`ContributedRoute`、`ConsoleServerOptions`、`ConfigStoreOptions`、`PutOutcome` 照旧，新增 `ConsoleConfigStore`、`ConsoleListener`、`ConsoleFactory`），要控制台就把控制台包的 `consoleFactory` 交给新的可选字段 `GatewayOptions.consoleFactory`；没有它时没有 `configStore`，`console: true` 启动即 `ConfigError`。`HarnessModule.admin`（`@agents-io/protocol`）是新的：harness 种类与通道类型一样贡献 `AdminContribution`（控制台设置、schema、路由、挂载），`HarnessRegistry` 注册时检查与认领，与通道类型的贡献互查；`console` 段里它们的键在通道类型的之后，控制台在通道类型的路由之后服务它们，`adminEndpoints(channels, harnesses)` 列在最后。内建的 harness 种类不贡献。见 `packages/daemon/README.md` 末尾与 `packages/console/README.md`。评审后的修复（2026-11-25）：`type: "module"` 通道文件的描述符贡献的 admin 路由或 schema 与注册了的 harness 种类的重复时，`PUT /api/config`、`POST /api/config/validate` 原先答 500 `internal`，现在与同通道类型重复时一样答 422（问题在 `/channels/<i>`，说出条目）；启动时是说出条目的配置错误（`aio serve` 退出码 2），原先是不说条目的普通错误。帧与字段不变。嵌入方：`importConfigModules`、`loadConfigModules`（经 `LoadOptions.harnessRegistry`）多了可选的 `harnessRegistry`（守护进程的 harness 种类，描述符的 admin 贡献与它们的一起认领；`@agents-io/daemon` 缺省是内建的），`ImportConfigModules` 的参数也多了可选的 `harnessRegistry`（控制台的 `ConfigStore` 交给它守护进程的）。
+- **2026-11-25（core-slimming G9：ACP harness）**：新的 harness 种类 `acp`（§4.10，新包 `@agents-io/harness-acp`：`AcpHarness`、`acpHarnessModule`、`MCP_STDIO_BRIDGE`、各 flavor 与映射函数），配置文件的 `harnesses.<名>.use` 多了 `"acp"`，`@agents-io/daemon` 的 `builtinHarnesses.kinds` 是 `claude-code`、`codex`、`bridge`、`acp`。别的线上（帧、字段、错误文字、admin HTTP API）不变；没有配 `acp` 实例的部署什么都不变（`/plan`、`/bypass` 的回复照旧只点名 Codex：这个种类没有种类级的声明）。`@agents-io/testkit` 的 transcript 多了 `protocol: "acp"`（`TRANSCRIPT_PROTOCOLS`），`teardownAnswers("acp")` 的答复带 `jsonrpc: "2.0"`。
+- **2026-11-25（core-slimming G9 北向：会话作为 ACP agent 与 AG-UI 事件流）**：两个新的内建功能模块 `acp-server`、`ag-ui`（§4.11，`@agents-io/daemon` 的 `bundle.ts` 注册，排在 `owner-commands` 之后、`external-mcp` 之前），都缺省关，没有它们的配置段时什么都不变；配置文件多了可选的顶层键 `acpServer`、`agUi`（文件 schema 里在 `externalMcp` 之前），`GET /api/status` 的 `modules` 多两项（`enabled: false`）。线上只加不改：客户端帧多了 `module.connect`（`ClientFrame.json`），`external` 回调的 `args` 多了可选的 `endpoint`（`HostEventFrame.json`），`features` 可能多 `acp.server`、`ag-ui`，`input.cancelled` 的 `reason` 可能是 `withdrawn`（ACP 客户端取消了还在排队的 prompt）。本地 socket 现在一行一行地解码收到的一块，坏行在它的位置答 `bad_json`（一块只有一行时与以前相同）。嵌入方：`KernelContext` 多了 `subscribe`、`blobs` 和 `lanes.withdraw`，`ModuleInstance` 多了 `connect`，`ModuleManifest` 多了 `cli`（`ModuleCliCommand`），`KernelBackend` 多了必需的 `subscribe`、`putBlob`、`laneWithdraw`（见 `packages/daemon/README.md` 末尾）；`@agents-io/session` 多了 `withholdingFold`。
 
 ### 4.6 模型生成的话题标题（模块 `topic-title`）
 
@@ -333,8 +335,86 @@ harness 也可以是另一个进程里、任何语言写的程序：守护进程
 - **在哪里读**：`sessions` 帧的答复（`SessionInfo.attention`，宿主连接也能发这个客户端帧）、控制台的 `GET /api/sessions`、订阅时拿到的快照（`SessionSnapshot.attention`）、`aio sessions` 每行的最后一列（`attention needs_you (request r1, 2 queued)`）。外部 MCP 的 `sessions_list` 也有，但请求不带 `title`（受检的一轮的卡片对外遮着，§4.1a）。
 - **订阅变化**：在占宿主位置的 `host.hello` 里加 `optIn: ["attention"]`（**只认结果**：结果的 `optIn` 里有 `attention` 才算拿到；不占宿主位置的 hello 得到 `optIn: []`；旧守护进程不认，结果里没有 `optIn`，`features` 里也没有 `attention`）。之后每个会话的值每变一次，守护进程发一帧 `{ "v": 1, "type": "attention.changed", "sessionKey": "…", "attention": { … } }`（`AttentionChanged`，不用应答）：改变它的事件提交、发布之后才发，同一个值只发一次（一个事务里的几条事件只发一次，是它们之后的值；回滚的什么都不发），同一会话按 `seq` 递增。
 - **断线**：宿主不在时不留，也不补发。重连（`hello` 带 `optIn`）之后列一次 `sessions` 取当前值，之后的帧按 `seq` 比较，旧的丢掉。
-- **怎么算**：规则由 `packages/session/test/fixtures/attention/*.json` 的 fixture 固定（每个是一段会话日志和它之后的值，格式见 `docs/design/core-slimming/` §3 G7/G8）；自己从事件 fold 的宿主或别的语言的实现可以拿它们自检。
+- **怎么算**：规则由 `packages/testkit/conformance/scenarios/attention/*.ndjson` 的 fixture 固定（每个是一段会话日志和它之后的值，一致性场景的格式，见 `docs/design/conformance-fixtures/` §3.6）；自己从事件 fold 的宿主或别的语言的实现可以拿它们自检。
 - **对严格校验的宿主可见的协议变化**（2026-11-24）：`SessionInfo.attention`（`AdminSession` 随之有）是新的可选字段；`features` 多了 `attention`；`HostEventFrame` 多了 `attention.changed`，只在 `optIn` 之后才发；快照（`agents-io.snapshot` 的 `native`）多了 `attention`；`aio sessions` 每行末尾多一列。
+
+### 4.10 任何 ACP agent 作为 harness（`use: "acp"`，Agent Client Protocol）
+
+支持 [ACP](https://agentclientprotocol.com) 的 coding agent（Claude Code 的 ACP agent、Gemini CLI、codex-acp 等）不用写适配器：harness 种类 `acp`（`harness/acp`，`@agents-io/harness-acp`，由 `packages/daemon/src/bundle.ts` 注册）让守护进程做 ACP 的客户端，agent 是它的子进程，经 stdio 说 ACP v1 的 JSON-RPC（官方 SDK `@agentclientprotocol/sdk`）。只起配置好的命令，不从 ACP registry 装东西（供应链风险）。
+
+```jsonc
+"harnesses": {
+  "claude-acp": { "use": "acp", "command": "/opt/acp/node_modules/.bin/claude-agent-acp",
+                  "env": { "ANTHROPIC_API_KEY": "env:ANTHROPIC_API_KEY" },
+                  "profiles": { "bypass": { "mode": "bypassPermissions" } } }
+}
+```
+
+- **配置**：`command`、`args`（原样上命令行，不放机密）；`mcp`：宿主 MCP 端点怎么给 agent，`http`（agent 声明了 `mcpCapabilities.http`：一个 `http` MCP 服务器，token 在 `Authorization` 头里，经 stdin 交给 agent，不上命令行）或 `stdio-bridge`（一个 stdio MCP 服务器，这个包的 `bin/mcp-stdio-bridge.mjs`，每条消息转发到端点；URL 和 token 在它的环境里；所有 ACP agent 都接 stdio），缺省按 agent 声明的选；`profiles` 的每一档只写 `mode`：这一档的轮次跑在 agent 的哪个 session mode 上（每轮开始前不同就 `session/set_mode`，所以 agent 自己换了 mode 下一轮也会换回来）。没写 `mode` 的：`bypass` 跑在会话打开时的 mode 上；其他各档（内置的 `restricted`：客人、放行的陌生人、外部 peer、任务）跑在 agent 动手前先问的那个 mode 上，与 Claude Code 的 `default`、Codex 的 `on-request` 一样，由 flavor 的 `restrictedMode` 选，generic 是 agent 提供的 `default`（Claude Code 的 ACP agent 打开时在 `auto`，由它自己决定，`default` 才问）；agent 有 mode 但 flavor 认不出哪个会问时，这样的一轮不开始、说明原因，直到给这一档配上 `mode`；agent 没有 session mode 就照它的样子跑。`flavor`（agent 的怪癖，具名的钩子：`generic`、`claude`；缺省按 `initialize` 的 `agentInfo` 选）、`planMode`、`compact`、`displayName`、`elicitation`、`authMethod`。
+- **能力来自 agent**（`initialize`、每个会话的 `session/new` / `session/load`）：`steer` 是 `none`（ACP 没有一轮里插话：插话排到下一轮）；打断是 `session/cancel`（agent 在等的请求先答 cancelled；15 s 内 prompt 不回答，这一轮照样以 `interrupted`、`cancel_timeout` 结束）；agent 之后还接着跑那个 prompt 时它占着会话：ACP 的更新不带 turn id，它流出的只记 `native`、不属于任何一轮，下一轮的 `session/prompt` 等它回答，至多再等 15 s，还不回答就关掉会话再打开（`session/close` 答了、agent 能 `session/load`，而且那个 prompt 随后也回答了（至多再等 15 s）才载入同一个会话：agent 可能把 close 也当作它不理的 cancel，prompt 还在跑时会流进同一个 id 的会话；否则开一个新会话、`session.bound` 给出新 id，之前的对话不在里面，旧会话还流出的到不了它），`continuity` 提示说明是哪种；会话关闭时（停放话题空闲关闭、`/preset` 切走、`release`，或一轮正跑着）agent 还没回答的 prompt 留给 agent 进程：回答之前它流出的不属于任何会话，同一个进程上续接这个会话时先等它回答，至多 15 s，回答了才 `session/load`，否则开新会话，`continuity` 提示说明（INVARIANTS LN-2、DL-3）；审批是 `session/request_permission`，映射成 `request.opened` / `request.resolved`，`allow_once` 只选 agent 给的一次性允许、绝不放宽，`allow_session` 选它的"总是"选项（没有就一次性的），`deny` 选拒绝，`native` 按 `{ optionId }` 选，"总是"的选项是请求的 `suggestions`；提问只在开了 `elicitation` 时（表单 `elicitation/create` 是 agent 问它的用户，映射成 `question` 请求，与 Codex 的 `requestUserInput` 一样：宿主问这一轮的人，对话里出问题卡片，主人的 bypass 轮次也不替人自动作答）；续接是 `session/load`（agent 重放的历史不写进日志）；Plan 模式看 `availableModes`；压缩看 agent 公布的命令（`/compact`）；从不接管：停止时会话关闭（正在跑的一轮记 `interrupted`）、agent 进程退出，重启后下一条输入经 `session/load` 续上（RS-1）。审批只在 agent 进程活着时有效。
+- **不声明 `fs`、`terminal` 客户端能力**：读写文件、跑命令都由 agent 自己按它的权限做，守护进程不替它执行，也就不需要 t3code 那样的客户端权限层；权限的边界是 agent 的 session mode（由 profile 选）和它发来的审批请求（由宿主的 resolver 答）。
+- **ACP 相对原生适配器少了的**：原生 steer、原生的 turn 与 item id、截断与 rollback、不开轮注入、跨重启接管、可续的审批、subagent 可见性（只有 flavor 认得出的）、稳定的用量统计；中途换模型只经 agent 不稳定的 config option。要这些的用原生的 `claude-code` / `codex`。
+- **一致性**：真实 agent（claude-agent-acp 0.110.1）录下的 transcript 在 `packages/testkit/conformance/transcripts/acp/`（G8 的 L1，`protocol: "acp"`），别的语言的 ACP 客户端可以用 `aio-transcript-replay` 当 agent 自检。细节：`harness/acp/README.md`。
+
+### 4.11 会话作为 ACP agent（`aio acp`）与 AG-UI 事件流（北向投影）
+
+core-slimming G9 的北向（POSITIONING §9.3）：任何会话都可以被一个标准协议的前端打开，前端不用学宿主协议。两个内建功能模块，都缺省关，按自己的配置段打开；设计与安全评审见 `docs/design/north-projections/`，不变量 PR-4（映射表），ID-10、SE-5、CF-10、IN-8、RQ-3、DL-7 都扩到了它们的客户端。
+
+**规则同对外 MCP 端点（§4.2）**：每个客户端在配置里有自己的令牌（`token: "env:NAME"` 或 `tokenFile`，存在则读、不存在则生成 0600；不得是宿主令牌，两个客户端不得相同）和 scope（只有 `read`、`read:<会话模式>`、`input:<会话模式>`）；客户端做的事由守护进程以它自己的主体盖章（`kind: "peer"`，主体缺省 `external:<名>`，永远不是人，所以它开的轮次缺省 `restricted`）；`origin.adapter` 与 `via` 是端点模块的 id（`acp-server` / `acp-server:<名>`，`ag-ui` / `ag-ui:<名>`）；声明了 `external` 钩子的宿主决定每条输入（`policy { hook: "external", args: { …, op: "input", endpoint } }`，`endpoint` 是 `acp-server` 或 `ag-ui`，新的可选字段）；输入经 lane 的回环检查（IN-8：一个客户端在一个会话里 15 分钟内开轮超过 `policy.loopGuard.pair.maxTurns`（缺省 10）次、其间没人写，之后的输入只记成上下文：ACP 的 prompt 答一个说明这一点的错误，AG-UI 的 run 以 `RUN_ERROR` `loop_guard` 结束；编辑器里聊得多的会话要调大这个上限）；答复留在会话日志里（回复路由是会话的 `local` 路由），不发到任何通道。客户端配了 `agent`（一个非任务 agent）就可以开它自己的会话（`<模块 id>:<名>:<id>`），它总能读写这些；别的会话要已存在、在它的 scope 里。受检的一轮（U20，§4.1a）的回答在放行之前不给这两个端点的客户端，扣下的永远不给（DL-7）。
+
+**ACP 服务端**（模块 `acp-server`，配置段 `acpServer`）：会话是一个 Agent Client Protocol v1 的 agent。编辑器（Zed、JetBrains）或 t3code（它通用的 ACP provider）把 `aio acp` 当 agent 程序起：`aio acp` 连守护进程的本地 socket，以配置的客户端名和它的令牌说 `module.connect`（客户端帧，`packages/protocol/src/client.ts`），之后只在 stdio 与守护进程之间转发 ACP 的 JSON-RPC；ACP 本身由守护进程里的模块说（官方 SDK `@agentclientprotocol/sdk`）。
+
+```jsonc
+"agents": { "dev": { "harness": "claude-code" } },
+"acpServer": {
+  "clients": {
+    "zed": { "tokenFile": "acp/zed.token", "scopes": ["read:dev:*", "input:dev:*"], "agent": "dev", "approvals": true }
+  },
+  "limits": { "maxTextChars": 16000, "promptsPerMinute": 20 }
+}
+```
+
+```jsonc
+// Zed 的 settings.json（t3code 的通用 ACP provider 同样：命令和参数）
+"agent_servers": {
+  "agents-io": { "command": "aio", "args": ["acp", "--client", "zed", "--token-file", "/path/to/acp/zed.token", "--socket", "/path/to/aio.sock"] }
+}
+```
+
+- `aio acp --client <名> [--token-file <路径>] [--session <键>] [--socket <路径> | --config <aio.config.json>]`：令牌来自 `--token-file`（只有本人可读的文件；就是配置里这个客户端的 `tokenFile`），或 `$AIO_ACP_TOKEN`；`$AIO_ACP_CLIENT` 可代替 `--client`。socket 来自 `--socket`、`$AIO_SOCKET`，否则读配置的 `socketPath`。退出码：编辑器关掉 stdin 时 0，守护进程不在或关了连接 69，客户端名或令牌不对 77，守护进程没开 ACP 服务端 2。
+- `initialize`：`loadSession: true`（会话的日志就是续接的来源），`promptCapabilities` 是文字、图片和内嵌的文本资源（`image: true`、`embeddedContext: true`，没有音频），`sessionCapabilities.list`；不要求认证。客户端的 `fs`、`terminal` 能力不用：agent 在守护进程那边按它自己的配置跑。
+- `session/new`：给了 `--session <键>` 就绑定那个会话（要在客户端的读 scope 里）；否则开客户端自己的新会话（要有 `agent`）。`sessionId` 就是会话键。`cwd` 与 `mcpServers` 不用：会话的工作目录与工具是 agent 的配置（改工作目录要宿主的 `session.launch`，FC-4）。`session/load` 先把会话日志（最近 5000 条持久事件）作为 `session/update` 重放（与在线时一样，`internal` 的事件不给），再回答，然后照常往下；重放完还没结算、要问这个客户端的请求这时才问，日志里已结算的（答过的、随它的一轮结束取消的）不再问；`session/list` 列出客户端能读的会话（标题是话题标题）。
+- `session/prompt`：文字、图片（存进 blob 库，作为图片块进这一轮）、链接与内嵌的文本资源；在会话里排一条输入（`queue`），等拿走它的那一轮结束才回答：`end_turn`、`cancelled`（被打断）、`refusal` / `max_tokens` / `max_turn_requests`，别的失败是一个错误（`data.code` 是这一轮的错误码）。别人在同一个会话里说的话、开的轮次也作为 `session/update` 推过来（用户消息前面带说话人的主体）。
+- `session/update` 的映射（PR-4，fixture 在 `packages/testkit/conformance/projections/acp/`）：回答 → `agent_message_chunk`，推理 → `agent_thought_chunk`，工具类条目 → `tool_call` / `tool_call_update`（命令 `execute`、改文件 `edit`、搜索 `fetch`，其余 `other`），计划 → `plan`；每个请求是一个待定的工具调用（`request:<id>`），结算后 `completed` 或 `failed`。
+- **审批与提问**：请求的 resolver 是 `human` 且点了这个客户端的主体时，才问编辑器（`session/request_permission`，选项是允许一次、本会话总是允许（请求允许时）、拒绝；提问在编辑器支持表单时是 `elicitation/create`）；答复以客户端自己的身份 `resolve`，lane 再查资格，先到者为准（RQ-1）；别人先答了，问编辑器的那个请求撤回（`$/cancel_request`），晚到的答复被拒。客户端从不代人作答（RQ-3）。客户端成为审批的 resolver 只有两条路：`approvals: true`（它独自开的、不是 `bypass` 的轮次的请求问它；缺省关：一个 peer 的 `restricted` 轮次里要审批的工具按缺省策略被拒），或宿主的 `resolve` 回调这样答。提问不同：缺省策略把提问交给这一轮的人，客户端自己开的轮次里就是它自己，所以不开 `approvals` 也问它（编辑器支持表单时）；它的答复是交给 agent 的文字，不放行任何工具，也不是一条输入（宿主的 `external` 钩子不问它）；不想这样，用自己的 `Policy.resolve` 或宿主的 `resolve` 回调另定 resolver。别人开的轮次里的提问不问它。
+- `session/cancel`：打断客户端自己的那个 prompt 的轮次（带 `turnId`，CT-1：别人的轮次不动）；还在排队的撤出队列（日志里是 `input.cancelled`，`reason: "withdrawn"`，agent 读不到它），再答 `cancelled`，之后发的 prompt 自成一轮；撤回之前已被一轮拿走的（它的轮次恰好这时开始），那一轮只有被取消的 prompt 时一开始就被打断，否则照跑，只回答没取消的。编辑器断开不打断任何东西：这一轮照常跑完，答复在日志里，下次 `session/load` 看得到。
+- 状态（`GET /api/status` 的 `modules[]`）：`{ clients, connections }`；feature `acp.server`。
+
+**AG-UI 端点**（模块 `ag-ui`，配置段 `agUi`）：会话是一个 AG-UI agent（docs.ag-ui.com，`@ag-ui/core` 1.0），给网页界面用：CopilotKit 一类的界面（及其运行时）用 `@ag-ui/client` 的 `HttpAgent` 就能接。
+
+```jsonc
+"agUi": {
+  "listen": "127.0.0.1:7466",                      // 缺省；只许回环地址
+  "origins": ["http://localhost:3000"],            // 浏览器直接连时它的 origin（答 CORS）；不写则带 Origin 的请求一律 403
+  "clients": { "web": { "tokenFile": "agui/web.token", "scopes": ["read:dev:*"], "agent": "dev" } },
+  "limits": { "maxBodyBytes": 1048576, "maxTextChars": 16000, "requestsPerMinute": 120, "runsPerMinute": 20 }
+}
+```
+
+```ts
+import { HttpAgent } from '@ag-ui/client';
+const agent = new HttpAgent({ url: 'http://127.0.0.1:7466/ag-ui', headers: { Authorization: `Bearer ${token}` }, threadId: 'my-thread' });
+agent.addMessage({ id: 'm1', role: 'user', content: 'hello' });
+await agent.runAgent({ runId: 'r1' }, { onEvent: ({ event }) => console.log(event.type) });
+```
+
+- `POST /ag-ui`，请求体是 `RunAgentInput`（按 `@ag-ui/core` 的 schema 校验，不合 400）：`threadId` 是客户端 scope 里一个已存在的会话键时就是那个会话，否则（客户端有 `agent`）是它自己的会话 `ag-ui:<名>:<threadId>`；`messages` 里最后一条 `user` 消息是这一轮的输入（文字；图片的 `data` 来源存进 blob 库，`url` 来源作为链接文字；别的部件 400）；`tools`、`context`、`state`、`forwardedProps` 不用。答复是 `text/event-stream`：`RUN_STARTED`，`STATE_SNAPSHOT`（会话现在的状态与 attention，请求不带标题；只给能读这个会话的客户端），然后只有拿走这条输入的那一轮的事件（一轮只收一个主体的输入，IN-3：只写不读的客户端看到的只是对它自己的输入的回答），最后 `RUN_FINISHED`（`outcome` 为 `success`，被打断的是 `cancelled`）或 `RUN_ERROR`（`code` 是这一轮的错误码；输入被拒是 `rejected`，回环检查截停是 `loop_guard`）。
+- 映射（PR-4，fixture 在 `packages/testkit/conformance/projections/ag-ui/`）：回答 → `TEXT_MESSAGE_START` / `CONTENT` / `END`，推理 → `REASONING_START`、`REASONING_MESSAGE_*`、`REASONING_END`，工具类条目 → `TOOL_CALL_START`（名字是条目类型，MCP 工具是 `<server>.<tool>`）、`TOOL_CALL_ARGS`（`{ title, input }`）、`TOOL_CALL_END`、`TOOL_CALL_RESULT`（结果的预览），计划 → `ACTIVITY_SNAPSHOT`（`PLAN`），请求 → `CUSTOM`（`agents-io.request.opened` / `agents-io.request.resolved`：AG-UI 客户端不答请求，审批与提问由会话里的人或宿主答）。
+- `GET /ag-ui/threads/<threadId>/events?fromSeq=<seq>`（或 `Last-Event-ID` 头）：从那个 seq 往后的每一轮各是一个 run（`runId` 是轮次 id），一直推到客户端断开；不给 seq 先一个 `STATE_SNAPSHOT`。每个 SSE 事件的 `id` 是它所示会话事件的 seq，一个流里不减，断了拿最后一个 `id` 续上：那个 seq 时还在跑的一轮（流断在一轮中间）是第一个 run，马上给它的 `RUN_STARTED`（`id` 就是这个 seq），再给这一轮剩下的；断在一条消息中间时，断之前流出的增量不在日志里，这条消息由它的 snapshot 整条给出（同一个 `messageId`，界面里已有的半条要换掉）。POST 的 `RUN_STARTED`、`STATE_SNAPSHOT` 的 `id` 是输入进会话之前的 seq：只收到了 `RUN_STARTED` 就断了的，从它续读拿得回这次 run（`runId` 是轮次 id）。要读 scope。
+- 每个请求要 `Authorization: Bearer <令牌>`（401）；`Host` 不是回环名 403；有 `limits`（413、429 带 `Retry-After`）。客户端断开不打断这一轮（会话还有别的端），续读用上面的 GET。没有 `allowRemote`：远处的界面经宿主自己的代理（TLS、认证）。
+- 状态：`{ url, clients }`；feature `ag-ui`（只在监听时）。
+
+**对严格校验的宿主可见的协议变化**（2026-11-25）：客户端帧多了 `module.connect`（旧守护进程答 `invalid_frame`）；`external` 回调的 `args` 多了可选的 `endpoint`；`features` 可能多 `acp.server`、`ag-ui`；`input.cancelled` 的 `reason` 可能是 `withdrawn`；输入的 `origin.adapter` 可能是 `acp-server` 或 `ag-ui`；会话列表里可能出现 `acp-server:<名>:<id>`、`ag-ui:<名>:<id>` 这样的会话。
 
 ## 5. 命令行（给不想写 socket 客户端的宿主）
 
@@ -350,6 +430,7 @@ harness 也可以是另一个进程里、任何语言写的程序：守护进程
 | `aio verify <channelRef>` | `input.verify` |
 | `aio replay --input <inputId> [--times N]` | `test.replay`（测试入口，§4.3；只在 `AIO_TEST_HOOKS=1` 时可用） |
 | `aio fault [list] \| drop-response --channel <id> [--account <a>] [--conversation <c>] --next <N> \| clear` | `test.fault`（同上） |
+| `aio acp --client <名> [--token-file <路径>] [--session <键>]` | 不是宿主命令：编辑器或 t3code 起它当 ACP agent（§4.11），以 `acpServer` 的一个客户端的身份经 `module.connect` 连 socket |
 
 `aio run` 的退出码：0 完成、1 失败、3 结果不明（ambiguous）、124 超时、130 被取消；其余命令：2 用法/配置错误，69 守护进程未运行，77 token 错误。
 

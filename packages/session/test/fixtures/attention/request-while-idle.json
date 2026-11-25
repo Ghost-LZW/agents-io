@@ -1,7 +1,0 @@
-{
-  "description": "A human request opened while no turn runs needs a person all the same; no turnId.",
-  "input": [
-    {"ts": 1000, "audience": "approval", "body": {"t": "request.opened", "requestId": "r1", "kind": "question", "title": "Which plan?", "risk": {}, "allowedDecisions": ["allow_once", "deny"], "allowAlways": false, "defaultDeny": true, "resolver": {"kind": "human", "principals": ["owner"], "routes": ["fake:default:c1"]}}}
-  ],
-  "expected": {"state": "needs_you", "reasons": [{"kind": "request", "requestId": "r1", "requestKind": "question", "title": "Which plan?", "since": 1000}], "since": 1000, "seq": 1}
-}

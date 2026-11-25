@@ -1,0 +1,4 @@
+{"scenario":"input-rejected","description":"An input rejected before any turn ran it (its turn failed to start) stops waiting; that is no turn's failure: idle.","invariants":["LN-11"]}
+{"emit":{"end":"log","event":{"ts":1000,"body":{"t":"input.admitted","inputId":"i1","disposition":"new_turn"}}}}
+{"emit":{"end":"log","event":{"ts":1050,"body":{"t":"input.rejected","inputIds":["i1"],"reason":"start_failed: harness not available"}}}}
+{"expect":{"end":"attention","exact":true,"match":{"state":"idle","reasons":[],"since":1050,"seq":2}}}

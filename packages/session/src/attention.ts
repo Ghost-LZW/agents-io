@@ -3,8 +3,9 @@ import type { SessionSnapshot } from './log.js';
 
 /*
  * The attention fold (core-slimming G7, INVARIANTS LN-11): what is pending in a session now, from
- * its log alone. The rules are the language-neutral fixtures' (`test/fixtures/attention/*.json`,
- * format in docs/design/core-slimming §3 G7/G8): an implementation in another language that passes
+ * its log alone. The rules are the language-neutral fixtures' (the conformance scenarios
+ * `packages/testkit/conformance/scenarios/attention/*.ndjson`, format in
+ * docs/design/conformance-fixtures §3.6): an implementation in another language that passes
  * them computes the same value from the same events.
  */
 

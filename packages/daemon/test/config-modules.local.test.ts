@@ -70,5 +70,10 @@ describe("a module harness descriptor's CLI commands", () => {
     const two = configFile({ harnesses: { plug: { use: 'module', module: join(fx, 'harness-descriptor-full.mjs') }, other: { use: 'module', module: join(fx, 'harness-descriptor-full.mjs'), export: 'otherHello' } } });
     const clash = await cli(['--config', two, 'acme-hello']).catch((e: Error) => e);
     expect((clash as Error).message).toBe('harnesses.other: cli "acme-hello": harnesses.plug adds it too');
+    // A feature module's command (acp-server's `aio acp`) never shadows a harness module's: the clash is an error, as at start.
+    const feat = configFile({ harnesses: { plug: { use: 'module', module: join(fx, 'harness-descriptor-full.mjs'), export: 'featureCli' } } });
+    const shadow = await cli(['--config', feat, 'acp']);
+    expect(shadow.code).toBe(2);
+    expect(shadow.err).toMatch(/command "acp" is added both by a feature module and by a harness module of the config/);
   });
 });

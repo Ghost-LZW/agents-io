@@ -22,6 +22,7 @@ const alias = [
   { find: /^@agents-io\/channel-jsonl-bridge$/, replacement: src('channel/jsonl-bridge') },
   { find: /^@agents-io\/channel-lark-bot$/, replacement: src('channel/lark-bot') },
   { find: /^@agents-io\/channel-mail$/, replacement: src('channel/mail') },
+  { find: /^@agents-io\/harness-acp$/, replacement: src('harness/acp') },
   { find: /^@agents-io\/harness-claude-code$/, replacement: src('harness/claude-code') },
   { find: /^@agents-io\/harness-codex$/, replacement: src('harness/codex') },
   { find: /^@agents-io\/harness-jsonl-bridge$/, replacement: src('harness/jsonl-bridge') },

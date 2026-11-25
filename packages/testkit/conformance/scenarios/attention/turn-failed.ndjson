@@ -1,0 +1,7 @@
+{"scenario":"turn-failed","description":"A turn that fails leaves the session failed, with the error's code, until another turn starts.","invariants":["LN-11"]}
+{"emit":{"end":"log","event":{"ts":1000,"body":{"t":"input.admitted","inputId":"i1","disposition":"new_turn"}}}}
+{"emit":{"end":"log","event":{"ts":1001,"body":{"t":"turn.started","turnId":"t1","inputIds":["i1"],"replyRoute":null}}}}
+{"emit":{"end":"log","event":{"ts":1002,"body":{"t":"session.state","state":"running"}}}}
+{"emit":{"end":"log","event":{"ts":2000,"body":{"t":"turn.completed","turnId":"t1","status":"failed","error":{"code":"harness_error","retryable":false}}}}}
+{"emit":{"end":"log","event":{"ts":2001,"body":{"t":"session.state","state":"idle"}}}}
+{"expect":{"end":"attention","exact":true,"match":{"state":"failed","reasons":[{"kind":"failed","turnId":"t1","code":"harness_error","since":2000}],"since":2000,"seq":4}}}

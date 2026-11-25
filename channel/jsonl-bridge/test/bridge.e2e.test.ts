@@ -67,7 +67,7 @@ describe('lifecycle', () => {
     expect(getEventListeners(ctl.signal, 'abort').length).toBeLessThanOrEqual(2);
     ctl.abort();
     await started;
-  });
+  }, 20_000); // six child processes start one after another: a loaded CI runner needs longer than the 5 s default
 
   it('restarts a wedged child after repeated request timeouts #CF-1 #DL-1', async () => {
     const { file, pids } = pidLog();

@@ -1,0 +1,10 @@
+{
+  "name": "@agents-io/harness-acp",
+  "version": "0.1.0",
+  "description": "agents-io harness adapter for any Agent Client Protocol (ACP) agent: drives the agent over JSON-RPC on stdio (the acp harness kind)",
+  "type": "module",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist", "bin"],
+  "dependencies": { "@agentclientprotocol/sdk": "^2.9.1", "@agents-io/protocol": "workspace:*", "@sinclair/typebox": "^0.34.0", "zod": "^4.0.0" },
+  "devDependencies": { "@agents-io/testkit": "workspace:*" }
+}

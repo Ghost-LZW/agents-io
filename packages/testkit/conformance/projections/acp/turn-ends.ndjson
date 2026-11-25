@@ -1,0 +1,16 @@
+{"projection":"acp","name":"turn-ends","description":"How a turn ends is the stop reason of the prompts it took: completed end_turn, interrupted cancelled, failed with refusal, max_tokens or max_turn_requests that reason; any other failure, and an ambiguous end, are an error with the turn's code.","options":{"principal":"external:zed"}}
+{"event":{"turnId":"t1","body":{"t":"turn.started","turnId":"t1","inputIds":["a"],"replyRoute":null}}}
+{"event":{"turnId":"t1","body":{"t":"turn.completed","turnId":"t1","status":"interrupted"}}}
+{"out":{"turnEnd":{"turnId":"t1","stopReason":"cancelled"}}}
+{"event":{"turnId":"t2","body":{"t":"turn.started","turnId":"t2","inputIds":["b"],"replyRoute":null}}}
+{"event":{"turnId":"t2","body":{"t":"turn.completed","turnId":"t2","status":"failed","error":{"code":"max_tokens","retryable":false,"message":"the agent reached its token limit"}}}}
+{"out":{"turnEnd":{"turnId":"t2","stopReason":"max_tokens"}}}
+{"event":{"turnId":"t3","body":{"t":"turn.started","turnId":"t3","inputIds":["c"],"replyRoute":null}}}
+{"event":{"turnId":"t3","body":{"t":"turn.completed","turnId":"t3","status":"failed","error":{"code":"adapter_error","retryable":true,"message":"the harness went away"}}}}
+{"out":{"turnEnd":{"turnId":"t3","error":{"code":"adapter_error","message":"the harness went away"}}}}
+{"event":{"turnId":"t4","body":{"t":"turn.started","turnId":"t4","inputIds":["d"],"replyRoute":null}}}
+{"event":{"turnId":"t4","body":{"t":"turn.completed","turnId":"t4","status":"ambiguous"}}}
+{"out":{"turnEnd":{"turnId":"t4","error":{"code":"ambiguous","message":"the turn ended ambiguous"}}}}
+{"event":{"turnId":"t5","body":{"t":"turn.started","turnId":"t5","inputIds":["e"],"replyRoute":null}}}
+{"event":{"turnId":"t5","body":{"t":"turn.completed","turnId":"t5","status":"failed","error":{"code":"refusal","retryable":false}}}}
+{"out":{"turnEnd":{"turnId":"t5","stopReason":"refusal"}}}

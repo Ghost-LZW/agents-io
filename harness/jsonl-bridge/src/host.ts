@@ -74,6 +74,11 @@ export interface HarnessBridgeOptions {
   timeoutsBeforeRestart?: number;
   /** How long to wait for the program to exit after `shutdown` before killing it. Default 2s. */
   shutdownGraceMs?: number;
+  /**
+   * Every frame of the connection, both ways, as it goes: `outbound` what the host writes to the
+   * program, `inbound` what it reads (a transcript recorder's tap, docs/design/conformance-fixtures §2).
+   */
+  record?: (direction: 'outbound' | 'inbound', frame: unknown) => void;
 }
 
 /** The adapter `spawnHarness` returns. */
@@ -301,13 +306,25 @@ class HarnessBridge implements BridgedHarness {
     });
     child.on('error', () => {});
     const conn: Conn = { child, pending: new Map(), sessions: new Map(), closed, gone: false, timeouts: 0, link: undefined as never };
+    const record = o.record;
     conn.link = new FrameLink(
       child.stdout!,
       child.stdin!,
-      (f) => this.onFrame(conn, f),
+      (f) => {
+        record?.('inbound', f);
+        this.onFrame(conn, f);
+      },
       (line, err) => this.log('warn', 'dropping malformed line from the harness program', { line: line.slice(0, 200), error: errMsg(err) }),
       () => {},
     );
+    if (record) {
+      const send = conn.link.send.bind(conn.link);
+      conn.link.send = (frame) => {
+        const sent = send(frame);
+        if (sent) record('outbound', frame);
+        return sent;
+      };
+    }
     child.stderr!.setEncoding('utf8');
     let buf = '';
     child.stderr!.on('data', (chunk: string) => {

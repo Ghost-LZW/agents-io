@@ -1,0 +1,6 @@
+{"projection":"ag-ui","name":"refused-input","description":"One run whose input never reaches a turn: rejected, the run is RUN_ERROR (code rejected); nothing after it is the run's.","options":{"threadId":"thread-2","runId":"run-2","inputId":"in-9"}}
+{"event":{"body":{"t":"input.admitted","inputId":"in-9","disposition":"queued"}}}
+{"out":{"type":"RUN_STARTED","threadId":"thread-2","runId":"run-2"}}
+{"event":{"body":{"t":"input.rejected","inputIds":["in-9"],"reason":"lane_closed: the daemon is stopping"}}}
+{"out":{"type":"RUN_ERROR","message":"the session did not take the input: lane_closed: the daemon is stopping","code":"rejected"}}
+{"event":{"turnId":"t1","body":{"t":"turn.started","turnId":"t1","inputIds":["in-9"],"replyRoute":null}}}

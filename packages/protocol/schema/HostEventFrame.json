@@ -6158,6 +6158,18 @@
             },
             "id": {
               "type": "string"
+            },
+            "endpoint": {
+              "anyOf": [
+                {
+                  "const": "acp-server",
+                  "type": "string"
+                },
+                {
+                  "const": "ag-ui",
+                  "type": "string"
+                }
+              ]
             }
           }
         }

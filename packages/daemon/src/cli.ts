@@ -6,9 +6,10 @@ import { constants as osConstants } from 'node:os';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
-import type { Attention, RenderedMessage, ReplyRoute, RunEnded, RunStart, SessionEvent, SessionLaunch, SessionScope, Tier, TuiAttach } from '@agents-io/protocol';
+import type { Attention, ModuleCliCommand, RenderedMessage, ReplyRoute, RunEnded, RunStart, SessionEvent, SessionLaunch, SessionScope, Tier, TuiAttach } from '@agents-io/protocol';
 import { runAttach } from './attach.js';
 import {
+  CLI_COMMON_OPTIONS,
   CommandError,
   ConfigError,
   DaemonUnavailable,
@@ -23,7 +24,7 @@ import {
   type ModuleLaunch,
 } from '@agents-io/kernel';
 import { consoleProof } from '@agents-io/console';
-import { builtinHarnesses } from './bundle.js';
+import { builtinHarnesses, builtinModules } from './bundle.js';
 import { Gateway, loadConfig, loadConfigModules } from './defaults.js';
 import { WATCH_SPEC_HELP, formatWatch, parseDuration, parseWatchSpec } from './watch-spec.js';
 
@@ -66,6 +67,7 @@ test hooks (fault injection; only when \`aio serve\` runs with AIO_TEST_HOOKS=1,
 
 console (HTTP + WebSocket API for web UIs, on 127.0.0.1:7464 by default; config \`console\`)
   aio console-link                                                    (prints a one-time login URL, valid 5 min)
+${moduleUsage()}
 
 watch keys: ${WATCH_SPEC_HELP}
 
@@ -75,6 +77,12 @@ other exit codes: 1 failed, 2 usage/config error, 69 daemon not running, 77 not 
 
 common: --config <aio.config.json> (or $AIO_CONFIG)  --env-file <.env.live>
         --socket <path> (or $AIO_SOCKET; default from the config)  --name <host name> (default aio-<command>)`;
+
+/** The commands the built-in feature modules add (`ModuleManifest.cli`), for the help. */
+function moduleUsage(): string {
+  const lines = builtinModules.cliCommands().map(({ name, module, command }) => `  aio ${name.padEnd(12)} ${command.usage}   [module ${module}]`);
+  return lines.length ? `\nfeature modules (their section on in the daemon's config)\n${lines.join('\n')}` : '';
+}
 
 const TIERS = ['full', 'card', 'headline', 'final'];
 
@@ -817,7 +825,86 @@ async function moduleKindCommand(a: CliArgs): Promise<{ run?: (a: CliArgs) => Pr
   return run ? { run: () => run({ argv: a.rest, env: process.env }) } : {};
 }
 
+/** `argv` as CLI args for finding the config only (`--config`, `--env-file`), its other options left alone. */
+function leniently(name: string, argv: string[]): CliArgs {
+  try {
+    const { values } = parseArgs({ args: argv, allowPositionals: true, strict: false, options: { config: { type: 'string' }, 'env-file': { type: 'string' } } });
+    return { cmd: name, values: { config: typeof values.config === 'string' ? values.config : undefined, 'env-file': typeof values['env-file'] === 'string' ? values['env-file'] : undefined }, rest: [] };
+  } catch {
+    return { cmd: name, values: {}, rest: [] };
+  }
+}
+
+/** The command name in `argv` (its first positional), read leniently: before its own options are known. */
+function commandName(argv: string[]): string | undefined {
+  try {
+    return parseArgs({ args: argv, allowPositionals: true, strict: false, options: { config: { type: 'string' }, 'env-file': { type: 'string' }, socket: { type: 'string' } } }).positionals[0];
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Run a command a feature module adds (`ModuleManifest.cli`): its own options and the CLI's common
+ * ones (`--config`, `--env-file`, `--socket`, `--help`) are parsed here, anything else is a usage error.
+ */
+async function runModuleCommand(name: string, c: ModuleCliCommand, argv: string[]): Promise<number> {
+  const own = Object.fromEntries(Object.entries(c.options ?? {}).map(([k, t]) => [k, { type: t }])) as Record<string, { type: 'string' | 'boolean' }>;
+  let parsed;
+  try {
+    parsed = parseArgs({ args: argv, allowPositionals: true, options: { config: { type: 'string' }, 'env-file': { type: 'string' }, socket: { type: 'string' }, help: { type: 'boolean', short: 'h' }, ...own } });
+  } catch (e) {
+    throw new ConfigError(`${name}: ${(e as Error).message}`);
+  }
+  const values = parsed.values as Record<string, string | boolean | undefined>;
+  if (values.help) {
+    console.log(`aio ${name} ${c.usage}\n\ncommon: ${CLI_COMMON_OPTIONS.filter((o) => o !== 'help').map((o) => `--${o}`).join(' ')}`);
+    return 0;
+  }
+  const positionals = parsed.positionals.slice(1);
+  const a: CliArgs = { cmd: name, values, rest: positionals };
+  return c.run({ options: values, positionals, env: process.env, socket: () => socketOf(a) });
+}
+
+/**
+ * A command a feature module of the config's `modules` entries adds (a third party's), found through
+ * the config (`--config`, `$AIO_CONFIG`, `./aio.config.json`): its modules are imported, nothing runs.
+ * A config that does not load adds none.
+ */
+async function configModuleCommand(name: string, argv: string[]): Promise<ModuleCliCommand | undefined> {
+  let opts: LoadOptions = {};
+  try {
+    const { values } = parseArgs({ args: argv, allowPositionals: true, strict: false, options: { config: { type: 'string' }, 'env-file': { type: 'string' } } });
+    opts = { ...(typeof values.config === 'string' ? { path: values.config } : {}), ...(typeof values['env-file'] === 'string' ? { envFile: values['env-file'] } : {}) };
+  } catch {
+    return undefined;
+  }
+  try {
+    return (await loadConfigModules(opts)).moduleRegistry.cliCommand(name)?.command;
+  } catch (e) {
+    if (e instanceof ConfigError) return undefined;
+    throw e;
+  }
+}
+
 export async function main(argv: string[]): Promise<number> {
+  // A feature module's command parses its own options (the CLI's parser does not know them).
+  const name = commandName(argv);
+  if (name !== undefined && !(name in COMMANDS) && name !== 'help' && name !== 'e2e' && !builtinHarnesses.cliCommand(name)) {
+    const c = builtinModules.cliCommand(name)?.command ?? (await configModuleCommand(name, argv));
+    if (c) {
+      // A harness module's command of the same name is a clash (the daemon refuses it at start too): never shadow it.
+      const clash = await moduleKindCommand(leniently(name, argv)).catch((e: unknown) => {
+        if (e instanceof ConfigError) return { run: undefined, reason: e.message };
+        throw e;
+      });
+      if (clash.run) {
+        console.error(`aio: command ${JSON.stringify(name)} is added both by a feature module and by a harness module of the config; rename one of them`);
+        return 2;
+      }
+      return runModuleCommand(name, c, argv);
+    }
+  }
   const a = parseCli(argv);
   if (a.cmd === 'help') {
     console.log(USAGE);

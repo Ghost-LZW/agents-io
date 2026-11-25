@@ -25,6 +25,8 @@ import {
   type HarnessEvent,
   type HarnessOpenArgs,
   type HarnessSession,
+  type KernelSubscription,
+  type ModuleConnection,
   type HostRequestFrame,
   type IdentityEntry,
   type InboundEnvelope,
@@ -125,6 +127,8 @@ import {
   handoverRefusal,
   settleLeftoverInputs,
   withholding,
+  isSnapshotEvent,
+  type Subscription,
 } from '@agents-io/session';
 import { HostMcpServer, HostTools, ToolError, agentIdentity, agentOrigin, scheduleRouteRefusal, toolCatalog, type TopicHandover } from '@agents-io/host-mcp';
 import { NO_REGISTRIES } from './core.js';
@@ -152,6 +156,28 @@ import { MAX_REPLAY_TIMES, TEST_HOOKS_ENV, TestHooks } from './test-hooks.js';
 import { consoleUrlPath, loadOrCreateTokenFile, removeTokenFile, TokenError, tokenPath, writeTokenFile } from './token.js';
 
 export type LogFn = (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
+
+/**
+ * A hub subscription as a module reads it (`KernelContext.subscribe`): the hub's snapshot (a `native`
+ * event `agents-io.snapshot`, kept so for the local socket's clients) is a `session.snapshot` event.
+ */
+function moduleSubscription(sub: Subscription): KernelSubscription {
+  return {
+    get dropped() {
+      return sub.dropped;
+    },
+    close: () => sub.close(),
+    async *[Symbol.asyncIterator]() {
+      for await (const e of sub) {
+        if (!isSnapshotEvent(e)) yield e;
+        else {
+          const { native, ...rest } = e;
+          yield { ...rest, body: { t: 'session.snapshot', snapshot: native } };
+        }
+      }
+    },
+  };
+}
 
 /** The log without `GatewayOptions.logger`: stderr. */
 const defaultLog: LogFn = (level, msg) => console.error(`[aio] ${level}: ${msg}`);
@@ -823,6 +849,8 @@ export class Gateway {
       log,
       events: (key, fromSeq) => gw().hub.log.read(key, fromSeq),
       head: (key) => gw().hub.log.head(key),
+      subscribe: (key, fromSeq) => moduleSubscription(gw().hub.subscribe({ sessionKey: key, tier: 'full', ...(fromSeq !== undefined ? { fromSeq } : {}) })),
+      putBlob: (bytes, meta) => gw().blobs.put(bytes, meta),
       appendNative: (key, e) => {
         gw().hub.append(key, { ts: Date.now(), level: e.level, audience: e.audience, durability: 'durable', visibility: e.visibility, body: { t: 'native', name: e.name }, native: e.native });
       },
@@ -883,6 +911,14 @@ export class Gateway {
       laneInput: async (key, input, mode) => {
         const lane = gw().lanes.get(key) ?? (await gw().laneAfterClose(key));
         return lane.command({ type: 'input', sessionKey: key, input, mode });
+      },
+      laneWithdraw: async (key, inputIds, principal) => {
+        // No lane open: nothing is queued.
+        const lane = gw().lanes.get(key);
+        if (!lane) return [];
+        const ids = new Set(inputIds);
+        const taken = await lane.take((i) => ids.has(i.inputId) && i.origin.kind === 'peer' && i.origin.principal?.id === principal, 'withdrawn');
+        return taken.map((i) => i.inputId);
       },
       laneHarness: (key, module) => gw().laneHarness(key, module),
       sessionRun: (key) => gw().sessionRun(key),
@@ -1326,6 +1362,8 @@ export class Gateway {
           for (const [name, run] of Object.entries(cli)) {
             const where = `harnesses.${inst.name} (module ${launch.file}): cli ${JSON.stringify(name)}`;
             if (this.harnessRegistry.cliCommand(name)) throw new Error(`${where}: a registered harness kind adds it too`);
+            const feature = this.moduleRegistry.cliCommand(name);
+            if (feature) throw new Error(`${where}: feature module ${feature.module} adds it too`);
             const other = commands.get(name);
             if (other && other.run !== run) throw new Error(`${where}: harnesses.${other.instance} adds it too`);
             commands.set(name, { instance: inst.name, run });
@@ -4142,6 +4180,12 @@ ${a.summary}` }],
   private async addWatchOp(by: Origin, draft: WatchDraft, op: Op): Promise<Outcome> {
     const r = await this.watches.add(by, draft, (put, watch) => op.commit(put, () => ({ outcome: { ok: true, value: watch } })));
     return r.ok ? { ok: true, value: r.watch } : fail(r.code, r.message);
+  }
+
+  /** `module.connect` (`LocalHost.moduleConnect`): the running module of that id takes the connection, or says why not. */
+  async moduleConnect(module: string, hello: unknown, conn: ModuleConnection): Promise<Outcome> {
+    if (this.stopped) return fail('stopped', 'gateway is stopping');
+    return this.modules.connect(module, hello, conn);
   }
 
   /**

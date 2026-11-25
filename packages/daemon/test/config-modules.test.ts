@@ -347,7 +347,7 @@ describe('a use: "module" harness descriptor\'s declares and cli', () => {
     expect(w2.gw.harness('plug').modes).toEqual([]);
   });
 
-  it('declarations of the wrong type, one that is none, one its adapter cannot honour, and commands the CLI cannot have (a bad name, not a function, a registered kind\'s, another instance\'s) fail the start, naming the instance and the member #CF-4', async () => {
+  it('declarations of the wrong type, one that is none, one its adapter cannot honour, and commands the CLI cannot have (a bad name, not a function, a registered kind\'s, a feature module\'s, another instance\'s) fail the start, naming the instance and the member #CF-4', async () => {
     const start = (harnesses: Record<string, unknown>) => serve({ harnesses }, { loadHarnesses: true });
     const at = /^harnesses\.plug \(module .*harness-descriptor-full\.mjs\): /;
     await expect(start({ plug: full('badModes') })).rejects.toThrow(at);
@@ -357,6 +357,7 @@ describe('a use: "module" harness descriptor\'s declares and cli', () => {
     await expect(start({ plug: full('badCliName') })).rejects.toThrow(/: bad cli "Hello" \(a command name is lowercase letters, digits and -, starting with a letter\)$/);
     await expect(start({ plug: full('cliNotFn') })).rejects.toThrow(/: bad cli "acme-hello" \(a function\)$/);
     await expect(start({ plug: full('builtinCli') })).rejects.toThrow(/^harnesses\.plug \(module .*\): cli "tui-bridge": a registered harness kind adds it too$/);
+    await expect(start({ plug: full('featureCli') })).rejects.toThrow(/^harnesses\.plug \(module .*\): cli "acp": feature module acp-server adds it too$/);
     await expect(start({ plug: full(), other: full('otherHello') })).rejects.toThrow(/^harnesses\.other \(module .*\): cli "acme-hello": harnesses\.plug adds it too$/);
     // Two instances of one descriptor add one command.
     await start({ plug: full(), again: full() });

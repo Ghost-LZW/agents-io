@@ -1,0 +1,27 @@
+{"projection":"ag-ui","name":"resume-mid-turn","description":"A resume from a seq inside a running turn (options.fromSeq: the durable events up to it are what the reader has, given to the projection's resume without output). The turn open at the seq is the first run: its RUN_STARTED comes before the first later event's outputs; a tool call started before the seq gets just its result, the turn's messages keep their numbering, and a final answer repeating what was said before the seq is not said again. A turn that ended before the seq is no run.","options":{"threadId":"S1","fromSeq":5}}
+{"note":"Before the seq (1 to 5): a turn that ended, then t1 running, a message said and a tool call started."}
+{"event":{"turnId":"t0","body":{"t":"turn.started","turnId":"t0","inputIds":["a"],"replyRoute":null}}}
+{"event":{"turnId":"t0","body":{"t":"turn.completed","turnId":"t0","status":"completed"}}}
+{"event":{"turnId":"t1","body":{"t":"turn.started","turnId":"t1","inputIds":["b"],"replyRoute":null}}}
+{"event":{"turnId":"t1","body":{"t":"text.snapshot","text":"Let me look.","final":false}}}
+{"event":{"turnId":"t1","itemId":"i1","body":{"t":"item.started","item":{"itemId":"i1","type":"command","title":"Run ls","status":"running","inputSummary":"ls"}}}}
+{"note":"After the seq: the rest of t1, then t2."}
+{"event":{"turnId":"t1","itemId":"i1","body":{"t":"item.completed","item":{"itemId":"i1","type":"command","title":"Run ls","status":"completed","inputSummary":"ls","result":{"preview":"a.txt","truncated":false,"isError":false}}}}}
+{"out":{"type":"RUN_STARTED","threadId":"S1","runId":"t1"}}
+{"out":{"type":"TOOL_CALL_RESULT","messageId":"i1:result","toolCallId":"i1","content":"a.txt","role":"tool"}}
+{"event":{"turnId":"t1","body":{"t":"text.delta","delta":"One file.","stream":"answer"}}}
+{"out":{"type":"TEXT_MESSAGE_START","messageId":"t1:2","role":"assistant"}}
+{"out":{"type":"TEXT_MESSAGE_CONTENT","messageId":"t1:2","delta":"One file."}}
+{"event":{"turnId":"t1","body":{"t":"text.snapshot","text":"One file.","final":false}}}
+{"out":{"type":"TEXT_MESSAGE_END","messageId":"t1:2"}}
+{"event":{"turnId":"t1","audience":"answer","body":{"t":"text.snapshot","text":"Let me look. One file.","final":true}}}
+{"event":{"turnId":"t1","body":{"t":"turn.completed","turnId":"t1","status":"completed"}}}
+{"out":{"type":"RUN_FINISHED","threadId":"S1","runId":"t1","outcome":{"type":"success"}}}
+{"event":{"turnId":"t2","body":{"t":"turn.started","turnId":"t2","inputIds":["c"],"replyRoute":null}}}
+{"out":{"type":"RUN_STARTED","threadId":"S1","runId":"t2"}}
+{"event":{"turnId":"t2","audience":"answer","body":{"t":"text.snapshot","text":"Done.","final":true}}}
+{"out":{"type":"TEXT_MESSAGE_START","messageId":"t2:1","role":"assistant"}}
+{"out":{"type":"TEXT_MESSAGE_CONTENT","messageId":"t2:1","delta":"Done."}}
+{"out":{"type":"TEXT_MESSAGE_END","messageId":"t2:1"}}
+{"event":{"turnId":"t2","body":{"t":"turn.completed","turnId":"t2","status":"completed"}}}
+{"out":{"type":"RUN_FINISHED","threadId":"S1","runId":"t2","outcome":{"type":"success"}}}

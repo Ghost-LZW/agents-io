@@ -33,6 +33,7 @@ Lark / email / private channel (JSONL) / terminal
 | `harness/claude-code` | Runs Claude Code through the Claude Agent SDK; also the `aio tui` terminal takeover and its `aio tui-bridge`. |
 | `harness/codex` | Uses `codex app-server` over stdio or a Unix socket; a host restart does not interrupt an active turn. |
 | `harness/jsonl-bridge` | Connects harnesses written in any language over stdio (`use: "bridge"`), with the same declarations, stop and restart, and blob access as in-process ones; `serveHarness` serves an adapter as such a program. |
+| `harness/acp` | Runs any Agent Client Protocol agent (Claude Code's ACP agent, Gemini CLI, codex-acp, …) as a harness (`use: "acp"`): capabilities from the agent's `initialize`, permission requests as approvals, `session/load` to resume. |
 | `channel/lark-bot` | Official Lark/Feishu bot with a long-lived connection and streaming cards. Create an app with [create-lark-bot](https://github.com/Ghost-LZW/create-lark-bot), or from the console (`POST /api/bots/lark`, whose schemas live in this package's `schema/`). |
 | `channel/mail` | Receives via IMAP and sends via SMTP, using DKIM/DMARC as identity evidence. |
 | `channel/jsonl-bridge` | Connects private channels written in any language over stdio or a socket. |

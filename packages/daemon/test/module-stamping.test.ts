@@ -69,6 +69,32 @@ describe('a module acts in a session only as a peer', () => {
     expect((w.turns('s4')[0]!.body as { run?: { profile?: string } }).run?.profile).toBe('restricted');
   });
 
+  it("lanes.withdraw takes back only a peer's own inputs still queued (input.cancelled, withdrawn; the agent never reads them): never another principal's, never one a turn took; a person's origin is refused #CT-1 #ID-10", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const w = await start(async (t) => {
+      if (t.inputs.some((i) => i.inputId === 'run')) await held;
+    });
+    const k = w.k();
+    const bot = peer({ id: 'external:bot', labels: ['external'] });
+    const other = peer({ id: 'external:other', labels: ['external'] });
+    await expect(k.lanes.withdraw('s5', ['x'], asOwner)).rejects.toThrow('module probe: lanes.withdraw takes a peer\'s origin (origin.kind "peer", not "human")');
+    await expect(k.lanes.withdraw('s5', ['x'], peer(owner))).rejects.toThrow('module probe: lanes.withdraw takes a peer\'s origin (a peer never carries the owner label)');
+    await expect(k.lanes.withdraw('s5', ['x'], peer({ id: 'fake:alice', labels: [] }))).rejects.toThrow('module probe: lanes.withdraw takes a peer\'s origin (fake:alice is an owner, never a peer)');
+    // No lane open: nothing queued.
+    expect(await k.lanes.withdraw('s5', ['x'], bot)).toEqual([]);
+    expect(await k.lanes.input('s5', input('run', bot))).toMatchObject({ ok: true, disposition: 'new_turn' });
+    await until(() => w.given.length === 1);
+    expect(await k.lanes.input('s5', input('mine', bot))).toMatchObject({ ok: true, disposition: 'queued' });
+    expect(await k.lanes.input('s5', input('theirs', other))).toMatchObject({ ok: true, disposition: 'queued' });
+    expect(await k.lanes.withdraw('s5', ['run', 'mine', 'theirs'], bot)).toEqual(['mine']);
+    expect(w.gw.hub.log.read('s5', 0).filter((e) => e.body.t === 'input.cancelled').map((e) => e.body)).toEqual([{ t: 'input.cancelled', inputIds: ['mine'], reason: 'withdrawn' }]);
+    release();
+    await until(() => w.turns('s5').length === 2 && w.given.length === 2);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(w.given.map((i) => i.inputId)).toEqual(['run', 'theirs']);
+  });
+
   it("schedules.addAs and removeAs refuse a person's origin, an owner-labelled peer and a peer named as an owner; a peer sets message and wake schedules only, and removes only its own #ID-10 #SC-3", async () => {
     const w = await start();
     const k = w.k();

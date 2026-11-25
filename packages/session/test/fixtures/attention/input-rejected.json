@@ -1,8 +1,0 @@
-{
-  "description": "An input rejected before any turn ran it (its turn failed to start) stops waiting; that is no turn's failure: idle.",
-  "input": [
-    {"ts": 1000, "body": {"t": "input.admitted", "inputId": "i1", "disposition": "new_turn"}},
-    {"ts": 1050, "body": {"t": "input.rejected", "inputIds": ["i1"], "reason": "start_failed: harness not available"}}
-  ],
-  "expected": {"state": "idle", "reasons": [], "since": 1050, "seq": 2}
-}

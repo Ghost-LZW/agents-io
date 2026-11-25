@@ -33,6 +33,7 @@ agents-io 提供底层机制。信任、审批、模型选择、任务和记忆�
 | `harness/claude-code` | 通过 Claude Agent SDK 驱动 Claude Code；`aio tui` 的终端接管和它的 `aio tui-bridge` 也在这里。 |
 | `harness/codex` | 通过 stdio 或 Unix socket 使用 `codex app-server`；宿主重启不会打断进行中的轮次。 |
 | `harness/jsonl-bridge` | 通过 stdio 接入用任何语言编写的 harness（`use: "bridge"`），声明、停止与重启、blob 访问与进程内的一样；`serveHarness` 把一个适配器服务成这样的程序。 |
+| `harness/acp` | 把任何 Agent Client Protocol 的 agent（Claude Code 的 ACP agent、Gemini CLI、codex-acp 等）作为 harness 运行（`use: "acp"`）：能力来自 agent 的 `initialize`，审批请求即审批，`session/load` 续接。 |
 | `channel/lark-bot` | 官方飞书/Lark 机器人，支持长连接和流式卡片；可用 [create-lark-bot](https://github.com/Ghost-LZW/create-lark-bot) 创建应用，也可以在控制台开通（`POST /api/bots/lark`，schema 在本包的 `schema/` 下）。 |
 | `channel/mail` | 通过 IMAP 收信、SMTP 发信，以 DKIM/DMARC 作为身份证据。 |
 | `channel/jsonl-bridge` | 通过 stdio 或 socket 接入用任何语言编写的私有通道。 |

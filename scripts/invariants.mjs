@@ -3,18 +3,31 @@
 //
 //   node scripts/invariants.mjs check              drift report; any drift is an error (exit 1, decision 14)
 //   node scripts/invariants.mjs affected [files…]  changed files -> invariants -> tests per tier
-//   node scripts/invariants.mjs list [ID…|--json]  the tests tagged with each id (or every test as JSON)
+//   node scripts/invariants.mjs list [ID…|--json]  the tests tagged with each id (or every test as JSON; scenarios too)
 //
 // Ids come from the `### XX-n …` headings of docs/INVARIANTS.md; tags are `#XX-n` in test names.
 // A test's tier is its file suffix: *.test.ts core, *.local.test.ts, *.e2e.test.ts, *.live.test.ts.
+// A conformance scenario (an .ndjson file whose first line is a header `{ "scenario", "description",
+// "invariants": [ids] }`, docs/design/conformance-fixtures §3) is a core test of the ids its header
+// names, if a core runner plays it: only the top-level *.ndjson of a directory in SCENARIO_DIRS count
+// (what testkit's scenarioFiles gives its runner). A scenario anywhere else is drift.
 import { execFileSync } from 'node:child_process';
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { basename, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const TIERS = ['core', 'local', 'e2e', 'live'];
 const TAG = /#([A-Z]{2}-\d+[a-z]?)(?![\w-])/g;
+const ROOTS = ['packages', 'harness', 'channel', 'examples'];
+// The scenario directories and the core test that plays each: it plays the directory's top-level
+// *.ndjson (scenarioFiles(dir), not below it). A new directory is played and counted once it is here
+// with its runner; packages/testkit/test/conformance.local.test.ts checks that this list counts
+// exactly the scenarios under packages/testkit/conformance/scenarios.
+const SCENARIO_DIRS = [
+  { dir: 'packages/testkit/conformance/scenarios/kernel', runner: 'packages/kernel/test/scenarios.test.ts' },
+  { dir: 'packages/testkit/conformance/scenarios/attention', runner: 'packages/session/test/attention.test.ts' },
+];
 
 // ---------- docs/INVARIANTS.md ----------
 
@@ -179,15 +192,73 @@ function parseTests(file) {
   return tests;
 }
 
+function walkNdjson(dir, out = []) {
+  for (const name of readdirSync(dir)) {
+    if (name === 'node_modules' || name === 'dist' || name.startsWith('.')) continue;
+    const p = join(dir, name);
+    const s = statSync(p);
+    if (s.isDirectory()) walkNdjson(p, out);
+    else if (name.endsWith('.ndjson')) out.push(p);
+  }
+  return out;
+}
+
+/** The scenario header on a file's first line, or null when it has none. */
+function scenarioHeader(file) {
+  const first = readFileSync(file, 'utf8').split('\n').find((l) => l.trim());
+  let h;
+  try {
+    h = JSON.parse(first ?? '');
+  } catch {
+    return null;
+  }
+  return h && typeof h === 'object' && typeof h.scenario === 'string' && Array.isArray(h.invariants) ? h : null;
+}
+
+/** The conformance scenarios: one core test each, tagged with the ids of its header. */
+function parseScenario(file) {
+  const h = scenarioHeader(file);
+  if (!h) return [];
+  const tags = h.invariants.filter((i) => typeof i === 'string' && /^[A-Z]{2}-\d+[a-z]?$/.test(i));
+  return [{ file: relative(root, file), line: 1, name: `${h.scenario}: ${h.description ?? ''} ${tags.map((t) => `#${t}`).join(' ')}`.trim(), kind: 'it', tags, tier: 'core', scenario: true }];
+}
+
+/** The files the scenario runners play: the top-level *.ndjson of each SCENARIO_DIRS directory, as scenarioFiles reads them. */
+function playedScenarioFiles() {
+  return SCENARIO_DIRS.flatMap(({ dir }) => {
+    const d = join(root, ...dir.split('/'));
+    try {
+      return readdirSync(d).filter((f) => f.endsWith('.ndjson')).map((f) => join(d, f));
+    } catch {
+      return [];
+    }
+  }).sort();
+}
+
+/** Every .ndjson with a scenario header that no runner plays (below a scenario directory, or anywhere else). */
+function strayScenarioFiles() {
+  const played = new Set(playedScenarioFiles());
+  return ROOTS.flatMap((d) => {
+    try {
+      return walkNdjson(join(root, d));
+    } catch {
+      return [];
+    }
+  }).filter((f) => !played.has(f) && scenarioHeader(f)).sort();
+}
+
 function readTests() {
-  const files = ['packages', 'harness', 'channel', 'examples'].flatMap((d) => {
+  const files = ROOTS.flatMap((d) => {
     try {
       return walk(join(root, d));
     } catch {
       return [];
     }
   });
-  return files.sort().flatMap((f) => parseTests(f).map((t) => ({ ...t, tier: tierOf(f) })));
+  return [
+    ...files.sort().flatMap((f) => parseTests(f).map((t) => ({ ...t, tier: tierOf(f) }))),
+    ...playedScenarioFiles().flatMap(parseScenario),
+  ];
 }
 
 // ---------- commands ----------
@@ -231,6 +302,21 @@ function check() {
     'core tests without an #ID tag (a promise-less test belongs in *.local.test.ts)',
     tests.filter((t) => t.tier === 'core' && t.tags.length === 0).map((t) => `${t.file}:${t.line}  ${t.name}`),
   );
+  section(
+    'scenario files no core runner plays (a runner plays only the top-level *.ndjson of a directory in SCENARIO_DIRS, scripts/invariants.mjs)',
+    strayScenarioFiles().map((f) => relative(root, f)),
+  );
+  section(
+    'files a scenario runner plays that have no scenario header on their first line',
+    playedScenarioFiles().filter((f) => !scenarioHeader(f)).map((f) => relative(root, f)),
+  );
+  section(
+    'scenario directories whose runner is missing or does not call scenarioFiles',
+    SCENARIO_DIRS.filter(({ runner }) => {
+      const p = join(root, ...runner.split('/'));
+      return tierOf(p) !== 'core' || !existsSync(p) || !readFileSync(p, 'utf8').includes('scenarioFiles(');
+    }).map(({ dir, runner }) => `${dir}  (runner ${runner})`),
+  );
   const has = (e, kind) => (tagged.get(e.id) ?? []).some((t) => t.kind === kind);
   section(
     'invariants marked 不成立 with no it.fails tagged with them (an it.todo does not count: reproduce it)',
@@ -238,7 +324,7 @@ function check() {
   );
   // Quoted test names in INVARIANTS.md that match no test (renamed or deleted).
   const names = tests.map((t) => t.name);
-  const describes = tests.map((t) => t.file).filter((f, i, a) => a.indexOf(f) === i)
+  const describes = tests.filter((t) => !t.scenario).map((t) => t.file).filter((f, i, a) => a.indexOf(f) === i)
     .flatMap((f) => [...readFileSync(join(root, f), 'utf8').matchAll(/\bdescribe(?:\.\w+)*\(\s*(['"`])((?:(?!\1).)*)\1/g)].map((d) => d[2]));
   const testFields = [...entries.values()].flatMap((e) =>
     Object.entries(e.fields).filter(([k]) => /^(测试|实现与测试|状态)/.test(k)).map(([, v]) => v),
@@ -287,7 +373,7 @@ function affected(args) {
   const add = (id, why) => hit.set(id, [...new Set([...(hit.get(id) ?? []), why])]);
   for (const f of files) {
     let found = false;
-    if (/\.test\.ts$/.test(f)) {
+    if (/\.test\.ts$/.test(f) || /\.ndjson$/.test(f)) {
       for (const t of tests.filter((t) => t.file === f)) for (const id of t.tags) (add(id, `tests in ${f}`), (found = true));
     } else {
       for (const e of entries.values()) {

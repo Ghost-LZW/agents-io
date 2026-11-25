@@ -1,0 +1,19 @@
+{"projection":"ag-ui","name":"requests-and-plan","description":"A plan is an ACTIVITY_SNAPSHOT (PLAN) that replaces the last; requests are CUSTOM events agents-io.request.opened / resolved (an AG-UI client answers none); text items are not tool calls; an MCP tool's call is named server.tool.","options":{"threadId":"S1"}}
+{"event":{"turnId":"t1","body":{"t":"turn.started","turnId":"t1","inputIds":["a"],"replyRoute":null}}}
+{"out":{"type":"RUN_STARTED","threadId":"S1","runId":"t1"}}
+{"event":{"turnId":"t1","body":{"t":"plan.updated","steps":[{"text":"read","status":"in_progress"},{"text":"write","status":"pending"}]}}}
+{"out":{"type":"ACTIVITY_SNAPSHOT","messageId":"t1:plan","activityType":"PLAN","content":{"steps":[{"text":"read","status":"in_progress"},{"text":"write","status":"pending"}]},"replace":true}}
+{"event":{"turnId":"t1","body":{"t":"request.opened","requestId":"r1","kind":"tool_approval","title":"Run make","risk":{},"allowedDecisions":[],"allowAlways":false,"defaultDeny":true,"resolver":{"kind":"human","principals":["fake:alice"],"routes":[]}}}}
+{"out":{"type":"CUSTOM","name":"agents-io.request.opened","value":{"requestId":"r1","kind":"tool_approval","title":"Run make"}}}
+{"event":{"turnId":"t1","body":{"t":"request.resolved","requestId":"r1","decision":{"kind":"allow_once"},"by":{"kind":"human","id":"fake:alice"}}}}
+{"out":{"type":"CUSTOM","name":"agents-io.request.resolved","value":{"requestId":"r1","decision":"allow_once"}}}
+{"event":{"turnId":"t1","itemId":"m1","body":{"t":"item.started","item":{"itemId":"m1","type":"agent_message","title":"message","status":"running"}}}}
+{"event":{"turnId":"t1","itemId":"i2","body":{"t":"item.completed","item":{"itemId":"i2","type":"mcp_tool","title":"agents_io.get_channel_context","status":"completed","tool":{"server":"agents_io","name":"get_channel_context"}}}}}
+{"out":{"type":"TOOL_CALL_START","toolCallId":"i2","toolCallName":"agents_io.get_channel_context"}}
+{"out":{"type":"TOOL_CALL_ARGS","toolCallId":"i2","delta":"{\"title\":\"agents_io.get_channel_context\"}"}}
+{"out":{"type":"TOOL_CALL_END","toolCallId":"i2"}}
+{"out":{"type":"TOOL_CALL_RESULT","messageId":"i2:result","toolCallId":"i2","content":"completed","role":"tool"}}
+{"event":{"turnId":"t1","body":{"t":"plan.updated","steps":[{"text":"read","status":"completed"},{"text":"write","status":"completed"}]}}}
+{"out":{"type":"ACTIVITY_SNAPSHOT","messageId":"t1:plan","activityType":"PLAN","content":{"steps":[{"text":"read","status":"completed"},{"text":"write","status":"completed"}]},"replace":true}}
+{"event":{"turnId":"t1","body":{"t":"turn.completed","turnId":"t1","status":"completed"}}}
+{"out":{"type":"RUN_FINISHED","threadId":"S1","runId":"t1","outcome":{"type":"success"}}}

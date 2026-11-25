@@ -730,6 +730,12 @@ export const ExternalCallout = Type.Object({
     content: Type.Array(ContentBlock),
     /** The send's operationId (`op: send`) or the input's id (`op: input`), as the daemon will record it. */
     id: Type.String(),
+    /**
+     * Where the client came in when it is not the external MCP endpoint (absent), by the endpoint
+     * module's id: `acp-server` (the ACP server, `aio acp`) or `ag-ui` (the AG-UI endpoint). `client`
+     * is its name in that endpoint's `clients`.
+     */
+    endpoint: Type.Optional(Type.Union([Type.Literal('acp-server'), Type.Literal('ag-ui')])),
   }),
 });
 

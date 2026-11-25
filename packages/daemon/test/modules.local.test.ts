@@ -87,6 +87,9 @@ const PRESETS = { id: 'presets', origin: 'builtin', enabled: true };
 /** The owner's run-config commands as a file without their section resolves them, and in `GET /api/status` `modules`: on. */
 const OWNER_COMMANDS_RESOLVED = { id: 'owner-commands', enabled: true, config: {} };
 const OWNER_COMMANDS = { id: 'owner-commands', origin: 'builtin', enabled: true };
+/** The north projections (G9) as a file without their sections resolves them, and in `GET /api/status` `modules`: off. */
+const NORTH_RESOLVED = [{ id: 'acp-server', enabled: false }, { id: 'ag-ui', enabled: false }];
+const NORTH = [{ id: 'acp-server', origin: 'builtin', enabled: false }, { id: 'ag-ui', origin: 'builtin', enabled: false }];
 
 const resolve = (raw: Record<string, unknown>, moduleRegistry?: ModuleRegistry) => resolveConfig(raw, { env: {}, baseDir: '/base', cwd: '/work', ...(moduleRegistry ? { moduleRegistry } : {}) });
 
@@ -100,14 +103,14 @@ const thrown = (f: () => unknown): string => {
 };
 
 describe('the module registry', () => {
-  it('the built-in ones are the topic titles and the watch, live and topic tools, on by default, the stranger approval, off by default, the presets and the owner\'s run-config commands, on, and the external MCP endpoint, off: their sections are in ConfigFile where externalMcp always was (presets where it was before it was a module\'s); an empty registry has no modules', () => {
-    expect(builtinModules.modules.map((m) => [m.manifest.id, m.origin])).toEqual([['topic-title', 'builtin'], ['tools.watch', 'builtin'], ['tools.schedules', 'builtin'], ['tools.live', 'builtin'], ['tools.topics', 'builtin'], ['strangers', 'builtin'], ['presets', 'builtin'], ['owner-commands', 'builtin'], ['external-mcp', 'builtin']]);
+  it('the built-in ones are the topic titles and the watch, live and topic tools, on by default, the stranger approval, off by default, the presets and the owner\'s run-config commands, on, the north projections (ACP server, AG-UI endpoint), off, and the external MCP endpoint, off: their sections are in ConfigFile where externalMcp always was (presets where it was before it was a module\'s); an empty registry has no modules', () => {
+    expect(builtinModules.modules.map((m) => [m.manifest.id, m.origin])).toEqual([['topic-title', 'builtin'], ['tools.watch', 'builtin'], ['tools.schedules', 'builtin'], ['tools.live', 'builtin'], ['tools.topics', 'builtin'], ['strangers', 'builtin'], ['presets', 'builtin'], ['owner-commands', 'builtin'], ['acp-server', 'builtin'], ['ag-ui', 'builtin'], ['external-mcp', 'builtin']]);
     expect(configFileSchema(builtinHarnesses)).toBe(ConfigFile);
-    expect(Object.keys(ConfigFile.properties).slice(-10)).toEqual(['host', 'topicTitles', 'watchTools', 'scheduleTools', 'liveTools', 'topicTools', 'strangers', 'ownerCommands', 'externalMcp', 'local']);
+    expect(Object.keys(ConfigFile.properties).slice(-12)).toEqual(['host', 'topicTitles', 'watchTools', 'scheduleTools', 'liveTools', 'topicTools', 'strangers', 'ownerCommands', 'acpServer', 'agUi', 'externalMcp', 'local']);
     // The presets' section is where it was in the file before it was a module's: after harness, before agents.
     const keys = Object.keys(ConfigFile.properties);
     expect(keys.slice(keys.indexOf('harness'), keys.indexOf('harness') + 3)).toEqual(['harness', 'presets', 'agents']);
-    expect(resolve({}).modules).toEqual([{ id: 'topic-title', enabled: true, config: {} }, ...TOOL_MODULES_RESOLVED, STRANGERS_RESOLVED, PRESETS_RESOLVED, OWNER_COMMANDS_RESOLVED, { id: 'external-mcp', enabled: false }]);
+    expect(resolve({}).modules).toEqual([{ id: 'topic-title', enabled: true, config: {} }, ...TOOL_MODULES_RESOLVED, STRANGERS_RESOLVED, PRESETS_RESOLVED, OWNER_COMMANDS_RESOLVED, ...NORTH_RESOLVED, { id: 'external-mcp', enabled: false }]);
     expect(resolve({}).externalMcp).toBeUndefined();
     // On: its settings are the module's, and (deprecated) Config.externalMcp is the same object.
     const on = resolve({ externalMcp: { clients: {} } });
@@ -117,6 +120,7 @@ describe('the module registry', () => {
       STRANGERS_RESOLVED,
       PRESETS_RESOLVED,
       OWNER_COMMANDS_RESOLVED,
+      ...NORTH_RESOLVED,
       { id: 'external-mcp', enabled: true, config: { host: '127.0.0.1', port: 7465, clients: [], limits: { maxBodyBytes: 262144, maxTextChars: 16000, requestsPerMinute: 120, writesPerMinute: 20 } } },
     ]);
     expect(on.externalMcp).toBe(on.modules!.find((m) => m.id === 'external-mcp')!.config);
@@ -358,7 +362,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     expect(w.gw.adminStatus().modules).toEqual([]);
     const b = await daemon(builtinModules);
     expect(await features(b.socketPath)).toEqual(KERNEL_HELLO);
-    expect(b.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, PRESETS, OWNER_COMMANDS, { id: 'external-mcp', origin: 'builtin', enabled: false }]);
+    expect(b.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, PRESETS, OWNER_COMMANDS, ...NORTH, { id: 'external-mcp', origin: 'builtin', enabled: false }]);
     expect(b.gw.adminStatus()).not.toHaveProperty('externalMcp');
   });
 
@@ -368,7 +372,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     const st = w.gw.adminStatus();
     expect(st.externalMcp).toEqual({ url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\//), clients: [] });
     expect(Object.keys(st).slice(-2)).toEqual(['externalMcp', 'modules']);
-    expect(st.modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, PRESETS, OWNER_COMMANDS, { id: 'external-mcp', origin: 'builtin', enabled: true, status: st.externalMcp }]);
+    expect(st.modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, PRESETS, OWNER_COMMANDS, ...NORTH, { id: 'external-mcp', origin: 'builtin', enabled: true, status: st.externalMcp }]);
     // Stopping closes it first: nothing listens there afterwards.
     await w.gw.stop();
     await expect(fetch(st.externalMcp!.url, { method: 'POST' })).rejects.toThrow();
@@ -381,7 +385,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     const busy = await daemon(builtinModules, { externalMcp: { listen: `127.0.0.1:${port}`, clients: {} } }, undefined, undefined, (level, msg) => logs.push(`${level}: ${msg}`));
     expect(await features(busy.socketPath)).toEqual(KERNEL_HELLO);
     expect(busy.gw.adminStatus()).not.toHaveProperty('externalMcp');
-    expect(busy.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, PRESETS, OWNER_COMMANDS, { id: 'external-mcp', origin: 'builtin', enabled: true }]);
+    expect(busy.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, PRESETS, OWNER_COMMANDS, ...NORTH, { id: 'external-mcp', origin: 'builtin', enabled: true }]);
     expect(logs).toContainEqual(expect.stringMatching(new RegExp(`^error: module external-mcp: external MCP endpoint not started: cannot listen on 127\\.0\\.0\\.1:${port}: `)));
   });
 
@@ -389,10 +393,10 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     const settings = resolveConfig({ externalMcp: { listen: '127.0.0.1:0', clients: {} } }, { env: {}, baseDir: '/base', cwd: '/work' }).externalMcp!;
     const on = await daemon(builtinModules, {}, undefined, undefined, undefined, (c) => ({ ...c, externalMcp: settings }));
     expect(await features(on.socketPath)).toEqual([...KERNEL_HELLO, 'external.mcp']);
-    expect(on.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, PRESETS, OWNER_COMMANDS, { id: 'external-mcp', origin: 'builtin', enabled: true, status: { url: expect.any(String), clients: [] } }]);
+    expect(on.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, PRESETS, OWNER_COMMANDS, ...NORTH, { id: 'external-mcp', origin: 'builtin', enabled: true, status: { url: expect.any(String), clients: [] } }]);
     const off = await daemon(builtinModules, { externalMcp: { listen: '127.0.0.1:0', clients: {} } }, undefined, undefined, undefined, ({ externalMcp: _, ...c }) => c);
     expect(await features(off.socketPath)).toEqual(KERNEL_HELLO);
-    expect(off.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, PRESETS, OWNER_COMMANDS, { id: 'external-mcp', origin: 'builtin', enabled: false }]);
+    expect(off.gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, PRESETS, OWNER_COMMANDS, ...NORTH, { id: 'external-mcp', origin: 'builtin', enabled: false }]);
     // A config without modules at all (built by hand, as before modules): the field still decides; a built-in module
     // without one is as a file without its section makes it (the topic titles, on as before); any other module is still an error.
     const dir = mkdtempSync(join(tmpdir(), 'aio-mod-'));
@@ -403,7 +407,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
     cleanups.push(() => gw.stop());
     expect(await features(bare.socketPath)).toEqual([...KERNEL_HELLO, 'external.mcp']);
     // The presets follow their field too (`Config.presets`, deprecated): absent, they are off (none).
-    expect(gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, { ...PRESETS, enabled: false }, OWNER_COMMANDS, { id: 'external-mcp', origin: 'builtin', enabled: true, status: { url: expect.any(String), clients: [] } }]);
+    expect(gw.adminStatus().modules).toEqual([{ id: 'topic-title', origin: 'builtin', enabled: true }, ...TOOL_MODULES, STRANGERS, { ...PRESETS, enabled: false }, OWNER_COMMANDS, ...NORTH, { id: 'external-mcp', origin: 'builtin', enabled: true, status: { url: expect.any(String), clients: [] } }]);
     await gw.stop();
     const withProbe = new ModuleRegistry([...builtinModules.modules, { manifest: probe('probe', []), origin: 'module' as const }], { fields: { 'external-mcp': { config: 'externalMcp' } } });
     await expect(Gateway.start({ config: bare, harness: new FakeHarness(), log: new MemorySessionLog(), listen: false, moduleRegistry: withProbe, logger: () => {} })).rejects.toThrow('module probe is registered but the config was resolved without it');

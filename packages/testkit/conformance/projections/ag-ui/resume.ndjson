@@ -1,0 +1,28 @@
+{"projection":"ag-ui","name":"resume","description":"A resume (GET from a seq): every turn is a run of its own (runId its turn id). Reasoning is a reasoning message, ended by the answer; a final answer repeating what was streamed is not said again; an interrupted turn finishes cancelled, a failed one is RUN_ERROR with its code.","options":{"threadId":"S1"}}
+{"event":{"turnId":"t1","body":{"t":"turn.started","turnId":"t1","inputIds":["a"],"replyRoute":null}}}
+{"out":{"type":"RUN_STARTED","threadId":"S1","runId":"t1"}}
+{"event":{"turnId":"t1","body":{"t":"text.delta","delta":"hmm","stream":"reasoning"}}}
+{"out":{"type":"REASONING_START","messageId":"t1:r1"}}
+{"out":{"type":"REASONING_MESSAGE_START","messageId":"t1:r1","role":"reasoning"}}
+{"out":{"type":"REASONING_MESSAGE_CONTENT","messageId":"t1:r1","delta":"hmm"}}
+{"event":{"turnId":"t1","body":{"t":"text.delta","delta":"Done.","stream":"answer"}}}
+{"out":{"type":"REASONING_MESSAGE_END","messageId":"t1:r1"}}
+{"out":{"type":"REASONING_END","messageId":"t1:r1"}}
+{"out":{"type":"TEXT_MESSAGE_START","messageId":"t1:2","role":"assistant"}}
+{"out":{"type":"TEXT_MESSAGE_CONTENT","messageId":"t1:2","delta":"Done."}}
+{"event":{"turnId":"t1","audience":"answer","body":{"t":"text.snapshot","text":"Done.","final":true}}}
+{"out":{"type":"TEXT_MESSAGE_END","messageId":"t1:2"}}
+{"event":{"turnId":"t1","body":{"t":"turn.completed","turnId":"t1","status":"completed"}}}
+{"out":{"type":"RUN_FINISHED","threadId":"S1","runId":"t1","outcome":{"type":"success"}}}
+{"event":{"turnId":"t2","body":{"t":"turn.started","turnId":"t2","inputIds":["b"],"replyRoute":null}}}
+{"out":{"type":"RUN_STARTED","threadId":"S1","runId":"t2"}}
+{"event":{"turnId":"t2","body":{"t":"text.delta","delta":"Start","stream":"answer"}}}
+{"out":{"type":"TEXT_MESSAGE_START","messageId":"t2:1","role":"assistant"}}
+{"out":{"type":"TEXT_MESSAGE_CONTENT","messageId":"t2:1","delta":"Start"}}
+{"event":{"turnId":"t2","body":{"t":"turn.completed","turnId":"t2","status":"interrupted"}}}
+{"out":{"type":"TEXT_MESSAGE_END","messageId":"t2:1"}}
+{"out":{"type":"RUN_FINISHED","threadId":"S1","runId":"t2","outcome":{"type":"cancelled"}}}
+{"event":{"turnId":"t3","body":{"t":"turn.started","turnId":"t3","inputIds":["c"],"replyRoute":null}}}
+{"out":{"type":"RUN_STARTED","threadId":"S1","runId":"t3"}}
+{"event":{"turnId":"t3","body":{"t":"turn.completed","turnId":"t3","status":"failed","error":{"code":"start_failed","retryable":false,"message":"the harness did not start"}}}}
+{"out":{"type":"RUN_ERROR","message":"the harness did not start","code":"start_failed"}}

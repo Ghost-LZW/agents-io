@@ -139,6 +139,15 @@ export const ClientFrame = Type.Union([
    * Default session: the local one.
    */
   Type.Object({ v: V, type: Type.Literal('tui.attach'), id: Type.String(), sessionKey: Type.Optional(Type.String()) }),
+  /**
+   * Hand this connection to a feature module that speaks its own protocol on it
+   * (`ModuleInstance.connect`; a daemon without it answers `invalid_frame`): `module` is its id, `hello` what it reads to decide
+   * (its client's name and token: the ACP server's `aio acp`). Accepted (`ok: true`, the module's
+   * `value`), the connection is the module's from the next line on: JSON values both ways, no more
+   * frames. Refused, it stays a client connection (`unsupported`: no running module of that id takes
+   * connections; `forbidden`: the connection said `host.hello`, or subscribed; else the module's code).
+   */
+  Type.Object({ v: V, type: Type.Literal('module.connect'), id: Type.String(), module: Type.String(), hello: Type.Optional(Type.Unknown()) }),
 ]);
 export type ClientFrame = Static<typeof ClientFrame>;
 
@@ -196,7 +205,7 @@ export const ServerFrame = Type.Union([
   /**
    * Answer to a request (`ClientResultFrame`). Values: input → `{ inputId, disposition }`; subscribe →
    * `{ head }`; sessions → `SessionInfo[]`; topic.list → `Topic[]`; topic.switch →
-   * `TopicSwitchResult`; tui.attach → `TuiAttach`; others → `{}`. Errors carry the lane's
+   * `TopicSwitchResult`; tui.attach → `TuiAttach`; module.connect → the module's value; others → `{}`. Errors carry the lane's
    * reason as `code` (`forbidden`, `not_eligible`, `no_active_turn`, …; `op_id_conflict`).
    */
   ClientResultFrame,
@@ -207,5 +216,5 @@ export const ServerFrame = Type.Union([
 ]);
 export type ServerFrame = Static<typeof ServerFrame>;
 
-export const CLIENT_FRAME_TYPES = ['command', 'sessions', 'watch.add', 'watch.remove', 'watch.list', 'topic.list', 'topic.switch', 'tui.attach'] as const;
+export const CLIENT_FRAME_TYPES = ['command', 'sessions', 'watch.add', 'watch.remove', 'watch.list', 'topic.list', 'topic.switch', 'tui.attach', 'module.connect'] as const;
 export const SERVER_FRAME_TYPES = ['result', 'event', 'closed'] as const;

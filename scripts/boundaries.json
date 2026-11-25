@@ -17,6 +17,7 @@
       "role": "test",
       "may": ["packages/protocol", "packages/session", "packages/host-mcp", "packages/daemon", "packages/testkit", "harness/codex"]
     },
+    "harness/acp": { "role": "module", "may": ["packages/protocol"] },
     "harness/claude-code": { "role": "module", "may": ["packages/protocol"] },
     "harness/codex": { "role": "module", "may": ["packages/protocol"] },
     "harness/jsonl-bridge": { "role": "module", "may": ["packages/protocol"] },
@@ -28,6 +29,6 @@
   "vendor": {
     "$comment": "Names that mean a core file knows a concrete module: identifiers containing these words (case-insensitive) in code, and string literals equal to a module id (not `mail`: it is also a conversation kind).",
     "identifierWords": ["lark", "feishu", "codex", "claude", "imap", "smtp"],
-    "literals": ["lark-bot", "lark", "feishu", "codex", "claude-code"]
+    "literals": ["lark-bot", "lark", "feishu", "codex", "claude-code", "acp"]
   }
 }

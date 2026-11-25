@@ -1,0 +1,7 @@
+{"scenario":"turn-ends-its-requests","description":"A turn that completes ends the requests still open (as the snapshot's pendingRequests), even when no request.resolved came for them.","invariants":["LN-11"]}
+{"emit":{"end":"log","event":{"ts":1000,"body":{"t":"input.admitted","inputId":"i1","disposition":"new_turn"}}}}
+{"emit":{"end":"log","event":{"ts":1001,"body":{"t":"turn.started","turnId":"t1","inputIds":["i1"],"replyRoute":null}}}}
+{"emit":{"end":"log","event":{"ts":1002,"body":{"t":"session.state","state":"running"}}}}
+{"emit":{"end":"log","event":{"ts":1100,"turnId":"t1","audience":"approval","body":{"t":"request.opened","requestId":"r1","kind":"tool_approval","title":"Bash: ls","risk":{},"allowedDecisions":["allow_once","deny"],"allowAlways":false,"defaultDeny":true,"resolver":{"kind":"human","principals":["owner"],"routes":["fake:default:c1"]}}}}}
+{"emit":{"end":"log","event":{"ts":2000,"body":{"t":"turn.completed","turnId":"t1","status":"completed"}}}}
+{"expect":{"end":"attention","exact":true,"match":{"state":"idle","reasons":[],"since":2000,"seq":5}}}

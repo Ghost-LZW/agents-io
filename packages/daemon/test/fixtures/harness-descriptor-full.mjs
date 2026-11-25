@@ -44,6 +44,9 @@ export const cliNotFn = { ...createHarness, cli: { 'acme-hello': 'echo' } };
 /** A built-in kind's command (Claude Code's tui-bridge). */
 export const builtinCli = { ...createHarness, cli: { 'tui-bridge': hello } };
 
+/** A built-in feature module's command (the acp-server module's `aio acp`). */
+export const featureCli = { ...createHarness, cli: { acp: hello } };
+
 /** The same command name as createHarness, another function. */
 export const otherHello = { ...createHarness, cli: { 'acme-hello': async () => 0 } };
 

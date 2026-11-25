@@ -1,0 +1,9 @@
+{"scenario":"request-answered","description":"Once the human request is resolved, the session is working again (its turn goes on), from the request.resolved.","invariants":["LN-11"]}
+{"emit":{"end":"log","event":{"ts":1000,"body":{"t":"input.admitted","inputId":"i1","disposition":"new_turn"}}}}
+{"emit":{"end":"log","event":{"ts":1001,"body":{"t":"turn.started","turnId":"t1","inputIds":["i1"],"replyRoute":null}}}}
+{"emit":{"end":"log","event":{"ts":1002,"body":{"t":"session.state","state":"running"}}}}
+{"emit":{"end":"log","event":{"ts":1100,"turnId":"t1","audience":"approval","body":{"t":"request.opened","requestId":"r1","kind":"tool_approval","title":"Bash: rm -rf build","risk":{},"allowedDecisions":["allow_once","deny"],"allowAlways":false,"defaultDeny":true,"resolver":{"kind":"human","principals":["owner"],"routes":["fake:default:c1"]}}}}}
+{"emit":{"end":"log","event":{"ts":1101,"body":{"t":"session.state","state":"requires_action"}}}}
+{"emit":{"end":"log","event":{"ts":1200,"turnId":"t1","audience":"approval","body":{"t":"request.resolved","requestId":"r1","decision":{"kind":"allow_once"},"by":{"kind":"human","id":"owner"}}}}}
+{"emit":{"end":"log","event":{"ts":1201,"body":{"t":"session.state","state":"running"}}}}
+{"expect":{"end":"attention","exact":true,"match":{"state":"working","reasons":[],"since":1200,"seq":6,"turnId":"t1"}}}

@@ -288,7 +288,7 @@ dev-gateway 没有宿主，用由 `policy.owners` 生成的默认表（`ownersTa
 - **档位**：由配置决定。
 - **对端起不来**：首次 `hello` 失败不会让守护进程启动失败。通道显示为 `failed`（`GET /api/status` 给出原因，后缀 `; retrying`），按 `backoff` 重试，连上后变回 `running`（之后对端离开、重连期间同样显示 `failed`）；命令本身无法执行（`ENOENT` / `EACCES`）仍让启动失败。未连接时请求以 `unavailable`（可重试）失败。见 `docs/design/bridge-first-connect`。
 - **通道 id**：可选的 `id` 是这个通道的 id，每次 `hello` 声明的 `adapterId` 都必须等于它，否则按 `bad_hello` 拒绝、杀掉子进程并按 `backoff` 重启（状态 `failed`，原因写明）；未连接时也用它显示与路由。不写 `id` 时第一次成功 `hello` 的 id 被固定，之后的 hello 不许换。见下文"通道盖章"。
-- **harness 也可以这样接**：任何语言写的 harness 程序同样经 JSONL stdio 接进来（harness 种类 `bridge`，`harness/jsonl-bridge`），它在 `probe` 的回答里声明的与进程内的 harness 一样起作用，见 HOSTS §4.8。
+- **harness 也可以这样接**：任何语言写的 harness 程序同样经 JSONL stdio 接进来（harness 种类 `bridge`，`harness/jsonl-bridge`），它在 `probe` 的回答里声明的与进程内的 harness 一样起作用，见 HOSTS §4.8；支持 Agent Client Protocol 的 agent 不用写程序，直接配成 harness 种类 `acp`（`harness/acp`，HOSTS §4.10）。内建的 harness 种类：`claude-code`、`codex`、`bridge`、`acp`，加上 `module`。
 
 ### 通道盖章（channel-stamping，决定 13）
 

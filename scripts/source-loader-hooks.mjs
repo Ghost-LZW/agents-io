@@ -13,6 +13,7 @@ const dirs = {
   'channel-jsonl-bridge': 'channel/jsonl-bridge',
   'channel-lark-bot': 'channel/lark-bot',
   'channel-mail': 'channel/mail',
+  'harness-acp': 'harness/acp',
   'harness-claude-code': 'harness/claude-code',
   'harness-codex': 'harness/codex',
   'harness-jsonl-bridge': 'harness/jsonl-bridge',

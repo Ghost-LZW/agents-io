@@ -1,10 +1,13 @@
 import { bridgeChannelModule, type BridgeChannelEntry } from '@agents-io/channel-jsonl-bridge';
 import { larkBotChannelModule, type LarkBotChannelEntry, type LarkBotChannelSettings } from '@agents-io/channel-lark-bot';
 import { mailChannelModule, type MailChannelEntry } from '@agents-io/channel-mail';
+import { acpHarnessModule } from '@agents-io/harness-acp';
 import { claudeCodeHarnessModule } from '@agents-io/harness-claude-code';
 import { codexHarnessModule } from '@agents-io/harness-codex';
 import { bridgeHarnessModule } from '@agents-io/harness-jsonl-bridge';
 import { ChannelRegistry, HarnessRegistry, ModuleRegistry, moduleChannelModule, type ModuleChannelEntry, type ModuleChannelSettings } from '@agents-io/kernel';
+import { acpServerModule, type AcpServerSection } from './acp-server.js';
+import { agUiModule, type AgUiSection } from './ag-ui.js';
 import { externalMcpModule, type ExternalMcpSection } from './external-mcp.js';
 import { ownerCommandsModule, type OwnerCommandsSection } from './owner-commands.js';
 import { presetsModule, type PresetsSection } from './presets.js';
@@ -21,11 +24,12 @@ import { topicTitleModule, type TopicTitleSection } from './topic-title.js';
 /**
  * The built-in harness kinds; Claude Code first, the default kind. Then Codex, and the bridge: a
  * harness in another process, any language, over JSONL stdio (`use: "bridge"`), which says what it
- * declares in its hello, so its instances are probed at start (`HarnessModule.probeAtStart`).
+ * declares in its hello, so its instances are probed at start (`HarnessModule.probeAtStart`). Then
+ * any Agent Client Protocol agent (`use: "acp"`, core-slimming G9), started on its first turn.
  * `launchAliases` (deprecated, one release): the `HarnessInstance` fields their launch settings
  * were under before `launch`.
  */
-export const builtinHarnesses = new HarnessRegistry([claudeCodeHarnessModule, codexHarnessModule, bridgeHarnessModule], {
+export const builtinHarnesses = new HarnessRegistry([claudeCodeHarnessModule, codexHarnessModule, bridgeHarnessModule, acpHarnessModule], {
   launchAliases: { [claudeCodeHarnessModule.kind]: 'claude', [codexHarnessModule.kind]: 'codex' },
 });
 
@@ -58,7 +62,10 @@ export const builtinChannels = new ChannelRegistry([larkBotChannelModule, mailCh
  * settings. Then the owner's run-config chat commands (`/agent`, `/preset`, `/model`, `/effort`,
  * `/plan`, `/bypass`, `/compact` and their `/status` line; a host-level feature, decision 16): on
  * unless `ownerCommands: { enabled: false }`; what they set and `Policy.plan` stay the kernel's,
- * which asks the presets module what a preset gives. The external MCP endpoint (off unless its
+ * which asks the presets module what a preset gives. Then the north projections (core-slimming
+ * G9), each off unless its section is in the file: the ACP server (`acpServer`; editors and t3code
+ * reach a session through `aio acp`, the command it adds to the CLI) and the AG-UI endpoint (`agUi`;
+ * web UIs, over HTTP and SSE). The external MCP endpoint (off unless its
  * section `externalMcp` is in the file) is the
  * last: it starts after everything else and stops first, so no external write comes in while the
  * rest stops; a module added later goes before it. Its settings and status stay where they were
@@ -67,7 +74,7 @@ export const builtinChannels = new ChannelRegistry([larkBotChannelModule, mailCh
  * kind's adapter does (`HarnessAdapter.takeover`, with the `tui-bridge` command its kind adds to the
  * CLI), and the gateway's part of it names no harness.
  */
-export const builtinModules = new ModuleRegistry([topicTitleModule, watchToolsModule, scheduleToolsModule, liveToolsModule, topicToolsModule, strangersModule, presetsModule, ownerCommandsModule, externalMcpModule], {
+export const builtinModules = new ModuleRegistry([topicTitleModule, watchToolsModule, scheduleToolsModule, liveToolsModule, topicToolsModule, strangersModule, presetsModule, ownerCommandsModule, acpServerModule, agUiModule, externalMcpModule], {
   origin: 'builtin',
   fields: {
     [strangersModule.id]: { switch: { path: 'policy.strangers', on: 'ask', off: 'drop' } },
@@ -87,6 +94,8 @@ export interface BuiltinModuleSections {
   strangers?: StrangersSection;
   presets?: PresetsSection;
   ownerCommands?: OwnerCommandsSection;
+  acpServer?: AcpServerSection;
+  agUi?: AgUiSection;
   externalMcp?: ExternalMcpSection;
 }
 
@@ -104,6 +113,12 @@ export { DEFAULT_PRESET, type PresetConfig, type PresetsConfig, type PresetsSect
 
 /** The owner's run-config commands' section (`ownerCommands`: only `enabled`). */
 export type { OwnerCommandsSection } from './owner-commands.js';
+
+/** The ACP server's section and settings (`acpServer`; `aio acp`). */
+export type { AcpServerClient, AcpServerConfig, AcpServerSection } from './acp-server.js';
+
+/** The AG-UI endpoint's section and settings (`agUi`). */
+export { DEFAULT_AG_UI_PORT, type AgUiConfig, type AgUiSection } from './ag-ui.js';
 
 /** The external MCP endpoint's settings and their parts (`Config.externalMcp`, deprecated: `Config.modules`). */
 export { DEFAULT_EXTERNAL_MCP_PORT, type ExternalMcpClient, type ExternalMcpConfig, type ExternalMcpSection } from './external-mcp.js';
