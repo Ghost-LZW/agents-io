@@ -1,4 +1,5 @@
 import type {
+  AdminBackends,
   AdminChannelsApplied,
   AdminConfigDocument,
   AdminConfigPutResult,
@@ -15,7 +16,7 @@ import type {
 import type { ChannelRegistry } from './channel-registry.js';
 import type { Config, ConsoleConfig } from './config.js';
 import type { ImportConfigModules } from './config-modules.js';
-import type { LogFn } from './gateway.js';
+import type { LogFn, Outcome } from './gateway.js';
 import type { HarnessRegistry } from './harness-registry.js';
 import type { LocalHost } from './local-server.js';
 import type { ModuleRegistry } from './modules.js';
@@ -42,9 +43,17 @@ export interface ConsoleHost {
   readonly local: LocalHost;
   /** The daemon's host token. */
   readonly token: string;
+  /** The backend whose key this token is (PB-1). Such a token opens `/ws` only: every `/api/*` answers 403. */
+  backendOf?(token: string): string | undefined;
   status(): AdminStatus;
   queue(): AdminQueue;
   sessions(): AdminSessions;
+  /** Backend keys and state (PB-3). Absent: `/api/backends*` answer 404. */
+  readonly backends?: {
+    list(): AdminBackends;
+    key(id: string, op: 'issue' | 'rotate' | 'revoke'): Outcome;
+    forget(id: string): Outcome;
+  };
   explain(inputId: string): AdminExplain | undefined;
   /** Origin of a console connection's client frames. */
   consoleOrigin(sessionKey: string): Origin;

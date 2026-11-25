@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, link, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { BlobStore } from '@agents-io/protocol';
 
@@ -32,6 +32,8 @@ interface BlobMeta {
   size: number;
   /** Data file name inside the shard directory (`<hex>.<ext>`). */
   file: string;
+  /** The mime and name came from a writer that only vouches for the bytes: the next writer's replace them. */
+  provisional?: true;
 }
 
 /** A conservative extension for a mime type, so tools that infer the format from the path work. */
@@ -64,7 +66,7 @@ export function parseBlobRef(ref: string): string | undefined {
 /**
  * Content-addressed blob store on the local filesystem. Refs are `sha256:<hex>` of
  * the bytes; the same bytes always get the same ref (the first `put` sets the stored
- * mime and name). Layout: `<dir>/<hex[0..2]>/<hex>.<ext>` plus `<hex>.json` metadata;
+ * mime and name, unless it was `provisional`: then the first that is not). Layout: `<dir>/<hex[0..2]>/<hex>.<ext>` plus `<hex>.json` metadata;
  * directories are 0700 and files 0600. `get` re-hashes, so a tampered file is refused.
  */
 export class FsBlobStore implements BlobStore {
@@ -88,18 +90,33 @@ export class FsBlobStore implements BlobStore {
     return join(this.dir, hex.slice(0, 2));
   }
 
-  async put(bytes: Uint8Array, meta: { mime: string; name?: string }): Promise<string> {
+  /**
+   * `o.provisional`: the writer vouches for the bytes only (PB-6: a backend attaching its upload).
+   * Its mime and name are kept until a `put` of the same bytes that is not provisional, whose mime
+   * and name then replace them; they never replace what such a `put` stored.
+   */
+  async put(bytes: Uint8Array, meta: { mime: string; name?: string }, o: { provisional?: boolean } = {}): Promise<string> {
     if (bytes.byteLength > this.maxBytes) throw new BlobTooLargeError(bytes.byteLength, this.maxBytes);
     await this.init();
     const hex = createHash('sha256').update(bytes).digest('hex');
     const ref = `sha256:${hex}`;
     const shard = this.shard(hex);
     await mkdir(shard, { recursive: true, mode: 0o700 });
-    if (await this.readMeta(hex)) return ref;
+    const had = await this.readMeta(hex);
+    if (had && (!had.provisional || o.provisional)) return ref;
     const file = `${hex}.${extOf(meta.mime)}`;
-    const m: BlobMeta = { mime: meta.mime, ...(meta.name ? { name: meta.name } : {}), size: bytes.byteLength, file };
+    const m: BlobMeta = { mime: meta.mime, ...(meta.name ? { name: meta.name } : {}), size: bytes.byteLength, file, ...(o.provisional ? { provisional: true as const } : {}) };
     // Data first, then metadata: a blob is visible only once both are complete (tmp + rename).
-    await atomicWrite(join(shard, file), bytes);
+    if (!had) await atomicWrite(join(shard, file), bytes);
+    else if (had.file !== file) {
+      // The bytes are here under the provisional extension. That file stays (a path handed out
+      // earlier keeps working); the new name is a second link to it, or a copy where links are not to be had.
+      try {
+        await link(join(shard, had.file), join(shard, file));
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'EEXIST') await atomicWrite(join(shard, file), bytes);
+      }
+    }
     await atomicWrite(join(shard, `${hex}.json`), Buffer.from(JSON.stringify(m)));
     return ref;
   }

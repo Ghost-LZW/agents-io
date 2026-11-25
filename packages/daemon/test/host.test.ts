@@ -92,6 +92,40 @@ describe('bindings.put / get', () => {
     const h = await w.host();
     await expect(h.bindingsPut(table('t', [{ id: 'bad', match: {}, on: 'dispatch', agent: 'exec' }]))).rejects.toMatchObject({ code: 'task_agent' });
   });
+
+  it("bindings.put over a connection, with no backends configured: a tag of the wrong type or length or with a control character on a host rule answers invalid naming the rule, and the table stays; a tag key on a rule that never queues for the host is accepted whatever it holds, kept as written, and neither copied to an item nor explained; a host rule's tag reaches its item and explain #RT-1 #EX-1 #HQ-5", async () => {
+    const w = await daemon();
+    const h = await w.host({ consumer: 'xwo' });
+    const items: InboundItem[] = [];
+    h.onRequest('inbound', (f) => {
+      items.push(f.item as InboundItem);
+      return { accepted: true };
+    });
+    // What a host's own tables carried before the feature: a `tag` key of its own on rules that do not queue for the host.
+    const own = table('h1', [{ id: 'team', match: { channel: 'fake', keywords: ['team'] }, on: 'dispatch', tag: 'team-a' }, { id: 'n', match: { channel: 'fake', keywords: ['n'] }, on: 'drop', tag: 7 }, { id: 'long', match: { channel: 'fake', keywords: ['long'] }, on: 'context', tag: 'x'.repeat(129) }, hostRule({ tag: 'inbox' })], { onHostDown: 'keep' });
+    expect(await h.bindingsPut(own)).toMatchObject({ version: 'h1', changed: true, active: true });
+    expect((await h.bindingsGet()).host?.table).toEqual(own);
+    // On a host rule the tag is checked: one code, and the message says which rule.
+    for (const [i, tag] of ['x'.repeat(129), 7, '', null, ['inbox']].entries()) {
+      const r = await h.exchange({ type: 'bindings.put', table: table(`bad${i}`, [hostRule(), { id: 'tagged', match: {}, on: 'host', tag }]) });
+      expect(r).toMatchObject({ ok: false, error: { code: 'invalid', message: `host table bad${i}, binding "tagged": tag must be a string of 1 to 128 characters` } });
+    }
+    expect(await h.exchange({ type: 'bindings.put', table: table('bad-cc', [{ id: 'tagged', match: {}, on: 'host', tag: 'in\nbox' }]) })).toMatchObject({ ok: false, error: { code: 'invalid', message: 'host table bad-cc, binding "tagged": tag has a control character' } });
+    expect((await h.bindingsGet()).host?.table.version).toBe('h1');
+
+    const both = await w.chat.inject({ id: 'm1', sender: alice, conversation: { id: 'g1', kind: 'group' }, text: 'xwo for the team' });
+    await until(() => items.length === 1);
+    expect([items[0]!.bindingId, items[0]!.tag]).toEqual(['to-host', 'inbox']);
+    const ex = (await h.explain(both.inputId!)) as { matched: { bindingId: string; source: string; tag?: unknown }[] };
+    const mine = ex.matched.filter((m) => m.source === 'host');
+    expect(mine.map((m) => [m.bindingId, m.tag])).toEqual([['team', undefined], ['to-host', 'inbox']]);
+    expect(mine.some((m) => m.bindingId === 'team' && 'tag' in m)).toBe(false);
+    // The table an earlier daemon persisted is the host table after a restart.
+    await closeAndWait(w.gw, h);
+    await w.stop();
+    const w2 = await daemon({ dir: w.dir });
+    expect(w2.gw.router.hostTable()).toMatchObject({ table: own, active: true });
+  });
 });
 
 describe('host inbound queue', () => {

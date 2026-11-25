@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach } from 'vitest';
 import type { HarnessAdapter, Policy } from '@agents-io/protocol';
 import { FakeChannel, FakeHarness, type FakeTurnScript } from '@agents-io/testkit';
-import { type ChannelRegistry, type GatewayOptions, type HarnessInstance, type HarnessRegistry, LocalClient, type ModuleRegistry, readTokenFile, tokenPath } from '@agents-io/kernel';
+import { type ChannelRegistry, type GatewayOptions, type HarnessInstance, type HarnessRegistry, type HelloResult, LocalClient, type ModuleRegistry, readTokenFile, tokenPath } from '@agents-io/kernel';
 import { type Config, Gateway, InstanceHarness, resolveConfig } from '../src/defaults.js';
 import type { HarnessDeclares } from './declares.js';
 
@@ -29,6 +29,17 @@ export function tmp(prefix = 'aio-d-'): string {
   return d;
 }
 
+/** What a backend's hello says besides its key (`World.backend`). */
+export interface BackendHello {
+  /** Use this key instead of making one. */
+  key?: string;
+  name?: string;
+  consumer?: string;
+  callouts?: boolean | string[];
+  optIn?: string[];
+  takeover?: boolean;
+}
+
 export interface World {
   gw: Gateway;
   dir: string;
@@ -40,6 +51,11 @@ export interface World {
   client(): Promise<LocalClient>;
   /** A connection that said host.hello with the daemon's token. */
   host(o?: { name?: string; consumer?: string; callouts?: boolean | string[] }): Promise<LocalClient>;
+  /**
+   * A connection that said host.hello with backend `id`'s key. Without `key` a key is made first
+   * (issued, or rotated when the backend has one: its earlier connections are closed).
+   */
+  backend(id: string, o?: BackendHello): Promise<{ c: LocalClient; key: string; hello: HelloResult }>;
   stop(): Promise<void>;
 }
 
@@ -70,8 +86,8 @@ export async function daemon(
     channelRegistry?: ChannelRegistry;
     /** The feature modules the config is resolved with and the daemon runs (default the built-in ones). */
     moduleRegistry?: ModuleRegistry;
-    /** GatewayOptions.testHooks, outboxAttemptTimeoutMs and logger. */
-    gateway?: Pick<GatewayOptions, 'testHooks' | 'outboxAttemptTimeoutMs' | 'logger'>;
+    /** GatewayOptions.testHooks, outboxAttemptTimeoutMs, logger and hostBlobs. */
+    gateway?: Pick<GatewayOptions, 'testHooks' | 'outboxAttemptTimeoutMs' | 'logger' | 'hostBlobs'>;
     /** The channel `fake` (default a plain FakeChannel): a subclass adds what a test needs (`openLive`). */
     chat?: FakeChannel;
   } = {},
@@ -127,7 +143,25 @@ export async function daemon(
     await c.hello({ token: readTokenFile(tokenPath(config.socketPath)), name: h.name ?? 'xwo', ...(h.consumer !== undefined ? { consumer: h.consumer } : {}), ...(h.callouts ? { callouts: h.callouts } : {}) });
     return c;
   };
-  return { gw, dir, config, chat, harness, built, client, host, stop };
+  const backend = async (id: string, b: BackendHello = {}) => {
+    let key = b.key;
+    if (key === undefined) {
+      const r = gw.backendKey(id, 'rotate');
+      if (!r.ok) throw new Error(`${r.code}: ${r.message}`);
+      key = (r.value as { key: string }).key;
+    }
+    const c = await client();
+    const hello = await c.hello({
+      token: key,
+      name: b.name ?? id,
+      ...(b.consumer !== undefined ? { consumer: b.consumer } : {}),
+      ...(b.callouts !== undefined ? { callouts: b.callouts } : {}),
+      ...(b.optIn !== undefined ? { optIn: b.optIn } : {}),
+      ...(b.takeover !== undefined ? { takeover: b.takeover } : {}),
+    });
+    return { c, key, hello };
+  };
+  return { gw, dir, config, chat, harness, built, client, host, backend, stop };
 }
 
 /** Wait for `c` to be fully closed on the daemon side. */

@@ -57,6 +57,11 @@ host commands (authenticate with the token file next to the socket; docs/HOSTS.m
   aio explain   <inputId | operationId> [--chain]                    (routing record; a delivery's turn and inputs;
                                                                        --chain: an agent input back to the root of its chain)
   aio verify    <channelRef>                                          (channel:<channel>/<message id>)
+  aio backend   list                                                  (backends: key id, connections, backlog, send grants; never a key)
+  aio backend   key <id>                                              (a first key, printed once on stdout; only its SHA-256 is kept)
+  aio backend   rotate <id>                                           (a new key; the old one stops working at once)
+  aio backend   revoke <id>                                           (no key: the backend cannot connect)
+  aio backend   forget <id>                                           (drops its queue items, cursor and send grants; keeps its key)
 
 test hooks (fault injection; only when \`aio serve\` runs with AIO_TEST_HOOKS=1, host token as above; docs/HOSTS.md §4.3)
   aio replay    --input <inputId> [--times N]                         (a channel message accepted earlier, to the gateway again;
@@ -683,6 +688,42 @@ async function explain(a: CliArgs): Promise<number> {
   }
 }
 
+/**
+ * `aio backend …` (PB-3): keys and state of the configured backends, with the host token. A new key
+ * goes to stdout on a line of its own, this once; what to do with it goes to stderr.
+ */
+async function backend(a: CliArgs): Promise<number> {
+  const usage = 'usage: aio backend list | aio backend key <id> | aio backend rotate <id> | aio backend revoke <id> | aio backend forget <id>';
+  const [sub, id, ...more] = a.rest;
+  const subs = ['list', 'ls', 'key', 'rotate', 'revoke', 'forget'];
+  if (!sub || !subs.includes(sub) || more.length) throw new ConfigError(usage);
+  const list = sub === 'list' || sub === 'ls';
+  if (list ? id !== undefined : !id) throw new ConfigError(usage);
+  const client = await hostClient(a);
+  try {
+    if (list) {
+      print(await client.backendsList());
+      return 0;
+    }
+    if (sub === 'forget') {
+      const r = await client.backendsForget(id!);
+      console.error(`backend ${r.backend} forgotten: ${r.items} queue item(s) and ${r.routes} conversation grant(s) removed, ${r.closed} connection(s) closed; its key is unchanged`);
+      return 0;
+    }
+    if (sub === 'revoke') {
+      const r = await client.backendsKey(id!, 'revoke');
+      console.error(`backend ${r.backend} has no key now; ${r.closed} connection(s) closed`);
+      return 0;
+    }
+    const r = await client.backendsKey(id!, sub === 'key' ? 'issue' : 'rotate');
+    console.error(`key of backend ${r.backend} (key id ${r.keyId})${sub === 'rotate' ? `; the old key no longer works, ${r.closed} connection(s) closed` : ''}. It is shown this once: the daemon keeps only its SHA-256. Give it to the backend as its host.hello token.`);
+    console.log(r.key);
+    return 0;
+  } finally {
+    client.close();
+  }
+}
+
 async function verify(a: CliArgs): Promise<number> {
   const ref = a.rest[0];
   if (!ref) throw new ConfigError('usage: aio verify <channelRef>   (channel:<channel>/<message id>)');
@@ -784,7 +825,7 @@ async function consoleLink(a: CliArgs): Promise<number> {
   return 0;
 }
 
-const COMMANDS: Record<string, (a: CliArgs) => Promise<number>> = { serve, attach, tui, input, sessions, watch, run: runCmd, send, tail, ack, redispatch, schedule, bindings, explain, verify, replay, fault, 'console-link': consoleLink, console: consoleLink };
+const COMMANDS: Record<string, (a: CliArgs) => Promise<number>> = { serve, attach, tui, input, sessions, watch, run: runCmd, send, tail, ack, redispatch, schedule, bindings, explain, verify, backend, replay, fault, 'console-link': consoleLink, console: consoleLink };
 
 /**
  * A command a built-in harness kind adds (`HarnessModule.cli`; Claude Code's `tui-bridge`, which its
@@ -930,7 +971,7 @@ export function exitCodeFor(e: unknown): number {
   if (e instanceof ConfigError) return 2;
   if (e instanceof DaemonUnavailable || e instanceof TokenError) return 69;
   if (e instanceof CommandError && e.code === 'unauthorized') return 77;
-  if (e instanceof CommandError && ['unknown_agent', 'not_task_agent', 'bad_cwd', 'bad_env', 'bad_run_id', 'invalid_frame', 'invalid', 'task_agent', 'unknown_agent', 'conflict', 'empty_input', 'bad_override', 'bad_input_id', 'bad_correlation', 'input_id_taken'].includes(e.code)) return 2;
+  if (e instanceof CommandError && ['unknown_agent', 'not_task_agent', 'bad_cwd', 'bad_env', 'bad_run_id', 'invalid_frame', 'invalid', 'task_agent', 'unknown_agent', 'conflict', 'empty_input', 'bad_override', 'bad_input_id', 'bad_correlation', 'input_id_taken', 'unknown_backend', 'key_exists'].includes(e.code)) return 2;
   return 1;
 }
 

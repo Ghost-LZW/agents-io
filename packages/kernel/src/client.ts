@@ -1,10 +1,17 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createConnection, type Socket } from 'node:net';
 import {
+  BLOB_FRAME_MAX_BYTES,
   FrameDecoder,
   PROTOCOL_VERSION,
   encodeFrame,
   type AttentionChanged,
+  type BackendsForgetResult,
+  type BackendsKeyResult,
+  type BackendsListResult,
+  type HostBlobGetResult,
+  type HostBlobPutResult,
+  type HostBlobStatResult,
   type BindingTable,
   type ClientResultFrame,
   type ContentBlock,
@@ -356,6 +363,77 @@ export class LocalClient {
   /** Test hook (feature `test.hooks`): drop the responses of a channel's next sends; clear; list. */
   testFault(o: { action: 'drop-response' | 'clear' | 'list'; channel?: string; account?: string; conversation?: string; next?: number }): Promise<TestFaultResult> {
     return this.call('test.fault', o);
+  }
+
+  /** The backends and the state kept for each (`backends.list`; the host token only). */
+  backendsList(): Promise<BackendsListResult> {
+    return this.call('backends.list');
+  }
+
+  /** Issue, rotate or revoke a backend's key (`backends.key`). The key is in the answer of issue / rotate, once. */
+  backendsKey(backend: string, op: 'issue' | 'rotate' | 'revoke'): Promise<BackendsKeyResult> {
+    return this.call('backends.key', { backend, op });
+  }
+
+  /** Remove a backend's queue items, cursor and send grants (`backends.forget`); its key stays. */
+  backendsForget(backend: string): Promise<BackendsForgetResult> {
+    return this.call('backends.forget', { backend });
+  }
+
+  /** A blob's size, or null (`blob.stat`): with a backend's key, only one it was given or uploaded. */
+  blobStat(ref: string): Promise<HostBlobStatResult> {
+    return this.call('blob.stat', { ref });
+  }
+
+  /** A blob's bytes, or a range of them, at most `BLOB_FRAME_MAX_BYTES` (`blob.get`). */
+  blobGet(o: { ref: string; offset?: number; length?: number }): Promise<HostBlobGetResult> {
+    return this.call('blob.get', o);
+  }
+
+  /** One `blob.put` frame: a whole blob, or (`part`) one piece of an upload. */
+  blobPut(o: { base64: string; part?: { upload: string; offset: number; last?: boolean }; mime?: string; name?: string }): Promise<HostBlobPutResult> {
+    return this.call('blob.put', o);
+  }
+
+  /**
+   * All the bytes of a blob, read in ranges of `chunk` bytes (default and at most
+   * `BLOB_FRAME_MAX_BYTES`; smaller on a slow link) and checked against the ref (the SHA-256 of
+   * the bytes): ranges are not checked one by one.
+   */
+  async readBlob(ref: string, o: { chunk?: number } = {}): Promise<Uint8Array> {
+    const chunk = Math.max(1, Math.min(o.chunk ?? BLOB_FRAME_MAX_BYTES, BLOB_FRAME_MAX_BYTES));
+    const parts: Buffer[] = [];
+    let offset = 0;
+    for (;;) {
+      const r = await this.blobGet({ ref, offset, length: chunk });
+      const b = Buffer.from(r.base64, 'base64');
+      parts.push(b);
+      offset += b.byteLength;
+      if (offset >= r.size) break;
+      if (b.byteLength === 0) throw new CommandError('blob_error', `blob ${ref} ended at ${offset} of ${r.size} bytes`);
+    }
+    const bytes = Buffer.concat(parts);
+    const m = /^sha256:([0-9a-f]{64})$/.exec(ref);
+    if (m && createHash('sha256').update(bytes).digest('hex') !== m[1]) throw new CommandError('blob_error', `the bytes read do not match ${ref}`);
+    return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  }
+
+  /** Upload bytes, in one frame or in parts of `chunk` bytes (default and at most `BLOB_FRAME_MAX_BYTES`); the blob's ref. */
+  async writeBlob(bytes: Uint8Array, o: { mime?: string; name?: string; chunk?: number; upload?: string } = {}): Promise<{ ref: string; size: number }> {
+    const chunk = Math.max(1, Math.min(o.chunk ?? BLOB_FRAME_MAX_BYTES, BLOB_FRAME_MAX_BYTES));
+    const meta = { ...(o.mime !== undefined ? { mime: o.mime } : {}), ...(o.name !== undefined ? { name: o.name } : {}) };
+    const buf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const done = (r: HostBlobPutResult): { ref: string; size: number } => {
+      if (!('ref' in r)) throw new CommandError('blob_error', 'the upload was not completed');
+      return r;
+    };
+    if (buf.byteLength <= chunk) return done(await this.blobPut({ base64: buf.toString('base64'), ...meta }));
+    const upload = o.upload ?? randomUUID();
+    for (let offset = 0; ; offset += chunk) {
+      const last = offset + chunk >= buf.byteLength;
+      const r = await this.blobPut({ base64: buf.subarray(offset, offset + chunk).toString('base64'), part: { upload, offset, ...(last ? { last: true } : {}) }, ...meta });
+      if (last) return done(r);
+    }
   }
 
   /**

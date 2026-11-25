@@ -561,3 +561,282 @@ describe('watches as runtime bindings', () => {
     expect(d.deliveries[0]!.agent).toBeUndefined();
   });
 });
+
+describe('backends: host rules that name one (to)', () => {
+  const B = { backends: ['alpha', 'beta'] };
+  const code = (f: () => unknown) => {
+    try {
+      f();
+    } catch (e) {
+      expect(e).toBeInstanceOf(RouterError);
+      return `${(e as RouterError).code}: ${(e as Error).message}`;
+    }
+    return 'ok';
+  };
+
+  it('a host rule\'s to must name a configured backend; an unknown one, or to on a rule that can never reach the host queue, is refused at load and at bindings.put; a persisted host table naming a backend no longer configured is ignored at start, whole #RT-1 #PB-1 #HQ-5', async () => {
+    // A host rule and a rule with a callout (its answer or failure may be `host`) may name one.
+    expect(code(() => router({ ...B, config: table([{ id: 'a', match: {}, on: 'host', to: 'alpha' }, { id: 'b', match: {}, on: 'dispatch', callout: {}, to: 'beta' }]) }))).toBe('ok');
+    expect(code(() => router({ ...B, config: table([{ id: 'a', match: {}, on: 'host', to: 'gamma' }]) }))).toBe('unknown_backend: config table v1, binding "a": unknown backend "gamma" (backends: alpha, beta)');
+    // No backends configured: every `to` is unknown.
+    expect(code(() => router({ config: table([{ id: 'a', match: {}, on: 'host', to: 'alpha' }]) }))).toMatch(/^unknown_backend: .*unknown backend "alpha" \(backends: none\)/);
+    for (const on of ['dispatch', 'context', 'drop'] as const) {
+      expect(code(() => router({ ...B, config: table([{ id: 'a', match: {}, on, to: 'alpha' }]) }))).toMatch(/^invalid: .*binding "a": to needs on: "host" or a callout/);
+    }
+    // bindings.put: refused with the same codes, the installed table stays.
+    const r = router({ ...B, hostConnected: true });
+    r.putHostTable(table([{ id: 'ok', match: {}, on: 'host', to: 'alpha' }], { version: 'h1' }));
+    expect(code(() => r.putHostTable(table([{ id: 'bad', match: {}, on: 'host', to: 'gamma' }], { version: 'h2' })))).toMatch(/^unknown_backend: host table h2, binding "bad"/);
+    expect(code(() => r.putHostTable(table([{ id: 'bad', match: {}, on: 'context', to: 'alpha' }], { version: 'h3' })))).toMatch(/^invalid: /);
+    expect(r.hostTable()?.table.version).toBe('h1');
+    expect((await route(r, fakeEnvelope({ text: 'x' }))).hosts).toEqual([{ bindingId: 'ok', source: 'host', to: 'alpha' }]);
+    // A persisted host table naming a backend that is no longer configured is left out at start (a warn), whole.
+    const path = tempDb();
+    const first = router({ ...B, path, hostConnected: true });
+    first.putHostTable(table([{ id: 'for-alpha', match: {}, on: 'host', to: 'alpha' }, { id: 'plain', match: {}, on: 'host' }], { version: 'p1', onHostDown: 'keep' }));
+    first.close();
+    const warns: string[] = [];
+    const later = router({ backends: ['beta'], path, log: (level, msg) => void (level === 'warn' && warns.push(msg)) });
+    expect(later.hostTable()).toBeUndefined();
+    expect(warns).toEqual([expect.stringMatching(/persisted host table p1 no longer valid, ignored: .*unknown backend "alpha"/)]);
+    expect((await route(later, fakeEnvelope({ text: 'x' }))).hosts).toEqual([]);
+    later.close();
+    // With the backend configured again the same table is back.
+    const back = router({ ...B, path });
+    expect(back.hostTable()?.table.version).toBe('p1');
+    back.close();
+  });
+
+  it("a callout rule naming a backend falls back to that backend's queue when the callout fails (no host, a timeout, an error); another backend and the untargeted queue get nothing #HQ-3 #PB-1", async () => {
+    const config = table([{ id: 'ask', match: {}, on: 'dispatch', callout: { timeoutMs: 20 }, to: 'beta' }]);
+    const failures: [string, Parameters<typeof router>[0]][] = [
+      ['no_host', { ...B, config }],
+      ['timeout', { ...B, config, hostConnected: true, routeCallout: () => new Promise(() => {}) }],
+      ['error', { ...B, config, hostConnected: true, routeCallout: async () => Promise.reject(new Error('boom')) }],
+    ];
+    for (const [outcome, o] of failures) {
+      const r = router(o);
+      const d = await route(r, fakeEnvelope({ conversation: group, text: 'x' }));
+      // Not dispatched behind the host's back, and queued for beta alone.
+      expect([outcome, d.deliveries]).toEqual([outcome, []]);
+      expect(d.hosts).toEqual([{ bindingId: 'ask', source: 'config', to: 'beta' }]);
+      expect(d.explanation.matched).toEqual([expect.objectContaining({ bindingId: 'ask', on: 'host', to: 'beta', callout: expect.objectContaining({ outcome, on: 'host' }) })]);
+      r.close();
+    }
+  });
+
+  it("a rule's tag must be 1 to 128 characters without control characters, on a rule that can reach the host queue; a bad one is refused at load and at bindings.put and the current table stays; it is copied to the queue entry of the rule that queued the input and shown on every matched or skipped rule; the same table without tags routes the same #RT-1 #EX-1", async () => {
+    // On a host rule (with or without `to`) and on a rule with a callout; any printable text, spaces and non-ASCII too.
+    expect(code(() => router({ ...B, config: table([{ id: 'a', match: {}, on: 'host', tag: 'inbox' }, { id: 'b', match: {}, on: 'host', to: 'alpha', tag: '收件箱 / guest' }, { id: 'c', match: {}, on: 'dispatch', callout: {}, tag: 'x'.repeat(128) }]) }))).toBe('ok');
+    for (const tag of ['a\nb', 'a\u0000', '\u001b[31m', 'tab\there', 'del\u007f', 'c1\u0085']) {
+      expect(code(() => router({ ...B, config: table([{ id: 'a', match: {}, on: 'host', tag }]) }))).toMatch(/^invalid: config table v1, binding "a": tag has a control character/);
+    }
+    // Length and type: the same answer, naming the rule (on a host rule and on one with a callout).
+    for (const tag of ['', 'x'.repeat(129), 7, null, ['inbox'], { a: 1 }, true]) {
+      expect(code(() => router({ ...B, config: table([{ id: 'ok', match: {}, on: 'host', tag: 'fine' }, { id: 'a', match: {}, on: 'host', tag }]) }))).toBe('invalid: config table v1, binding "a": tag must be a string of 1 to 128 characters');
+      expect(code(() => router({ ...B, config: table([{ id: 'a', match: {}, on: 'dispatch', callout: {}, tag }]) }))).toBe('invalid: config table v1, binding "a": tag must be a string of 1 to 128 characters');
+    }
+    // bindings.put: refused the same way, the installed table stays.
+    const h = router({ ...B, hostConnected: true });
+    h.putHostTable(table([{ id: 'ok', match: {}, on: 'host', to: 'alpha', tag: 'chat' }], { version: 'h1' }));
+    expect(code(() => h.putHostTable(table([{ id: 'bad', match: {}, on: 'host', tag: 'a\rb' }], { version: 'h2' })))).toMatch(/^invalid: host table h2, binding "bad": tag has a control character/);
+    expect(code(() => h.putHostTable(table([{ id: 'bad', match: {}, on: 'host', tag: 7 }], { version: 'h3' })))).toBe('invalid: host table h3, binding "bad": tag must be a string of 1 to 128 characters');
+    expect(code(() => h.putHostTable(table([{ id: 'bad', match: {}, on: 'host', tag: 'x'.repeat(129) }], { version: 'h4' })))).toBe('invalid: host table h4, binding "bad": tag must be a string of 1 to 128 characters');
+    expect(h.hostTable()?.table.version).toBe('h1');
+    expect((await route(h, fakeEnvelope({ text: 'x' }))).hosts).toEqual([{ bindingId: 'ok', source: 'host', to: 'alpha', tag: 'chat' }]);
+
+    // The entry of each queue carries the tag of the rule that made it (the first matching rule per `to`), not a later rule's.
+    const rules = (tags: boolean): Binding[] => {
+      const t = (tag: string) => (tags ? { tag } : {});
+      return [
+        { id: 'a1', match: { keywords: ['invoice'] }, on: 'host', to: 'alpha', ...t('inbox') },
+        { id: 'plain1', match: {}, on: 'host' },
+        { id: 'a2', match: {}, on: 'host', to: 'alpha', ...t('chat') },
+        { id: 'b1', match: {}, on: 'host', to: 'beta', ...t('guest') },
+        { id: 'plain2', match: {}, on: 'host', ...t('late') },
+        { id: 'ctx', match: {}, on: 'context' },
+      ];
+    };
+    const tagged = await route(router({ ...B, config: table(rules(true)) }), fakeEnvelope({ conversation: group, text: 'the invoice' }));
+    expect(tagged.hosts).toEqual([{ bindingId: 'a1', source: 'config', to: 'alpha', tag: 'inbox' }, { bindingId: 'plain1', source: 'config' }, { bindingId: 'b1', source: 'config', to: 'beta', tag: 'guest' }]);
+    expect(tagged.explanation.matched.map((m) => [m.bindingId, m.on, m.tag])).toEqual([
+      ['a1', 'host', 'inbox'],
+      ['plain1', 'host', undefined],
+      ['a2', 'host', 'chat'],
+      ['b1', 'host', 'guest'],
+      ['plain2', 'host', 'late'],
+      ['ctx', 'context', undefined],
+    ]);
+    expect(tagged.explanation.matched.some((m) => 'tag' in m && m.tag === undefined)).toBe(false);
+    // The same table without tags: the same rules, entries and deliveries, and no `tag` key anywhere.
+    const bare = await route(router({ ...B, config: table(rules(false)) }), fakeEnvelope({ conversation: group, text: 'the invoice' }));
+    const strip = <T extends { tag?: string }>(x: T) => {
+      const { tag: _tag, ...rest } = x;
+      return rest;
+    };
+    expect(bare.hosts).toEqual(tagged.hosts.map(strip));
+    expect(bare.explanation.matched).toEqual(tagged.explanation.matched.map(strip));
+    expect(bare.deliveries).toEqual(tagged.deliveries);
+    expect(JSON.stringify(bare)).not.toContain('"tag"');
+
+    // A rule skipped for a click (PB-1) is explained with its tag too.
+    const click = fakeEnvelope({ content: [{ type: 'event', name: 'action', data: { actionId: 'x:1', messageId: 'm1' } }] });
+    const cr = router({ ...B, config: table([{ id: 'for-alpha', match: {}, on: 'host', to: 'alpha', tag: 'inbox' }, { id: 'for-beta', match: {}, on: 'host', to: 'beta', tag: 'guest' }]) });
+    const d = await cr.route(click, OWNER, inputOf(click, OWNER), { clickOf: 'alpha' });
+    expect(d.hosts).toEqual([{ bindingId: 'for-alpha', source: 'config', to: 'alpha', tag: 'inbox' }]);
+    expect(d.explanation.matched.map((m) => [m.bindingId, m.tag, m.rejected?.code])).toEqual([['for-alpha', 'inbox', undefined], ['for-beta', 'guest', 'click_sender']]);
+  });
+
+  it("a tag key on a rule that can never queue for the host is not the daemon's: whatever it holds the table loads, is pushed and comes back after a restart as before the feature, with or without backends; the key is neither copied to an entry nor explained; such a rule routes as the same rule without it #RT-1 #EX-1 #RS-1", async () => {
+    // What a host may have kept under `tag` on its own rules before `binding.tag`: any JSON.
+    const foreign: unknown[] = ['team-a', '', 'x'.repeat(500), 'a\nb', 7, null, ['a'], { team: 'a' }];
+    for (const o of [{}, B]) {
+      for (const on of ['dispatch', 'context', 'drop'] as const) {
+        for (const tag of foreign) expect(code(() => router({ ...o, config: table([{ id: 'a', match: {}, on, tag }]) }))).toBe('ok');
+      }
+      // Pushed: accepted, kept as written (bindings.get answers what was put).
+      const h = router({ ...o, hostConnected: true });
+      const pushed = table([{ id: 'team', match: {}, on: 'dispatch', tag: 'team-a' }, { id: 'n', match: {}, on: 'context', tag: 7 }, { id: 'q', match: {}, on: 'host' }], { version: 'h1' });
+      expect(code(() => h.putHostTable(pushed))).toBe('ok');
+      expect(h.hostTable()?.table).toEqual(pushed);
+      const d = await route(h, fakeEnvelope({ conversation: group, text: 'x' }));
+      // Not copied (the entry is the untagged host rule's), not explained.
+      expect(d.hosts).toEqual([{ bindingId: 'q', source: 'host' }]);
+      expect(d.explanation.matched.map((m) => [m.bindingId, m.on])).toEqual([['team', 'dispatch'], ['n', 'context'], ['q', 'host']]);
+      expect(JSON.stringify(d)).not.toContain('"tag"');
+      // The same rules without the key route the same.
+      const bare = router({ ...o, hostConnected: true });
+      bare.putHostTable(table([{ id: 'team', match: {}, on: 'dispatch' }, { id: 'n', match: {}, on: 'context' }, { id: 'q', match: {}, on: 'host' }], { version: 'h1' }));
+      // `explanation.at` is the wall clock of each call: compare everything but it.
+      const same = await route(bare, fakeEnvelope({ conversation: group, text: 'x' }));
+      expect({ ...same, explanation: { ...same.explanation, at: 0 } }).toEqual({ ...d, explanation: { ...d.explanation, at: 0 } });
+      h.close();
+      bare.close();
+    }
+    // A host table an earlier daemon persisted with such a key is still the host table after the upgrade: no warn, not ignored.
+    const path = tempDb();
+    const first = router({ path, hostConnected: true });
+    const old = table([{ id: 'team', match: {}, on: 'dispatch', tag: 'team-a' }, { id: 'n', match: {}, on: 'drop', tag: 7 }], { version: 'h-old', onHostDown: 'keep' });
+    first.putHostTable(old);
+    first.close();
+    const warns: string[] = [];
+    const later = router({ path, log: (level, msg) => void (level === 'warn' && warns.push(msg)) });
+    expect(warns).toEqual([]);
+    expect(later.hostTable()?.table).toEqual(old);
+    expect((await route(later, fakeEnvelope({ conversation: group, text: 'x' }))).deliveries.map((x) => [x.bindingId, x.on])).toEqual([['team', 'dispatch']]);
+    // And the host pushing it again is answered as before.
+    expect(code(() => later.putHostTable({ ...old, version: 'h-new' }))).toBe('ok');
+    later.close();
+  });
+
+  it('host rules for different backends each queue the input once, and the explanation names each rule\'s to #PB-1 #EX-1', async () => {
+    const r = router({
+      ...B,
+      config: table([
+        { id: 'a1', match: { keywords: ['invoice'] }, on: 'host', to: 'alpha' },
+        { id: 'plain1', match: {}, on: 'host' },
+        { id: 'a2', match: {}, on: 'host', to: 'alpha' },
+        { id: 'b1', match: {}, on: 'host', to: 'beta' },
+        { id: 'plain2', match: {}, on: 'host' },
+        { id: 'ctx', match: {}, on: 'context' },
+      ]),
+    });
+    const d = await route(r, fakeEnvelope({ conversation: group, text: 'the invoice' }));
+    // The first matching rule per backend, and the first naming none.
+    expect(d.hosts).toEqual([{ bindingId: 'a1', source: 'config', to: 'alpha' }, { bindingId: 'plain1', source: 'config' }, { bindingId: 'b1', source: 'config', to: 'beta' }]);
+    expect(d.host).toEqual(d.hosts[0]);
+    expect(d.deliveries.map((x) => [x.bindingId, x.on])).toEqual([['ctx', 'context']]);
+    expect(d.explanation.matched.map((m) => [m.bindingId, m.on, m.to])).toEqual([
+      ['a1', 'host', 'alpha'],
+      ['plain1', 'host', undefined],
+      ['a2', 'host', 'alpha'],
+      ['b1', 'host', 'beta'],
+      ['plain2', 'host', undefined],
+      ['ctx', 'context', undefined],
+    ]);
+    expect(d.explanation.matched.some((m) => 'to' in m && m.to === undefined)).toBe(false);
+    expect(d.explanation.dropped).toBeUndefined();
+    // Only the rule for beta matches: one entry, for beta.
+    const other = await route(router({ ...B, config: table([{ id: 'b1', match: {}, on: 'host', to: 'beta' }]) }), fakeEnvelope({ text: 'x' }));
+    expect(other).toMatchObject({ deliveries: [], host: { bindingId: 'b1', to: 'beta' }, hosts: [{ bindingId: 'b1', source: 'config', to: 'beta' }] });
+    // No table names a backend: `hosts` is the one untargeted entry (or none), as `host` always was.
+    const legacy = router({ config: table([{ id: 'h', match: { keywords: ['invoice'] }, on: 'host' }, { id: 'h2', match: {}, on: 'host' }]) });
+    expect((await route(legacy, fakeEnvelope({ text: 'the invoice' }))).hosts).toEqual([{ bindingId: 'h', source: 'config' }]);
+    expect(await route(router({ config: table([]) }), fakeEnvelope({ text: 'x' }))).toMatchObject({ deliveries: [], hosts: [], explanation: { dropped: 'no_match' } });
+  });
+
+  it('a click on a message backend alpha delivered is taken only by rules to alpha; a rule with to takes a click only of its own backend\'s message; skipped rules are explained (click_sender) and asked no callout #PB-1 #RT-1 #EX-1', async () => {
+    const asked: string[] = [];
+    const r = router({
+      ...B,
+      hostConnected: true,
+      routeCallout: async (id) => {
+        asked.push(id);
+        return { on: id === 'alpha-session' ? 'dispatch' : 'host' };
+      },
+      config: table([
+        { id: 'alpha-clicks', match: { actionPrefix: 'x:' }, on: 'host', to: 'alpha' },
+        { id: 'beta-clicks', match: { actionPrefix: 'x:' }, on: 'host', to: 'beta' },
+        { id: 'beta-asks', match: {}, on: 'host', callout: {}, to: 'beta' },
+        { id: 'alpha-asks', match: {}, on: 'drop', callout: {}, to: 'alpha' },
+        { id: 'alpha-session', match: {}, on: 'host', callout: {}, to: 'alpha' },
+        { id: 'plain-clicks', match: { actionPrefix: 'x:' }, on: 'host' },
+        { id: 'plain-asks', match: {}, on: 'drop', callout: {} },
+        { id: 'session', match: {}, on: 'dispatch' },
+      ]),
+    });
+    const click = fakeEnvelope({ content: [{ type: 'event', name: 'action', data: { actionId: 'x:approve:1', messageId: 'om_card' } }] });
+    const view = (d: Awaited<ReturnType<Router['route']>>) => d.explanation.matched.map((m) => [m.bindingId, m.on, m.rejected?.code]);
+
+    // The clicked message was sent by alpha: only alpha's rules, and only into its queue.
+    const a = await r.route(click, OWNER, inputOf(click, OWNER), { clickOf: 'alpha' });
+    expect(a.hosts).toEqual([{ bindingId: 'alpha-clicks', source: 'config', to: 'alpha' }]);
+    expect(a.deliveries).toEqual([]);
+    expect(view(a)).toEqual([
+      ['alpha-clicks', 'host', undefined],
+      ['beta-clicks', 'host', 'click_sender'],
+      ['beta-asks', 'host', 'click_sender'],
+      ['alpha-asks', 'host', undefined], // answered host: alpha's queue (already entered by alpha-clicks)
+      ['alpha-session', 'dispatch', 'click_sender'], // its callout answered a session: a backend's click never becomes a turn
+      ['plain-clicks', 'host', 'click_sender'],
+      ['plain-asks', 'drop', 'click_sender'],
+      ['session', 'dispatch', 'click_sender'],
+    ]);
+    expect(a.explanation.matched.find((m) => m.bindingId === 'beta-clicks')).toEqual({ bindingId: 'beta-clicks', source: 'config', on: 'host', to: 'beta', rejected: { code: 'click_sender', message: expect.stringContaining('"alpha"') } });
+    expect(a.explanation.matched.find((m) => m.bindingId === 'alpha-session')).toMatchObject({ to: 'alpha', callout: { outcome: 'answered', on: 'dispatch' }, rejected: { code: 'click_sender' } });
+    // Only alpha's callout rules were asked.
+    expect(asked.sort()).toEqual(['alpha-asks', 'alpha-session']);
+
+    // The clicked message is nobody's (or the channel does not say): no rule naming a backend takes it.
+    asked.length = 0;
+    const none = await r.route(click, OWNER, inputOf(click, OWNER));
+    expect(none.hosts).toEqual([{ bindingId: 'plain-clicks', source: 'config' }]);
+    expect(none.deliveries.map((x) => x.bindingId)).toEqual(['session']);
+    expect(view(none)).toEqual([
+      ['alpha-clicks', 'host', 'click_sender'],
+      ['beta-clicks', 'host', 'click_sender'],
+      ['beta-asks', 'host', 'click_sender'],
+      ['alpha-asks', 'drop', 'click_sender'],
+      ['alpha-session', 'host', 'click_sender'],
+      ['plain-clicks', 'host', undefined],
+      ['plain-asks', 'host', undefined],
+      ['session', 'dispatch', undefined],
+    ]);
+    expect(asked).toEqual(['plain-asks']);
+
+    // A click of alpha's that only other rules match goes nowhere, and counts as matching nothing.
+    const lone = router({ ...B, config: table([{ id: 'beta-clicks', match: {}, on: 'host', to: 'beta' }, { id: 'session', match: {}, on: 'dispatch' }]) });
+    const dropped = await lone.route(click, OWNER, inputOf(click, OWNER), { clickOf: 'alpha' });
+    expect(dropped).toMatchObject({ deliveries: [], hosts: [], explanation: { dropped: 'no_match' } });
+    expect(dropped.host).toBeUndefined();
+    expect(view(dropped)).toEqual([['beta-clicks', 'host', 'click_sender'], ['session', 'dispatch', 'click_sender']]);
+
+    // An input that is not a click is not filtered, whatever the caller passes.
+    asked.length = 0;
+    const text = fakeEnvelope({ text: 'x:approve:1' });
+    const t = await r.route(text, OWNER, inputOf(text, OWNER), { clickOf: 'alpha' });
+    expect(t.hosts).toEqual([{ bindingId: 'beta-asks', source: 'config', to: 'beta' }, { bindingId: 'alpha-asks', source: 'config', to: 'alpha' }, { bindingId: 'plain-asks', source: 'config' }]);
+    expect(t.explanation.matched.some((m) => m.rejected)).toBe(false);
+    expect(asked.sort()).toEqual(['alpha-asks', 'alpha-session', 'beta-asks', 'plain-asks']);
+  });
+});

@@ -31,6 +31,11 @@ const names = [
   // Console / admin HTTP API
   'AdminError', 'AdminLoginRequest', 'AdminLoginResult', 'AdminStatus', 'AdminConfigDocument', 'AdminConfigPut', 'AdminConfigPutResult',
   'AdminChannelsApplied', 'AdminConfigValidateRequest', 'AdminConfigValidation', 'AdminQueue', 'AdminSessions',
+  // Backends (docs/design/persona-backend; HOSTS §4.12): the admin frames' results and the console endpoints
+  'BackendsListResult', 'BackendsKeyResult', 'BackendsForgetResult',
+  // Blobs over the host protocol (PB-6; HOSTS §4.13)
+  'HostBlobStatResult', 'HostBlobGetResult', 'HostBlobPutResult',
+  'AdminBackends', 'AdminBackendKeyRequest', 'AdminBackendKeyResult', 'AdminBackendForgetResult',
 ];
 /** Modules whose admin contribution declares schemas, and where they go. */
 const modules = [

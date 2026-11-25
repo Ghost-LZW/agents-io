@@ -56,15 +56,15 @@ export interface HostServiceDeps {
   queue: HostQueue;
   records: DaemonRecords;
   runs: Runs;
-  deliver(hostName: string, f: Extract<HostRequestFrame, { type: 'deliver' }>): Promise<Outcome>;
+  deliver(hostName: string, f: Extract<HostRequestFrame, { type: 'deliver' }>, backend?: string): Promise<Outcome>;
   /** `deliver.update`: edit (or, `final`, finalize) a message a `deliver` sent. */
-  deliverUpdate(hostName: string, f: Extract<HostRequestFrame, { type: 'deliver.update' }>): Promise<Outcome>;
-  /** `history.read`: the channel's earlier messages around a queued item (CHANNELS §1c). */
-  history(f: Extract<HostRequestFrame, { type: 'history.read' }>): Promise<Outcome>;
+  deliverUpdate(hostName: string, f: Extract<HostRequestFrame, { type: 'deliver.update' }>, backend?: string): Promise<Outcome>;
+  /** `history.read`: the channel's earlier messages around a queued item (CHANNELS §1c). `backend`: only for an item routed to it (PB-1). */
+  history(f: Extract<HostRequestFrame, { type: 'history.read' }>, backend?: string): Promise<Outcome>;
   /** `schedule.put` / `remove` / `list` (docs/design/schedules). */
   schedule(hostName: string, f: Extract<HostRequestFrame, { type: 'schedule.put' | 'schedule.remove' | 'schedule.list' }>): Promise<Outcome>;
   /** `message.ack`: the channel's mark on a message (a reaction). */
-  ackMessage(f: Extract<HostRequestFrame, { type: 'message.ack' }>): Promise<Outcome>;
+  ackMessage(f: Extract<HostRequestFrame, { type: 'message.ack' }>, backend?: string): Promise<Outcome>;
   /** `conversation.create`: a conversation the channel makes (a Lark group). */
   createConversation(f: Extract<HostRequestFrame, { type: 'conversation.create' }>): Promise<Outcome>;
   /** `session.prepare`: pin an agent and a launch to a session key (decision 7). */
@@ -89,6 +89,38 @@ export interface HostServiceDeps {
   testReplay?(hostName: string, f: Extract<HostRequestFrame, { type: 'test.replay' }>): Promise<Outcome>;
   /** `test.fault`: drop the responses of a channel's next sends; clear; list (answers `test_hooks_off` when off). */
   testFault?(hostName: string, f: Extract<HostRequestFrame, { type: 'test.fault' }>): Outcome;
+  /**
+   * `backends.list` / `backends.key` / `backends.forget` (PB-3): keys and state of the configured
+   * backends. Absent (an embedder without backends): the frames answer `unknown_backend` / an empty list.
+   */
+  backendsAdmin?: {
+    list(): Outcome;
+    key(id: string, op: 'issue' | 'rotate' | 'revoke'): Outcome;
+    forget(id: string): Outcome;
+  };
+  /**
+   * The configured backends and their keys (PB-1, PB-3). Absent, or with no ids: only the host
+   * token says hello and nothing below changes.
+   */
+  backends?: {
+    ids(): readonly string[];
+    /** The backend whose key this token is. */
+    verify(token: string): { id: string; keyId: string } | undefined;
+    /** `keyId` is still that backend's key. */
+    current(id: string, keyId: string): boolean;
+    /** `backends.<id>.history`: the backend may use `history.read`. */
+    history(id: string): boolean;
+  };
+  /**
+   * `blob.stat` / `blob.get` / `blob.put` (feature `blobs`, PB-6). `backend`: the frame came with that
+   * backend's key and sees only its own blobs; without it, the shared store. Absent (an embedder
+   * without a blob store): the frames answer `unsupported` and the feature is not advertised.
+   */
+  blobs?: {
+    stat(ref: string, backend?: string): Promise<Outcome>;
+    get(f: Extract<HostRequestFrame, { type: 'blob.get' }>, backend?: string): Promise<Outcome>;
+    put(f: Extract<HostRequestFrame, { type: 'blob.put' }>, backend?: string): Promise<Outcome>;
+  };
   log: LogFn;
   /** How long a pushed `inbound` waits for the host's result before it is retried (default 30 s). */
   pushTimeoutMs?: number;
@@ -114,6 +146,16 @@ export class HostService implements HostFrames {
   /** When the last host takeover happened (repeated ones within TAKEOVER_FLAP_MS are logged as errors). */
   private lastTakeover: number | undefined;
   private readonly token: Buffer;
+  /**
+   * PB-1: a backend's connections (by connection: `peer.auth` is gone when `gone` runs). One that said
+   * hello with its key, or (`admitted`) one the console let in on `/ws` with its key and that may not
+   * have said hello yet.
+   */
+  private readonly backendPeers = new Map<Peer, { id: string; admitted?: true }>();
+  /** PB-1: per backend, the one connection its items are pushed to. */
+  private readonly backendPush = new Map<string, { peer: Peer; push: PushSubscription }>();
+  /** PR-2: per connection, the last `blob.get` and its answer being written out: the next one waits for it. */
+  private readonly blobGets = new WeakMap<Peer, Promise<void>>();
 
   constructor(private readonly d: HostServiceDeps) {
     this.token = Buffer.from(d.token);
@@ -223,7 +265,24 @@ export class HostService implements HostFrames {
     return !!h && h.hooks.has(hook) && !h.peer.signal.aborted;
   }
 
+  private backendIds(): readonly string[] {
+    return this.d.backends?.ids() ?? [];
+  }
+
   async handle(peer: Peer, f: HostRequestFrame): Promise<Outcome> {
+    const backend = peer.auth?.backend;
+    if (backend) {
+      // PB-3: the key is checked on every frame (rotate / revoke close the connection; this is the second lock).
+      if (!this.d.backends?.current(backend.id, backend.keyId)) {
+        // After end() nothing is written: the answer goes first, the close after it.
+        setImmediate(() => this.endBackendPeer(peer, 'its key is no longer valid'));
+        return fail('unauthorized', 'this key is no longer valid');
+      }
+      // PB-1: default deny. A frame added later is not a backend's until it is listed here.
+      const allowed = BACKEND_FRAMES.has(f.type) || (f.type === 'history.read' && this.d.backends.history(backend.id));
+      if (!allowed) return fail('forbidden', `${f.type} is not open to a backend key`);
+    }
+    const own = backend ? `backend:${backend.id}` : undefined;
     switch (f.type) {
       case 'host.hello':
         return this.hello(peer, f);
@@ -243,13 +302,14 @@ export class HostService implements HostFrames {
       case 'run.cancel':
         return this.d.runs.cancel(f.runId, f.reason);
       case 'deliver':
-        return this.d.deliver(peer.auth!.name, f);
+        // With a backend's key (`backend`): within what it was routed or the admin registered (PB-2).
+        return backend ? this.d.deliver(peer.auth!.name, f, backend.id) : this.d.deliver(peer.auth!.name, f);
       case 'deliver.update':
-        return this.d.deliverUpdate(peer.auth!.name, f);
+        return backend ? this.d.deliverUpdate(peer.auth!.name, f, backend.id) : this.d.deliverUpdate(peer.auth!.name, f);
       case 'message.ack':
-        return this.d.ackMessage(f);
+        return backend ? this.d.ackMessage(f, backend.id) : this.d.ackMessage(f);
       case 'history.read':
-        return this.d.history(f);
+        return this.d.history(f, backend?.id);
       case 'schedule.put':
       case 'schedule.remove':
       case 'schedule.list':
@@ -260,17 +320,27 @@ export class HostService implements HostFrames {
         return ok(this.d.records.verify(f.channelRef));
       case 'inbound.read': {
         if (!f.consumer) return fail('invalid_frame', 'consumer is empty');
-        const items = await this.d.queue.read(f.consumer, {
+        if (own !== undefined && !isOwnConsumer(backend!.id, f.consumer)) return fail('forbidden', 'a backend key reads only its own cursor');
+        const consumer = own ?? f.consumer;
+        const stray = own === undefined ? this.strayBackendConsumer(consumer) : undefined;
+        if (stray) return stray;
+        const items = await this.d.queue.read(consumer, {
           ...(f.after !== undefined ? { after: f.after } : {}),
           ...(f.limit !== undefined ? { limit: f.limit } : {}),
           waitMs: Math.min(Math.max(0, f.waitMs ?? 0), 300_000),
           signal: peer.signal,
         });
-        return ok<InboundReadResult>({ items, acked: this.d.queue.cursor(f.consumer), head: this.d.queue.head() });
+        // The head is the consumer's own: a backend's is the last of its items (a consumer without a target: the queue's).
+        return ok<InboundReadResult>({ items, acked: this.d.queue.cursor(consumer), head: this.d.queue.headOf(consumer) });
       }
-      case 'inbound.ack':
+      case 'inbound.ack': {
         if (!f.consumer) return fail('invalid_frame', 'consumer is empty');
-        return ok({ consumer: f.consumer, acked: this.d.queue.ack(f.consumer, f.cursor) });
+        if (own !== undefined && !isOwnConsumer(backend!.id, f.consumer)) return fail('forbidden', 'a backend key acks only its own cursor');
+        const consumer = own ?? f.consumer;
+        const stray = own === undefined ? this.strayBackendConsumer(consumer) : undefined;
+        if (stray) return stray;
+        return ok({ consumer, acked: this.d.queue.ack(consumer, f.cursor) });
+      }
       case 'explain':
         return this.d.explain(f.inputId, f.chain === true);
       case 'session.prepare':
@@ -293,18 +363,177 @@ export class HostService implements HostFrames {
         this.d.log('info', `host ${h.name} replaced its outbound scope (revision ${revision}, ${f.routes.length} conversation(s))`);
         return ok({ revision });
       }
+      // PB-3: every authenticated connection here holds the host token (the admin credential).
+      case 'backends.list':
+        return this.d.backendsAdmin?.list() ?? ok({ backends: [] });
+      case 'backends.key':
+        return this.d.backendsAdmin?.key(f.backend, f.op) ?? fail('unknown_backend', `no backend ${JSON.stringify(f.backend)} in the config (backends)`);
+      case 'backends.forget':
+        return this.d.backendsAdmin?.forget(f.backend) ?? ok({ backend: f.backend, items: 0, routes: 0, closed: 0 });
+      // PB-6: with a backend's key, only its own blobs (`backend.id`); with the host token, the shared store.
+      case 'blob.stat':
+        return this.d.blobs ? this.d.blobs.stat(f.ref, backend?.id) : NO_BLOBS;
+      case 'blob.get':
+        return this.d.blobs ? this.blobGet(peer, f, backend?.id) : NO_BLOBS;
+      case 'blob.put':
+        return this.d.blobs ? this.d.blobs.put(f, backend?.id) : NO_BLOBS;
     }
+  }
+
+  /**
+   * `blob.get`, one at a time per connection (PR-2): the next range is read only once the answer
+   * before it was handed to the connection and written out by it (`Peer.flushed`: the local
+   * socket's drain, the WebSocket's own count of unwritten frames). A peer that asks without
+   * reading holds one answer in memory, not one per request.
+   */
+  private blobGet(peer: Peer, f: Extract<HostRequestFrame, { type: 'blob.get' }>, backend: string | undefined): Promise<Outcome> {
+    const before = this.blobGets.get(peer) ?? Promise.resolve();
+    const run = before.then(() => (peer.signal.aborted ? fail('disconnected', 'connection closed') : this.d.blobs!.get(f, backend)));
+    this.blobGets.set(
+      peer,
+      run
+        // The answer is written by the connection after this resolves: give it that turn, then wait for the write.
+        .then(() => new Promise<void>((r) => setImmediate(r)))
+        .then(() => peer.flushed?.())
+        .catch(() => undefined),
+    );
+    return run;
+  }
+
+  /**
+   * Close every connection authenticated with backend `id`'s key (its key was rotated or revoked,
+   * or the backend forgotten); how many were closed.
+   */
+  dropBackend(id: string, reason: string): number {
+    let n = 0;
+    for (const [peer, b] of [...this.backendPeers]) {
+      if (b.id !== id) continue;
+      this.endBackendPeer(peer, reason);
+      n++;
+    }
+    return n;
+  }
+
+  /**
+   * A connection the console admitted on `/ws` with backend `id`'s key, before any hello (PB-3):
+   * `dropBackend` closes it like one that said hello, and its `host.hello` must be that backend's key.
+   */
+  attachBackend(peer: Peer, id: string): void {
+    if (peer.signal.aborted || this.backendPeers.has(peer)) return;
+    this.backendPeers.set(peer, { id, admitted: true });
+  }
+
+  private endBackendPeer(peer: Peer, reason: string): void {
+    if (!this.backendPeers.has(peer)) return;
+    peer.end?.(reason);
+    // end() reports the connection gone; make sure it is forgotten even if it did not.
+    if (this.backendPeers.has(peer)) this.gone(peer);
+  }
+
+  /** Backend `id` has a live connection its items are pushed to. */
+  backendPushing(id: string): boolean {
+    const p = this.backendPush.get(id);
+    return !!p && !p.peer.signal.aborted;
+  }
+
+  /** Backend `id`'s connections now, and whether one of them is pushed its items. */
+  backendConnections(id: string): { connections: number; push: boolean } {
+    let connections = 0;
+    for (const b of this.backendPeers.values()) if (b.id === id) connections++;
+    return { connections, push: this.backendPushing(id) };
+  }
+
+  /**
+   * `host.hello` with a backend's key (PB-1): the key is the identity. The connection is
+   * `backend:<id>` whatever name it claims, answers no callouts, gets no opt-ins, and is not the
+   * host: the host slot, `router.hostConnected` and the host's flags are untouched (HQ-5, HQ-6).
+   * With `consumer` its own items are pushed to it; one push connection per backend.
+   */
+  private backendHello(peer: Peer, f: Extract<HostRequestFrame, { type: 'host.hello' }>, b: { id: string; keyId: string }): Outcome {
+    const name = `backend:${b.id}`;
+    if (f.consumer !== undefined && !isOwnConsumer(b.id, f.consumer)) return fail('forbidden', 'a backend key consumes only its own cursor');
+    let replaced: string | undefined;
+    if (f.consumer !== undefined) {
+      const old = this.backendPush.get(b.id);
+      if (old && !old.peer.signal.aborted) {
+        if (f.takeover !== true || !old.peer.end) return fail('host_connected', `backend ${b.id} already has a push connection; at most one per backend (host.hello takeover: true replaces it)`);
+        replaced = name;
+        this.d.log('warn', `backend ${b.id} takes over its push connection (connection ${old.peer.id}); closing the old connection`);
+        this.endBackendPeer(old.peer, `replaced by another connection of backend ${b.id} (takeover)`);
+      }
+    }
+    peer.auth = {
+      name,
+      // Not hostOrigin: a backend connection has no origin. A frame that needs one must fail, not act as the host.
+      origin: () => {
+        throw new Error('a backend connection sends no client frames');
+      },
+      backend: { id: b.id, keyId: b.keyId },
+    };
+    this.backendPeers.set(peer, { id: b.id, ...(this.backendPeers.get(peer)?.admitted ? { admitted: true as const } : {}) });
+    // The backend's consumer walks its own items only (known since the daemon started; again here in case it was forgotten).
+    this.d.queue.register(name, b.id);
+    if (f.consumer !== undefined) this.backendPush.set(b.id, { peer, push: this.startPush(peer, name) });
+    this.d.log('info', `backend ${b.id} connected (key id ${b.keyId})${f.consumer !== undefined ? ', pushed its items' : ''}`);
+    return ok<HelloResult>({
+      name,
+      protocol: PROTOCOL_VERSION,
+      host: false,
+      backend: { id: b.id },
+      bindings: { version: null, active: false },
+      ...(f.consumer !== undefined ? { inbound: { consumer: name, acked: this.d.queue.cursor(name), head: this.d.queue.headOf(name) } } : {}),
+      ...(replaced !== undefined ? { replaced: { name: replaced } } : {}),
+      // Only what a backend key can use now (the frames in BACKEND_FRAMES).
+      features: ['backends', 'deliver.update', 'message.ack', 'host.takeover', 'binding.tag', ...(this.d.blobs ? ['blobs'] : []), ...(this.d.backends?.history(b.id) ? ['history'] : [])],
+      ...(f.callouts !== undefined ? { callouts: [] } : {}),
+      ...(f.optIn !== undefined ? { optIn: [] } : {}),
+    });
+  }
+
+  /**
+   * PB-1: with backends configured, a consumer named `backend:…` with the host token is a backend's
+   * cursor or nothing. One that is no backend's (a mistyped id, an id never configured) is refused
+   * before the queue registers it: registered, it would be one more consumer of the items without a
+   * target, under a backend's name (it would show the host's own backlog and hold back its pruning).
+   * Undefined when the name is fine; always undefined without backends (names are plain strings then).
+   */
+  private strayBackendConsumer(consumer: string): Outcome | undefined {
+    if (!consumer.startsWith('backend:') || this.backendIds().length === 0) return undefined;
+    if (this.d.queue.consumerTarget(consumer) !== undefined) return undefined;
+    return fail('unknown_backend', `consumer ${JSON.stringify(consumer)} is no backend's cursor (a backend's is backend:<id>; see backends.list); choose a name that does not start with "backend:"`);
   }
 
   private hello(peer: Peer, f: Extract<HostRequestFrame, { type: 'host.hello' }>): Outcome {
     if (peer.auth) return fail('already_authenticated', `this connection is already ${peer.auth.name}`);
     const given = Buffer.from(f.token);
-    if (given.length !== this.token.length || !timingSafeEqual(given, this.token)) {
+    const isHost = given.length === this.token.length && timingSafeEqual(given, this.token);
+    // PB-1: a connection the console admitted with a backend's key is that backend's and nobody else's:
+    // not the host (whoever holds the host token as well), not another backend.
+    const admitted = this.backendPeers.get(peer);
+    if (admitted) {
+      const b = isHost ? undefined : this.d.backends?.verify(f.token);
+      if (b?.id === admitted.id) return this.backendHello(peer, f, b);
+      this.d.log('warn', `host.hello on a connection admitted with backend ${admitted.id}'s key, with ${isHost ? 'the host token' : b ? `backend ${b.id}'s key` : 'a wrong token'}`);
+      return fail('unauthorized', `this connection was opened with backend ${admitted.id}'s key: host.hello takes that key only`);
+    }
+    if (!isHost) {
+      // Not the host token: a backend's key (PB-1, PB-3)? The key decides who this is.
+      const b = this.d.backends?.verify(f.token);
+      if (b) return this.backendHello(peer, f, b);
       this.d.log('warn', `host.hello from ${JSON.stringify(f.name)} with a wrong token`);
       return fail('unauthorized', 'wrong token (read it from the token file next to the socket)');
     }
     const name = f.name.trim();
     if (!name) return fail('invalid_frame', 'name is empty');
+    const backends = this.backendIds().length > 0;
+    if (backends) {
+      // PB-1 / ID-3: `backend:<id>` names a connection made with that backend's key, and a backend's
+      // cursor is pushed only to it. (The host token may still pull and ack it: inbound.read / inbound.ack.)
+      if (name.startsWith('backend:')) return fail('invalid_frame', 'a name starting "backend:" is a backend key\'s; choose another name');
+      if (f.consumer && this.d.queue.consumerTarget(f.consumer) !== undefined) return fail('invalid_frame', `consumer ${JSON.stringify(f.consumer)} is a backend's cursor: only its key is pushed its items (inbound.read / inbound.ack work with the host token)`);
+      const stray = f.consumer ? this.strayBackendConsumer(f.consumer) : undefined;
+      if (stray) return stray;
+    }
     const hooks = calloutHooks(f.callouts);
     const optIn = new Set(OPT_INS.filter((x) => Array.isArray(f.optIn) && f.optIn.includes(x)));
     // `outbound.content` adds to `outbound` (`outbound.scoped` has the content anyway): alone it names nothing.
@@ -352,7 +581,7 @@ export class HostService implements HostFrames {
       bindings: { version: st?.table.version ?? null, active: st?.active ?? false, ...(st?.suspended ? { suspended: st.suspended } : {}) },
       ...(f.consumer !== undefined ? { inbound: { consumer: f.consumer, acked: this.d.queue.cursor(f.consumer), head: this.d.queue.head() } } : {}),
       ...(replaced !== undefined ? { replaced: { name: replaced } } : {}),
-      features: [...FEATURES.filter((x) => (x !== 'resolve.onBehalfOf' || this.d.answerOnBehalf) && (x !== 'test.hooks' || this.d.testHooks?.() === true)), ...(this.d.moduleFeatures?.() ?? [])],
+      features: [...FEATURES.filter((x) => (x !== 'resolve.onBehalfOf' || this.d.answerOnBehalf) && (x !== 'test.hooks' || this.d.testHooks?.() === true) && (x !== 'blobs' || this.d.blobs !== undefined)), ...(backends ? [BACKENDS_FEATURE] : []), ...(this.d.moduleFeatures?.() ?? [])],
       ...(f.callouts !== undefined ? { callouts: role ? [...hooks] : [] } : {}),
       ...(role && hooks.has('outbound.scoped') ? { outboundScope: { revision: this.outboundScope()!.revision, routes: this.outboundScope()!.routes.length } } : {}),
       ...(f.optIn !== undefined ? { optIn: role ? [...optIn] : [] } : {}),
@@ -383,6 +612,18 @@ export class HostService implements HostFrames {
 
   gone(peer: Peer): void {
     this.d.runs.peerGone(peer);
+    // A backend's connection (looked up by the connection: its `auth` is already cleared). Never the host.
+    const b = this.backendPeers.get(peer);
+    if (b) {
+      this.backendPeers.delete(peer);
+      const p = this.backendPush.get(b.id);
+      if (p?.peer === peer) {
+        p.push.close();
+        this.backendPush.delete(b.id);
+      }
+      this.d.log('info', `backend ${b.id} disconnected`);
+      return;
+    }
     if (this.host?.peer !== peer) return;
     this.host.push?.close();
     this.d.log('info', `host ${this.host.name} disconnected`);
@@ -497,6 +738,7 @@ export class HostService implements HostFrames {
   /** Close the host connection's push loop (daemon stop). */
   close(): void {
     this.host?.push?.close();
+    for (const p of this.backendPush.values()) p.push.close();
   }
 }
 
@@ -518,7 +760,9 @@ export class HostService implements HostFrames {
  * `topic.switch`, `watch.add`) may carry `opId`; the answer is kept with the event that decided it and a retry gets it
  * back (`replayed: true`, `seq`), an op id reused for another frame type or session is `op_id_conflict`. `attention` (LN-11):
  * `SessionInfo` (the `sessions` answer, the console's sessions) and the snapshot carry `attention`, what is pending in the
- * session now; a host asking `optIn: ["attention"]` gets an `attention.changed` frame on each change. These are the
+ * session now; a host asking `optIn: ["attention"]` gets an `attention.changed` frame on each change. `binding.tag` (RT-1):
+ * a host rule's `tag` is checked, copied to the items it queues (`InboundItem.tag`) and shown by `explain`. `blobs` (PB-6):
+ * the `blob.stat`, `blob.get` and `blob.put` requests (only with a blob store). These are the
  * kernel's own; `host.hello` adds the features of the modules that run (`ModuleManifest.features`) after them.
  */
 export const FEATURES = [
@@ -553,7 +797,24 @@ export const FEATURES = [
   'host-mcp.send_file.blob_scoped',
   'client.opId',
   'attention',
+  'binding.tag',
+  'blobs',
 ];
+
+/** The kernel's too, advertised after `FEATURES` while a backend is configured (PB-1): no module's feature may be it. */
+export const BACKENDS_FEATURE = 'backends';
+
+/**
+ * PB-1: the host frames a backend's key may use, besides `history.read` when `backends.<id>.history`
+ * is on. Every other host frame answers `forbidden` on such a connection. The `blob.*` frames see
+ * only the backend's own blobs (PB-6).
+ */
+const BACKEND_FRAMES: ReadonlySet<HostRequestFrame['type']> = new Set(['host.hello', 'inbound.read', 'inbound.ack', 'deliver', 'deliver.update', 'message.ack', 'blob.stat', 'blob.get', 'blob.put']);
+
+const NO_BLOBS: Outcome = { ok: false, code: 'unsupported', message: 'this server has no blob store' };
+
+/** The two ways a backend may name its own cursor. */
+const isOwnConsumer = (id: string, consumer: string) => consumer === id || consumer === `backend:${id}`;
 
 /** `DaemonRecords` flag: the name of the host that declared the `outbound` hook. */
 const OUTBOUND_FLAG = 'host.outbound';

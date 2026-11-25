@@ -146,7 +146,7 @@ describe('external MCP endpoint: off by default, loopback, tokens, limits', () =
     expect((await post(url, { token: TOKENS.reader, body: big })).status).toBe(413);
   });
 
-  it('tokens: a token file is generated 0600 when missing; a client may not use the host token #SE-5 #HQ-7', async () => {
+  it('tokens: a token file is generated 0600 when missing; a client may not use the host token, nor a backend\'s key #SE-5 #HQ-7 #PB-3', async () => {
     const dir = tmp();
     const file = join(dir, 'gen', 'c.token');
     const w = await daemon({ dir, raw: { externalMcp: { listen: '127.0.0.1:0', clients: { c: { tokenFile: file, scopes: ['read'] } } } } });
@@ -155,6 +155,19 @@ describe('external MCP endpoint: off by default, loopback, tokens, limits', () =
     const hostTokenFile = join(tmp(), 'host.token');
     writeFileSync(hostTokenFile, 'host-token-0123456789abcdef\n', { mode: 0o600 });
     await expect(daemon({ raw: { host: { tokenFile: hostTokenFile }, externalMcp: { listen: '127.0.0.1:0', clients: { c: { tokenFile: hostTokenFile, scopes: ['read'] } } } } })).rejects.toThrow(/host token/);
+    // Nor a backend's key (PB-3): it is a credential of the daemon too, and no admin or client credential.
+    const backends = { alpha: {} };
+    const b = await daemon({ raw: { backends } });
+    const { key } = await (await b.host({ name: 'admin' })).backendsKey('alpha', 'issue');
+    await b.stop();
+    const keyFile = join(tmp(), 'client.token');
+    writeFileSync(keyFile, `${key}\n`, { mode: 0o600 });
+    await expect(daemon({ dir: b.dir, raw: { backends, externalMcp: { listen: '127.0.0.1:0', clients: { c: { tokenFile: keyFile, scopes: ['read'] } } } } })).rejects.toThrow(/give every client its own/);
+    // The same file is fine once that key is revoked: it is then just a string.
+    const b2 = await daemon({ dir: b.dir, raw: { backends } });
+    await (await b2.host({ name: 'admin' })).backendsKey('alpha', 'revoke');
+    await b2.stop();
+    expect((await daemon({ dir: b.dir, raw: { backends, externalMcp: { listen: '127.0.0.1:0', clients: { c: { tokenFile: keyFile, scopes: ['read'] } } } } })).gw.adminStatus().externalMcp).toMatchObject({ clients: ['c'] });
   });
 
   it('rate-limits requests (429 with Retry-After) and writes per client #SE-5', async () => {

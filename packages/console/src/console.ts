@@ -10,6 +10,7 @@ import {
   ADMIN_WS_PATH,
   ADMIN_WS_SUBPROTOCOL,
   type AdminEndpoint,
+  AdminBackendKeyRequest,
   AdminConfigPut,
   AdminConfigValidateRequest,
   AdminLoginRequest,
@@ -113,7 +114,8 @@ function compileRoute(r: ContributedRoute): CompiledRoute {
   return { ...r, pattern: new RegExp(`^${source}$`), names };
 }
 
-type Role = 'host' | 'session';
+type Role = 'host' | 'session' | 'backend';
+type Checked = { ok: true; role: 'host' | 'session' } | { ok: true; role: 'backend'; backend: string } | { ok: false; why: string };
 
 /** One-time login tokens and console sessions, in memory (gone at restart). Stored hashed. */
 export class ConsoleAuth {
@@ -125,6 +127,8 @@ export class ConsoleAuth {
     hostToken: string,
     private readonly sessionTtlMs: number,
     private readonly now: () => number = Date.now,
+    /** The backend whose key a token is (PB-1); absent: no token is a backend's. */
+    private readonly backendOf?: (token: string) => string | undefined,
   ) {
     this.host = Buffer.from(hostToken);
   }
@@ -150,11 +154,13 @@ export class ConsoleAuth {
     return { token, expiresAt };
   }
 
-  /** Who a token is (presented through `host`): the host, a live session, or nobody (with why). */
-  check(token: string | undefined, host?: string): { ok: true; role: Role } | { ok: false; why: string } {
+  /** Who a token is (presented through `host`): the host, a backend (its key), a live session, or nobody (with why). */
+  check(token: string | undefined, host?: string): Checked {
     if (!token) return { ok: false, why: 'missing credentials (Authorization: Bearer <token>, the console cookie, or the bearer subprotocol)' };
     const given = Buffer.from(token);
     if (given.length === this.host.length && timingSafeEqual(given, this.host)) return { ok: true, role: 'host' };
+    const backend = this.backendOf?.(token);
+    if (backend !== undefined) return { ok: true, role: 'backend', backend };
     const k = hash(token);
     const s = this.sessions.get(k);
     if (s === undefined) return { ok: false, why: 'wrong token' };
@@ -197,7 +203,7 @@ export class ConsoleServer {
   private readonly routes: CompiledRoute[];
 
   constructor(private readonly o: ConsoleServerOptions) {
-    this.auth = new ConsoleAuth(o.host.token, o.config.sessionTtlMs, o.now);
+    this.auth = new ConsoleAuth(o.host.token, o.config.sessionTtlMs, o.now, o.host.backendOf ? (token) => o.host.backendOf!(token) : undefined);
     this.routes = (o.host.routes ?? []).map(compileRoute);
   }
 
@@ -311,9 +317,11 @@ export class ConsoleServer {
     }
   }
 
-  private authorize(req: IncomingMessage): Role {
+  /** The admin credential behind a request: the host token or a console session. A backend's key is neither (PB-1, PB-3). */
+  private authorize(req: IncomingMessage): 'host' | 'session' {
     const r = this.auth.check(this.credentials(req), req.headers.host);
     if (!r.ok) throw new HttpError(401, 'unauthorized', r.why);
+    if (r.role === 'backend') throw new HttpError(403, 'forbidden', 'a backend key opens /ws only (host.hello with the key); the console API needs the host token or a console session');
     return r.role;
   }
 
@@ -348,6 +356,15 @@ export class ConsoleServer {
       const e = h.explain(id);
       if (!e) throw new HttpError(404, 'unknown_input', `no routing record for ${id} (unknown, or older than the retention)`);
       return { status: 200, body: e };
+    }
+    // PB-3: backend keys are managed with the admin credential (the host token or a console session).
+    if (h.backends && m === 'GET' && p === '/api/backends') return { status: 200, body: h.backends.list() };
+    const backend = h.backends && m === 'POST' ? /^\/api\/backends\/([^/]+)\/(key|forget)$/.exec(p) : null;
+    if (h.backends && backend) {
+      const id = decode(backend[1]!);
+      const r = backend[2] === 'key' ? h.backends.key(id, (await readJson(req, AdminBackendKeyRequest)).op) : h.backends.forget(id);
+      if (r.ok) return { status: 200, body: r.value };
+      throw new HttpError(r.code === 'unknown_backend' ? 404 : r.code === 'key_exists' ? 409 : r.code === 'invalid_frame' ? 400 : 500, r.code === 'invalid_frame' ? 'invalid_request' : r.code, r.message);
     }
     if (p === '/api/config' || p === '/api/config/validate') {
       const store = h.configStore;
@@ -394,19 +411,36 @@ export class ConsoleServer {
     if (protocols.length && !protocols.includes(ADMIN_WS_SUBPROTOCOL)) return refuse(400, 'invalid_request', `subprotocol ${ADMIN_WS_SUBPROTOCOL} is required`);
     const r = this.auth.check(this.credentials(req, bearer), req.headers.host);
     if (!r.ok) return refuse(401, 'unauthorized', r.why);
-    this.wss.handleUpgrade(req, socket, head, (ws) => this.onSocket(ws));
+    const backend = r.role === 'backend' ? r.backend : undefined;
+    this.wss.handleUpgrade(req, socket, head, (ws) => this.onSocket(ws, backend));
   }
 
-  private onSocket(ws: WebSocket): void {
+  /** `backend`: the connection was admitted with that backend's key; it speaks host frames only, as that backend (PB-1). */
+  private onSocket(ws: WebSocket, backend?: string): void {
+    // Frames handed to the socket and not yet written out by it; who waits for that (PR-2: `blob.get`).
+    let unwritten = 0;
+    const waiting: (() => void)[] = [];
+    const release = () => {
+      unwritten = 0;
+      for (const w of waiting.splice(0)) w();
+    };
+    const written = () => {
+      if (unwritten > 0 && --unwritten === 0) release();
+    };
+    ws.once('close', release);
     const transport: FrameTransport = {
       write: (f) => {
         if (ws.readyState !== ws.OPEN) return false;
-        ws.send(JSON.stringify(f));
+        unwritten++;
+        // The callback runs once the frame was written to the socket, or could not be.
+        ws.send(JSON.stringify(f), written);
         return ws.bufferedAmount < WS_HIGH_WATER;
       },
       drained: async () => {
         while (ws.readyState === ws.OPEN && ws.bufferedAmount >= WS_HIGH_WATER) await new Promise((r) => setTimeout(r, 20));
       },
+      // The high-water mark is several answers of `blob.get`: those wait for the socket to have taken the one before.
+      flushed: () => (unwritten === 0 || ws.readyState !== ws.OPEN ? Promise.resolve() : new Promise<void>((r) => waiting.push(r))),
       get gone() {
         return ws.readyState !== ws.OPEN;
       },
@@ -418,8 +452,15 @@ export class ConsoleServer {
         ws.once('close', () => clearTimeout(t));
       },
     };
-    const c = new FrameConn(transport, this.o.host.local, () => this.conns.delete(c), { origin: (key) => this.o.host.consoleOrigin(key) });
+    const c = new FrameConn(transport, this.o.host.local, () => this.conns.delete(c), { origin: (key) => this.o.host.consoleOrigin(key), ...(backend !== undefined ? { backend } : {}) });
     this.conns.add(c);
+    if (backend !== undefined) {
+      const hf = this.o.host.local.hostFrames;
+      // Known to the host service before any hello, so a rotated or revoked key closes this connection too (PB-3).
+      if (hf?.attachBackend) hf.attachBackend(c, backend);
+      // Without it nothing would hold the connection to its backend: do not keep it.
+      else c.end('this server has no backends');
+    }
     const beat = this.heartbeat(ws, c.id);
     ws.on('message', (data, isBinary) => {
       beat.alive();

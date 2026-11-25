@@ -7,7 +7,7 @@ import { RunSpec } from './run.js';
 import { ConversationKind, InboundEnvelope, InputCause, InputRecord, OriginKind } from './inbound.js';
 import { RenderedMessage } from './channel.js';
 import { ScheduleDraft } from './schedule.js';
-import { ResultFrame } from './wire.js';
+import { BLOB_FRAME_MAX_BYTES, ResultFrame } from './wire.js';
 
 /*
  * Host protocol (docs/HOSTS.md r2, docs/design/locus/DECISIONS.md). A host keeps
@@ -94,6 +94,20 @@ export const Binding = Type.Object({
       skipWhenPinned: Type.Optional(Type.Boolean()),
     }),
   ),
+  /**
+   * The backend this rule hands the input to (feature `backends`): the id of a configured
+   * backend. Only meaningful on a rule with `on: "host"` or with a `callout`; the item is queued
+   * for that backend alone. Absent: the untargeted host queue, as before.
+   */
+  to: Type.Optional(Type.String()),
+  /**
+   * An opaque label the admin gives the items this rule queues (feature `binding.tag`): a string of
+   * 1 to 128 characters without control characters, on a rule with `on: "host"` or with a `callout`.
+   * It is copied to the queue item (`InboundItem.tag`) and shown by `explain`; the daemon never
+   * reads it. The router checks it (`invalid`, naming the rule), not this schema: on any other rule
+   * a `tag` key is not the daemon's and is ignored whatever it holds, as it was before the feature.
+   */
+  tag: Type.Optional(Type.Unknown()),
   note: Type.Optional(Type.String()),
 });
 export type Binding = Static<typeof Binding>;
@@ -164,6 +178,10 @@ export const RouteExplanation = Type.Object({
       source: Type.Union([Type.Literal('config'), Type.Literal('host'), Type.Literal('watch')]),
       on: BindingAction,
       agent: Type.Optional(Type.String()),
+      /** The backend the rule names (`Binding.to`). */
+      to: Type.Optional(Type.String()),
+      /** The rule's `tag` (`Binding.tag`), as written. */
+      tag: Type.Optional(Type.String()),
       sessionKey: Type.Optional(Type.String()),
       callout: Type.Optional(
         Type.Object({
@@ -189,7 +207,9 @@ export const RouteExplanation = Type.Object({
       /**
        * The target session refused the delivery before it reached a lane, with a
        * stable code, e.g. `agent_unavailable`: the agent the session is pinned to is
-       * no longer configured (or no longer interactive).
+       * no longer configured (or no longer interactive). `click_sender`: the input is a
+       * click on a message a backend sent and this rule is not that backend's (or the rule
+       * names a backend and the clicked message is not one it sent), so the rule was skipped (PB-1).
        */
       rejected: Type.Optional(Type.Object({ code: Type.String(), message: Type.Optional(Type.String()) })),
     }),
@@ -261,7 +281,10 @@ export type OutboundScopeRoute = Static<typeof OutboundScopeRoute>;
 
 export const HostHello = Type.Object({
   ...Req('host.hello'),
-  /** Daemon-generated secret, read from a 0600 file next to the socket. */
+  /**
+   * The host token (daemon-generated, read from a 0600 file next to the socket), or a backend
+   * key (feature `backends`): the key decides which backend the connection is.
+   */
   token: Type.String(),
   name: Type.String(),
   /** Push-consume the inbound queue as this consumer (omit to only pull with `aio tail`). */
@@ -542,7 +565,85 @@ export type TestFault = Static<typeof TestFault>;
 export const HostOutboundScope = Type.Object({ ...Req('host.outboundScope'), routes: Type.Array(OutboundScopeRoute) });
 export type HostOutboundScope = Static<typeof HostOutboundScope>;
 
-export const HostRequestFrame = Type.Union([HostHello, BindingsPut, BindingsGet, RunStart, RunCancel, Deliver, DeliverUpdate, MessageAck, ConversationCreate, SchedulePut, ScheduleRemove, ScheduleList, HistoryRead, InputVerify, InboundRead, InboundAck, Explain, SessionPrepare, InboundRedispatch, SessionCompact, SessionPrewarm, TestReplay, TestFault, HostOutboundScope]);
+/**
+ * Backend administration (PB-3): only a connection that said `host.hello` with the host token may
+ * send these; a backend key gets `forbidden`. `backends.list`: every configured backend, and every
+ * id that is no longer configured but still holds queue items, a cursor or send grants.
+ */
+export const BackendsList = Type.Object({ ...Req('backends.list') });
+export type BackendsList = Static<typeof BackendsList>;
+
+/**
+ * A backend's key. `issue`: a first key (`key_exists` when it has one). `rotate`: a new key; the
+ * old one stops working at once and connections made with it are closed. `revoke`: no key at all.
+ * `unknown_backend`: the id is not in the config.
+ */
+export const BackendsKey = Type.Object({
+  ...Req('backends.key'),
+  backend: Type.String(),
+  op: Type.Union([Type.Literal('issue'), Type.Literal('rotate'), Type.Literal('revoke')]),
+});
+export type BackendsKey = Static<typeof BackendsKey>;
+
+/**
+ * Remove what the daemon keeps for a backend id, configured or not: its queue items, its cursor
+ * and its send grants; its connections are closed. Its key stays. An id nothing is kept for
+ * answers zeros.
+ */
+export const BackendsForget = Type.Object({ ...Req('backends.forget'), backend: Type.String() });
+export type BackendsForget = Static<typeof BackendsForget>;
+
+/**
+ * Blobs over the host protocol (feature `blobs`; HOSTS §4.13, PB-6). With the host token: the
+ * daemon's shared blob store. With a backend's key: only the media of the items routed to it and
+ * the bytes it uploaded itself; any other ref answers like one nothing holds.
+ * `blob.stat`: `{ size }`, or `null`.
+ */
+export const HostBlobStat = Type.Object({ ...Req('blob.stat'), ref: Type.String() });
+export type HostBlobStat = Static<typeof HostBlobStat>;
+
+/**
+ * The bytes of a blob, or a range of them. Without `offset` and `length`: the whole blob when it is
+ * at most `BLOB_FRAME_MAX_BYTES`, else `too_large` (read it in ranges). With either: `offset`
+ * defaults to 0 and `length` to the rest, at most `BLOB_FRAME_MAX_BYTES`; an offset past the end is
+ * `bad_offset`. A ranged read is not hash-checked: the ref is the SHA-256 of all the bytes, for the
+ * reader to check. `not_found`: no such blob, or not one this key may read (same answer).
+ */
+export const HostBlobGet = Type.Object({
+  ...Req('blob.get'),
+  ref: Type.String(),
+  offset: Type.Optional(Type.Integer({ minimum: 0 })),
+  length: Type.Optional(Type.Integer({ minimum: 1, maximum: BLOB_FRAME_MAX_BYTES })),
+});
+export type HostBlobGet = Static<typeof HostBlobGet>;
+
+/**
+ * Upload bytes (base64; at most `BLOB_FRAME_MAX_BYTES` decoded per frame, else `too_large`).
+ * Without `part`: one blob, answered `{ ref, size }`. With `part`: one piece of the upload the
+ * caller names; `offset` must be the bytes received so far (else `bad_offset`, whose message says
+ * the offset expected; what was received is kept), `offset: 0` starts or restarts it, `last: true`
+ * completes it (`{ ref, size }`); other parts answer `{ upload, received }`. `too_large`: the blob
+ * exceeds the daemon's `blobs.maxBytes`. With a backend's key the bytes are staged for that
+ * backend alone for 24 h (`quota_exceeded`: too much staged; `busy`: too many unfinished uploads)
+ * and `mime` / `name` are not kept (give them on the attachment); with the host token they go to
+ * the shared store with `mime` (default `application/octet-stream`) and `name`.
+ */
+export const HostBlobPut = Type.Object({
+  ...Req('blob.put'),
+  base64: Type.String(),
+  part: Type.Optional(
+    Type.Object({
+      upload: Type.String({ minLength: 1, maxLength: 64 }),
+      offset: Type.Integer({ minimum: 0 }),
+      last: Type.Optional(Type.Boolean()),
+    }),
+  ),
+  mime: Type.Optional(Type.String()),
+  name: Type.Optional(Type.String()),
+});
+export type HostBlobPut = Static<typeof HostBlobPut>;
+
+export const HostRequestFrame = Type.Union([HostHello, BindingsPut, BindingsGet, RunStart, RunCancel, Deliver, DeliverUpdate, MessageAck, ConversationCreate, SchedulePut, ScheduleRemove, ScheduleList, HistoryRead, InputVerify, InboundRead, InboundAck, Explain, SessionPrepare, InboundRedispatch, SessionCompact, SessionPrewarm, TestReplay, TestFault, HostOutboundScope, BackendsList, BackendsKey, BackendsForget, HostBlobStat, HostBlobGet, HostBlobPut]);
 export type HostRequestFrame = Static<typeof HostRequestFrame>;
 
 // ---- daemon → host --------------------------------------------------------
@@ -554,6 +655,10 @@ export const InboundItem = Type.Object({
   channelRef: Type.String(),
   account: Type.String(),
   bindingId: Type.String(),
+  /** The backend this item was routed to (`Binding.to`); absent for the untargeted host queue. */
+  to: Type.Optional(Type.String()),
+  /** The `tag` of the rule that queued this item (`Binding.tag`): the admin's label, opaque to the daemon. Absent when the rule has none. */
+  tag: Type.Optional(Type.String()),
   input: InputRecord,
   /** The envelope without `raw`. */
   envelope: InboundEnvelope,
@@ -766,7 +871,7 @@ export type ContactCalloutAnswer = Static<typeof ContactCalloutAnswer>;
 export const HostEventFrame = Type.Union([InboundFrame, RouteCallout, ResolveCallout, ReviewCallout, OutboundCallout, ContactCallout, ExternalCallout, RunEnded, AttentionChanged, ResultFrame]);
 export type HostEventFrame = Static<typeof HostEventFrame>;
 
-export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'deliver.update', 'message.ack', 'conversation.create', 'schedule.put', 'schedule.remove', 'schedule.list', 'history.read', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare', 'inbound.redispatch', 'session.compact', 'session.prewarm', 'test.replay', 'test.fault', 'host.outboundScope'] as const;
+export const HOST_REQUEST_FRAME_TYPES = ['host.hello', 'bindings.put', 'bindings.get', 'run.start', 'run.cancel', 'deliver', 'deliver.update', 'message.ack', 'conversation.create', 'schedule.put', 'schedule.remove', 'schedule.list', 'history.read', 'input.verify', 'inbound.read', 'inbound.ack', 'explain', 'session.prepare', 'inbound.redispatch', 'session.compact', 'session.prewarm', 'test.replay', 'test.fault', 'host.outboundScope', 'backends.list', 'backends.key', 'backends.forget', 'blob.stat', 'blob.get', 'blob.put'] as const;
 export const HOST_EVENT_FRAME_TYPES = ['inbound', 'policy', 'run.ended', 'attention.changed', 'result'] as const;
 
 // ---- result values --------------------------------------------------------
@@ -811,6 +916,8 @@ export const HostHelloResult = Type.Object({
   outboundScope: Type.Optional(Type.Object({ revision: Type.Number(), routes: Type.Number() })),
   /** The hello's `optIn` this connection was granted (empty unless it is the host). */
   optIn: Type.Optional(Type.Array(Type.String())),
+  /** The hello's token was a backend key: the backend this connection is (it is not the host). */
+  backend: Type.Optional(Type.Object({ id: Type.String() })),
 });
 export type HostHelloResult = Static<typeof HostHelloResult>;
 
@@ -996,6 +1103,8 @@ export const EffectExplanation = Type.Object({
   at: Type.Number(),
   /** A send by a client of the external MCP endpoint: which client, the principal it was stamped with, whom it declared it acts for. */
   external: Type.Optional(ExternalSender),
+  /** A backend's `deliver`: which backend (its operationId is `backend:<id>:<operationId>`). */
+  backend: Type.Optional(Type.String()),
 });
 export type EffectExplanation = Static<typeof EffectExplanation>;
 
@@ -1152,6 +1261,66 @@ export const TestFaultResult = Type.Object({
 });
 export type TestFaultResult = Static<typeof TestFaultResult>;
 
+/** One backend in `backends.list`. */
+export const BackendInfo = Type.Object({
+  id: Type.String(),
+  /** In the config now. `false`: removed from it, listed because items, a cursor or grants remain under the id. */
+  configured: Type.Boolean(),
+  note: Type.Optional(Type.String()),
+  /** `backends.<id>.history`: it may use `history.read`. */
+  history: Type.Boolean(),
+  /** Its key, if it has one: `id` is the first 12 hex digits of the key's SHA-256. Never the key. */
+  key: Type.Optional(Type.Object({ id: Type.String(), createdAt: Type.Number() })),
+  /** Connections authenticated with its key now. */
+  connections: Type.Number(),
+  /** One of them is pushed its items. */
+  push: Type.Boolean(),
+  /** Its queue consumer: `backend:<id>`. */
+  consumer: Type.String(),
+  acked: Type.Number(),
+  /** Its items after `acked`. */
+  pending: Type.Number(),
+  /** Unix ms. */
+  oldestPendingAt: Type.Optional(Type.Number()),
+  /** Where it may send: destinations registered in the config, and conversations its items came from. */
+  routes: Type.Object({ registered: Type.Number(), granted: Type.Number() }),
+});
+export type BackendInfo = Static<typeof BackendInfo>;
+
+export const BackendsListResult = Type.Object({ backends: Type.Array(BackendInfo) });
+export type BackendsListResult = Static<typeof BackendsListResult>;
+
+/** `backends.key`. `key` is in the answer of `issue` and `rotate` only, this once: the daemon keeps its SHA-256. */
+export const BackendsKeyResult = Type.Object({
+  backend: Type.String(),
+  op: Type.Union([Type.Literal('issue'), Type.Literal('rotate'), Type.Literal('revoke')]),
+  key: Type.Optional(Type.String()),
+  keyId: Type.Optional(Type.String()),
+  createdAt: Type.Optional(Type.Number()),
+  /** Connections of this backend that were closed. */
+  closed: Type.Number(),
+});
+export type BackendsKeyResult = Static<typeof BackendsKeyResult>;
+
+/** `backends.forget`: how many queue items and conversation grants were removed, and connections closed. */
+export const BackendsForgetResult = Type.Object({ backend: Type.String(), items: Type.Number(), routes: Type.Number(), closed: Type.Number() });
+export type BackendsForgetResult = Static<typeof BackendsForgetResult>;
+
+/** `blob.stat`: the blob's size in bytes, or `null` (not held, or not one this key may read). Never the stored mime or name. */
+export const HostBlobStatResult = Type.Union([Type.Object({ size: Type.Integer() }), Type.Null()]);
+export type HostBlobStatResult = Static<typeof HostBlobStatResult>;
+
+/** `blob.get`: the bytes from `offset` in base64, and the blob's whole `size`. */
+export const HostBlobGetResult = Type.Object({ base64: Type.String(), size: Type.Integer(), offset: Type.Integer() });
+export type HostBlobGetResult = Static<typeof HostBlobGetResult>;
+
+/** `blob.put`: the stored blob, or (a part that is not the last) how many bytes of the upload arrived. */
+export const HostBlobPutResult = Type.Union([
+  Type.Object({ ref: Type.String(), size: Type.Integer() }),
+  Type.Object({ upload: Type.String(), received: Type.Integer() }),
+]);
+export type HostBlobPutResult = Static<typeof HostBlobPutResult>;
+
 /** Result value schema per host request type. */
 export const HOST_RESULT_VALUES = {
   'host.hello': HostHelloResult,
@@ -1178,4 +1347,10 @@ export const HOST_RESULT_VALUES = {
   'test.replay': TestReplayResult,
   'test.fault': TestFaultResult,
   'host.outboundScope': HostOutboundScopeResult,
+  'backends.list': BackendsListResult,
+  'backends.key': BackendsKeyResult,
+  'backends.forget': BackendsForgetResult,
+  'blob.stat': HostBlobStatResult,
+  'blob.get': HostBlobGetResult,
+  'blob.put': HostBlobPutResult,
 } as const satisfies Record<(typeof HOST_REQUEST_FRAME_TYPES)[number], TSchema>;

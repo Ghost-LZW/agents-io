@@ -24,6 +24,9 @@
           "consumer": {
             "type": "string"
           },
+          "backend": {
+            "type": "string"
+          },
           "acked": {
             "type": "number"
           },

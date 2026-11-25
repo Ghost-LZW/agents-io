@@ -7,6 +7,9 @@ import {
   ADMIN_REDACTED,
   ADMIN_WS_BEARER_PREFIX,
   ADMIN_WS_SUBPROTOCOL,
+  AdminBackendForgetResult,
+  AdminBackendKeyResult,
+  AdminBackends,
   AdminConfigDocument,
   AdminQueue,
   AdminSessions,
@@ -243,6 +246,102 @@ describe('console: explain, queue, sessions', () => {
   });
 });
 
+describe('console: the queue with backends', () => {
+  it('the queue lists a backend\'s consumer with its own pending count; legacy consumers\' counts leave targeted items out #PB-1', async () => {
+    const w = await consoleDaemon({
+      raw: {
+        backends: { alpha: {}, beta: {} },
+        bindings: [
+          { id: 'to-alpha', match: { channel: 'fake', keywords: ['alpha'] }, on: 'host', to: 'alpha' },
+          { id: 'to-host', match: { channel: 'fake', keywords: ['plain'] }, on: 'host' },
+        ],
+      },
+    });
+    const h = await w.host({ name: 'legacy' });
+    await h.inboundRead({ consumer: 'legacy', waitMs: 0 }); // makes the consumer known
+    await w.chat.inject({ id: 'm1', sender: alice, text: 'a plain one' });
+    await w.chat.inject({ id: 'm2', sender: alice, text: 'for alpha' });
+    await w.chat.inject({ id: 'm3', sender: alice, text: 'alpha again' });
+    await w.chat.inject({ id: 'm4', sender: alice, text: 'plain again' });
+    await w.chat.inject({ id: 'm5', sender: alice, text: 'alpha, a third' });
+    await until(() => w.gw.hostQueue.head() === 5);
+    const q = await w.api('/api/queue');
+    expect(check(AdminQueue, q.body)).toBe(true);
+    expect(q.body).toEqual({
+      head: 5,
+      consumers: [
+        { consumer: 'backend:alpha', backend: 'alpha', acked: 0, pending: 3, push: false, oldestPendingAt: expect.any(Number) },
+        { consumer: 'backend:beta', backend: 'beta', acked: 0, pending: 0, push: false },
+        { consumer: 'legacy', acked: 0, pending: 2, push: false, oldestPendingAt: expect.any(Number) },
+      ],
+    });
+    // Each count follows its own consumer's ack.
+    await h.inboundAck('legacy', 5);
+    w.gw.hostQueue.ack('backend:alpha', 2);
+    expect(((await w.api('/api/queue')).body as AdminQueue).consumers.map((c) => [c.consumer, c.acked, c.pending])).toEqual([['backend:alpha', 2, 2], ['backend:beta', 0, 0], ['legacy', 5, 0]]);
+  });
+});
+
+describe('console: backend keys', () => {
+  it('backend keys are issued, rotated and revoked, and a backend forgotten, with the admin credential (host token or a session), in answers that match their schemas; unknown backend 404, a second issue 409 #PB-3 #SE-3 #PR-1', async () => {
+    const w = await consoleDaemon({ raw: { backends: { alpha: { note: 'first' }, beta: {} }, bindings: [{ id: 'to-alpha', match: { channel: 'fake', keywords: ['alpha'] }, on: 'host', to: 'alpha' }] } });
+    const post = (path: string, json?: unknown, token?: string | null) => w.api(path, { method: 'POST', ...(json !== undefined ? { json } : {}), ...(token !== undefined ? { token } : {}) });
+    // No credentials, no backend administration.
+    expect((await w.api('/api/backends', { token: null })).status).toBe(401);
+    expect((await post('/api/backends/alpha/key', { op: 'issue' }, null)).status).toBe(401);
+    expect((await post('/api/backends/alpha/forget', undefined, 'nope')).status).toBe(401);
+    expect(w.gw.backends.list()).toEqual([]);
+
+    // With the host token.
+    const issued = await post('/api/backends/alpha/key', { op: 'issue' });
+    expect(issued.status).toBe(200);
+    expect(errors(AdminBackendKeyResult, issued.body)).toEqual([]);
+    expect(issued.body).toEqual({ backend: 'alpha', op: 'issue', key: expect.stringMatching(/^aiob_[\w-]{43}$/), keyId: expect.any(String), createdAt: expect.any(Number), closed: 0 });
+    expect(w.gw.backends.verify(issued.body.key)).toEqual({ id: 'alpha', keyId: issued.body.keyId });
+    expect(await post('/api/backends/alpha/key', { op: 'issue' })).toMatchObject({ status: 409, body: { error: { code: 'key_exists' } } });
+    for (const op of ['issue', 'rotate', 'revoke']) expect(await post('/api/backends/gamma/key', { op })).toMatchObject({ status: 404, body: { error: { code: 'unknown_backend' } } });
+    expect((await post('/api/backends/alpha/key', { op: 'print' })).status).toBe(400);
+    expect((await post('/api/backends/alpha/key', {})).status).toBe(400);
+    const list = await w.api('/api/backends');
+    expect(list.status).toBe(200);
+    expect(errors(AdminBackends, list.body)).toEqual([]);
+    expect(list.body.backends).toEqual([
+      { id: 'alpha', configured: true, note: 'first', history: false, key: { id: issued.body.keyId, createdAt: issued.body.createdAt }, connections: 0, push: false, consumer: 'backend:alpha', acked: 0, pending: 0, routes: { registered: 0, granted: 0 } },
+      { id: 'beta', configured: true, history: false, connections: 0, push: false, consumer: 'backend:beta', acked: 0, pending: 0, routes: { registered: 0, granted: 0 } },
+    ]);
+    // The key is in the answer that made it and nowhere else.
+    expect(JSON.stringify(list.body)).not.toContain(issued.body.key);
+
+    // With a console session (a login), the same operations.
+    const link = await post('/api/login-link', {});
+    const session = (await post('/api/login', { loginToken: link.body.url.split('#login=')[1] }, null)).body.token as string;
+    expect(((await w.api('/api/backends', { token: session })).body as AdminBackends).backends.map((b) => [b.id, b.key?.id])).toEqual([['alpha', issued.body.keyId], ['beta', undefined]]);
+    const rotated = await post('/api/backends/alpha/key', { op: 'rotate' }, session);
+    expect(rotated).toMatchObject({ status: 200, body: { backend: 'alpha', op: 'rotate', closed: 0 } });
+    expect(rotated.body.key).not.toBe(issued.body.key);
+    expect(w.gw.backends.verify(issued.body.key)).toBeUndefined();
+    expect(w.gw.backends.verify(rotated.body.key)).toEqual({ id: 'alpha', keyId: rotated.body.keyId });
+    // Forget: its queue items and grants go, its key stays.
+    await w.chat.inject({ id: 'm1', sender: alice, text: 'for alpha' });
+    await until(() => w.gw.hostQueue.head() === 1);
+    expect(((await w.api('/api/backends', { token: session })).body as AdminBackends).backends[0]).toMatchObject({ id: 'alpha', pending: 1, routes: { granted: 1 } });
+    const forgot = await post('/api/backends/alpha/forget', undefined, session);
+    expect(forgot.status).toBe(200);
+    expect(errors(AdminBackendForgetResult, forgot.body)).toEqual([]);
+    expect(forgot.body).toEqual({ backend: 'alpha', items: 1, routes: 1, closed: 0 });
+    expect(((await w.api('/api/backends')).body as AdminBackends).backends[0]).toMatchObject({ id: 'alpha', pending: 0, routes: { granted: 0 }, key: { id: rotated.body.keyId } });
+    expect((await post('/api/backends/alpha/forget')).body).toEqual({ backend: 'alpha', items: 0, routes: 0, closed: 0 });
+    expect(await post('/api/backends/Not%20An%20Id/forget')).toMatchObject({ status: 400, body: { error: { code: 'invalid_request' } } });
+    // Revoke: no key verifies for it.
+    expect(await post('/api/backends/alpha/key', { op: 'revoke' }, session)).toMatchObject({ status: 200, body: { backend: 'alpha', op: 'revoke', closed: 0 } });
+    expect(w.gw.backends.verify(rotated.body.key)).toBeUndefined();
+    expect(w.gw.backends.list()).toEqual([]);
+    // Only these methods and paths exist.
+    expect((await w.api('/api/backends/alpha/key')).status).toBe(404);
+    expect((await post('/api/backends/alpha')).status).toBe(404);
+  });
+});
+
 describe('console /ws', () => {
   /** A ws client that collects frames; `ask` sends a request and waits for its result. */
   function wsClient(ws: WebSocket) {
@@ -328,6 +427,110 @@ describe('console /ws', () => {
     expect(await status(`${base}/ws`, [ADMIN_WS_SUBPROTOCOL], { Authorization: `Bearer ${w.gw.token}`, Origin: 'https://evil.example' })).toBe(403);
     expect(await status(`${base}/other`, [ADMIN_WS_SUBPROTOCOL], { Authorization: `Bearer ${w.gw.token}` })).toBe(404);
     expect(await status(`${base}/ws`, [ADMIN_WS_SUBPROTOCOL], { Authorization: `Bearer ${w.gw.token}` })).toBe(101);
+  });
+
+  it("a backend key opens /ws only: every /api route answers 403 and it cannot make a login link; on that socket client frames are forbidden before and after hello, hello must be the same backend's key, and a revoke closes it even before hello #SE-3 #PB-1 #PB-3", async () => {
+    const turns: unknown[] = [];
+    const w = await consoleDaemon({
+      script: async (t) => void turns.push(t.inputs),
+      raw: { backends: { alpha: {}, beta: {} }, bindings: [{ id: 'to-alpha', match: { channel: 'fake', keywords: ['alpha'] }, on: 'host', to: 'alpha' }] },
+    });
+    const issue = async (id: string) => (await w.api(`/api/backends/${id}/key`, { method: 'POST', json: { op: 'issue' } })).body.key as string;
+    const [alphaKey, betaKey] = [await issue('alpha'), await issue('beta')];
+
+    // The console API: 403 on every route, the ones that exist and the ones that do not, whatever carries the key.
+    const FORBIDDEN = { status: 403, body: { error: { code: 'forbidden' } } };
+    const calls: [string, string, unknown?][] = [
+      ['GET', '/api/status'],
+      ['GET', '/api/queue'],
+      ['GET', '/api/sessions'],
+      ['GET', '/api/explain/m1'],
+      ['GET', '/api/backends'],
+      ['POST', '/api/backends/alpha/key', { op: 'rotate' }],
+      ['POST', '/api/backends/beta/key', { op: 'revoke' }],
+      ['POST', '/api/backends/beta/forget'],
+      ['GET', '/api/config'],
+      ['PUT', '/api/config', { config: {}, ifRevision: 'x' }],
+      ['POST', '/api/config/validate', { config: {} }],
+      ['POST', '/api/login-link', {}],
+      ['GET', '/api/nope'],
+    ];
+    for (const [method, path, json] of calls) expect([path, await w.api(path, { method, token: alphaKey, ...(json !== undefined ? { json } : {}) })]).toMatchObject([path, FORBIDDEN]);
+    expect(await w.api('/api/status', { token: null, headers: { Cookie: `${w.gw.console!.cookieName}=${alphaKey}` } })).toMatchObject(FORBIDDEN);
+    // Nothing above acted: both keys are the ones issued.
+    expect(w.gw.backends.verify(alphaKey)?.id).toBe('alpha');
+    expect(w.gw.backends.verify(betaKey)?.id).toBe('beta');
+    // A key is not a login token either: no session comes out of it.
+    const login = await w.api('/api/login', { method: 'POST', token: null, json: { loginToken: alphaKey } });
+    expect(login).toMatchObject({ status: 401, body: { error: { code: 'unauthorized' } } });
+    expect(login.headers.get('set-cookie')).toBeNull();
+    // A wrong token is still 401, and the admin credential still works.
+    expect((await w.api('/api/status', { token: 'aiob_not-a-real-key' })).status).toBe(401);
+    expect((await w.api('/api/status')).status).toBe(200);
+
+    // /ws with the key: the upgrade is accepted.
+    const base = `${w.url.replace('http', 'ws')}/ws`;
+    const ws = new WebSocket(base, [ADMIN_WS_SUBPROTOCOL], { headers: { Authorization: `Bearer ${alphaKey}` } });
+    await opened(ws);
+    const c = wsClient(ws);
+    const clientFrames = [
+      { type: 'sessions' },
+      { type: 'command', command: { type: 'input', sessionKey: 'local:main', mode: 'queue', input: { content: [{ type: 'text', text: 'as the owner?' }] } } },
+      { type: 'command', command: { type: 'subscribe', sessionKey: 'local:main', tier: 'full' } },
+      { type: 'command', command: { type: 'interrupt', sessionKey: 'local:main' } },
+      { type: 'watch.list' },
+      { type: 'topic.list' },
+      { type: 'tui.attach' },
+      { type: 'nope' },
+    ];
+    const NO_CLIENT = { ok: false, error: { code: 'forbidden' } };
+    // Before hello: a console connection would act as the owner here; this one is nobody yet.
+    for (const f of clientFrames) expect([f.type, await c.ask(f)]).toMatchObject([f.type, NO_CLIENT]);
+    expect(await c.ask({ type: 'bindings.get' })).toMatchObject({ ok: false, error: { code: 'unauthorized' } });
+    expect(await c.ask({ type: 'inbound.read', consumer: 'alpha' })).toMatchObject({ ok: false, error: { code: 'unauthorized' } });
+    // It counts as alpha's connection from the upgrade on.
+    expect(w.gw.host.backendConnections('alpha')).toEqual({ connections: 1, push: false });
+    // hello: the host token and another backend's key are refused on this connection.
+    expect(await c.ask({ type: 'host.hello', token: w.gw.token, name: 'admin', consumer: 'admin' })).toMatchObject({ ok: false, error: { code: 'unauthorized' } });
+    expect(await c.ask({ type: 'host.hello', token: betaKey, name: 'beta' })).toMatchObject({ ok: false, error: { code: 'unauthorized' } });
+    expect(await c.ask({ type: 'host.hello', token: 'aiob_not-a-real-key', name: 'x' })).toMatchObject({ ok: false, error: { code: 'unauthorized' } });
+    expect(w.gw.host.info()).toBeUndefined();
+    expect(w.gw.host.backendConnections('beta')).toEqual({ connections: 0, push: false });
+    expect(await c.ask({ type: 'sessions' })).toMatchObject(NO_CLIENT);
+    // Its own key: it is backend alpha, with the backend whitelist.
+    expect(await c.ask({ type: 'host.hello', token: alphaKey, name: 'whoever' })).toMatchObject({ ok: true, value: { name: 'backend:alpha', host: false, backend: { id: 'alpha' } } });
+    for (const f of clientFrames) expect([f.type, await c.ask(f)]).toMatchObject([f.type, NO_CLIENT]);
+    expect(await c.ask({ type: 'bindings.get' })).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+    await w.chat.inject({ id: 'm1', sender: alice, text: 'for alpha' });
+    expect(await c.ask({ type: 'inbound.read', consumer: 'alpha', waitMs: 2000 })).toMatchObject({ ok: true, value: { items: [{ to: 'alpha', envelope: { id: 'm1' } }] } });
+    // No client frame got through: no session, no turn.
+    expect(w.gw.sessions()).toEqual([]);
+    expect(turns).toEqual([]);
+
+    // A second socket (the bearer subprotocol, as a browser sends it) that never says hello.
+    const idle = new WebSocket(base, [ADMIN_WS_SUBPROTOCOL, ADMIN_WS_BEARER_PREFIX + alphaKey]);
+    await opened(idle);
+    // And one of beta's, which a revoke of alpha leaves alone.
+    const other = new WebSocket(base, [ADMIN_WS_SUBPROTOCOL], { headers: { Authorization: `Bearer ${betaKey}` } });
+    await opened(other);
+    expect(w.gw.host.backendConnections('alpha')).toEqual({ connections: 2, push: false });
+    const gone = (x: WebSocket) => new Promise<void>((r) => x.once('close', () => r()));
+    const [wsGone, idleGone] = [gone(ws), gone(idle)];
+    expect((await w.api('/api/backends/alpha/key', { method: 'POST', json: { op: 'revoke' } })).body).toEqual({ backend: 'alpha', op: 'revoke', closed: 2 });
+    await Promise.all([wsGone, idleGone]);
+    expect(w.gw.host.backendConnections('alpha')).toEqual({ connections: 0, push: false });
+    expect(other.readyState).toBe(WebSocket.OPEN);
+    expect(w.gw.host.backendConnections('beta')).toEqual({ connections: 1, push: false });
+    // The revoked key opens nothing now: the upgrade is refused, and the API answers 401 (a wrong token), not 403.
+    const refused = await new Promise<number>((resolve) => {
+      const x = new WebSocket(base, [ADMIN_WS_SUBPROTOCOL], { headers: { Authorization: `Bearer ${alphaKey}` } });
+      x.on('unexpected-response', (_req, res) => resolve(res.statusCode!));
+      x.on('open', () => resolve(101));
+      x.on('error', () => undefined);
+    });
+    expect(refused).toBe(401);
+    expect((await w.api('/api/status', { token: alphaKey })).status).toBe(401);
+    other.close();
   });
 });
 

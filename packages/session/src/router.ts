@@ -36,12 +36,16 @@ import { contentText } from './watch.js';
  * no rule matches is dropped. No model is ever called here: a rule that needs a
  * judgement hands the input to the host (`on: "host"`) or asks it synchronously
  * (`callout`). Every decision is explained and the explanation is persisted.
+ *
+ * A `host` rule may name a backend (`to`): the input is then queued for that
+ * backend alone, once per backend named. A click on a message a backend sent
+ * belongs to that backend: only its own rules can take it (PB-1).
  */
 
 export class RouterError extends Error {
   override name = 'RouterError';
   constructor(
-    readonly code: 'invalid' | 'conflict' | 'task_agent' | 'unknown_agent' | 'stale_version',
+    readonly code: 'invalid' | 'conflict' | 'task_agent' | 'unknown_agent' | 'stale_version' | 'unknown_backend',
     message: string,
   ) {
     super(message);
@@ -112,11 +116,25 @@ export type Explanation = RouteExplanation & {
   dropped?: 'adapter' | 'no_match' | 'drop_rule';
 };
 
+/** One host-queue entry of a routed input: the rule that put it there and the backend it is for (absent: the untargeted queue). */
+export interface RouteHost {
+  bindingId: string;
+  source: BindingSource;
+  to?: string;
+  /** The rule's `tag`, copied to the queue item as written. */
+  tag?: string;
+}
+
 export interface RouteDecision {
   /** One per target session: the strongest matching action for it. */
   deliveries: RouteDelivery[];
-  /** Put into the host inbound queue (the first matching `host` rule). */
-  host?: { bindingId: string; source: BindingSource };
+  /** Put into the host inbound queue: the first of `hosts`. */
+  host?: RouteHost;
+  /**
+   * Every queue the input goes into: the first matching `host` rule per backend named
+   * (`to`), and the first one naming none (the untargeted queue). Empty: not queued.
+   */
+  hosts: RouteHost[];
   explanation: Explanation;
 }
 
@@ -173,6 +191,8 @@ export interface RouterOptions {
   log?: (level: 'debug' | 'info' | 'warn', msg: string) => void;
   /** Session launches (decision 7). Without it a callout answer with `launch` is an error. */
   launches?: RouterLaunches;
+  /** The configured backends a rule's `to` may name (none: every `to` is `unknown_backend`). */
+  backends?: readonly string[];
 }
 
 const DAY = 86_400_000;
@@ -211,8 +231,10 @@ export class Router {
   private identities!: IdentityMap;
   private q: Record<'tablePut' | 'tableGet' | 'tableDel' | 'explainPut' | 'explainGet' | 'explainPrune' | 'convAgentGet' | 'convAgentPut' | 'convAgentDel', StatementSync>;
   private records = 0;
+  private readonly backends: ReadonlySet<string>;
 
   constructor(private readonly o: RouterOptions) {
+    this.backends = new Set(o.backends ?? []);
     for (const a of o.agents) {
       if (!a.name) throw new RouterError('invalid', 'agent without a name');
       if (this.agents.has(a.name)) throw new RouterError('invalid', `agent ${a.name} is defined twice`);
@@ -378,6 +400,17 @@ export class Router {
       if (b.digest?.maxItems !== undefined && !(b.digest.maxItems >= 1)) throw new RouterError('invalid', `${where}: digest.maxItems must be >= 1`);
       if (b.match.conversationKind !== undefined && !KINDS.has(b.match.conversationKind)) throw new RouterError('invalid', `${where}: unknown conversationKind`);
       if (b.callout?.skipWhenPinned && !targets(b.on)) throw new RouterError('invalid', `${where}: callout.skipWhenPinned needs an on that targets a session (dispatch, context, digest)`);
+      if (b.to !== undefined) {
+        // `to` picks a backend's queue: a rule that can never queue for the host has no use for it.
+        if (b.on !== 'host' && !b.callout) throw new RouterError('invalid', `${where}: to needs on: "host" or a callout`);
+        if (!this.backends.has(b.to)) throw new RouterError('unknown_backend', `${where}: unknown backend ${JSON.stringify(b.to)} (backends: ${[...this.backends].join(', ') || 'none'})`);
+      }
+      // `tag` labels a queue item, so it is checked on the rules that can queue for the host. On any other
+      // rule the key is not ours: tables carried one there before the feature, and still load (RT-1).
+      if (b.tag !== undefined && taggable(b)) {
+        if (typeof b.tag !== 'string' || b.tag.length < 1 || b.tag.length > TAG_MAX_LENGTH) throw new RouterError('invalid', `${where}: tag must be a string of 1 to ${TAG_MAX_LENGTH} characters`);
+        if (/\p{Cc}/u.test(b.tag)) throw new RouterError('invalid', `${where}: tag has a control character`);
+      }
     }
     try {
       checkIdentities(table.identities);
@@ -433,8 +466,14 @@ export class Router {
   /**
    * Route one stamped input. Does not record the explanation (`record` does),
    * so the caller can still settle the input id.
+   *
+   * `o.clickOf`: the backend that sent the message this click is on (the caller knows
+   * who sent what). A click belongs to the sender of its message (PB-1): with `clickOf`
+   * only rules `to` that backend take it, and only into its queue; without it no rule
+   * naming a backend takes a click. Skipped rules are explained (`rejected.code:
+   * "click_sender"`) and asked no callout. Inputs that are not clicks are not filtered.
    */
-  async route(env: InboundEnvelope, origin: Origin, input: InputRecord): Promise<RouteDecision> {
+  async route(env: InboundEnvelope, origin: Origin, input: InputRecord, o: { clickOf?: string } = {}): Promise<RouteDecision> {
     const explanation: Explanation = {
       inputId: input.inputId,
       tableVersions: this.versions(),
@@ -444,17 +483,44 @@ export class Router {
       at: this.now(),
     };
     // Auto-replies, bounces, bulk mail: not a message for anyone, not even a watch.
-    if (env.admission === 'drop') return { deliveries: [], explanation: { ...explanation, dropped: 'adapter' } };
+    if (env.admission === 'drop') return { deliveries: [], hosts: [], explanation: { ...explanation, dropped: 'adapter' } };
+
+    const clickOf = actionIdOf(env) !== undefined ? o.clickOf : undefined;
+    // Why a rule does not get this click; undefined: it does (always, for an input that is not a click).
+    const notForClick = (to: string | undefined): string | undefined => {
+      if (actionIdOf(env) === undefined) return undefined;
+      if (clickOf !== undefined) return to === clickOf ? undefined : `the clicked message was sent by backend ${JSON.stringify(clickOf)}: only rules to it take the click`;
+      return to !== undefined ? `the clicked message was not sent by backend ${JSON.stringify(to)}` : undefined;
+    };
+    const skipped = (r: Rule, on: BindingAction, message: string, callout?: Resolved['callout']): Skipped => ({
+      skipped: { bindingId: r.binding.id, source: r.source, on, ...(r.binding.to !== undefined ? { to: r.binding.to } : {}), ...tagOf(r.binding), ...(callout ? { callout } : {}), rejected: { code: 'click_sender', message } },
+    });
 
     const rules = this.rules();
     const hits = rules.filter((r) => matches(r.binding.match, env, origin, this.selfAccounts));
-    // Callouts run in parallel so one slow host does not add up per rule.
-    const resolved = await Promise.all(hits.map((r) => this.resolve(r, env, input)));
-    if (this.o.legacyAdmit && !this.config && !this.activeHost()) resolved.unshift(await this.legacy(env, origin));
+    // Callouts run in parallel so one slow host does not add up per rule. A rule the click is not for is never asked.
+    const resolved: (Resolved | Skipped)[] = await Promise.all(
+      hits.map((r) => {
+        const why = notForClick(r.binding.to);
+        return why !== undefined ? skipped(r, r.binding.on, why) : this.resolve(r, env, input);
+      }),
+    );
+    // A click on a backend's message is that backend's alone: the legacy admit is not asked either.
+    if (this.o.legacyAdmit && !this.config && !this.activeHost() && clickOf === undefined) resolved.unshift(await this.legacy(env, origin));
 
     const best = new Map<string, RouteDelivery>();
-    let host: RouteDecision['host'];
-    for (const answered of resolved) {
+    const hosts: RouteHost[] = [];
+    let counted = 0;
+    for (let answered of resolved) {
+      // A backend's click goes into its queue or nowhere: a callout that answered a session (or drop) does not take it.
+      if (!('skipped' in answered) && clickOf !== undefined && answered.on !== 'host') {
+        answered = skipped(answered, answered.on, `a click on a message backend ${JSON.stringify(clickOf)} sent can only be queued for it (on: "host")`, answered.callout);
+      }
+      if ('skipped' in answered) {
+        explanation.matched.push(answered.skipped);
+        continue;
+      }
+      counted++;
       let r = answered;
       let p = this.place(r, env, origin);
       if (r.launch !== undefined && p.delivery) {
@@ -480,15 +546,20 @@ export class Router {
         else if (d.launch && !prior.launch) prior.launch = d.launch;
         // U21: the host's `history: false` rides along to whichever delivery wins, like a launch (only callout answers set it).
         if (d.noHistory) best.get(d.sessionKey)!.noHistory = true;
-      } else if (on === 'host') host ??= { bindingId: r.binding.id, source: r.source };
+      } else if (on === 'host') {
+        // One queue entry per backend named, and one for the rules naming none: the first matching rule of each.
+        const to = r.binding.to;
+        if (!hosts.some((h) => h.to === to)) hosts.push({ bindingId: r.binding.id, source: r.source, ...(to !== undefined ? { to } : {}), ...tagOf(r.binding) });
+      }
       explanation.matched.push(entry);
     }
     const deliveries = [...best.values()];
-    if (!deliveries.length && !host) {
-      explanation.dropped = explanation.matched.length ? 'drop_rule' : 'no_match';
-      if (!explanation.matched.length) this.o.log?.('debug', `input ${input.inputId} from ${origin.via} (${origin.principal?.id ?? 'unknown'}) matched no binding: dropped`);
+    if (!deliveries.length && !hosts.length) {
+      // Rules skipped for a click did not decide anything: without another match the input matched nothing.
+      explanation.dropped = counted ? 'drop_rule' : 'no_match';
+      if (!counted) this.o.log?.('debug', `input ${input.inputId} from ${origin.via} (${origin.principal?.id ?? 'unknown'}) matched no binding: dropped`);
     }
-    return { deliveries, ...(host ? { host } : {}), explanation };
+    return { deliveries, ...(hosts[0] ? { host: hosts[0] } : {}), hosts, explanation };
   }
 
   /**
@@ -537,7 +608,7 @@ export class Router {
     let on = r.on;
     // Our own echoes are recorded at most, never start a turn: no rule can make the deployment loop on its output.
     if (origin.self && on === 'dispatch') on = 'context';
-    const entry: RouteExplanation['matched'][number] = { bindingId: r.binding.id, source: r.source, on, ...(r.callout ? { callout: r.callout } : {}) };
+    const entry: RouteExplanation['matched'][number] = { bindingId: r.binding.id, source: r.source, on, ...(r.binding.to !== undefined ? { to: r.binding.to } : {}), ...tagOf(r.binding), ...(r.callout ? { callout: r.callout } : {}) };
     if (!targets(on)) return { on, entry };
     let agent = r.watchId !== undefined || r.legacyKey !== undefined ? undefined : this.agents.get(r.agent ?? this.o.defaultAgent ?? '');
     // A flat conversation whose agent was chosen (`/agent`) goes to that agent, for every table rule.
@@ -730,6 +801,11 @@ export class Router {
   }
 }
 
+/** A matching rule that did not get the input (a click that belongs to another sender): only its explanation entry. */
+interface Skipped {
+  skipped: RouteExplanation['matched'][number];
+}
+
 interface Resolved extends Rule {
   on: BindingAction;
   agent?: string;
@@ -754,6 +830,13 @@ export function topicConversation(env: InboundEnvelope): string {
 export const REDISPATCH_RULE = 'host:redispatch';
 
 const targets = (on: BindingAction): on is Effective => on === 'dispatch' || on === 'context' || on === 'digest';
+
+/** The longest `Binding.tag` (RT-1). */
+const TAG_MAX_LENGTH = 128;
+/** A rule that can queue for the host: only there `to` and `tag` mean something. */
+const taggable = (b: Binding): boolean => b.on === 'host' || b.callout !== undefined;
+/** The rule's `tag` where it is one (validated at load); a `tag` key on any other rule is ignored: not copied, not explained. */
+const tagOf = (b: Binding): { tag?: string } => (typeof b.tag === 'string' && taggable(b) ? { tag: b.tag } : {});
 
 /** `v` is older than `than`: both are decimal integers and `v` is smaller. */
 function olderVersion(v: string, than: string): boolean {

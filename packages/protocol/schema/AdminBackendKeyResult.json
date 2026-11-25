@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/AdminBackendKeyResult",
+  "type": "object",
+  "required": [
+    "backend",
+    "op",
+    "closed"
+  ],
+  "properties": {
+    "backend": {
+      "type": "string"
+    },
+    "op": {
+      "anyOf": [
+        {
+          "const": "issue",
+          "type": "string"
+        },
+        {
+          "const": "rotate",
+          "type": "string"
+        },
+        {
+          "const": "revoke",
+          "type": "string"
+        }
+      ]
+    },
+    "key": {
+      "type": "string"
+    },
+    "keyId": {
+      "type": "string"
+    },
+    "createdAt": {
+      "type": "number"
+    },
+    "closed": {
+      "type": "number"
+    }
+  }
+}

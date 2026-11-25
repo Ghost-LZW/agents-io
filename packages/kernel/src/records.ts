@@ -39,6 +39,8 @@ export interface OutboundRecord {
   provenance?: Pick<TurnProvenance, 'external' | 'watched' | 'group' | 'cause'>;
   /** A send by a client of the external MCP endpoint (no turn made it): who. */
   external?: ExternalSender;
+  /** A `deliver` (or final `deliver.update`) made with a backend's key: which backend (PB-2). */
+  backend?: string;
   at: number;
 }
 
@@ -64,8 +66,9 @@ export class DaemonRecords implements OutboxStore, OpStore {
   private q: Record<
     | 'inPut' | 'inGet' | 'inPrune' | 'outGet' | 'outPut' | 'outPrune' | 'flyPut' | 'flyGet' | 'flyAll' | 'flyDel' | 'agentGet' | 'agentPut' | 'launchGet' | 'launchPut' | 'launchKeys'
     | 'flagGet' | 'flagPut' | 'flagDel'
-    | 'obPut' | 'obByOp' | 'obByMsg' | 'obAnyMsg' | 'obAnyPart' | 'obPrune' | 'obPartPut' | 'obByPart' | 'obPartPrune' | 'causePut' | 'causeGet' | 'causeAll' | 'causePrune'
-    | 'opGet' | 'opPut',
+    | 'obPut' | 'obByOp' | 'obByMsg' | 'obAnyMsg' | 'obAnyPart' | 'obBackendMsg' | 'obBackendPart' | 'obPrune' | 'obPartPut' | 'obByPart' | 'obPartPrune' | 'causePut' | 'causeGet' | 'causeAll' | 'causePrune'
+    | 'opGet' | 'opPut'
+    | 'bkAll' | 'bkPut' | 'bkDel',
     StatementSync
   >;
   /** Tests: called between the agent row and the launch row of `pin` (a throw rolls both back). */
@@ -85,6 +88,7 @@ export class DaemonRecords implements OutboxStore, OpStore {
       CREATE TABLE IF NOT EXISTS daemon_outbound (operation_id TEXT PRIMARY KEY, channel TEXT NOT NULL, provider_message_id TEXT, sent_message_id TEXT, at INTEGER NOT NULL, json TEXT NOT NULL) WITHOUT ROWID;
       CREATE INDEX IF NOT EXISTS daemon_outbound_msg ON daemon_outbound (channel, provider_message_id);
       CREATE TABLE IF NOT EXISTS daemon_outbound_parts (channel TEXT NOT NULL, provider_message_id TEXT NOT NULL, operation_id TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (channel, provider_message_id, operation_id)) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS daemon_backend_keys (backend TEXT PRIMARY KEY, hash TEXT NOT NULL, created_at INTEGER NOT NULL) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS client_ops (principal TEXT NOT NULL, op_id TEXT NOT NULL, frame_type TEXT NOT NULL, session_key TEXT NOT NULL, status TEXT NOT NULL, result TEXT, seq INTEGER, turn_id TEXT, at INTEGER NOT NULL, PRIMARY KEY (principal, op_id)) WITHOUT ROWID;
     `);
     // `sent_message_id` (any delivered message, `sentByUs`) came later: added to an older table and filled
@@ -94,6 +98,8 @@ export class DaemonRecords implements OutboxStore, OpStore {
       this.db.exec(`ALTER TABLE daemon_outbound ADD COLUMN sent_message_id TEXT;
         UPDATE daemon_outbound SET sent_message_id = json_extract(json, '$.providerMessageId') WHERE json_extract(json, '$.result') = 'delivered';`);
     }
+    // `backend` (which backend's key made the delivery, PB-2) came later still; NULL for every other row.
+    if (!obCols.includes('backend')) this.db.exec('ALTER TABLE daemon_outbound ADD COLUMN backend TEXT');
     this.db.exec('CREATE INDEX IF NOT EXISTS daemon_outbound_sent ON daemon_outbound(channel, sent_message_id)');
     // One envelope may reach several sessions (a dispatch and a watch): a cause record per (input, session).
     // A table from before keyed by input_id alone is moved over.
@@ -132,17 +138,25 @@ export class DaemonRecords implements OutboxStore, OpStore {
       flagGet: p('SELECT value FROM daemon_flags WHERE name = ?'),
       flagPut: p('INSERT INTO daemon_flags (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value'),
       flagDel: p('DELETE FROM daemon_flags WHERE name = ?'),
-      obPut: p('INSERT INTO daemon_outbound (operation_id, channel, provider_message_id, sent_message_id, at, json) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(operation_id) DO UPDATE SET channel = excluded.channel, provider_message_id = excluded.provider_message_id, sent_message_id = excluded.sent_message_id, at = excluded.at, json = excluded.json'),
+      // PB-3: a backend's key is kept as its SHA-256 only, one per backend.
+      bkAll: p('SELECT backend, hash, created_at FROM daemon_backend_keys ORDER BY backend'),
+      bkPut: p('INSERT INTO daemon_backend_keys (backend, hash, created_at) VALUES (?, ?, ?) ON CONFLICT(backend) DO UPDATE SET hash = excluded.hash, created_at = excluded.created_at'),
+      bkDel: p('DELETE FROM daemon_backend_keys WHERE backend = ?'),
+      obPut: p('INSERT INTO daemon_outbound (operation_id, channel, provider_message_id, sent_message_id, at, json, backend) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(operation_id) DO UPDATE SET channel = excluded.channel, provider_message_id = excluded.provider_message_id, sent_message_id = excluded.sent_message_id, at = excluded.at, json = excluded.json, backend = excluded.backend'),
       obByOp: p('SELECT json FROM daemon_outbound WHERE operation_id = ?'),
       // Only messages a turn delivered name a turn; the newest wins if a platform id was ever reused.
       obByMsg: p('SELECT json FROM daemon_outbound WHERE channel = ? AND provider_message_id = ? ORDER BY at DESC LIMIT 1'),
       obAnyMsg: p('SELECT 1 FROM daemon_outbound WHERE channel = ? AND sent_message_id = ? LIMIT 1'),
-      obPrune: p('DELETE FROM daemon_outbound WHERE at < ?'),
+      // PB-2: every backend delivery of a platform message (a `deliver` and a final `deliver.update` are two rows), newest first.
+      obBackendMsg: p('SELECT json FROM daemon_outbound WHERE channel = ? AND sent_message_id = ? AND backend IS NOT NULL ORDER BY at DESC'),
+      obBackendPart: p('SELECT o.json FROM daemon_outbound_parts p JOIN daemon_outbound o ON o.operation_id = p.operation_id WHERE p.channel = ? AND p.provider_message_id = ? AND o.backend IS NOT NULL ORDER BY p.at DESC'),
+      // A backend's rows are kept: who sent a message decides whose its clicks and edits are (PB-1, PB-2), however old it is.
+      obPrune: p('DELETE FROM daemon_outbound WHERE at < ? AND backend IS NULL'),
       // The other parts of a split send (the main row keys the primary one).
       obPartPut: p('INSERT INTO daemon_outbound_parts (channel, provider_message_id, operation_id, at) VALUES (?, ?, ?, ?) ON CONFLICT(channel, provider_message_id, operation_id) DO UPDATE SET at = excluded.at'),
       obByPart: p('SELECT o.json FROM daemon_outbound_parts p JOIN daemon_outbound o ON o.operation_id = p.operation_id WHERE p.channel = ? AND p.provider_message_id = ? AND o.provider_message_id IS NOT NULL ORDER BY p.at DESC LIMIT 1'),
       obAnyPart: p('SELECT 1 FROM daemon_outbound_parts WHERE channel = ? AND provider_message_id = ? LIMIT 1'),
-      obPartPrune: p('DELETE FROM daemon_outbound_parts WHERE at < ?'),
+      obPartPrune: p('DELETE FROM daemon_outbound_parts WHERE at < ? AND operation_id NOT IN (SELECT operation_id FROM daemon_outbound WHERE backend IS NOT NULL)'),
       causePut: p('INSERT INTO daemon_causes (input_id, chain, hop, session_key, at, json) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(input_id, session_key) DO UPDATE SET chain = excluded.chain, hop = excluded.hop, json = excluded.json'),
       causeGet: p('SELECT json FROM daemon_causes WHERE input_id = ? AND session_key = ?'),
       causeAll: p('SELECT json FROM daemon_causes WHERE input_id = ? ORDER BY at, session_key'),
@@ -171,7 +185,7 @@ export class DaemonRecords implements OutboxStore, OpStore {
     const sent = r.result === 'delivered' && r.providerMessageId !== undefined ? r.providerMessageId : null;
     this.db.exec('SAVEPOINT outbound_put');
     try {
-      this.q.obPut.run(r.operationId, r.channel, msg, sent, r.at, JSON.stringify(r));
+      this.q.obPut.run(r.operationId, r.channel, msg, sent, r.at, JSON.stringify(r), r.backend ?? null);
       if (sent !== null) for (const id of r.providerMessageIds ?? []) if (id !== sent) this.q.obPartPut.run(r.channel, id, r.operationId, r.at);
       this.db.exec('RELEASE outbound_put');
     } catch (e) {
@@ -193,6 +207,19 @@ export class DaemonRecords implements OutboxStore, OpStore {
    */
   sentByUs(channel: string, providerMessageId: string): boolean {
     return !!(this.q.obAnyMsg.get(channel, providerMessageId) ?? this.q.obAnyPart.get(channel, providerMessageId));
+  }
+
+  /**
+   * The backends whose key delivered platform message `id` on `channel` (any account of it: the
+   * caller compares `route`), newest first. Empty for a message a turn, the host token or nobody
+   * here sent. These rows are not pruned (PB-2).
+   */
+  backendSent(channel: string, providerMessageId: string): { backend: string; route: ReplyRoute }[] {
+    const rows = [...this.q.obBackendMsg.all(channel, providerMessageId), ...this.q.obBackendPart.all(channel, providerMessageId)] as { json: string }[];
+    return rows.flatMap((x) => {
+      const r = JSON.parse(x.json) as OutboundRecord;
+      return r.backend !== undefined ? [{ backend: r.backend, route: r.route }] : [];
+    });
   }
 
   /** The turn that delivered platform message `id` on `channel` (any account of it), if this daemon did. */
@@ -324,6 +351,21 @@ export class DaemonRecords implements OutboxStore, OpStore {
   setFlag(name: string, value: string | undefined): void {
     if (value === undefined) this.q.flagDel.run(name);
     else this.q.flagPut.run(name, value);
+  }
+
+  /** PB-3: the stored backend key digests (SHA-256, hex), by backend id. Never a key itself. */
+  backendKeys(): { backend: string; hash: string; createdAt: number }[] {
+    return (this.q.bkAll.all() as { backend: string; hash: string; created_at: number }[]).map((r) => ({ backend: r.backend, hash: r.hash, createdAt: r.created_at }));
+  }
+
+  /** Set (or replace) a backend's key digest. */
+  putBackendKey(backend: string, hash: string, at: number): void {
+    this.q.bkPut.run(backend, hash, at);
+  }
+
+  /** Remove a backend's key digest; whether there was one. */
+  delBackendKey(backend: string): boolean {
+    return Number(this.q.bkDel.run(backend).changes) > 0;
   }
 
   // ---- session launch (decision 7) ---------------------------------------

@@ -213,6 +213,10 @@
               }
             }
           },
+          "to": {
+            "type": "string"
+          },
+          "tag": {},
           "note": {
             "type": "string"
           }

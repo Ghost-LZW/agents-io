@@ -37,12 +37,16 @@
   "agent": "assistant",            // dispatch/context/digest 的目标 agent（命名的运行配置）
   "session": "main",               // main | per-conversation | per-thread | topic（决定 6：平铺对话的当前话题）
   "digest": { "everyMs": 3600000, "maxItems": 50 },
-  "callout": { "timeoutMs": 1500, "onFailure": "host", "skipWhenPinned": true }   // 可选：显式开启同步回调（§2.2）
+  "callout": { "timeoutMs": 1500, "onFailure": "host", "skipWhenPinned": true },  // 可选：显式开启同步回调（§2.2）
+  "to": "beta",                    // 可选，只对 on: "host" 或带 callout 的规则：交给哪个后端（§2.1、§4.12）
+  "tag": "inbox"                   // 可选，在这两种规则上是管理员给条目的标签：原样抄到条目上，守护进程不解读（§2.1）
 }
 ```
 
 - **agents**：配置里命名的运行默认值（harness 实例、model、profile、cwd、工具），不含人设。部署方可以在 agent 上写 `sessionParams`，允许宿主按会话指定工作目录和环境变量（决定 7，§2.3）。`mode: "task"` 的 agent 只能由 `run.start` 启动，任何规则指向它都在加载时报错。
-- **来源**：本地配置，以及宿主推送的整表 `bindings.put { version, bindings, identities, expiresAt?, onHostDown: "keep" | "suspend" }`（宿主推送的默认 `suspend`）。`version` 都是十进制整数（计数器、毫秒时间戳）时有先后：比当前表小的推送答 `stale_version`、不替换（迟到的旧推送不覆盖新表）；其他形式的版本是不透明标签，任何一个都替换。同一输入命中多条规则时全部生效；同一 (agent, session) 取最强的动作。
+- **来源**：本地配置，以及宿主推送的整表 `bindings.put { version, bindings, identities, expiresAt?, onHostDown: "keep" | "suspend" }`（宿主推送的默认 `suspend`）。`version` 都是十进制整数（计数器、毫秒时间戳）时有先后：比当前表小的推送答 `stale_version`、不替换（迟到的旧推送不覆盖新表）；其他形式的版本是不透明标签，任何一个都替换。同一输入命中多条规则时全部生效；同一 (agent, session) 取最强的动作。唯一的例外是卡片点击：被点的消息是某个后端 `deliver` 的，只有 `to` 是它的规则接这次点击；带 `to` 的规则也只接它那个后端发的消息上的点击（§4.12）。
+- **`to`（feature `backends`）**：规则把输入交给配置里的一个后端（`backends.<id>`）。只能写在 `on: "host"` 或带 `callout` 的规则上（别的规则到不了宿主队列），写在别处答 `invalid`；指向没有配置的后端，配置表加载失败，`bindings.put` 答 `unknown_backend`。推带 `to` 的表之前先看 `host.hello` 结果的 `features` 里有 `backends`：没有它的守护进程（旧版本，或没有配置任何后端）不认识这个字段或这个后端。宿主推送的表里带 `to` 的规则随宿主表一起挂起（`onHostDown`）；给后端的规则写在配置表里，或者推送时用 `onHostDown: "keep"`。
+- **`tag`（feature `binding.tag`）**：规则给它入队的条目贴的标签，1 到 128 个字符，不含控制字符，内容随管理员定（例如 `inbox` / `chat` / `guest`，告诉后端这条条目该怎么处理）。它在 `on: "host"` 或带 `callout` 的规则上才是标签：在那里不是字符串、为空、超长或带控制字符都答 `invalid`，文字指出是哪条规则（配置表加载失败，`bindings.put` 不替换当前表；类型与长度也是 `invalid`，不是 `invalid_frame`）。写在别的规则上（`dispatch`、`context`、`digest`、`drop` 且不带 `callout`）的 `tag` 键不归守护进程管：写什么都不报错，不抄到条目，`explain` 里也不出现，与有这个功能之前一样，所以原来自己在规则上带着 `tag` 键的表照样能推、能加载。守护进程不解读标签：匹配、fan-out、按 `to` 去重、点击归属都不看。它原样出现在条目的 `tag` 上（§2.1）和 `aio explain` 里这两种规则的每条命中上。推带 `tag` 的表之前先看 `features` 里有 `binding.tag`：没有它的守护进程不校验、也不抄这个字段。
 - **watch** 就是 agent 在运行时通过输出工具新增的一条规则，仍受 `Policy.watch` 约束。
 - **可解释**：每条输入记下命中的规则 id、表版本、回调结果；`aio explain <inputId>` 列出来。
 
@@ -50,8 +54,12 @@
 
 输入写入**宿主入站队列**：按消费者记游标，至少投递一次，幂等键为渠道消息引用（`channel:<渠道>/<消息 id>`）。两种消费方式，语义相同：
 
-- **推送**：宿主连接守护进程并 `host.hello { inbound: true, consumer }`；守护进程推 `inbound` 帧，宿主回 `result { accepted }` 后前移；断线期间留在队列，重连后补推。
+- **推送**：宿主连接守护进程并 `host.hello { consumer }`；守护进程推 `inbound` 帧，宿主回 `result { accepted }` 后前移；断线期间留在队列，重连后补推。
 - **拉取**：`aio tail --consumer <name> [--from <cursor>]` 逐行输出 JSON（含 `cursor`）；宿主处理后 `aio ack --consumer <name> <cursor>`。
+
+**按后端分（规则带 `to`，§4.12）**：带 `to: "<id>"` 的规则命中的输入，条目带 `to`，只给消费者 `backend:<id>`（那个后端凭自己的钥匙连接时的游标）；不带 `to` 的规则照旧，条目只给不带后端的消费者。两边互相看不到。同一条输入命中指向两个后端的规则，是两条条目，各自去重（幂等键是账号、渠道消息引用加后端）；同时命中一条不带 `to` 的 `host` 规则时，宿主那边也有一条，写规则的人要自己避免两边都回复（`aio explain` 的每条命中规则带 `to`）。游标是全队列共用的序列，所以一个后端看到的游标不连续。清理也分开：不带 `to` 的条目在所有不带后端的消费者都 ack 之后删，一个后端的条目在它自己 ack 之后删；一个长期不 ack 的后端只积压它自己的条目。
+
+**条目的 `tag`**：入队这条条目的那条规则带 `tag` 时，条目带同样的 `tag`（`InboundItem.tag`）；规则没有就没有这个键。每个队列视图（每个后端、以及不带后端的）的条目来自它第一条命中的规则，`tag` 也是那条规则的，不会借后面规则的。同一条消息被渠道重投时返回第一次的条目，`tag` 是第一次入队时的，之后改了表也不变。
 
 条目里的 `input.channelContext` 与 `envelope`（路由回调的 `args.input` / `args.envelope` 也一样）在通道给得出时带回复链：`rootMessageId`（链或话题的第一条）、`parentMessageId`（这条回复的那一条），都是通道自己的消息 id（飞书 `root_id` / `parent_id`，私聊、群、话题都有）。宿主可据此判断一条回复是在回哪条消息（例如自己 `deliver` 过的通知）。模型的发送者说明行不显示这两项。
 
@@ -116,7 +124,7 @@
 
 ## 4. 宿主协议
 
-本地 unix socket（目录 0700、socket 0600），JSONL，请求带 `id`、同 `id` 的 `result` 应答。宿主连接先 `host.hello { token, name, consumer?, callouts? }`；token 由守护进程每次启动时重新生成，写入 socket 旁的 0600 文件 `<socket>.token`；运维可用 `aio serve --token-file <path>` 或配置 `host.tokenFile` 指定一个跨重启不变的令牌文件（存在则读、不存在则生成，见 `docs/design/host-token-file`）。带 token 的连接数量不限（`aio run`、`aio tail` 等命令都是这样的连接）；`hello` 里带 `consumer`（推送消费）或开启任一回调钩子（`callouts`）的连接才是**宿主**，同一时刻至多一个。宿主在线时，`onHostDown: "suspend"` 的宿主表生效，回调发给它，发起连接已断开的 run 的 `run.ended` 也发给它。只拉取的宿主（`aio tail` / `inbound.read`）没有这样的常驻连接，守护进程始终视它为不在线：它的表要用 `onHostDown: "keep"`，并定期重推（`bindings.put`）、每次给一个新的 `expiresAt` 当租约（例如每隔 T 重推一次，`expiresAt = now + 2T`），宿主停止重推后表到点挂起；否则默认的 `suspend` 表一直不生效（§6）。协议里曾有的 `host.hello.lease` 守护进程从未实现，已删除（决定 13）；旧宿主仍带这个字段不会被拒，只是被忽略。已有宿主时再来一个带角色的 `hello` 默认得到 `host_connected`；带 `takeover: true`（且 token 正确）则顶替旧连接：守护进程关闭旧连接、记日志，旧连接未确认的推送改推给新连接，结果里带 `replaced: { name }`（宿主断线重连而旧连接半开时用）。控制台 `/ws` 有心跳（`console.heartbeat`，默认每 30 s ping，10 s 内无应答即断开），半开的远程宿主连接会被及时清掉（见 `docs/design/host-liveness`）。宿主连接也可以发送所有客户端帧（`subscribe`、`input`、`resolve` 等，见 `packages/protocol/src/client.ts`），`origin` 标记为 `kind: "system"`；会重发的客户端给 `input`、`interrupt`、`topic.switch`、`watch.add` 带上 `opId`，重发就不会做两次（§4.7）。
+本地 unix socket（目录 0700、socket 0600），JSONL，请求带 `id`、同 `id` 的 `result` 应答。宿主连接先 `host.hello { token, name, consumer?, callouts? }`；token 由守护进程每次启动时重新生成，写入 socket 旁的 0600 文件 `<socket>.token`；运维可用 `aio serve --token-file <path>` 或配置 `host.tokenFile` 指定一个跨重启不变的令牌文件（存在则读、不存在则生成，见 `docs/design/host-token-file`）。带 token 的连接数量不限（`aio run`、`aio tail` 等命令都是这样的连接）；`hello` 里带 `consumer`（推送消费）或开启任一回调钩子（`callouts`）的连接才是**宿主**；凭宿主 token 的宿主同一时刻至多一个，后端另见 §4.12（每个后端凭自己的钥匙连接，不占宿主位）。宿主 token 就是管理凭据：它能读、ack、补投任何消费者的条目，签发和作废后端钥匙，不要发给后端。宿主在线时，`onHostDown: "suspend"` 的宿主表生效，回调发给它，发起连接已断开的 run 的 `run.ended` 也发给它。只拉取的宿主（`aio tail` / `inbound.read`）没有这样的常驻连接，守护进程始终视它为不在线：它的表要用 `onHostDown: "keep"`，并定期重推（`bindings.put`）、每次给一个新的 `expiresAt` 当租约（例如每隔 T 重推一次，`expiresAt = now + 2T`），宿主停止重推后表到点挂起；否则默认的 `suspend` 表一直不生效（§6）。协议里曾有的 `host.hello.lease` 守护进程从未实现，已删除（决定 13）；旧宿主仍带这个字段不会被拒，只是被忽略。已有宿主时再来一个带角色的 `hello` 默认得到 `host_connected`；带 `takeover: true`（且 token 正确）则顶替旧连接：守护进程关闭旧连接、记日志，旧连接未确认的推送改推给新连接，结果里带 `replaced: { name }`（宿主断线重连而旧连接半开时用）。控制台 `/ws` 有心跳（`console.heartbeat`，默认每 30 s ping，10 s 内无应答即断开），半开的远程宿主连接会被及时清掉（见 `docs/design/host-liveness`）。宿主连接也可以发送所有客户端帧（`subscribe`、`input`、`resolve` 等，见 `packages/protocol/src/client.ts`），`origin` 标记为 `kind: "system"`；会重发的客户端给 `input`、`interrupt`、`topic.switch`、`watch.add` 带上 `opId`，重发就不会做两次（§4.7）。
 
 | 帧 | 方向 | 用途 |
 |---|---|---|
@@ -138,6 +146,8 @@
 | `inbound.redispatch` | 宿主 → 守护进程 | 把宿主入站队列里的一条输入按原始来源投递到指定会话（§2.1） |
 | `session.compact` | 宿主 → 守护进程 | 让一个安静的、lane 打开着的会话的 harness 立刻压缩上下文（见下） |
 | `session.prewarm` | 宿主 → 守护进程 | 不开轮，先把一个已知会话的 harness 拉起来，等快要到的输入（见下） |
+| `backends.list` / `backends.key` / `backends.forget` | 宿主 → 守护进程 | 后端的状态与钥匙（§4.12；feature `backends`）：`backends.list` 列出每个后端的钥匙 id、连接数、积压与发送许可（没有钥匙本身）；`backends.key { backend, op: "issue" \| "rotate" \| "revoke" }` 签发、轮换、作废；`backends.forget { backend }` 清掉它的条目、游标与发送许可。只给宿主 token 的连接，后端钥匙答 `forbidden` |
+| `blob.stat` / `blob.get` / `blob.put` | 宿主 → 守护进程 | 读写 blob（§4.13；feature `blobs`）：`blob.stat { ref }` 答 `{ size }` 或 `null`；`blob.get { ref, offset?, length? }` 答 `{ base64, size, offset }`，每帧至多 1 MiB；`blob.put { base64, part?, mime?, name? }` 上传，答 `{ ref, size }`，分片时中间的片答 `{ upload, received }`。宿主 token 读写共用的 blob 库；后端钥匙只读得到路由给它的条目里的媒体和它自己上传的 |
 | `test.replay` / `test.fault` | 宿主 → 守护进程 | 测试入口：重投一条渠道消息 / 扔掉某通道接下来几次发送的响应（§4.3；缺省关闭，只在 `AIO_TEST_HOOKS=1` 时可用） |
 
 **`deliver` 的结果没能记下时**（INVARIANTS DL-1 细节 5）：结算记录、出站索引与会话日志里的 `delivery.settled` 在一个事务里提交。消息发出之后这一步失败（磁盘满、I/O 错误）时，这次 `deliver` 答 `internal`（消息是原错误），消息可能已经发出，什么都还没记下（`explain <operationId>` 答 `unknown_input`）。同一个 operationId 再 `deliver` 不会再发：同一进程里答 `status: "unknown"`、`duplicate: false`、`error: "recording its outcome failed in this process (…); not resent"`；守护进程重启之后，启动时已把它记为 `unknown`（`error: "in flight when the previous process stopped; not resent"`），再 `deliver` 答 `duplicate: true`。按 `unknown` 处理（交给人或宿主自己的规则），不要换一个 operationId 重发：可能发两次。
@@ -162,7 +172,7 @@
 - **`external`**（对外 MCP 端点，§4.2，feature `callouts.external`）：端点的客户端每做一次写（`send_message` 发消息、`session_input` 排输入）都问一次：`policy { hook: "external", args: { client, principal, declared?, op: "send" | "input", route?, sessionKey?, content, id } }`，答复 `{ verdict: "allow" | "deny", reason? }`（`reason` 原样给客户端）。超时（`hostCallouts.external.timeoutMs`，默认 2000 ms）、出错、答复不合 schema 一律拒绝；声明过它的宿主断开后（名字记在本地库里，重启后也一样）所有外部写都拒绝，直到它重连或另一个宿主以不含 `external` 的 `callouts` 连上。读不问。发送另外还过外发检查：声明了 `outbound` 的宿主照样收到 `outbound` 回调，`from` 是只含这条请求的一轮（会话键 `external:<名>`、`replyRoute: null`、输入的来源是客户端），宿主不必区分新旧形状就能拒绝；没有这样的宿主时，客户端的 `send:` scope 就是本地放行。
 - **代答**：宿主连接（`origin.kind = "system"` 且 `origin.adapter = "host"`；网关与会话 lane 各查一次）发 `resolve` 时可带 `onBehalfOf: "<成员 id>"`。`human` 请求要求该成员在 `principals` 里；日志记 `request.resolved.by = { kind, id: <成员>, via: "host:<名字>" }`。非宿主连接带 `onBehalfOf` 答 `not_eligible`。**须部署方显式开启**（决定 13）：配置 `"policy": { "answerOnBehalf": true }`，缺省 `false`；未开启时宿主连接带 `onBehalfOf` 的 `resolve` 答 `on_behalf_not_allowed`（请求保持打开，宿主仍可不带 `onBehalfOf` 以自己的名义作答），`host.hello` 的 `features` 也不列 `"resolve.onBehalfOf"`。这是"以别人的名义作答"的唯一开关，决定 12 的 agent 代为审批以后也挂在它下面，不另设开关。**行为变化（2026-10-11）**：此前任何带 token 的宿主都能代答；依赖代答的部署升级后要加这一项。
 
-**能力协商**：`host.hello` 的结果带 `features: string[]`，按能力名协商而不是按版本号。目前有 `"session.launch"`：回调答复可带 `launch`、可用 `session.prepare`、规则可用 `callout.skipWhenPinned`；`"callouts.resolve"`、`"callouts.outbound"`、`"resolve.onBehalfOf"`（§4.1，只在 `policy.answerOnBehalf` 开启时列出）；`"inbound.redispatch"`（§2.1）；`"host.takeover"`：`host.hello` 支持 `takeover: true`（§2）；`"callouts.contact"`（§4.1）；`"explain.chain"`：`explain` 接受 operationId 与 `chain: true`（§5）；`"run.overrides"`、`"run.ended.usage"`、`"run.correlation"`：任务运行的三个可选项（§4 表下）；`"callouts.external"`（§4.1）；`"callouts.review"`、`"resolve.native"`、`"resolver.human.extras"`（§4.1）；`"external.mcp"`：对外 MCP 端点开着（§4.2，只在配置了 `externalMcp` 且在监听时列出）；`"session.compact"`：宿主替空闲会话压缩上下文（§4 表下）；`"deliver.update"`、`"conversation.create"`、`"message.ack"`、`"schedules"`、`"history"`（§4 表）；`"session.prewarm"`：宿主提前拉起会话的 harness（§4 表下）。`"test.hooks"`：`test.replay`、`test.fault` 两个测试入口（§4.3，只在守护进程以 `AIO_TEST_HOOKS=1` 启动时列出）。`"host-mcp.send_file.blob_scoped"`：输出工具 `send_file` 的 `blob` 只发本 session 见过的引用（INVARIANTS SE-7）；没有它的旧守护进程会把 blob 存储里任何一个文件发到本轮路由，靠它挡住跨会话外发的宿主要先看到它。`"client.opId"`：客户端帧可以带 `opId`，重发答第一次的应答（§4.7，INVARIANTS PR-3）。旧守护进程的 `callouts` 只接受布尔。推荐做法：直接发钩子列表，收到 `invalid_frame` 再用 `callouts: true` 重发（旧守护进程只有 `route`）。不要先用 `callouts: true` 握手探测 features：那次握手已让这条连接成为**唯一的**宿主、只开了 `route`，想换成列表必须断开重连，期间占着宿主位置。结果里没有某个 feature 时，宿主不得依赖它。
+**能力协商**：`host.hello` 的结果带 `features: string[]`，按能力名协商而不是按版本号。目前有 `"session.launch"`：回调答复可带 `launch`、可用 `session.prepare`、规则可用 `callout.skipWhenPinned`；`"callouts.resolve"`、`"callouts.outbound"`、`"resolve.onBehalfOf"`（§4.1，只在 `policy.answerOnBehalf` 开启时列出）；`"inbound.redispatch"`（§2.1）；`"host.takeover"`：`host.hello` 支持 `takeover: true`（§2）；`"callouts.contact"`（§4.1）；`"explain.chain"`：`explain` 接受 operationId 与 `chain: true`（§5）；`"run.overrides"`、`"run.ended.usage"`、`"run.correlation"`：任务运行的三个可选项（§4 表下）；`"callouts.external"`（§4.1）；`"callouts.review"`、`"resolve.native"`、`"resolver.human.extras"`（§4.1）；`"external.mcp"`：对外 MCP 端点开着（§4.2，只在配置了 `externalMcp` 且在监听时列出）；`"session.compact"`：宿主替空闲会话压缩上下文（§4 表下）；`"deliver.update"`、`"conversation.create"`、`"message.ack"`、`"schedules"`、`"history"`（§4 表）；`"session.prewarm"`：宿主提前拉起会话的 harness（§4 表下）。`"test.hooks"`：`test.replay`、`test.fault` 两个测试入口（§4.3，只在守护进程以 `AIO_TEST_HOOKS=1` 启动时列出）。`"host-mcp.send_file.blob_scoped"`：输出工具 `send_file` 的 `blob` 只发本 session 见过的引用（INVARIANTS SE-7）；没有它的旧守护进程会把 blob 存储里任何一个文件发到本轮路由，靠它挡住跨会话外发的宿主要先看到它。`"client.opId"`：客户端帧可以带 `opId`，重发答第一次的应答（§4.7，INVARIANTS PR-3）。`"binding.tag"`：规则的 `tag` 被校验并抄到条目上（§2、§2.1）。`"blobs"`：`blob.stat` / `blob.get` / `blob.put`（§4.13）。旧守护进程的 `callouts` 只接受布尔。推荐做法：直接发钩子列表，收到 `invalid_frame` 再用 `callouts: true` 重发（旧守护进程只有 `route`）。不要先用 `callouts: true` 握手探测 features：那次握手已让这条连接成为**唯一的**宿主、只开了 `route`，想换成列表必须断开重连，期间占着宿主位置。结果里没有某个 feature 时，宿主不得依赖它。
 
 **`session.prepare { sessionKey, agent, launch }`**：用于不经渠道路由打开的会话（宿主连接发的客户端 `input` 帧、本地 `aio input` / `aio attach`、指向该键的 watch），也可以让宿主在键可预知时（如成员入驻时建群）提前登记，规则就不必开回调。它只登记（agent 行与 launch 行在同一事务里写入），不拉起 harness；第一条输入到达时按登记建 lane。结果 `{ sessionKey, agent, launch: { cwd?, envKeys }, created }`：同一键用相同的值再 prepare 幂等（`created: false`）。错误码：`unknown_agent`、`not_interactive_agent`、`launch_not_allowed`（agent 没有 `sessionParams`）、`bad_cwd`、`bad_env`、`launch_unsupported`（Codex `unix` 实例带 env）、`launch_conflict`（键已有不同的 launch，或已是无 launch 的会话）、`agent_conflict`（键已属于另一个 agent）、`invalid_frame`（含 `run:` 前缀的键，task run 用 `run.start`）。遇到 `launch_conflict` 换键，不要重试。每个请求的 `result.value` 都有 schema（`packages/protocol/src/host.ts` 末尾的 `HOST_RESULT_VALUES`，JSON Schema 见 `packages/protocol/schema/*Result.json`）。
 
@@ -259,6 +269,9 @@
 - **2026-11-25（core-slimming：控制台成为自己的包，harness 种类也能贡献 admin）**：线上（帧、字段、配置文件、错误文字、admin HTTP API 的路径、状态、答复体与鉴权）不变，`packages/daemon/dist/index.js`、`dist/cli.js`、`aio` 和 JSON Schema 文件都在原处。嵌入方：控制台是新包 `@agents-io/console`（`packages/console`，只依赖 `@agents-io/protocol` 与 `@agents-io/kernel`）：`ConsoleServer`、`ConsoleAuth`、`consoleProof`、`CONSOLE_COOKIE_PREFIX`、`adminEndpoints`、`ConfigStore`、`isCredential`、`redact`、`unredact`、`implicitEnv`、`envRefs`、`writeFileAtomic`、`CredentialMarks` 从内核搬到这里，另有给网关用的 `consoleFactory`；`@agents-io/daemon` 照旧导出这些名字（也再导出控制台包），它的 `Gateway.start` 照旧服务控制台。直接用 `@agents-io/kernel` 的嵌入方：内核没有控制台的类与函数，只留接缝（`ConsoleHost`、`ContributedRoute`、`ConsoleServerOptions`、`ConfigStoreOptions`、`PutOutcome` 照旧，新增 `ConsoleConfigStore`、`ConsoleListener`、`ConsoleFactory`），要控制台就把控制台包的 `consoleFactory` 交给新的可选字段 `GatewayOptions.consoleFactory`；没有它时没有 `configStore`，`console: true` 启动即 `ConfigError`。`HarnessModule.admin`（`@agents-io/protocol`）是新的：harness 种类与通道类型一样贡献 `AdminContribution`（控制台设置、schema、路由、挂载），`HarnessRegistry` 注册时检查与认领，与通道类型的贡献互查；`console` 段里它们的键在通道类型的之后，控制台在通道类型的路由之后服务它们，`adminEndpoints(channels, harnesses)` 列在最后。内建的 harness 种类不贡献。见 `packages/daemon/README.md` 末尾与 `packages/console/README.md`。评审后的修复（2026-11-25）：`type: "module"` 通道文件的描述符贡献的 admin 路由或 schema 与注册了的 harness 种类的重复时，`PUT /api/config`、`POST /api/config/validate` 原先答 500 `internal`，现在与同通道类型重复时一样答 422（问题在 `/channels/<i>`，说出条目）；启动时是说出条目的配置错误（`aio serve` 退出码 2），原先是不说条目的普通错误。帧与字段不变。嵌入方：`importConfigModules`、`loadConfigModules`（经 `LoadOptions.harnessRegistry`）多了可选的 `harnessRegistry`（守护进程的 harness 种类，描述符的 admin 贡献与它们的一起认领；`@agents-io/daemon` 缺省是内建的），`ImportConfigModules` 的参数也多了可选的 `harnessRegistry`（控制台的 `ConfigStore` 交给它守护进程的）。
 - **2026-11-25（core-slimming G9：ACP harness）**：新的 harness 种类 `acp`（§4.10，新包 `@agents-io/harness-acp`：`AcpHarness`、`acpHarnessModule`、`MCP_STDIO_BRIDGE`、各 flavor 与映射函数），配置文件的 `harnesses.<名>.use` 多了 `"acp"`，`@agents-io/daemon` 的 `builtinHarnesses.kinds` 是 `claude-code`、`codex`、`bridge`、`acp`。别的线上（帧、字段、错误文字、admin HTTP API）不变；没有配 `acp` 实例的部署什么都不变（`/plan`、`/bypass` 的回复照旧只点名 Codex：这个种类没有种类级的声明）。`@agents-io/testkit` 的 transcript 多了 `protocol: "acp"`（`TRANSCRIPT_PROTOCOLS`），`teardownAnswers("acp")` 的答复带 `jsonrpc: "2.0"`。
 - **2026-11-25（core-slimming G9 北向：会话作为 ACP agent 与 AG-UI 事件流）**：两个新的内建功能模块 `acp-server`、`ag-ui`（§4.11，`@agents-io/daemon` 的 `bundle.ts` 注册，排在 `owner-commands` 之后、`external-mcp` 之前），都缺省关，没有它们的配置段时什么都不变；配置文件多了可选的顶层键 `acpServer`、`agUi`（文件 schema 里在 `externalMcp` 之前），`GET /api/status` 的 `modules` 多两项（`enabled: false`）。线上只加不改：客户端帧多了 `module.connect`（`ClientFrame.json`），`external` 回调的 `args` 多了可选的 `endpoint`（`HostEventFrame.json`），`features` 可能多 `acp.server`、`ag-ui`，`input.cancelled` 的 `reason` 可能是 `withdrawn`（ACP 客户端取消了还在排队的 prompt）。本地 socket 现在一行一行地解码收到的一块，坏行在它的位置答 `bad_json`（一块只有一行时与以前相同）。嵌入方：`KernelContext` 多了 `subscribe`、`blobs` 和 `lanes.withdraw`，`ModuleInstance` 多了 `connect`，`ModuleManifest` 多了 `cli`（`ModuleCliCommand`），`KernelBackend` 多了必需的 `subscribe`、`putBlob`、`laneWithdraw`（见 `packages/daemon/README.md` 末尾）；`@agents-io/session` 多了 `withholdingFold`。
+- **2026-11-24（路由层与后端，§4.12）对严格校验的宿主可见的协议变化**：都是新增的可选字段、帧与错误码，没有配置 `backends` 的守护进程发出的帧不变。字段：`Binding.to`、`InboundItem.to`、`RouteExplanation.matched[].to`、`RouteExplanation.matched[].rejected.code` 多一个值 `click_sender`、`HostHelloResult.backend`、`EffectExplanation.backend`、`AdminQueueConsumer.backend`（`GET /api/queue`）。帧：`backends.list`、`backends.key`、`backends.forget` 与结果 `BackendsListResult`、`BackendsKeyResult`、`BackendsForgetResult`；admin 端点 `GET /api/backends`、`POST /api/backends/:id/key`、`POST /api/backends/:id/forget` 与 `AdminBackends`、`AdminBackendKeyRequest`、`AdminBackendKeyResult`、`AdminBackendForgetResult`（JSON Schema 都在 `packages/protocol/schema/`）。错误码：`forbidden`（后端钥匙用了白名单之外的帧，或开控制台 API）、`route_not_allowed`、`unknown_backend`、`key_exists`。配置了至少一个后端时 `features` 多一项 `backends`，并且宿主 token 的连接不能再自称 `backend:` 开头的名字、不能推送消费 `backend:<id>`（`invalid_frame`），用 `backend:` 开头、又不是哪个后端游标的消费者名（`host.hello` 的 `consumer`、`inbound.read`、`inbound.ack`）答 `unknown_backend`：之前拿 `backend:` 开头的字符串当普通消费者名的宿主，配置后端之前要改名。`Binding` 的 schema 是开放的（允许多余的键）：宿主若一直在规则上带着自己的 `to` 字段，升级后它会被当成后端名校验，整张表答 `unknown_backend` 或 `invalid`；升级前看一眼自己推的表。降级要小心：旧守护进程不认识条目的后端一列，队列里带 `to` 的条目会被宿主 token 的消费者读到，队列里有过带 `to` 的条目就不要降级。
+- **2026-11-25（后端的媒体与规则标签，§4.13、§2）对严格校验的宿主可见的协议变化**：都是新增的可选字段、帧与错误码。字段：`Binding.tag`、`InboundItem.tag`、`RouteExplanation.matched[].tag`。帧：`blob.stat`、`blob.get`、`blob.put`（`HostRequestFrame` 多三种；结果 `HostBlobStatResult`、`HostBlobGetResult`、`HostBlobPutResult`；常量 `BLOB_FRAME_MAX_BYTES`），这三种 `type` 原来答 `invalid_frame`。错误码：`blob.*` 的 `not_found`、`too_large`、`bad_offset`、`busy`、`quota_exceeded`、`blob_error`、`unsupported`，后端的 `deliver` / `deliver.update` 多 `unknown_blob`、`too_many_attachments`。`host.hello` 的 `features` 多 `binding.tag` 与 `blobs`（宿主 token 的连接，排在 `attention` 之后）；后端钥匙的 `features` 多 `blobs`。行为变化只有两处：(1) `Binding` 的 schema 是开放的，原来表里自己带着 `tag` 键的宿主（守护进程以前忽略它）：键写在 `on: "host"` 或带 `callout` 的规则上时，现在它是标签，值是 1 到 128 个字符、不含控制字符的字符串就被抄到条目与 `explain` 上，不是的话整张表答 `invalid`（这样一张旧守护进程持久化的宿主表，升级后启动时被整张忽略并记一条 warn，直到宿主推一张合法的）；写在别的规则上的照旧忽略，不校验、不抄；(2) 后端钥匙的 `deliver` / `deliver.update` 的附件原来不检查，现在必须是它被给过的或它自己上传的引用，且一条消息至多 32 个（§4.13）。宿主 token 的 `deliver`、不带 `tag` 的表、不用这三个帧的宿主都不变。`@agents-io/protocol` 新导出 `mediaBlocks`、`MediaBlock`；`@agents-io/daemon` 的 `LocalClient` 多 `blobStat` / `blobGet` / `blobPut` / `readBlob` / `writeBlob`，`Peer` 多可选的 `flushed()`，`FrameTransport` 多可选的 `flushed()`，`GatewayOptions` 多 `hostBlobs`（测试用）；`@agents-io/session` 的 `FsBlobStore.put` 多第三个可选参数 `{ provisional }`。
+- **2026-11-25（后端分支与 origin/main 合并）**：两边的帧、字段、错误码与文字都不变。本文里后端的两节是 §4.12（后端与钥匙）、§4.13（blob），§4.10、§4.11 是 ACP harness 与北向投影。线上可见的只有顺序：配置了后端时宿主 token 的 `host.hello` 的 `features` 里，`backends` 排在内核的之后、功能模块的（`external.mcp`、`acp.server`、`ag-ui`）之前。功能模块不能声明 feature `backends`（注册时拒绝，与内核别的 feature 一样）。凭后端钥匙的连接发客户端帧 `module.connect`（`aio acp` 用的那一帧）同别的客户端帧一样答 `forbidden`；后端钥匙开不了 ACP 服务端与 AG-UI 端点，它们各有自己的客户端令牌。嵌入方：`BackendKeys`、`HostBlobs` 随内核在 `@agents-io/kernel`（`packages/kernel/src/backends.ts`、`host-blobs.ts`），`ConsoleHost` 的 `backendOf`、`backends` 在它的 `console-host.ts`；`@agents-io/daemon` 照旧转出 `LocalClient`（`readBlob`、`writeBlob`、`backends*`）与 `Gateway`。
 
 ### 4.6 模型生成的话题标题（模块 `topic-title`）
 
@@ -416,6 +429,108 @@ await agent.runAgent({ runId: 'r1' }, { onEvent: ({ event }) => console.log(even
 
 **对严格校验的宿主可见的协议变化**（2026-11-25）：客户端帧多了 `module.connect`（旧守护进程答 `invalid_frame`）；`external` 回调的 `args` 多了可选的 `endpoint`；`features` 可能多 `acp.server`、`ag-ui`；`input.cancelled` 的 `reason` 可能是 `withdrawn`；输入的 `origin.adapter` 可能是 `acp-server` 或 `ag-ui`；会话列表里可能出现 `acp-server:<名>:<id>`、`ag-ui:<名>:<id>` 这样的会话。
 
+### 4.12 后端与后端钥匙（feature `backends`；INVARIANTS PB-1 到 PB-3、PB-6）
+
+守护进程可以同时接几个**后端**：各自凭自己的钥匙连接，只收到路由给它的输入，只能往它收到过输入的会话和管理员为它登记的目的地发。方案见 `docs/design/persona-backend/`。没有配置 `backends` 时这一节的东西都不存在，行为与之前相同。
+
+**配置**（配置文件的 `backends` 段；改这一段要重启）：
+
+```jsonc
+"backends": {
+  "alpha": { "note": "我的助手", "routes": [{ "channel": "lark-bot", "account": "default", "conversationId": "oc_family" }] },
+  "beta":  { "note": "另一个", "history": true }
+},
+"bindings": [
+  { "id": "family-to-beta", "match": { "channel": "lark-bot", "conversation": "oc_family" }, "on": "host", "to": "beta", "tag": "chat" },
+  { "id": "beta-clicks",    "match": { "actionPrefix": "beta:" }, "on": "host", "to": "beta" }
+]
+```
+
+- id：小写字母、数字、`.`、`_`、`-`，以字母或数字开头，至多 64 个字符。它就是身份（见下面“id 就是身份”）。
+- `routes`：管理员为这个后端登记的目的地（`channel`、`account`、`conversationId`，逐字段比较；放行该会话的所有话题）。后端不用先收到输入就能往这里发。
+- `history`（缺省 `false`）：这个后端能不能用 `history.read`。
+- `note`：给人看的说明。别的键（包括设计稿里的 `callback`）加载时报未知键。
+
+**钥匙**。钥匙由守护进程生成（`aiob_` 开头），只在签发或轮换的应答里出现一次；守护进程只存它的 SHA-256，日志里只写 key id（摘要的前 12 位）。用宿主 token：
+
+| 命令 | 控制台 | 作用 |
+|---|---|---|
+| `aio backend list` | `GET /api/backends` | 每个后端：是否还在配置里、钥匙 id 与签发时间、连接数、是否有推送连接、游标与积压、登记与获得的会话许可数 |
+| `aio backend key <id>` | `POST /api/backends/:id/key`，体 `{ "op": "issue" }` | 第一把钥匙；已有答 `key_exists`（409） |
+| `aio backend rotate <id>` | 同上，`{ "op": "rotate" }` | 换一把：旧的立即作废，凭它在线的连接被关 |
+| `aio backend revoke <id>` | 同上，`{ "op": "revoke" }` | 作废：这个后端没有钥匙能用，在线的连接被关 |
+| `aio backend forget <id>` | `POST /api/backends/:id/forget` | 清掉它的队列条目、游标、发送许可、媒体许可与暂存的上传（§4.13），关它的连接；不动钥匙 |
+
+`aio backend key` / `rotate` 把钥匙单独一行打到 stdout，说明打到 stderr。没有配置的 id 答 `unknown_backend`（404，命令行退出码 2）。没有并存窗口：轮换之后、新钥匙部署到后端之前，这个后端不在线，条目留在队列里等它。从配置里删掉一个后端要重启才生效（下次启动删掉它的钥匙），要立即切断用 `revoke`。
+
+**连接**。后端与宿主说同一套协议，`host.hello` 的 `token` 填钥匙。钥匙决定身份：连接的名字是 `backend:<id>`，帧里自报的 `name` 不起作用；`consumer` 可以不写（只拉取），写了必须是 `<id>` 或 `backend:<id>`，表示推送消费；`callouts`、`optIn` 一律不给。应答：
+
+```jsonc
+{ "name": "backend:beta", "protocol": 1, "host": false, "backend": { "id": "beta" },
+  "bindings": { "version": null, "active": false },
+  "inbound": { "consumer": "backend:beta", "acked": 12, "head": 15 },   // 写了 consumer 才有；head 是它自己条目的最大游标
+  "features": ["backends", "deliver.update", "message.ack", "host.takeover", "binding.tag", "blobs", "history"],   // history 只在配置放开时有
+  "callouts": [], "optIn": [] }                                          // 帧里写了才回，总是空的
+```
+
+几个后端可以同时在线，与凭宿主 token 的宿主互不影响：后端不占宿主位，不改变宿主表是否生效，每个后端至多一条推送连接（第二条答 `host_connected`，`takeover: true` 只顶替它自己的旧连接）。
+
+**能用的帧**（白名单，缺省拒绝：以后新加的帧不列进来就不给后端）：
+
+| 能 | 限制 |
+|---|---|
+| `host.hello` | 见上 |
+| `inbound.read` / `inbound.ack` | 只限自己的游标（别的消费者名答 `forbidden`）；`head` 与 ack 的上限是自己条目的最大游标 |
+| `deliver` | 会话在许可内；`route.replyToMessageId` 有值时是它收到过的或自己发的、同一会话的消息；附件至多 32 个（否则 `too_many_attachments`），每个 `ref` 是它被给过的或自己上传的（§4.13，否则 `unknown_blob`） |
+| `deliver.update` | 同上，且 `providerMessageId` 是它自己 `deliver` 的、同一会话的消息 |
+| `message.ack` | 会话在许可内，`messageId` 是它收到过的或自己发的、同一会话的消息 |
+| `blob.stat` / `blob.get` | 只限路由给它的条目里的媒体，和它自己上传、还没过期的引用；别的引用答得和不存在的一样（§4.13） |
+| `blob.put` | 进它自己的暂存区，有配额，24 小时过期（§4.13） |
+| `history.read` | 只在 `backends.<id>.history: true` 时；只限 `to` 是自己的条目（别的游标答 `unknown_cursor`） |
+
+其余的宿主帧（`bindings.put` / `bindings.get`、`explain`、`run.*`、`session.*`、`schedule.*`、`inbound.redispatch`、`conversation.create`、`input.verify`、`test.*`、`host.outboundScope`、`backends.*`）和全部客户端帧（`input`、`subscribe`、`sessions`、监听、话题、`tui.attach`）答 `forbidden`。钥匙被轮换或作废后，连接被关；万一还开着，下一帧答 `unauthorized`。
+
+**队列视图**。后端的游标是消费者 `backend:<id>`，只走 `to` 是它的条目（§2.1）。管理员用宿主 token 看和清某个后端的积压：`aio tail --consumer backend:<id>`、`aio ack --consumer backend:<id> <cursor>`，补投（`inbound.redispatch`）也只有宿主 token 能做。id 打错时（`backend:` 开头、又不是哪个后端的游标）这两个命令和 `host.hello` 的 `consumer` 都答 `unknown_backend`，不会把它登记成一个读宿主自己积压的消费者；从配置里删掉、但还留着条目的后端照旧能读（`aio backend list` 列得出）。`history.read` 放开后读到的是那个会话更早的全部消息（通道给得出的），包括路由给别的后端或本地 agent 的：隔离的是队列条目，不是会话历史。同一个群分给两个后端时想清楚再开。
+
+**发送范围**。后端的 `deliver` 只能发往 (a) 路由给过它的输入的回复路由所在的会话（按 `channel`、`account`、`conversationId`，任何话题；入队时记下，跨重启，不过期），(b) `backends.<id>.routes` 登记的目的地。回复目标（`replyToMessageId`）、被标记的消息（`message.ack` 的 `messageId`）必须是它收到过的输入的消息（记 30 天）或它自己发的消息，且在同一个会话；被改的消息（`deliver.update`）必须是它自己发的。不满足一律答 `route_not_allowed`，文字是固定的一句，通道或账号解析不到也答这个（不列出有哪些通道）；这次请求不发、不占用 operationId。回复一条 30 天前收到的消息会被拒，去掉 `replyToMessageId` 可以照发到那个会话。operationId 按后端分开（内部是 `backend:<id>:<operationId>`，与宿主的互不重叠），两个后端用同一个 id 互不影响；`aio explain backend:<id>:<operationId>` 查得到，结果带 `backend`。宿主的 `outbound` 回调与出口检查（§4.1、§4.1a）不看后端的发送，与宿主自己的 `deliver` 一样：靠出口检查把关所有外发的部署，加了后端以后要知道这条路不经过它。只检查会话和消息 id，不检查 `threadId`。附件另有检查（§4.13）：每个引用必须是路由给它的条目里的媒体或它自己上传的，否则答 `unknown_blob`；`channelData`（通道原生内容）不检查。
+
+**卡片点击**。点击跟着发卡片的后端走：被点的消息是后端 X `deliver` 的，这次点击只可能由 `to: X` 的规则接、进 X 的队列（仍要有这样一条规则命中，通常按 `actionPrefix`），不按内核的审批、停止、提问按钮解析，也不交给模块；带 `to` 的规则只接它那个后端发的消息上的点击，所以别人（宿主、本地 agent）发的卡片上的点击到不了后端。条目的 `input.origin` 是点击者的盖章身份（§3），谁有资格点由后端自己核对。归属靠通道报回发出的消息 id 和点击事件里的 `messageId`；通道不给时点击归不了属，进不了任何后端的队列，按普通输入走不带 `to` 的规则。点击不授予会话许可（只记下点击和被点的消息，供回复用）：后端能回这次点击，是因为它本来就能往那个会话发；许可被收回以后（`aio backend forget`、登记的目的地被删），旧卡片上的点击照样进它的队列，但不把许可写回来。
+
+**id 就是身份**。状态都记在 id 下：后端从配置里删掉再加回来（要重新签发钥匙），它的积压、游标、会话许可、operationId 的结果、消息的归属都延续。指向它的规则要一起删掉或改指，否则配置加载失败；宿主推送并持久化的表里有这样的规则时，启动时整张宿主表被忽略，直到宿主推一张不含它的表。`aio backend forget <id>` 清掉条目、游标与许可，连同媒体许可和暂存的上传（会话许可不过期，规则改道以后原来的后端仍能往那个会话发，直到 forget；没有按会话撤销的办法；forget 之后只有规则再路由给它一条输入才重新授予）；它不清 operationId 的结果和消息归属，所以同一个 id 交给另一方用，会继承旧的 operationId 结果、旧消息的编辑权和旧卡片的点击。换人就换 id。
+
+**经 `/ws` 接入**。本地 unix socket 不是后端的隔离边界：能打开它的进程在 `hello` 之前就是主人。后端走控制台端口的 `/ws`：升级请求带 `Authorization: Bearer <钥匙>`（浏览器式的客户端不能设头：子协议列表里放 `agents-io.v1` 和 `agents-io.bearer.<钥匙>`），连上后发 `host.hello { token: <同一把钥匙>, name, consumer? }`。凭钥匙升级的连接在 `hello` 前后都不收客户端帧，`hello` 只认同一个后端的钥匙（宿主 token 或别的后端的钥匙答 `unauthorized`），钥匙被轮换、作废或后端被 forget 时连还没 `hello` 的连接一起关。钥匙只能开 `/ws`：控制台的 `/api/*` 对它一律答 403，换不到登录链接。远程后端要求控制台听非回环地址（`console.allowRemote`，通配地址还要 `console.allowedHosts`），同一个端口上也有管理 API；控制台只说 http，钥匙以明文 bearer 过网，前面要有 TLS 终结或只在可信网络里。
+
+**这一轮没有的**：回调推送（守护进程主动把条目推到后端的地址）、轮换的并存窗口、后端用 `schedule.*` / `run.start` / `conversation.create` / `explain`、后端之间转信、不重启就增删后端、按会话撤销许可、按 HTTP 传很大的文件（媒体走 §4.13 的帧，一个 blob 至多 `blobs.maxBytes`）。
+
+### 4.13 blob：取条目里的媒体，上传附件（feature `blobs`；INVARIANTS PB-6）
+
+条目里的图片、文件、语音是内容块 `{ type: "image" | "file" | "audio", ref, mime, name? }`，`ref` 指向守护进程 blob 库里的字节（`sha256:<hex>`，字节的 SHA-256）；`deliver` 的附件是 `message.attachments[] { ref, mime, name? }`。这三个帧让不在同一台机器上的宿主或后端拿到字节、交上字节。本地 socket 与 `/ws` 上相同。
+
+| 帧 | 请求 | 应答 |
+|---|---|---|
+| `blob.stat` | `{ ref }` | `{ size }`；读不到（没有，或不是你能读的）答 `null` |
+| `blob.get` | `{ ref, offset?, length? }` | `{ base64, size, offset }`：`size` 是整个 blob 的字节数，`base64` 是从 `offset` 起的这一段 |
+| `blob.put` | `{ base64, part?: { upload, offset, last? }, mime?, name? }` | 传完答 `{ ref, size }`；分片时不是最后一片答 `{ upload, received }` |
+
+**每帧至多 1 MiB**（`BLOB_FRAME_MAX_BYTES`，base64 之前的字节数）。为什么是帧、不是 HTTP 端点，为什么不是一帧一个 blob：本地 socket 上没有 HTTP，帧无论如何要有；后端钥匙在控制台的 `/api/*` 上一律 403 是已有的承诺（PB-1、PB-3），不为媒体开口子；`/ws` 上一帧十几 MiB 会把心跳的 pong 堵在后面（缺省 30 秒一次 ping、10 秒没有回应就断），连接在传输中被掐掉，还占住推送条目的那条连接。分成小帧之后只多 base64 的三分之一。
+
+- **读**。不带 `offset` / `length`：整个 blob 不超过 1 MiB 就整份给；更大答 `too_large`（不会悄悄只给前一段）。带了任一个就是按范围读：`offset` 缺省 0；`length` 至多 1 MiB（写得更大答 `invalid_frame`），不写就是到末尾、但一次至多给 1 MiB（看应答里 `base64` 的实际长度往前走）；`offset` 等于大小答空串，超过大小答 `bad_offset`。范围读不逐片校验：**读的一方自己核对整份字节的 SHA-256 等于 `ref`**。链路慢就把 `length` 取小：一帧要在心跳超时之内传完。`blob.get` 的应答按连接一个一个出，上一个写出去之后才读下一片（本地 socket 与 `/ws` 都是；你不读的时候守护进程为这条连接至多拿着一个应答），所以一口气发很多请求不会更快。
+- **写**。不带 `part`：一帧一个 blob。带 `part`：`upload` 是调用方起的 id（1 到 64 个字符），`offset` 必须等于已经收到的字节数，否则答 `bad_offset`，文字是 `expected offset <n>`，已收的保留、可以从那里续传；`offset: 0` 开始或重新开始这个 `upload`；`last: true` 收尾。没传完的上传在内存里：守护进程重启、5 分钟没有新分片、钥匙轮换或作废之后，续传答 `bad_offset`（`expected offset 0`），从头再传。同时至多 2 个没传完的上传（第三个答 `busy`）。分片大小随你（最后一片之外不能为空）；守护进程把小分片并成 64 KiB 的块存，占的内存只随字节数走。
+- **应答里没有 mime 与名字**：库里记的是这份字节第一次进来时的，可能是别的会话的文件名。条目的内容块、你自己的上传已经告诉你了。
+
+**凭宿主 token**：`blob.stat` / `blob.get` 读共用 blob 库里的任何引用；`blob.put` 直接存进共用库（`mime` 缺省 `application/octet-stream`，决定存储的扩展名；同样的字节已经在库里时保留原来的 mime 与名字），没有配额、不过期。它的 `deliver` 不变：附件引用不检查。
+
+**凭后端钥匙**（PB-6）：
+
+- **读得到的只有两类引用**：(a) 路由给过它的条目（`to` 是它）里 `image` / `file` / `audio` 块的 `ref`，入队时记下，记 30 天，跨重启，`aio backend forget` 收回；(b) 它自己上传、还没过期的。别的一律答得和不存在的一样（`blob.stat` 答 `null`，`blob.get` 答 `not_found`、同一句话）：别的后端的条目或上传里的、只进了某个会话的、文字或 `quote` 或事件数据里提到的、凭内容哈希算出来的。`history.read` 放开后看得到更早消息的引用，但读不到字节；同一份字节后来出现在路由给它的条目里才读得到。条目里不是 `sha256:` 形式的平台引用（通道没有下载的）没有字节可读。30 天之后才打开的旧条目取不到媒体：要留就在收到时取。
+- **上传进它自己的暂存区**（`<blobs.dir>/uploads/<后端>/`），不进共用库：引用是内容哈希，进了共用库别的后端就能凭哈希读到、或试出库里有没有某份字节。别的后端拿同一个引用读不到也发不出，除非它自己也上传了同样的字节。`mime` / `name` 不记，发的时候写在附件上。
+- **上限**：一个 blob 至多 `blobs.maxBytes`（缺省 20 MiB；超过答 `too_large`，这个上传整个丢掉）；一个后端暂存的合计至多它的 8 倍、至多 256 个（超过答 `quota_exceeded`，什么都不留；同样的字节再传一次只算一份，并重新计 24 小时）；**上传 24 小时后文件被删、引用失效**，要发就在这之前发。
+- **附件**：`deliver` / `deliver.update` 的 `message.attachments` 里每个 `ref` 必须是 (a) 或 (b)（条目里的平台引用也算 (a)，原样交给通道），否则整条答 `unknown_blob`，文字是固定的一句，与引用根本不存在时一字不差；不发、不占用 operationId。先过发送范围的检查（`route_not_allowed`），再查附件。**一条消息至多 32 个附件**，更多的整条答 `too_many_attachments`（宿主 token 的 `deliver` 没有这个上限）。通过的上传在发送前复制进共用库（通道从那里读，发出去的附件与别的外发附件一样留着，不随 24 小时删）；同一个上传只复制一次，一个后端一次复制一个，所以同时发很多条带同一个大附件的消息，后面的在排队、不重读文件。发不成的不复制：被拒的消息，以及通道不能编辑时的 `deliver.update`（答 `unsupported`，先于附件检查）。**附件总是写上 `name`**：没写的按 `file` 发，不回退到库里记的名字。你写的 `mime` 与 `name` 随这条消息交给通道；它们在共用库里只是临时的记法，同一份字节之后由通道收到或宿主存入时换成那一方的。已经结算的 operationId 重发照旧答 `duplicate: true`，不重新检查。`channelData`（通道原生内容）里的平台资源键不在这项检查之内。
+
+错误码：`not_found`（读不到）、`too_large`（一帧超过 1 MiB、不带范围读一个大于 1 MiB 的 blob、blob 超过 `blobs.maxBytes`）、`bad_offset`、`busy`、`quota_exceeded`、`invalid_frame`（base64 不合法、内容为空、`length` 超过 1 MiB、`upload` 超过 64 个字符）、`blob_error`（读写失败，或暂存的字节与引用对不上）、`unknown_blob`（附件）、`too_many_attachments`（附件多于 32 个）、`unsupported`（嵌入方没有 blob 库；这时 `features` 里也没有 `blobs`）。
+
+`@agents-io/daemon` 的 `LocalClient` 有现成的循环：`readBlob(ref, { chunk? })`（按范围读完并核对哈希）、`writeBlob(bytes, { mime?, name?, chunk? })`（一帧或分片）。
+
 ## 5. 命令行（给不想写 socket 客户端的宿主）
 
 | 命令 | 等价于 |
@@ -428,9 +543,12 @@ await agent.runAgent({ runId: 'r1' }, { onEvent: ({ event }) => console.log(even
 | `aio explain <operationId>` | 某次投递（`delivery.settled` 里的 operationId）：会话、轮次与该轮的触发输入；系统回复给出它回应的输入，宿主 `deliver` 给出宿主 |
 | `aio explain --chain <inputId>` | 一条 agent 输入沿 cause 链走回根：每一级的 inputId、跳数、会话地址、主体、触发的轮次、是否截停；链断（另一部署、不认识的机器人）处注明 |
 | `aio verify <channelRef>` | `input.verify` |
+| `aio backend list` / `key <id>` / `rotate <id>` / `revoke <id>` / `forget <id>` | `backends.list` / `backends.key`（`issue`、`rotate`、`revoke`）/ `backends.forget`（§4.12）。钥匙单独一行打到 stdout，只出现这一次 |
 | `aio replay --input <inputId> [--times N]` | `test.replay`（测试入口，§4.3；只在 `AIO_TEST_HOOKS=1` 时可用） |
 | `aio fault [list] \| drop-response --channel <id> [--account <a>] [--conversation <c>] --next <N> \| clear` | `test.fault`（同上） |
 | `aio acp --client <名> [--token-file <路径>] [--session <键>]` | 不是宿主命令：编辑器或 t3code 起它当 ACP agent（§4.11），以 `acpServer` 的一个客户端的身份经 `module.connect` 连 socket |
+
+管理员看、清某个后端的积压：`aio tail --consumer backend:<id>`、`aio ack --consumer backend:<id> <cursor>`（用宿主 token；§4.12）。
 
 `aio run` 的退出码：0 完成、1 失败、3 结果不明（ambiguous）、124 超时、130 被取消；其余命令：2 用法/配置错误，69 守护进程未运行，77 token 错误。
 
@@ -448,5 +566,5 @@ x-work-os 核心不依赖 agents-io；换成别的 IO 实现，只需换掉这�
 
 ## 7. 待定
 
-- 多宿主、宿主重连后对运行中 run 的恢复。
+- 宿主重连后对运行中 run 的恢复。多个接入方已由后端（§4.12）覆盖：各自的钥匙、队列视图与发送范围；仍只有一个凭宿主 token 的宿主（回调只问它），后端的回调推送、后端之间转信未做。
 - 版本协商：已改为按能力名协商（`host.hello` 结果的 `features`，§4）；`PROTOCOL_VERSION` 只在不兼容的改动时变。

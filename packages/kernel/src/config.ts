@@ -18,6 +18,7 @@ import {
   type HarnessResolveContext,
   type ModuleConfig,
   type ModuleManifest,
+  type OutboundScopeRoute,
   type Principal,
   type RunSpec,
   type WatchSource,
@@ -26,6 +27,7 @@ import { DEFAULT_BLOB_MAX_BYTES, Router, RouterError, checkIdentities, ownerIden
 import { NO_REGISTRIES } from './core.js';
 import { adminContributions, ownerName } from './admin-contributions.js';
 import type { ChannelRegistry } from './channel-registry.js';
+import { BACKEND_ID } from './backends.js';
 import { ConfigError } from './config-error.js';
 import { loadEnvFile } from './env-file.js';
 import type { HarnessRegistry } from './harness-registry.js';
@@ -538,6 +540,28 @@ const KernelFile = Type.Object(
      * (0600). Without it every start makes a fresh token. `aio serve --token-file` wins.
      * The token is still copied to `<socket>.token` for the CLI.
      */
+    /**
+     * Backends (docs/design/persona-backend): other processes that take inputs from the host queue
+     * and deliver, each under its own key. The key of an entry is the backend's id
+     * (`^[a-z0-9][a-z0-9._-]{0,63}$`): what a rule's `to` names and what its queue consumer
+     * (`backend:<id>`) is called. Changing this section needs a restart.
+     */
+    backends: Type.Optional(
+      Type.Record(
+        Type.String(),
+        Type.Object(
+          {
+            /** For the operator; shown in lists. */
+            note: Type.Optional(Type.String()),
+            /** Destinations registered for this backend: it may deliver there without having received an input from them (every thread of the conversation). */
+            routes: Type.Optional(Type.Array(Type.Object({ channel: Type.String(), account: Type.String(), conversationId: Type.String() }, Closed))),
+            /** Whether this backend may read conversation history (`history.read`; default false). */
+            history: Type.Optional(Type.Boolean()),
+          },
+          Closed,
+        ),
+      ),
+    ),
     host: Type.Optional(Type.Object({ tokenFile: Type.Optional(Type.String()) }, Closed)),
     /** Who local socket clients are. */
     local: Type.Optional(
@@ -764,6 +788,8 @@ export interface Config {
   console: ConsoleConfig;
   /** The host connection: `tokenFile` is an absolute path when set. */
   host?: { tokenFile?: string };
+  /** The configured backends by id (`backends`; none: `{}`). */
+  backends: Record<string, BackendConfig>;
   /**
    * The registered feature modules, on or off, with their settings (`resolveModules`), in
    * registration order (a module of a `modules` entry where its entry is); absent when there are none.
@@ -778,6 +804,16 @@ export interface Config {
   moduleEntries?: ModuleEntryRef[];
   /** Where this config came from (loadConfig): the file (it may not exist) and the env file found for it. */
   source?: { path: string; envFile?: string };
+}
+
+/** One configured backend (`backends.<id>`). */
+export interface BackendConfig {
+  id: string;
+  note?: string;
+  /** Destinations the admin registered for it; compared field by field. */
+  routes: OutboundScopeRoute[];
+  /** May use `history.read`. */
+  history: boolean;
 }
 
 export interface ConsoleConfig {
@@ -1046,7 +1082,8 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
   const identities = c.identities ?? [];
   const localSession = c.local?.session ?? ownerSessionKey ?? 'local:main';
   const table: BindingTable | undefined = c.bindings ? { version: 'config', bindings: c.bindings, identities: [] } : undefined;
-  checkTable({ agents, defaultAgent, owners, identities, table, ownerSessionKey, localSession });
+  const backends = resolveBackends(c.backends);
+  checkTable({ agents, defaultAgent, owners, identities, table, ownerSessionKey, localSession, backends: Object.keys(backends) });
 
   const config: Config = {
     dataDir,
@@ -1092,6 +1129,7 @@ export function resolveConfig(raw: unknown, ctx: ResolveContext): Config {
     },
     console: resolveConsole(c.console, registry, channelRegistry),
     host: c.host?.tokenFile !== undefined ? { tokenFile: path(c.host.tokenFile) } : {},
+    backends,
   };
   // After everything else, where the external MCP endpoint's settings were resolved before it was a
   // module: a file with several mistakes fails on the one it always did (the presets' resolved above).
@@ -1470,6 +1508,20 @@ export function configTable(c: Pick<Config, 'defaultAgent' | 'identities' | 'tab
   return { ...ownersTable({ owners: [], agent: c.defaultAgent, ...(c.policy.ownerSessionKey ? { ownerSessionKey: c.policy.ownerSessionKey } : {}) }), identities };
 }
 
+/** `backends`: ids are checked (they become consumer names and operation id prefixes), registered routes must name all three fields. */
+function resolveBackends(file: ConfigFile['backends']): Record<string, BackendConfig> {
+  const out: Record<string, BackendConfig> = {};
+  for (const [id, b] of Object.entries(file ?? {})) {
+    if (!BACKEND_ID.test(id)) fail(`backends: id ${JSON.stringify(id)} must match ${BACKEND_ID.source}`);
+    const routes = (b.routes ?? []).map((r, i) => {
+      for (const k of ['channel', 'account', 'conversationId'] as const) if (!r[k]) fail(`backends.${id}.routes[${i}]: ${k} is empty`);
+      return { channel: r.channel, account: r.account, conversationId: r.conversationId };
+    });
+    out[id] = { id, ...(b.note !== undefined ? { note: b.note } : {}), routes, history: b.history ?? false };
+  }
+  return out;
+}
+
 /** Check the table at load: rule targets exist and are interactive (task agents can not be targets), digests have periods, no identity conflicts. */
 function checkTable(o: {
   agents: Record<string, AgentConfig>;
@@ -1479,6 +1531,8 @@ function checkTable(o: {
   table: BindingTable | undefined;
   ownerSessionKey: string | undefined;
   localSession: string;
+  /** Ids a rule's `to` may name. */
+  backends: string[];
 }): void {
   let table: BindingTable | undefined;
   try {
@@ -1495,7 +1549,7 @@ function checkTable(o: {
   if (!table) return;
   const at = { defaultAgent: o.defaultAgent, local: { principal: { id: '', labels: [] }, session: o.localSession } };
   try {
-    new Router({ agents: Object.values(o.agents).map((a) => agentSpec(a, at)), ...(o.defaultAgent ? { defaultAgent: o.defaultAgent } : {}), config: table }).close();
+    new Router({ agents: Object.values(o.agents).map((a) => agentSpec(a, at)), ...(o.defaultAgent ? { defaultAgent: o.defaultAgent } : {}), config: table, backends: o.backends }).close();
   } catch (e) {
     if (e instanceof RouterError) fail(`bindings: ${e.message}`);
     throw e;
