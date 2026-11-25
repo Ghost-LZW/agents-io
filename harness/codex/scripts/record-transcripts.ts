@@ -75,8 +75,15 @@ for (const sc of CODEX_SCENARIOS) {
   const t = recorder.transcript();
   const init = t.entries.find((e) => e.type === 'emit_inbound' && e.label === 'initialize');
   t.header.version = versionFromUserAgent(((init as { frame: { result?: { userAgent?: string } } } | undefined)?.frame.result?.userAgent)) ?? 'unknown';
-  const scrubbed = scrubTranscript(t, { home: homedir(), hostname: hostname(), workspace, ids: codexId });
+  const scrubbed = scrubTranscript(t, { home: homedir(), hostname: hostname(), workspace, ids: codexId, rewrite: machineSetup });
   const file = join(out, `${sc.name}.ndjson`);
   writeFileSync(file, formatTranscript(scrubbed));
   console.error(`[${sc.name}] wrote ${file} (${scrubbed.entries.length} lines, codex ${t.header.version})`);
+}
+
+/** The recording machine's own setup: its model provider's name and what its user agent says about the terminal. */
+function machineSetup(key: string, value: unknown): unknown {
+  if (key === 'modelProvider' && typeof value === 'string') return 'replay-provider';
+  if (key === 'userAgent' && typeof value === 'string') return value.replace(/\s.*$/, ' (replay)');
+  return undefined;
 }

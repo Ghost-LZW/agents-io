@@ -161,6 +161,11 @@ export interface ScrubOptions {
   ids?: (key: string, value: string, path: string) => string | undefined;
   /** Values of outbound frames that differ every run and are not echoed back (tokens, URLs): `<any>`. */
   volatile?: (key: string, value: unknown, path: string) => boolean;
+  /**
+   * Values that name the recording machine's own setup (a model provider's name, a user agent's
+   * terminal) in any frame: the value returned replaces it; undefined keeps it.
+   */
+  rewrite?: (key: string, value: unknown, path: string) => unknown;
 }
 
 export const REPLAY_HOME = '/home/replay-user';
@@ -198,6 +203,8 @@ export function scrubTranscript(t: Transcript, o: ScrubOptions): Transcript {
   };
   const scrub = (v: unknown, outbound: boolean, key: string, path: string): unknown => {
     if (outbound && o.volatile?.(key, v, path)) return '<any>';
+    const r = o.rewrite?.(key, v, path);
+    if (r !== undefined) return r;
     if (typeof v === 'string') return text(v);
     if (Array.isArray(v)) return v.map((x, i) => scrub(x, outbound, key, `${path}[${i}]`));
     if (isObject(v)) return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, scrub(x, outbound, k, path ? `${path}.${k}` : k)]));
