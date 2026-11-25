@@ -265,6 +265,26 @@ export AIO_ACP_COMMAND=/tmp/acp-agents/node_modules/.bin/claude-agent-acp CLAUDE
    - [ ] Ctrl-C 停 serve：`claude-agent-acp` 进程退出；再 `aio serve` 后发一条，回答接得上前面的对话（`session/load`），`aio tail` 里没有重放的旧消息。
 3. 重新录 transcript（适配器写出的帧有意变了时；同样要真模型）：`node --experimental-transform-types --disable-warning=ExperimentalWarning --import ./scripts/source-loader.mjs harness/acp/scripts/record-transcripts.ts`，写进 `packages/testkit/conformance/transcripts/acp/`，再跑 `harness/acp/test/transcripts.test.ts`。2026-11-25 的录制：claude-agent-acp 0.110.1、模型 `gpt-6-sol`（AsterGate 的 Gemini Flash 当时答 503）。
 
+### 1.7 手动：会话作为 ACP agent（`aio acp`：t3code、Zed）与 AG-UI 事件流
+
+自动测试（`packages/daemon/test/acp-server.test.ts`：官方 SDK 的客户端一侧，一条经真实的 `aio acp` 进程；`ag-ui.test.ts`：官方的 `HttpAgent`；`north-withhold.test.ts`；`projections.test.ts`）只用假 harness、不连真的编辑器或界面。下面在真的守护进程上用 t3code（它通用的 ACP provider）和 Zed 核对一遍；harness 用哪种都行（本地的 Claude Code 实例最简单），要模型时按 §0 用测试模型。
+
+1. 配置（HOSTS §4.11）：`"agents": { "dev": { "harness": "<实例>" } }`，`"acpServer": { "clients": { "t3": { "tokenFile": "acp/t3.token", "scopes": [], "agent": "dev", "approvals": true }, "zed": { "tokenFile": "acp/zed.token", "scopes": ["read"], "agent": "dev" } } }`，`aio serve`。
+   - [ ] 启动日志有 `token of client t3 generated and written to …/acp/t3.token`（0600）和 `ACP server ready for aio acp (clients: t3, zed)`；`aio sessions` 照旧。
+   - [ ] 命令行自检：`aio acp --client t3 --token-file <上面的文件> --socket <socket>` 不退出（等 stdin）；Ctrl-D 退出码 0。令牌文件换成别的客户端的：退出码 77，stderr `refused: unauthorized`。
+2. **t3code**：在它的设置里加一个通用 ACP agent（provider 的命令 `aio`，参数 `acp --client t3 --token-file <路径> --socket <socket>`），开一个新线程，说一句 hello。
+   - [ ] 回答流式出现；`aio sessions` 多了 `acp-server:t3:<uuid>`；`aio explain <那条输入的 id>` 是 `bindingId: acp-server:t3`、主体 `external:t3`（不是人）。
+   - [ ] 让它改一个文件：t3code 里出现权限对话框（Allow once / Allow for this session / Deny），允许后改了；`aio tail` 里 `request.resolved` 的 `by` 是 `{ kind: human, id: external:t3 }`，没有 `via`。
+   - [ ] 一个长回答进行中按 t3code 的停止：这一轮 `interrupted`，t3code 显示已取消。
+   - [ ] 关掉 t3code 再打开、回到这个线程（它用 `session/load`）：之前的对话重放出来，接着说一句，回答接得上。
+3. **Zed**：`settings.json` 的 `agent_servers` 加 `"agents-io": { "command": "aio", "args": ["acp", "--client", "zed", "--token-file", "<路径>", "--socket", "<socket>"] }`，在 Agent 面板里新开一个 agents-io 线程。
+   - [ ] 一轮能完成；Zed 的历史里能看到客户端可读的会话（`session/list`），打开主人在飞书里的那个会话（`read` scope）能看到它的历史，飞书里接着说的话、agent 的回答实时出现在 Zed 里（用户消息前面带 `[<主体>]`）。
+   - [ ] zed 没有 `approvals`：让它跑要审批的命令时 Zed 里不弹权限框，那个请求显示为失败的工具调用（缺省策略拒绝 peer 的 restricted 轮次里的审批）。
+4. **AG-UI**：配置 `"agUi": { "listen": "127.0.0.1:7466", "clients": { "web": { "tokenFile": "agui/web.token", "scopes": [], "agent": "dev" } } }`，重启。
+   - [ ] `curl -N -H "Authorization: Bearer $(cat <路径>)" -H 'content-type: application/json' -d '{"threadId":"t1","runId":"r1","messages":[{"id":"m1","role":"user","content":"hello"}],"tools":[],"context":[]}' http://127.0.0.1:7466/ag-ui` 依次看到 `RUN_STARTED`、`STATE_SNAPSHOT`、`TEXT_MESSAGE_*`、`RUN_FINISHED`；不带令牌 401，`-H 'Origin: http://evil.example'` 403。
+   - [ ] 有 CopilotKit 一类的界面时：它的运行时用 `HttpAgent` 指到这个 URL（带 `Authorization` 头），对话能完成，工具调用显示为已完成的调用。
+   - [ ] `curl -N -H "Authorization: …" 'http://127.0.0.1:7466/ag-ui/threads/t1/events?fromSeq=0'` 把这个线程的每一轮作为一个 run 重放出来，然后等着；再 POST 一次，新的一轮出现在这条流里。
+
 ## Tier 3：多端 + 重启
 
 1. 默认实例是 codex 且 `transport: { kind: "unix", spawn: "own" }`（`aio serve --harness codex`；app-server 独立于网关进程运行，状态在 `~/.agents-io/codex.<实例名>`，旧 `harness` 块为 `~/.agents-io/codex`）。

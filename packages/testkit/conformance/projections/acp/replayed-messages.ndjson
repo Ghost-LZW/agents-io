@@ -1,0 +1,15 @@
+{"projection":"acp","name":"replayed-messages","description":"A log read back (session/load): no deltas, only snapshots. Each message of the turn is said once, a command item in between is a tool call, and the final answer repeating the messages is not said again. The client's own message has no sender prefix.","options":{"principal":"external:zed"}}
+{"event":{"body":{"t":"input.admitted","inputId":"in-1","disposition":"new_turn","principalId":"external:zed","input":{"inputId":"in-1","origin":{"kind":"peer","principal":{"id":"external:zed","labels":["external"]},"evidence":"device_only","via":"acp-server:zed","adapter":"acp-server"},"content":[{"type":"text","text":"list the files"},{"type":"image","ref":"sha256:00","mime":"image/png","name":"shot.png"}],"replyRoute":{"channel":"local","account":"local","conversationId":"s"},"channelContext":{"channel":"acp-server"}}}}}
+{"event":{"turnId":"t1","body":{"t":"turn.started","turnId":"t1","inputIds":["in-1"],"replyRoute":{"channel":"local","account":"local","conversationId":"s"}}}}
+{"out":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"list the files\n[image shot.png]"}},"inputId":"in-1"}}
+{"event":{"turnId":"t1","body":{"t":"text.snapshot","text":"Looking.","final":false}}}
+{"out":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Looking."},"messageId":"t1:1"}}}
+{"event":{"turnId":"t1","itemId":"i1","body":{"t":"item.started","item":{"itemId":"i1","type":"command","title":"Run ls","status":"running","inputSummary":"ls -la"}}}}
+{"out":{"update":{"sessionUpdate":"tool_call","toolCallId":"i1","title":"Run ls","kind":"execute","status":"in_progress","rawInput":"ls -la"}}}
+{"event":{"turnId":"t1","itemId":"i1","body":{"t":"item.completed","item":{"itemId":"i1","type":"command","title":"Run ls","status":"completed","inputSummary":"ls -la","result":{"preview":"a.txt\nb.txt","truncated":false,"isError":false}}}}}
+{"out":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"i1","status":"completed","content":[{"type":"content","content":{"type":"text","text":"a.txt\nb.txt"}}]}}}
+{"event":{"turnId":"t1","body":{"t":"text.snapshot","text":"Two files.","final":false}}}
+{"out":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Two files."},"messageId":"t1:2"}}}
+{"event":{"turnId":"t1","audience":"answer","body":{"t":"text.snapshot","text":"Looking.\n\nTwo files.","final":true}}}
+{"event":{"turnId":"t1","body":{"t":"turn.completed","turnId":"t1","status":"completed"}}}
+{"out":{"turnEnd":{"turnId":"t1","stopReason":"end_turn"}}}

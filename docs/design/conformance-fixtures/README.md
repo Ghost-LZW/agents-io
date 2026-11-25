@@ -1,6 +1,6 @@
 # 一致性 fixture：录下的 harness transcript 与内核场景，都是数据
 
-> 状态：已落地（2026-11-25，core-slimming G8，`docs/design/core-slimming/` §3）。格式取自 t3code 的录制回放（core-slimming §7.1，scoping 见 t3orch 提案 3），输入和断言也写成数据；匹配按端保持顺序、端与端之间不排序。
+> 状态：已落地（2026-11-25，core-slimming G8，`docs/design/core-slimming/` §3）。L3 北向投影的 fixture（§4a）随 G9 的北向一起落地（2026-11-25）。格式取自 t3code 的录制回放（core-slimming §7.1，scoping 见 t3orch 提案 3），输入和断言也写成数据；匹配按端保持顺序、端与端之间不排序。
 
 ## 1. 是什么
 
@@ -10,6 +10,7 @@
 |---|---|---|
 | L1 harness transcript | 一个 harness 线上来回的帧：适配器写出的（`expect_outbound`）、harness 发来的（`emit_inbound`） | 回放它就是一个假的 harness 进程（stdio），适配器在它上面跑；任何语言的适配器或内核都能 spawn 它 |
 | L2 内核场景 | 往内核各端送什么（通道、客户端、宿主、日志）、各端应当看到什么 | 一个运行器照行执行；TS 的运行器在 `packages/testkit`，别的语言的内核写自己的驱动或运行器 |
+| L3 北向投影 | 会话日志里的一串事件，投影成标准协议（ACP、AG-UI）的哪些消息（§4a） | 别的语言的 ACP 服务端、AG-UI 端点照它自检：把事件喂给自己的投影，比对输出 |
 
 文件都在 `packages/testkit/conformance/`（随 testkit 发布，`package.json` 的 `files`）：
 
@@ -20,6 +21,7 @@
 | `transcripts/acp/` | 真实 ACP agent 的录制（`acp`；Claude Code 的 ACP agent 0.110.1）：`plain-turn`、`permission`、`cancel`、`load` |
 | `scenarios/kernel/` | 内核场景，由 `packages/kernel/test/scenarios.test.ts` 在没有模块的内核上跑 |
 | `scenarios/attention/` | G7 的 attention fixture，同一场景格式（§3.6），由 `packages/session/test/attention.test.ts` 跑 |
+| `projections/acp/`、`projections/ag-ui/` | L3 北向投影的映射表（§4a），由 `packages/daemon/test/projections.test.ts` 跑 |
 
 代码：`packages/testkit/src/conformance/`（`match.ts` 匹配，`transcript.ts` 格式、录制与去本机值，`replay.ts` 回放，`transcript-harness.ts` 进程内的 bridge harness，`scenario.ts` 场景格式与运行器），`packages/testkit/src/transcript-replay.ts`（stdio 回放程序，bin `aio-transcript-replay`）；录制的接头在适配器包里：`harness/codex/src/record.ts` `recordTransport`、`harness/jsonl-bridge` 的 `HarnessBridgeOptions.record`、`harness/acp/src/record.ts` `recordStream`（`AcpHarnessOptions.record`）。
 
@@ -173,11 +175,28 @@ G7 的 fixture 用的是同一格式：每行一条 `emit` 到 `log` 端（`even
 
 别的都是漂移，`check` 报错（退出码 1）：`packages`、`harness`、`channel`、`examples` 下任何别处（场景目录的子目录、别的目录）带场景头的 `.ndjson`，因为没有运行器跑它；运行器要跑、第一行却不是场景头的文件；`SCENARIO_DIRS` 里运行器不存在、不是 core 测试或不调 `scenarioFiles` 的目录。所以新的目录要先有跑它的测试，再写进 `SCENARIO_DIRS`。`packages/testkit/test/conformance.local.test.ts` 查每个场景和 transcript 都读得通、场景指名的 transcript 都在，并查 `scenarios/` 下（任意深度）的每个场景都在 `kernel/` 或 `attention/` 的顶层，且 `invariants.mjs list --json` 算的场景正是这些。
 
+## 4a. L3：北向投影
+
+会话的日志对外投影成标准协议时（core-slimming G9：ACP 服务端、AG-UI 端点，`docs/design/north-projections/`），映射是事件的纯函数（INVARIANTS PR-4）。fixture 把这张表写成数据：
+
+```json
+{"projection":"acp","name":"streamed-answer","description":"…","options":{"principal":"external:zed"}}
+{"event":{"turnId":"t1","body":{"t":"text.delta","delta":"All ","stream":"answer"}}}
+{"out":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"All "},"messageId":"t1:1"}}}
+```
+
+- 第一行是头：`projection`（`acp` 或 `ag-ui`）、`name`、`description`，可选的 `options` 是投影建起来时给的（ACP：`principal`，客户端的主体，请求的 resolver 点了它才问它；AG-UI：`threadId`，一次 run 另有 `runId` 与 `inputId`，没有就是续读，每一轮一个 run）。没有别的键。
+- 之后每行是 `event`（一条会话事件，只写要的字段，至少 `body`；日志盖的字段由读的一方补上：`seq` 从 1 数持久事件，易失的（`text.delta`、`item.progress`、`headline`）带上一条持久事件的 seq）、`out`（紧跟着它的那条 `event` 应当给出的一条输出，按顺序，不多不少）或 `note`（给人看的）。
+- 比较是精确的（`match.ts` 的 `exact`，占位符照样可用）。输出的形状：ACP 是 `{ update }`（一条 `session/update` 的 `update`，用户消息另带它所示的 `inputId`）、`{ permission: { requestId, toolCall, options } }`、`{ question: { requestId, message, requestedSchema } }`、`{ turnEnd: { turnId, stopReason } | { turnId, error } }`；AG-UI 是一个 AG-UI 事件。一次 run（有 `runId`）的 `RUN_STARTED` 算在第一条事件的输出前面。
+- 运行器：`packages/testkit/src/conformance/projection.ts` 的 `readProjection` / `runProjection`；TS 的投影由 `packages/daemon/test/projections.test.ts` 喂（core 测试，`#PR-4`，每个文件一条），每条输出再过它的协议自己的 schema：AG-UI 是 `@ag-ui/core` 的 `EventSchema`，ACP 的经官方 SDK 的客户端一侧（解析不了的不交给处理）。
+- 这些文件不是场景（头里没有 `scenario` 和 `invariants`），`scripts/invariants.mjs` 不算它们，算的是跑它们的那条测试。
+
 ## 5. 给别的语言的实现
 
 - **适配器**：拿 `transcripts/` 里对应协议的 transcript，spawn `aio-transcript-replay` 当 harness，做 transcript 里的那些事（Codex 的做法写在 `harness/codex/test/transcript-scenarios.ts`）；或者照 §2.3 在自己的语言里回放。
 - **内核**：照 §3 写一个运行器或一个驱动：参考通道、参考 harness、参考配置照 §3.2 实现，`aio.jsonl-harness` 的 transcript 用 `aio-transcript-replay` 当 bridge 程序（没有 gate），或照 §2.3 在进程内回放（有 gate）。场景说的是线上的帧和日志里的事件，与实现语言无关；参考通道与参考 harness 的行为写在 §3.2，不需要读 TS。
 - **宿主**：fold 自己的投影（如 attention）的宿主照 `scenarios/attention/` 自检。
+- **北向投影**：别的语言的 ACP 服务端或 AG-UI 端点照 `projections/` 自检（§4a）。
 
 ## 6. 还没有的
 

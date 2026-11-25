@@ -1,0 +1,23 @@
+{"projection":"acp","name":"tools-reasoning-plan","description":"Reasoning streams as agent_thought_chunk; a plan is a plan; items are tool calls by kind (command execute, file_change edit, web_search fetch, an MCP tool and the rest other), failed, declined and skipped ones end failed; text items are not tool calls; an item that completes without starting is announced complete.","options":{"principal":"external:zed"}}
+{"event":{"turnId":"t1","body":{"t":"turn.started","turnId":"t1","inputIds":[],"replyRoute":null,"initiator":"harness"}}}
+{"event":{"turnId":"t1","body":{"t":"text.delta","delta":"thinking it over","stream":"reasoning"}}}
+{"out":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking it over"}}}}
+{"event":{"turnId":"t1","body":{"t":"plan.updated","steps":[{"text":"read","status":"completed"},{"text":"edit","status":"in_progress"},{"text":"test","status":"pending"}]}}}
+{"out":{"update":{"sessionUpdate":"plan","entries":[{"content":"read","priority":"medium","status":"completed"},{"content":"edit","priority":"medium","status":"in_progress"},{"content":"test","priority":"medium","status":"pending"}]}}}
+{"event":{"turnId":"t1","itemId":"i1","body":{"t":"item.started","item":{"itemId":"i1","type":"file_change","title":"Edit a.ts","status":"running","inputSummary":"a.ts"}}}}
+{"out":{"update":{"sessionUpdate":"tool_call","toolCallId":"i1","title":"Edit a.ts","kind":"edit","status":"in_progress","rawInput":"a.ts"}}}
+{"event":{"turnId":"t1","itemId":"i1","body":{"t":"item.completed","item":{"itemId":"i1","type":"file_change","title":"Edit a.ts","status":"declined"}}}}
+{"out":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"i1","status":"failed"}}}
+{"event":{"turnId":"t1","itemId":"i2","body":{"t":"item.started","item":{"itemId":"i2","type":"mcp_tool","title":"agents_io.send_message","status":"running","tool":{"server":"agents_io","name":"send_message"}}}}}
+{"out":{"update":{"sessionUpdate":"tool_call","toolCallId":"i2","title":"agents_io.send_message","kind":"other","status":"in_progress"}}}
+{"event":{"turnId":"t1","itemId":"i2","body":{"t":"item.completed","item":{"itemId":"i2","type":"mcp_tool","title":"agents_io.send_message","status":"failed","result":{"preview":"denied","truncated":false,"isError":true},"tool":{"server":"agents_io","name":"send_message"}}}}}
+{"out":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"i2","status":"failed","content":[{"type":"content","content":{"type":"text","text":"denied"}}]}}}
+{"event":{"turnId":"t1","itemId":"i3","body":{"t":"item.completed","item":{"itemId":"i3","type":"web_search","title":"Search: acp spec","status":"completed"}}}}
+{"out":{"update":{"sessionUpdate":"tool_call","toolCallId":"i3","title":"Search: acp spec","kind":"fetch","status":"completed"}}}
+{"event":{"turnId":"t1","itemId":"i4","body":{"t":"item.started","item":{"itemId":"i4","type":"agent_message","title":"message","status":"running"}}}}
+{"event":{"turnId":"t1","itemId":"i5","body":{"t":"item.started","item":{"itemId":"i5","type":"subagent","title":"Explore","status":"running"}}}}
+{"out":{"update":{"sessionUpdate":"tool_call","toolCallId":"i5","title":"Explore","kind":"other","status":"in_progress"}}}
+{"event":{"turnId":"t1","itemId":"i5","body":{"t":"item.completed","item":{"itemId":"i5","type":"subagent","title":"Explore","status":"skipped"}}}}
+{"out":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"i5","status":"failed"}}}
+{"event":{"turnId":"t1","body":{"t":"turn.completed","turnId":"t1","status":"completed"}}}
+{"out":{"turnEnd":{"turnId":"t1","stopReason":"end_turn"}}}

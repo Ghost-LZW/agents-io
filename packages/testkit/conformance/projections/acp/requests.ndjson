@@ -1,0 +1,22 @@
+{"projection":"acp","name":"requests","description":"Every request shows as a pending tool call (request:<id>). Only one whose human resolver names the client is asked of it: an approval as session/request_permission with the options its allowed decisions give (allow once, allow for the session where allowAlways, deny), a question as a form. How it was resolved ends the tool call: completed when allowed or answered, failed when denied or cancelled.","options":{"principal":"external:zed"}}
+{"event":{"turnId":"t1","body":{"t":"turn.started","turnId":"t1","inputIds":[],"replyRoute":null}}}
+{"event":{"turnId":"t1","body":{"t":"request.opened","requestId":"r1","kind":"file_change","title":"Edit a.ts","risk":{"writes":true},"inputPreview":"a.ts","allowedDecisions":[],"allowAlways":true,"defaultDeny":true,"resolver":{"kind":"human","principals":["external:zed"],"routes":[]}}}}
+{"out":{"update":{"sessionUpdate":"tool_call","toolCallId":"request:r1","title":"Edit a.ts","kind":"edit","status":"pending","rawInput":"a.ts"}}}
+{"out":{"permission":{"requestId":"r1","toolCall":{"toolCallId":"request:r1","title":"Edit a.ts","kind":"edit","status":"pending","rawInput":"a.ts"},"options":[{"optionId":"allow_once","name":"Allow once","kind":"allow_once"},{"optionId":"allow_session","name":"Allow for this session","kind":"allow_always"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]}}}
+{"event":{"turnId":"t1","body":{"t":"request.resolved","requestId":"r1","decision":{"kind":"allow_session"},"by":{"kind":"human","id":"external:zed"}}}}
+{"out":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"request:r1","status":"completed"}}}
+{"event":{"turnId":"t1","body":{"t":"request.opened","requestId":"r2","kind":"tool_approval","title":"Run rm -rf build","risk":{"writes":true},"allowedDecisions":["allow_once","deny"],"allowAlways":false,"defaultDeny":true,"resolver":{"kind":"human","principals":["fake:alice"],"routes":["fake:default:c1"]}}}}
+{"out":{"update":{"sessionUpdate":"tool_call","toolCallId":"request:r2","title":"Run rm -rf build","kind":"execute","status":"pending"}}}
+{"event":{"turnId":"t1","body":{"t":"request.resolved","requestId":"r2","decision":{"kind":"deny"},"by":{"kind":"human","id":"fake:alice"}}}}
+{"out":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"request:r2","status":"failed"}}}
+{"event":{"turnId":"t1","body":{"t":"request.opened","requestId":"r3","kind":"question","title":"Which colour?","risk":{},"questions":[{"id":"q1","text":"Colour","options":[{"label":"Red"},{"label":"Green"}]},{"id":"q2","text":"Toppings","options":[{"label":"Ham"},{"label":"Egg"}],"multiSelect":true},{"id":"q3","text":"Anything else?"}],"allowedDecisions":["answer","deny"],"allowAlways":false,"defaultDeny":false,"resolver":{"kind":"human","principals":["external:zed"],"routes":[]}}}}
+{"out":{"update":{"sessionUpdate":"tool_call","toolCallId":"request:r3","title":"Which colour?","kind":"other","status":"pending"}}}
+{"out":{"question":{"requestId":"r3","message":"Which colour?","requestedSchema":{"type":"object","properties":{"q1":{"type":"string","title":"Colour","oneOf":[{"const":"Red","title":"Red"},{"const":"Green","title":"Green"}]},"q2":{"type":"array","title":"Toppings","items":{"anyOf":[{"const":"Ham","title":"Ham"},{"const":"Egg","title":"Egg"}]}},"q3":{"type":"string","title":"Anything else?"}},"required":["q1","q2","q3"]}}}}
+{"event":{"turnId":"t1","body":{"t":"request.resolved","requestId":"r3","decision":{"kind":"answer","answers":{"q1":"Red","q2":["Ham"],"q3":"no"}},"by":{"kind":"human","id":"external:zed"}}}}
+{"out":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"request:r3","status":"completed"}}}
+{"event":{"turnId":"t1","body":{"t":"request.opened","requestId":"r4","kind":"permissions","title":"Network access","risk":{"network":true},"allowedDecisions":["allow_once","deny"],"allowAlways":false,"defaultDeny":true,"resolver":{"kind":"auto","decision":{"kind":"deny","message":"not allowed in restricted profile"}}}}}
+{"out":{"update":{"sessionUpdate":"tool_call","toolCallId":"request:r4","title":"Network access","kind":"other","status":"pending"}}}
+{"event":{"turnId":"t1","body":{"t":"request.resolved","requestId":"r4","decision":null,"by":"runtime_cancelled"}}}
+{"out":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"request:r4","status":"failed"}}}
+{"event":{"turnId":"t1","body":{"t":"turn.completed","turnId":"t1","status":"completed"}}}
+{"out":{"turnEnd":{"turnId":"t1","stopReason":"end_turn"}}}

@@ -1,0 +1,12 @@
+{"projection":"acp","name":"streamed-answer","description":"Someone else's message starts a turn; the answer streams as agent_message_chunk; the final snapshot repeats what was streamed and adds nothing; the turn ends end_turn.","options":{"principal":"external:zed"}}
+{"event":{"body":{"t":"input.admitted","inputId":"in-1","disposition":"new_turn","principalId":"fake:alice","input":{"inputId":"in-1","origin":{"kind":"human","principal":{"id":"fake:alice","labels":["owner"]},"evidence":"platform_signed","via":"fake:default:c1","adapter":"fake"},"content":[{"type":"text","text":"what is up?"}],"replyRoute":{"channel":"fake","account":"default","conversationId":"c1"},"channelContext":{"channel":"fake"}}}}}
+{"event":{"turnId":"t1","body":{"t":"turn.started","turnId":"t1","inputIds":["in-1"],"replyRoute":{"channel":"fake","account":"default","conversationId":"c1"},"initiator":"host"}}}
+{"out":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"[fake:alice] what is up?"}},"inputId":"in-1"}}
+{"event":{"turnId":"t1","body":{"t":"text.delta","delta":"All ","stream":"answer"}}}
+{"out":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"All "},"messageId":"t1:1"}}}
+{"event":{"turnId":"t1","body":{"t":"text.delta","delta":"good.","stream":"answer"}}}
+{"out":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"good."},"messageId":"t1:1"}}}
+{"event":{"turnId":"t1","audience":"answer","body":{"t":"text.snapshot","text":"All good.","final":true}}}
+{"event":{"turnId":"t1","body":{"t":"input.consumed","inputIds":["in-1"],"turnId":"t1"}}}
+{"event":{"turnId":"t1","body":{"t":"turn.completed","turnId":"t1","status":"completed"}}}
+{"out":{"turnEnd":{"turnId":"t1","stopReason":"end_turn"}}}

@@ -28,3 +28,8 @@ export {
   type ResolvedChannel,
 } from './defaults.js';
 export * from './bundle.js';
+// The north projections (core-slimming G9): the ACP server (`aio acp`) and the AG-UI endpoint, and their mapping tables.
+export { acpPipe, acpServerModule } from './acp-server.js';
+export { AcpProjection, permissionDecision, permissionOptions, questionDecision, questionForm, stopReasonOf, toolKindOf, toolStatusOf, type AcpFormSchema, type AcpOut } from './acp-projection.js';
+export { agUiModule } from './ag-ui.js';
+export { AgUiProjection, sessionState, type AgUiEvent } from './ag-ui-projection.js';

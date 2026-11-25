@@ -28,6 +28,7 @@
 
 - 一个场景文件（`.ndjson`，第一行是头 `{ "scenario", "description", "invariants": [编号] }`）就是这些编号的一条 core 测试：`scripts/invariants.mjs` 读头部，`check`、`list`、`affected` 都算它。跑它们的是 core 测试 `packages/kernel/test/scenarios.test.ts`（`scenarios/kernel/`，没有模块的内核）和 `packages/session/test/attention.test.ts`（`scenarios/attention/`），各跑自己目录顶层的 `*.ndjson`（不含子目录）；测试名带头部的编号，`-t '#IN-1\b'` 照样选得到。只有这些文件算数：别处（子目录里、别的目录里）带场景头的 `.ndjson` 没有运行器跑，`check` 把它报为漂移。加一个新的场景目录，先加跑它的测试，再把目录和运行器写进 `scripts/invariants.mjs` 的 `SCENARIO_DIRS`（`packages/testkit/test/conformance.local.test.ts` 查 `scenarios/` 下的每个场景都在运行器跑的目录顶层，且正是 `invariants.mjs` 算的那些）。
 - 写场景时用 `AIO_SCENARIO_TRACE=1 npx vitest run packages/kernel/test/scenarios.test.ts` 看各端实际有什么；只写承诺说的，不写时机决定的先后（端与端之间本来就不排序）。
+- 北向投影的映射表（L3，`projections/acp/`、`projections/ag-ui/`，格式见 `docs/design/conformance-fixtures/` §4a）不是场景：由 core 测试 `packages/daemon/test/projections.test.ts` 逐个文件跑（`#PR-4`），每条输出还要过它的协议自己的 schema。表有意变了就改 fixture 的 `out` 行，并说明为什么（它们是别的语言的实现对照的东西）。
 - 录下的 transcript 不手改去迁就代码：适配器写出的帧有意变了，就重新录（Codex：`harness/codex/scripts/record-transcripts.ts`，真模型，手动跑，`harness/codex/README.md`；ACP：`harness/acp/scripts/record-transcripts.ts`，同样，`harness/acp/README.md`）。
 
 ## 对照脚本

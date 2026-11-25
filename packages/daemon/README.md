@@ -605,6 +605,47 @@ host side: `docs/HOSTS.md` §4.2.
   `GET /api/status` shows `externalMcp: { url, clients }` while it listens, and its `modules` entry.
   A bad client token or token file fails the start; a port that is taken is logged, not fatal.
 
+## North projections: sessions as ACP agents and AG-UI streams (core-slimming G9)
+
+Off unless configured. Two built-in feature modules let a standard front end open any session:
+an editor (Zed, JetBrains) or t3code's generic ACP provider runs `aio acp` as an Agent Client
+Protocol agent, and a web UI (CopilotKit-style, `HttpAgent` of `@ag-ui/client`) posts an AG-UI
+`RunAgentInput` and reads the run's events as SSE. Host side: `docs/HOSTS.md` §4.11; design and
+security review: `docs/design/north-projections/`.
+
+```jsonc
+"acpServer": {                                  // module acp-server; `aio acp` reaches it through the local socket
+  "clients": {
+    "zed": { "tokenFile": "acp/zed.token", "scopes": ["read:dev:*", "input:dev:*"], "agent": "dev", "approvals": false }
+  },
+  "limits": { "maxTextChars": 16000, "promptsPerMinute": 20 }
+},
+"agUi": {                                       // module ag-ui; POST /ag-ui, GET /ag-ui/threads/<threadId>/events?fromSeq=
+  "listen": "127.0.0.1:7466", "origins": ["http://localhost:3000"],
+  "clients": { "web": { "token": "env:AIO_AGUI_WEB_TOKEN", "scopes": ["read"], "agent": "dev" } },
+  "limits": { "maxBodyBytes": 1048576, "maxTextChars": 16000, "requestsPerMinute": 120, "runsPerMinute": 20 }
+}
+```
+
+- Clients are as the external MCP endpoint's: their own token (`env:NAME` or `tokenFile`, never
+  the host token, no two the same), scopes `read`, `read:<session pattern>`, `input:<session
+  pattern>`; what they do is stamped `kind: "peer"`, principal `external:<name>` (never a person),
+  `adapter` / `via` the module id (`acp-server`, `ag-ui`); a host's `external` callout decides
+  every input (`args.endpoint`); inputs pass the loop guard. A client with `agent` may open
+  sessions of its own (`acp-server:<name>:<id>`, `ag-ui:<name>:<threadId>`).
+- `aio acp --client <name> [--token-file <path>] [--session <key>] [--socket <path>]` (token also
+  `$AIO_ACP_TOKEN`): speaks ACP v1 on stdio (the official SDK), piped to the module over the
+  socket (`module.connect`). `session/new`, `session/load` (replays the log), `session/list`,
+  `session/prompt` (a lane input; answered when its turn ends), `session/cancel` (the client's own
+  turn); a request is asked of the client (`session/request_permission`, a form elicitation) only
+  when its resolver names the client (`approvals: true` makes it the resolver of its own turns).
+  Exit codes: 0 stdin ended, 2 no ACP server in the daemon, 69 daemon not there, 77 refused.
+- The mapping tables are `src/acp-projection.ts` and `src/ag-ui-projection.ts`, pinned by the
+  fixtures in `packages/testkit/conformance/projections/` (INVARIANTS PR-4). A checked turn's
+  answer (U20) reaches neither before it is past the host's exit check (`src/external-view.ts`).
+- Status: `acp-server` `{ clients, connections }`, `ag-ui` `{ url, clients }` (while it listens);
+  features `acp.server`, `ag-ui`.
+
 ## Topics (decision 6)
 
 A flat conversation (no platform threads) can hold several **topics**, each its
@@ -678,7 +719,14 @@ aio bindings put [--file table.json|-] | get
 aio explain <inputId>
 aio verify <channelRef>
 aio console-link                                              (one-time console login URL)
+aio acp --client <name> [--token-file <path>] [--session <key>]   (module acp-server: ACP on stdio, for an editor or t3code)
 ```
+
+- A feature module may add commands (`ModuleManifest.cli`): a built-in one's (`aio acp`), or one a
+  config file's `modules` entry loads (found through `--config` / `$AIO_CONFIG`). Such a command
+  declares its options; the CLI parses them with its common `--config`, `--env-file`, `--socket`
+  and `--help` (anything else is a usage error, exit 2) and runs it with a `socket()` helper. The
+  CLI's own commands and the harness kinds' come first; `aio help` lists the built-in modules'.
 
 - A built-in harness kind may add commands (`HarnessModule.cli`), for its own processes to
   start, not listed above: Claude Code's `aio tui-bridge` is what its terminal UI starts as an
@@ -714,8 +762,8 @@ A feature of the daemon can be a module: a `ModuleManifest` (`@agents-io/protoco
 `module.ts`) registered in a `ModuleRegistry` by the composition root (`bundle.ts`
 `builtinModules`, origin `builtin`; so far the topic titles, `topic-title`, the watch, schedule,
 live and topic tools, `tools.watch`, `tools.schedules`, `tools.live`, `tools.topics`, the stranger approval, `strangers`, the
-presets, `presets`, the owner's run-config chat commands, `owner-commands`, and the external MCP
-endpoint, `external-mcp`). A third
+presets, `presets`, the owner's run-config chat commands, `owner-commands`, the north projections,
+`acp-server` and `ag-ui`, and the external MCP endpoint, `external-mcp`). A third
 party's module has the same shape (origin `module`): an embedder registers it in its own
 registry, and the bundled `aio` loads one from the config file's `modules` entries (each imported
 at `aio serve`'s start, before the config is resolved: `loadConfigModules`; registered after the
@@ -1659,3 +1707,27 @@ What changed for embedders with the ACP harness (core-slimming G9, south, 2026-1
 - `@agents-io/testkit`: transcripts may be of `protocol: "acp"` (`TRANSCRIPT_PROTOCOLS`);
   `teardownAnswers("acp")` answers with `jsonrpc: "2.0"`. The recorded ACP transcripts are in
   `conformance/transcripts/acp/`.
+
+What changed for embedders with the north projections (core-slimming G9, 2026-11-25):
+
+- Two more built-in feature modules, `acp-server` (`acpServerModule`, section `acpServer`, CLI
+  command `acp`) and `ag-ui` (`agUiModule`, section `agUi`), registered after `owner-commands` and
+  before `external-mcp`; both off without their section, so `builtinModules`, the config file
+  schema's top-level keys (`acpServer`, `agUi`, before `externalMcp`) and `GET /api/status`
+  `modules` have two more entries, and nothing else changes for a deployment without them. This
+  package exports them, `acpPipe`, and the projections (`AcpProjection`, `AgUiProjection` and their
+  table functions). New dependencies: `@agentclientprotocol/sdk`, `@ag-ui/core`, `zod`.
+- `KernelContext` gains `subscribe(sessionKey, { fromSeq? })` (a session's events as they come,
+  tier `full`; a `session.snapshot` event first without `fromSeq`) and `blobs.put(bytes, meta)`;
+  `KERNEL_CAPABILITIES` lists `subscribe` and `blobs`. `KernelBackend` gains `subscribe` and
+  `putBlob` (required, so this breaks an embedder that implements it).
+- `ModuleInstance.connect(hello, conn)` (served): a local socket connection that sends the new
+  client frame `module.connect { module, hello }` is the module's once it answers `{ ok: true }`
+  (`ModuleConnection`: JSON values both ways). `LocalHost.moduleConnect` is the gateway's side; a
+  connection that said `host.hello` or subscribed is refused (`forbidden`). The local socket now
+  decodes a chunk line by line, so a bad line is answered in its place (as before for a chunk of
+  one line).
+- `ModuleManifest.cli` (`ModuleCliCommand`: `usage`, `options`, `run`); `ModuleRegistry.cliCommand`
+  and `cliCommands`; `CLI_COMMON_OPTIONS`. Two modules adding the same name fail the registration.
+- The `external` callout's `args` may carry `endpoint` (`acp-server` or `ag-ui`; absent for the
+  external MCP endpoint). JSON Schemas: `ClientFrame.json` and `HostEventFrame.json` grew.

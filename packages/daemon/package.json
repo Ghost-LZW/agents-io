@@ -14,6 +14,8 @@
     "attach": "node dist/cli.js attach"
   },
   "dependencies": {
+    "@ag-ui/core": "^1.0.5",
+    "@agentclientprotocol/sdk": "^2.9.1",
     "@agents-io/channel-jsonl-bridge": "workspace:*",
     "@agents-io/channel-lark-bot": "workspace:*",
     "@agents-io/channel-mail": "workspace:*",
@@ -26,9 +28,11 @@
     "@agents-io/kernel": "workspace:*",
     "@agents-io/protocol": "workspace:*",
     "@agents-io/session": "workspace:*",
-    "@sinclair/typebox": "^0.34.0"
+    "@sinclair/typebox": "^0.34.0",
+    "zod": "^4.0.0"
   },
   "devDependencies": {
+    "@ag-ui/client": "^1.0.5",
     "@agents-io/testkit": "workspace:*",
     "@modelcontextprotocol/sdk": "1.32.1",
     "@types/ws": "^8.18.2",

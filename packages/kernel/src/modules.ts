@@ -25,10 +25,13 @@ import type {
   KernelSendResult,
   KernelSessionRun,
   KernelSettledSend,
+  KernelSubscription,
   KernelUnscheduleResult,
   KernelUnwatchResult,
   KernelWatchResult,
   ModuleActionResult,
+  ModuleCliCommand,
+  ModuleConnection,
   ModuleInstance,
   ModuleManifest,
   ModuleOrigin,
@@ -168,7 +171,7 @@ export interface ModuleRegistryOptions {
 export const KERNEL_CAPABILITIES: readonly string[] = [
   'log', 'events', 'head', 'appendNative', 'sessions', 'status', 'stopping', 'policy', 'records', 'db', 'topics', 'watches', 'live', 'agents',
   'router', 'lanes', 'runConfig', 'channelFor', 'resolveRoute', 'send', 'settled', 'outbound', 'hold', 'owner', 'ownerRoute', 'redispatch', 'explain', 'host',
-  'schedules',
+  'schedules', 'subscribe', 'blobs',
 ];
 
 const MODULE_ID = /^[a-z0-9][a-z0-9._-]*$/;
@@ -177,6 +180,11 @@ const ALIAS = /^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*$/;
 const TOOL_NAME = /^[a-z][a-z0-9_]*$/;
 const COMMAND_NAME = /^[a-z][a-z0-9_-]*$/;
 const FIELD = /^[A-Za-z][A-Za-z0-9_]*$/;
+/** A CLI command's name (`ModuleManifest.cli`) and its options' long names. */
+const CLI_NAME = /^[a-z][a-z0-9-]*$/;
+
+/** The CLI's options every module command takes besides its own (`ModuleCliCommand.options` names none of them). */
+export const CLI_COMMON_OPTIONS: readonly string[] = ['config', 'env-file', 'socket', 'help'];
 
 const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 const isFn = (v: unknown) => typeof v === 'function';
@@ -249,6 +257,20 @@ function badManifest(m: ModuleManifest<any>): string | undefined {
   }
   if (m.runDefaults !== undefined && (!isObject(m.runDefaults) || !isFn(m.runDefaults.names) || !isFn(m.runDefaults.resolve))) return 'runDefaults must be { names, resolve }, both functions';
   if (m.admin !== undefined) return 'admin (an AdminContribution) is not served for feature modules yet';
+  if (m.cli !== undefined) {
+    if (!isObject(m.cli)) return 'cli must map command names to commands';
+    for (const [name, c] of Object.entries(m.cli as Record<string, unknown>)) {
+      if (!CLI_NAME.test(name)) return `cli: ${JSON.stringify(name)} is not a command name (lower-case ASCII letters, digits and -, starting with a letter)`;
+      if (!isObject(c) || !nonEmpty(c.usage) || !isFn(c.run)) return `cli.${name} must be { usage: a non-empty string, options?, run: a function }`;
+      if (c.options !== undefined) {
+        if (!isObject(c.options)) return `cli.${name}.options must map option names to "string" or "boolean"`;
+        for (const [o, t] of Object.entries(c.options)) {
+          if (!CLI_NAME.test(o) || (t !== 'string' && t !== 'boolean')) return `cli.${name}.options.${o} must be a lower-case option name with "string" or "boolean"`;
+          if (CLI_COMMON_OPTIONS.includes(o)) return `cli.${name}.options.${o} is one of the CLI's common options`;
+        }
+      }
+    }
+  }
   return undefined;
 }
 
@@ -325,6 +347,7 @@ export class ModuleRegistry {
       if (m.runDefaults) claim('the named run defaults (runDefaults)', m.id);
       for (const t of m.mcpTools ?? []) claim(`tool ${t.name}`, m.id);
       for (const c of m.commands ?? []) for (const n of [c.name, ...(c.aliases ?? [])]) claim(`command /${n}`, m.id);
+      for (const n of Object.keys(m.cli ?? {})) claim(`CLI command ${n}`, m.id);
       const reg: RegisteredModule = { manifest: m, origin: r.origin, ...(r.entry ? { entry: { module: r.entry.module, ...(r.entry.export !== undefined ? { export: r.entry.export } : {}) } } : {}) };
       this.byId.set(m.id, reg);
       if (reg.entry) this.byEntry.set(entryKey(reg.entry), reg);
@@ -398,6 +421,20 @@ export class ModuleRegistry {
 
   get size(): number {
     return this.byId.size;
+  }
+
+  /** The CLI command `name` a registered module adds (`ModuleManifest.cli`), with its module's id; undefined when none does. */
+  cliCommand(name: string): { module: string; command: ModuleCliCommand } | undefined {
+    for (const { manifest: m } of this.byId.values()) {
+      const c = m.cli && Object.hasOwn(m.cli, name) ? m.cli[name] : undefined;
+      if (c) return { module: m.id, command: c };
+    }
+    return undefined;
+  }
+
+  /** Every CLI command the registered modules add, in registration order (for the CLI's help). */
+  cliCommands(): { name: string; module: string; command: ModuleCliCommand }[] {
+    return this.modules.flatMap(({ manifest: m }) => Object.entries(m.cli ?? {}).map(([name, command]) => ({ name, module: m.id, command })));
   }
 
   /** The module whose tool `name` is, if a registered one's. */
@@ -484,7 +521,7 @@ function badInstance(m: ModuleManifest<any>, i: ModuleInstance): string | undefi
     }
   }
   if (i.localFrames !== undefined && (!isObject(i.localFrames) || Object.keys(i.localFrames).length)) return 'localFrames are not served yet';
-  for (const k of ['offeredTools', 'features', 'status', 'start', 'stop'] as const) if (i[k] !== undefined && !isFn(i[k])) return `${k} must be a function`;
+  for (const k of ['offeredTools', 'features', 'status', 'connect', 'start', 'stop'] as const) if (i[k] !== undefined && !isFn(i[k])) return `${k} must be a function`;
   return undefined;
 }
 
@@ -874,6 +911,25 @@ export class ModuleHost {
     if (got !== true) throw not(`does not act for ${by} now`);
   }
 
+  /**
+   * A local socket connection asks to be module `id`'s (`module.connect`, `ModuleInstance.connect`):
+   * its answer, while it runs (started, not stopping); `unsupported` when no running module of that
+   * id takes connections. A throw is answered `internal` (logged).
+   */
+  async connect(id: string, hello: unknown, conn: ModuleConnection): Promise<KernelOutcome> {
+    const m = this.all.find((x) => x.r.manifest.id === id);
+    if (!m?.started || this.stopping || !m.instance?.connect) return { ok: false, code: 'unsupported', message: `no running module ${JSON.stringify(id)} takes connections` };
+    try {
+      const r: unknown = await m.instance.connect(hello, conn);
+      if (isObject(r) && r.ok === true) return { ok: true, value: r.value ?? {} };
+      if (isObject(r) && r.ok === false && nonEmpty(r.code)) return { ok: false, code: r.code, message: typeof r.message === 'string' ? r.message : r.code };
+      throw new Error('connect answered neither { ok: true, value } nor { ok: false, code, message }');
+    } catch (e) {
+      this.o.log('warn', `module ${id}: connect failed: ${(e as Error)?.message ?? String(e)}`);
+      return { ok: false, code: 'internal', message: `module ${id} failed to take the connection` };
+    }
+  }
+
   /** Step 4: stop the started modules in reverse order, each bounded (`MODULE_STOP_MS`); failures are logged. Their hooks are no longer called. */
   async stop(): Promise<void> {
     this.stopping = true;
@@ -905,6 +961,10 @@ export interface KernelBackend {
   log: Log;
   events(sessionKey: string, fromSeq: number): SessionEvent[];
   head(sessionKey: string): number;
+  /** The hub's subscription at tier `full` (`KernelContext.subscribe`). */
+  subscribe(sessionKey: string, fromSeq: number | undefined): KernelSubscription;
+  /** Put a blob in the host's store (`KernelContext.blobs.put`). */
+  putBlob(bytes: Uint8Array, meta: { mime: string; name?: string }): Promise<string>;
   appendNative(logKey: string, e: Parameters<KernelContext['appendNative']>[1]): void;
   sessions(): AdminSession[];
   knownSession(sessionKey: string): boolean;
@@ -1013,6 +1073,17 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
     log: (level, msg, data) => k.log(level, `module ${id}: ${msg}`, data),
     events: (sessionKey, fromSeq) => live().events(sessionKey, fromSeq ?? 0),
     head: (sessionKey) => live().head(sessionKey),
+    subscribe: (sessionKey, o) => {
+      const fromSeq = o?.fromSeq;
+      if (fromSeq !== undefined && (typeof fromSeq !== 'number' || !Number.isInteger(fromSeq) || fromSeq < 0)) throw new Error(`module ${id}: subscribe: fromSeq must be a seq (an integer, 0 or more)`);
+      return live().subscribe(text(sessionKey, 'subscribe: sessionKey'), fromSeq);
+    },
+    blobs: {
+      put: async (bytes, meta) => {
+        if (!(bytes instanceof Uint8Array)) throw new Error(`module ${id}: blobs.put takes the bytes as a Uint8Array`);
+        return live().putBlob(bytes, { mime: text(meta?.mime, 'blobs.put: mime'), ...(meta?.name !== undefined ? { name: text(meta.name, 'blobs.put: name') } : {}) });
+      },
+    },
     appendNative: (logKey, e) => live().appendNative(logKey, e),
     sessions: {
       list: () => live().sessions(),

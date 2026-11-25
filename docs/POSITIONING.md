@@ -133,7 +133,7 @@ x-work-os 的执行器是"一轮一个无头进程、只通过命令输出、运
 | harness / agent loop | 工具、上下文、沙箱、一轮怎么跑 | Claude Code、Codex、OpenCode、Gemini CLI；框架有 Claude Agent SDK、OpenAI Agents SDK、LangGraph、Mastra、Google ADK、CrewAI | **南向**：驱动它们（`HarnessAdapter`）；支持 ACP 的 agent 经一个通用的 ACP 适配器（harness 种类 `acp`，已完成） |
 | agent ↔ 工具 | 调工具 | MCP | 给 agent 挂 IO 工具；对外 MCP 端点 |
 | agent ↔ agent | 发现、委派 | A2A | 远端 agent 可作为一种 harness；`run.start` 可对外以 A2A 暴露（规划） |
-| agent ↔ 单个前端 | 把一个 agent 的事件流交给一个在线的界面 | AG-UI、ACP（Zed 的 Agent Client Protocol）、A2UI、MCP Apps | **北向投影**：任何会话都能以这些形式被一个端订阅（规划） |
+| agent ↔ 单个前端 | 把一个 agent 的事件流交给一个在线的界面 | AG-UI、ACP（Zed 的 Agent Client Protocol）、A2UI、MCP Apps | **北向投影**：任何会话都能以这些形式被一个端订阅（ACP 与 AG-UI 已完成：模块 `acp-server`（`aio acp`）、`ag-ui`，HOSTS §4.11；A2UI、MCP Apps 规划） |
 | 通道 | 各 IM 平台的收发 | Vercel Chat SDK、Bot Framework、openclaw 的通道插件 | **北向通道**：自有适配器，也可桥接 Chat SDK 的适配器（规划） |
 | 产品 / 宿主 | 任务、记忆、信任、界面 | persona、openclaw、x-work-os、multica、happyclaw、botmux | **宿主**：经 `Policy` 钩子和宿主协议使用 agents-io |
 
@@ -178,7 +178,7 @@ x-work-os 的执行器是"一轮一个无头进程、只通过命令输出、运
 2. **内核不发起模型调用、不带产品默认值**：话题标题、预设、陌生人放行、改运行配置的聊天命令，都做成可替换的模块或交还宿主（core-slimming §2 的 host 级）。
 3. **三个面都接标准协议**，这样框架接入时一行代码都不用改：
    - **南向**：原生适配器接 Claude Code、Codex（最深：插话、对账、重启接管）；**一个 ACP 适配器**接一批支持 ACP 的 coding agent（**已完成**，2026-11-25：harness 种类 `acp`，`harness/acp`，HOSTS §4.10；能力来自 agent 的 `initialize` 与 `session/new`，各 agent 的怪癖是包里具名的 flavor 钩子；比原生适配器少的是插话、跨重启接管、可续的审批等，见 `harness/acp/README.md`；真实 agent 的录制是 G8 的 L1 fixture）；**一个 AG-UI 客户端适配器**接以 AG-UI 暴露后端的框架（规划）；JSONL harness 帧兜底任意程序（**已完成**，2026-11-24：harness 种类 `bridge`，`harness/jsonl-bridge`，HOSTS §4.8）。
-   - **北向**：原生通道（飞书、邮件）、JSONL 桥、**Chat SDK 桥**（复用它的 Slack / Teams / Discord / Telegram / WhatsApp 等适配器）；会话按标准协议对外投影：**AG-UI 服务端**让网页界面订阅任意会话，**ACP 服务端**让编辑器加入会话，MCP 端点（已有）给外部 agent，A2A 服务端（规划）给调用方形态的 agent 通信。
+   - **北向**：原生通道（飞书、邮件）、JSONL 桥、**Chat SDK 桥**（复用它的 Slack / Teams / Discord / Telegram / WhatsApp 等适配器）；会话按标准协议对外投影：**AG-UI 服务端**让网页界面订阅任意会话，**ACP 服务端**让编辑器加入会话（**都已完成**，2026-11-25：内建功能模块 `ag-ui` 与 `acp-server`，缺省关；编辑器与 t3code 的通用 ACP provider 把 `aio acp` 当 agent 起，网页界面用 AG-UI 的 `HttpAgent` POST 一个 run 得到 SSE；客户端与对外 MCP 的一样是配置的 peer，永远不是人；映射表是 G8 式的 fixture；HOSTS §4.11、`docs/design/north-projections/`），MCP 端点（已有）给外部 agent，A2A 服务端（规划）给调用方形态的 agent 通信。
    - **宿主**：`Policy` 钩子和宿主协议，任意语言（HOSTS §1）。
 4. **语义可以离开 TS 验证**：一致性 fixture（core-slimming G8）让其他语言的实现和宿主不跑 TS 也能自检。实现语言的取舍见 core-slimming §8。
 
