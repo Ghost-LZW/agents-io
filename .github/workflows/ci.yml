@@ -53,3 +53,28 @@ jobs:
       - name: test (e2e)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm test:e2e
+
+  # persona-plugin/ is a Go module of its own (a Persona extension that connects an assistant to the
+  # router as a backend); it shares nothing with the pnpm workspace.
+  persona-plugin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: persona-plugin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: persona-plugin/go.mod
+          cache-dependency-path: persona-plugin/go.sum
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: go test -count=1 ./...

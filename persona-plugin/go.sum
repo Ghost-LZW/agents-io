@@ -1,0 +1,4 @@
+github.com/coder/websocket v1.8.15 h1:6B2JPeOGlpff2Uz6vOEH1Vzpi0iUz20A+lPVhPHtNUA=
+github.com/coder/websocket v1.8.15/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
+github.com/nwverse/persona/sdk/go v0.0.0-20261125041530-00eba930dae6 h1:yRSHRp2VV+Ngh2BiPh+I0fzvgdbSke0NvSoqnVgLQo0=
+github.com/nwverse/persona/sdk/go v0.0.0-20261125041530-00eba930dae6/go.mod h1:5270/bhN/R89mTgouwg/5tTuCUgRLn4EDN51ofvIn4Y=

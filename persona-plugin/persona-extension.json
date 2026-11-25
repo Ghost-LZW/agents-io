@@ -1,0 +1,139 @@
+{
+  "manifest_version": 1,
+  "id": "agents-io",
+  "name": "消息路由（agents-io）",
+  "version": "0.1.0",
+  "description": "把助手接到你自己的 agents-io 消息路由上：路由分给它的消息进收件箱，或交给助手对话并把回答发回原渠道。",
+  "publisher": "Ghost-LZW",
+  "icon": "assets/icon.png",
+  "tags": [
+    "agents-io",
+    "消息",
+    "路由",
+    "收件箱",
+    "connector"
+  ],
+  "engines": {
+    "persona": ">=202611151305",
+    "plugin_protocol": 1
+  },
+  "runtime": {
+    "command": {
+      "linux-amd64": "bin/agents-io-linux-amd64",
+      "linux-arm64": "bin/agents-io-linux-arm64",
+      "darwin-arm64": "bin/agents-io-darwin-arm64",
+      "darwin-amd64": "bin/agents-io-darwin-amd64"
+    }
+  },
+  "activation_events": [
+    "on_startup"
+  ],
+  "contributes": {
+    "connectors": [
+      {
+        "id": "agentsio",
+        "name": "消息路由（agents-io）",
+        "capabilities": [
+          "status",
+          "tools",
+          "events",
+          "inbox",
+          "settle",
+          "fallback"
+        ],
+        "kinds": [
+          "dm",
+          "group",
+          "mail",
+          "other"
+        ],
+        "kind_descriptions": {
+          "dm": "路由转来的私聊消息：别人在某个渠道里单独发给你的",
+          "group": "路由转来的群聊或话题里的消息",
+          "mail": "路由转来的邮件",
+          "other": "路由转来的其他消息：会议、通话或渠道事件"
+        }
+      }
+    ]
+  },
+  "configuration": {
+    "type": "object",
+    "properties": {
+      "router_url": {
+        "type": "string",
+        "title": "路由地址",
+        "format": "uri",
+        "description": "agents-io 控制台的地址，只填协议、主机和端口，比如 https://router.example.test；扩展连它的 /ws。控制台只说 http 时填 http://，这时钥匙明文过网，只在可信网络里用"
+      },
+      "chat_rules": {
+        "type": "array",
+        "title": "进助手对话的规则",
+        "items": {
+          "type": "string"
+        },
+        "uniqueItems": true,
+        "maxItems": 64,
+        "description": "路由规则的名字，一行一个。条目自己没带标签时，这些规则转来的消息交给助手对话（当作你本人在说话），回答发回原渠道。路由规则上写了 tag 就不用填"
+      },
+      "guest_rules": {
+        "type": "array",
+        "title": "进访客对话的规则",
+        "items": {
+          "type": "string"
+        },
+        "uniqueItems": true,
+        "maxItems": 64,
+        "description": "路由规则的名字，一行一个。条目自己没带标签时，这些规则转来的消息交给访客对话（没有工具，看不到你的资料），回答发回原渠道"
+      },
+      "working_mark": {
+        "type": "boolean",
+        "title": "在原消息上标记处理进度",
+        "default": true,
+        "description": "打开后，扩展请路由在原消息上标出处理中、已完成或失败（飞书是表情）；渠道不支持时不标"
+      },
+      "chat_wait_minutes": {
+        "type": "integer",
+        "title": "等助手回答的最长时间（分钟）",
+        "default": 240,
+        "minimum": 5,
+        "maximum": 480,
+        "description": "一条消息交给助手后最多等这么久；到时还没有回答，这条消息改进收件箱"
+      },
+      "keep_days": {
+        "type": "integer",
+        "title": "已处理记录保留天数",
+        "default": 30,
+        "minimum": 7,
+        "maximum": 90,
+        "description": "扩展在自己的数据目录里记下处理过的消息，用来防止重复处理；处理完的记录保留这么多天"
+      },
+      "triage_rules": {
+        "type": "string",
+        "title": "分拣规则",
+        "maxLength": 4000,
+        "description": "路由消息的条目按什么分「需要你 / 知悉即可 / 噪音」，用你自己的话写；填了就只用它、不用收件箱的全局规则（只管路由消息）。一般不在这里改：和助手说（比如「群里没 @ 我的都算噪音」），它来改。写 \\n 换行；空着用全局规则"
+      }
+    }
+  },
+  "secrets": [
+    {
+      "name": "backend_key",
+      "title": "后端钥匙",
+      "description": "路由给这个后端签发的钥匙（在路由的机器上运行 aio backend key 得到，以 aiob_ 开头）。不要填路由的宿主令牌。加密保存，之后只显示末 4 位",
+      "hint": "last4"
+    }
+  ],
+  "settings_check": true,
+  "permissions": {
+    "hub": [
+      "agents.control",
+      "agents.read",
+      "assistant.ask"
+    ],
+    "network": [
+      "config:router_url:http",
+      "localhost",
+      "127.0.0.1"
+    ]
+  }
+}
