@@ -733,7 +733,9 @@ aio acp --client <name> [--token-file <path>] [--session <key>]   (module acp-se
   config file's `modules` entry loads (found through `--config` / `$AIO_CONFIG`). Such a command
   declares its options; the CLI parses them with its common `--config`, `--env-file`, `--socket`
   and `--help` (anything else is a usage error, exit 2) and runs it with a `socket()` helper. The
-  CLI's own commands and the harness kinds' come first; `aio help` lists the built-in modules'.
+  CLI's own commands and the registered harness kinds' come first; a `use: "module"` harness that
+  adds a feature module's command name is refused (the daemon does not start, the CLI answers
+  exit 2) rather than one silently shadowing the other. `aio help` lists the built-in modules'.
 
 - A built-in harness kind may add commands (`HarnessModule.cli`), for its own processes to
   start, not listed above: Claude Code's `aio tui-bridge` is what its terminal UI starts as an

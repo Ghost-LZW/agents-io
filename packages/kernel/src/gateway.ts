@@ -1362,6 +1362,8 @@ export class Gateway {
           for (const [name, run] of Object.entries(cli)) {
             const where = `harnesses.${inst.name} (module ${launch.file}): cli ${JSON.stringify(name)}`;
             if (this.harnessRegistry.cliCommand(name)) throw new Error(`${where}: a registered harness kind adds it too`);
+            const feature = this.moduleRegistry.cliCommand(name);
+            if (feature) throw new Error(`${where}: feature module ${feature.module} adds it too`);
             const other = commands.get(name);
             if (other && other.run !== run) throw new Error(`${where}: harnesses.${other.instance} adds it too`);
             commands.set(name, { instance: inst.name, run });

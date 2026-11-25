@@ -825,6 +825,16 @@ async function moduleKindCommand(a: CliArgs): Promise<{ run?: (a: CliArgs) => Pr
   return run ? { run: () => run({ argv: a.rest, env: process.env }) } : {};
 }
 
+/** `argv` as CLI args for finding the config only (`--config`, `--env-file`), its other options left alone. */
+function leniently(name: string, argv: string[]): CliArgs {
+  try {
+    const { values } = parseArgs({ args: argv, allowPositionals: true, strict: false, options: { config: { type: 'string' }, 'env-file': { type: 'string' } } });
+    return { cmd: name, values: { config: typeof values.config === 'string' ? values.config : undefined, 'env-file': typeof values['env-file'] === 'string' ? values['env-file'] : undefined }, rest: [] };
+  } catch {
+    return { cmd: name, values: {}, rest: [] };
+  }
+}
+
 /** The command name in `argv` (its first positional), read leniently: before its own options are known. */
 function commandName(argv: string[]): string | undefined {
   try {
@@ -882,7 +892,18 @@ export async function main(argv: string[]): Promise<number> {
   const name = commandName(argv);
   if (name !== undefined && !(name in COMMANDS) && name !== 'help' && name !== 'e2e' && !builtinHarnesses.cliCommand(name)) {
     const c = builtinModules.cliCommand(name)?.command ?? (await configModuleCommand(name, argv));
-    if (c) return runModuleCommand(name, c, argv);
+    if (c) {
+      // A harness module's command of the same name is a clash (the daemon refuses it at start too): never shadow it.
+      const clash = await moduleKindCommand(leniently(name, argv)).catch((e: unknown) => {
+        if (e instanceof ConfigError) return { run: undefined, reason: e.message };
+        throw e;
+      });
+      if (clash.run) {
+        console.error(`aio: command ${JSON.stringify(name)} is added both by a feature module and by a harness module of the config; rename one of them`);
+        return 2;
+      }
+      return runModuleCommand(name, c, argv);
+    }
   }
   const a = parseCli(argv);
   if (a.cmd === 'help') {

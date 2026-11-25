@@ -527,8 +527,10 @@ export interface ModuleManifest<C = unknown> {
    * Commands it adds to the host's CLI, by name (lower-case letters, digits and `-`, starting with a
    * letter): `aio <name> …` runs it in its own process (no instance, no kernel: it reaches the daemon
    * through its socket). A registered module's whether or not it is on (a command that needs it
-   * running says so when the daemon answers); the CLI's own commands and the harness kinds' keep
-   * their names, two modules adding the same name fail the registration. The ACP server: `acp`.
+   * running says so when the daemon answers); the CLI's own commands and the registered harness
+   * kinds' keep their names, two modules adding the same name fail the registration, and a
+   * `use: "module"` harness adding a feature module's name fails the daemon's start (and the CLI
+   * refuses the command, exit 2) instead of one shadowing the other. The ACP server: `acp`.
    */
   readonly cli?: Readonly<Record<string, ModuleCliCommand>>;
   /**
