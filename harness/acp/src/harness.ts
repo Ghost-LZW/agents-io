@@ -16,7 +16,7 @@ import {
 } from '@agentclientprotocol/sdk';
 import { ACP_FLAVORS, flavorFor, withDefaults, type AcpCommand, type AcpFlavor } from './flavors.js';
 import { recordStream, type AcpTranscriptTap } from './record.js';
-import { AcpSession, type AcpLink } from './session.js';
+import { AcpSession, type AcpLink, type AcpPrompt } from './session.js';
 
 /*
  * The ACP harness: any Agent Client Protocol agent (agentclientprotocol.com) as a `HarnessAdapter`.
@@ -27,7 +27,11 @@ import { AcpSession, type AcpLink } from './session.js';
  * client capabilities offered are form elicitation only: no `fs`, no `terminal`, so the agent reads,
  * writes and runs things itself, under its own permissions, and asks for permission
  * (`session/request_permission`) as it decides. A process that exits ends its sessions; the next
- * `probe` or `open` starts another, and a session resumes there with `session/load`.
+ * `probe` or `open` starts another, and a session resumes there with `session/load`. A session
+ * closed while the agent goes on with its prompt (it would not stop at `session/cancel`) leaves the
+ * prompt with the process (`Proc.running`): updates carry no turn id, so until it answers what it
+ * streams is no session's, and `open` resumes that id only once it has answered (waiting at most
+ * `cancelTimeoutMs`), else starts a new session.
  */
 
 export type AcpLog = (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', msg: string, data?: unknown) => void;
@@ -79,7 +83,8 @@ export interface AcpHarnessOptions {
    * How long an interrupted turn waits for the agent to stop before it ends anyway; how long the
    * next turn then waits for the agent to answer that prompt before the session is closed and opened
    * again; and how long, `session/close` answered, the prompt still has to answer before the same
-   * session is loaded again (else a new one is started). Default 15 s.
+   * session is loaded again (else a new one is started). As long, `open` of a closed session's id
+   * waits for a prompt the agent still runs there before it loads it (else starts a new one). Default 15 s.
    */
   cancelTimeoutMs?: number;
   /** How long the agent has to exit after its stdin closes (`dispose`), and then after SIGTERM, before it is killed. Default 1 s. */
@@ -117,6 +122,8 @@ interface Proc {
   sessions: Map<string, AcpSession>;
   /** Updates for a session id no session has yet (a `session/new` answer may come after them). */
   early: Map<string, SessionNotification[]>;
+  /** Prompts the agent has not answered for an id no session holds now (closed, or opened again as a new one): session id → the prompt. */
+  running: Map<string, AcpPrompt>;
   gone: boolean;
   /** Why it is gone, once it is. */
   closed: Promise<string>;
@@ -211,6 +218,7 @@ export class AcpHarness implements HarnessAdapter {
     if (this.o.record) stream = recordStream(stream, this.o.record);
     const sessions = new Map<string, AcpSession>();
     const early = new Map<string, SessionNotification[]>();
+    const running = new Map<string, AcpPrompt>();
     const identity = (p: unknown) => p as never;
     const app = client({ name: 'agents-io' })
       // Taken as sent (no schema check): an update of a shape or type this SDK does not know is still routed (and becomes `native`).
@@ -218,6 +226,8 @@ export class AcpHarness implements HarnessAdapter {
         const s = sessions.get(params?.sessionId);
         if (s) return s.update(params);
         if (typeof params?.sessionId !== 'string') return;
+        // What a prompt of a closed session still streams is no session's (nor that id's next open's).
+        if (running.has(params.sessionId)) return;
         const q = early.get(params.sessionId) ?? [];
         if (q.length < 64) q.push(params);
         early.set(params.sessionId, q);
@@ -234,7 +244,7 @@ export class AcpHarness implements HarnessAdapter {
       })
       .onNotification('elicitation/complete', identity, () => undefined);
     const conn = app.connect(stream);
-    const proc: Proc = { child, conn, init: undefined as unknown as InitializeResponse, sessions, early, gone: false, closed, stderr };
+    const proc: Proc = { child, conn, init: undefined as unknown as InitializeResponse, sessions, early, running, gone: false, closed, stderr };
     void closed.then((why) => {
       proc.gone = true;
       conn.close();
@@ -315,6 +325,14 @@ export class AcpHarness implements HarnessAdapter {
     const link = this.link(p, common);
 
     if (args.resume) {
+      // The agent still runs a prompt of that session (it would not stop it): loading it now would give
+      // the next turn what that prompt streams, beside a second prompt. Loaded once it answers, else a new one.
+      const busy = caps.loadSession ? await this.stillRunning(p, args.resume, link.cancelTimeoutMs) : undefined;
+      if (busy) {
+        const s = await this.newSession(p, link, common);
+        s.notice('continuity', `could not resume ACP session ${args.resume} (the agent goes on with the prompt of turn ${busy.turnId} after session/cancel: no answer to it within ${link.cancelTimeoutMs}ms); started a new one`);
+        return s;
+      }
       if (caps.loadSession) {
         const s = new AcpSession(link, args.resume);
         try {
@@ -333,6 +351,26 @@ export class AcpHarness implements HarnessAdapter {
       return s;
     }
     return this.newSession(p, link, common);
+  }
+
+  /**
+   * Wait, at most `ms`, for the agent to answer the prompt it still runs for session `id` with no
+   * session holding it (`Proc.running`); the agent's process ending ends the wait. The prompt, when
+   * it is still unanswered.
+   */
+  private async stillRunning(p: Proc, id: string, ms: number): Promise<AcpPrompt | undefined> {
+    const r = p.running.get(id);
+    if (!r) return undefined;
+    let timer: NodeJS.Timeout | undefined;
+    const late = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), ms);
+      timer.unref?.();
+    });
+    const answered = await Promise.race([r.answered.then(() => true, () => true), p.closed.then(() => true), late]);
+    clearTimeout(timer);
+    if (answered) return undefined;
+    this.log('info', `acp session ${id}: the agent still runs the prompt of turn ${r.turnId} ${ms}ms after it was opened again; starting a new session`);
+    return r;
   }
 
   private async newSession(p: Proc, link: AcpLink, common: Record<string, unknown>): Promise<AcpSession> {
@@ -414,8 +452,15 @@ export class AcpHarness implements HarnessAdapter {
       learned: (o) => {
         this.seen = { ...this.seen, ...o };
       },
-      forget: (s) => {
-        if (p.sessions.get(s.sessionId) === s) p.sessions.delete(s.sessionId);
+      forget: (s, prompt) => {
+        const id = s.sessionId;
+        if (p.sessions.get(id) === s) p.sessions.delete(id);
+        if (!prompt) return;
+        p.running.set(id, prompt);
+        const done = () => {
+          if (p.running.get(id) === prompt) p.running.delete(id);
+        };
+        void prompt.answered.then(done, done);
       },
       log: (level, msg) => this.log(level, msg),
     };

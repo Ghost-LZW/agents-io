@@ -36,7 +36,8 @@
  * mode it ran in (`mode`); `prompt-end` (with its `sessionId`) is logged as it answers. `session/close`
  * stops a session's work (its prompt answers `cancelled`) and forgets it: `session/load` reopens it.
  * FAKE_ACP_CLOSE_KEEPS_GOING=1: `session/close` is answered and forgets the session, but its prompt
- * goes on (an agent that takes close as the `session/cancel` it ignores).
+ * goes on (an agent that takes close as the `session/cancel` it ignores). FAKE_ACP_NEW_FAILS (comma
+ * list of 1-based call numbers): those `session/new` calls answer an error.
  */
 import { spawn } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -67,6 +68,7 @@ interface Sess {
 }
 const sessions = new Map<string, Sess>();
 let seq = 0;
+let newCalls = 0;
 let clientCaps: Record<string, unknown> = {};
 const stateDir = env.FAKE_ACP_STATE;
 const save = (s: Sess) => {
@@ -164,6 +166,7 @@ const app = agent({ name: 'fake-acp' })
   })
   .onRequest(methods.agent.session.new, ({ params, client }) => {
     log({ call: 'session/new', params });
+    if ((env.FAKE_ACP_NEW_FAILS ?? '').split(',').includes(String(++newCalls))) throw RequestError.internalError(undefined, 'the fake agent failed session/new');
     const s: Sess = { id: `sess-${process.pid}-${++seq}`, cwd: params.cwd, mode: OPEN_MODE, mcp: params.mcpServers, cancelled: false, history: [] };
     sessions.set(s.id, s);
     save(s);

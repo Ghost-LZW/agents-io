@@ -13,8 +13,9 @@ import { completed, disposeAll, events, fake, input, loader, FAKE_AGENT, openArg
  * a protocol version it does not speak is refused), a session's own env only on a process of its
  * own (HC-2), permission requests as requests that resolve once (RQ-1 on the harness side), a
  * prompt the agent will not cancel holding the session until it answers, so that nothing it streams
- * is the next turn's and no two prompts overlap (LN-2, DL-3), and a resumed session whose replayed
- * history never becomes events (RS-1).
+ * is the next turn's and no two prompts overlap (LN-2, DL-3), also once the session is closed and its
+ * id opened again on the same agent process, and a resumed session whose replayed history never
+ * becomes events (RS-1).
  */
 
 afterEach(disposeAll);
@@ -379,6 +380,100 @@ describe('the ACP harness: a prompt that outlives its cancel timeout', () => {
     await s.close('done');
     await ev.done;
     expect(checkEventStream(ev.all, { turnInputs: { t1: ['in-1'], t2: ['in-2'] } })).toEqual([]);
+  }, 15_000);
+
+  /** Nothing of the old prompt's words (`stale <i> `) is in these events. */
+  const noStale = (all: HarnessEvent[]) => expect(JSON.stringify(all)).not.toMatch(/stale \d/);
+  /**
+   * t1 runs `stubborn`; `stale`: it is interrupted and ends at its cancel timeout, else the session
+   * closes while it runs. Then the session closes (a parked topic, a harness switch, a release) and
+   * its id is opened again on the same agent process, and t2 runs there.
+   */
+  const closedThenResumed = async (env: Record<string, string>, cancelTimeoutMs: number, how: 'stale' | 'mid-turn') => {
+    const f = fake(env, { cancelTimeoutMs });
+    const s = await f.h.open(openArgs());
+    const ev = events(s);
+    const first = s.nativeId();
+    await s.startTurn('t1', [input('in-1', 'stubborn', { channelContext: ctx })], run);
+    await ev.until((e) => e.body.t === 'text.delta');
+    if (how === 'stale') {
+      await s.interrupt('t1');
+      await ev.until(completed('t1'));
+    }
+    await s.close('topic parked');
+    await ev.done;
+    const s2 = await f.h.open(openArgs({ resume: first }));
+    const ev2 = events(s2);
+    await s2.startTurn('t2', [input('in-2', 'hello pause', { channelContext: ctx })], run);
+    await ev2.until(completed('t2'));
+    return { f, ev, s2, ev2, first };
+  };
+  /** The session opened again is a new one (`second`): nothing of the old prompt reaches it, now or later. */
+  const startedAnew = async ({ f, s2, ev2, first }: Awaited<ReturnType<typeof closedThenResumed>>, turnId: string, why: string) => {
+    const second = s2.nativeId();
+    expect(second).not.toBe(first);
+    const t = trail(f.calls());
+    expect(t.some((c) => c.startsWith('session/load'))).toBe(false);
+    expect(t.filter((c) => c.startsWith('session/prompt') || c.startsWith('prompt-end'))).toEqual([`session/prompt:${first}`, `session/prompt:${second}`, `prompt-end:${second}`]);
+    expect(ev2.of('session.bound')).toEqual([{ t: 'session.bound', nativeId: second }]);
+    expect(ev2.of('notice')).toEqual([{ t: 'notice', code: 'continuity', message: `could not resume ACP session ${first} (${why}); started a new one` }]);
+    expect(ev2.of('text.snapshot').filter((x) => x.final).at(-1)!.text).toMatch(/^echo: [\s\S]*hello pause$/);
+    // Its context in full: none of the conversation is in the new session (ID-2).
+    expect(prompts(f.calls()).at(-1)).toBe(full('hello pause'));
+    // The old prompt still streams; none of it reaches the new session.
+    await new Promise((r) => setTimeout(r, 200));
+    noStale(ev2.all);
+    await s2.close('done');
+    await ev2.done;
+    expect(checkEventStream(ev2.all, { turnInputs: { [turnId]: [`in-${turnId.slice(1)}`] } })).toEqual([]);
+  };
+
+  it('a session closed after a turn whose prompt the agent would not cancel, opened again on the same agent process: it is not loaded while that prompt runs; still running after the wait, a new session is started (a notice says so) and nothing the old prompt says reaches the next turn #LN-2 #DL-3', async () => {
+    const r = await closedThenResumed({ FAKE_ACP_STUBBORN_MS: '60000' }, 300, 'stale');
+    expect(r.ev.of('turn.completed')[0]).toMatchObject({ turnId: 't1', status: 'interrupted', error: { code: 'cancel_timeout' } });
+    await startedAnew(r, 't2', 'the agent goes on with the prompt of turn t1 after session/cancel: no answer to it within 300ms');
+  }, 15_000);
+
+  it('a session closed mid-turn whose agent goes on with the prompt, opened again on the same agent process: not loaded while that prompt runs; a new session is started and nothing the old prompt says reaches the next turn #LN-2 #DL-3', async () => {
+    const r = await closedThenResumed({ FAKE_ACP_STUBBORN_MS: '60000' }, 300, 'mid-turn');
+    expect(r.ev.of('turn.completed')[0]).toMatchObject({ turnId: 't1', status: 'interrupted', error: { code: 'session_closed' } });
+    await startedAnew(r, 't2', 'the agent goes on with the prompt of turn t1 after session/cancel: no answer to it within 300ms');
+  }, 15_000);
+
+  it('a session closed after a turn whose prompt the agent would not cancel, opened again on the same agent process: the open waits for the agent to answer that prompt, then loads the same session; nothing the prompt said reaches the next turn #LN-2 #DL-3', async () => {
+    const { f, ev, s2, ev2, first } = await closedThenResumed({ FAKE_ACP_STUBBORN_MS: '1500' }, 1_000, 'stale');
+    expect(ev.of('turn.completed')[0]).toMatchObject({ turnId: 't1', status: 'interrupted', error: { code: 'cancel_timeout' } });
+    const t = trail(f.calls());
+    expect(t.filter((c) => c.startsWith('session/prompt') || c.startsWith('prompt-end'))).toEqual([`session/prompt:${first}`, `prompt-end:${first}`, `session/prompt:${first}`, `prompt-end:${first}`]);
+    expect(t.indexOf(`session/load:${first}`)).toBeGreaterThan(t.indexOf(`prompt-end:${first}`));
+    expect(s2.nativeId()).toBe(first);
+    expect(ev2.of('session.bound')).toEqual([{ t: 'session.bound', nativeId: first }]);
+    expect(ev2.of('notice')).toEqual([]);
+    noStale(ev2.all);
+    expect(ev2.of('text.snapshot').filter((x) => x.final).at(-1)!.text).toMatch(/^echo: [\s\S]*hello pause$/);
+    await s2.close('done');
+    await ev2.done;
+    expect(checkEventStream(ev2.all, { turnInputs: { t2: ['in-2'] } })).toEqual([]);
+  }, 15_000);
+
+  it('a session that cannot be opened again after a prompt that would not stop ends; its id, opened again on the same agent process while that prompt runs, is not loaded: a new session is started and nothing the old prompt says reaches the next turn #LN-2 #DL-3', async () => {
+    // The second session/new (the one `reopen` asks for) fails.
+    const f = fake({ FAKE_ACP_STUBBORN_MS: '60000', FAKE_ACP_NEW_FAILS: '2' }, { cancelTimeoutMs: 300 });
+    const s = await f.h.open(openArgs());
+    const ev = events(s);
+    const first = s.nativeId();
+    await s.startTurn('t1', [input('in-1', 'stubborn', { channelContext: ctx })], run);
+    await ev.until((e) => e.body.t === 'text.delta');
+    await s.interrupt('t1');
+    await ev.until(completed('t1'));
+    await expect(s.startTurn('t2', [input('in-2', 'hello', { channelContext: ctx })], run)).rejects.toThrow(`could not open ACP session ${first} again after turn t1's prompt would not stop`);
+    await ev.done;
+    // No new session was bound: the lane opens the id it has again.
+    const s2 = await f.h.open(openArgs({ resume: first }));
+    const ev2 = events(s2);
+    await s2.startTurn('t3', [input('in-3', 'hello pause', { channelContext: ctx })], run);
+    await ev2.until(completed('t3'));
+    await startedAnew({ f, ev, s2, ev2, first }, 't3', 'the agent goes on with the prompt of turn t1 after session/cancel: no answer to it within 300ms');
   }, 15_000);
 
   it('a session closed while the next turn waits for the old prompt ends the wait at once: that turn does not start and no prompt is sent #RS-8', async () => {

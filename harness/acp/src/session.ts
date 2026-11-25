@@ -41,8 +41,16 @@ import { AsyncQueue } from './queue.js';
  * Updates carry no turn id, so a prompt the agent goes on with after its turn ended (the cancel timed
  * out) keeps the session: what it streams is `native`, and the next turn's prompt waits for it to
  * answer, or for the session to be closed and opened again (the same one only once the prompt has
- * answered, else a new one).
+ * answered, else a new one). A session closed (or opened again as a new one) while the agent has
+ * not answered its prompt hands that prompt to the adapter (`forget`): until it answers, no session
+ * takes what it streams and its id is not loaded again (`AcpHarness.open`).
  */
+
+/** A prompt the agent has not answered: its turn, and when it answers (or the connection ends). */
+export interface AcpPrompt {
+  readonly turnId: string;
+  readonly answered: Promise<void>;
+}
 
 /** What a session uses of its adapter's connection. */
 export interface AcpLink {
@@ -69,7 +77,8 @@ export interface AcpLink {
    * How long `interrupt` waits for the prompt to stop before ending the turn anyway; how long the
    * next turn then waits for that prompt to answer before the session is closed and opened again;
    * and how long, `session/close` answered, the prompt still has to answer before the same session
-   * is loaded again rather than a new one started.
+   * is loaded again rather than a new one started (as long as an open of a closed session's id waits
+   * for a prompt the agent still runs there: `AcpHarness.open`).
    */
   readonly cancelTimeoutMs: number;
   /** Instance profiles: profile → its settings (`mode`: the session mode it selects). */
@@ -78,7 +87,11 @@ export interface AcpLink {
   readonly planMode: string | undefined;
   /** What a session learned that the adapter declares (`modes`, `compact`). */
   learned(o: { modes?: readonly string[]; commands?: readonly AcpCommand[] }): void;
-  forget(s: AcpSession): void;
+  /**
+   * `s` no longer takes the updates of its id. `running`: a prompt of that id the agent has not
+   * answered; until it does, what it streams is no session's and the id is not loaded again.
+   */
+  forget(s: AcpSession, running?: AcpPrompt): void;
   log(level: 'debug' | 'info' | 'warn' | 'error', msg: string): void;
 }
 
@@ -286,6 +299,12 @@ export class AcpSession implements HarnessSession {
     if (this.turn && !this.turn.done) throw new Error('turn already active');
   }
 
+  /** The prompt of this session's id the agent has not answered, if any: the stale one, else the running turn's. */
+  private unanswered(): Turn | undefined {
+    const t = this.stale ?? this.turn;
+    return t && !t.isAnswered ? t : undefined;
+  }
+
   /** The agent answered a turn's prompt: a stale one no longer holds the session. */
   private promptAnswered(t: Turn): void {
     t.isAnswered = true;
@@ -357,9 +376,9 @@ export class AcpSession implements HarnessSession {
       load = await this.answeredWithin(t, ms);
       if (!load) detail = `the agent answered session/close, but still not the prompt ${ms}ms after`;
     }
-    // Whatever the old session still says is no session's now.
+    // Whatever the old session still says is no session's now; while the prompt runs, its id is not loaded again.
     this.stale = undefined;
-    this.link.forget(this);
+    this.link.forget(this, t.isAnswered ? undefined : t);
     if (this.closed || this.link.gone) return; // startTurn says why
     if (load) {
       try {
@@ -504,13 +523,16 @@ export class AcpSession implements HarnessSession {
     if (this.closed) return;
     this.closed = true;
     this.wake?.();
+    // A prompt the agent has not answered (a stale one, or the running turn's, cancelled below) outlives
+    // the session: the adapter keeps it, so that the id is not loaded again while it runs.
+    const running = this.unanswered();
     const t = this.turn;
     if (t && !t.done) {
       this.cancelRequests(t.turnId);
       if (!this.link.gone) void this.link.notify('session/cancel', { sessionId: this.sessionId }).catch(() => undefined);
       this.finish(t, 'interrupted', { code: 'session_closed', retryable: false, message: reason });
     }
-    this.link.forget(this);
+    this.link.forget(this, running);
     if (this.link.closes && !this.link.gone) await this.link.request('session/close', { sessionId: this.sessionId }, 5_000).catch(() => undefined);
     this.queue.close();
   }
