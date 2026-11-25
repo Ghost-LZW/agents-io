@@ -1,5 +1,5 @@
 import type { KernelContext, KernelSubscription, SessionEvent } from '@agents-io/protocol';
-import { withholding } from '@agents-io/session';
+import { passes, withholding } from '@agents-io/session';
 
 /*
  * A session's events as a reader outside the daemon may see them while they come (the north
@@ -25,12 +25,13 @@ function checks(e: SessionEvent): boolean {
 /**
  * A session's durable events from `fromSeq` as an external reader may read them now (U20): those
  * shown, and those still withheld (`checking`; give them to an `ExternalView` as `waiting`). Held
- * ones are left out.
+ * ones are left out, and so are `internal` ones: what the live view never gives
+ * (`KernelContext.subscribe`'s default visibility), a replay does not either.
  */
 export function replay(k: KernelContext, sessionKey: string, fromSeq: number): { shown: SessionEvent[]; waiting: SessionEvent[]; head: number } {
   const all = k.events(sessionKey, 0);
   const head = all.at(-1)?.seq ?? 0;
-  const from = all.filter((e) => e.seq > fromSeq);
+  const from = all.filter((e) => e.seq > fromSeq && passes(e, 'full'));
   const w = withholding(all);
   if (w.none) return { shown: from, waiting: [], head };
   const shown: SessionEvent[] = [];

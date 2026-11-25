@@ -276,14 +276,16 @@ export AIO_ACP_COMMAND=/tmp/acp-agents/node_modules/.bin/claude-agent-acp CLAUDE
    - [ ] 回答流式出现；`aio sessions` 多了 `acp-server:t3:<uuid>`；`aio explain <那条输入的 id>` 是 `bindingId: acp-server:t3`、主体 `external:t3`（不是人）。
    - [ ] 让它改一个文件：t3code 里出现权限对话框（Allow once / Allow for this session / Deny），允许后改了；`aio tail` 里 `request.resolved` 的 `by` 是 `{ kind: human, id: external:t3 }`，没有 `via`。
    - [ ] 一个长回答进行中按 t3code 的停止：这一轮 `interrupted`，t3code 显示已取消。
-   - [ ] 关掉 t3code 再打开、回到这个线程（它用 `session/load`）：之前的对话重放出来，接着说一句，回答接得上。
+   - [ ] 关掉 t3code 再打开、回到这个线程（它用 `session/load`）：之前的对话重放出来，之前答过的权限对话框不再弹出，接着说一句，回答接得上。
 3. **Zed**：`settings.json` 的 `agent_servers` 加 `"agents-io": { "command": "aio", "args": ["acp", "--client", "zed", "--token-file", "<路径>", "--socket", "<socket>"] }`，在 Agent 面板里新开一个 agents-io 线程。
    - [ ] 一轮能完成；Zed 的历史里能看到客户端可读的会话（`session/list`），打开主人在飞书里的那个会话（`read` scope）能看到它的历史，飞书里接着说的话、agent 的回答实时出现在 Zed 里（用户消息前面带 `[<主体>]`）。
    - [ ] zed 没有 `approvals`：让它跑要审批的命令时 Zed 里不弹权限框，那个请求显示为失败的工具调用（缺省策略拒绝 peer 的 restricted 轮次里的审批）。
+   - [ ] 编辑器支持表单（ACP 的 `elicitation` 能力）时：在 zed 自己开的线程里让 agent 问一个问题（Claude Code 的 AskUserQuestion），没有 `approvals` 也弹出表单（缺省策略把提问交给这一轮的人，即客户端自己），答了这一轮接着跑；`aio tail` 里 `request.resolved` 的 `by` 是 `{ kind: human, id: external:zed }`。
 4. **AG-UI**：配置 `"agUi": { "listen": "127.0.0.1:7466", "clients": { "web": { "tokenFile": "agui/web.token", "scopes": [], "agent": "dev" } } }`，重启。
    - [ ] `curl -N -H "Authorization: Bearer $(cat <路径>)" -H 'content-type: application/json' -d '{"threadId":"t1","runId":"r1","messages":[{"id":"m1","role":"user","content":"hello"}],"tools":[],"context":[]}' http://127.0.0.1:7466/ag-ui` 依次看到 `RUN_STARTED`、`STATE_SNAPSHOT`、`TEXT_MESSAGE_*`、`RUN_FINISHED`；不带令牌 401，`-H 'Origin: http://evil.example'` 403。
    - [ ] 有 CopilotKit 一类的界面时：它的运行时用 `HttpAgent` 指到这个 URL（带 `Authorization` 头），对话能完成，工具调用显示为已完成的调用。
    - [ ] `curl -N -H "Authorization: …" 'http://127.0.0.1:7466/ag-ui/threads/t1/events?fromSeq=0'` 把这个线程的每一轮作为一个 run 重放出来，然后等着；再 POST 一次，新的一轮出现在这条流里。
+   - [ ] 一个长回答进行中断开 POST 的流（Ctrl-C），拿它最后一个 `id:` 续读（`-H 'Last-Event-ID: <id>'`）：马上一个 `RUN_STARTED`（`runId` 是轮次 id），这一轮剩下的接着出来，最后 `RUN_FINISHED`。
 
 ## Tier 3：多端 + 重启
 

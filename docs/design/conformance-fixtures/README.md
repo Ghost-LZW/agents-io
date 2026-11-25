@@ -185,7 +185,7 @@ G7 的 fixture 用的是同一格式：每行一条 `emit` 到 `log` 端（`even
 {"out":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"All "},"messageId":"t1:1"}}}
 ```
 
-- 第一行是头：`projection`（`acp` 或 `ag-ui`）、`name`、`description`，可选的 `options` 是投影建起来时给的（ACP：`principal`，客户端的主体，请求的 resolver 点了它才问它；AG-UI：`threadId`，一次 run 另有 `runId` 与 `inputId`，没有就是续读，每一轮一个 run）。没有别的键。
+- 第一行是头：`projection`（`acp` 或 `ag-ui`）、`name`、`description`，可选的 `options` 是投影建起来时给的（ACP：`principal`，客户端的主体，请求的 resolver 点了它才问它；AG-UI：`threadId`，一次 run 另有 `runId` 与 `inputId`，没有就是续读，每一轮一个 run；续读可以带 `fromSeq`：seq 不大于它的持久事件是读者已有的，一起交给投影的 `resume`，各自没有输出，那时还开着的一轮的 `RUN_STARTED` 算在其后第一条事件的输出前面）。没有别的键。
 - 之后每行是 `event`（一条会话事件，只写要的字段，至少 `body`；日志盖的字段由读的一方补上：`seq` 从 1 数持久事件，易失的（`text.delta`、`item.progress`、`headline`）带上一条持久事件的 seq）、`out`（紧跟着它的那条 `event` 应当给出的一条输出，按顺序，不多不少）或 `note`（给人看的）。
 - 比较是精确的（`match.ts` 的 `exact`，占位符照样可用）。输出的形状：ACP 是 `{ update }`（一条 `session/update` 的 `update`，用户消息另带它所示的 `inputId`）、`{ permission: { requestId, toolCall, options } }`、`{ question: { requestId, message, requestedSchema } }`、`{ turnEnd: { turnId, stopReason } | { turnId, error } }`；AG-UI 是一个 AG-UI 事件。一次 run（有 `runId`）的 `RUN_STARTED` 算在第一条事件的输出前面。
 - 运行器：`packages/testkit/src/conformance/projection.ts` 的 `readProjection` / `runProjection`；TS 的投影由 `packages/daemon/test/projections.test.ts` 喂（core 测试，`#PR-4`，每个文件一条），每条输出再过它的协议自己的 schema：AG-UI 是 `@ag-ui/core` 的 `EventSchema`，ACP 的经官方 SDK 的客户端一侧（解析不了的不交给处理）。

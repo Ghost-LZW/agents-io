@@ -6,6 +6,7 @@ import { HttpAgent } from '@ag-ui/client';
 import type { BaseEvent } from '@ag-ui/core';
 import { EventSchema } from '@ag-ui/core/schemas';
 import type { InputRecord } from '@agents-io/protocol';
+import type { FakeTurnScript } from '@agents-io/testkit';
 import { resolveConfig } from '../src/defaults.js';
 import { cleanups, daemon, tmp, until, type World } from './helpers.js';
 
@@ -29,11 +30,12 @@ function tokenFiles(dir: string): Record<keyof typeof TOKENS, string> {
   return out;
 }
 
-async function world(o: { raw?: Record<string, unknown>; agUi?: Record<string, unknown> } = {}) {
+async function world(o: { raw?: Record<string, unknown>; agUi?: Record<string, unknown>; script?: FakeTurnScript } = {}) {
   const dir = tmp();
   const f = tokenFiles(dir);
   const w = await daemon({
     dir,
+    ...(o.script ? { script: o.script } : {}),
     raw: {
       agents: { dev: { harness: 'claude-code' } },
       agUi: { listen: '127.0.0.1:0', clients: { web: { tokenFile: f.web, scopes: ['read:S*', 'input:S1'], agent: 'dev' }, reader: { tokenFile: f.reader, scopes: ['read:S1'] } }, ...(o.agUi ?? {}) },
@@ -184,6 +186,44 @@ describe('AG-UI endpoint: runs and resumes', () => {
     await until(() => w.gw.hub.log.read('S2', 0).some((e) => e.body.t === 'turn.completed'));
     expect((await fetch(`${url}/threads/S2/events`, { headers: { authorization: `Bearer ${TOKENS.reader}` } })).status).toBe(404);
     expect((await post(url, input('S2'), { authorization: `Bearer ${TOKENS.reader}` })).status).toBe(404);
+  });
+
+  it('a resume from a seq inside a running turn: that turn is the first run (RUN_STARTED at once, then the rest of it); a run\'s RUN_STARTED id is a seq a resume gets the run back from, and a stream\'s ids never go down #PR-4', async () => {
+    let open: () => void = () => {};
+    const gate = new Promise<void>((r) => (open = r));
+    const script: FakeTurnScript = async (t) => {
+      const text = t.inputs.flatMap((i) => i.content).map((c) => (c.type === 'text' ? c.text : '')).join(' ');
+      if (text === 'held') await gate;
+      t.emit({ t: 'text.snapshot', text: `echo: ${text}`, final: true }, { audience: 'answer' });
+    };
+    const { w, url } = await world({ script });
+    const ids = (got: { id: string }[]) => got.map((e) => Number(e.id));
+    const rising = (xs: number[]) => xs.every((x, i) => i === 0 || x >= xs[i - 1]!);
+    const local = await w.client();
+    await local.input('S1', 'held');
+    const started = await until(() => w.gw.hub.log.read('S1', 0).find((e) => e.body.t === 'turn.started'));
+    // The stream was cut right after the turn's start: the rest of the turn is its run.
+    const res = await fetch(`${url}/threads/S1/events`, { headers: { authorization: `Bearer ${TOKENS.reader}`, 'last-event-id': String(started.seq) } });
+    expect(res.status).toBe(200);
+    open();
+    const got = await sse(res, 5);
+    expect(got.map((e) => e.data.type)).toEqual(['RUN_STARTED', 'TEXT_MESSAGE_START', 'TEXT_MESSAGE_CONTENT', 'TEXT_MESSAGE_END', 'RUN_FINISHED']);
+    expect(got[0]).toMatchObject({ id: String(started.seq), data: { threadId: 'S1', runId: started.turnId } });
+    expect(got[2]!.data).toMatchObject({ delta: 'echo: held' });
+    expect(rising(ids(got))).toBe(true);
+    for (const e of got) expect(EventSchema.safeParse(e.data).success).toBe(true);
+
+    // A run: its RUN_STARTED's id is a seq before its turn; resumed from it, the run comes back (as its turn's run).
+    const run = await sse(await post(url, { ...input('S1', 'again'), runId: 'r-again' }, { authorization: `Bearer ${TOKENS.web}` }), 6);
+    expect(run.map((e) => e.data.type)).toEqual(['RUN_STARTED', 'STATE_SNAPSHOT', 'TEXT_MESSAGE_START', 'TEXT_MESSAGE_CONTENT', 'TEXT_MESSAGE_END', 'RUN_FINISHED']);
+    expect(rising(ids(run))).toBe(true);
+    const again = admitted(w, 'S1').at(-1)!.inputId;
+    const turn = w.gw.hub.log.read('S1', 0).find((e) => e.body.t === 'turn.started' && e.body.inputIds.includes(again))!;
+    expect(Number(run[0]!.id)).toBeLessThan(turn.seq);
+    const back = await sse(await fetch(`${url}/threads/S1/events?fromSeq=${run[0]!.id}`, { headers: { authorization: `Bearer ${TOKENS.reader}` } }), 5);
+    expect(back.map((e) => e.data.type)).toEqual(['RUN_STARTED', 'TEXT_MESSAGE_START', 'TEXT_MESSAGE_CONTENT', 'TEXT_MESSAGE_END', 'RUN_FINISHED']);
+    expect(back[0]!.data).toMatchObject({ runId: turn.turnId });
+    expect(back[2]!.data).toMatchObject({ delta: 'echo: again' });
   });
 
   it('runs go through the lane\'s loop guard: past pair.maxTurns the run ends RUN_ERROR loop_guard and the input is kept as context #IN-8', async () => {

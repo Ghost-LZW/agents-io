@@ -89,14 +89,20 @@ describe('north projection fixtures', () => {
   for (const file of projectionFiles(join(DIR, 'ag-ui'))) {
     const f = readProjection(file);
     it(`ag-ui ${f.header.name}: ${f.header.description} #PR-4`, () => {
-      const o = (f.header.options ?? {}) as { threadId: string; runId?: string; inputId?: string };
+      const o = (f.header.options ?? {}) as { threadId: string; runId?: string; inputId?: string; fromSeq?: number };
       const p = new AgUiProjection(o);
-      // With a runId, the run's RUN_STARTED comes before the first event's outputs.
-      let first = o.runId !== undefined;
+      // With a runId, the run's RUN_STARTED comes before the first event's outputs. With a fromSeq
+      // (a resume), the durable events up to it go to `resume`, whose output comes before the first later event's.
+      let first = true;
+      const before: SessionEvent[] = [];
       runProjection(
         f,
         (e) => {
-          const out = [...(first ? p.begin() : []), ...p.push(e)];
+          if (first && o.fromSeq !== undefined && e.durability === 'durable' && e.seq <= o.fromSeq) {
+            before.push(e);
+            return [];
+          }
+          const out = [...(first && o.runId !== undefined ? p.begin() : []), ...(first && o.fromSeq !== undefined ? p.resume(before) : []), ...p.push(e)];
           first = false;
           return out;
         },

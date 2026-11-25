@@ -2,12 +2,12 @@ import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Type, type Static, type TObject } from '@sinclair/typebox';
-import type { ContentBlock, KernelContext, ModuleManifest, ModuleResolveContext } from '@agents-io/protocol';
+import type { ContentBlock, KernelContext, ModuleManifest, ModuleResolveContext, SessionEvent } from '@agents-io/protocol';
 import { isLoopback } from '@agents-io/host-mcp';
 import { EventType, type RunAgentInput } from '@ag-ui/core';
 import { RunAgentInputSchema } from '@ag-ui/core/schemas';
 import { AgUiProjection, type AgUiEvent } from './ag-ui-projection.js';
-import { ExternalView } from './external-view.js';
+import { ExternalView, replay } from './external-view.js';
 import { PeerRefusal, PeerTokens, RateWindow, checkText, inlineImage, mayRead, peerClientSchema, peerInput, resolveListen, resolvePeerClients, sessionFor, type PeerClient } from './peers.js';
 
 /*
@@ -20,8 +20,10 @@ import { PeerRefusal, PeerTokens, RateWindow, checkText, inlineImage, mayRead, p
  * message is an input stamped as the client (`peer`, never a person, ID-10), and the answer is an
  * SSE stream of the turn that takes it (`ag-ui-projection.ts`, through the U20 gate of
  * `external-view.ts`). `GET /ag-ui/threads/<threadId>/events?fromSeq=<seq>` (or `Last-Event-ID`):
- * every turn of the session from that seq on, each a run of its own; each event's SSE `id` is the
- * seq of the session event it shows. A browser's request (an `Origin` header) only from `origins`.
+ * every turn of the session from that seq on, each a run of its own (the turn still open at the
+ * seq first); each event's SSE `id` is the seq of the session event it shows, never going down in a
+ * stream (a run's `RUN_STARTED`: the seq its input came after, so a resume from it gets the run
+ * back). A browser's request (an `Origin` header) only from `origins`.
  * No approvals: an AG-UI client answers no request (requests show as `CUSTOM` events).
  */
 
@@ -247,7 +249,10 @@ export class AgUiEndpoint {
     const runs = this.runs.take(client.name, this.cfg.limits.runsPerMinute);
     if (!runs.ok) throw new HttpRefusal(429, `rate limited: at most ${this.cfg.limits.runsPerMinute} runs per minute`, { 'retry-after': String(Math.max(1, Math.ceil(runs.retryMs / 1000))) });
     const inputId = `agui_${randomUUID()}`;
-    // Watching before the input goes in (a snapshot first): its turn may start, and end, before the lane answers.
+    // Watching before the input goes in (a snapshot first, of the log up to `from`): its turn may
+    // start, and end, before the lane answers. Every event of the run comes after `from`: the SSE id
+    // of its RUN_STARTED, so a resume from that id gets the run back (as its turn's run).
+    const from = this.k.head(s.key);
     const view = new ExternalView(this.k, s.key);
     let r;
     try {
@@ -258,7 +263,7 @@ export class AgUiEndpoint {
     }
     const p = new AgUiProjection({ threadId: input.threadId, runId: input.runId, inputId });
     const sse = this.open(req, res, () => view.close());
-    sse.write(p.begin(), this.k.head(s.key));
+    sse.write(p.begin(), from);
     if (r.disposition === 'observe_only') {
       sse.write([{ type: EventType.RUN_ERROR, message: 'kept as context only: the loop guard stopped it (too many turns started from outside without a person writing in this session; policy.loopGuard.pair)', code: 'loop_guard' }], this.k.head(s.key));
       return sse.end();
@@ -276,16 +281,23 @@ export class AgUiEndpoint {
     sse.end();
   }
 
-  /** `GET /ag-ui/threads/<threadId>/events`: every turn of the session from a seq on (a resume), until the client goes. */
+  /**
+   * `GET /ag-ui/threads/<threadId>/events`: every turn of the session from a seq on (a resume),
+   * until the client goes. A turn still open at the seq (the stream was cut mid-turn) is the first
+   * run: its `RUN_STARTED` at once, then the rest of it.
+   */
   private resume(client: PeerClient, threadId: string, url: URL, req: IncomingMessage, res: ServerResponse): void {
     const s = sessionFor(this.k, client, ENDPOINT, threadId, 'read');
     if (!this.k.sessions.known(s.key) || !mayRead(client, ENDPOINT, s.key)) throw new HttpRefusal(404, `no session ${threadId}`);
     const given = url.searchParams.get('fromSeq') ?? req.headers['last-event-id'];
     const fromSeq = typeof given === 'string' && /^\d+$/.test(given) ? Number(given) : undefined;
     if (given !== undefined && fromSeq === undefined) throw new HttpRefusal(400, 'fromSeq (or Last-Event-ID) is a seq number');
+    // Read and subscribe with nothing in between: the turn open at the seq, and every event after it.
+    const before = fromSeq !== undefined && fromSeq <= this.k.head(s.key) ? openTurnAt(this.k, s.key, fromSeq) : [];
     const view = new ExternalView(this.k, s.key, fromSeq !== undefined ? { fromSeq } : {});
     const p = new AgUiProjection({ threadId });
     const sse = this.open(req, res, () => view.close());
+    if (fromSeq !== undefined) sse.write(p.resume(before), fromSeq);
     void (async () => {
       for await (const e of view) {
         if (sse.closed) break;
@@ -339,6 +351,22 @@ export class AgUiEndpoint {
       end,
     };
   }
+}
+
+/**
+ * The durable events up to `fromSeq` from the start of the last turn begun by then, as an external
+ * reader may read them (`replay`: U20, no `internal` ones): what a resume takes in first
+ * (`AgUiProjection.resume`) to go on with a turn still open at the seq. Empty when none is.
+ */
+function openTurnAt(k: KernelContext, sessionKey: string, fromSeq: number): SessionEvent[] {
+  const r = replay(k, sessionKey, 0);
+  const shown = r.shown.filter((e) => e.seq <= fromSeq);
+  const start = shown.findLastIndex((e) => e.body.t === 'turn.started' || e.body.t === 'turn.adopted');
+  if (start < 0) return [];
+  const turnId = (shown[start]!.body as { turnId: string }).turnId;
+  // Ended by the seq but not shown yet (behind an event still withheld, everything waits): not open.
+  if (r.waiting.some((e) => e.seq <= fromSeq && e.body.t === 'turn.completed' && e.body.turnId === turnId)) return [];
+  return shown.slice(start);
 }
 
 function tokenOf(req: IncomingMessage): string | undefined {

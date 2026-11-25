@@ -70,7 +70,8 @@ const AcpServerKeys = {
     /**
      * Ask this client the approvals of the turns it started (its inputs only, not a bypass turn): it
      * answers them in the editor, as itself (default false: the policy decides, which denies a peer's
-     * restricted turn's tools).
+     * restricted turn's tools). Questions are not approvals: the default policy asks a turn's question
+     * of the turn's person, which in a turn the client started is the client, with or without this.
      */
     approvals: Type.Optional(Type.Boolean()),
   }),
@@ -215,7 +216,7 @@ interface Bound {
   prompts: Map<string, Pending>;
   /** Requests being asked of the client, by request id (aborted when someone answers first). */
   asking: Map<string, AbortController>;
-  /** While `session/load` replays: requests to ask once it is done (those still open then). */
+  /** While `session/load` replays: requests to ask once it is done (those the log has not settled by then). */
   deferred?: Map<string, Extract<AcpOut, { permission: unknown } | { question: unknown }>>;
 }
 
@@ -325,7 +326,16 @@ class AcpLink {
     const r = replay(this.k, sessionId, from);
     const b = this.bind(sessionId, undefined, r.head, r.waiting);
     b.deferred = new Map();
-    for (const e of r.shown) for (const out of b.projection.push(e)) await this.emit(b, out, cx, true);
+    /** The turn each replayed request was opened in. */
+    const turnOf = new Map<string, string>();
+    for (const e of r.shown) {
+      // What the log settled is not asked: answered or cancelled (`watch` drops it), or ended with its
+      // turn (RQ-2; a turn a stopped daemon left is settled at the next start without its requests' resolutions).
+      this.watch(b, e);
+      if (e.body.t === 'request.opened' && e.turnId !== undefined) turnOf.set(e.body.requestId, e.turnId);
+      else if (e.body.t === 'turn.completed') for (const [id, t] of turnOf) if (t === e.body.turnId) b.deferred.delete(id);
+      for (const out of b.projection.push(e)) await this.emit(b, out, cx, true);
+    }
     // Asked now: the requests still open after the replay. Then what came meanwhile, and on.
     const ask = [...b.deferred.values()];
     delete b.deferred;

@@ -44,17 +44,27 @@ async function world(o: { raw?: Record<string, unknown>; script?: Parameters<typ
 }
 
 /** An ACP client connected through `acpPipe` (what `aio acp` runs), collecting what the server sends. */
-async function editor(w: World, name: keyof typeof TOKENS, o: { session?: string; permission?: (p: RequestPermissionRequest) => Promise<unknown> | unknown; elicitation?: boolean } = {}) {
+async function editor(
+  w: World,
+  name: keyof typeof TOKENS,
+  o: { session?: string; permission?: (p: RequestPermissionRequest) => Promise<unknown> | unknown; elicitation?: boolean; answer?: (p: Record<string, unknown>) => Promise<unknown> | unknown } = {},
+) {
   const toDaemon = new PassThrough();
   const fromDaemon = new PassThrough();
   const updates: SessionNotification[] = [];
   const asked: RequestPermissionRequest[] = [];
+  /** The form elicitations (questions) asked. */
+  const questions: Record<string, unknown>[] = [];
   const exit = acpPipe({ socket: w.config.socketPath, client: name, token: TOKENS[name], ...(o.session ? { session: o.session } : {}), input: toDaemon, output: fromDaemon, error: () => {} });
   const app = acpClient({ name: 'test-editor' })
     .onNotification(methods.client.session.update, ({ params }) => void updates.push(params))
     .onRequest(methods.client.session.requestPermission, async ({ params }) => {
       asked.push(params);
       return (await (o.permission ?? (() => ({ outcome: { outcome: 'selected', optionId: 'allow_once' } })))(params)) as never;
+    })
+    .onRequest(methods.client.elicitation.create, async ({ params }) => {
+      questions.push(params as Record<string, unknown>);
+      return (await (o.answer ?? (() => ({ action: 'cancel' })))(params as Record<string, unknown>)) as never;
     });
   const conn: ClientConnection = app.connect(ndJsonStream(Writable.toWeb(toDaemon) as WritableStream<Uint8Array>, Readable.toWeb(fromDaemon) as ReadableStream<Uint8Array>));
   cleanups.push(() => {
@@ -62,7 +72,7 @@ async function editor(w: World, name: keyof typeof TOKENS, o: { session?: string
     toDaemon.end();
   });
   const init = await conn.agent.request(methods.agent.initialize, { protocolVersion: 1, clientCapabilities: o.elicitation ? { elicitation: { form: {} } } : {} });
-  return { conn, agent: conn.agent, updates, asked, init, exit, close: () => toDaemon.end() };
+  return { conn, agent: conn.agent, updates, asked, questions, init, exit, close: () => toDaemon.end() };
 }
 
 const texts = (u: SessionNotification[], kind: string) => u.filter((x) => x.update.sessionUpdate === kind).map((x) => ('content' in x.update && x.update.content.type === 'text' ? x.update.content.text : '')).join('');
@@ -165,6 +175,26 @@ describe('ACP server: sessions as ACP agents', () => {
     await expect(e.agent.request(methods.agent.session.prompt, { sessionId: 'T9', prompt: [{ type: 'text', text: 'x' }] })).rejects.toMatchObject({ code: -32002 });
   });
 
+  it('an internal event (a hook prompt item) reaches the client neither live nor in session/load\'s replay: a replay shows what the live view does #PR-4', async () => {
+    const hook = { itemId: 'h1', type: 'hook', title: 'Hook prompt (internal)', status: 'running', inputSummary: 'the hook said' };
+    const script = async (t: { emit: (b: never, x?: never) => void }) => {
+      t.emit({ t: 'item.started', item: hook } as never, { audience: 'internal', level: 'debug' } as never);
+      t.emit({ t: 'item.completed', item: { ...hook, status: 'completed' } } as never, { audience: 'internal', level: 'debug' } as never);
+      t.emit({ t: 'text.snapshot', text: 'answered', final: true } as never, { audience: 'answer' } as never);
+    };
+    const { w } = await world({ script: script as never });
+    const e = await editor(w, 'zed');
+    const s = await e.agent.request(methods.agent.session.new, { cwd: '/tmp', mcpServers: [] });
+    expect(await e.agent.request(methods.agent.session.prompt, { sessionId: s.sessionId, prompt: [{ type: 'text', text: 'go' }] })).toEqual({ stopReason: 'end_turn' });
+    // The log has the item, as internal.
+    expect(w.gw.hub.log.read(s.sessionId, 0).filter((x) => x.body.t === 'item.completed').map((x) => x.visibility)).toEqual(['internal']);
+    expect(e.updates.map((u) => u.update.sessionUpdate)).toEqual(['agent_message_chunk']);
+    const again = await editor(w, 'zed');
+    await again.agent.request(methods.agent.session.load, { sessionId: s.sessionId, cwd: '/tmp', mcpServers: [] });
+    expect(again.updates.map((u) => u.update.sessionUpdate)).toEqual(['user_message_chunk', 'agent_message_chunk']);
+    expect(JSON.stringify(again.updates)).not.toContain('Hook prompt');
+  });
+
   it('a session given with --session: session/new binds it; prompting it needs an input scope, reading it a read scope #CF-10', async () => {
     const { w } = await world();
     const local = await w.client();
@@ -248,6 +278,82 @@ describe('ACP server: requests, cancel and the loop guard', () => {
     const res = w.gw.hub.log.read(s.sessionId, 0).filter((e) => e.body.t === 'request.resolved');
     expect(res).toHaveLength(1);
     expect(res[0]!.body).toMatchObject({ decision: { kind: 'deny' }, by: { kind: 'human', id: 'external:asker', via: 'host:xwo' } });
+  });
+
+  it('session/load asks only the requests the log has not settled: one the client answered, or one cancelled with its turn, is not asked again; one still open is, once the replay is done #RQ-1', async () => {
+    const script = async (t: { emit: (b: never, x?: never) => void; waitDecision: (id: string) => Promise<unknown>; inputs: InputRecord[] }) => {
+      const text = t.inputs.flatMap((i) => i.content).map((c) => (c.type === 'text' ? c.text : '')).join(' ');
+      const id = text === 'answer it' ? 'r1' : text === 'leave it' ? 'r2' : 'r3';
+      t.emit({ t: 'request.opened', requestId: id, kind: 'tool_approval', title: `Run ${id}`, risk: {}, allowedDecisions: ['allow_once', 'deny'], allowAlways: false, defaultDeny: true } as never);
+      // r2: the turn ends without its answer (RQ-2 cancels it).
+      const d = id === 'r2' ? { kind: 'none' } : ((await t.waitDecision(id)) as { kind: string });
+      t.emit({ t: 'text.snapshot', text: `${id} ${d.kind}`, final: true } as never, { audience: 'answer' } as never);
+    };
+    const { w } = await world({ script: script as never });
+    // The first connection answers r1 only.
+    const a = await editor(w, 'asker', { permission: (p) => (p.toolCall.toolCallId === 'request:r1' ? { outcome: { outcome: 'selected', optionId: 'allow_once' } } : new Promise(() => {})) });
+    const s = await a.agent.request(methods.agent.session.new, { cwd: '/tmp', mcpServers: [] });
+    const prompt = (text: string) => a.agent.request(methods.agent.session.prompt, { sessionId: s.sessionId, prompt: [{ type: 'text', text }] });
+    expect(await prompt('answer it')).toEqual({ stopReason: 'end_turn' });
+    expect(await prompt('leave it')).toEqual({ stopReason: 'end_turn' });
+    const resolved = () => w.gw.hub.log.read(s.sessionId, 0).flatMap((e) => (e.body.t === 'request.resolved' ? [e.body] : []));
+    expect(resolved()).toMatchObject([{ requestId: 'r1', decision: { kind: 'allow_once' } }, { requestId: 'r2', decision: null, by: 'runtime_cancelled' }]);
+    const held = prompt('hold it');
+    await until(() => a.asked.some((p) => p.toolCall.toolCallId === 'request:r3'));
+
+    // A second connection loads the session: only r3 is still open, so only r3 is asked.
+    const b = await editor(w, 'asker');
+    await b.agent.request(methods.agent.session.load, { sessionId: s.sessionId, cwd: '/tmp', mcpServers: [] });
+    await until(() => b.asked.length >= 1);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(b.asked.map((p) => p.toolCall.toolCallId)).toEqual(['request:r3']);
+    // Its answer settles r3 (as the client); the first connection's prompt ends.
+    expect(await held).toEqual({ stopReason: 'end_turn' });
+    expect(resolved().at(-1)).toMatchObject({ requestId: 'r3', decision: { kind: 'allow_once' }, by: { kind: 'human', id: 'external:asker' } });
+    // The replay shows every request and how it went, then r3's answer live.
+    const calls = () => b.updates.filter((u) => u.update.sessionUpdate === 'tool_call' || u.update.sessionUpdate === 'tool_call_update').map((u) => [(u.update as { toolCallId: string }).toolCallId, (u.update as { status?: string }).status]);
+    await until(() => calls().length === 6);
+    expect(calls()).toEqual([
+      ['request:r1', 'pending'],
+      ['request:r1', 'completed'],
+      ['request:r2', 'pending'],
+      ['request:r2', 'failed'],
+      ['request:r3', 'pending'],
+      ['request:r3', 'completed'],
+    ]);
+  });
+
+  it('a question in a turn the client started is asked of it as a form without approvals (the default policy asks the turn\'s person, here the client); its answer resolves it as the client, never on anyone\'s behalf; another\'s turn\'s question is not asked #RQ-3 #RQ-1', async () => {
+    const script = async (t: { emit: (b: never, x?: never) => void; waitDecision: (id: string) => Promise<unknown> }) => {
+      t.emit({ t: 'request.opened', requestId: 'q1', kind: 'question', title: 'Which one?', risk: {}, questions: [{ id: 'a', text: 'Which one?', options: [{ label: 'x' }, { label: 'y' }] }], allowedDecisions: ['answer', 'deny'], allowAlways: false, defaultDeny: false } as never);
+      const d = (await t.waitDecision('q1')) as { answers?: unknown };
+      t.emit({ t: 'text.snapshot', text: `picked ${JSON.stringify(d.answers)}`, final: true } as never, { audience: 'answer' } as never);
+    };
+    const { w } = await world({ script: script as never });
+    const z = await editor(w, 'zed', { elicitation: true, answer: () => ({ action: 'accept', content: { a: 'y' } }) });
+    const s = await z.agent.request(methods.agent.session.new, { cwd: '/tmp', mcpServers: [] });
+    expect(await z.agent.request(methods.agent.session.prompt, { sessionId: s.sessionId, prompt: [{ type: 'text', text: 'which?' }] })).toEqual({ stopReason: 'end_turn' });
+    expect(z.questions).toHaveLength(1);
+    expect(z.questions[0]).toMatchObject({ sessionId: s.sessionId, mode: 'form', message: 'Which one?', requestedSchema: { properties: { a: { type: 'string', oneOf: [{ const: 'x' }, { const: 'y' }] } }, required: ['a'] } });
+    expect(z.asked).toHaveLength(0);
+    const log = w.gw.hub.log.read(s.sessionId, 0);
+    // zed has no approvals: the resolver is the policy's, naming the turn's person (the client itself).
+    expect(log.find((e) => e.body.t === 'request.opened')!.body).toMatchObject({ resolver: { kind: 'human', principals: ['external:zed'] } });
+    const resolved = log.find((e) => e.body.t === 'request.resolved')!.body as { by: { via?: string } };
+    expect(resolved).toMatchObject({ decision: { kind: 'answer', answers: { a: 'y' } }, by: { kind: 'human', id: 'external:zed' } });
+    expect(resolved.by.via).toBeUndefined();
+    expect(texts(z.updates, 'agent_message_chunk')).toBe('picked {"a":"y"}');
+
+    // A turn someone else started in a session the client reads: its question names that person, not the client.
+    const local = await w.client();
+    await local.input('S1', 'which?');
+    const opened = await until(() => w.gw.hub.log.read('S1', 0).find((e) => e.body.t === 'request.opened'));
+    expect(opened.body).toMatchObject({ resolver: { kind: 'human', principals: ['me'] } });
+    await z.agent.request(methods.agent.session.load, { sessionId: 'S1', cwd: '/tmp', mcpServers: [] });
+    await until(() => z.updates.some((u) => u.sessionId === 'S1' && (u.update as { toolCallId?: string }).toolCallId === 'request:q1'));
+    await local.command({ type: 'resolve', sessionKey: 'S1', requestId: 'q1', decision: { kind: 'answer', answers: { a: 'x' } } });
+    await until(() => w.gw.hub.log.read('S1', 0).some((e) => e.body.t === 'turn.completed'));
+    expect(z.questions).toHaveLength(1);
   });
 
   it('session/cancel interrupts the client\'s own turn (stopReason cancelled); a turn someone else started is not touched #CT-1', async () => {

@@ -20,7 +20,7 @@ export interface ProjectionHeader {
   projection: ProjectionKind;
   name: string;
   description: string;
-  /** What the projection is built with (ACP: `{ principal }`; AG-UI: `{ threadId, runId?, inputId? }`). */
+  /** What the projection is built with (ACP: `{ principal }`; AG-UI: `{ threadId, runId?, inputId? }`, and `fromSeq?` for a resume from that seq: the durable events up to it are what the reader has, given to the projection's resume). */
   options?: Record<string, unknown>;
 }
 

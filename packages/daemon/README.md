@@ -635,11 +635,17 @@ security review: `docs/design/north-projections/`.
   sessions of its own (`acp-server:<name>:<id>`, `ag-ui:<name>:<threadId>`).
 - `aio acp --client <name> [--token-file <path>] [--session <key>] [--socket <path>]` (token also
   `$AIO_ACP_TOKEN`): speaks ACP v1 on stdio (the official SDK), piped to the module over the
-  socket (`module.connect`). `session/new`, `session/load` (replays the log), `session/list`,
+  socket (`module.connect`). `session/new`, `session/load` (replays the log as the live view shows
+  it: no `internal` events; then asks only the requests the log has not settled), `session/list`,
   `session/prompt` (a lane input; answered when its turn ends), `session/cancel` (the client's own
   turn); a request is asked of the client (`session/request_permission`, a form elicitation) only
-  when its resolver names the client (`approvals: true` makes it the resolver of its own turns).
+  when its resolver names the client (`approvals: true` makes it the resolver of its own turns'
+  approvals; the default policy asks a question of the turn's person, the client in its own turns).
   Exit codes: 0 stdin ended, 2 no ACP server in the daemon, 69 daemon not there, 77 refused.
+- `GET /ag-ui/threads/<threadId>/events?fromSeq=` (or `Last-Event-ID`): every turn from that seq a
+  run (`runId` its turn id), the turn still open at the seq first; SSE ids are session seqs and
+  never go down in a stream (a POST run's `RUN_STARTED` has the seq before its input: a resume from
+  it gets the run back).
 - The mapping tables are `src/acp-projection.ts` and `src/ag-ui-projection.ts`, pinned by the
   fixtures in `packages/testkit/conformance/projections/` (INVARIANTS PR-4). A checked turn's
   answer (U20) reaches neither before it is past the host's exit check (`src/external-view.ts`).

@@ -9,7 +9,7 @@ import { EventType, type BaseEvent } from '@ag-ui/core';
  *
  * | agents-io event | AG-UI |
  * |---|---|
- * | (the run's request) / `turn.started` (a resume) | `RUN_STARTED` |
+ * | (the run's request) / `turn.started`, or the turn open at the seq (a resume) | `RUN_STARTED` |
  * | `session.snapshot` | `STATE_SNAPSHOT` (the session's state, attention without request titles) |
  * | `text.delta` (answer) | `TEXT_MESSAGE_START` (first), `TEXT_MESSAGE_CONTENT` |
  * | `text.snapshot` | the rest not streamed yet, `TEXT_MESSAGE_END`; a final answer repeating what was said is not said again |
@@ -60,7 +60,8 @@ interface Run {
  * The AG-UI events of a session for a thread. With `runId`: one run, the turn that takes `inputId`
  * (`begin` gives its `RUN_STARTED`; it is finished once that turn ends, or the input is refused).
  * Without: every turn is a run of its own (`runId` its turn id), from `turn.started` to
- * `turn.completed`. `push` each event of the session's log, in order (live ephemeral ones too).
+ * `turn.completed` (a resume from a seq inside a turn starts with that one: `resume`). `push` each
+ * event of the session's log, in order (live ephemeral ones too).
  */
 export class AgUiProjection {
   private run: Run | undefined;
@@ -77,6 +78,20 @@ export class AgUiProjection {
   begin(): AgUiEvent[] {
     if (!this.run) return [];
     return [{ type: EventType.RUN_STARTED, threadId: this.o.threadId, runId: this.run.runId }];
+  }
+
+  /**
+   * A resume from a seq (without `runId`): `before` are the durable events up to it, the reader
+   * has them (from the start of the turn open there, at least). They are taken in without output,
+   * so that turn goes on as a run: its `RUN_STARTED` (answered here), then the rest of it as it is
+   * pushed; its messages keep their ids, and a final answer repeating what it said before the seq
+   * is not said again. Nothing when no turn is open there.
+   */
+  resume(before: readonly SessionEvent[]): AgUiEvent[] {
+    if (this.o.runId !== undefined) return [];
+    for (const e of before) this.push(e);
+    const r = this.run;
+    return r ? [{ type: EventType.RUN_STARTED, threadId: this.o.threadId, runId: r.runId }] : [];
   }
 
   push(e: SessionEvent): AgUiEvent[] {
