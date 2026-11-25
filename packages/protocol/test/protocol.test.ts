@@ -110,6 +110,83 @@ describe('FrameDecoder bytes', () => {
 });
 
 describe('host protocol', () => {
+  it('a host rule may name the backend it is for (to); tables without it are unchanged #RT-1 #PR-1', async () => {
+    const { Binding, BindingTable, HostRequestFrame } = await import('../src/index.js');
+    const plain = { id: 'buttons', match: { actionPrefix: 'alpha:' }, on: 'host' };
+    const routed = { ...plain, to: 'alpha' };
+    expect(errors(Binding, plain)).toEqual([]);
+    expect(errors(Binding, routed)).toEqual([]);
+    expect(check(Binding, { ...plain, to: 1 })).toBe(false);
+    expect(errors(Binding, { id: 'triage', match: { known: false }, on: 'context', agent: 'assistant', callout: { onFailure: 'host' }, to: 'beta' })).toEqual([]);
+    const table = { version: '1', bindings: [plain], identities: [] };
+    expect(errors(BindingTable, table)).toEqual([]);
+    expect(errors(BindingTable, { ...table, bindings: [plain, { ...routed, id: 'to-alpha' }] })).toEqual([]);
+    expect(check(HostRequestFrame, { v: 1, type: 'bindings.put', id: '1', table: { ...table, bindings: [routed] } })).toBe(true);
+    expect(check(HostRequestFrame, { v: 1, type: 'bindings.put', id: '1', table: { ...table, bindings: [{ ...routed, to: {} }] } })).toBe(false);
+    // A table without `to` carries no such key: old hosts and old daemons see the same value.
+    expect('to' in plain).toBe(false);
+  });
+
+  it('a host rule may carry a tag, and an item and a matched rule of an explanation too; tables, items and explanations without it are unchanged #RT-1 #PR-1', async () => {
+    const { Binding, BindingTable, HostRequestFrame, InboundItem, RouteExplanation } = await import('../src/index.js');
+    const plain = { id: 'buttons', match: { channel: 'fake' }, on: 'host' };
+    expect(errors(Binding, plain)).toEqual([]);
+    expect(errors(Binding, { ...plain, tag: 'inbox' })).toEqual([]);
+    expect(errors(Binding, { ...plain, to: 'alpha', tag: 'x'.repeat(128) })).toEqual([]);
+    // The schema leaves a rule's tag open (a table may carry its own `tag` key on other rules, as before the
+    // feature): the router checks it where it is a tag (router.test.ts). An item's and an explanation's is a string.
+    for (const tag of ['', 'x'.repeat(129), 1, null, ['inbox'], { a: 1 }]) expect(check(Binding, { ...plain, on: 'dispatch', tag })).toBe(true);
+    const table = { version: '1', bindings: [{ ...plain, tag: 'chat' }], identities: [] };
+    expect(errors(BindingTable, table)).toEqual([]);
+    expect(check(HostRequestFrame, { v: 1, type: 'bindings.put', id: '1', table })).toBe(true);
+    expect(check(HostRequestFrame, { v: 1, type: 'bindings.put', id: '1', table: { ...table, bindings: [{ ...plain, on: 'dispatch', tag: 7 }] } })).toBe(true);
+    const input = { inputId: 'in1', origin: { kind: 'human', principal: null, evidence: 'platform_signed', via: 'fake:default:c1', adapter: 'fake' }, content: env.content, replyRoute: env.replyRoute, channelContext: {} };
+    const item = { cursor: 1, channelRef: 'channel:lark/m1', account: 'bot1', bindingId: 'buttons', input, envelope: env, receivedAt: 1 };
+    expect(errors(InboundItem, item)).toEqual([]);
+    expect(errors(InboundItem, { ...item, to: 'alpha', tag: 'inbox' })).toEqual([]);
+    expect(check(InboundItem, { ...item, tag: 7 })).toBe(false);
+    const explanation = { inputId: 'in1', tableVersions: ['1'], matched: [{ bindingId: 'buttons', source: 'config', on: 'host' }], principal: null, evidence: 'platform_signed' };
+    expect(errors(RouteExplanation, explanation)).toEqual([]);
+    expect(errors(RouteExplanation, { ...explanation, matched: [{ bindingId: 'buttons', source: 'config', on: 'host', to: 'alpha', tag: 'inbox' }] })).toEqual([]);
+    expect(check(RouteExplanation, { ...explanation, matched: [{ bindingId: 'buttons', source: 'config', on: 'host', tag: {} }] })).toBe(false);
+    // Without a tag there is no such key anywhere.
+    expect('tag' in plain || 'tag' in item || 'tag' in explanation.matched[0]!).toBe(false);
+  });
+
+  it('blob.stat, blob.get and blob.put are host request frames with result schemas; a length over BLOB_FRAME_MAX_BYTES, a negative offset and an upload id over 64 characters are invalid #PR-1 #PB-6', async () => {
+    const { BLOB_FRAME_MAX_BYTES, HOST_REQUEST_FRAME_TYPES, HOST_RESULT_VALUES, HostRequestFrame, HostBlobStatResult, HostBlobGetResult, HostBlobPutResult } = await import('../src/index.js');
+    expect(BLOB_FRAME_MAX_BYTES).toBe(1024 * 1024);
+    const ref = `sha256:${'a'.repeat(64)}`;
+    const f = (type: string, rest: Record<string, unknown>) => ({ v: 1, type, id: '1', ...rest });
+    for (const type of ['blob.stat', 'blob.get', 'blob.put'] as const) {
+      expect(HOST_REQUEST_FRAME_TYPES).toContain(type);
+      expect(HOST_RESULT_VALUES[type]).toBeDefined();
+    }
+    expect(errors(HostRequestFrame, f('blob.stat', { ref }))).toEqual([]);
+    expect(check(HostRequestFrame, f('blob.stat', {}))).toBe(false);
+    expect(errors(HostRequestFrame, f('blob.get', { ref }))).toEqual([]);
+    expect(errors(HostRequestFrame, f('blob.get', { ref, offset: 0, length: BLOB_FRAME_MAX_BYTES }))).toEqual([]);
+    expect(check(HostRequestFrame, f('blob.get', { ref, length: BLOB_FRAME_MAX_BYTES + 1 }))).toBe(false);
+    expect(check(HostRequestFrame, f('blob.get', { ref, length: 0 }))).toBe(false);
+    expect(check(HostRequestFrame, f('blob.get', { ref, offset: -1 }))).toBe(false);
+    expect(check(HostRequestFrame, f('blob.get', { ref, offset: 1.5 }))).toBe(false);
+    expect(errors(HostRequestFrame, f('blob.put', { base64: 'aGk=' }))).toEqual([]);
+    expect(errors(HostRequestFrame, f('blob.put', { base64: 'aGk=', mime: 'text/plain', name: 'a.txt', part: { upload: 'u'.repeat(64), offset: 0, last: true } }))).toEqual([]);
+    expect(check(HostRequestFrame, f('blob.put', { base64: 'aGk=', part: { upload: 'u'.repeat(65), offset: 0 } }))).toBe(false);
+    expect(check(HostRequestFrame, f('blob.put', { base64: 'aGk=', part: { upload: '', offset: 0 } }))).toBe(false);
+    expect(check(HostRequestFrame, f('blob.put', { base64: 'aGk=', part: { upload: 'u', offset: -1 } }))).toBe(false);
+    expect(check(HostRequestFrame, f('blob.put', { part: { upload: 'u', offset: 0 } }))).toBe(false);
+    // Results: a size or null; bytes with the whole size and the offset; a stored blob or the bytes received so far. No mime, no name.
+    expect(errors(HostBlobStatResult, { size: 3 })).toEqual([]);
+    expect(errors(HostBlobStatResult, null)).toEqual([]);
+    expect(check(HostBlobStatResult, {})).toBe(false);
+    expect(errors(HostBlobGetResult, { base64: 'aGk=', size: 2, offset: 0 })).toEqual([]);
+    expect(check(HostBlobGetResult, { base64: 'aGk=' })).toBe(false);
+    expect(errors(HostBlobPutResult, { ref, size: 2 })).toEqual([]);
+    expect(errors(HostBlobPutResult, { upload: 'u', received: 2 })).toEqual([]);
+    expect(check(HostBlobPutResult, { upload: 'u' })).toBe(false);
+  });
+
   it('validates a binding table and host frames #PR-1', async () => {
     const { BindingTable, HostRequestFrame, HostEventFrame } = await import('../src/index.js');
     const table = {

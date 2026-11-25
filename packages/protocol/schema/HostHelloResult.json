@@ -114,6 +114,17 @@
       "items": {
         "type": "string"
       }
+    },
+    "backend": {
+      "type": "object",
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      }
     }
   }
 }

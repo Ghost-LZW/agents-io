@@ -6,7 +6,7 @@ import { exitCodeFor, main } from '../src/cli.js';
 import { CommandError, ConfigError, configTable, DaemonUnavailable, TokenError, tokenPath } from '@agents-io/kernel';
 import { resolveConfig } from '../src/defaults.js';
 import { cli } from './cli-helpers.js';
-import { daemon, tmp } from './helpers.js';
+import { daemon, tmp, until } from './helpers.js';
 
 const ctx = (dir: string) => ({ env: {}, baseDir: dir, cwd: dir });
 
@@ -81,6 +81,61 @@ describe('cli against a daemon', () => {
     // Rerunning an id reports the first outcome.
     expect((await cli(['run', ...s, '--agent', 'exec', '--run-id', 'cli-1', '-q', '--', 'x'])).code).toBe(0);
     await expect(main(['run', ...s, '--agent', 'chat', '--', 'x'])).rejects.toMatchObject({ code: 'not_task_agent' });
+  });
+
+  it('aio backend key prints the key once; list shows the key id, never the key; rotate, revoke and forget; an unknown backend exits 2 #PB-3', async () => {
+    const w = await daemon({ raw: { backends: { alpha: {}, beta: {} }, bindings: [{ id: 'to-alpha', match: { channel: 'fake', keywords: ['alpha'] }, on: 'host', to: 'alpha' }] } });
+    const s = ['--socket', w.config.socketPath];
+    const key = await cli(['backend', 'key', 'alpha', ...s]);
+    expect(key.code).toBe(0);
+    // stdout: the key alone on one line. The explanation is on stderr and does not repeat it.
+    expect(key.out).toMatch(/^aiob_[\w-]{43}\n$/);
+    const k1 = key.out.trim();
+    const id1 = w.gw.backends.verify(k1)!.keyId;
+    expect(w.gw.backends.verify(k1)).toEqual({ id: 'alpha', keyId: id1 });
+    expect(key.err).toContain(`key id ${id1}`);
+    expect(key.err).not.toContain(k1);
+    // A second `key` is refused (exit 2) and prints no key.
+    const twice = await main(['backend', 'key', 'alpha', ...s]).catch((e: Error) => e);
+    expect(twice).toMatchObject({ code: 'key_exists' });
+    expect(exitCodeFor(twice)).toBe(2);
+    expect(exitCodeFor(new CommandError('unknown_backend', 'x'))).toBe(2);
+
+    const list = await cli(['backend', 'list', ...s]);
+    expect(list.code).toBe(0);
+    expect((JSON.parse(list.out) as { backends: { id: string; key?: { id: string } }[] }).backends.map((b) => [b.id, b.key?.id])).toEqual([['alpha', id1], ['beta', undefined]]);
+    expect(list.out + list.err).not.toContain(k1);
+
+    const rot = await cli(['backend', 'rotate', 'alpha', ...s]);
+    expect(rot.out).toMatch(/^aiob_[\w-]{43}\n$/);
+    const k2 = rot.out.trim();
+    expect(k2).not.toBe(k1);
+    expect(rot.err).not.toContain(k2);
+    expect(w.gw.backends.verify(k1)).toBeUndefined();
+    expect(w.gw.backends.verify(k2)).toMatchObject({ id: 'alpha' });
+
+    await w.chat.inject({ id: 'm1', sender: { channelUserId: 'alice', evidence: 'platform_signed' }, text: 'for alpha' });
+    await until(() => w.gw.hostQueue.head() === 1);
+    const forget = await cli(['backend', 'forget', 'alpha', ...s]);
+    expect(forget).toMatchObject({ code: 0, out: '' });
+    expect(forget.err).toMatch(/backend alpha forgotten: 1 queue item\(s\) and 1 conversation grant\(s\) removed/);
+    expect(w.gw.hostQueue.pending(0, 'alpha').count).toBe(0);
+    expect(w.gw.backends.verify(k2)).toMatchObject({ id: 'alpha' }); // forget keeps the key
+
+    const rev = await cli(['backend', 'revoke', 'alpha', ...s]);
+    expect(rev).toMatchObject({ code: 0, out: '' });
+    expect(w.gw.backends.verify(k2)).toBeUndefined();
+    expect(w.gw.backends.list()).toEqual([]);
+
+    for (const sub of ['key', 'rotate', 'revoke']) {
+      const e = await main(['backend', sub, 'gamma', ...s]).catch((x: Error) => x);
+      expect(e).toMatchObject({ code: 'unknown_backend' });
+      expect(exitCodeFor(e)).toBe(2);
+    }
+    // Usage errors never reach the daemon.
+    for (const argv of [['backend'], ['backend', 'key'], ['backend', 'list', 'alpha'], ['backend', 'show', 'alpha'], ['backend', 'key', 'alpha', 'beta']]) {
+      await expect(main([...argv, ...s])).rejects.toBeInstanceOf(ConfigError);
+    }
   });
 
   it('a wrong token is refused (exit 77) #SE-3', async () => {

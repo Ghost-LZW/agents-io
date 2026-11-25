@@ -46,6 +46,12 @@
             "bindingId": {
               "type": "string"
             },
+            "to": {
+              "type": "string"
+            },
+            "tag": {
+              "type": "string"
+            },
             "input": {
               "type": "object",
               "required": [

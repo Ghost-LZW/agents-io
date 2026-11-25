@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/BackendsListResult",
+  "type": "object",
+  "required": [
+    "backends"
+  ],
+  "properties": {
+    "backends": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "configured",
+          "history",
+          "connections",
+          "push",
+          "consumer",
+          "acked",
+          "pending",
+          "routes"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "configured": {
+            "type": "boolean"
+          },
+          "note": {
+            "type": "string"
+          },
+          "history": {
+            "type": "boolean"
+          },
+          "key": {
+            "type": "object",
+            "required": [
+              "id",
+              "createdAt"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "createdAt": {
+                "type": "number"
+              }
+            }
+          },
+          "connections": {
+            "type": "number"
+          },
+          "push": {
+            "type": "boolean"
+          },
+          "consumer": {
+            "type": "string"
+          },
+          "acked": {
+            "type": "number"
+          },
+          "pending": {
+            "type": "number"
+          },
+          "oldestPendingAt": {
+            "type": "number"
+          },
+          "routes": {
+            "type": "object",
+            "required": [
+              "registered",
+              "granted"
+            ],
+            "properties": {
+              "registered": {
+                "type": "number"
+              },
+              "granted": {
+                "type": "number"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

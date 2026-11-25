@@ -8,6 +8,7 @@ import {
   type ChannelAdapter,
   type ChannelCaps,
   type ContentBlock,
+  mediaBlocks,
   type InboundEnvelope,
   type Origin,
   type Policy,
@@ -77,9 +78,7 @@ interface SeenRefs {
 }
 
 /** The blocks that carry a blob: another block with a stray top-level `ref` (the schema does not forbid one) does not count. */
-function blobBlocks(content: ContentBlock[] | undefined): Extract<ContentBlock, { ref: string }>[] {
-  return (content ?? []).filter((c): c is Extract<ContentBlock, { ref: string }> => c.type === 'image' || c.type === 'file' || c.type === 'audio');
-}
+const blobBlocks = mediaBlocks;
 
 /** What a token authenticates: one harness binding (run) of one session. */
 export interface ToolBinding {

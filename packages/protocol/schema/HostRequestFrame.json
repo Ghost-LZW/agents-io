@@ -319,6 +319,10 @@
                       }
                     }
                   },
+                  "to": {
+                    "type": "string"
+                  },
+                  "tag": {},
                   "note": {
                     "type": "string"
                   }
@@ -2349,6 +2353,205 @@
               }
             }
           }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "backends.list",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "backend",
+        "op"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "backends.key",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "backend": {
+          "type": "string"
+        },
+        "op": {
+          "anyOf": [
+            {
+              "const": "issue",
+              "type": "string"
+            },
+            {
+              "const": "rotate",
+              "type": "string"
+            },
+            {
+              "const": "revoke",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "backend"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "backends.forget",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "backend": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "ref"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "blob.stat",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ref": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "ref"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "blob.get",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ref": {
+          "type": "string"
+        },
+        "offset": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "length": {
+          "minimum": 1,
+          "maximum": 1048576,
+          "type": "integer"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "id",
+        "base64"
+      ],
+      "properties": {
+        "v": {
+          "const": 1,
+          "type": "number"
+        },
+        "type": {
+          "const": "blob.put",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "base64": {
+          "type": "string"
+        },
+        "part": {
+          "type": "object",
+          "required": [
+            "upload",
+            "offset"
+          ],
+          "properties": {
+            "upload": {
+              "minLength": 1,
+              "maxLength": 64,
+              "type": "string"
+            },
+            "offset": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "last": {
+              "type": "boolean"
+            }
+          }
+        },
+        "mime": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
         }
       }
     }

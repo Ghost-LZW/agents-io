@@ -6,6 +6,9 @@ import {
   formatAddress,
   routeKey,
   type AdminQueue,
+  type BackendsForgetResult,
+  type BackendsKeyResult,
+  type BackendsListResult,
   type AdminSession,
   type AdminSessions,
   type AdminChannelsApplied,
@@ -137,6 +140,7 @@ import { descriptorAdmin } from './module-channel.js';
 import { ConfigError, EMBEDDED_HARNESS, UNGRANTED_EVIDENCE, agentSpec, configTable, consoleSettings, resolveModules, type AgentConfig, type Config, type HarnessInstance, type ModuleLaunch, type ResolvedChannel } from './config.js';
 import { canonical, type ConsoleConfigStore, type ConsoleFactory, type ConsoleListener, type ContributedRoute } from './console-host.js';
 import { adminContributions } from './admin-contributions.js';
+import { BACKEND_ID, BackendKeyError, BackendKeys } from './backends.js';
 import type { ChannelRegistry, DefaultEvidence } from './channel-registry.js';
 import type { HarnessRegistry } from './harness-registry.js';
 import type { ImportConfigModules } from './config-modules.js';
@@ -144,6 +148,7 @@ import { NamedRuns, type NamedRun } from './run-defaults.js';
 import type { ClientCommand, SessionInfo } from './frames.js';
 import { ClientOps, type Op, type OpFrame, type OpOutcome } from './client-ops.js';
 import { HostService, isHostOrigin, type CalloutHook } from './host.js';
+import { HostBlobs, MAX_ATTACHMENTS, type HostBlobsLimits } from './host-blobs.js';
 import { LocalServer } from './local-server.js';
 import { privateDb, privateDir } from './private.js';
 import { DaemonRecords, type CauseRecord, type OutboundRecord } from './records.js';
@@ -249,6 +254,8 @@ export interface GatewayOptions {
   tokenFile?: string;
   /** Inbound push: how long a pushed item waits for the host's result, and the retry delay (tests). */
   hostPush?: { timeoutMs?: number; retryMs?: number };
+  /** Blobs over the host protocol (PB-6): the clock and the limits of backends' staged uploads (tests). */
+  hostBlobs?: HostBlobsLimits;
   /** Serve the console API per `config.console` (default false; `aio serve` turns it on unless `console.enabled` is false); it needs `consoleFactory`. */
   console?: boolean;
   /**
@@ -433,6 +440,8 @@ export class Gateway {
    * `external`): who, taken into the in-flight mark (`sendTime`) for the outbound record.
    */
   private readonly externalSends = new Map<string, ExternalSender>();
+  /** Deliveries made with a backend's key while in flight (PB-2): which backend, taken into the in-flight mark like `externalSends`. */
+  private readonly backendSends = new Map<string, string>();
   /**
    * An agent's scheduled messages while they are sent (`sendScheduled`): the firing as the turn they
    * come from, for the exit check only (`exitCheck`), as the agent's send_message's turn is for its.
@@ -456,6 +465,10 @@ export class Gateway {
   readonly topics: TopicRegistry;
   /** Secret a host presents in `host.hello` (written 0600 next to the socket). */
   readonly token: string;
+  /** PB-3: the backends' keys (digests only), in the log's database. */
+  readonly backends: BackendKeys;
+  /** Blobs over the host protocol (`blob.*`): the shared store for the host token, a backend's own view for its key (PB-6). */
+  readonly hostBlobs: HostBlobs;
   /** Built instance adapters, by instance name (lazily, on first use). */
   private readonly instances = new Map<string, HarnessAdapter>();
   /** What the factories of `use: "module"` instances returned, by instance name (loaded at start). */
@@ -546,6 +559,23 @@ export class Gateway {
     // PR-3: a receipt commits with the event that decided it (records share the log's connection).
     this.clientOps = new ClientOps({ store: this.records, hub: this.hub, log: (msg) => this.log('warn', msg) });
     this.hostQueue = new HostQueue(db);
+    // PB-1: each configured backend walks its own items as `backend:<id>`, known from the start so
+    // its items are kept for it. Without `backends` no consumer has a target.
+    const backends = Object.keys(c.backends ?? {});
+    for (const id of backends) this.hostQueue.register(`backend:${id}`, id);
+    // PB-3: only configured backends have keys. One removed from the config loses its key here; its
+    // items, cursor and grants stay under the id (PB-2) until `backends.forget`.
+    this.backends = new BackendKeys(this.records, () => Object.keys(this.o.config.backends ?? {}));
+    this.hostBlobs = new HostBlobs({
+      store: this.blobs,
+      uploadsDir: join(c.blobs.dir, 'uploads'),
+      granted: (backend, ref) => this.hostQueue.grantedBlob(backend, ref),
+      log: (level, msg, data) => this.log(level, msg, data),
+      ...o.hostBlobs,
+    });
+    // Uploads that expired while the daemon was down go now; the rest on the hourly sweep.
+    void this.hostBlobs.sweep();
+    for (const id of this.backends.pruneUnconfigured()) this.log('warn', `backend ${id} is no longer in the config: its key is revoked (its queue items, cursor and send grants are kept; aio backend forget ${id} removes them)`);
     // Every topic change is recorded (topic.changed) in the session left and the one now current.
     this.topics = new TopicRegistry({ ...db, hub: this.hub, onChange: (ch) => this.topicChanged(ch) });
     // Agents: the configured ones, or `default` on the default instance with sessions keyed by bare route keys as before.
@@ -555,6 +585,7 @@ export class Gateway {
       agents: Object.values(c.agents).map((a) => agentSpec(a, c)),
       ...(c.defaultAgent !== undefined ? { defaultAgent: c.defaultAgent } : {}),
       ...(legacyAdmit ? { legacyAdmit: legacyAdmit.bind(o.policy) } : table ? { config: table } : {}),
+      backends,
       watches: { list: () => this.watches.list() },
       selfAccounts: c.policy.selfAccounts,
       agentAccounts: c.policy.agentAccounts,
@@ -687,11 +718,11 @@ export class Gateway {
       queue: this.hostQueue,
       records: this.records,
       runs: this.runs,
-      deliver: (name, f) => this.deliver(name, f),
-      deliverUpdate: (name, f) => this.deliverUpdate(name, f),
-      ackMessage: (f) => this.ackMessage(f),
+      deliver: (name, f, backend) => this.deliver(name, f, backend),
+      deliverUpdate: (name, f, backend) => this.deliverUpdate(name, f, backend),
+      ackMessage: (f, backend) => this.ackMessage(f, backend),
       schedule: (name, f) => this.hostSchedule(name, f),
-      history: (f) => this.hostHistory(f),
+      history: (f, backend) => this.hostHistory(f, backend),
       createConversation: (f) => this.createConversation(f),
       prepareSession: (f) => this.prepareSession(f),
       redispatch: (name, f) => this.redispatch(name, f),
@@ -703,6 +734,18 @@ export class Gateway {
       testHooks: () => this.testHooks !== undefined,
       testReplay: (name, f) => this.testReplay(name, f),
       testFault: (name, f) => this.testFault(name, f),
+      backends: {
+        ids: () => Object.keys(this.o.config.backends ?? {}),
+        verify: (token) => this.backends.verify(token),
+        current: (id, keyId) => this.backends.current(id, keyId),
+        history: (id) => this.o.config.backends?.[id]?.history === true,
+      },
+      blobs: {
+        stat: (ref, backend) => this.hostBlobs.stat(ref, backend),
+        get: (f, backend) => this.hostBlobs.get(f, backend),
+        put: (f, backend) => this.hostBlobs.put(f, backend),
+      },
+      backendsAdmin: { list: () => ({ ok: true, value: this.backendsList() }), key: (id, op) => this.backendKey(id, op), forget: (id) => this.backendForget(id) },
       answerOnBehalf: c.policy.answerOnBehalf,
       log: (level, msg, data) => this.log(level, msg, data),
       onScope: () => this.leaveScopedLives(),
@@ -782,6 +825,8 @@ export class Gateway {
       onWatchError: (err) => this.log('warn', `watch fan-out failed: ${(err as Error).message}`),
       // `on: "host"` inputs wait in the durable queue until the host acks them.
       hostQueue: this.hostQueue,
+      // PB-1: a click on a message a backend delivered is that backend's, whatever the config says now.
+      clickOwner: (env) => this.clickOwner(env),
       replyCaps: (ch, account) => this.replyCaps(ch, account),
       // Clicks on ask_choice buttons (and numbered replies) go back to the session that asked.
       ...(tools ? { rewrite: (a) => tools.rewriteInbound(a) } : {}),
@@ -976,7 +1021,8 @@ export class Gateway {
       hostAnswers: (hook) => gw().host.answers(hook as CalloutHook),
       hostHeldBy: (hook) => (hook === 'outbound' ? gw().host.outboundHeldBy() : gw().host.externalHeldBy()),
       hostExternal: (args) => gw().host.externalCallout(args),
-      isHostToken: (token) => token === gw().token,
+      // SE-5: a backend's key is a credential of the daemon too, never an external client's token.
+      isHostToken: (token) => token === gw().token || gw().backends.has(token),
     };
   }
 
@@ -1072,8 +1118,10 @@ export class Gateway {
       host: {
         local: this,
         token: this.token,
+        backendOf: (token) => this.backends.verify(token)?.id,
         status: () => this.adminStatus(),
         queue: () => this.adminQueue(),
+        backends: { list: () => this.backendsList(), key: (id, op) => this.backendKey(id, op), forget: (id) => this.backendForget(id) },
         sessions: () => this.adminSessions(),
         explain: (id) => this.router.explain(id),
         consoleOrigin: (key) => this.consoleOrigin(key),
@@ -1231,10 +1279,84 @@ export class Gateway {
     return {
       head: this.hostQueue.head(),
       consumers: this.hostQueue.consumers().map((x) => {
-        const p = this.hostQueue.pending(x.acked);
-        return { consumer: x.name, acked: x.acked, pending: p.count, push: h?.consumer === x.name, ...(p.oldestAt !== undefined ? { oldestPendingAt: p.oldestAt } : {}) };
+        // A backend's consumer counts its own items; the others count the items routed to no backend.
+        const p = this.hostQueue.pending(x.acked, x.target);
+        return { consumer: x.name, ...(x.target !== undefined ? { backend: x.target } : {}), acked: x.acked, pending: p.count, push: h?.consumer === x.name || (x.target !== undefined && this.host.backendPushing(x.target)), ...(p.oldestAt !== undefined ? { oldestPendingAt: p.oldestAt } : {}) };
       }),
     };
+  }
+
+  /**
+   * `backends.list` / `GET /api/backends`: the configured backends, then the ids that left the config
+   * but still have a consumer (items, a cursor, grants kept under the id, PB-2). Registers nobody.
+   */
+  backendsList(): BackendsListResult {
+    const configured = this.o.config.backends ?? {};
+    const consumers = new Map(this.hostQueue.consumers().flatMap((x) => (x.target !== undefined && x.name === `backend:${x.target}` ? [[x.target, x] as const] : [])));
+    const keys = new Map(this.backends.list().map((k) => [k.backend, k]));
+    const ids = [...Object.keys(configured), ...[...consumers.keys()].filter((id) => !(id in configured)).sort()];
+    return {
+      backends: ids.map((id) => {
+        const b = configured[id];
+        const acked = consumers.get(id)?.acked ?? 0;
+        const p = this.hostQueue.pending(acked, id);
+        const k = b ? keys.get(id) : undefined;
+        return {
+          id,
+          configured: b !== undefined,
+          ...(b?.note !== undefined ? { note: b.note } : {}),
+          history: b?.history ?? false,
+          ...(k ? { key: { id: k.keyId, createdAt: k.createdAt } } : {}),
+          ...this.host.backendConnections(id),
+          consumer: `backend:${id}`,
+          acked,
+          pending: p.count,
+          ...(p.oldestAt !== undefined ? { oldestPendingAt: p.oldestAt } : {}),
+          routes: { registered: b?.routes.length ?? 0, granted: this.hostQueue.grantCount(id) },
+        };
+      }),
+    };
+  }
+
+  /**
+   * `backends.key` (PB-3): issue, rotate or revoke a configured backend's key. The key is in the
+   * answer of `issue` / `rotate` and nowhere else: the log names it by its id. Connections made
+   * with the key it replaces or removes are closed.
+   */
+  backendKey(id: string, op: 'issue' | 'rotate' | 'revoke'): Outcome {
+    try {
+      if (op === 'revoke') {
+        const had = this.backends.revoke(id);
+        const closed = this.host.dropBackend(id, 'its key was revoked');
+        this.hostBlobs.dropParts(id);
+        this.log('info', `backend ${id}: ${had ? 'key revoked' : 'revoke: it had no key'}${closed ? `; ${closed} connection(s) closed` : ''}`);
+        return { ok: true, value: { backend: id, op, closed } satisfies BackendsKeyResult };
+      }
+      const k = op === 'issue' ? this.backends.issue(id) : this.backends.rotate(id);
+      const closed = this.host.dropBackend(id, 'its key was replaced');
+      // PB-6: an upload the old key left unfinished is not the new key's to continue.
+      this.hostBlobs.dropParts(id);
+      this.log('info', `backend ${id}: key ${op === 'issue' ? 'issued' : 'rotated'} (key id ${k.keyId})${closed ? `; ${closed} connection(s) closed` : ''}`);
+      return { ok: true, value: { backend: id, op, key: k.key, keyId: k.keyId, createdAt: k.createdAt, closed } satisfies BackendsKeyResult };
+    } catch (e) {
+      if (e instanceof BackendKeyError) return fail(e.code, e.message);
+      throw e;
+    }
+  }
+
+  /**
+   * `backends.forget` (PB-2): remove the queue items, cursor and send grants kept under a backend id,
+   * configured or not, with its media grants and staged uploads (PB-6), and close its connections. Its key, its settled operation ids (DL-2) and the
+   * record of what it sent stay. A configured backend starts again with an empty view.
+   */
+  backendForget(id: string): Outcome {
+    if (!BACKEND_ID.test(id)) return fail('invalid_frame', `backend id must match ${BACKEND_ID.source}`);
+    const closed = this.host.dropBackend(id, 'the backend was forgotten');
+    const r = this.hostQueue.forgetTarget(id, { consumer: `backend:${id}` });
+    this.hostBlobs.forget(id);
+    if (id in (this.o.config.backends ?? {})) this.hostQueue.register(`backend:${id}`, id);
+    if (r.items || r.routes || closed) this.log('info', `backend ${id} forgotten: ${r.items} queue item(s) and ${r.routes} conversation grant(s) removed${closed ? `, ${closed} connection(s) closed` : ''}`);
+    return { ok: true, value: { backend: id, items: r.items, routes: r.routes, closed } satisfies BackendsForgetResult };
   }
 
   /** `GET /api/sessions`: `SessionInfo` plus agent, conversation (the latest reply route), run id, last event time. */
@@ -2089,7 +2211,8 @@ export class Gateway {
   private sendTime(d: { operationId: string; sessionKey: string; turnId?: string }): SendTime | undefined {
     const provenance = this.provenanceAtSend(d);
     const external = this.externalSends.get(d.operationId);
-    return provenance || external ? { ...(provenance ? { provenance } : {}), ...(external ? { external } : {}) } : undefined;
+    const backend = this.backendSends.get(d.operationId);
+    return provenance || external || backend !== undefined ? { ...(provenance ? { provenance } : {}), ...(external ? { external } : {}), ...(backend !== undefined ? { backend } : {}) } : undefined;
   }
 
   /** The sending turn's provenance (chain and flags), while its lane is open or just closed. */
@@ -2107,6 +2230,7 @@ export class Gateway {
   private indexOutbound(d: { sessionKey: string; turnId?: string; inputIds?: string[] }, rec: DeliveryRecord, atSend?: SendTime): void {
     const p = atSend?.provenance ?? this.provenanceAtSend(d);
     const external = atSend?.external ?? this.externalSends.get(rec.operationId);
+    const backend = atSend?.backend ?? this.backendSends.get(rec.operationId);
     const agent = this.agentOfSession(d.sessionKey);
     this.records.putOutbound({
       operationId: rec.operationId,
@@ -2121,6 +2245,7 @@ export class Gateway {
       ...(d.turnId === undefined && d.inputIds?.length ? { inputIds: [...d.inputIds] } : {}),
       ...(p ? { provenance: p } : {}),
       ...(external ? { external } : {}),
+      ...(backend !== undefined ? { backend } : {}),
       at: Date.now(),
     });
   }
@@ -2171,6 +2296,7 @@ export class Gateway {
       ...(r.providerMessageId !== undefined ? { providerMessageId: r.providerMessageId } : {}),
       at: r.at,
       ...(r.external ? { external: r.external } : {}),
+      ...(r.backend !== undefined ? { backend: r.backend } : {}),
     };
   }
 
@@ -2274,21 +2400,100 @@ export class Gateway {
     return { sessionKey, ...(agent !== undefined ? { address: formatAddress({ agent, sessionKey }) } : {}) };
   }
 
-  /** `deliver`: send a host's message through the outbox, idempotent per operationId (across restarts too). */
-  async deliver(hostName: string, f: Extract<HostRequestFrame, { type: 'deliver' }>): Promise<Outcome> {
+  /**
+   * PB-2: why backend `id` may not use `route` (its account already the channel's), or undefined
+   * when it may. The conversation must be one an input routed to it came from (any thread) or one
+   * the admin registered (`backends.<id>.routes`); a reply target and `o.messageId` must each be a
+   * message of that conversation the backend received or sent; `o.own` one it sent itself.
+   */
+  private backendMay(id: string, route: ReplyRoute, o: { messageId?: string; own?: string } = {}): string | undefined {
+    const at = { channel: route.channel, account: route.account, conversationId: route.conversationId };
+    const registered = (this.o.config.backends?.[id]?.routes ?? []).some((r) => r.channel === at.channel && r.account === at.account && r.conversationId === at.conversationId);
+    if (!registered && !this.hostQueue.granted(id, at)) return 'the conversation is neither one it received input from nor registered for it';
+    const sent = (m: string) => this.records.backendSent(at.channel, m).some((x) => x.backend === id && x.route.account === at.account && x.route.conversationId === at.conversationId);
+    const known = (m: string) => this.hostQueue.grantedMessage(id, { ...at, messageId: m }) || sent(m);
+    if (route.replyToMessageId !== undefined && !known(route.replyToMessageId)) return 'replyToMessageId is not a message of that conversation it received or sent';
+    if (o.messageId !== undefined && !known(o.messageId)) return 'messageId is not a message of that conversation it received or sent';
+    if (o.own !== undefined && !sent(o.own)) return 'providerMessageId is not a message it delivered in that conversation';
+    return undefined;
+  }
+
+  /**
+   * PB-2: the answer to a backend's frame outside its scope, or undefined when it is inside. One
+   * code and one text whatever was wrong (no channel, another account, another conversation,
+   * someone else's message): the answer tells a backend nothing about what exists here.
+   */
+  private backendRefusal(id: string, what: string, route: ReplyRoute, ch: RunningChannel | undefined, o: { messageId?: string; own?: string } = {}): Outcome | undefined {
+    const why = ch ? this.backendMay(id, { ...route, account: ch.account }, o) : 'no running channel sends to it';
+    if (why === undefined) return undefined;
+    this.log('warn', `backend ${id}: ${what} to ${logText(routeKey(route))} refused (${why})`);
+    return fail('route_not_allowed', 'this backend may not send to that route or message');
+  }
+
+  /**
+   * PB-6: the attachments of a backend's message. Each ref must be an upload of its own or the media
+   * of an item routed to it; its uploads are copied to the shared store (where adapters read). One
+   * code and one text for any ref that is not its own, whether or not such a blob exists.
+   */
+  private async backendAttachments(id: string, what: string, route: ReplyRoute, msg: RenderedMessage): Promise<{ msg: RenderedMessage } | { refused: Outcome }> {
+    if (!msg.attachments?.length) return { msg };
+    const r = await this.hostBlobs.attachments(id, msg);
+    if (r.ok) return { msg: r.msg };
+    if (r.code === 'too_many') {
+      this.log('warn', `backend ${id}: ${what} to ${logText(routeKey(route))} refused (${msg.attachments.length} attachments, at most ${MAX_ATTACHMENTS})`);
+      return { refused: fail('too_many_attachments', `a message carries at most ${MAX_ATTACHMENTS} attachments`) };
+    }
+    // The ref is the backend's text: it goes into the log bounded and escaped (`logText`).
+    this.log('warn', `backend ${id}: ${what} to ${logText(routeKey(route))} refused (attachment ${logText(r.ref)}: ${r.code === 'unknown_blob' ? 'neither its upload nor the media of an item routed to it' : 'its staged bytes do not match the ref'})`);
+    return { refused: r.code === 'unknown_blob' ? fail('unknown_blob', 'an attachment is not a blob this backend uploaded or was given') : fail('blob_error', 'an attachment could not be read') };
+  }
+
+  /**
+   * `deliver`: send a host's message through the outbox, idempotent per operationId (across restarts too).
+   * `backend`: made with that backend's key, within its scope only (PB-2) and in its own operationId namespace.
+   */
+  async deliver(hostName: string, f: Extract<HostRequestFrame, { type: 'deliver' }>, backend?: string): Promise<Outcome> {
     if (this.stopped) return fail('stopped', 'daemon is stopping');
     if (!f.operationId) return fail('invalid_frame', 'operationId is empty');
-    // Host operation ids get their own namespace, apart from the compositor's and the output tools'.
-    const operationId = `host:${f.operationId}`;
+    // Host operation ids get their own namespace, apart from the compositor's and the output tools';
+    // each backend's are apart from the host's and from each other's (a backend id has no colon).
+    const operationId = backend !== undefined ? `backend:${backend}:${f.operationId}` : `host:${f.operationId}`;
     const settled = this.outbox.get(operationId);
     if (settled) return { ok: true, value: { ...settled, operationId: f.operationId, duplicate: true } };
     const ch = this.channelFor(f.route);
+    if (backend !== undefined) {
+      const refused = this.backendRefusal(backend, 'deliver', f.route, ch);
+      if (refused) return refused;
+    }
     if (!ch) return fail('unknown_channel', this.noChannelMessage(f.route));
+    let msg = f.message;
+    if (backend !== undefined) {
+      // PB-6: after the route check (a refused route says nothing about blobs), before anything is sent or recorded.
+      const a = await this.backendAttachments(backend, 'deliver', f.route, msg);
+      if ('refused' in a) return a.refused;
+      msg = a.msg;
+      if (this.stopped) return fail('stopped', 'daemon is stopping');
+    }
     // A single-entry fallback sends as that entry's account (the adapter refuses routes of other accounts).
     // Not agent-authored (the host speaks): no `as`.
     // The host's own message: it checked it itself; the settlement says what it is (U20).
-    const rec = await this.outbox.send(ch.adapter, { operationId, sessionKey: `host:${hostName}`, route: { ...f.route, account: ch.account }, msg: f.message, kind: 'host', exitChecked: true });
-    return { ok: true, value: { ...rec, operationId: f.operationId, duplicate: false } };
+    if (backend !== undefined) this.backendSends.set(operationId, backend);
+    try {
+      const rec = await this.outbox.send(ch.adapter, { operationId, sessionKey: `host:${hostName}`, route: { ...f.route, account: ch.account }, msg, kind: 'host', exitChecked: true });
+      return { ok: true, value: { ...rec, operationId: f.operationId, duplicate: false } };
+    } finally {
+      if (backend !== undefined) this.backendSends.delete(operationId);
+    }
+  }
+
+  /** PB-1: the backend that delivered the message a click is on (the click's `messageId`, on the account it came in by), if one did. */
+  private clickOwner(env: InboundEnvelope): string | undefined {
+    for (const c of env.content) {
+      if (c.type !== 'event' || c.name !== 'action' || typeof c.data.messageId !== 'string') continue;
+      const by = this.records.backendSent(env.channel, c.data.messageId).find((x) => x.route.account === env.account);
+      if (by) return by.backend;
+    }
+    return undefined;
   }
 
   /**
@@ -2296,31 +2501,51 @@ export class Gateway {
    * finalize, with `final`). A final update goes through the outbox (once per operationId);
    * the others are cosmetic and not recorded.
    */
-  async deliverUpdate(hostName: string, f: Extract<HostRequestFrame, { type: 'deliver.update' }>): Promise<Outcome> {
+  async deliverUpdate(hostName: string, f: Extract<HostRequestFrame, { type: 'deliver.update' }>, backend?: string): Promise<Outcome> {
     if (this.stopped) return fail('stopped', 'daemon is stopping');
     if (!f.operationId) return fail('invalid_frame', 'operationId is empty');
     if (!f.providerMessageId) return fail('invalid_frame', 'providerMessageId is empty');
     const ch = this.channelFor(f.route);
+    if (backend !== undefined) {
+      // PB-2: only a message this backend delivered itself, in a conversation it may send to.
+      const refused = this.backendRefusal(backend, 'deliver.update', f.route, ch, { own: f.providerMessageId });
+      if (refused) return refused;
+    }
     if (!ch) return fail('unknown_channel', this.noChannelMessage(f.route));
+    const ns = backend !== undefined ? `backend:${backend}:` : 'host:';
     const adapter = ch.adapter;
     if (!adapter.edit) return fail('unsupported', `channel ${adapter.id} cannot edit a sent message`);
+    let message = f.message;
+    // PB-6: the attachments, after the scope check and after "the channel cannot edit": an update that
+    // cannot be made copies nothing to the shared store. A final update already settled is answered as
+    // the first time below: its upload may have expired since.
+    if (backend !== undefined && !(f.final && this.outbox.get(`${ns}${f.operationId}`))) {
+      const a = await this.backendAttachments(backend, 'deliver.update', f.route, message);
+      if ('refused' in a) return a.refused;
+      message = a.msg;
+    }
     const route = { ...f.route, account: ch.account };
     const id = f.providerMessageId;
     const answer = (rec: { status: string; error?: string }, duplicate: boolean) =>
       ({ ok: true as const, value: { operationId: f.operationId, providerMessageId: id, status: rec.status, ...(rec.error !== undefined ? { error: rec.error } : {}), duplicate } });
     if (f.final) {
-      const operationId = `host:${f.operationId}`;
+      const operationId = `${ns}${f.operationId}`;
       const settled = this.outbox.get(operationId);
       if (settled) return answer(settled, true);
-      const rec = await this.outbox.deliver({ operationId, sessionKey: `host:${hostName}`, route, kind: 'host', exitChecked: true }, async () => {
-        if (adapter.finalize) await adapter.finalize(route, id, f.message);
-        else await adapter.edit!(route, id, f.message, { operationId, sequence: f.sequence });
-        return { providerMessageId: id };
-      });
-      return answer(rec, false);
+      if (backend !== undefined) this.backendSends.set(operationId, backend);
+      try {
+        const rec = await this.outbox.deliver({ operationId, sessionKey: `host:${hostName}`, route, kind: 'host', exitChecked: true }, async () => {
+          if (adapter.finalize) await adapter.finalize(route, id, message);
+          else await adapter.edit!(route, id, message, { operationId, sequence: f.sequence });
+          return { providerMessageId: id };
+        });
+        return answer(rec, false);
+      } finally {
+        if (backend !== undefined) this.backendSends.delete(operationId);
+      }
     }
     try {
-      await adapter.edit(route, id, f.message, { operationId: `host:${f.operationId}`, sequence: f.sequence });
+      await adapter.edit(route, id, message, { operationId: `${ns}${f.operationId}`, sequence: f.sequence });
       return answer({ status: 'delivered' }, false);
     } catch (e) {
       return answer({ status: 'rejected', error: (e as Error).message }, false);
@@ -2328,10 +2553,15 @@ export class Gateway {
   }
 
   /** `message.ack`: the channel's mark on a message (a reaction), for the host's own handling. */
-  async ackMessage(f: Extract<HostRequestFrame, { type: 'message.ack' }>): Promise<Outcome> {
+  async ackMessage(f: Extract<HostRequestFrame, { type: 'message.ack' }>, backend?: string): Promise<Outcome> {
     if (this.stopped) return fail('stopped', 'daemon is stopping');
     if (!f.messageId) return fail('invalid_frame', 'messageId is empty');
     const ch = this.channelFor(f.route);
+    if (backend !== undefined) {
+      // PB-2: only a message it received or sent, in a conversation it may send to.
+      const refused = this.backendRefusal(backend, 'message.ack', f.route, ch, { messageId: f.messageId });
+      if (refused) return refused;
+    }
     if (!ch) return fail('unknown_channel', this.noChannelMessage(f.route));
     if (!ch.adapter.acknowledge) return fail('unsupported', `channel ${ch.adapter.id} cannot mark a message`);
     try {
@@ -4117,9 +4347,10 @@ ${a.summary}` }],
   }
 
   /** `history.read`: what the channel can tell of the conversation before a queued item (never throws for platform errors). */
-  private async hostHistory(f: Extract<HostRequestFrame, { type: 'history.read' }>): Promise<Outcome> {
+  private async hostHistory(f: Extract<HostRequestFrame, { type: 'history.read' }>, backend?: string): Promise<Outcome> {
     const item = this.hostQueue.get(f.cursor);
-    if (!item) return fail('unknown_cursor', `no queued item ${f.cursor}`);
+    // PB-1: a backend's key reads around its own items only; another's cursor answers as one that does not exist.
+    if (!item || (backend !== undefined && item.to !== backend)) return fail('unknown_cursor', `no queued item ${f.cursor}`);
     const env = item.envelope;
     const ch = this.channelFor(env);
     if (!ch?.adapter.history) return { ok: true, value: { messages: [] } };
@@ -4330,6 +4561,7 @@ ${a.summary}` }],
     this.schedules.stop();
     await within(this.schedules.idle(), 3000);
     this.host.close();
+    this.hostBlobs.close();
     // Step 4: then the modules stop, in reverse order (each bounded), while what they use still runs.
     // The external MCP endpoint is the last registered: it closes first, so no new external write comes in.
     await this.modules.stop();
@@ -4434,6 +4666,20 @@ function isHandedContext(id: string, context: Set<string>): boolean {
   return at > 0 && context.has(id.slice(0, at));
 }
 
+/** The longest text of someone else's that a log line carries whole (`logText`). */
+const LOG_TEXT_MAX = 200;
+
+/**
+ * A string a backend chose (a route, an attachment ref), for a log line: as it is when it is short
+ * printable text; otherwise cut to `LOG_TEXT_MAX` and escaped as a JSON string, with every control,
+ * format and line-separator character as `\u…`. It cannot end the line, start another or drive a terminal.
+ */
+function logText(s: string): string {
+  if (s.length <= LOG_TEXT_MAX && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cs}]/u.test(s)) return s;
+  const cut = s.length > LOG_TEXT_MAX ? `${s.slice(0, LOG_TEXT_MAX)}… (${s.length} characters)` : s;
+  return JSON.stringify(cut).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (c) => `\\u{${c.codePointAt(0)!.toString(16)}}`);
+}
+
 function fail(code: string, message = code): Outcome {
   return { ok: false, code, message };
 }
@@ -4490,6 +4736,8 @@ interface SendTime {
   provenance?: OutboundRecord['provenance'];
   /** The external MCP client that sends it (`OutboundRecord.external`). */
   external?: ExternalSender;
+  /** The backend whose key made the delivery (`OutboundRecord.backend`). */
+  backend?: string;
 }
 
 /** Per-session adapters of a launched session (`Gateway.launchAdapters`). */

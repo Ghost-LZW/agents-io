@@ -75,6 +75,12 @@
           "agent": {
             "type": "string"
           },
+          "to": {
+            "type": "string"
+          },
+          "tag": {
+            "type": "string"
+          },
           "sessionKey": {
             "type": "string"
           },

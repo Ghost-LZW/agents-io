@@ -94,6 +94,9 @@
           "type": "string"
         }
       }
+    },
+    "backend": {
+      "type": "string"
     }
   }
 }

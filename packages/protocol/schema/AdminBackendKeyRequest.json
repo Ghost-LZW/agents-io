@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/AdminBackendKeyRequest",
+  "type": "object",
+  "required": [
+    "op"
+  ],
+  "properties": {
+    "op": {
+      "anyOf": [
+        {
+          "const": "issue",
+          "type": "string"
+        },
+        {
+          "const": "rotate",
+          "type": "string"
+        },
+        {
+          "const": "revoke",
+          "type": "string"
+        }
+      ]
+    }
+  }
+}

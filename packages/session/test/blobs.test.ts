@@ -22,6 +22,42 @@ describe('FsBlobStore', () => {
     expect(st!.path.endsWith('.png')).toBe(true);
   });
 
+  it("a provisional put vouches for the bytes only: its mime and name hold until a put of the same bytes that is not provisional, whose mime, name and file extension then replace them for good; the path handed out before still reads the bytes; a provisional put never replaces anything, and without the flag the first writer's stay as before #PB-6 #MD-1", async () => {
+    const dir = join(await tmp(), 'blobs');
+    const store = new FsBlobStore({ dir });
+    const png = bytes('the bytes of a picture');
+    // A writer that only vouches for the bytes names them misleadingly.
+    const ref = await store.put(png, { mime: 'application/octet-stream', name: 'invoice.exe' }, { provisional: true });
+    const before = (await store.stat(ref))!;
+    expect(before).toMatchObject({ mime: 'application/octet-stream', name: 'invoice.exe', size: png.byteLength });
+    expect(before.path.endsWith('.bin')).toBe(true);
+    // Another provisional writer changes nothing.
+    expect(await store.put(png, { mime: 'text/plain', name: 'again.txt' }, { provisional: true })).toBe(ref);
+    expect(await store.stat(ref)).toEqual(before);
+    // The first writer that is not provisional (a channel storing an inbound picture) sets them.
+    expect(await store.put(png, { mime: 'image/png', name: 'logo.png' })).toBe(ref);
+    const after = (await store.stat(ref))!;
+    expect(after).toMatchObject({ mime: 'image/png', name: 'logo.png', size: png.byteLength });
+    expect(after.path.endsWith('.png')).toBe(true);
+    expect((await stat(after.path)).mode & 0o777).toBe(0o600);
+    expect(await store.get(ref)).toMatchObject({ mime: 'image/png', name: 'logo.png' });
+    expect(new TextDecoder().decode((await store.get(ref)).bytes)).toBe('the bytes of a picture');
+    // A path handed out while the metadata was provisional still reads the same bytes.
+    expect(await readFile(before.path, 'utf8')).toBe('the bytes of a picture');
+    // From here on nobody replaces them: not a provisional writer, not another plain one (as always).
+    await store.put(png, { mime: 'application/octet-stream', name: 'x.bin' }, { provisional: true });
+    await store.put(png, { mime: 'text/plain', name: 'other.txt' });
+    expect(await store.stat(ref)).toEqual(after);
+    // Across a restart too.
+    expect(await new FsBlobStore({ dir }).stat(ref)).toEqual(after);
+    // The same extension: only the metadata changes. No name given: none is kept.
+    const txt = bytes('some text');
+    const r2 = await store.put(txt, { mime: 'text/plain', name: 'guess.txt' }, { provisional: true });
+    await store.put(txt, { mime: 'text/plain' });
+    expect(await store.stat(r2)).toEqual({ path: (await store.stat(r2))!.path, mime: 'text/plain', size: txt.byteLength });
+    expect((await store.stat(r2))!.path.endsWith('.txt')).toBe(true);
+  });
+
   it('after a restart (a new store on the same directory) a reference reads back the same bytes, mime and name #RS-1', async () => {
     const dir = join(await tmp(), 'blobs');
     const data = new Uint8Array([0, 255, 1, 254, 128]);

@@ -22,7 +22,7 @@ const group = { id: 'g1', kind: 'group' as const };
 const OWNER: Origin = { kind: 'human', principal: { id: 'fake:alice', labels: ['owner'] }, evidence: 'device_only', via: 'local:local:main', adapter: 'local' };
 
 /** Ingress + Router (owners table + extra host rules) + host queue + watches over one SQLite log. */
-function world(o: { extra?: BindingTable['bindings']; policy?: Partial<SessionPolicy> } = {}) {
+function world(o: { extra?: BindingTable['bindings']; policy?: Partial<SessionPolicy>; backends?: string[] } = {}) {
   const log = new SqliteSessionLog();
   const hub = new Hub(log);
   const policy: SessionPolicy = { ...defaultPolicy({ owners: ['fake:alice'], selfAccounts: ['fake:mybot'], run: RUN }), ...o.policy };
@@ -41,7 +41,7 @@ function world(o: { extra?: BindingTable['bindings']; policy?: Partial<SessionPo
   watches.start();
   const config = ownersTable({ owners: ['fake:alice'], agent: 'default' });
   config.bindings.push(...(o.extra ?? []));
-  const router = new Router({ agents: [{ name: 'default', sessionPrefix: '' }, { name: 'ops', sessionPrefix: 'ops/' }], defaultAgent: 'default', config, watches, db: log.db });
+  const router = new Router({ agents: [{ name: 'default', sessionPrefix: '' }, { name: 'ops', sessionPrefix: 'ops/' }], defaultAgent: 'default', config, watches, db: log.db, ...(o.backends ? { backends: o.backends } : {}) });
   const queue = new HostQueue({ db: log.db });
   const ingress = new Ingress({ policy, lanes: lane, router, hostQueue: queue, watches, hub });
   const events = (k: string) => log.read(k, 0);
@@ -66,6 +66,74 @@ describe('Ingress through the Router', () => {
     // A second Ingress (a restart: in-memory dedup gone) gets the same queue entry back.
     const again = new Ingress({ policy: defaultPolicy({ owners: [] }), lanes: (k) => w.lanes.get(k)!, router: w.router, hostQueue: w.queue });
     expect((await again.accept({ ...env })).host).toEqual({ cursor: 1, duplicate: true, bindingId: 'invoices' });
+    await w.close();
+  });
+
+  it('an input matched for two backends becomes one item per backend; an untargeted host rule still feeds untargeted consumers only #PB-1 #HQ-2', async () => {
+    const w = world({
+      backends: ['alpha', 'beta'],
+      extra: [
+        { id: 'inv-alpha', match: { keywords: ['invoice'] }, on: 'host', to: 'alpha' },
+        { id: 'inv-beta', match: { keywords: ['invoice'] }, on: 'host', to: 'beta' },
+        { id: 'plain', match: { keywords: ['plain'] }, on: 'host' },
+      ],
+    });
+    w.queue.register('backend:alpha', 'alpha');
+    w.queue.register('backend:beta', 'beta');
+    const env = fakeEnvelope({ id: 'm-inv', sender: eve, conversation: group, text: 'the invoice is attached' });
+    const r = await w.ingress.accept(env);
+    expect(r.hosts).toEqual([{ cursor: 1, duplicate: false, bindingId: 'inv-alpha', to: 'alpha' }, { cursor: 2, duplicate: false, bindingId: 'inv-beta', to: 'beta' }]);
+    expect(r.host).toEqual({ cursor: 1, duplicate: false, bindingId: 'inv-alpha' });
+    const plain = await w.ingress.accept(fakeEnvelope({ id: 'm-plain', sender: eve, conversation: group, text: 'a plain one' }));
+    expect(plain.hosts).toEqual([{ cursor: 3, duplicate: false, bindingId: 'plain' }]);
+    // Each backend walks its own copy; the consumer without a target walks the untargeted item only.
+    const seen = async (c: string) => (await w.queue.read(c)).map((x) => [x.cursor, x.bindingId, x.to, x.input.inputId]);
+    expect(await seen('backend:alpha')).toEqual([[1, 'inv-alpha', 'alpha', r.inputId]]);
+    expect(await seen('backend:beta')).toEqual([[2, 'inv-beta', 'beta', r.inputId]]);
+    expect(await seen('xwo')).toEqual([[3, 'plain', undefined, plain.inputId]]);
+    // Both rules are explained with their backend.
+    expect(w.router.explain(r.inputId!)!.matched.filter((m) => m.on === 'host').map((m) => [m.bindingId, m.to])).toEqual([['inv-alpha', 'alpha'], ['inv-beta', 'beta']]);
+    // The message delivered again (a restart: in-memory dedup gone): each backend gets its first copy back, no new item.
+    const again = new Ingress({ policy: defaultPolicy({ owners: [] }), lanes: (k) => w.lanes.get(k)!, router: w.router, hostQueue: w.queue });
+    expect((await again.accept({ ...env })).hosts).toEqual([{ cursor: 1, duplicate: true, bindingId: 'inv-alpha', to: 'alpha' }, { cursor: 2, duplicate: true, bindingId: 'inv-beta', to: 'beta' }]);
+    expect(w.queue.head()).toBe(3);
+    await w.close();
+  });
+
+  it("a queued item carries the tag of the rule that queued it: two backends' rules give each item its own, an untagged rule's item has none, and a redelivery returns the first copy with its first tag #RT-1 #HQ-2 #PB-1", async () => {
+    const rules = (alphaTag: string): BindingTable['bindings'] => [
+      { id: 'inv-alpha', match: { keywords: ['invoice'] }, on: 'host', to: 'alpha', tag: alphaTag },
+      { id: 'inv-beta', match: { keywords: ['invoice'] }, on: 'host', to: 'beta', tag: 'guest' },
+      { id: 'inv-plain', match: { keywords: ['invoice'] }, on: 'host' },
+      { id: 'late-plain', match: { keywords: ['invoice'] }, on: 'host', tag: 'never' },
+    ];
+    const w = world({ backends: ['alpha', 'beta'], extra: rules('inbox') });
+    w.queue.register('backend:alpha', 'alpha');
+    w.queue.register('backend:beta', 'beta');
+    const env = fakeEnvelope({ id: 'm-inv', sender: eve, conversation: group, text: 'the invoice is attached' });
+    const r = await w.ingress.accept(env);
+    expect(r.hosts?.map((h) => [h.cursor, h.bindingId, h.to])).toEqual([[1, 'inv-alpha', 'alpha'], [2, 'inv-beta', 'beta'], [3, 'inv-plain', undefined]]);
+    const seen = async (c: string) => (await w.queue.read(c)).map((x) => [x.cursor, x.bindingId, x.to, x.tag]);
+    expect(await seen('backend:alpha')).toEqual([[1, 'inv-alpha', 'alpha', 'inbox']]);
+    expect(await seen('backend:beta')).toEqual([[2, 'inv-beta', 'beta', 'guest']]);
+    // The untargeted entry is the first untargeted rule's: it has no tag, and the later rule's is not borrowed.
+    const plain = await w.queue.read('xwo');
+    expect(plain.map((x) => [x.cursor, x.bindingId, x.to, x.tag])).toEqual([[3, 'inv-plain', undefined, undefined]]);
+    expect('tag' in plain[0]!).toBe(false);
+    expect(w.router.explain(r.inputId!)!.matched.filter((m) => m.on === 'host').map((m) => [m.bindingId, m.tag])).toEqual([['inv-alpha', 'inbox'], ['inv-beta', 'guest'], ['inv-plain', undefined], ['late-plain', 'never']]);
+
+    // The table changes the rule's tag, then the channel redelivers the message (a restart: in-memory dedup gone):
+    // each consumer gets its first copy back, with the tag it was queued with.
+    const config = ownersTable({ owners: ['fake:alice'], agent: 'default' });
+    config.bindings.push(...rules('chat'));
+    w.router.setConfigTable({ ...config, version: 'v2' });
+    const again = new Ingress({ policy: defaultPolicy({ owners: [] }), lanes: (k) => w.lanes.get(k)!, router: w.router, hostQueue: w.queue });
+    expect((await again.accept({ ...env })).hosts?.map((h) => [h.cursor, h.duplicate])).toEqual([[1, true], [2, true], [3, true]]);
+    expect(w.queue.head()).toBe(3);
+    expect(await seen('backend:alpha')).toEqual([[1, 'inv-alpha', 'alpha', 'inbox']]);
+    // A new message gets the new tag.
+    await again.accept(fakeEnvelope({ id: 'm-inv2', sender: eve, conversation: group, text: 'another invoice' }));
+    expect((await seen('backend:alpha')).map((x) => x[3])).toEqual(['inbox', 'chat']);
     await w.close();
   });
 

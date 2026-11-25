@@ -223,6 +223,10 @@
                       }
                     }
                   },
+                  "to": {
+                    "type": "string"
+                  },
+                  "tag": {},
                   "note": {
                     "type": "string"
                   }
@@ -526,6 +530,10 @@
                           }
                         }
                       },
+                      "to": {
+                        "type": "string"
+                      },
+                      "tag": {},
                       "note": {
                         "type": "string"
                       }

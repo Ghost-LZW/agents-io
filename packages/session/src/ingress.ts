@@ -25,7 +25,7 @@ import { channelRefOf, type HostQueue } from './host-queue.js';
 import type { Hub } from './hub.js';
 import type { CommandResult, Lane } from './lane.js';
 import { conversationRouteKey, withDefaults, type FullPolicy, type SessionPolicy } from './policy.js';
-import { Router, RouterError, defaultBindings, sourceOf, type Explanation, type RouteDelivery } from './router.js';
+import { Router, RouterError, actionIdOf as routedActionIdOf, defaultBindings, sourceOf, type Explanation, type RouteDelivery } from './router.js';
 import type { TopicRecord } from './topics.js';
 import { contentText, type WatchDelivery, type WatchDispatcher } from './watch.js';
 import { parseQuestionActionId, questionFormAnswer } from './question.js';
@@ -188,6 +188,13 @@ export interface IngressOptions {
   history?: (env: InboundEnvelope, scope: HistoryScope) => Promise<InboundEnvelope[]>;
   /** Fetching or recording history for a dispatched message failed; the message went on without it. */
   onHistoryError?: (err: unknown, a: { sessionKey: string; scope: HistoryScope; inputId: string }) => void;
+  /**
+   * The backend that sent the message a click is on, if one did (asked for clicks only). Such a
+   * click belongs to that backend (PB-1): it is not parsed as an approval, stop or question
+   * button, not handed to `onAction` or `onUndispatched`, and only rules `to` that backend
+   * can take it (`Router.route`'s `clickOf`). Without this no rule naming a backend takes a click.
+   */
+  clickOwner?: (env: InboundEnvelope) => string | undefined;
 }
 
 /** Evidence an envelope needs before its message id is trusted to name our own message (a forged copy of a mail Message-ID is not). */
@@ -254,8 +261,10 @@ export interface IngressResult {
   watched?: WatchDelivery[];
   /** Every target session, table rules and watches. */
   deliveries?: DeliveryOutcome[];
-  /** Queued for the host. */
+  /** Queued for the host: the first of `hosts`. */
   host?: { cursor: number; duplicate: boolean; bindingId: string };
+  /** Every queue entry made (one per backend a matching rule names, one for the untargeted queue); absent when none. */
+  hosts?: { cursor: number; duplicate: boolean; bindingId: string; to?: string }[];
   /** Why (also persisted: `Router.explain(inputId)`). */
   explanation?: Explanation;
   /** A command (topic or embedder) was answered instead of delivering the input. */
@@ -397,7 +406,11 @@ export class Ingress {
     // A click on an approval or stop button acts on a request or turn: it goes to the session that
     // owns it (Hub index), which re-checks who may act (resolver eligibility, Policy.control, still
     // the running turn). Other action ids are inputs and route through the bindings (`actionPrefix`).
-    const click = env.admission === 'drop' || origin.self ? undefined : actionClick(env);
+    // Except a click on a message a backend sent: it is that backend's, whatever its action id says (PB-1).
+    // Whether it is a click is the Router's test (an `action` event in any block, not only a lone one): the
+    // two must agree, or a click the Router filters would come without its owner and fall to the other rules.
+    const clickOf = this.o.clickOwner && routedActionIdOf(env) !== undefined ? this.o.clickOwner(env) : undefined;
+    const click = env.admission === 'drop' || origin.self || clickOf !== undefined ? undefined : actionClick(env);
     if (click) {
       const owner = click.kind === 'question' ? click.sessionKey
         : this.o.hub ? this.o.hub.locate(click.kind === 'interrupt' ? { turnId: click.turnId } : { requestId: click.requestId }) : conversationRouteKey(env);
@@ -428,7 +441,7 @@ export class Ingress {
       const result = await lane.command(cmd);
       return { accepted: true, action, sessionKey: owner, origin, result };
     }
-    const embedderAction = env.admission === 'drop' || origin.self || !this.o.onAction ? undefined : actionIdOf(env);
+    const embedderAction = env.admission === 'drop' || origin.self || !this.o.onAction || clickOf !== undefined ? undefined : actionIdOf(env);
     if (embedderAction !== undefined) {
       const handled = await this.o.onAction!({ actionId: embedderAction, env, origin });
       if (handled) return handled;
@@ -448,7 +461,7 @@ export class Ingress {
       ...(cause ? { cause } : {}),
       channelContext: channelContext(env, this.replyOf(env)),
     };
-    const decision = await this.router.route(env, origin, input);
+    const decision = await this.router.route(env, origin, input, clickOf !== undefined ? { clickOf } : {});
     const own = decision.deliveries.filter((d) => d.source !== 'watch');
     // Latest-wins revisions keep the original input id, but only for context-only inputs:
     // a dispatched input may already be running, so its revision is a new input.
@@ -491,13 +504,24 @@ export class Ingress {
       if (d.source === 'watch') continue;
       outcomes.push(await this.deliverOwn(d, env, origin, input));
     }
-    let host: IngressResult['host'];
-    if (decision.host) {
+    // One queue entry per backend a matching rule names, and one for the untargeted queue.
+    const hosts: NonNullable<IngressResult['hosts']> = [];
+    for (const h of decision.hosts) {
       if (this.o.hostQueue) {
         const { raw: _raw, ...envelope } = env;
-        const r = this.o.hostQueue.append({ channelRef: channelRefOf(env), account: env.account, bindingId: decision.host.bindingId, input, envelope, receivedAt: Date.now() });
-        host = { ...r, bindingId: decision.host.bindingId };
-      } else this.o.onHostUnavailable?.({ inputId: input.inputId, bindingId: decision.host.bindingId });
+        // PB-2: a click on a backend's own message is its input, but does not grant it the conversation
+        // (sending the message took one; the admin taking it away is not undone by a click on an old card).
+        const r = this.o.hostQueue.append(
+          { channelRef: channelRefOf(env), account: env.account, bindingId: h.bindingId, ...(h.to !== undefined ? { to: h.to } : {}), ...(h.tag !== undefined ? { tag: h.tag } : {}), input, envelope, receivedAt: Date.now() },
+          clickOf !== undefined ? { grantConversation: false } : {},
+        );
+        hosts.push({ ...r, bindingId: h.bindingId, ...(h.to !== undefined ? { to: h.to } : {}) });
+      } else this.o.onHostUnavailable?.({ inputId: input.inputId, bindingId: h.bindingId });
+    }
+    let host: IngressResult['host'];
+    if (hosts[0]) {
+      const { to: _to, ...first } = hosts[0];
+      host = first;
     }
     for (const d of decision.deliveries) {
       if (d.source !== 'watch' || !this.o.watches || d.watchId === undefined) continue;
@@ -524,7 +548,7 @@ export class Ingress {
       this.router.record(explanation);
     }
 
-    if (this.o.onUndispatched && !host && !outcomes.some((x) => x.on === 'dispatch')) {
+    if (this.o.onUndispatched && !hosts.length && clickOf === undefined && !outcomes.some((x) => x.on === 'dispatch')) {
       try {
         await this.o.onUndispatched({ env, origin, input });
       } catch (err) {
@@ -544,6 +568,7 @@ export class Ingress {
       ...(watched.length ? { watched } : {}),
       deliveries: outcomes,
       ...(host ? { host } : {}),
+      ...(hosts.length ? { hosts } : {}),
       explanation,
     };
   }

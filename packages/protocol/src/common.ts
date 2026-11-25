@@ -61,6 +61,17 @@ export const ContentBlock = Type.Union([
 ]);
 export type ContentBlock = Static<typeof ContentBlock>;
 
+/** A content block that carries a blob (`image`, `file`, `audio`). */
+export type MediaBlock = Extract<ContentBlock, { ref: string }>;
+
+/**
+ * The blocks of `content` that carry a blob. Another block with a stray top-level `ref` (the schema
+ * does not forbid one), a `ref` block's `uri`, text and event data do not count (SE-7, PB-6).
+ */
+export function mediaBlocks(content: readonly ContentBlock[] | undefined): MediaBlock[] {
+  return (content ?? []).filter((c): c is MediaBlock => c.type === 'image' || c.type === 'file' || c.type === 'audio');
+}
+
 /** What an adapter can prove about a sender. Evidence, not a conclusion. */
 export const Evidence = Type.Union([
   Type.Literal('platform_signed'),

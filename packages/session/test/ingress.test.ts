@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FakeHarness, fakeEnvelope } from '@agents-io/testkit';
-import { Hub, Ingress, Lane, MemorySessionLog, Router, SOURCE_MISMATCH, SqliteSessionLog, actionId, defaultPolicy, interruptActionId, ownersTable, parseActionId, type EmitSource, type SessionPolicy } from '../src/index.js';
+import { HostQueue, Hub, Ingress, Lane, MemorySessionLog, Router, SOURCE_MISMATCH, SqliteSessionLog, actionId, defaultPolicy, interruptActionId, ownersTable, parseActionId, questionActionId, type EmitSource, type IngressResult, type SessionPolicy } from '../src/index.js';
 import type { InputRecord } from '@agents-io/protocol';
 import { RUN, bodies, until } from './helpers.js';
 
@@ -150,6 +150,173 @@ describe('Ingress', () => {
     expect(await click(alice, actionId('nope', 'allow_once'))).toMatchObject({ action: 'resolve', result: { ok: false, reason: 'unknown_request' } });
     expect(parseActionId('req:a:b:deny')).toEqual({ requestId: 'a:b', kind: 'deny' });
     expect(parseActionId('req:a:answer')).toBeUndefined();
+  });
+});
+
+describe('Ingress: clicks on a backend\'s message (PB-1)', () => {
+  it('a click on a backend\'s message is never parsed as an approval, stop or question button and never handed to onAction, whatever its action id #PB-1 #RQ-1', async () => {
+    const hub = new Hub(new MemorySessionLog());
+    const policy: SessionPolicy = { ...defaultPolicy({ owners: ['fake:alice'], run: RUN }), resolve: async () => ({ kind: 'human', principals: ['fake:alice'], routes: [] }) };
+    const asked = new FakeHarness(async (t) => {
+      t.emit({ t: 'request.opened', requestId: 'r1', kind: 'tool_approval', title: 'push', risk: {}, allowedDecisions: ['allow_once', 'deny'], allowAlways: false, defaultDeny: true });
+      await t.waitDecision('r1');
+      await new Promise((_, reject) => t.signal.addEventListener('abort', () => reject(new Error('aborted'))));
+    });
+    const lanes = new Map<string, Lane>();
+    const config = ownersTable({ owners: ['fake:alice'], agent: 'default', ownerSessionKey: 'main' });
+    // Backend alpha takes every click on its own messages; beta has no rule.
+    config.bindings.unshift({ id: 'alpha-clicks', match: { actionPrefix: '' }, on: 'host', to: 'alpha' });
+    const router = new Router({ agents: [{ name: 'default', sessionPrefix: '' }], config, backends: ['alpha', 'beta'] });
+    const queue = new HostQueue();
+    queue.register('backend:alpha', 'alpha');
+    const actions: string[] = [];
+    const undispatched: string[] = [];
+    const ingress = new Ingress({
+      policy,
+      router,
+      hub,
+      hostQueue: queue,
+      lanes: (k) => {
+        let l = lanes.get(k);
+        if (!l) lanes.set(k, (l = new Lane({ sessionKey: k, harness: asked, hub, policy, thinkingHeadline: null })));
+        return l;
+      },
+      onAction: (a): IngressResult => {
+        actions.push(a.actionId);
+        return { accepted: true, action: 'command', origin: a.origin, result: { ok: true } as never };
+      },
+      onUndispatched: (a) => void undispatched.push(a.env.id),
+      // The daemon knows who sent which message (S6); here: by the clicked message's id.
+      clickOwner: (env) => {
+        const b = env.content[0];
+        const id = b?.type === 'event' ? b.data.messageId : undefined;
+        return id === 'om_alpha' ? 'alpha' : id === 'om_beta' ? 'beta' : undefined;
+      },
+    });
+    await ingress.accept(fakeEnvelope({ id: 'm0', sender: alice, text: 'ship it' }));
+    const main = () => hub.log.read('main', 0);
+    await until(() => bodies(main(), 'request.opened').length === 1);
+    const turnId = (bodies(main(), 'turn.started')[0] as { turnId: string }).turnId;
+    let n = 0;
+    const click = (aid: string, messageId: string) =>
+      ingress.accept(fakeEnvelope({ id: `click-${++n}`, sender: alice, conversation: { id: 'c1', kind: 'other' }, content: [{ type: 'event', name: 'action', data: { actionId: aid, messageId } }] }));
+
+    // Kernel button ids and an embedder's, on a message alpha sent: all four are alpha's inputs, nothing else.
+    const ids = [actionId('r1', 'allow_once'), interruptActionId(turnId), questionActionId('main', 'r1'), 'mod:anything'];
+    for (const [i, aid] of ids.entries()) {
+      const r = await click(aid, 'om_alpha');
+      expect(r).toMatchObject({ accepted: true, action: 'host', host: { cursor: i + 1, duplicate: false, bindingId: 'alpha-clicks' }, hosts: [{ cursor: i + 1, duplicate: false, bindingId: 'alpha-clicks', to: 'alpha' }] });
+      expect(r.result).toBeUndefined();
+      expect(r.deliveries).toEqual([]);
+    }
+    expect(actions).toEqual([]);
+    expect(undispatched).toEqual([]);
+    // The request is still open and the turn still running.
+    expect(hub.snapshot('main').pendingRequests.map((x) => x.requestId)).toEqual(['r1']);
+    expect(bodies(main(), 'turn.completed')).toHaveLength(0);
+    expect((await queue.read('backend:alpha')).map((x) => [x.to, x.envelope.content[0]])).toEqual(ids.map((aid) => ['alpha', { type: 'event', name: 'action', data: { actionId: aid, messageId: 'om_alpha' } }]));
+    // The explanation says which rule took it, and which were skipped.
+    const e = router.explain((await click('mod:again', 'om_alpha')).inputId!)!;
+    expect(e.matched[0]).toEqual({ bindingId: 'alpha-clicks', source: 'config', on: 'host', to: 'alpha' });
+    expect(e.matched.slice(1).every((m) => m.rejected?.code === 'click_sender')).toBe(true);
+
+    // A click on a message of beta, which has no rule for it: dropped, and still nobody else's.
+    const b = await click(actionId('r1', 'deny'), 'om_beta');
+    expect(b).toMatchObject({ accepted: true, action: 'drop', deliveries: [], explanation: { dropped: 'no_match' } });
+    expect(b.host).toBeUndefined();
+    expect(b.hosts).toBeUndefined();
+    expect(actions).toEqual([]);
+    expect(undispatched).toEqual([]);
+    expect(hub.snapshot('main').pendingRequests).toHaveLength(1);
+    expect(queue.head()).toBe(5);
+
+    // The same ids on a message no backend sent act as before: the embedder's click, then the approval.
+    expect(await click('mod:anything', 'om_other')).toMatchObject({ action: 'command' });
+    expect(actions).toEqual(['mod:anything']);
+    expect(await click(actionId('r1', 'allow_once'), 'om_other')).toMatchObject({ action: 'resolve', sessionKey: 'main', result: { ok: true } });
+    expect(await click(interruptActionId(turnId), 'om_other')).toMatchObject({ action: 'interrupt', sessionKey: 'main', result: { ok: true } });
+    await until(() => bodies(main(), 'turn.completed').length === 1);
+    expect(queue.head()).toBe(5);
+  });
+
+  it("a click that comes with other blocks is still its message's sender's: taken only by the rule to that backend, never by a rule without to or onUndispatched; a click queued for its backend grants no conversation, a message routed to it does #PB-1 #PB-2", async () => {
+    const hub = new Hub(new MemorySessionLog());
+    const policy: SessionPolicy = defaultPolicy({ owners: ['fake:alice'], run: RUN });
+    const lanes = new Map<string, Lane>();
+    const harness = new FakeHarness(async () => {});
+    const config = ownersTable({ owners: ['fake:alice'], agent: 'default', ownerSessionKey: 'main' });
+    config.bindings.unshift(
+      { id: 'to-alpha', match: { keywords: ['alpha'] }, on: 'host', to: 'alpha' },
+      { id: 'alpha-clicks', match: { actionPrefix: 'pick:' }, on: 'host', to: 'alpha' },
+      // Every click, for the untargeted queue and for a session: neither is for a click on a backend's message.
+      { id: 'host-clicks', match: { actionPrefix: '' }, on: 'host' },
+      { id: 'agent-clicks', match: { actionPrefix: '' }, on: 'dispatch', agent: 'default', session: { key: 'clicks' } },
+    );
+    const router = new Router({ agents: [{ name: 'default', sessionPrefix: '' }], config, backends: ['alpha', 'beta'] });
+    const queue = new HostQueue();
+    queue.register('backend:alpha', 'alpha');
+    const actions: string[] = [];
+    const undispatched: string[] = [];
+    const ingress = new Ingress({
+      policy,
+      router,
+      hub,
+      hostQueue: queue,
+      lanes: (k) => {
+        let l = lanes.get(k);
+        if (!l) lanes.set(k, (l = new Lane({ sessionKey: k, harness, hub, policy, thinkingHeadline: null })));
+        return l;
+      },
+      onAction: (a): IngressResult => {
+        actions.push(a.actionId);
+        return { accepted: true, action: 'command', origin: a.origin, result: { ok: true } as never };
+      },
+      onUndispatched: (a) => void undispatched.push(a.env.id),
+      // As the daemon does: the clicked message's id, in whichever block the action event is.
+      clickOwner: (env) => {
+        for (const b of env.content) {
+          if (b.type !== 'event' || b.name !== 'action') continue;
+          if (b.data.messageId === 'om_alpha') return 'alpha';
+          if (b.data.messageId === 'om_beta') return 'beta';
+        }
+        return undefined;
+      },
+    });
+    const room = { id: 'room', kind: 'group' as const };
+    const grant = { channel: 'fake', account: 'default', conversationId: 'room' };
+    const click = (id: string, actionId: string, messageId: string) =>
+      ingress.accept(fakeEnvelope({ id, sender: alice, conversation: room, content: [{ type: 'text', text: 'Yes' }, { type: 'event', name: 'action', data: { actionId, messageId } }] }));
+
+    // A text block before the action event (a bridge may send both): alpha's rule, and only alpha's.
+    const r = await click('k1', 'pick:yes', 'om_alpha');
+    expect(r).toMatchObject({ accepted: true, action: 'host', hosts: [{ cursor: 1, duplicate: false, bindingId: 'alpha-clicks', to: 'alpha' }] });
+    expect(r.hosts).toHaveLength(1);
+    expect(r.deliveries).toEqual([]);
+    expect(router.explain(r.inputId!)!.matched.map((m) => [m.bindingId, m.rejected?.code]).slice(0, 3)).toEqual([['alpha-clicks', undefined], ['host-clicks', 'click_sender'], ['agent-clicks', 'click_sender']]);
+    // On a message of beta, which has no rule for it: nobody's, and not handed on.
+    const b = await click('k2', 'pick:yes', 'om_beta');
+    expect(b).toMatchObject({ accepted: true, action: 'drop', deliveries: [] });
+    expect(b.hosts).toBeUndefined();
+    expect((await queue.read('host')).map((x) => x.envelope.id)).toEqual([]);
+    expect((await queue.read('backend:alpha')).map((x) => [x.to, x.envelope.id])).toEqual([['alpha', 'k1']]);
+    expect(lanes.has('clicks')).toBe(false);
+    expect(actions).toEqual([]);
+    expect(undispatched).toEqual([]);
+
+    // PB-2: the click gave alpha its messages (it may answer them where it may send), not the conversation.
+    expect(queue.grantedMessage('alpha', { ...grant, messageId: 'k1' })).toBe(true);
+    expect(queue.granted('alpha', grant)).toBe(false);
+    expect(queue.grantCount('alpha')).toBe(0);
+    // An input a rule routes to it does.
+    expect(await ingress.accept(fakeEnvelope({ id: 'm1', sender: alice, conversation: room, text: 'for alpha' }))).toMatchObject({ hosts: [{ bindingId: 'to-alpha', to: 'alpha' }] });
+    expect(queue.granted('alpha', grant)).toBe(true);
+    expect(queue.grantCount('alpha')).toBe(1);
+
+    // A click on nobody's message, in the same shape, goes where clicks went before.
+    const plain = await click('k3', 'pick:yes', 'om_other');
+    expect(plain.hosts).toEqual([{ cursor: 3, duplicate: false, bindingId: 'host-clicks' }]);
+    expect(plain.deliveries?.map((d) => d.sessionKey)).toContain('clicks');
+    queue.close();
   });
 });
 

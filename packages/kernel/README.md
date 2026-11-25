@@ -4,7 +4,8 @@ The agents-io daemon kernel with no module in it (`docs/design/core-slimming/` �
 gateway (ingress, the binding-table router, one lane per session, the hub, compositors and the
 outbox, watches, schedules, task runs, the host inbound queue), config resolution, the feature
 module host and the harness, channel and module registries, the module file loader, the local
-Unix socket with the client and host frames (`docs/HOSTS.md`), the daemon's records, the
+Unix socket with the client and host frames (`docs/HOSTS.md`), backends with their keys and
+blobs over host frames (`src/backends.ts`, `src/host-blobs.ts`; HOSTS §4.12, §4.13), the daemon's records, the
 mounting of the modules' admin contributions (`ChannelModule.admin`, `HarnessModule.admin`), and
 the seam to the console (`src/console-host.ts`). The console API itself, its HTTP server and the
 config file editing, is its own package, `@agents-io/console`, which depends on this one; give its

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents-io/v1/BackendsForgetResult",
+  "type": "object",
+  "required": [
+    "backend",
+    "items",
+    "routes",
+    "closed"
+  ],
+  "properties": {
+    "backend": {
+      "type": "string"
+    },
+    "items": {
+      "type": "number"
+    },
+    "routes": {
+      "type": "number"
+    },
+    "closed": {
+      "type": "number"
+    }
+  }
+}

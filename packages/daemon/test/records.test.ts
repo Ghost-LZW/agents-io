@@ -1,9 +1,11 @@
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
-import type { SendResult } from '@agents-io/protocol';
+import type { RenderedMessage, ReplyRoute, SendOp, SendResult } from '@agents-io/protocol';
 import { Hub, Outbox, SqliteSessionLog, type Delivery } from '@agents-io/session';
-import { DaemonRecords } from '@agents-io/kernel';
-import { cleanups, tmp } from './helpers.js';
+import { FakeChannel } from '@agents-io/testkit';
+import { DaemonRecords, type OutboundRecord } from '@agents-io/kernel';
+import { cleanups, daemon, tmp, until } from './helpers.js';
 
 /*
  * The daemon's records inside the outbox's settlement transaction (INVARIANTS DL-1): a write that
@@ -74,5 +76,140 @@ describe('daemon records in an atomic settlement', () => {
       expect(w.records.outboundByOperation(op), c.what).toMatchObject({ result: 'unknown' });
       expect(w.log.read('s', 0).map((e) => e.body), c.what).toEqual([{ t: 'delivery.settled', operationId: op, route, result: 'unknown' }]);
     }
+  });
+
+  it("outbound rows of a backend's deliveries name the backend, also when settled after a restart, and are kept past the retention; other rows are pruned as before #PB-2 #EX-2 #RS-1", async () => {
+    // A send that does not come back until released: its in-flight mark can be looked at.
+    class Slow extends FakeChannel {
+      release: (() => void) | undefined;
+      hold = false;
+      override async send(r: ReplyRoute, msg: RenderedMessage, op: SendOp) {
+        if (this.hold) await new Promise<void>((resolve) => (this.release = resolve));
+        return super.send(r, msg, op);
+      }
+    }
+    const raw = { backends: { alpha: {} }, bindings: [{ id: 'to-alpha', match: { channel: 'fake', keywords: ['alpha'] }, on: 'host', to: 'alpha' }] };
+    const chat = new Slow('fake');
+    const w = await daemon({ raw, chat });
+    await chat.inject({ id: 'in-1', sender: { channelUserId: 'alice', evidence: 'platform_signed' }, text: 'for alpha' });
+    await until(() => w.gw.hostQueue.head() === 1);
+    const a = await w.backend('alpha');
+    const h = await w.host({ name: 'admin' });
+    const sent = await a.c.deliver({ operationId: 'n1', route, message: { text: 'hi' } });
+    await h.deliver({ operationId: 'n1', route, message: { text: 'hi' } });
+    const rows = () => (w.gw.records.db.prepare('SELECT operation_id AS id, backend FROM daemon_outbound ORDER BY operation_id').all() as { id: string; backend: string | null }[]).map((x) => [x.id, x.backend]);
+    expect(rows()).toEqual([['backend:alpha:n1', 'alpha'], ['host:n1', null]]);
+    expect(w.gw.records.outboundByOperation('backend:alpha:n1')).toMatchObject({ backend: 'alpha', sessionKey: 'host:backend:alpha', result: 'delivered', providerMessageId: sent.providerMessageId });
+    expect('backend' in w.gw.records.outboundByOperation('host:n1')!).toBe(false);
+    expect(w.gw.records.backendSent('fake', sent.providerMessageId!)).toEqual([{ backend: 'alpha', route }]);
+    // The host's message is nobody's.
+    expect(w.gw.records.backendSent('fake', chat.sent[1]!.providerMessageId)).toEqual([]);
+    expect(w.gw.records.backendSent('other', sent.providerMessageId!)).toEqual([]);
+
+    // While a backend's send is on its way, its mark already says whose it is; the host's mark says nothing more than before.
+    chat.hold = true;
+    const going = a.c.deliver({ operationId: 'n2', route, message: { text: 'slow' } });
+    const mark = await until(() => w.gw.records.inFlight('backend:alpha:n2'));
+    expect(mark.atSend).toEqual({ backend: 'alpha' });
+    chat.release!();
+    await going;
+    const hostGoing = h.deliver({ operationId: 'n2', route, message: { text: 'slow' } });
+    const hostMark = await until(() => w.gw.records.inFlight('host:n2'));
+    expect(hostMark.atSend).toBeUndefined();
+    chat.release!();
+    await hostGoing;
+    chat.hold = false;
+    // The process dies with such a send in flight: the same mark, under an id that never settled.
+    w.gw.records.begin({ ...mark, operationId: 'backend:alpha:lost' });
+    await w.stop();
+    const again = await daemon({ raw, dir: w.dir });
+    expect(again.gw.records.outboundByOperation('backend:alpha:lost')).toMatchObject({ backend: 'alpha', sessionKey: 'host:backend:alpha', result: 'unknown' });
+    expect(again.gw.explain('backend:alpha:lost')).toMatchObject({ ok: true, value: { backend: 'alpha', result: 'unknown' } });
+    expect(again.gw.records.backendSent('fake', sent.providerMessageId!)).toEqual([{ backend: 'alpha', route }]);
+
+    // Retention (30 days): a backend's rows and the parts of its split sends stay, the others go as before.
+    const r = world();
+    const old = Date.now() - 40 * 86_400_000;
+    const row = (operationId: string, ids: string[], at: number, backend?: string): OutboundRecord =>
+      ({ operationId, channel: 'fake', providerMessageId: ids[0]!, providerMessageIds: ids, sessionKey: backend ? `host:backend:${backend}` : 'host:admin', route, result: 'delivered', ...(backend ? { backend } : {}), at });
+    r.records.putOutbound(row('backend:alpha:old', ['a1', 'a2'], old, 'alpha'));
+    r.records.putOutbound(row('host:old', ['h1', 'h2'], old));
+    r.records.putOutbound(row('host:new', ['h3', 'h4'], Date.now()));
+    expect(r.records.backendSent('fake', 'a2')).toEqual([{ backend: 'alpha', route }]);
+    // The next start prunes.
+    const next = new DaemonRecords({ db: r.db });
+    expect(next.outboundByOperation('backend:alpha:old')).toMatchObject({ backend: 'alpha' });
+    expect(['a1', 'a2'].map((id) => next.backendSent('fake', id))).toEqual([[{ backend: 'alpha', route }], [{ backend: 'alpha', route }]]);
+    expect(['a1', 'a2'].map((id) => next.sentByUs('fake', id))).toEqual([true, true]);
+    expect(next.outboundByOperation('host:old')).toBeUndefined();
+    expect(['h1', 'h2', 'h3', 'h4'].map((id) => next.sentByUs('fake', id))).toEqual([false, false, true, true]);
+    expect(next.outboundByOperation('host:new')).toMatchObject({ result: 'delivered' });
+    // A final update of the same message is one more row of the backend's: both are found.
+    next.putOutbound(row('backend:alpha:fin', ['a1'], Date.now(), 'alpha'));
+    next.putOutbound(row('host:fin', ['a1'], Date.now()));
+    expect(next.backendSent('fake', 'a1').map((x) => x.backend)).toEqual(['alpha', 'alpha']);
+  });
+
+  it('a database from before backends gains the outbound backend column at open: its rows read as before and are nobody\'s, old ones are pruned as before, and rows with and without a backend can be written #RS-1 #PB-2', () => {
+    const path = join(tmp('aio-rec-old-'), 'log.db');
+    // The outbound tables as they were before a row could name a backend (and nothing else of the daemon's).
+    const old = new DatabaseSync(path);
+    cleanups.push(() => {
+      if (old.isOpen) old.close();
+    });
+    old.exec(`
+      CREATE TABLE daemon_outbound (operation_id TEXT PRIMARY KEY, channel TEXT NOT NULL, provider_message_id TEXT, sent_message_id TEXT, at INTEGER NOT NULL, json TEXT NOT NULL) WITHOUT ROWID;
+      CREATE INDEX daemon_outbound_msg ON daemon_outbound (channel, provider_message_id);
+      CREATE INDEX daemon_outbound_sent ON daemon_outbound(channel, sent_message_id);
+      CREATE TABLE daemon_outbound_parts (channel TEXT NOT NULL, provider_message_id TEXT NOT NULL, operation_id TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (channel, provider_message_id, operation_id)) WITHOUT ROWID;
+    `);
+    const now = Date.now();
+    const stale = now - 40 * 86_400_000;
+    const before = (operationId: string, ids: string[], at: number): OutboundRecord =>
+      ({ operationId, channel: 'fake', providerMessageId: ids[0]!, providerMessageIds: ids, sessionKey: 'host:admin', route, result: 'delivered', at });
+    const put = old.prepare('INSERT INTO daemon_outbound (operation_id, channel, provider_message_id, sent_message_id, at, json) VALUES (?, ?, ?, ?, ?, ?)');
+    const part = old.prepare('INSERT INTO daemon_outbound_parts (channel, provider_message_id, operation_id, at) VALUES (?, ?, ?, ?)');
+    // A host's deliver (no turn: only `sent_message_id` names its message), recent and past the retention, each split in two.
+    for (const r of [before('host:recent', ['h1', 'h2'], now), before('host:stale', ['h3', 'h4'], stale)]) {
+      put.run(r.operationId, r.channel, null, r.providerMessageId!, r.at, JSON.stringify(r));
+      part.run(r.channel, r.providerMessageIds![1]!, r.operationId, r.at);
+    }
+    const cols = (db: DatabaseSync) => (db.prepare('PRAGMA table_info(daemon_outbound)').all() as { name: string }[]).map((c) => c.name);
+    expect(cols(old)).not.toContain('backend');
+    old.close();
+
+    // Opening it is what an upgraded daemon does at its first start: it must not fail on the missing column.
+    const db = new DatabaseSync(path);
+    cleanups.push(() => {
+      if (db.isOpen) db.close();
+    });
+    const records = new DaemonRecords({ db });
+    expect(cols(db)).toContain('backend');
+    // What was there reads as it did; no row is a backend's.
+    expect(records.outboundByOperation('host:recent')).toEqual(before('host:recent', ['h1', 'h2'], now));
+    expect(['h1', 'h2'].map((id) => records.sentByUs('fake', id))).toEqual([true, true]);
+    expect(['h1', 'h2', 'h3'].map((id) => records.backendSent('fake', id))).toEqual([[], [], []]);
+    expect((db.prepare('SELECT operation_id AS id, backend FROM daemon_outbound ORDER BY operation_id').all() as { id: string; backend: string | null }[]).map((x) => [x.id, x.backend])).toEqual([['host:recent', null]]);
+    // The row past the retention went at open, with its part, as before the column existed.
+    expect(records.outboundByOperation('host:stale')).toBeUndefined();
+    expect(['h3', 'h4'].map((id) => records.sentByUs('fake', id))).toEqual([false, false]);
+    // Both kinds of row can be written and read; replacing a row keeps working (the upsert names the new column).
+    records.putOutbound(before('host:next', ['h5'], now));
+    records.putOutbound({ ...before('backend:alpha:n1', ['a1', 'a2'], now), sessionKey: 'host:backend:alpha', backend: 'alpha' });
+    records.putOutbound({ ...before('host:recent', ['h1', 'h2'], now), result: 'delivered', agent: 'main' });
+    expect(records.outboundByOperation('host:next')).toEqual(before('host:next', ['h5'], now));
+    expect('backend' in records.outboundByOperation('host:recent')!).toBe(false);
+    expect(records.outboundByOperation('host:recent')).toMatchObject({ agent: 'main' });
+    expect(['a1', 'a2', 'h5'].map((id) => records.backendSent('fake', id))).toEqual([[{ backend: 'alpha', route }], [{ backend: 'alpha', route }], []]);
+    db.close();
+    // Opening it again changes nothing more.
+    const again = new DatabaseSync(path);
+    cleanups.push(() => {
+      if (again.isOpen) again.close();
+    });
+    const second = new DaemonRecords({ db: again });
+    expect(cols(again).filter((c) => c === 'backend')).toHaveLength(1);
+    expect(second.backendSent('fake', 'a2')).toEqual([{ backend: 'alpha', route }]);
+    expect(second.outboundByOperation('host:recent')).toMatchObject({ result: 'delivered' });
   });
 });

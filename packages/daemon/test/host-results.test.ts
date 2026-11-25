@@ -57,4 +57,28 @@ describe('host result values', () => {
     valid('session.compact', await t.sessionCompact({ sessionKey: key, inputId: 'cmp-1' }));
     valid('session.compact', await t.sessionCompact({ sessionKey: key, inputId: 'cmp-1' }));
   });
+  it('blob.stat, blob.get and blob.put answer values that match their schemas #PR-1 #PB-6', async () => {
+    const w = await daemon({ raw: { backends: { alpha: {} }, bindings: [{ id: 'to-alpha', match: { channel: 'fake' }, on: 'host', to: 'alpha' }] } });
+    const stored = await w.gw.blobs.put(Buffer.from('stored'), { mime: 'text/plain', name: 'a.txt' });
+    const b64 = (s: string) => Buffer.from(s).toString('base64');
+    // The host token, and a backend's key: the same shapes.
+    const h = await w.host({ name: 'admin' });
+    const a = (await w.backend('alpha')).c;
+    await w.chat.inject({ id: 'm1', sender: alice, content: [{ type: 'file', ref: stored, mime: 'text/plain' }] });
+    for (const c of [h, a]) {
+      const stat = await c.blobStat(stored);
+      expect(stat).toEqual({ size: 6 });
+      valid('blob.stat', stat);
+      valid('blob.stat', await c.blobStat(`sha256:${'0'.repeat(64)}`));
+      valid('blob.get', await c.blobGet({ ref: stored }));
+      valid('blob.get', await c.blobGet({ ref: stored, offset: 1, length: 2 }));
+      const whole = await c.blobPut({ base64: b64('one frame') });
+      expect(whole).toHaveProperty('ref');
+      valid('blob.put', whole);
+      const part = await c.blobPut({ base64: b64('first'), part: { upload: 'u', offset: 0 } });
+      expect(part).toEqual({ upload: 'u', received: 5 });
+      valid('blob.put', part);
+      valid('blob.put', await c.blobPut({ base64: b64(' second'), part: { upload: 'u', offset: 5, last: true } }));
+    }
+  });
 });

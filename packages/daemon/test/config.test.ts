@@ -274,4 +274,67 @@ describe('config', () => {
       expect(bad({ envKeys: [] })).toMatch(/invalid config/);
     });
   });
+
+  it('backends: ids and registered routes are checked; a binding naming an unknown backend fails the load and says which #CF-4 #PB-1', () => {
+    const bad = (raw: unknown) => {
+      try {
+        resolve(raw);
+      } catch (e) {
+        expect(e).toBeInstanceOf(ConfigError);
+        return (e as Error).message;
+      }
+      throw new Error('no error');
+    };
+    // None configured: an empty map, and nothing else about the config changes.
+    expect(resolve({}).backends).toEqual({});
+    const { backends: _none, ...plain } = resolve({});
+    const { backends, ...withBackends } = resolve({ backends: { alpha: { note: 'mine', routes: [{ channel: 'fake', account: 'default', conversationId: 'c1' }] }, 'beta.2_x-y': { history: true } } });
+    expect(backends).toEqual({
+      alpha: { id: 'alpha', note: 'mine', routes: [{ channel: 'fake', account: 'default', conversationId: 'c1' }], history: false },
+      'beta.2_x-y': { id: 'beta.2_x-y', routes: [], history: true },
+    });
+    expect({ ...withBackends, timeZone: '' }).toEqual({ ...plain, timeZone: '' });
+
+    // Ids become consumer names and operation id prefixes: lowercase, no separators that mean something elsewhere.
+    for (const id of ['Alpha', '', 'a b', '-x', '.x', 'a:b', 'a/b', 'x'.repeat(65)]) expect(bad({ backends: { [id]: {} } })).toBe(`backends: id ${JSON.stringify(id)} must match ^[a-z0-9][a-z0-9._-]{0,63}$`);
+    expect(() => resolve({ backends: { ['x'.repeat(64)]: {} } })).not.toThrow();
+    // Routes: all three fields, nothing else, none empty. Unknown keys of a backend are errors (no `callback` yet).
+    expect(bad({ backends: { alpha: { routes: [{ channel: 'fake', account: 'default' }] } } })).toMatch(/^invalid config: .*\/backends\/alpha\/routes\/0/);
+    expect(bad({ backends: { alpha: { routes: [{ channel: 'fake', account: 'default', conversationId: 'c1', threadId: 't' }] } } })).toMatch(/^invalid config: .*\/backends\/alpha\/routes\/0/);
+    expect(bad({ backends: { alpha: { routes: [{ channel: 'fake', account: 'default', conversationId: 'c1' }, { channel: 'fake', account: '', conversationId: 'c1' }] } } })).toBe('backends.alpha.routes[1]: account is empty');
+    expect(bad({ backends: { alpha: { callback: { url: 'http://127.0.0.1:1' } } } })).toMatch(/^invalid config: .*\/backends\/alpha/);
+    expect(bad({ backends: { alpha: { history: 'yes' } } })).toMatch(/^invalid config: .*\/backends\/alpha\/history/);
+    expect(bad({ backends: ['alpha'] })).toMatch(/^invalid config: .*\/backends/);
+
+    // A rule's `to`: a configured backend, on a rule that can reach the host queue.
+    const ok = resolve({ backends: { alpha: {} }, bindings: [{ id: 'r1', match: { channel: 'fake' }, on: 'host', to: 'alpha' }] });
+    expect(ok.table?.bindings).toEqual([{ id: 'r1', match: { channel: 'fake' }, on: 'host', to: 'alpha' }]);
+    expect(bad({ backends: { alpha: {} }, bindings: [{ id: 'r0', match: {}, on: 'host', to: 'alpha' }, { id: 'r1', match: {}, on: 'host', to: 'gamma' }] })).toBe('bindings: config table config, binding "r1": unknown backend "gamma" (backends: alpha)');
+    expect(bad({ bindings: [{ id: 'r1', match: {}, on: 'host', to: 'alpha' }] })).toBe('bindings: config table config, binding "r1": unknown backend "alpha" (backends: none)');
+    expect(bad({ backends: { alpha: {} }, bindings: [{ id: 'r1', match: {}, on: 'drop', to: 'alpha' }] })).toBe('bindings: config table config, binding "r1": to needs on: "host" or a callout');
+  });
+
+  it('bindings: a tag that is not 1 to 128 characters, or has a control character, on a rule that can queue for the host fails the load and says which rule; a tag key on any other rule is ignored as before #CF-4 #RT-1', () => {
+    const bad = (raw: unknown) => {
+      try {
+        resolve(raw);
+      } catch (e) {
+        expect(e).toBeInstanceOf(ConfigError);
+        return (e as Error).message;
+      }
+      throw new Error('no error');
+    };
+    // A tag is kept as written, with or without a backend; a config without tags resolves as before.
+    const ok = resolve({ backends: { alpha: {} }, bindings: [{ id: 'r1', match: { channel: 'fake' }, on: 'host', to: 'alpha', tag: 'inbox' }, { id: 'r2', match: { channel: 'fake' }, on: 'host', tag: 'chat room' }] });
+    expect(ok.table?.bindings).toEqual([{ id: 'r1', match: { channel: 'fake' }, on: 'host', to: 'alpha', tag: 'inbox' }, { id: 'r2', match: { channel: 'fake' }, on: 'host', tag: 'chat room' }]);
+    expect(JSON.stringify(resolve({ bindings: [{ id: 'r1', match: { channel: 'fake' }, on: 'host' }] }).table)).not.toContain('tag');
+    // On a rule that never queues for the host the key is not the daemon's: the config loads, whatever it holds.
+    for (const tag of ['inbox', '', 'x'.repeat(129), 'in\nbox', 5]) {
+      expect(resolve({ bindings: [{ id: 'r0', match: {}, on: 'host', tag: 'fine' }, { id: 'r1', match: {}, on: 'drop', tag }] }).table?.bindings[1]).toEqual({ id: 'r1', match: {}, on: 'drop', tag });
+    }
+    expect(bad({ bindings: [{ id: 'r0', match: {}, on: 'host', tag: 'fine' }, { id: 'r1', match: {}, on: 'host', tag: 'in\nbox' }] })).toBe('bindings: config table config, binding "r1": tag has a control character');
+    for (const tag of ['x'.repeat(129), '', 5]) {
+      expect(bad({ bindings: [{ id: 'r0', match: {}, on: 'host', tag: 'fine' }, { id: 'r1', match: {}, on: 'host', tag }] })).toBe('bindings: config table config, binding "r1": tag must be a string of 1 to 128 characters');
+    }
+  });
 });

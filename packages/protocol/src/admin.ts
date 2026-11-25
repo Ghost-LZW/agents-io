@@ -1,6 +1,6 @@
 import { Type, type Static, type TSchema } from '@sinclair/typebox';
 import { SessionInfo } from './client.js';
-import { RouteExplanation } from './host.js';
+import { BackendsForgetResult, BackendsKeyResult, BackendsListResult, RouteExplanation } from './host.js';
 import { Topic } from './topic.js';
 
 /*
@@ -25,8 +25,9 @@ import { Topic } from './topic.js';
  *
  * Errors: a non-2xx status with an `AdminError` body. Statuses: 400
  * `invalid_request`, 401 `unauthorized`, 403 `forbidden`, 404 `not_found` /
- * `unknown_input` / `unknown_job`, 409 `conflict` (stale config revision, or a
- * provisioning job already running), 422 `invalid_config`, 500 `internal`.
+ * `unknown_input` / `unknown_job` / `unknown_backend`, 409 `conflict` (stale
+ * config revision, or a provisioning job already running) / `key_exists`, 422
+ * `invalid_config`, 500 `internal`.
  *
  * Secrets never leave the daemon: the config document shows `env:NAME`
  * references as written; a literal secret in the file is shown as
@@ -253,8 +254,10 @@ export type AdminExplain = RouteExplanation;
 
 export const AdminQueueConsumer = Type.Object({
   consumer: Type.String(),
+  /** The backend whose items this consumer walks (`backend:<id>`); absent: the items routed to no backend. */
+  backend: Type.Optional(Type.String()),
   acked: Type.Number(),
-  /** Items after `acked` up to the head. */
+  /** Items after `acked` that this consumer walks (a backend's consumer: that backend's; any other: those routed to no backend). */
   pending: Type.Number(),
   /** Pushed to a connected host right now. */
   push: Type.Boolean(),
@@ -294,6 +297,24 @@ export type AdminSession = Static<typeof AdminSession>;
 export const AdminSessions = Type.Object({ sessions: Type.Array(AdminSession) });
 export type AdminSessions = Static<typeof AdminSessions>;
 
+// ---- backends ---------------------------------------------------------------
+
+/** `GET /api/backends`: what `backends.list` answers. */
+export const AdminBackends = BackendsListResult;
+export type AdminBackends = Static<typeof AdminBackends>;
+
+/** `POST /api/backends/:id/key`: as `backends.key`. 404 `unknown_backend`, 409 `key_exists`. */
+export const AdminBackendKeyRequest = Type.Object({ op: Type.Union([Type.Literal('issue'), Type.Literal('rotate'), Type.Literal('revoke')]) });
+export type AdminBackendKeyRequest = Static<typeof AdminBackendKeyRequest>;
+
+/** The key is in the answer of `issue` and `rotate` only, this once. */
+export const AdminBackendKeyResult = BackendsKeyResult;
+export type AdminBackendKeyResult = Static<typeof AdminBackendKeyResult>;
+
+/** `POST /api/backends/:id/forget` (no body): as `backends.forget`. */
+export const AdminBackendForgetResult = BackendsForgetResult;
+export type AdminBackendForgetResult = Static<typeof AdminBackendForgetResult>;
+
 // ---- endpoint table --------------------------------------------------------
 
 export interface AdminEndpoint {
@@ -319,4 +340,7 @@ export const ADMIN_ENDPOINTS = [
   { method: 'GET', path: '/api/explain/:inputId', status: 200, response: AdminExplain },
   { method: 'GET', path: '/api/queue', status: 200, response: AdminQueue },
   { method: 'GET', path: '/api/sessions', status: 200, response: AdminSessions },
+  { method: 'GET', path: '/api/backends', status: 200, response: AdminBackends },
+  { method: 'POST', path: '/api/backends/:id/key', body: AdminBackendKeyRequest, status: 200, response: AdminBackendKeyResult },
+  { method: 'POST', path: '/api/backends/:id/forget', status: 200, response: AdminBackendForgetResult },
 ] as const satisfies readonly AdminEndpoint[];

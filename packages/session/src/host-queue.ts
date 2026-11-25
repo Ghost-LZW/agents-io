@@ -1,5 +1,5 @@
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
-import type { InboundEnvelope, InboundItem } from '@agents-io/protocol';
+import { mediaBlocks, type InboundEnvelope, type InboundItem } from '@agents-io/protocol';
 
 /*
  * The durable host inbound queue (docs/HOSTS.md §2.1, decision 1). Inputs a rule
@@ -9,6 +9,13 @@ import type { InboundEnvelope, InboundItem } from '@agents-io/protocol';
  * the idempotency key: a channel redelivering a message gets the cursor of the
  * first copy. Two ways to consume, same semantics: pull (`read`, with long-poll)
  * and push (`subscribe`, which redelivers whatever is unacked after a reconnect).
+ *
+ * Items and consumers may carry a target (a backend id; `InboundItem.to`). A
+ * consumer registered with a target walks only that target's items, one without
+ * walks only items without a target; they share the cursor sequence and nothing
+ * else. Appending a targeted item also records, in the same transaction, the
+ * conversation and the messages it came from (what that target may later answer)
+ * and the blob refs of its media blocks (what that target may read and attach, PB-6).
  */
 
 export interface HostQueueOptions {
@@ -21,6 +28,15 @@ export interface HostQueueOptions {
   retainAckedMs?: number;
   /** How long a channel reference stays an idempotency key after its item was deleted (default 7 days). */
   refTtlMs?: number;
+  /** How long a message a target received stays one it may reply to or mark, and its media readable by the target (default 30 days). */
+  grantMsgTtlMs?: number;
+}
+
+/** A conversation as a target's grants are keyed: no thread, no reply target. */
+export interface GrantRoute {
+  channel: string;
+  account: string;
+  conversationId: string;
 }
 
 export interface AppendResult {
@@ -61,7 +77,7 @@ export class HostQueue {
   private readonly ownsDb: boolean;
   private readonly now: () => number;
   private q: Record<
-    'refGet' | 'refPut' | 'insert' | 'after' | 'one' | 'consumerGet' | 'consumerPut' | 'consumerAck' | 'consumers' | 'consumerDel' | 'head' | 'prune' | 'pruneRefs' | 'pending' | 'redispatchGet' | 'redispatchPut' | 'redispatchSet' | 'redispatchDel' | 'pruneRedispatch',
+    'refGet' | 'refPut' | 'trefGet' | 'trefPut' | 'pruneTrefs' | 'pruneTargeted' | 'headTarget' | 'consumerRegister' | 'consumerTarget' | 'consumersOf' | 'routePut' | 'routeGet' | 'routeCount' | 'msgPut' | 'msgGet' | 'pruneMsgs' | 'blobPut' | 'blobGet' | 'pruneBlobs' | 'forgetBlobs' | 'forgetItems' | 'forgetTrefs' | 'forgetConsumers' | 'forgetRoutes' | 'forgetMsgs' | 'insert' | 'after' | 'one' | 'consumerGet' | 'consumerPut' | 'consumerAck' | 'consumers' | 'consumerDel' | 'head' | 'prune' | 'pruneRefs' | 'pending' | 'redispatchGet' | 'redispatchPut' | 'redispatchSet' | 'redispatchDel' | 'pruneRedispatch',
     StatementSync
   >;
   private waiters = new Set<() => void>();
@@ -73,17 +89,29 @@ export class HostQueue {
     this.db = o.db ?? new DatabaseSync(o.path ?? ':memory:');
     this.now = o.now ?? Date.now;
     this.db.exec(`
-      CREATE TABLE IF NOT EXISTS host_inbound (cursor INTEGER PRIMARY KEY AUTOINCREMENT, channel_ref TEXT NOT NULL, at INTEGER NOT NULL, json TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS host_inbound (cursor INTEGER PRIMARY KEY AUTOINCREMENT, channel_ref TEXT NOT NULL, at INTEGER NOT NULL, json TEXT NOT NULL, target TEXT);
       CREATE TABLE IF NOT EXISTS host_inbound_refs (channel_ref TEXT PRIMARY KEY, cursor INTEGER NOT NULL, at INTEGER NOT NULL) WITHOUT ROWID;
-      CREATE TABLE IF NOT EXISTS host_consumers (name TEXT PRIMARY KEY, acked INTEGER NOT NULL, seen INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS host_consumers (name TEXT PRIMARY KEY, acked INTEGER NOT NULL, seen INTEGER NOT NULL, target TEXT);
       CREATE TABLE IF NOT EXISTS host_redispatch (cursor INTEGER PRIMARY KEY, at INTEGER NOT NULL, json TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS host_inbound_trefs (target TEXT NOT NULL, channel_ref TEXT NOT NULL, cursor INTEGER NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (target, channel_ref)) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS host_routes (target TEXT NOT NULL, channel TEXT NOT NULL, account TEXT NOT NULL, conversation TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (target, channel, account, conversation)) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS host_route_msgs (target TEXT NOT NULL, channel TEXT NOT NULL, account TEXT NOT NULL, message_id TEXT NOT NULL, conversation TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (target, channel, account, message_id)) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS host_blob_grants (target TEXT NOT NULL, ref TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (target, ref)) WITHOUT ROWID;
     `);
+    // `target` came later: a database from before gains the column, NULL (no target) on every row it has.
+    for (const table of ['host_inbound', 'host_consumers']) {
+      const cols = (this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((c) => c.name);
+      if (!cols.includes('target')) this.db.exec(`ALTER TABLE ${table} ADD COLUMN target TEXT`);
+    }
+    this.db.exec('CREATE INDEX IF NOT EXISTS host_inbound_target ON host_inbound (target, cursor)');
     const p = (sql: string) => this.db.prepare(sql);
     this.q = {
       refGet: p('SELECT cursor FROM host_inbound_refs WHERE channel_ref = ?'),
       refPut: p('INSERT INTO host_inbound_refs (channel_ref, cursor, at) VALUES (?, ?, ?)'),
-      insert: p('INSERT INTO host_inbound (channel_ref, at, json) VALUES (?, ?, ?)'),
-      after: p('SELECT cursor, json FROM host_inbound WHERE cursor > ? ORDER BY cursor LIMIT ?'),
+      trefGet: p('SELECT cursor FROM host_inbound_trefs WHERE target = ? AND channel_ref = ?'),
+      trefPut: p('INSERT INTO host_inbound_trefs (target, channel_ref, cursor, at) VALUES (?, ?, ?, ?)'),
+      insert: p('INSERT INTO host_inbound (channel_ref, at, json, target) VALUES (?, ?, ?, ?)'),
+      after: p('SELECT cursor, json FROM host_inbound WHERE cursor > ? AND target IS ? ORDER BY cursor LIMIT ?'),
       one: p('SELECT cursor, json FROM host_inbound WHERE cursor = ?'),
       redispatchGet: p('SELECT json FROM host_redispatch WHERE cursor = ?'),
       redispatchPut: p('INSERT INTO host_redispatch (cursor, at, json) VALUES (?, ?, ?) ON CONFLICT(cursor) DO NOTHING'),
@@ -93,20 +121,50 @@ export class HostQueue {
       consumerGet: p('SELECT acked FROM host_consumers WHERE name = ?'),
       consumerPut: p('INSERT INTO host_consumers (name, acked, seen) VALUES (?, 0, ?) ON CONFLICT(name) DO UPDATE SET seen = excluded.seen'),
       consumerAck: p('UPDATE host_consumers SET acked = MAX(acked, ?), seen = ? WHERE name = ?'),
-      consumers: p('SELECT name, acked, seen FROM host_consumers ORDER BY name'),
+      consumerRegister: p('INSERT INTO host_consumers (name, acked, seen, target) VALUES (?, 0, ?, ?) ON CONFLICT(name) DO UPDATE SET target = excluded.target, seen = excluded.seen'),
+      consumerTarget: p('SELECT target FROM host_consumers WHERE name = ?'),
+      consumersOf: p('SELECT name FROM host_consumers WHERE target = ?'),
+      consumers: p('SELECT name, acked, seen, target FROM host_consumers ORDER BY name'),
       consumerDel: p('DELETE FROM host_consumers WHERE name = ?'),
       head: p("SELECT seq FROM sqlite_sequence WHERE name = 'host_inbound'"),
-      prune: p('DELETE FROM host_inbound WHERE cursor <= ? AND at < ?'),
+      headTarget: p('SELECT MAX(cursor) AS head FROM host_inbound WHERE target = ?'),
+      prune: p('DELETE FROM host_inbound WHERE target IS NULL AND cursor <= ? AND at < ?'),
+      // One target's items up to what all its consumers acked (walks the (target, cursor) index, not the table).
+      pruneTargeted: p('DELETE FROM host_inbound WHERE target = ? AND cursor <= ? AND at < ?'),
+      pruneTrefs: p('DELETE FROM host_inbound_trefs WHERE at < ? AND cursor NOT IN (SELECT cursor FROM host_inbound)'),
+      routePut: p('INSERT INTO host_routes (target, channel, account, conversation, at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(target, channel, account, conversation) DO NOTHING'),
+      routeGet: p('SELECT 1 AS ok FROM host_routes WHERE target = ? AND channel = ? AND account = ? AND conversation = ?'),
+      routeCount: p('SELECT COUNT(*) AS n FROM host_routes WHERE target = ?'),
+      msgPut: p('INSERT INTO host_route_msgs (target, channel, account, message_id, conversation, at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(target, channel, account, message_id) DO UPDATE SET conversation = excluded.conversation, at = excluded.at'),
+      msgGet: p('SELECT 1 AS ok FROM host_route_msgs WHERE target = ? AND channel = ? AND account = ? AND message_id = ? AND conversation = ? AND at >= ?'),
+      pruneMsgs: p('DELETE FROM host_route_msgs WHERE at < ?'),
+      blobPut: p('INSERT INTO host_blob_grants (target, ref, at) VALUES (?, ?, ?) ON CONFLICT(target, ref) DO UPDATE SET at = excluded.at'),
+      blobGet: p('SELECT 1 AS ok FROM host_blob_grants WHERE target = ? AND ref = ? AND at >= ?'),
+      pruneBlobs: p('DELETE FROM host_blob_grants WHERE at < ?'),
+      forgetBlobs: p('DELETE FROM host_blob_grants WHERE target = ?'),
+      forgetItems: p('DELETE FROM host_inbound WHERE target = ?'),
+      forgetTrefs: p('DELETE FROM host_inbound_trefs WHERE target = ?'),
+      forgetConsumers: p('DELETE FROM host_consumers WHERE target = ?'),
+      forgetRoutes: p('DELETE FROM host_routes WHERE target = ?'),
+      forgetMsgs: p('DELETE FROM host_route_msgs WHERE target = ?'),
       pruneRefs: p('DELETE FROM host_inbound_refs WHERE at < ? AND cursor NOT IN (SELECT cursor FROM host_inbound)'),
-      pending: p('SELECT COUNT(*) AS n, MIN(at) AS oldest FROM host_inbound WHERE cursor > ?'),
+      pending: p('SELECT COUNT(*) AS n, MIN(at) AS oldest FROM host_inbound WHERE cursor > ? AND target IS ?'),
     };
   }
 
-  /** Append an item; a channel reference seen before returns the first copy's cursor. */
-  append(item: Omit<InboundItem, 'cursor'>): AppendResult {
+  /**
+   * Append an item; a channel reference seen before returns the first copy's cursor.
+   * An item with `to` is deduplicated per target (the same message for two targets is
+   * two items), and grants its target the conversation and messages of its reply route.
+   * `o.grantConversation: false` (a click on a message the target sent itself): the
+   * messages only. Sending that message already took the conversation; a click, which
+   * its sender cannot stop people from making, must not give it back once it was taken away.
+   */
+  append(item: Omit<InboundItem, 'cursor'>, o: { grantConversation?: boolean } = {}): AppendResult {
     // Message ids are unique per account: dedup on (account, channelRef).
     const key = `${item.account}\n${item.channelRef}`;
-    const prior = this.q.refGet.get(key) as { cursor: number } | undefined;
+    const to = item.to;
+    const prior = (to !== undefined ? this.q.trefGet.get(to, key) : this.q.refGet.get(key)) as { cursor: number } | undefined;
     if (prior) return { cursor: prior.cursor, duplicate: true };
     const at = this.now();
     let cursor: number;
@@ -114,8 +172,24 @@ export class HostQueue {
     try {
       const { raw: _raw, ...envelope } = item.envelope;
       const stored = { ...item, envelope };
-      cursor = Number(this.q.insert.run(item.channelRef, at, JSON.stringify(stored)).lastInsertRowid);
-      this.q.refPut.run(key, cursor, at);
+      cursor = Number(this.q.insert.run(item.channelRef, at, JSON.stringify(stored), to ?? null).lastInsertRowid);
+      if (to === undefined) this.q.refPut.run(key, cursor, at);
+      else {
+        this.q.trefPut.run(to, key, cursor, at);
+        const r = item.input.replyRoute;
+        if (r) {
+          if (o.grantConversation !== false) this.q.routePut.run(to, r.channel, r.account, r.conversationId, at);
+          // Both ids: a card click's envelope id is not a message, its reply target is the card.
+          for (const id of new Set([item.envelope.id, r.replyToMessageId])) {
+            if (id) this.q.msgPut.run(to, r.channel, r.account, id, r.conversationId, at);
+          }
+        }
+        // PB-6: the media of an item routed to a target is the target's to read and attach, whatever
+        // the item is (no reply route, a click). Only media blocks count: a ref anywhere else grants nothing.
+        for (const ref of new Set([...mediaBlocks(stored.input.content), ...mediaBlocks(stored.envelope.content)].map((b) => b.ref))) {
+          if (typeof ref === 'string' && ref) this.q.blobPut.run(to, ref, at);
+        }
+      }
       this.db.exec('COMMIT');
     } catch (e) {
       this.db.exec('ROLLBACK');
@@ -137,13 +211,44 @@ export class HostQueue {
     return (this.q.consumerGet.get(consumer) as { acked: number }).acked;
   }
 
-  consumers(): { name: string; acked: number; seen: number }[] {
-    return this.q.consumers.all() as { name: string; acked: number; seen: number }[];
+  /**
+   * Make `consumer` known and set which items it walks: `target`'s, or (without one)
+   * the items without a target. Its acked cursor is kept.
+   */
+  register(consumer: string, target?: string): void {
+    if (!consumer) throw new Error('consumer name is empty');
+    this.q.consumerRegister.run(consumer, this.now(), target ?? null);
   }
 
-  /** How many items there are after `after`, and when the oldest of them arrived (Unix ms). Reads only. */
-  pending(after: number): { count: number; oldestAt?: number } {
-    const r = this.q.pending.get(after) as { n: number; oldest: number | null };
+  /** The target a known consumer walks (undefined: none, or not a known consumer). Reads only. */
+  consumerTarget(consumer: string): string | undefined {
+    const r = this.q.consumerTarget.get(consumer) as { target: string | null } | undefined;
+    return r?.target ?? undefined;
+  }
+
+  /**
+   * The highest cursor this consumer can reach (registers it): the queue's head, or
+   * for a consumer with a target the last of its target's items (never below what it acked).
+   */
+  headOf(consumer: string): number {
+    const acked = this.cursor(consumer);
+    const target = this.consumerTarget(consumer);
+    if (target === undefined) return this.head();
+    const r = this.q.headTarget.get(target) as { head: number | null };
+    return Math.max(acked, r.head ?? 0);
+  }
+
+  /** Known consumers; `target` only on those that have one. */
+  consumers(): { name: string; acked: number; seen: number; target?: string }[] {
+    return (this.q.consumers.all() as { name: string; acked: number; seen: number; target: string | null }[]).map(({ target, ...c }) => (target === null ? c : { ...c, target }));
+  }
+
+  /**
+   * How many items of `target` (default: items without one) there are after `after`,
+   * and when the oldest of them arrived (Unix ms). Reads only.
+   */
+  pending(after: number, target?: string): { count: number; oldestAt?: number } {
+    const r = this.q.pending.get(after, target ?? null) as { n: number; oldest: number | null };
     return { count: r.n, ...(r.oldest !== null ? { oldestAt: r.oldest } : {}) };
   }
 
@@ -158,8 +263,8 @@ export class HostQueue {
     this.q.consumerPut.run(consumer, this.now());
   }
 
-  private load(after: number, limit: number): InboundItem[] {
-    return (this.q.after.all(after, Math.max(1, Math.min(limit, 10_000))) as { cursor: number; json: string }[]).map((r) => ({ ...(JSON.parse(r.json) as Omit<InboundItem, 'cursor'>), cursor: r.cursor }));
+  private load(after: number, limit: number, target: string | undefined): InboundItem[] {
+    return (this.q.after.all(after, target ?? null, Math.max(1, Math.min(limit, 10_000))) as { cursor: number; json: string }[]).map((r) => ({ ...(JSON.parse(r.json) as Omit<InboundItem, 'cursor'>), cursor: r.cursor }));
   }
 
   /** One queued item by cursor (undefined once pruned, or never queued). */
@@ -203,9 +308,10 @@ export class HostQueue {
     const after = o.after ?? this.cursor(consumer);
     if (o.after !== undefined) this.touch(consumer);
     const limit = o.limit ?? 100;
+    const target = this.consumerTarget(consumer);
     const deadline = this.now() + (o.waitMs ?? 0);
     for (;;) {
-      const items = this.load(after, limit);
+      const items = this.load(after, limit, target);
       const left = deadline - this.now();
       if (items.length || left <= 0 || this.closed || o.signal?.aborted) return items;
       await this.waitAppend(left, o.signal);
@@ -214,26 +320,90 @@ export class HostQueue {
 
   /** Move the consumer's cursor forward (never back). Returns the acked cursor. */
   ack(consumer: string, cursor: number): number {
-    this.touch(consumer);
-    const c = Math.min(Math.max(0, Math.floor(cursor)), this.head());
+    const c = Math.min(Math.max(0, Math.floor(cursor)), this.headOf(consumer));
     this.q.consumerAck.run(c, this.now(), consumer);
     this.prune();
     return this.cursor(consumer);
   }
 
   /**
-   * Delete items every known consumer has acked, once older than `retainAckedMs`.
-   * Without any known consumer nothing is deleted. Returns how many were deleted.
+   * Delete items every known consumer of theirs has acked, once older than
+   * `retainAckedMs`: items without a target count the consumers without one, a
+   * target's items count that target's consumers. Without any known consumer
+   * nothing is deleted. Returns how many were deleted.
    */
   prune(): number {
     const cs = this.consumers();
     if (!cs.length) return 0;
-    const min = Math.min(...cs.map((c) => c.acked));
+    const plain = cs.filter((c) => c.target === undefined);
     const now = this.now();
-    const n = Number(this.q.prune.run(min, now - (this.o.retainAckedMs ?? DAY)).changes);
+    const before = now - (this.o.retainAckedMs ?? DAY);
+    let n = plain.length ? Number(this.q.prune.run(Math.min(...plain.map((c) => c.acked)), before).changes) : 0;
+    // A targeted item goes once every consumer of its target acked it; a target nobody consumes keeps its items.
+    const acked = new Map<string, number>();
+    for (const c of cs) if (c.target !== undefined) acked.set(c.target, Math.min(acked.get(c.target) ?? Infinity, c.acked));
+    for (const [target, upTo] of acked) if (upTo > 0) n += Number(this.q.pruneTargeted.run(target, upTo, before).changes);
     this.q.pruneRefs.run(now - (this.o.refTtlMs ?? 7 * DAY));
+    this.q.pruneTrefs.run(now - (this.o.refTtlMs ?? 7 * DAY));
+    this.q.pruneMsgs.run(now - (this.o.grantMsgTtlMs ?? 30 * DAY));
+    this.q.pruneBlobs.run(now - (this.o.grantMsgTtlMs ?? 30 * DAY));
     this.q.pruneRedispatch.run(now - (this.o.refTtlMs ?? 7 * DAY));
     return n;
+  }
+
+  /** Whether an item routed to `target` came from this conversation (any thread). Never lapses. */
+  granted(target: string, r: GrantRoute): boolean {
+    return this.q.routeGet.get(target, r.channel, r.account, r.conversationId) !== undefined;
+  }
+
+  /**
+   * Whether `messageId` is a message of this conversation that `target` received
+   * (an item's envelope id or its reply target) within `grantMsgTtlMs`.
+   */
+  grantedMessage(target: string, r: GrantRoute & { messageId: string }): boolean {
+    const since = this.now() - (this.o.grantMsgTtlMs ?? 30 * DAY);
+    return this.q.msgGet.get(target, r.channel, r.account, r.messageId, r.conversationId, since) !== undefined;
+  }
+
+  /**
+   * PB-6: whether `ref` is the blob of a media block (`image`, `file`, `audio`) of an item routed
+   * to `target` within `grantMsgTtlMs`.
+   */
+  grantedBlob(target: string, ref: string): boolean {
+    const since = this.now() - (this.o.grantMsgTtlMs ?? 30 * DAY);
+    return this.q.blobGet.get(target, ref, since) !== undefined;
+  }
+
+  /** How many conversations `target` was granted by the items routed to it. */
+  grantCount(target: string): number {
+    return (this.q.routeCount.get(target) as { n: number }).n;
+  }
+
+  /**
+   * Remove everything kept for `target`: its items, their idempotency keys, its
+   * consumers (their pushes are closed first) and its grants (media grants too). Others are untouched.
+   * `o.consumer`: a consumer name to remove as well, whatever it walks (the name a
+   * target's consumer goes by, registered without the target before targets existed:
+   * such a row counts for the untargeted items' retention and nothing else removes it).
+   */
+  forgetTarget(target: string, o: { consumer?: string } = {}): { items: number; routes: number } {
+    for (const c of this.q.consumersOf.all(target) as { name: string }[]) this.pushes.get(c.name)?.close();
+    if (o.consumer !== undefined) this.pushes.get(o.consumer)?.close();
+    this.db.exec('BEGIN');
+    try {
+      const items = Number(this.q.forgetItems.run(target).changes);
+      this.q.forgetTrefs.run(target);
+      this.q.forgetConsumers.run(target);
+      if (o.consumer !== undefined) this.q.consumerDel.run(o.consumer);
+      const routes = Number(this.q.forgetRoutes.run(target).changes);
+      this.q.forgetMsgs.run(target);
+      this.q.forgetBlobs.run(target);
+      this.db.exec('COMMIT');
+      return { items, routes };
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw e;
+    }
   }
 
   /**
@@ -268,8 +438,8 @@ export class HostQueue {
   }
 
   /** @internal */
-  next(after: number): InboundItem | undefined {
-    return this.load(after, 1)[0];
+  next(after: number, target?: string): InboundItem | undefined {
+    return this.load(after, 1, target)[0];
   }
 
   close(): void {
@@ -297,8 +467,10 @@ class Push implements PushSubscription {
   private async run(): Promise<void> {
     const signal = this.ac.signal;
     let after = this.queue.cursor(this.consumer);
+    // Taken once: a consumer's target is set before it subscribes.
+    const target = this.queue.consumerTarget(this.consumer);
     while (!signal.aborted) {
-      const item = this.queue.next(after);
+      const item = this.queue.next(after, target);
       if (!item) {
         await this.queue.waitAppend(60_000, signal);
         continue;
@@ -311,7 +483,8 @@ class Push implements PushSubscription {
       }
       if (signal.aborted) {
         // Closed while the host had it: an accepted item still counts; anything else waits for the next subscription.
-        if (ok) this.queue.ack(this.consumer, item.cursor);
+        // Not for a target that was forgotten meanwhile: an ack would bring the consumer back without its target.
+        if (ok && this.queue.consumerTarget(this.consumer) === target) this.queue.ack(this.consumer, item.cursor);
         return;
       }
       if (ok) after = this.queue.ack(this.consumer, item.cursor);

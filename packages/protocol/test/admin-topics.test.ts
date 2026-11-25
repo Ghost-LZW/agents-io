@@ -2,12 +2,16 @@ import { describe, expect, it } from 'vitest';
 import {
   ADMIN_ENDPOINTS,
   ADMIN_WS_SUBPROTOCOL,
+  AdminBackendKeyRequest,
   AdminHostState,
+  BackendsKeyResult,
+  BackendsListResult,
   Binding,
   BindingsGetResult,
   CLIENT_FRAME_TYPES,
   ClientFrame,
   DeliverResult,
+  EffectExplanation,
   HOST_REQUEST_FRAME_TYPES,
   HOST_RESULT_VALUES,
   HostHello,
@@ -102,6 +106,32 @@ describe('host protocol additions', () => {
     const item = { cursor: 1, channelRef: 'channel:lark-bot/m1', account: 'default', bindingId: 'b', input, envelope: env, receivedAt: 1 };
     expect(errors(InboundReadResult, { items: [item], acked: 0, head: 1 })).toEqual([]);
     expect(errors(HOST_RESULT_VALUES.explain, explanation)).toEqual([]);
+    // Backends: data fields only, all optional.
+    expect(errors(InboundReadResult, { items: [{ ...item, to: 'alpha' }], acked: 0, head: 1 })).toEqual([]);
+    expect(check(InboundReadResult, { items: [{ ...item, to: 1 }], acked: 0, head: 1 })).toBe(false);
+    const backendHello = { name: 'backend:alpha', protocol: 1, host: false, backend: { id: 'alpha' }, bindings: { version: null, active: false }, inbound: { consumer: 'backend:alpha', acked: 0, head: 0 }, features: ['backends'] };
+    expect(errors(HostHelloResult, backendHello)).toEqual([]);
+    expect(check(HostHelloResult, { ...backendHello, backend: {} })).toBe(false);
+    const effect = { operationId: 'backend:alpha:o1', sessionKey: 'host:backend:alpha', inputIds: [], route, result: 'delivered', at: 1, backend: 'alpha' };
+    expect(errors(EffectExplanation, effect)).toEqual([]);
+    expect(errors(HOST_RESULT_VALUES.explain, effect)).toEqual([]);
+    expect(check(EffectExplanation, { ...effect, backend: 1 })).toBe(false);
+    expect(errors(HOST_RESULT_VALUES.explain, { ...explanation, matched: [{ bindingId: 'b', source: 'config', on: 'host', to: 'alpha', rejected: { code: 'click_sender' } }] })).toEqual([]);
+    // Backend administration frames (PB-3) and their results.
+    for (const t of ['backends.list', 'backends.key', 'backends.forget']) expect(HOST_REQUEST_FRAME_TYPES).toContain(t);
+    expect(check(HostRequestFrame, { v: 1, type: 'backends.list', id: '1' })).toBe(true);
+    for (const op of ['issue', 'rotate', 'revoke']) expect(check(HostRequestFrame, { v: 1, type: 'backends.key', id: '2', backend: 'alpha', op })).toBe(true);
+    expect(check(HostRequestFrame, { v: 1, type: 'backends.key', id: '2', backend: 'alpha', op: 'show' })).toBe(false);
+    expect(check(HostRequestFrame, { v: 1, type: 'backends.key', id: '2', op: 'issue' })).toBe(false);
+    expect(check(HostRequestFrame, { v: 1, type: 'backends.forget', id: '3', backend: 'alpha' })).toBe(true);
+    expect(check(HostRequestFrame, { v: 1, type: 'backends.forget', id: '3' })).toBe(false);
+    const info = { id: 'alpha', configured: true, history: false, connections: 0, push: false, consumer: 'backend:alpha', acked: 0, pending: 0, routes: { registered: 0, granted: 0 } };
+    expect(errors(BackendsListResult, { backends: [info, { ...info, id: 'beta', configured: false, note: 'n', key: { id: '0123456789ab', createdAt: 1 }, oldestPendingAt: 1 }] })).toEqual([]);
+    expect(check(BackendsListResult, { backends: [{ ...info, key: { id: 1 } }] })).toBe(false);
+    expect(errors(BackendsKeyResult, { backend: 'alpha', op: 'issue', key: 'aiob_not-a-real-key', keyId: '0123456789ab', createdAt: 1, closed: 0 })).toEqual([]);
+    expect(errors(BackendsKeyResult, { backend: 'alpha', op: 'revoke', closed: 1 })).toEqual([]);
+    expect(check(BackendsKeyResult, { backend: 'alpha', op: 'revoke' })).toBe(false);
+    expect(errors(HOST_RESULT_VALUES['backends.forget'], { backend: 'alpha', items: 2, routes: 1, closed: 0 })).toEqual([]);
     expect(errors(RouteCalloutAnswer, { on: 'context', session: 'topic' })).toEqual([]);
   });
 });
@@ -110,13 +140,20 @@ describe('admin API', () => {
   it('lists every endpoint once, with schemas #PR-1', () => {
     const keys = ADMIN_ENDPOINTS.map((e) => `${e.method} ${e.path}`);
     expect(new Set(keys).size).toBe(keys.length);
-    for (const k of ['GET /api/status', 'GET /api/config', 'PUT /api/config', 'POST /api/config/validate', 'GET /api/explain/:inputId', 'GET /api/queue', 'GET /api/sessions']) {
+    for (const k of ['GET /api/status', 'GET /api/config', 'PUT /api/config', 'POST /api/config/validate', 'GET /api/explain/:inputId', 'GET /api/queue', 'GET /api/sessions', 'GET /api/backends', 'POST /api/backends/:id/key', 'POST /api/backends/:id/forget']) {
       expect(keys).toContain(k);
     }
     for (const e of ADMIN_ENDPOINTS) {
       expect(e.response).toBeTypeOf('object');
       if (e.method === 'GET') expect('body' in e).toBe(false);
     }
+    // Backend administration (PB-3): the same shapes as the `backends.*` host frames.
+    const at = (k: string) => ADMIN_ENDPOINTS.find((e) => `${e.method} ${e.path}` === k)!;
+    expect(at('GET /api/backends').response).toBe(BackendsListResult);
+    expect(at('POST /api/backends/:id/key')).toMatchObject({ body: AdminBackendKeyRequest, response: BackendsKeyResult });
+    expect('body' in at('POST /api/backends/:id/forget')).toBe(false);
+    expect(check(AdminBackendKeyRequest, { op: 'rotate' })).toBe(true);
+    expect(check(AdminBackendKeyRequest, { op: 'show' })).toBe(false);
     expect(ADMIN_WS_SUBPROTOCOL).toBe('agents-io.v1');
   });
 });

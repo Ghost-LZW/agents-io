@@ -151,6 +151,7 @@ describe('the module registry', () => {
     expect(bad({ commands: [{ name: 'probe', aliases: ['probe'], help: '/probe' }] })).toThrow("module probe: command /probe is also module probe's");
     expect(bad({ commands: [{ name: 'probe', help: '/probe', helpBefore: 'model' }] })).toThrow('module probe: commands: /probe: helpBefore "model" is not a kernel command (help, status, stop, steer, answer, new, topics, switch, tui)');
     expect(bad({ features: ['session.launch'] })).toThrow('module probe: feature "session.launch" is the kernel\'s');
+    expect(bad({ features: ['backends'] })).toThrow('module probe: feature "backends" is the kernel\'s');
     expect(bad({ needs: ['module:nope'] })).toThrow('module probe: needs module nope, which is not registered');
     expect(bad({ needs: ['kernel:nope'] })).toThrow('module probe: needs: "kernel:nope" is neither module:<id> nor kernel:<capability>');
     expect(bad({ admin: {} })).toThrow('module probe: admin (an AdminContribution) is not served for feature modules yet');
@@ -346,7 +347,7 @@ const KERNEL_HELLO = [
   'session.launch', 'callouts.resolve', 'callouts.review', 'resolve.native', 'resolver.human.extras', 'callouts.outbound', 'callouts.contact',
   'inbound.redispatch', 'host.takeover', 'explain.chain', 'run.overrides', 'run.ended.usage', 'run.correlation', 'callouts.external', 'session.compact',
   'session.prewarm', 'callouts.outbound.content', 'callouts.outbound.scope', 'reply.check', 'callout.history', 'item.tool', 'deliver.update',
-  'conversation.create', 'message.ack', 'schedules', 'history', 'host-mcp.send_file.blob_scoped', 'client.opId', 'attention',
+  'conversation.create', 'message.ack', 'schedules', 'history', 'host-mcp.send_file.blob_scoped', 'client.opId', 'attention', 'binding.tag', 'blobs',
 ];
 
 describe('modules in the daemon (lifecycle steps 2-4)', () => {
@@ -355,7 +356,7 @@ describe('modules in the daemon (lifecycle steps 2-4)', () => {
       'session.launch', 'callouts.resolve', 'callouts.review', 'resolve.native', 'resolver.human.extras', 'callouts.outbound', 'callouts.contact', 'resolve.onBehalfOf',
       'inbound.redispatch', 'host.takeover', 'explain.chain', 'run.overrides', 'run.ended.usage', 'run.correlation', 'callouts.external', 'session.compact',
       'session.prewarm', 'test.hooks', 'callouts.outbound.content', 'callouts.outbound.scope', 'reply.check', 'callout.history', 'item.tool', 'deliver.update',
-      'conversation.create', 'message.ack', 'schedules', 'history', 'host-mcp.send_file.blob_scoped', 'client.opId', 'attention',
+      'conversation.create', 'message.ack', 'schedules', 'history', 'host-mcp.send_file.blob_scoped', 'client.opId', 'attention', 'binding.tag', 'blobs',
     ]);
     const w = await daemon(new ModuleRegistry([]));
     expect(await features(w.socketPath)).toEqual(KERNEL_HELLO);

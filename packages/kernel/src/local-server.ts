@@ -12,8 +12,12 @@ import type { Outcome } from './gateway.js';
 /** One socket connection, as the host protocol sees it. */
 export interface Peer {
   readonly id: string;
-  /** Set once `host.hello` succeeded: the connection's host name and the origin its client frames carry. */
-  auth?: { name: string; origin: (sessionKey: string) => Origin };
+  /**
+   * Set once `host.hello` succeeded: the connection's host name and the origin its client frames carry.
+   * `backend` (PB-1): the hello was made with a backend's key, not the host token. Such a connection
+   * speaks only the host frames the backend whitelist names, and no client frame.
+   */
+  auth?: { name: string; origin: (sessionKey: string) => Origin; backend?: { id: string; keyId: string } };
   /** Write a frame; false when the connection is gone. */
   send(frame: Record<string, unknown>): boolean;
   /** Send a request frame (an `id` is added) and wait for the peer's `result`; a closed connection or the timeout answers `ok: false`. */
@@ -22,12 +26,22 @@ export interface Peer {
   readonly signal: AbortSignal;
   /** Close the connection (a host taken over); reports it gone. */
   end?(reason: string): void;
+  /**
+   * Resolves once what was sent is written out, or the connection is gone; at once when nothing is
+   * held back. For answers that are large and asked for one after another (`blob.get`, PR-2).
+   */
+  flushed?(): Promise<void>;
 }
 
 /** Host-protocol frames (docs/HOSTS.md §4), handled by the daemon. */
 export interface HostFrames {
   handle(peer: Peer, frame: HostRequestFrame): Promise<Outcome>;
   gone(peer: Peer): void;
+  /**
+   * A connection admitted with backend `id`'s key before any `host.hello` (the console's `/ws`):
+   * it is that backend's from now on, so its key going away closes it too (PB-3).
+   */
+  attachBackend?(peer: Peer, id: string): void;
 }
 
 /** What the socket server needs from the gateway. */
@@ -177,6 +191,12 @@ export interface FrameTransport {
   write(frame: Record<string, unknown>): boolean;
   /** Resolves when writing may continue, or the transport is gone. */
   drained(): Promise<void>;
+  /**
+   * Resolves once every frame written so far has left this process (or the transport is gone); at
+   * once when nothing is held. For a transport whose `write` reports the buffer full only far above
+   * one large answer (`/ws`); without it a connection waits on `drained` after a `write` that said so.
+   */
+  flushed?(): Promise<void>;
   /** True once the transport cannot write any more. */
   readonly gone: boolean;
   /** Close after flushing. */
@@ -214,6 +234,11 @@ function socketTransport(socket: Socket): FrameTransport {
 export interface FrameConnOptions {
   /** Origin of client frames before `host.hello` (default: the host's local origin). */
   origin?: (sessionKey: string) => Origin;
+  /**
+   * The connection was admitted with this backend's key (the console's `/ws`, PB-1): it sends no
+   * client frame, before `host.hello` or after it, and its `host.hello` must be that backend's key.
+   */
+  backend?: string;
 }
 
 let connSeq = 0;
@@ -230,6 +255,8 @@ export class FrameConn implements Peer {
   /** Requests this side sent (inbound pushes, callouts), by id. */
   private readonly pending = new Map<string, (r: ResultFrame) => void>();
   private closed = false;
+  /** A write did not go out at once: resolves when the transport drained (or is gone). */
+  private backlog: Promise<void> | undefined;
   /** Set once a feature module took the connection (`module.connect`): every value from the far end is its. */
   private taken: ((value: unknown) => void) | undefined;
   /** While a `module.connect` is being answered: what came meanwhile, in order (the module's if it takes the connection, else frames). */
@@ -264,7 +291,19 @@ export class FrameConn implements Peer {
 
   send(f: ServerFrame | Record<string, unknown>): boolean {
     if (this.closed || this.transport.gone) return false;
-    return this.transport.write(f);
+    const written = this.transport.write(f);
+    if (!written && !this.transport.gone && !this.backlog) {
+      const clear = () => {
+        this.backlog = undefined;
+      };
+      this.backlog = this.transport.drained().then(clear, clear);
+    }
+    return written;
+  }
+
+  flushed(): Promise<void> {
+    if (this.closed || this.transport.gone) return Promise.resolve();
+    return this.transport.flushed?.() ?? this.backlog ?? Promise.resolve();
   }
 
   request(frame: Record<string, unknown>, timeoutMs = 60_000): Promise<ResultFrame> {
@@ -316,6 +355,13 @@ export class FrameConn implements Peer {
       return;
     }
     if (typeof type === 'string' && HOST_TYPES.has(type)) return this.onHostFrame(raw);
+    if (this.opts.backend !== undefined || this.auth?.backend) {
+      // PB-1: a backend's key opens no client frame (input, subscribe, sessions, watches, topics, tui.attach).
+      // Before hello too: a `/ws` connection admitted with a key would otherwise speak as the console's owner.
+      const id = (raw as { id?: unknown }).id;
+      if (typeof id === 'string') this.result(id, { ok: false, code: 'forbidden', message: 'a backend key cannot send client frames' });
+      return;
+    }
     const p = parseClientFrame(raw);
     if (!p.ok) {
       // Unknown frame types without an id are ignored, as on the adapter bridges.

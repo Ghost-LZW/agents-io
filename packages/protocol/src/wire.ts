@@ -244,6 +244,11 @@ export const BlobStat = Type.Object({ path: Type.String(), mime: Type.String(), 
 export const BlobBytes = Type.Object({ base64: Type.String(), mime: Type.String(), name: Type.Optional(Type.String()) });
 /** The largest blob `blob.get` answers with its bytes. */
 export const BLOB_GET_MAX_BYTES = 16 * 1024 * 1024;
+/**
+ * The most bytes (before base64) one host-protocol `blob.get` answer or `blob.put` frame carries
+ * (`HostBlobGet`, `HostBlobPut`): larger blobs are read in ranges and uploaded in parts.
+ */
+export const BLOB_FRAME_MAX_BYTES = 1024 * 1024;
 
 /**
  * What this side of the harness bridge speaks beyond the original frames (`probe.features`):

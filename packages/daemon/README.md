@@ -281,7 +281,21 @@ does not start), else a fresh token is generated and written there (0600, a miss
 directory is created 0700). It is still copied to `<socket>.token` for the CLI; the
 daemon never removes or rotates the operator's file. A connection sends `host.hello { token, name, consumer?, callouts? }`
 before any host frame; after it, the connection's client frames carry the origin
-`{ kind: "system", principal: "host:<name>" }`.
+`{ kind: "system", principal: "host:<name>" }`. The host token is the admin credential.
+With `backends` configured, `token` may instead be a backend's key (`aio backend key <id>`):
+that connection is `backend:<id>`, sees only the queue items routed to it (a binding's
+`to`), may deliver only where it received input or the admin registered a route, speaks a
+whitelist of host frames and no client frame, and never takes the host role
+(docs/HOSTS.md §4.12; INVARIANTS PB-1 to PB-3). Media goes over three host frames,
+`blob.stat` / `blob.get` / `blob.put` (feature `blobs`, at most 1 MiB of bytes per frame:
+ranged reads, uploads in parts; docs/HOSTS.md §4.13, INVARIANTS PB-6): the host token
+reads and writes the daemon's blob store (`blobs.dir`); a backend's key reads only the
+media of the items routed to it and its own uploads, which are staged apart from the
+store in `<blobs.dir>/uploads/<backend>/` (0700 / 0600, a quota per backend, deleted
+24 h after the upload) and copied into the store when attached to a `deliver` (each
+upload once, at most 32 attachments per message). A binding with `on: "host"` may carry
+an opaque `tag` that is copied to the queue item (`InboundItem.tag`, feature
+`binding.tag`); a `tag` key on a rule that never queues for the host is ignored.
 
 - Any number of authenticated connections may use the request frames (the CLI's
   host commands are such connections). A connection whose hello sets `consumer`
@@ -493,7 +507,9 @@ private package `@agents-io/daemon-e2e` (`packages/daemon-e2e`) now, which expor
   advertised as `http://127.0.0.1:<port>`. Bodies must be `application/json`.
 - **Endpoints**: `GET /api/status`, `GET|PUT /api/config`,
   `POST /api/config/validate`, `GET /api/explain/:inputId`, `GET /api/queue`,
-  `GET /api/sessions`, and the channel types' (`POST /api/bots/lark`,
+  `GET /api/sessions`, `GET /api/backends`, `POST /api/backends/:id/key`
+  (`{ op: "issue" | "rotate" | "revoke" }`; an unknown backend 404, a second issue 409),
+  `POST /api/backends/:id/forget`, and the channel types' (`POST /api/bots/lark`,
   `GET /api/bots/lark/:job` from lark-bot); `GET /` is a minimal page that completes
   a login link opened on the console itself.
 - **Config**: credential fields follow the config schema: every value of an
@@ -540,7 +556,11 @@ private package `@agents-io/daemon-e2e` (`packages/daemon-e2e`) now, which expor
   message within `heartbeat.timeoutMs` is terminated (logged), which frees the host
   role a half-open remote host held. Client frames carry the local
   principal with `via: "console"`, `adapter: "console"`; host frames work after
-  `host.hello` with the host token.
+  `host.hello` with the host token. A backend's key (docs/HOSTS.md §4.12) is a third
+  credential: it upgrades `/ws` and nothing else (every `/api/*` answers 403, it gets no
+  login link). A connection upgraded with it takes no client frame, before `host.hello`
+  or after, its `host.hello` must carry that same backend's key, and it is closed when
+  the key is rotated or revoked or the backend forgotten.
 - **Lark bot provisioning**: `POST /api/bots/lark` runs `larkBotCommand` with
   `--qr-out <file> --json --write-env <env file> --name … --brand … --preset …`
   (`--avatar` from a `data:` URI, `--no-owner`, and `--env-prefix LARK_<ACCOUNT>_`
@@ -725,6 +745,7 @@ aio ack --consumer <name> <cursor>
 aio bindings put [--file table.json|-] | get
 aio explain <inputId>
 aio verify <channelRef>
+aio backend list | key <id> | rotate <id> | revoke <id> | forget <id>   (backends and their keys; a key is printed once, on stdout)
 aio console-link                                              (one-time console login URL)
 aio acp --client <name> [--token-file <path>] [--session <key>]   (module acp-server: ACP on stdio, for an editor or t3code)
 ```
