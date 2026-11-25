@@ -183,9 +183,11 @@ func TestUnknownFramesAreIgnored(t *testing.T) {
 	id := fr.add(itemOpt{text: "hello", tag: "inbox"})
 	r := startRig(t, fr, newFakeHub(t))
 	r.waitItem(id, stateInbox)
-	if st := r.status(); st.State != wire.ConnectorStateOk || st.LastEvent.IsZero() {
-		t.Errorf("status = %+v", st)
-	}
+	// The item's state and the status's last-event time are set one after the other: wait for the second.
+	eventually(t, "the status shows the event", func() bool {
+		st := r.status()
+		return st.State == wire.ConnectorStateOk && !st.LastEvent.IsZero()
+	})
 }
 
 func TestPingKeepsHalfOpenShort(t *testing.T) {
