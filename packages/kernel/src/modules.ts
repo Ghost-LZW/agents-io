@@ -1021,6 +1021,8 @@ export interface KernelBackend {
   command(cmd: ClientCommand, origin: Origin): Promise<KernelOutcome>;
   /** The lane's answer to the input (the lane opened when it is not). */
   laneInput(sessionKey: string, input: InputRecord, mode: 'queue' | 'steer' | 'interrupt'): Promise<KernelInputResult>;
+  /** Take a peer's queued inputs out of the queue (`KernelContext.lanes.withdraw`): those of `inputIds` whose origin is a peer's with this principal; the ids taken. */
+  laneWithdraw(sessionKey: string, inputIds: string[], principal: string): Promise<string[]>;
   /** What a module (`module`: its id, which names the ephemeral turn's session, profile and input) may run beside the lane (`KernelContext.lanes.harness`). */
   laneHarness(sessionKey: string, module: string): KernelLaneHarness | undefined;
   /** What a session's next turn runs, and what is set for it (`KernelContext.runConfig`). */
@@ -1174,6 +1176,14 @@ export function kernelContext(id: string, k: KernelBackend): KernelContext {
         // Only the kernel marks a harness's native command (CT-2), and the loop guard's label is the lane's.
         const { nativeCommand: _n, loopGuard: _l, ...channelContext } = input.channelContext ?? {};
         return live().laneInput(sessionKey, { ...input, channelContext }, mode ?? 'queue');
+      },
+      withdraw: async (sessionKey, inputIds, origin) => {
+        // As lanes.input: a module takes back only what it queued as a peer, and only that peer's own (CT-1).
+        const refused = peerRefusal(origin, live().owner().principals) ?? (typeof origin.principal?.id === 'string' ? undefined : 'a peer with a principal');
+        if (refused) throw new Error(`module ${id}: lanes.withdraw takes a peer's origin (${refused})`);
+        const principal = origin.principal!.id;
+        if (!Array.isArray(inputIds) || !inputIds.every((x) => typeof x === 'string')) throw new Error(`module ${id}: lanes.withdraw: inputIds must be strings`);
+        return live().laneWithdraw(text(sessionKey, 'lanes.withdraw: sessionKey'), [...inputIds], principal);
       },
       harness: (sessionKey) => {
         const lane = live().laneHarness(sessionKey, id);

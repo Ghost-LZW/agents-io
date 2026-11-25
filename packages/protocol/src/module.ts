@@ -934,6 +934,15 @@ export interface KernelContext {
      */
     input(sessionKey: string, input: InputRecord, mode?: 'queue' | 'steer' | 'interrupt'): Promise<KernelInputResult>;
     /**
+     * Take inputs a peer queued in a session back out of its queue before a turn takes them (a
+     * prompt its client cancelled): recorded as `input.cancelled` with reason `withdrawn`, never
+     * read by the agent. Only those of `inputIds` still queued whose origin is a peer's with
+     * `origin`'s principal (CT-1: a caller cancels only what it queued itself); `origin` as for
+     * `input` (any other kind, an owner-labelled principal and one of the owners reject). The ids
+     * taken out: none when no lane is open, or a turn took them already.
+     */
+    withdraw(sessionKey: string, inputIds: string[], origin: Origin): Promise<string[]>;
+    /**
      * What the module may run beside the open lane of a configured agent's session: an ephemeral
      * turn on the harness one of its turns ran on (topic titles). Undefined when no lane is open
      * for the session, for a task run's session, and when its agent is not a configured one (the

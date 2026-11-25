@@ -381,6 +381,64 @@ describe('ACP server: requests, cancel and the loop guard', () => {
     await local.command({ type: 'interrupt', sessionKey: 'S1' });
   });
 
+  it('a queued prompt the client cancels is taken out of the queue: the agent never reads it, and the next prompt the client sends is a turn of its own, answered #CT-1', async () => {
+    let unblock!: () => void;
+    const blocked = new Promise<void>((r) => (unblock = r));
+    /** The text of each turn's inputs, as the agent got them. */
+    const turns: string[][] = [];
+    const script = async (t: { emit: (b: never, x?: never) => void; inputs: InputRecord[] }) => {
+      const said = t.inputs.map((i) => i.content.map((c) => (c.type === 'text' ? c.text : '')).join(''));
+      turns.push(said);
+      if (said.includes('block')) await blocked;
+      t.emit({ t: 'text.snapshot', text: `echo: ${said.join(' + ')}`, final: true } as never, { audience: 'answer' } as never);
+    };
+    const { w } = await world({ script: script as never });
+    // The owner's turn runs in S1: the client's prompts queue behind it.
+    const local: LocalClient = await w.client();
+    await local.input('S1', 'block');
+    await until(() => w.gw.hub.log.read('S1', 0).some((x) => x.body.t === 'turn.started'));
+    const e = await editor(w, 'zed');
+    await e.agent.request(methods.agent.session.load, { sessionId: 'S1', cwd: '/tmp', mcpServers: [] });
+    const a = e.agent.request(methods.agent.session.prompt, { sessionId: 'S1', prompt: [{ type: 'text', text: 'first' }] });
+    await until(() => admitted(w, 'S1').some((i) => i.content.some((c) => c.type === 'text' && c.text === 'first')));
+    const first = admitted(w, 'S1').find((i) => i.content.some((c) => c.type === 'text' && c.text === 'first'))!.inputId;
+    await e.agent.notify(methods.agent.session.cancel, { sessionId: 'S1' });
+    expect(await a).toEqual({ stopReason: 'cancelled' });
+    expect(w.gw.hub.log.read('S1', 0).find((x) => x.body.t === 'input.cancelled')!.body).toEqual({ t: 'input.cancelled', inputIds: [first], reason: 'withdrawn' });
+    // The owner's turn was not touched.
+    expect(w.gw.hub.log.read('S1', 0).some((x) => x.body.t === 'turn.completed')).toBe(false);
+
+    const b = e.agent.request(methods.agent.session.prompt, { sessionId: 'S1', prompt: [{ type: 'text', text: 'second' }] });
+    await until(() => admitted(w, 'S1').some((i) => i.content.some((c) => c.type === 'text' && c.text === 'second')));
+    unblock();
+    expect(await b).toEqual({ stopReason: 'end_turn' });
+    expect(turns).toEqual([['block'], ['second']]);
+    expect(texts(e.updates, 'agent_message_chunk')).toContain('echo: second');
+    expect(w.gw.hub.log.read('S1', 0).flatMap((x) => (x.body.t === 'turn.completed' ? [x.body.status] : []))).toEqual(['completed', 'completed']);
+  });
+
+  it('a prompt cancelled while the host decides it is answered cancelled; when a turn takes it before it can be withdrawn, that turn (nothing else in it) is interrupted as it starts #CT-1', async () => {
+    const script = async (t: { emit: (b: never, x?: never) => void; signal: AbortSignal }) => {
+      await new Promise<void>((r) => t.signal.addEventListener('abort', () => r(), { once: true }));
+      t.emit({ t: 'text.snapshot', text: 'done', final: true } as never, { audience: 'answer' } as never);
+    };
+    const { w } = await world({ script: script as never });
+    const host = await w.host({ name: 'xwo', callouts: ['external'] });
+    let allow: (() => void) | undefined;
+    host.onRequest('policy', () => new Promise((r) => (allow = () => r({ verdict: 'allow' }))));
+    const e = await editor(w, 'zed');
+    const s = await e.agent.request(methods.agent.session.new, { cwd: '/tmp', mcpServers: [] });
+    const p = e.agent.request(methods.agent.session.prompt, { sessionId: s.sessionId, prompt: [{ type: 'text', text: 'go' }] });
+    await until(() => allow !== undefined);
+    await e.agent.notify(methods.agent.session.cancel, { sessionId: s.sessionId });
+    await new Promise((x) => setTimeout(x, 50));
+    // The session is idle: the lane starts its turn as it takes it.
+    allow!();
+    expect(await p).toEqual({ stopReason: 'cancelled' });
+    await until(() => w.gw.hub.log.read(s.sessionId, 0).some((x) => x.body.t === 'turn.completed'));
+    expect(w.gw.hub.log.read(s.sessionId, 0).find((x) => x.body.t === 'turn.completed')!.body).toMatchObject({ status: 'interrupted' });
+  });
+
   it('prompts go through the lane\'s loop guard: past pair.maxTurns the prompt is kept as context and answered an error saying so #IN-8 #ID-10', async () => {
     const { w } = await world({ raw: { policy: { owners: ['fake:alice'], loopGuard: { pair: { maxTurns: 2 } } } } });
     const e = await editor(w, 'zed');

@@ -912,6 +912,14 @@ export class Gateway {
         const lane = gw().lanes.get(key) ?? (await gw().laneAfterClose(key));
         return lane.command({ type: 'input', sessionKey: key, input, mode });
       },
+      laneWithdraw: async (key, inputIds, principal) => {
+        // No lane open: nothing is queued.
+        const lane = gw().lanes.get(key);
+        if (!lane) return [];
+        const ids = new Set(inputIds);
+        const taken = await lane.take((i) => ids.has(i.inputId) && i.origin.kind === 'peer' && i.origin.principal?.id === principal, 'withdrawn');
+        return taken.map((i) => i.inputId);
+      },
       laneHarness: (key, module) => gw().laneHarness(key, module),
       sessionRun: (key) => gw().sessionRun(key),
       setSessionRun: (key, o) => gw().setRunOverride(key, o),

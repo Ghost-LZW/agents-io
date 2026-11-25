@@ -1,5 +1,5 @@
 import type { KernelContext, KernelSubscription, SessionEvent } from '@agents-io/protocol';
-import { passes, withholding } from '@agents-io/session';
+import { passes, withholding, withholdingFold } from '@agents-io/session';
 
 /*
  * A session's events as a reader outside the daemon may see them while they come (the north
@@ -9,7 +9,9 @@ import { passes, withholding } from '@agents-io/session';
  * one held for good is dropped (its text never reaches the reader). Withheld ephemeral events (text
  * deltas) are dropped, not kept: a checked turn does not stream (DL-7), and its snapshot says it all.
  * While no event of the log is checked (no `outbound.scoped` host ever declared a scope that took a
- * turn of this session), events go through as they come, unread.
+ * turn of this session), events go through as they come. The log is read once, as the view starts;
+ * after that what is withheld is folded in as the durable events come (`withholdingFold`), so an
+ * ephemeral event (a text delta) is decided without reading the log.
  */
 
 /** Events that a checked turn may make withheld (`withholding`); every other kind never is. */
@@ -48,7 +50,11 @@ export function replay(k: KernelContext, sessionKey: string, fromSeq: number): {
 /** A subscription's events through the U20 gate: iterate it; `close` ends it. */
 export class ExternalView implements AsyncIterable<SessionEvent> {
   private readonly sub: KernelSubscription;
-  private active: boolean;
+  /** What the log withholds, folded as far as it was read: up to `folded`, its last seq. */
+  private readonly fold = withholdingFold();
+  private folded = 0;
+  /** Some event folded in is checked: from then on events go through the gate. */
+  private active = false;
   private readonly waiting: SessionEvent[] = [];
   private closed = false;
 
@@ -61,7 +67,7 @@ export class ExternalView implements AsyncIterable<SessionEvent> {
     private readonly sessionKey: string,
     o: { fromSeq?: number; waiting?: readonly SessionEvent[] } = {},
   ) {
-    this.active = this.k.events(sessionKey, 0).some(checks);
+    this.read();
     this.waiting.push(...(o.waiting ?? []));
     this.sub = k.subscribe(sessionKey, o.fromSeq !== undefined ? { fromSeq: o.fromSeq } : {});
   }
@@ -71,16 +77,40 @@ export class ExternalView implements AsyncIterable<SessionEvent> {
     this.sub.close();
   }
 
+  /** Fold in what the log has after `folded`. */
+  private read(): void {
+    for (const e of this.k.events(this.sessionKey, this.folded)) this.take(e);
+  }
+
+  private take(e: SessionEvent): void {
+    if (e.seq <= this.folded) return;
+    this.folded = e.seq;
+    this.fold.push(e);
+    if (!this.active && checks(e)) this.active = true;
+  }
+
+  /**
+   * The log folded up to `e` before it is decided. A durable event next in seq is folded as it
+   * came; past a gap (events the subscription does not give, `internal` ones) the log is read from
+   * `folded`. An ephemeral event carries the seq of the durable one before it, already folded in:
+   * nothing is read for it.
+   */
+  private advance(e: SessionEvent): void {
+    if (e.seq <= this.folded) return;
+    if (e.durability !== 'ephemeral' && e.seq === this.folded + 1) this.take(e);
+    else this.read();
+  }
+
   async *[Symbol.asyncIterator](): AsyncIterator<SessionEvent> {
     for await (const e of this.sub) {
       if (this.closed) return;
-      if (!this.active && checks(e)) this.active = true;
+      this.advance(e);
       if (!this.active || (!this.waiting.length && !MAY_WITHHOLD.has(e.body.t))) {
         yield e;
         continue;
       }
-      // Read the log as it is now: what is withheld, and what was released since.
-      const w = withholding(this.k.events(this.sessionKey, 0));
+      // The log as folded up to `e`: what is withheld, and what was released since.
+      const w = this.fold;
       if (w.none) {
         yield* this.waiting.splice(0);
         yield e;

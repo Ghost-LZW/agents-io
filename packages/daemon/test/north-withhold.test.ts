@@ -3,9 +3,12 @@ import { join } from 'node:path';
 import { PassThrough, Readable, Writable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import { client as acpClient, methods, ndJsonStream, type SessionNotification } from '@agentclientprotocol/sdk';
+import type { KernelContext, SessionEvent } from '@agents-io/protocol';
 import type { FakeTurnScript } from '@agents-io/testkit';
 import type { LocalClient } from '@agents-io/kernel';
+import { Hub, MemorySessionLog, type EventDraft } from '@agents-io/session';
 import { acpPipe } from '../src/acp-server.js';
+import { ExternalView } from '../src/external-view.js';
 import { cleanups, daemon, tmp, until, type World } from './helpers.js';
 
 /*
@@ -101,5 +104,49 @@ describe('north projections and the exit check (U20)', () => {
     await new Promise((r) => setTimeout(r, 150));
     expect(acpText()).toBe(`warm${SECRET}`);
     expect(sse.split(SECRET).length - 1).toBe(1);
+  });
+});
+
+describe('the U20 gate of the north projections reads the log as it grows', () => {
+  it('once a turn of the session was checked, a streamed text delta is decided from what was folded in: the log is read as the view starts and past a gap, never per event; what is withheld and released is as before #DL-7', async () => {
+    const hub = new Hub(new MemorySessionLog());
+    let reads = 0;
+    const k = {
+      events: (key: string, fromSeq = 0) => (reads++, hub.log.read(key, fromSeq)),
+      subscribe: (key: string, o: { fromSeq?: number } = {}) => hub.subscribe({ sessionKey: key, tier: 'full', ...(o.fromSeq !== undefined ? { fromSeq: o.fromSeq } : {}) }),
+    } as unknown as KernelContext;
+    const S = 'S';
+    const G1 = { channel: 'fake', account: 'default', conversationId: 'g1' };
+    const add = (turnId: string, body: SessionEvent['body'], o: Partial<EventDraft> = {}) =>
+      hub.append(S, { ts: 0, level: 'primary', audience: body.t.startsWith('text.') ? 'answer' : 'status', durability: body.t === 'text.delta' ? 'ephemeral' : 'durable', turnId, body, ...o } as EventDraft);
+    const turn = (turnId: string, checked: boolean, deltas: number, o: { internal?: boolean } = {}) => {
+      add(turnId, { t: 'turn.started', turnId, inputIds: [`in_${turnId}`], replyRoute: G1, checked });
+      if (o.internal) add(turnId, { t: 'item.started', item: { itemId: `hook_${turnId}`, type: 'hook_prompt', title: 'hook', status: 'running' } } as SessionEvent['body'], { visibility: 'internal' });
+      for (let i = 0; i < deltas; i++) add(turnId, { t: 'text.delta', stream: 'answer', delta: `${turnId}-${i} ` });
+      add(turnId, { t: 'text.snapshot', text: `answer of ${turnId}`, final: true });
+      add(turnId, { t: 'turn.completed', turnId, status: 'completed' });
+      add(turnId, { t: 'delivery.settled', operationId: `op_${turnId}`, route: G1, result: 'delivered', kind: 'reply', turnId } as SessionEvent['body']);
+    };
+    turn('t0', true, 0);
+    const view = new ExternalView(k, S, { fromSeq: hub.log.head(S) });
+    cleanups.push(() => view.close());
+    expect(reads).toBe(1);
+    const got: SessionEvent[] = [];
+    void (async () => {
+      for await (const e of view) got.push(e);
+    })();
+    const said = () => got.flatMap((e) => (e.body.t === 'text.snapshot' ? [e.body.text] : e.body.t === 'text.delta' ? [e.body.delta] : []));
+
+    // A checked turn: its 300 deltas are dropped, its answer comes once settled; nothing is read for them.
+    turn('t1', true, 300);
+    await until(() => said().includes('answer of t1'));
+    expect(said()).toEqual(['answer of t1']);
+    expect(reads).toBe(1);
+    // A turn not checked streams as it is; one internal event (the subscription does not give it) is read once.
+    turn('t2', false, 300, { internal: true });
+    await until(() => said().includes('answer of t2'));
+    expect(said()).toEqual(['answer of t1', ...Array.from({ length: 300 }, (_, i) => `t2-${i} `), 'answer of t2']);
+    expect(reads).toBe(2);
+    expect(got.map((e) => e.seq)).toEqual([...got.map((e) => e.seq)].sort((a, b) => a - b));
   });
 });

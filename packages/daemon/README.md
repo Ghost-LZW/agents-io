@@ -638,7 +638,8 @@ security review: `docs/design/north-projections/`.
   socket (`module.connect`). `session/new`, `session/load` (replays the log as the live view shows
   it: no `internal` events; then asks only the requests the log has not settled), `session/list`,
   `session/prompt` (a lane input; answered when its turn ends), `session/cancel` (the client's own
-  turn); a request is asked of the client (`session/request_permission`, a form elicitation) only
+  turn; a prompt still queued is taken out of the queue first, `lanes.withdraw`, so the next one is
+  a turn of its own); a request is asked of the client (`session/request_permission`, a form elicitation) only
   when its resolver names the client (`approvals: true` makes it the resolver of its own turns'
   approvals; the default policy asks a question of the turn's person, the client in its own turns).
   Exit codes: 0 stdin ended, 2 no ACP server in the daemon, 69 daemon not there, 77 refused.
@@ -1724,9 +1725,15 @@ What changed for embedders with the north projections (core-slimming G9, 2026-11
   package exports them, `acpPipe`, and the projections (`AcpProjection`, `AgUiProjection` and their
   table functions). New dependencies: `@agentclientprotocol/sdk`, `@ag-ui/core`, `zod`.
 - `KernelContext` gains `subscribe(sessionKey, { fromSeq? })` (a session's events as they come,
-  tier `full`; a `session.snapshot` event first without `fromSeq`) and `blobs.put(bytes, meta)`;
-  `KERNEL_CAPABILITIES` lists `subscribe` and `blobs`. `KernelBackend` gains `subscribe` and
-  `putBlob` (required, so this breaks an embedder that implements it).
+  tier `full`; a `session.snapshot` event first without `fromSeq`), `blobs.put(bytes, meta)` and
+  `lanes.withdraw(sessionKey, inputIds, origin)` (a peer's own inputs still queued taken back out
+  of the queue, recorded as `input.cancelled` with reason `withdrawn`; a peer's origin only, as
+  `lanes.input`); `KERNEL_CAPABILITIES` lists `subscribe` and `blobs`. `KernelBackend` gains
+  `subscribe`, `putBlob` and `laneWithdraw` (required, so this breaks an embedder that implements
+  it).
+- `@agents-io/session` exports `withholdingFold()` (`WithholdingFold`): `withholding` of a log
+  read as it grows (`push` each event once, in seq order), which the north projections' U20 gate
+  keeps instead of rereading the log for each event.
 - `ModuleInstance.connect(hello, conn)` (served): a local socket connection that sends the new
   client frame `module.connect { module, hello }` is the module's once it answers `{ ok: true }`
   (`ModuleConnection`: JSON values both ways). `LocalHost.moduleConnect` is the gateway's side; a

@@ -65,6 +65,23 @@ function isRotate(item: { type: string; title: string; tool?: { name: string } }
 
 /** Read the whole log of a session (from seq 0) once; then ask for each event read out of it. */
 export function withholding(events: readonly SessionEvent[]): Withholding {
+  const w = withholdingFold();
+  for (const e of events) w.push(e);
+  return w;
+}
+
+/** A `Withholding` of a log as it grows (`withholdingFold`). */
+export interface WithholdingFold extends Withholding {
+  /** Fold in the log's next event (each durable event once, in seq order, from the log's first). */
+  push(e: SessionEvent): void;
+}
+
+/**
+ * `withholding` of a log read as it grows (a reader's live view): `push` each of its events once, in
+ * seq order from its first; between pushes it answers as `withholding` of the events pushed so far,
+ * without reading them again.
+ */
+export function withholdingFold(): WithholdingFold {
   const turns = new Map<string, CheckedTurn>();
   const itemTypes = new Map<string, string>();
   /**
@@ -86,7 +103,12 @@ export function withholding(events: readonly SessionEvent[]): Withholding {
     if (!t) turns.set(turnId, (t = { from, routes: new Set(), released: new Set(), held: false, completed: false, cards: new Map() }));
     return t;
   };
-  for (const e of events) {
+  /** The cards' tool items, by item id (undefined: a card was opened since they were last listed). */
+  let cardItems: Map<string, { t: CheckedTurn; requestId: string }> | undefined;
+  /** Whether nothing is withheld, as of the last push (undefined: not asked since). */
+  let nothing: boolean | undefined;
+  const push = (e: SessionEvent): void => {
+    nothing = undefined;
     const b = e.body;
     if (b.t === 'turn.started' || b.t === 'turn.adopted') open = b.turnId;
     const turnId = e.turnId ?? open;
@@ -139,7 +161,10 @@ export function withholding(events: readonly SessionEvent[]): Withholding {
       }
       case 'request.opened': {
         const t = turnId !== undefined ? turns.get(turnId) : undefined;
-        if (t && e.seq >= t.from) t.cards.set(b.requestId, { ...(e.itemId !== undefined ? { itemId: e.itemId } : {}), released: new Set(), held: false });
+        if (t && e.seq >= t.from) {
+          t.cards.set(b.requestId, { ...(e.itemId !== undefined ? { itemId: e.itemId } : {}), released: new Set(), held: false });
+          cardItems = undefined;
+        }
         break;
       }
       case 'delivery.settled': {
@@ -159,15 +184,13 @@ export function withholding(events: readonly SessionEvent[]): Withholding {
         break;
       }
     }
-  }
+  };
   const answer = (t: CheckedTurn): Withheld | undefined => {
     if (t.held) return 'held';
     if (!t.completed) return 'checking';
     const all = t.routes.size ? [...t.routes].every((k) => t.released.has(k)) : t.released.size > 0;
     return all ? undefined : 'checking';
   };
-  const cardItems = new Map<string, { t: CheckedTurn; requestId: string }>();
-  for (const t of turns.values()) for (const [requestId, c] of t.cards) if (c.itemId !== undefined) cardItems.set(c.itemId, { t, requestId });
   /**
    * A card: held anywhere = held; released once it settled (not held) on every route the turn is checked
    * on (an adopted turn: any). Sent to none of them yet: as the turn's answer.
@@ -201,7 +224,13 @@ export function withholding(events: readonly SessionEvent[]): Withholding {
     const item = itemIdOf(e);
     return item !== undefined && rotates.has(item) ? rotate(item, e.seq) : undefined;
   };
-  const none = turns.size === 0 && heldSummaries.size === 0 && [...rotates.keys()].every((id) => rotate(id, Infinity) === undefined);
+  const cards = (): Map<string, { t: CheckedTurn; requestId: string }> => {
+    if (cardItems) return cardItems;
+    cardItems = new Map();
+    for (const t of turns.values()) for (const [requestId, c] of t.cards) if (c.itemId !== undefined) cardItems.set(c.itemId, { t, requestId });
+    return cardItems;
+  };
+  const none = (): boolean => (nothing ??= turns.size === 0 && heldSummaries.size === 0 && [...rotates.keys()].every((id) => rotate(id, Infinity) === undefined));
   const of = (e: SessionEvent): Withheld | undefined => {
     if (heldSummaries.has(e.seq) && e.body.t === 'input.admitted') return 'held';
     const r = rotateOf(e);
@@ -212,20 +241,23 @@ export function withholding(events: readonly SessionEvent[]): Withholding {
     const b = e.body;
     if (b.t === 'request.opened' && t.cards.has(b.requestId)) return card(t, b.requestId);
     const item = itemIdOf(e);
-    const opened = item !== undefined ? cardItems.get(item) : undefined;
+    const opened = item !== undefined ? cards().get(item) : undefined;
     if (opened) return card(opened.t, opened.requestId);
     return answer(t);
   };
   return {
-    none,
+    push,
+    get none() {
+      return none();
+    },
     of,
     apply<V extends { body: unknown; native?: unknown }>(e: SessionEvent, view: V): V & { withheld?: Withheld } {
-      const w = none ? undefined : of(e);
+      const w = none() ? undefined : of(e);
       if (w === undefined) return view;
       const { native: _native, ...rest } = view;
       const b = e.body;
       const item = itemIdOf(e);
-      const content = item !== undefined && (cardItems.has(item) || CONTENT_ITEMS.has(itemTypes.get(item) ?? '') || rotateOf(e) !== undefined);
+      const content = item !== undefined && (cards().has(item) || CONTENT_ITEMS.has(itemTypes.get(item) ?? '') || rotateOf(e) !== undefined);
       const body = view.body as Record<string, unknown>;
       let out: Record<string, unknown> | undefined;
       switch (b.t) {

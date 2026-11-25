@@ -11,9 +11,9 @@
 
 | 部分 | 在哪 | 做什么 |
 |---|---|---|
-| 接缝（内核与协议） | `packages/protocol/src/module.ts`、`client.ts`、`host.ts`；`packages/kernel/src/modules.ts`、`local-server.ts`、`gateway.ts` | `KernelContext.subscribe`（会话事件按到来的顺序，tier `full`；从头时第一条是 `session.snapshot`）、`KernelContext.blobs.put`（客户端发来的图片）、`ModuleInstance.connect` 与客户端帧 `module.connect`（本地 socket 的一条连接交给模块，之后两边都是模块的 JSON 值）、`ModuleManifest.cli`（模块给 `aio` 加命令，`ModuleRegistry.cliCommand`）、`external` 回调的可选 `endpoint` |
+| 接缝（内核与协议） | `packages/protocol/src/module.ts`、`client.ts`、`host.ts`；`packages/kernel/src/modules.ts`、`local-server.ts`、`gateway.ts` | `KernelContext.subscribe`（会话事件按到来的顺序，tier `full`；从头时第一条是 `session.snapshot`）、`KernelContext.blobs.put`（客户端发来的图片）、`KernelContext.lanes.withdraw`（把 peer 自己还排着的输入撤出队列：取消的 prompt，`input.cancelled` `withdrawn`）、`ModuleInstance.connect` 与客户端帧 `module.connect`（本地 socket 的一条连接交给模块，之后两边都是模块的 JSON 值）、`ModuleManifest.cli`（模块给 `aio` 加命令，`ModuleRegistry.cliCommand`）、`external` 回调的可选 `endpoint` |
 | 客户端的规则 | `packages/daemon/src/peers.ts` | 配置客户端（schema、解析、主体规则、令牌、频率窗口）、盖章（`peerOrigin`）、会话归属（`mayRead`、`mayInput`、`sessionFor`、`newOwnSession`）、宿主的 `external` 钩子（`hostAllows`）、交给 lane 的输入（`peerInput`：路由记录、`cause`、`local` 回复路由） |
-| U20 的门 | `packages/daemon/src/external-view.ts` | 外部读取面的流式版本：受检的一轮被遮的事件等它放行（之后的也等着，顺序照日志），扣下的丢掉；`replay`（日志里外部读者现在能读的：不含扣下的与 `internal` 的）给 `session/load` 和 AG-UI 续读接上开着的一轮用 |
+| U20 的门 | `packages/daemon/src/external-view.ts` | 外部读取面的流式版本：受检的一轮被遮的事件等它放行（之后的也等着，顺序照日志），扣下的丢掉；开始时读一次日志，之后按到来的持久事件折叠（`withholdingFold`），文字增量不读日志；`replay`（日志里外部读者现在能读的：不含扣下的与 `internal` 的）给 `session/load` 和 AG-UI 续读接上开着的一轮用 |
 | ACP | `acp-projection.ts`（映射，纯）、`acp-server.ts`（模块、每条连接一个 `AcpLink`、`aio acp` 与 `acpPipe`） | 见 §3 |
 | AG-UI | `ag-ui-projection.ts`（映射，纯）、`ag-ui.ts`（模块、HTTP 服务器 `AgUiEndpoint`） | 见 §4 |
 | fixture | `packages/testkit/conformance/projections/{acp,ag-ui}/`，读法 `packages/testkit/src/conformance/projection.ts` | `docs/design/conformance-fixtures/` §4a |
@@ -28,7 +28,7 @@
 - **prompt**：转成输入的内容（图片进 blob 库），先登记"等哪条输入"，再交给 lane（`peerInput`）；`turn.started` 里有它的输入就记下轮次，那一轮 `turn.completed` 时按映射表回答 stop reason；输入被拒是错误、被取消是 `cancelled`；回环检查截停（`observe_only`）是一个说明它的错误。prompt 的回答在这一轮的所有 `session/update` 之后发出（同一个 pump 依次处理）。
 - **映射**（`AcpProjection`，PR-4）：见 `acp-projection.ts` 文件头的表。文字：增量照流（同一条消息一个 `messageId`：`<轮次>:<n>`），`text.snapshot` 只补还没流出的部分并结束这条消息，最终回答重复已经说过的（最后一条，或全部连起来）不再说；只有 snapshot 时（重放）每条消息说一次。别人的输入作为 `user_message_chunk`，前面带 `[<主体>] `；客户端自己这条连接发的不再推（编辑器已经显示）。
 - **请求**：每个请求都是一个待定的工具调用 `request:<id>`（谁在等、等什么，编辑器看得到），结算后 `completed` / `failed`。只有 resolver 是 `human`、`principals` 里有客户端主体的，才 `session/request_permission`（选项 id 就是决定的种类：`allow_once`、`allow_session`（请求 `allowAlways` 时）、`deny`）或在客户端支持表单时 `elicitation/create`；答复经 `KernelContext.lanes.command` 以客户端的 peer 身份 `resolve`。请求先在别处结算了，用 SDK 的 `cancellationSignal` 撤回（`$/cancel_request`）。resolver 由谁定：审批要 `approvals: true`（模块的 `resolver` 钩子）或宿主的 `resolve` 回调；提问照缺省策略交给这一轮的人（`TurnContext.owner`），客户端自己开的轮次里就是它，所以不开 `approvals` 也问它（§5）。
-- **取消**：`session/cancel` 只对客户端自己的 prompt：轮次已开始就带 `turnId` 打断（CT-1，别人的轮次不动）；还在排队的立即答 `cancelled`，它的轮次一开始就被打断（lane 没有单独撤回一条排队输入的命令）。
+- **取消**：`session/cancel` 只对客户端自己的 prompt：轮次已开始就带 `turnId` 打断（CT-1，别人的轮次不动）；还在排队的先经 `KernelContext.lanes.withdraw` 撤出队列（`input.cancelled`，`reason: "withdrawn"`；agent 读不到它），再答 `cancelled`。原先它留在队列里、等它的轮次开始再打断：lane 把同一主体、同一回复路由的相邻输入合成一轮，客户端随后发的 prompt 就与它合成一轮、跟着被打断，agent 还读到了被取消的文字。撤回之前已被一轮拿走的（它还在进会话时取消，或它的轮次恰好这时开始），那一轮只有被取消的 prompt 时一开始就打断，否则照跑、只回答没取消的（同一客户端的另一条连接发的也在里面时）。
 
 ## 4. AG-UI 端点
 
@@ -49,7 +49,7 @@
 | 两个 agent 经编辑器或界面互相触发、无限来回 | 输入是 `peer`，过 lane 的同一个回环检查（成对计数按 `<模块 id>:<名>`） | IN-8 |
 | 受检的一轮（U20）的回答从外部读取面漏出去 | `ExternalView` 让被遮的事件（及其后的）等到放行，扣下的丢掉；重放同样；快照只给状态，attention 不带请求标题 | DL-7：`north-withhold.test.ts`（把门去掉这条测试就红） |
 | `internal` 的事件（harness 只给守护进程自己看的条目）经重放漏出去 | 在线的订阅缺省不给 `internal`；`replay`（`session/load`、AG-UI 续读接上开着的一轮）照同样的可见性（`passes(e, 'full')`）过滤 | PR-4：`acp-server.test.ts` 的 internal 条目测试 |
-| 打断别人的轮次 | `session/cancel` 只带客户端自己 prompt 的 `turnId` 打断；lane 按 `Policy.control` 再查（主人或本轮发起者） | CT-1 |
+| 打断别人的轮次、撤掉别人排着的输入 | `session/cancel` 只带客户端自己 prompt 的 `turnId` 打断；lane 按 `Policy.control` 再查（主人或本轮发起者）；排着的只撤它自己的 prompt：`KernelContext.lanes.withdraw` 只收 peer 的来源，只撤这个主体自己排着的输入 | CT-1 |
 | 令牌出现在命令行、日志或状态里 | `aio acp` 的令牌来自 0600 文件或环境变量，不上命令行；日志与状态只有客户端名；配置错误只说键名 | SE-1 的规则（`acp-server.test.ts` 查状态里没有令牌） |
 
 还留着的（不是这一步的缺口，写在这里以免遗忘）：一个客户端可以往它能写的会话里一直排输入（每分钟的 prompt / run 有上限，回环检查兜住无人值守的来回）；同一个令牌的持有者就是这个客户端（与对外 MCP 端点一样，没有更细的会话级凭据；远处的端经宿主的代理）。

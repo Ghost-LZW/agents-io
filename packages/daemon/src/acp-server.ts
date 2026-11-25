@@ -201,7 +201,11 @@ interface Pending {
   resolve(r: { stopReason: 'end_turn' | 'cancelled' | 'refusal' | 'max_tokens' | 'max_turn_requests' }): void;
   reject(e: Error): void;
   turnId?: string;
-  /** `session/cancel` came before its turn started: answered `cancelled`, and its turn is interrupted when it starts. */
+  /**
+   * `session/cancel` came before its turn started: answered `cancelled` and taken out of the queue
+   * (`lanes.withdraw`). Kept only while a turn may still take it (it was not in the queue yet, or a
+   * turn took it first): that turn is interrupted if it has nothing else.
+   */
   cancelled?: boolean;
 }
 
@@ -392,12 +396,19 @@ class AcpLink {
   private watch(b: Bound, e: SessionEvent): void {
     const body = e.body;
     if (body.t === 'turn.started') {
+      let cancelled = 0;
       for (const id of body.inputIds) {
         const p = b.prompts.get(id);
         if (!p) continue;
         p.turnId = body.turnId;
-        if (p.cancelled) void this.interrupt(b, body.turnId);
+        if (!p.cancelled) continue;
+        // Answered already: the turn's end is not its answer.
+        b.prompts.delete(id);
+        cancelled++;
       }
+      // A turn took a cancelled prompt before it was withdrawn: interrupted when it has nothing else
+      // (another prompt in it, also from another connection of the client, is answered as it ends).
+      if (cancelled && cancelled === body.inputIds.length) void this.interrupt(b, body.turnId);
     } else if (body.t === 'input.rejected' || body.t === 'input.cancelled') {
       for (const id of body.inputIds) {
         const p = b.prompts.get(id);
@@ -495,7 +506,8 @@ class AcpLink {
       checkText(content, this.cfg.limits.maxTextChars);
       const inputId = `acp_${randomUUID()}`;
       // Waiting before the input goes in: its turn may start (and end) before the lane answers.
-      const done = new Promise<Parameters<Pending['resolve']>[0]>((resolve, reject) => b.prompts.set(inputId, { resolve, reject }));
+      let pending!: Pending;
+      const done = new Promise<Parameters<Pending['resolve']>[0]>((resolve, reject) => b.prompts.set(inputId, (pending = { resolve, reject })));
       this.own.add(inputId);
       try {
         const r = await peerInput(this.k, this.c, ENDPOINT, { sessionKey: b.key, ...(b.agent !== undefined ? { agent: b.agent } : {}), inputId, content });
@@ -507,6 +519,8 @@ class AcpLink {
         b.prompts.delete(inputId);
         throw e;
       }
+      // Cancelled while it was going in: out of the queue now, before a turn takes it.
+      if (pending.cancelled) await this.withdraw(b, [inputId]);
       return await done;
     } catch (e) {
       throw rpcError(e);
@@ -540,19 +554,40 @@ class AcpLink {
     return out;
   }
 
-  /** `session/cancel`: the client's own prompts in the session stop; a turn someone else started is not touched (CT-1). */
+  /**
+   * `session/cancel`: the client's own prompts in the session stop; a turn someone else started is
+   * not touched (CT-1). One still queued is taken out of the queue (never a turn, the agent never
+   * reads it), then answered `cancelled`: a prompt sent after it is a turn of its own.
+   */
   private async cancel(sessionId: string): Promise<void> {
     const b = this.sessions.get(sessionId);
     if (!b) return;
-    for (const [id, p] of [...b.prompts]) {
-      if (p.turnId !== undefined) {
-        await this.interrupt(b, p.turnId);
-        continue;
+    const queued: string[] = [];
+    const turns = new Set<string>();
+    for (const [id, p] of b.prompts) {
+      if (p.turnId !== undefined) turns.add(p.turnId);
+      else if (!p.cancelled) {
+        p.cancelled = true;
+        queued.push(id);
       }
-      // Still queued: answered now; its turn is interrupted when it starts.
-      p.cancelled = true;
-      p.resolve({ stopReason: 'cancelled' });
-      b.prompts.set(id, { ...p, resolve: () => {}, reject: () => {} });
+    }
+    // Asked of the lane before anything else is: a prompt sent after the answer below queues after it.
+    const withdrawn = queued.length ? this.withdraw(b, queued) : Promise.resolve();
+    for (const turnId of turns) await this.interrupt(b, turnId);
+    await withdrawn;
+    for (const id of queued) b.prompts.get(id)?.resolve({ stopReason: 'cancelled' });
+  }
+
+  /** Take the client's cancelled prompts out of the session's queue; those it took are no longer waited for. */
+  private async withdraw(b: Bound, inputIds: string[]): Promise<void> {
+    try {
+      const taken = await this.k.lanes.withdraw(b.key, inputIds, this.origin);
+      for (const id of taken) {
+        b.prompts.get(id)?.resolve({ stopReason: 'cancelled' });
+        b.prompts.delete(id);
+      }
+    } catch (e) {
+      this.k.log('warn', `ACP client ${this.c.name}: withdrawing ${inputIds.join(', ')} from ${b.key} failed: ${(e as Error).message}`);
     }
   }
 
