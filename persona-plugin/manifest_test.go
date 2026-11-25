@@ -33,7 +33,7 @@ func TestRuntimeManifestIsTheSourceWithoutCatalogFields(t *testing.T) {
 	if err := json.Unmarshal(manifest, &m); err != nil {
 		t.Fatalf("wire.Manifest: %v", err)
 	}
-	if m.ID != extensionID || m.Version != version || version != "0.1.0" {
+	if m.ID != extensionID || m.Version != version || version != "0.2.0" {
 		t.Errorf("id %q version %q", m.ID, m.Version)
 	}
 }
@@ -110,7 +110,7 @@ func TestManifestFollowsTheRules(t *testing.T) {
 		t.Errorf("connector id %q", c.ID)
 	}
 	// events: the program sends connector.changed, which the connector protocol ties to this capability.
-	if want := []string{"status", "tools", "events", "inbox", "settle", "fallback"}; !slices.Equal(c.Capabilities, want) {
+	if want := []string{"status", "tools", "actions", "events", "inbox", "settle", "fallback"}; !slices.Equal(c.Capabilities, want) {
 		t.Errorf("capabilities = %v, want %v", c.Capabilities, want)
 	}
 	for _, k := range []string{"dm", "group", "mail", "other"} {
@@ -155,6 +155,49 @@ func TestTriageRulesSettingIsPinned(t *testing.T) {
 	for _, part := range []string{"路由消息", "群里没 @ 我的都算噪音", `\n`} {
 		if !strings.Contains(p.Description, part) {
 			t.Errorf("triage_rules.description lacks %q: %s", part, p.Description)
+		}
+	}
+}
+
+// TestSendIsAGatedWrite: the send is an action (a write the hub runs only after its gate), the manifest makes the
+// gate ask the owner every time, and nothing hands the tools to coding agents or sends around the gate.
+func TestSendIsAGatedWrite(t *testing.T) {
+	var m wire.Manifest
+	if err := json.Unmarshal(manifest, &m); err != nil {
+		t.Fatal(err)
+	}
+	c := m.Contributes.Connectors[0]
+	if !slices.Equal(c.ConfirmAlways, []string{toolSendName}) || len(c.AgentTools) != 0 || c.SendsAsUser {
+		t.Errorf("confirm_always = %v, agent_tools = %v, sends_as_user = %v", c.ConfirmAlways, c.AgentTools, c.SendsAsUser)
+	}
+	for _, part := range []string{"真实", "确认", "替谁", "批准", "route_not_allowed", "结果不明"} {
+		if !strings.Contains(sendTool.Description, part) {
+			t.Errorf("the send tool's description lacks %q", part)
+		}
+	}
+	for _, tool := range []wire.ConnectorTool{aboutTool, destinationsTool, sendTool} {
+		if !strings.HasPrefix(tool.Name, connectorID+"_") || !json.Valid(tool.InputSchema) {
+			t.Errorf("tool %q", tool.Name)
+		}
+	}
+	var raw struct {
+		Configuration struct {
+			Properties map[string]map[string]any `json:"properties"`
+		} `json:"configuration"`
+	}
+	if err := json.Unmarshal(sourceManifest, &raw); err != nil {
+		t.Fatal(err)
+	}
+	d := raw.Configuration.Properties[destinationsKey]
+	items, _ := d["items"].(map[string]any)
+	_, hasDefault := d["default"]
+	if d["type"] != "array" || items["type"] != "string" || d["maxItems"] != float64(destsMost) || hasDefault || len(items) != 1 {
+		t.Errorf("destinations = %v", d)
+	}
+	desc, _ := d["description"].(string)
+	for _, part := range []string{"名字 = 渠道:账号:会话", "routes", "不要写钥匙"} {
+		if !strings.Contains(desc, part) {
+			t.Errorf("destinations.description lacks %q", part)
 		}
 	}
 }

@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"slices"
+	"strings"
+	"time"
 
 	"github.com/nwverse/persona/sdk/go/wire"
 )
@@ -18,6 +20,7 @@ func notConfigured(why string) wire.ConnectorStatus {
 func (x *app) statusNow() wire.ConnectorStatus {
 	x.mu.Lock()
 	off, missing, storeErr, st, rt, unreadable := x.off, x.missing, x.storeErr, x.st, x.rt, x.unreadable
+	badDests := len(x.set.badDests)
 	lacking := slices.Clone(x.lacking)
 	hubOK := x.api != nil
 	x.mu.Unlock()
@@ -55,12 +58,37 @@ func (x *app) statusNow() wire.ConnectorStatus {
 	}
 	out := wire.ConnectorStatus{State: wire.ConnectorStateOk, Account: "backend:" + s.backend, LastSync: s.connectedAt,
 		LastEvent: s.lastItem}
+	// Via is everything worth knowing while the state is fine, a clause each.
+	var notes []string
 	switch {
 	case corrupt:
-		out.Via = wordsStoreCorrupt
+		notes = append(notes, wordsStoreCorrupt)
 	case unreadable > 0:
-		out.Via = fmt.Sprintf(wordsUnreadableVia, unreadable)
+		notes = append(notes, fmt.Sprintf(wordsUnreadableVia, unreadable))
 	}
+	if badDests > 0 {
+		notes = append(notes, fmt.Sprintf(wordsBadDestsVia, badDests))
+	}
+	var sent, notSent, unsure int
+	for _, r := range st.sendsSince(time.Now().Add(-24 * time.Hour)) {
+		switch r.Outcome {
+		case sendDelivered:
+			sent++
+		case sendRefused:
+			notSent++
+		default:
+			unsure++
+		}
+	}
+	if sent+notSent+unsure > 0 {
+		notes = append(notes, fmt.Sprintf(wordsSendsVia, sent, notSent, unsure))
+	}
+	if len(notes) > 1 {
+		for i := range notes {
+			notes[i] = strings.TrimSuffix(notes[i], "。")
+		}
+	}
+	out.Via = strings.Join(notes, "；")
 	return out
 }
 

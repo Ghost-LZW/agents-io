@@ -77,8 +77,20 @@ type timings struct {
 	changedDebounce, capsEvery   time.Duration
 	hubTimeout                   time.Duration
 
+	// send is how long one request of a send the assistant asked for waits for the router's answer: two of them
+	// (the second without the reply target) end before the hub's two-minute wait for a connector call does, so the
+	// program says "unknown" before the hub gives up. echoWait is how long an item of a conversation with a send
+	// under way waits for the send's answer before it is judged. sendWindow is the rate limit's window; sendReuse is
+	// how long a send of unknown outcome is continued under its own operation id when the same text is sent again.
+	// echoKeep is how long after a send of unknown outcome an item of the same conversation and text is taken for
+	// its echo.
+	send, echoWait, echoKeep time.Duration
+	sendWindow, sendReuse    time.Duration
+
 	// runsMost is not a wait: how many channel conversations may have a round trip under way at once.
 	runsMost int
+	// sendPerDest and sendPerWindow are the rate limit: sends per destination, and in all, per sendWindow.
+	sendPerDest, sendPerWindow int
 }
 
 // defaultTimings follow the router's own (push answered within 30 s, server ping every 30 s) and the product's
@@ -94,6 +106,8 @@ var defaultTimings = timings{
 	deliverWaitMost: time.Hour, unsureRetry: 5 * time.Second, scopeRetryMost: 2 * time.Minute,
 	changedDebounce: time.Second, capsEvery: 10 * time.Minute, hubTimeout: 2 * time.Minute,
 	runsMost: 4,
+	send:     45 * time.Second, echoWait: 3 * time.Second, echoKeep: 10 * time.Minute, sendWindow: time.Minute, sendReuse: time.Hour,
+	sendPerDest: 3, sendPerWindow: 10,
 }
 
 // app is one run of the program: the settings it was started with (the hub restarts it when they change).
@@ -115,6 +129,13 @@ type app struct {
 	changed   *time.Timer
 	// unreadable counts the pushed items this run could not read and filed as placeholders (status says so).
 	unreadable int
+	// sending counts the delivers under way per conversation (channel:account:conversation); sendFlight has the
+	// operations of sends the assistant asked for that are under way, so a repeat waits for the first.
+	sending    map[string]int
+	sendFlight map[string]chan struct{}
+	// sendGate makes counting the sends of the rate limit's window and recording one more a single step, so calls
+	// that arrive together cannot all find room.
+	sendGate sync.Mutex
 
 	wakeCh chan struct{}
 	bg     sync.WaitGroup // the worker: once it is over no run is started
@@ -123,7 +144,7 @@ type app struct {
 
 func newApp(tm timings) *app {
 	return &app{tm: tm, missing: wordsNotConfigured, active: map[string]bool{}, markQuiet: map[string]bool{},
-		wakeCh: make(chan struct{}, 1)}
+		sending: map[string]int{}, sendFlight: map[string]chan struct{}{}, wakeCh: make(chan struct{}, 1)}
 }
 
 func main() {
@@ -141,14 +162,24 @@ func program(x *app) ext.Program {
 					return x.statusNow(), nil
 				}),
 				"tools.list": ext.Method(func(ctx context.Context, p wire.ConnectorParams) (wire.ConnectorTools, error) {
-					return wire.ConnectorTools{Tools: []wire.ConnectorTool{aboutTool}}, nil
+					return wire.ConnectorTools{Tools: []wire.ConnectorTool{aboutTool, destinationsTool}}, nil
 				}),
 				"tools.call": ext.Method(func(ctx context.Context, p wire.ConnectorCallParams) (wire.ConnectorCallResult, error) {
-					if p.Name != toolAboutName {
-						return wire.ConnectorCallResult{}, &ext.Error{Message: "unknown tool " + p.Name}
+					switch p.Name {
+					case toolAboutName:
+						return wire.ConnectorCallResult{Text: x.about()}, nil
+					case toolDestinationsName:
+						return wire.ConnectorCallResult{Text: x.destinationsText()}, nil
 					}
-					return wire.ConnectorCallResult{Text: x.about()}, nil
+					return wire.ConnectorCallResult{}, &ext.Error{Message: "unknown tool " + p.Name}
 				}),
+				// Writes: the hub calls actions.do only after its gate let the write through (the manifest's
+				// confirm_always makes that the owner confirming on their phone).
+				"actions.list": ext.Method(func(ctx context.Context, p wire.ConnectorParams) (wire.ConnectorTools, error) {
+					return wire.ConnectorTools{Tools: []wire.ConnectorTool{sendTool}}, nil
+				}),
+				"actions.describe": ext.Method(x.describeSend),
+				"actions.do":       ext.Method(x.doSend),
 				"inbox.collect": ext.Method(func(ctx context.Context, p wire.ConnectorParams) (collected, error) {
 					return collected{Things: x.collect()}, nil
 				}),
@@ -206,7 +237,8 @@ func (x *app) init(ctx context.Context, in *ext.Init, hub *ext.Hub) (map[string]
 	x.rt = newRouter(ws, set.key, &http.Client{}, x.tm)
 	x.rt.onInbound = x.intake
 	x.rt.onUp = x.wake
-	log.Printf("start: chat=%v rules(chat=%d guest=%d) journal=%d", x.api != nil, len(set.chatRules), len(set.guestRules), len(st.items))
+	log.Printf("start: chat=%v rules(chat=%d guest=%d) journal=%d dests=%d bad=%d", x.api != nil, len(set.chatRules),
+		len(set.guestRules), len(st.items), len(set.dests), len(set.badDests))
 	go x.rt.run(ctx)
 	x.bg.Add(1)
 	go x.worker(ctx)

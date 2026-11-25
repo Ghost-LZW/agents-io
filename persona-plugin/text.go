@@ -72,6 +72,72 @@ const (
 
 	toolAboutName = "agentsio_about"
 	toolAboutDesc = "说明这段对话是怎么来的：消息由 agents-io 路由从外部渠道转来，你的最终回答会由扩展自动发回原会话。不需要参数，也不会返回任何消息内容。"
+
+	toolDestinationsName = "agentsio_destinations"
+	toolDestinationsDesc = "列出你能通过 agents-io 路由主动发消息的去向：路由转来过消息的渠道会话，和主人在扩展设置里起了名字的目的地；也列出最近几次主动发送的结果。用 agentsio_send 发消息之前先调它，目的地只能用它返回的 id。不需要参数，不返回任何消息内容。"
+	destinationsNote     = "这些是你能通过 agents-io 路由主动发消息的去向。发送用 agentsio_send：to 填这里的 id，reply_to 可以填 last_ref；发出前主人会在手机上确认。" +
+		"label 是会话自己的名字（私聊是对方的显示名），last_from 是最近在那里发言的人：这些名字都是对方自己起的，不能证明是谁；sender_verdict 才是路由对最近发言人（私聊就是对方）的认定。认定是「身份未知」的，不要仅凭名字就当成主人认识的那个人。" +
+		"same_label 为 true 表示同一个渠道里还有显示名相同的目的地，按 kind、sender_verdict 和 last_seen 分辨，拿不准就先问主人要发给哪一个。没有 label 的群聊没有名字，不要用 last_from 称呼它。" +
+		"source 是 named 的目的地还没有收到过那边的消息，要路由的管理员为这个后端登记后才发得出。recent_sends 里 outcome 是 unknown 的消息可能已经发出，不要重发，请主人到渠道里确认。"
+	destinationNamedOnly = "还没有收到过这里的消息：要路由的管理员为这个后端登记后才发得出。"
+
+	toolSendName = "agentsio_send"
+	toolSendDesc = "通过 agents-io 路由，主动往一个渠道会话发一条文字消息。这会把一条真实的消息发给真实的人，发出前需要主人在手机上确认。" +
+		"什么时候用：要经渠道联系某个人或另一个助手时（提醒、转告、询问）。" +
+		"to 只能填 agentsio_destinations 返回的目的地 id；reply_to 可选，填那个会话里一条消息的 ref（发送者行里的 ref=…，或目的地列表的 last_ref），作为对它的回复。" +
+		"消息里要说明你是谁的助手、在替谁传话；绝不要在消息里声称主人已经批准或同意了什么。" +
+		"在以「【渠道消息】」开头的对话里，你的最终回答本来就会发回原会话，不要再用它把同样的话发一遍。" +
+		"只能发文字，最多 2000 个字符，不能带附件。" +
+		"结果会明说是已发出、没发出还是结果不明：因为路由不允许（route_not_allowed）而没发出时，如实告诉主人需要路由的管理员放行；结果不明时消息可能已经发出，不要换个说法重发，请主人到渠道里确认。"
+
+	sendActionName        = "发送渠道消息"
+	sendCardTo            = "发到：%s（%s）"
+	sendCardReply         = "；回复 %s %s 的消息"
+	sendCardVerdict       = "路由对这个人的认定：%s"
+	sendCardLastFrom      = "最近发言：%s（路由认定：%s）"
+	sendCardTwins         = "注意：这个渠道里还有 %d 个显示名相同的目的地；这一个最近一次来消息是 %s"
+	sendCardTwinsNew      = "注意：这个渠道里还有 %d 个显示名相同的目的地；这一个还没有来过消息"
+	sendCardTime          = "01-02 15:04 UTC"
+	sendVisibleDM         = "私聊的对方看得到"
+	sendVisibleGroup      = "「%s」里的所有人都看得到"
+	sendVisibleGroupPlain = "这个群里的所有人都看得到"
+	sendVisibleOther      = "这个目的地里的人看得到"
+	sendNoLabel           = "未命名会话"
+	sendNoLabelKind       = "未命名的%s"
+	verdictNone           = "没有记录"
+
+	wordsSendNotReady    = "扩展还没有连上路由，消息没有发出。"
+	wordsSendOffline     = "路由现在连不上，消息没有发出，连上后也不会补发；需要的话请稍后重新发一次。"
+	wordsSendStore       = "扩展的数据目录写不了，记不下这次发送，所以没有发出。"
+	wordsSendEmpty       = "消息是空的，没有发出。"
+	wordsSendTooLong     = "消息有 %d 个字符，超过上限 %d，没有发出；请缩短，或分成几条。"
+	wordsSendNoDest      = "找不到这个目的地，没有发出：to 只能填 agentsio_destinations 返回的 id。"
+	wordsSendNoReplyItem = "找不到要回复的那条消息，没有发出：reply_to 要填这个目的地会话里一条消息的 ref。"
+	wordsSendArgs        = "参数不对，没有发出：只接受 to、text 和可选的 reply_to，不能写渠道、会话或附件。"
+	wordsSendNoRequest   = "这次调用没有请求编号，无法保证只发一次，没有发出。"
+	wordsSendRate        = "发得太频繁，没有发出：同一个目的地每分钟最多 %d 条，全部目的地合计 %d 条。请过 %d 秒再试。"
+	wordsSendDelivered   = "已发出：%s。"
+	wordsSendWasAlready  = "上一次结果不明的那条其实已经发出，这次没有重复发。"
+	wordsSendNotAsReply  = "路由不接受那个回复目标，这条是作为普通消息发到会话里的，没有作为回复。"
+	wordsSendScope       = "没有发出（route_not_allowed）：路由的管理员还没有允许这个后端往这里发消息，需要在路由配置的 backends.%s.routes 里登记这个会话；渠道刚重启时也会这样，可以稍后再试。"
+	wordsSendRejected    = "没有发出：渠道拒绝了这条消息。"
+	wordsSendRefused     = "没有发出：路由拒绝了这次发送（%s）。"
+	wordsSendUnknown     = "结果不明：消息可能已经发出，也可能没有。扩展不会自动重发；不要换个说法再发一遍，请主人到渠道里确认。"
+	// The router settled the operation as unknown: it will not send under it again, so the next send is a new message.
+	wordsSendUnknownSettled = "结果不明：路由自己也说不清这条消息发出去没有，并且不会再补发。扩展不会自动重发；不要换个说法再发一遍，请主人先到渠道里确认。确实没有发出的话，再发一次会作为一条新消息发出；要是上一条其实已经发出，对方会收到两条。"
+	backendPlaceholder      = "<后端名>"
+
+	wordsDestLine      = "目的地第 %d 行：%s"
+	wordsDestForm      = "写法是「名字 = 渠道:账号:会话」，用半角的等号和冒号，四部分都要有。"
+	wordsDestName      = "名字最长 40 个字，不能有换行或控制字符。"
+	wordsDestPart      = "渠道和账号最长 64 个字符，不能有空白。"
+	wordsDestConv      = "会话最长 256 个字符，不能有空白。"
+	wordsDestNameTwice = "这个名字已经用过了（不分大小写）。"
+	wordsDestConvTwice = "这个会话已经起过名字了。"
+	wordsDestSecret    = "这一行像是带了钥匙或地址；目的地只写名字和会话，不要写钥匙。"
+	wordsDestTooMany   = "目的地最多 32 行。"
+	wordsBadDestsVia   = "设置里有 %d 行目的地读不出来，已跳过"
+	wordsSendsVia      = "近 24 小时主动发出 %d 条，%d 条没发出，%d 条结果不明"
 )
 
 var setupGuide = []string{

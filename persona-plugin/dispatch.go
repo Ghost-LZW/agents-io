@@ -37,6 +37,10 @@ func short(id string) string {
 	return hex.EncodeToString(sum[:16])
 }
 
+// textDigest names a text without keeping it: what a send is recorded with, and what an item is compared by when it
+// may be that send coming back.
+func textDigest(text string) string { return short("text|" + cleanText(text, 0)) }
+
 // cleanText makes text safe to hand on: CRLF becomes LF, every control character but newline and tab is removed (the
 // hub refuses them from an extension), and it is cut at most bytes on a rune boundary.
 func cleanText(s string, most int) string {
@@ -248,6 +252,22 @@ func (x *app) intake(ctx context.Context, raw json.RawMessage) bool {
 		return true
 	}
 	rec := normalize(it)
+	// A message this program sent, coming back as an item: the router stamps the ones it knows for its own (self,
+	// above); the ones it does not are known here by the platform id the send was answered with. A send the assistant
+	// asked for whose answer never came has no id to be known by: its echo is known by the conversation and the text
+	// (store.claimEcho), and its id is remembered from then on.
+	if rec.MessageID != "" && rec.State != stateSkipped {
+		x.awaitSends(ctx, rec)
+		now := time.Now()
+		switch {
+		case st.sentByUs(rec.Channel, rec.MessageID):
+			rec.State, rec.Why = stateSkipped, whySelf
+		case st.claimEcho(placeKeyOf(rec), textDigest(rec.Text), rec.SenderID, rec.MessageID, now.Add(-x.tm.echoKeep)):
+			st.noteSent(rec.Channel, []string{rec.MessageID}, now)
+			log.Printf("echo: item %s is taken for the echo of a send of unknown outcome", short(id)[:12])
+			rec.State, rec.Why = stateSkipped, whySelf
+		}
+	}
 	rec.TakenAt = time.Now().UTC()
 	decide(&rec, x.settings(), it.Tag, x.hubReady())
 	added, err := st.add(rec)
@@ -258,6 +278,7 @@ func (x *app) intake(ctx context.Context, raw json.RawMessage) bool {
 	if !added {
 		return true
 	}
+	st.sawPlace(rec)
 	log.Printf("intake: item %s tag=%s(%s) state=%s", short(id)[:12], rec.Tag, rec.TagSource, rec.State)
 	switch rec.State {
 	case stateInbox:
@@ -266,6 +287,21 @@ func (x *app) intake(ctx context.Context, raw json.RawMessage) bool {
 		x.wake()
 	}
 	return true
+}
+
+// awaitSends waits, for at most echoWait, while a deliver into the item's conversation is under way and the item is
+// not yet known for our own: a channel may hand the echo to the router before the router answers the send. What it
+// cannot wait out is put right when the send is answered (store.skipEchoes).
+func (x *app) awaitSends(ctx context.Context, rec itemRec) {
+	key, st := placeKeyOf(rec), x.store()
+	for began := time.Now(); time.Since(began) < x.tm.echoWait; {
+		x.mu.Lock()
+		under := x.sending[key] > 0
+		x.mu.Unlock()
+		if !under || st.sentByUs(rec.Channel, rec.MessageID) || sleep(ctx, x.tm.tick) != nil {
+			return
+		}
+	}
 }
 
 // unreadableThread is the one Inbox thread of the items this program could not read.

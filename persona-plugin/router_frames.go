@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"slices"
 )
 
 // The frames of the agents-io host protocol a backend uses (the router's docs/HOSTS.md, backend section; exact types
@@ -169,8 +170,20 @@ type renderedMessage struct {
 
 // deliverResult is the settled record of a deliver.
 type deliverResult struct {
-	Status            string `json:"status"`
-	ProviderMessageID string `json:"providerMessageId"`
-	Error             string `json:"error"`
-	Duplicate         bool   `json:"duplicate"`
+	Status             string   `json:"status"`
+	ProviderMessageID  string   `json:"providerMessageId"`
+	ProviderMessageIDs []string `json:"providerMessageIds"`
+	Error              string   `json:"error"`
+	Duplicate          bool     `json:"duplicate"`
+}
+
+// messageIDs are the platform ids of what was sent: one message, or the several a channel split it into.
+func (d deliverResult) messageIDs() []string {
+	var out []string
+	for _, id := range append([]string{d.ProviderMessageID}, d.ProviderMessageIDs...) {
+		if id != "" && !slices.Contains(out, id) {
+			out = append(out, id)
+		}
+	}
+	return out
 }

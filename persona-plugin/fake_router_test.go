@@ -18,10 +18,12 @@ const fakeKey = "aiob_test_key_not_real"
 
 // fakeAnswer scripts the fake router's answer to one request.
 type fakeAnswer struct {
-	errCode        string // answer ok:false with this code (nothing is sent, the operation id is not used up)
-	status         string // the deliver's settled status instead of delivered ("unknown", "rejected")
-	drop           bool   // no answer at all, nothing sent
-	sendThenHangup bool   // send and record, then close the connection without answering
+	errCode        string        // answer ok:false with this code (nothing is sent, the operation id is not used up)
+	status         string        // the deliver's settled status instead of delivered ("unknown", "rejected")
+	drop           bool          // no answer at all, nothing sent
+	sendThenHangup bool          // send and record, then close the connection without answering
+	ids            []string      // the settled record also lists these as providerMessageIds
+	delay          time.Duration // wait this long before answering (the send is recorded after the wait)
 }
 
 type queued struct {
@@ -258,6 +260,9 @@ func (f *fakeRouter) serve(w http.ResponseWriter, r *http.Request) {
 			if ans != nil && ans.drop {
 				continue
 			}
+			if ans != nil && ans.delay > 0 {
+				time.Sleep(ans.delay)
+			}
 			if ans != nil && ans.errCode != "" {
 				fail(id, ans.errCode)
 				continue
@@ -282,6 +287,9 @@ func (f *fakeRouter) serve(w http.ResponseWriter, r *http.Request) {
 				if status == "delivered" {
 					f.sends++
 					rec["providerMessageId"] = fmt.Sprintf("pm_%d", f.sends)
+					if ans != nil && len(ans.ids) > 0 {
+						rec["providerMessageIds"] = ans.ids
+					}
 				}
 				f.ops[op] = rec
 			}

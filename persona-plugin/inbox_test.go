@@ -165,7 +165,7 @@ func TestProtocolConformanceWithData(t *testing.T) {
 	if len(things.Things) != 1 || things.Things[0].Thread != demoThread || things.Things[0].Extra == nil || things.Things[0].Extra.RuleTier != "action" {
 		t.Errorf("things = %+v", things.Things)
 	}
-	if len(tools.Tools) != 1 || tools.Tools[0].Name != toolAboutName {
+	if len(tools.Tools) != 2 || tools.Tools[0].Name != toolAboutName || tools.Tools[1].Name != toolDestinationsName {
 		t.Errorf("tools = %+v", tools.Tools)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/url"
@@ -11,6 +12,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/nwverse/persona/sdk/go/ext"
 	"github.com/nwverse/persona/sdk/go/wire"
@@ -41,6 +44,10 @@ type settings struct {
 	chatWait    time.Duration
 	keep        time.Duration
 	triageRules string
+	// dests are the named destinations that read well; badDests are the lines that do not (settings.check refuses
+	// them, a start with them skips them and the status counts them).
+	dests    []destination
+	badDests []destProblem
 }
 
 func settingsOf(config json.RawMessage, secrets map[string]string) settings {
@@ -52,6 +59,7 @@ func settingsOf(config json.RawMessage, secrets map[string]string) settings {
 		ChatWait    *int     `json:"chat_wait_minutes"`
 		KeepDays    *int     `json:"keep_days"`
 		TriageRules string   `json:"triage_rules"`
+		Dests       []string `json:"destinations"`
 	}{}
 	if len(config) > 0 {
 		_ = json.Unmarshal(config, &c)
@@ -66,7 +74,102 @@ func settingsOf(config json.RawMessage, secrets map[string]string) settings {
 		keep:        time.Duration(clamp(c.KeepDays, 30, 7, 90)) * 24 * time.Hour,
 		triageRules: triageRulesOf(c.TriageRules),
 	}
+	s.dests, s.badDests = parseDestinations(c.Dests)
 	return s
+}
+
+// Named destinations: places the assistant may send to before the router ever routed a message from them. One line
+// each, "<name> = <channel>:<account>:<conversation id>". They name a conversation and nothing else: the router's
+// admin decides whether this backend may send there (backends.<id>.routes), and no line may carry a key or an address.
+const (
+	destsMost       = 32
+	destNameMost    = 40
+	destPartMost    = 64
+	destConvMost    = 256
+	destinationsKey = "destinations"
+)
+
+type destination struct{ Name, Channel, Account, ConvID string }
+
+func (d destination) key() string { return destKey(d.Channel, d.Account, d.ConvID) }
+func (d destination) id() string  { return destID(d.Channel, d.Account, d.ConvID) }
+
+// destKey is a conversation as the router's send scope sees it: channel, account and conversation, no thread.
+func destKey(channel, account, conv string) string { return channel + ":" + account + ":" + conv }
+
+// destID is the id the assistant names a destination by. It says nothing about the coordinates and changes when
+// they do, so a name that now points elsewhere is a new id.
+func destID(channel, account, conv string) string {
+	return "d-" + short("dest|" + channel + "|" + account + "|" + conv)[:12]
+}
+
+// destProblem is one line of the setting that cannot be read: its number as the form shows it, and why.
+type destProblem struct {
+	Line int
+	Why  string
+}
+
+// parseDestinations reads the setting's lines. Empty lines are skipped. The reasons never repeat the line's text.
+func parseDestinations(lines []string) (good []destination, bad []destProblem) {
+	names, keys := map[string]bool{}, map[string]bool{}
+	for i, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		n := i + 1
+		if len(good) >= destsMost {
+			bad = append(bad, destProblem{n, wordsDestTooMany})
+			break
+		}
+		d, why := parseDestination(line)
+		switch {
+		case why != "":
+		case names[strings.ToLower(d.Name)]:
+			why = wordsDestNameTwice
+		case keys[d.key()]:
+			why = wordsDestConvTwice
+		}
+		if why != "" {
+			bad = append(bad, destProblem{n, why})
+			continue
+		}
+		names[strings.ToLower(d.Name)], keys[d.key()] = true, true
+		good = append(good, d)
+	}
+	return good, bad
+}
+
+func parseDestination(line string) (destination, string) {
+	if lower := strings.ToLower(line); strings.Contains(lower, keyPrefix) || strings.Contains(line, "://") {
+		return destination{}, wordsDestSecret
+	}
+	name, rest, ok := strings.Cut(line, "=")
+	if !ok {
+		return destination{}, wordsDestForm
+	}
+	parts := strings.SplitN(strings.TrimSpace(rest), ":", 3)
+	if len(parts) != 3 {
+		return destination{}, wordsDestForm
+	}
+	d := destination{Name: strings.TrimSpace(name), Channel: strings.TrimSpace(parts[0]), Account: strings.TrimSpace(parts[1]),
+		ConvID: strings.TrimSpace(parts[2])}
+	plain := func(s string, spaces bool) bool {
+		return !strings.ContainsFunc(s, func(r rune) bool {
+			return unicode.IsControl(r) || r == utf8.RuneError || (!spaces && unicode.IsSpace(r))
+		})
+	}
+	switch {
+	case d.Name == "" || d.Channel == "" || d.Account == "" || d.ConvID == "":
+		return destination{}, wordsDestForm
+	case utf8.RuneCountInString(d.Name) > destNameMost || !plain(d.Name, true):
+		return destination{}, wordsDestName
+	case len(d.Channel) > destPartMost || len(d.Account) > destPartMost || !plain(d.Channel, false) || !plain(d.Account, false):
+		return destination{}, wordsDestPart
+	case len(d.ConvID) > destConvMost || !plain(d.ConvID, false):
+		return destination{}, wordsDestConv
+	}
+	return d, ""
 }
 
 func trimmed(in []string) []string {
@@ -190,6 +293,11 @@ func (x *app) settingsHandler(ctx context.Context, method string, params json.Ra
 // part of them (the address before the key) is fine; what is filled in must work. A key without the usual prefix is
 // not refused on its form: the handshake decides.
 func (x *app) checkSettings(ctx context.Context, s settings, params wire.SettingsCheckParams) (string, string) {
+	// The destinations first, whatever else is filled in: they need no connection to be read.
+	if len(s.badDests) > 0 {
+		p := s.badDests[0]
+		return fmt.Sprintf(wordsDestLine, p.Line, p.Why), destinationsKey
+	}
 	if s.routerURL == "" {
 		return "", ""
 	}
