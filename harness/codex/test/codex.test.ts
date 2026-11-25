@@ -457,6 +457,56 @@ describe('steer', () => {
     expect(await s.steer([input('i4', 'late')], 'T1')).toBe('no_active_turn');
   });
 
+  it('an answer Codex abandons (started, never completed: steered, interrupted) ends skipped with its turn; its partial text is never the final answer #HC-1', async () => {
+    const { fake, harness } = setup();
+    const s = await open(harness);
+    const c = collector(s);
+    const msg = (id: string, text: string) => ({ type: 'agentMessage', id, text, phase: 'final_answer', memoryCitation: null, delivery: null, questions: null });
+    const n = (th: string, tid: string, method: string, params: object) => fake.notify(method, { threadId: th, turnId: tid, ...params });
+    const turnDone = (id: string) => (e: { body: { t: string }; turnId?: string }) => e.body.t === 'turn.completed' && e.turnId === id;
+    let completeAfterAnswer = false;
+    fake.onTurnStart = (p, tid) => {
+      fake.echoUser(p.threadId, tid, p.clientUserMessageId);
+      n(p.threadId, tid, 'item/started', { item: msg(`m-${tid}`, ''), startedAtMs: 1 });
+      n(p.threadId, tid, 'item/agentMessage/delta', { itemId: `m-${tid}`, delta: '1\n2\n' });
+      if (completeAfterAnswer) fake.completeTurn(p.threadId, tid, 'completed');
+    };
+    // As recorded from Codex 0.171 (steer.ndjson): the steered input, then a new answer; the one it was writing never completes.
+    fake.onSteer = (p, tid) => {
+      fake.echoUser(p.threadId, tid, p.clientUserMessageId, 'stop');
+      n(p.threadId, tid, 'item/started', { item: msg('m-steered', ''), startedAtMs: 1 });
+      n(p.threadId, tid, 'item/agentMessage/delta', { itemId: 'm-steered', delta: 'steered' });
+      n(p.threadId, tid, 'item/completed', { item: msg('m-steered', 'steered'), completedAtMs: 1 });
+      fake.completeTurn(p.threadId, tid, 'completed');
+    };
+    await s.startTurn('T1', [input('i1', 'count')]);
+    await c.until((e) => e.body.t === 'text.delta');
+    expect(await s.steer([input('i2', 'stop')], 'T1')).toBe('steered');
+    await c.until(turnDone('T1'));
+    // A turn whose only answer Codex left unfinished, and an interrupted one.
+    completeAfterAnswer = true;
+    await s.startTurn('T2', [input('i3', 'count')]);
+    await c.until(turnDone('T2'));
+    completeAfterAnswer = false;
+    await s.startTurn('T3', [input('i4', 'count')]);
+    await c.until((e) => e.body.t === 'text.delta' && e.turnId === 'T3');
+    await s.interrupt('T3');
+    await c.until(turnDone('T3'));
+
+    assertConformingStream(c.events, { turnInputs: { T1: ['i1', 'i2'], T2: ['i3'], T3: ['i4'] } });
+    const ended = (turnId: string) =>
+      c.events.flatMap((e) => (e.turnId === turnId && (e.body.t === 'item.completed' || e.body.t === 'turn.completed') ? [e.body.t === 'item.completed' ? [e.body.item.itemId, e.body.item.status] : ['turn', e.body.status]] : []));
+    expect(ended('T1')).toEqual([['m-steered', 'completed'], ['m-turn-1', 'skipped'], ['turn', 'completed']]);
+    expect(ended('T2')).toEqual([['m-turn-2', 'skipped'], ['turn', 'completed']]);
+    expect(ended('T3')).toEqual([['m-turn-3', 'skipped'], ['turn', 'interrupted']]);
+    const skipped = c.events.find((e) => e.body.t === 'item.completed' && e.itemId === 'm-turn-1')!;
+    expect(skipped).toMatchObject({ level: 'detail', body: { item: { type: 'agent_message', title: '', result: { preview: 'not completed by codex before the turn ended', isError: false } } } });
+    // The partial text streamed, but no snapshot carries it: the final answer is the last completed one, or none.
+    const snapshots = c.events.filter((e) => e.body.t === 'text.snapshot');
+    expect(snapshots.filter((e) => e.itemId?.startsWith('m-turn-'))).toEqual([]);
+    expect(snapshots.filter((e) => (e.body as { final: boolean }).final).map((e) => [e.turnId, (e.body as { text: string }).text])).toEqual([['T1', 'steered']]);
+  });
+
   it('maps stale, not steerable and no-active-turn #HC-1', async () => {
     const { fake, harness } = setup();
     const s = await open(harness);

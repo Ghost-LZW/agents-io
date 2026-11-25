@@ -84,7 +84,7 @@ aio-transcript-replay <transcript.ndjson> [--bind name=value]... [--after-end er
 
 `harness/acp/test/transcripts.test.ts` 同样用 `aio-transcript-replay` 当 agent，经真实 `AcpHarness` 回放四段（Claude Code 的 ACP agent `@agentclientprotocol/claude-agent-acp` 0.110.1，模型 `gpt-6-sol`，2026-11-25）：普通一轮写出的帧与录下的一字不差（`initialize` 里没有 `fs`、`terminal`）、回答相同；审批那一段是没配 profile 的 `restricted` 一轮：agent 打开时在 `auto`，适配器先 `session/set_mode` 到它会先问的 `default`，`allow_once` 作为 agent 给的那个选项回去；其余三段是主人的 `bypass` 轮次，跑在会话打开时的 mode 上，没有 `session/set_mode`；取消后这一轮 `interrupted`、输入记消费；`session/load` 时 agent 先重放对话再回答，重放的不成为事件，下一轮照常（HC-1、RQ-1、IN-1、RS-1）。
 
-录下的 steer 查出 HC-1 的一条不成立：Codex 0.171 在 steer 时放弃正在写的回答（`agentMessage` 有 `item/started`，没有 `item/completed`），适配器把这个 item 一直开着。由同一文件的 `it.fails` 复现，没修（INVARIANTS HC-1 不成立 1）。
+录下的 steer 查出 HC-1 的一条不成立：Codex 0.171 在 steer 时放弃正在写的回答（`agentMessage` 有 `item/started`，没有 `item/completed`；打断时同样），适配器把这个 item 一直开着。先由同一文件的 `it.fails` 复现，已修（2026-11-25，INVARIANTS HC-1 已修 1）：适配器在一轮结束时把还开着的 item 记成 `skipped`，被放弃的回答没有 snapshot，最终回答是录下的那条完成的回答；那条测试改成 `it`。
 
 ## 3. L2：内核场景
 

@@ -763,16 +763,19 @@ export class CodexSession implements HarnessSession {
   private finishTurn(t: Turn, status: BodyOf<'turn.completed'>['status'], error?: BodyOf<'turn.completed'>['error'], native?: unknown): void {
     if (t.done) return;
     for (const [id, r] of this.requests) if (r.turnId === t.turnId) this.cancelRequest(id);
-    if (t.gap) {
-      // Their item/completed may have been sent while we were disconnected.
-      for (const [itemId, item] of t.openItems) {
-        this.emit(
-          { t: 'item.completed', item: { ...item, status: 'skipped', result: { preview: 'completion not observed (reconnected)', truncated: null, isError: false } } },
-          { turnId: t.turnId, itemId, level: 'detail' },
-        );
-      }
-      t.openItems.clear();
+    // A turn ends with every item it started ended (HC-1). Codex may never complete one: it abandons
+    // the answer it was writing when steered (item/started, no item/completed, not in the turn's
+    // items). After a reconnect, their item/completed may have been sent while we were disconnected.
+    // Either way the item ends here, skipped; its partial text never becomes the answer (only a
+    // completed agentMessage sets lastAnswer).
+    const unseen = t.gap ? 'completion not observed (reconnected)' : 'not completed by codex before the turn ended';
+    for (const [itemId, item] of t.openItems) {
+      this.emit(
+        { t: 'item.completed', item: { ...item, status: 'skipped', result: { preview: unseen, truncated: null, isError: false } } },
+        { turnId: t.turnId, itemId, level: 'detail' },
+      );
     }
+    t.openItems.clear();
     const missing = t.startInputs.filter((id) => !t.consumed.has(id));
     // An input the model may not have read took its preface with it.
     if (missing.length || [...t.steerInputs].some((id) => !t.consumed.has(id))) this.memo.reset();

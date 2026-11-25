@@ -95,10 +95,18 @@ describe('recorded Codex 0.171 transcripts, replayed through the adapter', () =>
     expect(r.of('turn.completed')).toEqual([expect.objectContaining({ turnId: 't1', status: 'completed' })]);
   });
 
-  // INVARIANTS HC-1 不成立 1: Codex 0.171 abandons the answer it was writing when steered (item/started, never item/completed); the adapter leaves that item open in a completed turn.
-  it.fails('a steer: the answer Codex abandoned when steered is closed before the turn completes, so the stream conforms #HC-1', async () => {
+  it('a steer: the answer Codex abandoned when steered is closed before the turn completes, so the stream conforms #HC-1', async () => {
     const r = await replay('steer');
     expect(r.violations).toEqual([]);
+    // Codex 0.171 abandons the answer it was writing when steered (item/started, deltas, never
+    // item/completed): the adapter ends it skipped. Its partial text streamed, but it is not the
+    // answer: no snapshot of it; the final answer is the completed one.
+    const skipped = r.of('item.completed').filter((c) => c.item.status === 'skipped');
+    expect(skipped).toEqual([expect.objectContaining({ item: expect.objectContaining({ type: 'agent_message' }) })]);
+    const abandoned = skipped[0]!.item.itemId;
+    expect(r.events.some((e) => e.itemId === abandoned && e.body.t === 'text.delta')).toBe(true);
+    expect(r.events.filter((e) => e.itemId === abandoned && e.body.t === 'text.snapshot')).toEqual([]);
+    expect(r.of('text.snapshot').filter((x) => x.final).map((x) => x.text)).toEqual([recordedAnswer(r.t)]);
   });
 
   it('an approval: the server request opens a request, the decision goes back as the recorded answer to it, the command runs and the turn completes #HC-9 #HC-1', async () => {
