@@ -94,7 +94,7 @@ R1–R3 是第一条链路的前提。
 
 ## 5. persona 扩展 `agents-io`
 
-放 `persona-extensions-internal`，Go，用现成的 `pluginkit`。**每个 manager 装一份，每份配一把后端钥匙。** 通用于所有渠道。它用 persona 发给扩展的受限令牌（`pext_`，范围 `assistant.ask`、`agents.read`、`agents.control`，可选 `agents.permission_mode`）调 hub，只能碰自己那个 manager。
+Go 写的一个 persona 扩展。**每个 manager 装一份，每份配一把后端钥匙。** 通用于所有渠道。它用 persona 发给扩展的受限令牌（`pext_`，范围 `assistant.ask`、`agents.read`、`agents.control`，可选 `agents.permission_mode`）调 hub，只能碰自己那个 manager。
 
 ### 5.1 收到一条输入
 
