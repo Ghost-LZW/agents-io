@@ -212,4 +212,79 @@ describe('daemon records in an atomic settlement', () => {
     expect(second.backendSent('fake', 'a2')).toEqual([{ backend: 'alpha', route }]);
     expect(second.outboundByOperation('host:recent')).toMatchObject({ result: 'delivered' });
   });
+
+  it('a database from before read keys opens as it is: its stored key is a read-write key; a read key is kept in a table of its own, so the older table never holds one and reads back unchanged once the read key is removed #RS-1 #PB-3 #PB-7', () => {
+    const path = join(tmp('aio-rec-keys-'), 'log.db');
+    // The key table as it was when a backend had one key (and nothing else of the daemon's).
+    const old = new DatabaseSync(path);
+    cleanups.push(() => {
+      if (old.isOpen) old.close();
+    });
+    const OLD_TABLE = 'CREATE TABLE daemon_backend_keys (backend TEXT PRIMARY KEY, hash TEXT NOT NULL, created_at INTEGER NOT NULL) WITHOUT ROWID';
+    // What a daemon from before read keys runs against the table (it prepares these when it opens the database).
+    const OLD_SELECT = 'SELECT backend, hash, created_at FROM daemon_backend_keys ORDER BY backend';
+    const OLD_UPSERT = 'INSERT INTO daemon_backend_keys (backend, hash, created_at) VALUES (?, ?, ?) ON CONFLICT(backend) DO UPDATE SET hash = excluded.hash, created_at = excluded.created_at';
+    const OLD_DELETE = 'DELETE FROM daemon_backend_keys WHERE backend = ?';
+    old.exec(OLD_TABLE);
+    const [rw, rd, rd2, betaRead] = ['a', 'b', 'c', 'd'].map((x) => x.repeat(64));
+    old.prepare(OLD_UPSERT).run('alpha', rw, 111);
+    old.close();
+
+    const db = new DatabaseSync(path);
+    cleanups.push(() => {
+      if (db.isOpen) db.close();
+    });
+    const schema = () => (db.prepare("SELECT sql FROM sqlite_master WHERE name = 'daemon_backend_keys'").get() as { sql: string }).sql;
+    const olderTable = () => db.prepare(OLD_SELECT).all() as { backend: string; hash: string; created_at: number }[];
+    const records = new DaemonRecords({ db });
+    // Opened as it is: the table is not rebuilt and gains no column, and its key is a read-write key.
+    expect(schema()).toBe(OLD_TABLE);
+    const before = olderTable();
+    expect(before).toEqual([{ backend: 'alpha', hash: rw, created_at: 111 }]);
+    expect(records.backendKeys()).toEqual([{ backend: 'alpha', access: 'readwrite', hash: rw, createdAt: 111 }]);
+
+    // A read key, replaced once, and one of a backend that has no read-write key: none of them is a row of the older table.
+    records.putBackendKey('alpha', rd, 222, 'read');
+    records.putBackendKey('alpha', rd2, 333, 'read');
+    records.putBackendKey('beta', betaRead, 444, 'read');
+    expect(records.backendKeys()).toEqual([
+      { backend: 'alpha', access: 'read', hash: rd2, createdAt: 333 },
+      { backend: 'alpha', access: 'readwrite', hash: rw, createdAt: 111 },
+      { backend: 'beta', access: 'read', hash: betaRead, createdAt: 444 },
+    ]);
+    expect(olderTable()).toEqual(before);
+    expect(JSON.stringify(olderTable())).not.toContain(rd2);
+    expect(db.prepare('SELECT backend, access, hash, created_at FROM daemon_backend_access_keys ORDER BY backend').all()).toEqual([
+      { backend: 'alpha', access: 'read', hash: rd2, created_at: 333 },
+      { backend: 'beta', access: 'read', hash: betaRead, created_at: 444 },
+    ]);
+    // A level this version does not know, written by whatever: not a key at all.
+    db.prepare('INSERT INTO daemon_backend_access_keys (backend, access, hash, created_at) VALUES (?, ?, ?, ?)').run('alpha', 'admin', 'e'.repeat(64), 555);
+    expect(records.backendKeys().map((k) => [k.backend, k.access])).toEqual([['alpha', 'read'], ['alpha', 'readwrite'], ['beta', 'read']]);
+
+    // Each level is removed on its own; the older table reads back as it was once the read keys are gone.
+    expect(records.delBackendKey('alpha', 'read')).toBe(true);
+    expect(records.delBackendKey('alpha', 'read')).toBe(false);
+    expect(records.backendKeys().map((k) => [k.backend, k.access])).toEqual([['alpha', 'readwrite'], ['beta', 'read']]);
+    expect(olderTable()).toEqual(before);
+    expect(schema()).toBe(OLD_TABLE);
+    // The default level is the read-write key, in the older table, as before.
+    records.putBackendKey('beta', 'f'.repeat(64), 666);
+    expect(olderTable()).toEqual([...before, { backend: 'beta', hash: 'f'.repeat(64), created_at: 666 }]);
+    expect(records.delBackendKey('beta', 'readwrite')).toBe(true);
+    expect(records.backendKeys().map((k) => [k.backend, k.access])).toEqual([['alpha', 'readwrite'], ['beta', 'read']]);
+    // Without a level: both.
+    records.putBackendKey('alpha', rd, 777, 'read');
+    expect(records.delBackendKey('alpha')).toBe(true);
+    expect(records.backendKeys().map((k) => [k.backend, k.access])).toEqual([['beta', 'read']]);
+    expect(records.delBackendKey('beta')).toBe(true);
+    expect(records.delBackendKey('beta')).toBe(false);
+    expect(records.backendKeys()).toEqual([]);
+
+    // What an older daemon does with this database still works: its statements prepare and run against the table.
+    db.prepare(OLD_UPSERT).run('alpha', rw, 111);
+    db.prepare(OLD_UPSERT).run('alpha', rw, 112);
+    expect(db.prepare(OLD_SELECT).all()).toEqual([{ backend: 'alpha', hash: rw, created_at: 112 }]);
+    expect(Number(db.prepare(OLD_DELETE).run('alpha').changes)).toBe(1);
+  });
 });

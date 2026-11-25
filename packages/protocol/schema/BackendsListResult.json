@@ -52,6 +52,33 @@
           "connections": {
             "type": "number"
           },
+          "read": {
+            "type": "object",
+            "required": [
+              "key",
+              "connections"
+            ],
+            "properties": {
+              "key": {
+                "type": "object",
+                "required": [
+                  "id",
+                  "createdAt"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "createdAt": {
+                    "type": "number"
+                  }
+                }
+              },
+              "connections": {
+                "type": "number"
+              }
+            }
+          },
           "push": {
             "type": "boolean"
           },

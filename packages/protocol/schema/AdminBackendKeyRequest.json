@@ -21,6 +21,18 @@
           "type": "string"
         }
       ]
+    },
+    "access": {
+      "anyOf": [
+        {
+          "const": "read",
+          "type": "string"
+        },
+        {
+          "const": "readwrite",
+          "type": "string"
+        }
+      ]
     }
   }
 }

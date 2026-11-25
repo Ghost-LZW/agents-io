@@ -131,6 +131,16 @@ describe('host protocol additions', () => {
     expect(errors(BackendsKeyResult, { backend: 'alpha', op: 'issue', key: 'aiob_not-a-real-key', keyId: '0123456789ab', createdAt: 1, closed: 0 })).toEqual([]);
     expect(errors(BackendsKeyResult, { backend: 'alpha', op: 'revoke', closed: 1 })).toEqual([]);
     expect(check(BackendsKeyResult, { backend: 'alpha', op: 'revoke' })).toBe(false);
+    // Key levels (PB-7): optional everywhere, and only the two names.
+    for (const access of ['read', 'readwrite']) expect(check(HostRequestFrame, { v: 1, type: 'backends.key', id: '2', backend: 'alpha', op: 'issue', access })).toBe(true);
+    expect(check(HostRequestFrame, { v: 1, type: 'backends.key', id: '2', backend: 'alpha', op: 'issue', access: 'admin' })).toBe(false);
+    expect(errors(HostHelloResult, { ...backendHello, backend: { id: 'alpha', access: 'read' } })).toEqual([]);
+    expect(errors(HostHelloResult, { ...backendHello, backend: { id: 'alpha', access: 'readwrite' } })).toEqual([]);
+    expect(check(HostHelloResult, { ...backendHello, backend: { id: 'alpha', access: 'write' } })).toBe(false);
+    expect(errors(BackendsListResult, { backends: [{ ...info, read: { key: { id: '0123456789ab', createdAt: 1 }, connections: 0 } }] })).toEqual([]);
+    expect(check(BackendsListResult, { backends: [{ ...info, read: {} }] })).toBe(false);
+    expect(errors(BackendsKeyResult, { backend: 'alpha', op: 'issue', access: 'read', key: 'aiobr_not-a-real-key', keyId: '0123456789ab', createdAt: 1, closed: 0 })).toEqual([]);
+    expect(check(BackendsKeyResult, { backend: 'alpha', op: 'revoke', access: 'x', closed: 0 })).toBe(false);
     expect(errors(HOST_RESULT_VALUES['backends.forget'], { backend: 'alpha', items: 2, routes: 1, closed: 0 })).toEqual([]);
     expect(errors(RouteCalloutAnswer, { on: 'context', session: 'topic' })).toEqual([]);
   });
@@ -154,6 +164,8 @@ describe('admin API', () => {
     expect('body' in at('POST /api/backends/:id/forget')).toBe(false);
     expect(check(AdminBackendKeyRequest, { op: 'rotate' })).toBe(true);
     expect(check(AdminBackendKeyRequest, { op: 'show' })).toBe(false);
+    expect(check(AdminBackendKeyRequest, { op: 'issue', access: 'read' })).toBe(true);
+    expect(check(AdminBackendKeyRequest, { op: 'issue', access: 'x' })).toBe(false);
     expect(ADMIN_WS_SUBPROTOCOL).toBe('agents-io.v1');
   });
 });

@@ -6,6 +6,7 @@ import {
   PROTOCOL_VERSION,
   encodeFrame,
   type AttentionChanged,
+  type BackendAccess,
   type BackendsForgetResult,
   type BackendsKeyResult,
   type BackendsListResult,
@@ -370,9 +371,13 @@ export class LocalClient {
     return this.call('backends.list');
   }
 
-  /** Issue, rotate or revoke a backend's key (`backends.key`). The key is in the answer of issue / rotate, once. */
-  backendsKey(backend: string, op: 'issue' | 'rotate' | 'revoke'): Promise<BackendsKeyResult> {
-    return this.call('backends.key', { backend, op });
+  /**
+   * Issue, rotate or revoke a backend's key (`backends.key`). The key is in the answer of issue / rotate, once.
+   * `access`: which of its keys (default the read-write one). A daemon whose `host.hello` features lack
+   * `backends.access` ignores it and acts on the read-write key: check the answer's `access`.
+   */
+  backendsKey(backend: string, op: 'issue' | 'rotate' | 'revoke', access?: BackendAccess): Promise<BackendsKeyResult> {
+    return this.call('backends.key', { backend, op, ...(access !== undefined ? { access } : {}) });
   }
 
   /** Remove a backend's queue items, cursor and send grants (`backends.forget`); its key stays. */

@@ -58,10 +58,13 @@ host commands (authenticate with the token file next to the socket; docs/HOSTS.m
                                                                        --chain: an agent input back to the root of its chain)
   aio verify    <channelRef>                                          (channel:<channel>/<message id>)
   aio backend   list                                                  (backends: key id, connections, backlog, send grants; never a key)
-  aio backend   key <id>                                              (a first key, printed once on stdout; only its SHA-256 is kept)
-  aio backend   rotate <id>                                           (a new key; the old one stops working at once)
-  aio backend   revoke <id>                                           (no key: the backend cannot connect)
-  aio backend   forget <id>                                           (drops its queue items, cursor and send grants; keeps its key)
+  aio backend   key <id> [--read]                                     (a first key, printed once on stdout; only its SHA-256 is kept)
+  aio backend   rotate <id> [--read]                                  (a new key; the old one stops working at once)
+  aio backend   revoke <id> [--read]                                  (no key: the backend cannot connect)
+  aio backend   forget <id>                                           (drops its queue items, cursor and send grants; keeps its keys)
+                                                                      (--read: the backend's read key instead, kept and rotated on its own.
+                                                                       It only observes: the backend's queue items and their media; it acks,
+                                                                       sends and uploads nothing)
 
 test hooks (fault injection; only when \`aio serve\` runs with AIO_TEST_HOOKS=1, host token as above; docs/HOSTS.md §4.3)
   aio replay    --input <inputId> [--times N]                         (a channel message accepted earlier, to the gateway again;
@@ -143,6 +146,7 @@ export function parseCli(argv: string[]): CliArgs {
         limit: { type: 'string' },
         'token-file': { type: 'string' },
         chain: { type: 'boolean' },
+        read: { type: 'boolean' },
         preset: { type: 'string' },
         model: { type: 'string' },
         effort: { type: 'string' },
@@ -201,16 +205,21 @@ export function socketOf(a: CliArgs, env: NodeJS.ProcessEnv = process.env): stri
 
 /** Connect and authenticate as a host (not THE host: no consumer, no callouts). */
 async function hostClient(a: CliArgs): Promise<LocalClient> {
+  return (await hostClientHello(a)).client;
+}
+
+/** `hostClient`, with what the daemon answered to the hello (its features). */
+async function hostClientHello(a: CliArgs): Promise<{ client: LocalClient; hello: Awaited<ReturnType<LocalClient['hello']>> }> {
   const socket = socketOf(a);
   const token = readTokenFile(tokenPath(socket));
   const client = await LocalClient.connect(socket);
   try {
-    await client.hello({ token, name: str(a, 'name') ?? `aio-${a.cmd}` });
+    const hello = await client.hello({ token, name: str(a, 'name') ?? `aio-${a.cmd}` });
+    return { client, hello };
   } catch (e) {
     client.close();
     throw e;
   }
-  return client;
 }
 
 async function readInput(file: string | undefined): Promise<string> {
@@ -689,18 +698,23 @@ async function explain(a: CliArgs): Promise<number> {
 }
 
 /**
- * `aio backend …` (PB-3): keys and state of the configured backends, with the host token. A new key
- * goes to stdout on a line of its own, this once; what to do with it goes to stderr.
+ * `aio backend …` (PB-3, PB-7): keys and state of the configured backends, with the host token. A new key
+ * goes to stdout on a line of its own, this once; what to do with it goes to stderr. `--read`: the
+ * backend's read key instead of its read-write one.
  */
 async function backend(a: CliArgs): Promise<number> {
-  const usage = 'usage: aio backend list | aio backend key <id> | aio backend rotate <id> | aio backend revoke <id> | aio backend forget <id>';
+  const usage = 'usage: aio backend list | aio backend key <id> [--read] | aio backend rotate <id> [--read] | aio backend revoke <id> [--read] | aio backend forget <id>';
   const [sub, id, ...more] = a.rest;
   const subs = ['list', 'ls', 'key', 'rotate', 'revoke', 'forget'];
   if (!sub || !subs.includes(sub) || more.length) throw new ConfigError(usage);
   const list = sub === 'list' || sub === 'ls';
   if (list ? id !== undefined : !id) throw new ConfigError(usage);
-  const client = await hostClient(a);
+  const read = a.values.read === true;
+  // A level belongs to a key: list shows both, forget is about the backend.
+  if (read && (list || sub === 'forget')) throw new ConfigError(usage);
+  const { client, hello } = await hostClientHello(a);
   try {
+    if (read) return await backendReadKey(client, hello.features ?? [], id!, sub === 'key' ? 'issue' : (sub as 'rotate' | 'revoke'));
     if (list) {
       print(await client.backendsList());
       return 0;
@@ -722,6 +736,26 @@ async function backend(a: CliArgs): Promise<number> {
   } finally {
     client.close();
   }
+}
+
+/**
+ * `aio backend key|rotate|revoke <id> --read` (PB-7). A daemon from before read keys ignores the
+ * level and would act on the read-write key: it is refused before any frame about a key is sent,
+ * and an answer that is not about a read key prints no key.
+ */
+async function backendReadKey(client: LocalClient, features: readonly string[], id: string, op: 'issue' | 'rotate' | 'revoke'): Promise<number> {
+  if (features.includes('backends') && !features.includes('backends.access')) {
+    throw new ConfigError('this daemon does not know read keys (its host.hello lacks backends.access): restart it on this version first; nothing was changed');
+  }
+  const r = await client.backendsKey(id, op, 'read');
+  if (r.access !== 'read') throw new Error(`the daemon did not answer about a read key (it does not know them): backend ${r.backend}'s READ-WRITE key was ${op === 'issue' ? 'issued' : op === 'rotate' ? 'rotated' : 'revoked'} instead. Nothing is printed; rotate it (aio backend rotate ${r.backend}) once the daemon runs this version`);
+  if (op === 'revoke') {
+    console.error(`backend ${r.backend} has no read key now; ${r.closed} read-only connection(s) closed (its read-write key is unchanged)`);
+    return 0;
+  }
+  console.error(`read key of backend ${r.backend} (key id ${r.keyId})${op === 'rotate' ? `; the old read key no longer works, ${r.closed} read-only connection(s) closed` : ''}. It is shown this once: the daemon keeps only its SHA-256. It is a host.hello token that only observes: the backend's queue items (inbound.read), their media, and the history where the backend may read it. It cannot ack, send, edit or upload.`);
+  console.log(r.key);
+  return 0;
 }
 
 async function verify(a: CliArgs): Promise<number> {

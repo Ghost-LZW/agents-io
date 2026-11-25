@@ -59,7 +59,7 @@ import { KERNEL_TOOL_NAMES, moduleToolInput, type ModuleTools } from '@agents-io
 import { FinalFiringError, OWNER_LABEL } from '@agents-io/session';
 import { CommandTable, KERNEL_COMMAND_NAMES, type ModuleCommand } from './commands.js';
 import { ConfigError } from './config-error.js';
-import { BACKENDS_FEATURE, FEATURES } from './host.js';
+import { BACKENDS_FEATURE, BACKEND_ACCESS_FEATURE, BLOBS_READ_FEATURE, FEATURES } from './host.js';
 import type { RunDefaultsProvider } from './run-defaults.js';
 import { TokenError } from './token.js';
 
@@ -223,7 +223,7 @@ function badManifest(m: ModuleManifest<any>): string | undefined {
   }
   if (m.features !== undefined) {
     if (!Array.isArray(m.features) || m.features.some((f) => !nonEmpty(f))) return 'features must be non-empty strings';
-    const own = m.features.find((f) => FEATURES.includes(f) || f === BACKENDS_FEATURE);
+    const own = m.features.find((f) => FEATURES.includes(f) || f === BACKENDS_FEATURE || f === BACKEND_ACCESS_FEATURE || f === BLOBS_READ_FEATURE);
     if (own !== undefined) return `feature ${JSON.stringify(own)} is the kernel's`;
   }
   if (m.mcpTools !== undefined) {

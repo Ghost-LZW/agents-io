@@ -51,6 +51,75 @@ const upgrade = (url: string, key: string) =>
   });
 
 describe('backends over /ws', () => {
+  it('over /ws a read key observes its backend\'s items next to the backend\'s push connection with the heartbeat on; deliver and inbound.ack are forbidden; revoking the read key closes its socket and refuses its reconnect while the backend keeps consuming #PB-7 #PB-1 #PB-3', async () => {
+    const w = await consoleDaemon({
+      raw: {
+        console: { port: 0, heartbeat: { intervalMs: 50, timeoutMs: 500 } },
+        backends: { alpha: {}, beta: {} },
+        bindings: [
+          { id: 'to-alpha', match: { channel: 'fake', keywords: ['alpha'] }, on: 'host', to: 'alpha' },
+          { id: 'to-beta', match: { channel: 'fake', keywords: ['beta'] }, on: 'host', to: 'beta' },
+        ],
+      },
+    });
+    const url = `${w.url.replace('http', 'ws')}/ws`;
+    const key = async (id: string, op: 'issue' | 'rotate' | 'revoke', access?: 'read') => (await w.api(`/api/backends/${id}/key`, { method: 'POST', json: { op, ...(access ? { access } : {}) } })).body as { key: string; closed: number; access: string };
+    const alphaKey = (await key('alpha', 'issue')).key;
+    const readKey = (await key('alpha', 'issue', 'read')).key;
+    expect(readKey).toMatch(/^aiobr_[\w-]{43}$/);
+
+    // The backend consumes by push; an observer connects next to it with the read key.
+    const aWs = new WebSocket(url, [ADMIN_WS_SUBPROTOCOL], { headers: { Authorization: `Bearer ${alphaKey}` } });
+    const rWs = new WebSocket(url, [ADMIN_WS_SUBPROTOCOL, ADMIN_WS_BEARER_PREFIX + readKey]);
+    await Promise.all([opened(aWs), opened(rWs)]);
+    const [a, r] = [backendEnd(aWs), backendEnd(rWs)];
+    expect(await a.ask({ type: 'host.hello', token: alphaKey, name: 'alpha', consumer: 'alpha' })).toMatchObject({ ok: true, value: { name: 'backend:alpha', backend: { id: 'alpha', access: 'readwrite' }, inbound: { consumer: 'backend:alpha', acked: 0, head: 0 } } });
+    // Asking to consume with the read key is refused and leaves the backend's push connection alone.
+    expect(await r.ask({ type: 'host.hello', token: readKey, name: 'watcher', consumer: 'alpha', takeover: true })).toMatchObject({ ok: false, error: { code: 'forbidden', message: 'this key is read-only' } });
+    const hello = await r.ask({ type: 'host.hello', token: readKey, name: 'watcher' });
+    expect(hello).toMatchObject({ ok: true, value: { name: 'backend:alpha', host: false, backend: { id: 'alpha', access: 'read' }, features: ['backends', 'binding.tag', 'blobs.read'] } });
+    expect(hello.value.inbound).toBeUndefined();
+    expect(aWs.readyState).toBe(WebSocket.OPEN);
+
+    // The observer long-polls; what arrives for alpha is pushed to the backend and shown to the observer.
+    const waiting = r.ask({ type: 'inbound.read', consumer: 'alpha', after: 0, waitMs: 2000 });
+    await new Promise((x) => setTimeout(x, 100));
+    await w.chat.inject({ id: 'm1', sender: alice, text: 'for beta', conversation: { id: 'c-b', kind: 'group' } });
+    await w.chat.inject({ id: 'm2', sender: alice, text: 'for alpha', conversation: { id: 'c-a', kind: 'group' } });
+    expect(await waiting).toMatchObject({ ok: true, value: { items: [{ cursor: 2, to: 'alpha', envelope: { id: 'm2' } }] } });
+    await until(() => a.items.length === 1);
+    expect((await waiting).value.items).toHaveLength(1);
+    const backends = async () => ((await w.api('/api/backends')).body as AdminBackends).backends.map((x) => [x.id, x.connections, x.push, x.read?.connections, x.acked, x.pending]);
+    await until(async () => (await backends())[0]![4] === 2);
+    expect(await backends()).toEqual([['alpha', 1, true, 1, 2, 0], ['beta', 0, false, undefined, 0, 1]]);
+    // Nothing was pushed to the observer, and it changes nothing: no send, no ack.
+    expect(r.items).toEqual([]);
+    const READ_ONLY = { ok: false, error: { code: 'forbidden', message: 'this key is read-only' } };
+    expect(await r.ask({ type: 'deliver', operationId: 'op1', route: { channel: 'fake', account: 'default', conversationId: 'c-a' }, message: { text: 'from the observer' } })).toMatchObject(READ_ONLY);
+    expect(await r.ask({ type: 'inbound.ack', consumer: 'alpha', cursor: 0 })).toMatchObject(READ_ONLY);
+    expect(await r.ask({ type: 'inbound.read', consumer: 'beta' })).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+    expect(w.chat.sent).toEqual([]);
+    // The backend may: the same deliver with its key goes out.
+    expect(await a.ask({ type: 'deliver', operationId: 'op1', route: { channel: 'fake', account: 'default', conversationId: 'c-a' }, message: { text: 'from alpha' } })).toMatchObject({ ok: true, value: { status: 'delivered' } });
+    // The heartbeat ran several times meanwhile: both stay connected.
+    await new Promise((x) => setTimeout(x, 300));
+    expect([aWs.readyState, rWs.readyState]).toEqual([WebSocket.OPEN, WebSocket.OPEN]);
+
+    // The read key is revoked: the observer's socket is closed by the daemon, the backend's is not.
+    expect(await key('alpha', 'revoke', 'read')).toMatchObject({ access: 'read', closed: 1 });
+    await until(() => r.closed() !== undefined, 3000);
+    expect(aWs.readyState).toBe(WebSocket.OPEN);
+    expect(await upgrade(url, readKey)).toBe(401);
+    expect(await upgrade(url, alphaKey)).toBe(101);
+    // The backend keeps consuming.
+    await w.chat.inject({ id: 'm3', sender: alice, text: 'for alpha, later', conversation: { id: 'c-a', kind: 'group' } });
+    await until(() => a.items.length === 2);
+    expect(a.items.map((x) => [x.envelope.id, x.to])).toEqual([['m2', 'alpha'], ['m3', 'alpha']]);
+    await until(async () => (await backends())[0]![4] === 3);
+    expect((await backends())[0]).toEqual(['alpha', 1, true, undefined, 3, 0]);
+    aWs.close();
+  });
+
   it("over /ws two backends consume their own items and deliver into their conversations; a rotated key's socket is closed and its reconnect refused #PB-1 #PB-2 #PB-3", async () => {
     const w = await consoleDaemon({
       raw: {

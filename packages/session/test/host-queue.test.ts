@@ -624,4 +624,73 @@ describe('HostQueue', () => {
     expect(q.consumers().map((c) => [c.name, c.target])).toEqual([['backend:alpha', 'alpha'], ['backend:beta', 'beta'], ['host', undefined]]);
     q.close();
   });
+
+  it('peek shows a target\'s items after a cursor and long-polls like read, and writes nothing: no consumer is registered or touched, no cursor moves, and an acked item is pruned whether or not it was peeked; an empty target is refused #PB-7 #HQ-1', async () => {
+    let now = 1_000;
+    const q = new HostQueue({ now: () => now, retainAckedMs: 100 });
+    q.register('backend:alpha', 'alpha');
+    q.register('backend:beta', 'beta');
+    q.register('host');
+    q.append(targeted('alpha', 'a1')); // 1
+    q.append(item('h1')); // 2
+    q.append(targeted('beta', 'b1')); // 3
+    q.append(targeted('alpha', 'a2')); // 4
+    q.ack('backend:alpha', 1);
+    const consumers = q.consumers();
+    const rows = () => (q.db.prepare('SELECT COUNT(*) AS n FROM host_inbound').get() as { n: number }).n;
+    const items = rows();
+    // Later: a write to a consumer's row would show in `seen`.
+    now += 50;
+
+    // Only the target's items, after the cursor given; nothing of another target or of the host.
+    expect((await q.peek('alpha', { after: 0 })).map((x) => [x.cursor, x.envelope.id, x.to])).toEqual([[1, 'a1', 'alpha'], [4, 'a2', 'alpha']]);
+    expect((await q.peek('alpha', { after: 1 })).map((x) => x.cursor)).toEqual([4]);
+    expect((await q.peek('alpha', { after: 0, limit: 1 })).map((x) => x.cursor)).toEqual([1]);
+    expect(await q.peek('alpha', { after: 4 })).toEqual([]);
+    // A target nobody consumes and one that has no items: empty, and still nobody is registered.
+    expect(await q.peek('gamma', { after: 0 })).toEqual([]);
+    expect([q.ackedOf('backend:alpha'), q.ackedOf('backend:beta'), q.ackedOf('nobody'), q.ackedOf('backend:gamma')]).toEqual([1, 0, 0, 0]);
+    expect([q.targetHead('alpha'), q.targetHead('beta'), q.targetHead('gamma')]).toEqual([4, 3, 0]);
+    // The long-poll: empty after waitMs, the next append of the target wakes it, an abort ends it.
+    const real = Date.now;
+    const live = new HostQueue();
+    live.register('backend:alpha', 'alpha');
+    const liveConsumers = live.consumers();
+    const t0 = real();
+    expect(await live.peek('alpha', { after: 0, waitMs: 40 })).toEqual([]);
+    expect(real() - t0).toBeGreaterThanOrEqual(35);
+    const waiting = live.peek('alpha', { after: 0, waitMs: 5000 });
+    setTimeout(() => {
+      live.append(targeted('beta', 'late-b'));
+      live.append(targeted('alpha', 'late-a'));
+    }, 20);
+    expect((await waiting).map((x) => x.envelope.id)).toEqual(['late-a']);
+    const ac = new AbortController();
+    const aborted = live.peek('alpha', { after: 2, waitMs: 5000, signal: ac.signal });
+    setTimeout(() => ac.abort(), 20);
+    expect(await aborted).toEqual([]);
+    await new Promise((r) => setTimeout(r, 5));
+    expect(live.consumers()).toEqual(liveConsumers);
+    live.close();
+
+    // Nothing was written: the same consumers with the same cursors and the same `seen`, no row more, no item less.
+    expect(q.consumers()).toEqual(consumers);
+    expect(rows()).toBe(items);
+    expect(q.cursor('backend:alpha')).toBe(1);
+
+    // Retention does not know who peeked: what alpha acked goes after retainAckedMs, peeked (1) or not (4);
+    // beta's item, which nobody acked, stays although alpha's observer never looked at it.
+    now += 1_000;
+    q.ack('backend:alpha', 4);
+    expect([1, 3, 4].map((c) => q.get(c) !== undefined)).toEqual([false, true, false]);
+    expect(await q.peek('alpha', { after: 0 })).toEqual([]);
+    expect((await q.peek('beta', { after: 0 })).map((x) => x.cursor)).toEqual([3]);
+    expect(q.targetHead('alpha')).toBe(0);
+
+    // No target is not "the items without one" (the host's backlog): refused, and item 2 is never shown.
+    await expect(q.peek('', { after: 0 })).rejects.toThrow('target is empty');
+    await expect(q.peek(undefined as never, { after: 0 })).rejects.toThrow('target is empty');
+    expect(q.consumers().map((c) => c.name)).toEqual(['backend:alpha', 'backend:beta', 'host']);
+    q.close();
+  });
 });

@@ -152,6 +152,9 @@ describe('the module registry', () => {
     expect(bad({ commands: [{ name: 'probe', help: '/probe', helpBefore: 'model' }] })).toThrow('module probe: commands: /probe: helpBefore "model" is not a kernel command (help, status, stop, steer, answer, new, topics, switch, tui)');
     expect(bad({ features: ['session.launch'] })).toThrow('module probe: feature "session.launch" is the kernel\'s');
     expect(bad({ features: ['backends'] })).toThrow('module probe: feature "backends" is the kernel\'s');
+    // The names a hello gives for the key levels (PB-7) are the kernel's too, though neither is in FEATURES.
+    expect(bad({ features: ['backends.access'] })).toThrow('module probe: feature "backends.access" is the kernel\'s');
+    expect(bad({ features: ['blobs.read'] })).toThrow('module probe: feature "blobs.read" is the kernel\'s');
     expect(bad({ needs: ['module:nope'] })).toThrow('module probe: needs module nope, which is not registered');
     expect(bad({ needs: ['kernel:nope'] })).toThrow('module probe: needs: "kernel:nope" is neither module:<id> nor kernel:<capability>');
     expect(bad({ admin: {} })).toThrow('module probe: admin (an AdminContribution) is not served for feature modules yet');

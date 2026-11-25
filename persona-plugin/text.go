@@ -15,6 +15,7 @@ const (
 	wordsRefused        = "路由拒绝了连接：控制台没有放行这个来源或主机名。"
 	wordsKeyRefused     = "路由不认这把后端钥匙：可能填错了，或者已被轮换、作废；没有开启后端功能（backends）的路由也不认任何 aiob_ 钥匙。"
 	wordsNotBackend     = "这把钥匙不是后端钥匙：请填路由用 aio backend key 签发的那一把，不要填宿主令牌。"
+	wordsReadKey        = "这是一把只读钥匙，只能旁观，收不了也回不了消息：请填路由用 aio backend key 签发的读写钥匙（命令不带 --read）。"
 	wordsNoBackends     = "路由没有开启后端功能（features 里没有 backends）：请升级路由并在配置里加上 backends。"
 	wordsDisconnected   = "和路由的连接断了，正在重连。"
 	wordsFlapping       = "和路由的连接反复被顶掉：每个助手要用自己的后端钥匙，不要两处共用一把。"

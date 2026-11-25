@@ -1,5 +1,5 @@
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
-import type { ExternalSender, InboundEnvelope, InputCause, InputVerifyResult, LoopGuardTrip, Origin, ReplyRoute, SessionLaunch, TurnProvenance, VerifiedInput } from '@agents-io/protocol';
+import type { BackendAccess, ExternalSender, InboundEnvelope, InputCause, InputVerifyResult, LoopGuardTrip, Origin, ReplyRoute, SessionLaunch, TurnProvenance, VerifiedInput } from '@agents-io/protocol';
 import { channelRefOf, type DeliveryRecord, type InFlightDelivery, type OutboxStore } from '@agents-io/session';
 import type { OpReceipt, OpStore } from './client-ops.js';
 
@@ -68,7 +68,7 @@ export class DaemonRecords implements OutboxStore, OpStore {
     | 'flagGet' | 'flagPut' | 'flagDel'
     | 'obPut' | 'obByOp' | 'obByMsg' | 'obAnyMsg' | 'obAnyPart' | 'obBackendMsg' | 'obBackendPart' | 'obPrune' | 'obPartPut' | 'obByPart' | 'obPartPrune' | 'causePut' | 'causeGet' | 'causeAll' | 'causePrune'
     | 'opGet' | 'opPut'
-    | 'bkAll' | 'bkPut' | 'bkDel',
+    | 'bkAll' | 'bkPut' | 'bkDel' | 'bkaPut' | 'bkaDel' | 'bkaDelAll',
     StatementSync
   >;
   /** Tests: called between the agent row and the launch row of `pin` (a throw rolls both back). */
@@ -89,8 +89,16 @@ export class DaemonRecords implements OutboxStore, OpStore {
       CREATE INDEX IF NOT EXISTS daemon_outbound_msg ON daemon_outbound (channel, provider_message_id);
       CREATE TABLE IF NOT EXISTS daemon_outbound_parts (channel TEXT NOT NULL, provider_message_id TEXT NOT NULL, operation_id TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (channel, provider_message_id, operation_id)) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS daemon_backend_keys (backend TEXT PRIMARY KEY, hash TEXT NOT NULL, created_at INTEGER NOT NULL) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS daemon_backend_access_keys (backend TEXT NOT NULL, access TEXT NOT NULL, hash TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (backend, access)) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS client_ops (principal TEXT NOT NULL, op_id TEXT NOT NULL, frame_type TEXT NOT NULL, session_key TEXT NOT NULL, status TEXT NOT NULL, result TEXT, seq INTEGER, turn_id TEXT, at INTEGER NOT NULL, PRIMARY KEY (principal, op_id)) WITHOUT ROWID;
     `);
+    // PB-7: a read key is a row of `daemon_backend_access_keys`, never of `daemon_backend_keys`, and that
+    // table is not given a level column. A daemon from before read keys reads every row of the older table
+    // as a full key, so a read key stored there would be a read-write key after a downgrade; and two rows
+    // per backend would need the table rebuilt with another primary key, which that daemon cannot open
+    // (its upsert names ON CONFLICT(backend)). Kept apart, the older table is what it always was: an older
+    // daemon opens the database, its keys work, and the read keys are unknown to it.
+
     // `sent_message_id` (any delivered message, `sentByUs`) came later: added to an older table and filled
     // from what it already records.
     const obCols = (this.db.prepare('PRAGMA table_info(daemon_outbound)').all() as { name: string }[]).map((c) => c.name);
@@ -138,8 +146,13 @@ export class DaemonRecords implements OutboxStore, OpStore {
       flagGet: p('SELECT value FROM daemon_flags WHERE name = ?'),
       flagPut: p('INSERT INTO daemon_flags (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value'),
       flagDel: p('DELETE FROM daemon_flags WHERE name = ?'),
-      // PB-3: a backend's key is kept as its SHA-256 only, one per backend.
-      bkAll: p('SELECT backend, hash, created_at FROM daemon_backend_keys ORDER BY backend'),
+      // PB-3: a backend's key is kept as its SHA-256 only, one per backend and level. The read-write key is
+      // the row of `daemon_backend_keys`; the read key (PB-7) a row of `daemon_backend_access_keys`. A level
+      // this version does not know is not read: it verifies as nothing.
+      bkAll: p("SELECT backend, 'readwrite' AS access, hash, created_at FROM daemon_backend_keys UNION ALL SELECT backend, access, hash, created_at FROM daemon_backend_access_keys WHERE access = 'read' ORDER BY backend, access"),
+      bkaPut: p('INSERT INTO daemon_backend_access_keys (backend, access, hash, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(backend, access) DO UPDATE SET hash = excluded.hash, created_at = excluded.created_at'),
+      bkaDel: p('DELETE FROM daemon_backend_access_keys WHERE backend = ? AND access = ?'),
+      bkaDelAll: p('DELETE FROM daemon_backend_access_keys WHERE backend = ?'),
       bkPut: p('INSERT INTO daemon_backend_keys (backend, hash, created_at) VALUES (?, ?, ?) ON CONFLICT(backend) DO UPDATE SET hash = excluded.hash, created_at = excluded.created_at'),
       bkDel: p('DELETE FROM daemon_backend_keys WHERE backend = ?'),
       obPut: p('INSERT INTO daemon_outbound (operation_id, channel, provider_message_id, sent_message_id, at, json, backend) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(operation_id) DO UPDATE SET channel = excluded.channel, provider_message_id = excluded.provider_message_id, sent_message_id = excluded.sent_message_id, at = excluded.at, json = excluded.json, backend = excluded.backend'),
@@ -353,19 +366,24 @@ export class DaemonRecords implements OutboxStore, OpStore {
     else this.q.flagPut.run(name, value);
   }
 
-  /** PB-3: the stored backend key digests (SHA-256, hex), by backend id. Never a key itself. */
-  backendKeys(): { backend: string; hash: string; createdAt: number }[] {
-    return (this.q.bkAll.all() as { backend: string; hash: string; created_at: number }[]).map((r) => ({ backend: r.backend, hash: r.hash, createdAt: r.created_at }));
+  /** PB-3: the stored backend key digests (SHA-256, hex), by backend id and level. Never a key itself. */
+  backendKeys(): { backend: string; access: BackendAccess; hash: string; createdAt: number }[] {
+    return (this.q.bkAll.all() as { backend: string; access: BackendAccess; hash: string; created_at: number }[]).map((r) => ({ backend: r.backend, access: r.access, hash: r.hash, createdAt: r.created_at }));
   }
 
-  /** Set (or replace) a backend's key digest. */
-  putBackendKey(backend: string, hash: string, at: number): void {
-    this.q.bkPut.run(backend, hash, at);
+  /** Set (or replace) a backend's key digest of one level (default the read-write key). */
+  putBackendKey(backend: string, hash: string, at: number, access: BackendAccess = 'readwrite'): void {
+    if (access === 'read') this.q.bkaPut.run(backend, access, hash, at);
+    else this.q.bkPut.run(backend, hash, at);
   }
 
-  /** Remove a backend's key digest; whether there was one. */
-  delBackendKey(backend: string): boolean {
-    return Number(this.q.bkDel.run(backend).changes) > 0;
+  /** Remove a backend's key digest of one level, or (no level) of both; whether there was one. */
+  delBackendKey(backend: string, access?: BackendAccess): boolean {
+    let n = 0;
+    if (access !== 'read') n += Number(this.q.bkDel.run(backend).changes);
+    if (access === 'read') n += Number(this.q.bkaDel.run(backend, access).changes);
+    else if (access === undefined) n += Number(this.q.bkaDelAll.run(backend).changes);
+    return n > 0;
   }
 
   // ---- session launch (decision 7) ---------------------------------------

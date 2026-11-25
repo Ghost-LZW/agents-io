@@ -20,6 +20,8 @@ const (
 	frameAck     = "message.ack"
 
 	featureBackends = "backends"
+	// accessRead is hello's backend.access for a read key: an observer, which this program cannot be.
+	accessRead = "read"
 
 	codeForbidden       = "forbidden"
 	codeRouteNotAllowed = "route_not_allowed"
@@ -60,6 +62,8 @@ type helloResult struct {
 	Host    bool   `json:"host"`
 	Backend *struct {
 		ID string `json:"id"`
+		// Access is the level of the key: "readwrite", "read" (accessRead), or empty from a router without key levels.
+		Access string `json:"access"`
 	} `json:"backend"`
 	Inbound *struct {
 		Consumer string `json:"consumer"`

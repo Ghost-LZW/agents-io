@@ -297,6 +297,33 @@ upload once, at most 32 attachments per message). A binding with `on: "host"` ma
 an opaque `tag` that is copied to the queue item (`InboundItem.tag`, feature
 `binding.tag`); a `tag` key on a rule that never queues for the host is ignored.
 
+A backend's key has one of two levels (feature `backends.access`; docs/HOSTS.md §4.12,
+INVARIANTS PB-7), and a backend holds at most one key of each, issued, rotated and
+revoked on its own. The **read-write** key (`aiob_…`, the default, everything above) is
+the backend. The **read** key (`aio backend key <id> --read`, `aiobr_…`) is an observer of
+that backend: its connection may say `host.hello` without `consumer`, look at the
+backend's queue items with `inbound.read` (`after` + `waitMs` to follow them; it is not
+a consumer: no cursor moves, nothing is registered, retention ignores it, so it has no
+delivery guarantee), read the blobs the backend may read (`blob.stat`, `blob.get`) and,
+where `backends.<id>.history` is on, `history.read`. Everything else answers `forbidden`
+with the fixed text `this key is read-only`: `inbound.ack`, a hello that asks to consume
+(with or without `takeover`), `deliver`, `deliver.update`, `message.ack`, `blob.put` and
+every other host frame. Several read connections may be online next to the
+backend's one push connection; they never take or disturb it. They are bounded, since
+every waiting long-poll is woken by every append: at most 32 read connections that said
+hello per backend, and at most 4 waiting long-polls (`inbound.read` with `waitMs`) per
+read connection; one more answers `busy` (wait for an answer before asking again).
+Read-write keys and the host token have no such bound. The hello answer says the
+level (`backend.access: "read" | "readwrite"`) and lists only the features that level can
+use (`blobs.read` instead of `blobs` for a read key). Rotating or revoking one level's
+key closes the connections made with that key and leaves the other level alone. A daemon
+that does not advertise `backends.access` ignores the level and would act on the
+read-write key: `aio backend … --read` checks for the feature before it asks, and other
+callers should check the `access` in the answer. Before going back to a daemon from
+before key levels, revoke the read keys (`aio backend revoke <id> --read`): that daemon
+does not know them, so it neither accepts nor removes them, and a backend taken out of
+the config while it runs still has its old read key when the newer daemon is back.
+
 - Any number of authenticated connections may use the request frames (the CLI's
   host commands are such connections). A connection whose hello sets `consumer`
   (push-consume the inbound queue) or any callout hook (`callouts`) becomes **the host**: at most
@@ -508,7 +535,9 @@ private package `@agents-io/daemon-e2e` (`packages/daemon-e2e`) now, which expor
 - **Endpoints**: `GET /api/status`, `GET|PUT /api/config`,
   `POST /api/config/validate`, `GET /api/explain/:inputId`, `GET /api/queue`,
   `GET /api/sessions`, `GET /api/backends`, `POST /api/backends/:id/key`
-  (`{ op: "issue" | "rotate" | "revoke" }`; an unknown backend 404, a second issue 409),
+  (`{ op: "issue" | "rotate" | "revoke", access?: "read" | "readwrite" }`, default the
+  read-write key, the answer says which; an unknown backend 404, a second issue of the
+  same level 409, an unknown level 400),
   `POST /api/backends/:id/forget`, and the channel types' (`POST /api/bots/lark`,
   `GET /api/bots/lark/:job` from lark-bot); `GET /` is a minimal page that completes
   a login link opened on the console itself.
@@ -559,8 +588,9 @@ private package `@agents-io/daemon-e2e` (`packages/daemon-e2e`) now, which expor
   `host.hello` with the host token. A backend's key (docs/HOSTS.md §4.12) is a third
   credential: it upgrades `/ws` and nothing else (every `/api/*` answers 403, it gets no
   login link). A connection upgraded with it takes no client frame, before `host.hello`
-  or after, its `host.hello` must carry that same backend's key, and it is closed when
-  the key is rotated or revoked or the backend forgotten.
+  or after, its `host.hello` must carry that same backend's key of the level it was
+  upgraded with (a socket opened with the read key never becomes the backend), and it is
+  closed when that key is rotated or revoked or the backend forgotten.
 - **Lark bot provisioning**: `POST /api/bots/lark` runs `larkBotCommand` with
   `--qr-out <file> --json --write-env <env file> --name … --brand … --preset …`
   (`--avatar` from a `data:` URI, `--no-owner`, and `--env-prefix LARK_<ACCOUNT>_`
@@ -745,7 +775,9 @@ aio ack --consumer <name> <cursor>
 aio bindings put [--file table.json|-] | get
 aio explain <inputId>
 aio verify <channelRef>
-aio backend list | key <id> | rotate <id> | revoke <id> | forget <id>   (backends and their keys; a key is printed once, on stdout)
+aio backend list | key <id> [--read] | rotate <id> [--read] | revoke <id> [--read] | forget <id>
+                                                              (backends and their keys; a key is printed once, on stdout;
+                                                               --read: the backend's read key, which only observes)
 aio console-link                                              (one-time console login URL)
 aio acp --client <name> [--token-file <path>] [--session <key>]   (module acp-server: ACP on stdio, for an editor or t3code)
 ```
@@ -1129,6 +1161,31 @@ const gw = await Gateway.start({
   This package's `Gateway.start` gives its `aio` (`dist/cli.js`).
 - `@agents-io/daemon` still works this way too (`coreRegistries()` given to both), and loads the
   module packages without running their code.
+
+What changed for embedders with backend key levels (read keys, INVARIANTS PB-7):
+
+- `ConsoleHost.backendOf(token)` returns `{ id, access } | undefined` (it returned the id). A
+  console of your own must pass both to `HostFrames.attachBackend(peer, id, access?)`, whose third
+  argument is new and optional (default `readwrite`): a connection attached without it is held to
+  the read-write key at `host.hello`.
+- `ConsoleHost.backends.key(id, op, access?)`, `Gateway.backendKey(id, op, access?)`,
+  `LocalClient.backendsKey(backend, op, access?)` and `HostServiceDeps.backendsAdmin.key` take the
+  level as an optional last argument (default `readwrite`); the result carries `access`.
+- `BackendKeys.verify` returns `{ id, keyId, access }`, `current(id, keyId, access)` takes the
+  level, `list()` rows carry `access`; `DaemonRecords.backendKeys()` rows carry `access`,
+  `putBackendKey(backend, hash, at, access?)` and `delBackendKey(backend, access?)` take it
+  (without one, `delBackendKey` removes both levels). `Peer.auth.backend` carries `access`.
+- `HostService.backendConnections(id)` counts read-write connections only;
+  `backendReadConnections(id)` counts the read ones. `dropBackend(id, reason, access?)` closes one
+  level's connections when given a level.
+- `HostQueue` gains `peek(target, { after, limit?, waitMs?, signal? })`, `ackedOf(consumer)` and
+  `targetHead(target)`: reads that register no consumer and write nothing.
+- Feature modules may not declare the features `backends.access` or `blobs.read`.
+- `MAX_OBSERVER_WAITS` (4) and `MAX_OBSERVERS` (32) are exported: the waiting long-polls a read
+  connection may hold and the read connections a backend may have; one more answers `busy`.
+- Storage: read keys are rows of a new table, `daemon_backend_access_keys`;
+  `daemon_backend_keys` is unchanged, so a database opens under an older daemon as before (which
+  does not know the read keys).
 
 What changed for embedders with core-slimming §4 P2 item 5 (the kernel without modules):
 

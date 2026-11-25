@@ -39,9 +39,10 @@ type fakeRouter struct {
 	key, backend  string
 	features      []string
 	upgradeStatus int
-	noBackend     bool // hello answers as for a host token: no backend block
-	mute          bool // connections stop reading: no pongs, no answers
-	dropAccepts   int  // accepts to lose: the connection is closed instead of advancing the cursor
+	noBackend     bool   // hello answers as for a host token: no backend block
+	access        string // the key's level as hello says it ("read", "readwrite"); empty: a router without key levels
+	mute          bool   // connections stop reading: no pongs, no answers
+	dropAccepts   int    // accepts to lose: the connection is closed instead of advancing the cursor
 	extras        []map[string]any
 	hellos        []map[string]any
 	queue         []queued
@@ -186,7 +187,7 @@ func (f *fakeRouter) serve(w http.ResponseWriter, r *http.Request) {
 		case "host.hello":
 			f.mu.Lock()
 			f.hellos = append(f.hellos, m)
-			backend, features, noBackend, key := f.backend, f.features, f.noBackend, f.key
+			backend, features, noBackend, key, access := f.backend, f.features, f.noBackend, f.key, f.access
 			extras := f.extras
 			f.mu.Unlock()
 			consumer, consuming := m["consumer"].(string)
@@ -200,10 +201,17 @@ func (f *fakeRouter) serve(w http.ResponseWriter, r *http.Request) {
 			case consuming && !noBackend && consumer != "backend:"+backend && consumer != backend:
 				fail(id, "forbidden")
 				continue
+			case consuming && !noBackend && access == "read": // a read key observes: it is never the consumer
+				fail(id, "forbidden")
+				continue
 			}
 			authed = true
+			block := map[string]any{"id": backend}
+			if access != "" {
+				block["access"] = access
+			}
 			value := map[string]any{"name": "backend:" + backend, "protocol": 1, "host": false,
-				"backend":  map[string]any{"id": backend},
+				"backend":  block,
 				"bindings": map[string]any{"version": nil, "active": false}, "features": features}
 			if noBackend {
 				value = map[string]any{"name": m["name"], "protocol": 1, "host": consuming,

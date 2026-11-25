@@ -40,7 +40,7 @@ The extension contributes one connector, `agentsio` (connector ids allow no hyph
 | Setting | Kind | Meaning |
 | --- | --- | --- |
 | `router_url` | address | The router console's address: scheme, host and port only, for example `https://<router address>`. The extension connects to its `/ws`. `http://` is accepted because the router console itself speaks plain HTTP (see [Network](#network)). |
-| `backend_key` | secret | The key the router issued for this backend (`aio backend key <backend id>` on the router's machine; it looks like `aiob_example_key_not_real`). Stored through the hub's encrypted secret flow, handed to the program at start, never logged. Do not put the router's host token here: the extension refuses a key that is not a backend's before taking any role on the router. |
+| `backend_key` | secret | The key the router issued for this backend (`aio backend key <backend id>` on the router's machine; it looks like `aiob_example_key_not_real`). Stored through the hub's encrypted secret flow, handed to the program at start, never logged. It must be the backend's read-write key (the command without `--read`): the extension consumes, accepts and answers. A read key (`aiobr_…`, `aio backend key <backend id> --read`) only observes: the router says which level a key is when it answers `host.hello`, so the extension refuses a read key when the settings are saved, never asks to consume with one, and the status says it is a read-only key. Do not put the router's host token here: the extension refuses a key that is not a backend's before taking any role on the router. |
 | `chat_rules` | list of rule names | Router rule ids whose items are handled as `chat` when the item carries no tag. |
 | `guest_rules` | list of rule names | Router rule ids whose items are handled as `guest` when the item carries no tag. |
 | `working_mark` | on/off, default on | Ask the router to mark the channel message as working, done or failed (the channel decides how; a channel without marks is skipped quietly). |
@@ -48,7 +48,7 @@ The extension contributes one connector, `agentsio` (connector ids allow no hyph
 | `keep_days` | 7–90, default 30 | How long finished records stay in the extension's journal (the dedupe memory). |
 | `triage_rules` | text | The standard per-source Inbox triage rules, as in other Inbox connectors. |
 
-Nothing personal or environment-specific is built in: every address, key and rule name comes from these settings. Saving the settings first tries the real handshake (`settings.check`) and says, in one sentence, when the router cannot be reached, refuses the key, was given a key that is not a backend's, or has no `backends` feature.
+Nothing personal or environment-specific is built in: every address, key and rule name comes from these settings. Saving the settings first tries the real handshake (`settings.check`) and says, in one sentence, when the router cannot be reached, refuses the key, was given a key that is not a backend's or is a backend's read key, or has no `backends` feature.
 
 The address and the key are both needed, but neither is marked `required` in the manifest. The hub does not start an extension that waits for a required setting, and saves those settings unchecked; marked required, the first address and key would never go through the handshake. The program runs without them instead, reports `not_configured` with a setup guide, and accepts a partial save (the address before the key).
 

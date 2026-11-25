@@ -2,7 +2,7 @@ import { chmodSync, lstatSync, mkdirSync, statSync, unlinkSync, type Stats } fro
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { FrameDecoder, HOST_REQUEST_FRAME_TYPES, HostRequestFrame, PROTOCOL_VERSION, check, encodeFrame, errors, type ModuleConnection, type Origin, type ResultFrame, type Topic, type TopicSwitchFrame, type Watch, type WatchDraft } from '@agents-io/protocol';
+import { FrameDecoder, HOST_REQUEST_FRAME_TYPES, HostRequestFrame, PROTOCOL_VERSION, check, encodeFrame, errors, type BackendAccess, type ModuleConnection, type Origin, type ResultFrame, type Topic, type TopicSwitchFrame, type Watch, type WatchDraft } from '@agents-io/protocol';
 import type { AddWatchResult, RemoveWatchResult } from '@agents-io/session';
 import type { Hub, Subscription } from '@agents-io/session';
 import type { OpFrame, OpOutcome } from './client-ops.js';
@@ -15,9 +15,9 @@ export interface Peer {
   /**
    * Set once `host.hello` succeeded: the connection's host name and the origin its client frames carry.
    * `backend` (PB-1): the hello was made with a backend's key, not the host token. Such a connection
-   * speaks only the host frames the backend whitelist names, and no client frame.
+   * speaks only the host frames the whitelist of its key's level (`access`, PB-7) names, and no client frame.
    */
-  auth?: { name: string; origin: (sessionKey: string) => Origin; backend?: { id: string; keyId: string } };
+  auth?: { name: string; origin: (sessionKey: string) => Origin; backend?: { id: string; keyId: string; access: BackendAccess } };
   /** Write a frame; false when the connection is gone. */
   send(frame: Record<string, unknown>): boolean;
   /** Send a request frame (an `id` is added) and wait for the peer's `result`; a closed connection or the timeout answers `ok: false`. */
@@ -39,9 +39,10 @@ export interface HostFrames {
   gone(peer: Peer): void;
   /**
    * A connection admitted with backend `id`'s key before any `host.hello` (the console's `/ws`):
-   * it is that backend's from now on, so its key going away closes it too (PB-3).
+   * it is that backend's from now on, so its key going away closes it too (PB-3). `access`: the
+   * level of the key it was admitted with (default `readwrite`); its hello takes that key only (PB-7).
    */
-  attachBackend?(peer: Peer, id: string): void;
+  attachBackend?(peer: Peer, id: string, access?: BackendAccess): void;
 }
 
 /** What the socket server needs from the gateway. */

@@ -33,6 +33,8 @@ export function tmp(prefix = 'aio-d-'): string {
 export interface BackendHello {
   /** Use this key instead of making one. */
   key?: string;
+  /** Without `key`: make (rotate) the key of this level. Default the read-write key. */
+  access?: 'read' | 'readwrite';
   name?: string;
   consumer?: string;
   callouts?: boolean | string[];
@@ -146,7 +148,7 @@ export async function daemon(
   const backend = async (id: string, b: BackendHello = {}) => {
     let key = b.key;
     if (key === undefined) {
-      const r = gw.backendKey(id, 'rotate');
+      const r = gw.backendKey(id, 'rotate', b.access ?? 'readwrite');
       if (!r.ok) throw new Error(`${r.code}: ${r.message}`);
       key = (r.value as { key: string }).key;
     }

@@ -43,14 +43,14 @@ describe('backend keys', () => {
     const h = await w.host({ name: 'admin' });
     const r = await h.backendsKey('alpha', 'issue');
     expect(errors(BackendsKeyResult, r)).toEqual([]);
-    expect(r).toEqual({ backend: 'alpha', op: 'issue', key: expect.stringMatching(KEY), keyId: expect.stringMatching(/^[0-9a-f]{12}$/), createdAt: expect.any(Number), closed: 0 });
+    expect(r).toEqual({ backend: 'alpha', op: 'issue', access: 'readwrite', key: expect.stringMatching(KEY), keyId: expect.stringMatching(/^[0-9a-f]{12}$/), createdAt: expect.any(Number), closed: 0 });
     const key = r.key!;
     expect(key.startsWith(BACKEND_KEY_PREFIX)).toBe(true);
     const sha = createHash('sha256').update(key).digest('hex');
     expect(r.keyId).toBe(sha.slice(0, 12));
 
     // What is stored is the digest, in the session log's database; no table holds the key.
-    expect(w.gw.records.backendKeys()).toEqual([{ backend: 'alpha', hash: sha, createdAt: r.createdAt }]);
+    expect(w.gw.records.backendKeys()).toEqual([{ backend: 'alpha', access: 'readwrite', hash: sha, createdAt: r.createdAt }]);
     const tables = dump(w.config.logPath);
     expect(Object.keys(tables)).toContain('daemon_backend_keys');
     expect(tables.daemon_backend_keys).toContain(sha);
@@ -73,15 +73,15 @@ describe('backend keys', () => {
     expect(JSON.stringify(list)).not.toContain(key);
 
     // The key verifies as alpha; anything else, the host token included, does not.
-    expect(w.gw.backends.verify(key)).toEqual({ id: 'alpha', keyId: r.keyId });
-    expect(w.gw.backends.current('alpha', r.keyId!)).toBe(true);
-    expect(w.gw.backends.current('beta', r.keyId!)).toBe(false);
+    expect(w.gw.backends.verify(key)).toEqual({ id: 'alpha', keyId: r.keyId, access: 'readwrite' });
+    expect(w.gw.backends.current('alpha', r.keyId!, 'readwrite')).toBe(true);
+    expect(w.gw.backends.current('beta', r.keyId!, 'readwrite')).toBe(false);
     for (const bad of [key.slice(0, -1), `${key}x`, key.toUpperCase(), sha, w.gw.token, '', BACKEND_KEY_PREFIX]) expect(w.gw.backends.verify(bad), JSON.stringify(bad.slice(0, 8))).toBeUndefined();
     await w.stop();
 
     // Across a restart: still only the digest, and the same key still verifies.
     const again = await daemon({ raw, dir: w.dir, gateway: { logger } });
-    expect(again.gw.backends.verify(key)).toEqual({ id: 'alpha', keyId: r.keyId });
+    expect(again.gw.backends.verify(key)).toEqual({ id: 'alpha', keyId: r.keyId, access: 'readwrite' });
     expect(again.gw.backends.has(key)).toBe(true);
     for (const f of files(w.dir)) expect(f.bytes.includes(key), f.path).toBe(false);
     expect(lines.some((l) => l.includes(key))).toBe(false);
@@ -94,33 +94,33 @@ describe('backend keys', () => {
     const first = await h.backendsKey('alpha', 'issue');
     await expect(h.backendsKey('alpha', 'issue')).rejects.toMatchObject({ code: 'key_exists' });
     // The refused issue changed nothing.
-    expect(k.verify(first.key!)).toEqual({ id: 'alpha', keyId: first.keyId });
-    expect(k.list()).toEqual([{ backend: 'alpha', keyId: first.keyId, createdAt: first.createdAt }]);
+    expect(k.verify(first.key!)).toEqual({ id: 'alpha', keyId: first.keyId, access: 'readwrite' });
+    expect(k.list()).toEqual([{ backend: 'alpha', access: 'readwrite', keyId: first.keyId, createdAt: first.createdAt }]);
 
     const second = await h.backendsKey('alpha', 'rotate');
     expect(second).toMatchObject({ backend: 'alpha', op: 'rotate', key: expect.stringMatching(KEY), closed: 0 });
     expect(second.key).not.toBe(first.key);
     expect(second.keyId).not.toBe(first.keyId);
     expect(k.verify(first.key!)).toBeUndefined();
-    expect(k.current('alpha', first.keyId!)).toBe(false);
-    expect(k.verify(second.key!)).toEqual({ id: 'alpha', keyId: second.keyId });
+    expect(k.current('alpha', first.keyId!, 'readwrite')).toBe(false);
+    expect(k.verify(second.key!)).toEqual({ id: 'alpha', keyId: second.keyId, access: 'readwrite' });
     expect(k.list().map((x) => x.keyId)).toEqual([second.keyId]);
 
     // Each backend has its own key; one backend's operations leave the other's alone.
     const beta = await h.backendsKey('beta', 'rotate'); // no old key: the same as issue
     expect(beta).toMatchObject({ backend: 'beta', op: 'rotate', key: expect.stringMatching(KEY) });
-    expect(k.verify(beta.key!)).toEqual({ id: 'beta', keyId: beta.keyId });
+    expect(k.verify(beta.key!)).toEqual({ id: 'beta', keyId: beta.keyId, access: 'readwrite' });
 
-    expect(await h.backendsKey('alpha', 'revoke')).toEqual({ backend: 'alpha', op: 'revoke', closed: 0 });
+    expect(await h.backendsKey('alpha', 'revoke')).toEqual({ backend: 'alpha', op: 'revoke', access: 'readwrite', closed: 0 });
     expect(k.verify(second.key!)).toBeUndefined();
     expect(k.verify(first.key!)).toBeUndefined();
-    expect(k.verify(beta.key!)).toEqual({ id: 'beta', keyId: beta.keyId });
+    expect(k.verify(beta.key!)).toEqual({ id: 'beta', keyId: beta.keyId, access: 'readwrite' });
     expect(row(await h.backendsList(), 'alpha')).not.toHaveProperty('key');
     expect(row(await h.backendsList(), 'beta')).toMatchObject({ key: { id: beta.keyId } });
     // Revoking again is harmless; a key can be issued again afterwards.
-    expect(await h.backendsKey('alpha', 'revoke')).toEqual({ backend: 'alpha', op: 'revoke', closed: 0 });
+    expect(await h.backendsKey('alpha', 'revoke')).toEqual({ backend: 'alpha', op: 'revoke', access: 'readwrite', closed: 0 });
     const third = await h.backendsKey('alpha', 'issue');
-    expect(k.verify(third.key!)).toEqual({ id: 'alpha', keyId: third.keyId });
+    expect(k.verify(third.key!)).toEqual({ id: 'alpha', keyId: third.keyId, access: 'readwrite' });
 
     // A backend that is not configured has no key operations.
     for (const op of ['issue', 'rotate', 'revoke'] as const) await expect(h.backendsKey('gamma', op)).rejects.toMatchObject({ code: 'unknown_backend' });
@@ -163,7 +163,7 @@ describe('backend keys', () => {
     expect(row(await h.backendsList(), 'alpha')).toEqual({ id: 'alpha', configured: true, history: false, connections: 0, push: false, consumer: 'backend:alpha', acked: 1, pending: 1, oldestPendingAt: expect.any(Number), routes: { registered: 0, granted: 1 } });
     const fresh = await h.backendsKey('alpha', 'issue');
     expect(fresh.key).not.toBe(issued.key);
-    expect(back.gw.backends.verify(fresh.key!)).toEqual({ id: 'alpha', keyId: fresh.keyId });
+    expect(back.gw.backends.verify(fresh.key!)).toEqual({ id: 'alpha', keyId: fresh.keyId, access: 'readwrite' });
     expect(back.gw.backends.verify(issued.key!)).toBeUndefined();
     // Its backlog, cursor and grant are the ones it had.
     expect(back.gw.hostQueue.cursor('backend:alpha')).toBe(1);
@@ -189,7 +189,7 @@ describe('backend keys', () => {
     // Forget alpha: its items, cursor and grants go; its key stays and still verifies; beta is as it was.
     expect(await h.backendsForget('alpha')).toEqual({ backend: 'alpha', items: 3, routes: 1, closed: 0 });
     expect(await state()).toEqual([['alpha', true, 0, 0, 0, ka.keyId, false], ['beta', true, 2, 1, 1, kb.keyId, true]]);
-    expect(w.gw.backends.verify(ka.key!)).toEqual({ id: 'alpha', keyId: ka.keyId });
+    expect(w.gw.backends.verify(ka.key!)).toEqual({ id: 'alpha', keyId: ka.keyId, access: 'readwrite' });
     expect(await w.gw.hostQueue.read('backend:alpha')).toEqual([]);
     expect((await w.gw.hostQueue.read('backend:beta')).map((x) => x.envelope.id)).toEqual(['m4']);
     expect(w.gw.hostQueue.grantedMessage('alpha', { ...grant, messageId: 'm1' })).toBe(false);
@@ -218,7 +218,7 @@ describe('backend keys', () => {
     expect(await state(onlyAlpha.gw, h2)).toEqual([['alpha', true, 0, 0, 0, ka.keyId, false]]);
     expect(onlyAlpha.gw.hostQueue.consumers().map((c) => c.name)).toEqual(['backend:alpha']);
     expect(onlyAlpha.gw.hostQueue.granted('beta', grant)).toBe(false);
-    expect(onlyAlpha.gw.backends.verify(ka.key!)).toEqual({ id: 'alpha', keyId: ka.keyId });
+    expect(onlyAlpha.gw.backends.verify(ka.key!)).toEqual({ id: 'alpha', keyId: ka.keyId, access: 'readwrite' });
   });
   it("backends.forget removes a backend's staged uploads and media grants and nothing of another backend's #PB-6 #PB-2", async () => {
     const w = await daemon({ raw: { backends: { alpha: {}, beta: {} }, bindings: rules('alpha', 'beta') } });

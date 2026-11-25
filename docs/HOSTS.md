@@ -146,7 +146,7 @@
 | `inbound.redispatch` | 宿主 → 守护进程 | 把宿主入站队列里的一条输入按原始来源投递到指定会话（§2.1） |
 | `session.compact` | 宿主 → 守护进程 | 让一个安静的、lane 打开着的会话的 harness 立刻压缩上下文（见下） |
 | `session.prewarm` | 宿主 → 守护进程 | 不开轮，先把一个已知会话的 harness 拉起来，等快要到的输入（见下） |
-| `backends.list` / `backends.key` / `backends.forget` | 宿主 → 守护进程 | 后端的状态与钥匙（§4.12；feature `backends`）：`backends.list` 列出每个后端的钥匙 id、连接数、积压与发送许可（没有钥匙本身）；`backends.key { backend, op: "issue" \| "rotate" \| "revoke" }` 签发、轮换、作废；`backends.forget { backend }` 清掉它的条目、游标与发送许可。只给宿主 token 的连接，后端钥匙答 `forbidden` |
+| `backends.list` / `backends.key` / `backends.forget` | 宿主 → 守护进程 | 后端的状态与钥匙（§4.12；feature `backends`）：`backends.list` 列出每个后端的钥匙 id、连接数、积压与发送许可（没有钥匙本身）；`backends.key { backend, op: "issue" \| "rotate" \| "revoke", access?: "read" \| "readwrite" }` 签发、轮换、作废（`access` 缺省 `readwrite`；只读钥匙见 §4.12，feature `backends.access`）；`backends.forget { backend }` 清掉它的条目、游标与发送许可。只给宿主 token 的连接，后端钥匙答 `forbidden` |
 | `blob.stat` / `blob.get` / `blob.put` | 宿主 → 守护进程 | 读写 blob（§4.13；feature `blobs`）：`blob.stat { ref }` 答 `{ size }` 或 `null`；`blob.get { ref, offset?, length? }` 答 `{ base64, size, offset }`，每帧至多 1 MiB；`blob.put { base64, part?, mime?, name? }` 上传，答 `{ ref, size }`，分片时中间的片答 `{ upload, received }`。宿主 token 读写共用的 blob 库；后端钥匙只读得到路由给它的条目里的媒体和它自己上传的 |
 | `test.replay` / `test.fault` | 宿主 → 守护进程 | 测试入口：重投一条渠道消息 / 扔掉某通道接下来几次发送的响应（§4.3；缺省关闭，只在 `AIO_TEST_HOOKS=1` 时可用） |
 
@@ -272,6 +272,7 @@
 - **2026-11-24（路由层与后端，§4.12）对严格校验的宿主可见的协议变化**：都是新增的可选字段、帧与错误码，没有配置 `backends` 的守护进程发出的帧不变。字段：`Binding.to`、`InboundItem.to`、`RouteExplanation.matched[].to`、`RouteExplanation.matched[].rejected.code` 多一个值 `click_sender`、`HostHelloResult.backend`、`EffectExplanation.backend`、`AdminQueueConsumer.backend`（`GET /api/queue`）。帧：`backends.list`、`backends.key`、`backends.forget` 与结果 `BackendsListResult`、`BackendsKeyResult`、`BackendsForgetResult`；admin 端点 `GET /api/backends`、`POST /api/backends/:id/key`、`POST /api/backends/:id/forget` 与 `AdminBackends`、`AdminBackendKeyRequest`、`AdminBackendKeyResult`、`AdminBackendForgetResult`（JSON Schema 都在 `packages/protocol/schema/`）。错误码：`forbidden`（后端钥匙用了白名单之外的帧，或开控制台 API）、`route_not_allowed`、`unknown_backend`、`key_exists`。配置了至少一个后端时 `features` 多一项 `backends`，并且宿主 token 的连接不能再自称 `backend:` 开头的名字、不能推送消费 `backend:<id>`（`invalid_frame`），用 `backend:` 开头、又不是哪个后端游标的消费者名（`host.hello` 的 `consumer`、`inbound.read`、`inbound.ack`）答 `unknown_backend`：之前拿 `backend:` 开头的字符串当普通消费者名的宿主，配置后端之前要改名。`Binding` 的 schema 是开放的（允许多余的键）：宿主若一直在规则上带着自己的 `to` 字段，升级后它会被当成后端名校验，整张表答 `unknown_backend` 或 `invalid`；升级前看一眼自己推的表。降级要小心：旧守护进程不认识条目的后端一列，队列里带 `to` 的条目会被宿主 token 的消费者读到，队列里有过带 `to` 的条目就不要降级。
 - **2026-11-25（后端的媒体与规则标签，§4.13、§2）对严格校验的宿主可见的协议变化**：都是新增的可选字段、帧与错误码。字段：`Binding.tag`、`InboundItem.tag`、`RouteExplanation.matched[].tag`。帧：`blob.stat`、`blob.get`、`blob.put`（`HostRequestFrame` 多三种；结果 `HostBlobStatResult`、`HostBlobGetResult`、`HostBlobPutResult`；常量 `BLOB_FRAME_MAX_BYTES`），这三种 `type` 原来答 `invalid_frame`。错误码：`blob.*` 的 `not_found`、`too_large`、`bad_offset`、`busy`、`quota_exceeded`、`blob_error`、`unsupported`，后端的 `deliver` / `deliver.update` 多 `unknown_blob`、`too_many_attachments`。`host.hello` 的 `features` 多 `binding.tag` 与 `blobs`（宿主 token 的连接，排在 `attention` 之后）；后端钥匙的 `features` 多 `blobs`。行为变化只有两处：(1) `Binding` 的 schema 是开放的，原来表里自己带着 `tag` 键的宿主（守护进程以前忽略它）：键写在 `on: "host"` 或带 `callout` 的规则上时，现在它是标签，值是 1 到 128 个字符、不含控制字符的字符串就被抄到条目与 `explain` 上，不是的话整张表答 `invalid`（这样一张旧守护进程持久化的宿主表，升级后启动时被整张忽略并记一条 warn，直到宿主推一张合法的）；写在别的规则上的照旧忽略，不校验、不抄；(2) 后端钥匙的 `deliver` / `deliver.update` 的附件原来不检查，现在必须是它被给过的或它自己上传的引用，且一条消息至多 32 个（§4.13）。宿主 token 的 `deliver`、不带 `tag` 的表、不用这三个帧的宿主都不变。`@agents-io/protocol` 新导出 `mediaBlocks`、`MediaBlock`；`@agents-io/daemon` 的 `LocalClient` 多 `blobStat` / `blobGet` / `blobPut` / `readBlob` / `writeBlob`，`Peer` 多可选的 `flushed()`，`FrameTransport` 多可选的 `flushed()`，`GatewayOptions` 多 `hostBlobs`（测试用）；`@agents-io/session` 的 `FsBlobStore.put` 多第三个可选参数 `{ provisional }`。
 - **2026-11-25（后端分支与 origin/main 合并）**：两边的帧、字段、错误码与文字都不变。本文里后端的两节是 §4.12（后端与钥匙）、§4.13（blob），§4.10、§4.11 是 ACP harness 与北向投影。线上可见的只有顺序：配置了后端时宿主 token 的 `host.hello` 的 `features` 里，`backends` 排在内核的之后、功能模块的（`external.mcp`、`acp.server`、`ag-ui`）之前。功能模块不能声明 feature `backends`（注册时拒绝，与内核别的 feature 一样）。凭后端钥匙的连接发客户端帧 `module.connect`（`aio acp` 用的那一帧）同别的客户端帧一样答 `forbidden`；后端钥匙开不了 ACP 服务端与 AG-UI 端点，它们各有自己的客户端令牌。嵌入方：`BackendKeys`、`HostBlobs` 随内核在 `@agents-io/kernel`（`packages/kernel/src/backends.ts`、`host-blobs.ts`），`ConsoleHost` 的 `backendOf`、`backends` 在它的 `console-host.ts`；`@agents-io/daemon` 照旧转出 `LocalClient`（`readBlob`、`writeBlob`、`backends*`）与 `Gateway`。
+- **2026-11-25（后端钥匙分两级，§4.12；INVARIANTS PB-7）对严格校验的宿主可见的协议变化**：都是新增的可选字段和一个新的 feature；没有配置 `backends` 的守护进程发出的帧不变，只签发过缺省钥匙的部署除下面这些新增字段之外也不变。字段：`backends.key` 请求与 `POST /api/backends/:id/key` 的体多可选的 `access`（`"read"` / `"readwrite"`，缺省 `"readwrite"`）；`BackendsKeyResult` / `AdminBackendKeyResult` 多 `access`（现在总是有）；凭后端钥匙的 `HostHelloResult.backend` 多 `access`（现在总是有）；`BackendInfo`（`backends.list`、`GET /api/backends`）多可选的 `read { key { id, createdAt }, connections }`，只在这个后端有只读钥匙时出现，`key`、`connections`、`push` 仍是读写一级的。配置了至少一个后端时，宿主 token 的 `host.hello` 的 `features` 在 `backends` 之后多一项 `backends.access`（功能模块的 feature 仍排在它们之后）；凭只读钥匙的 hello 里有一个新名字 `blobs.read`。功能模块不能声明 `backends.access`、`blobs.read`。只读钥匙以 `aiobr_` 开头：按 `aiob_` 前缀认钥匙的客户端要知道有第二种。错误：只读钥匙做不了的事答 `forbidden`，文字固定是 `this key is read-only`。存储：只读钥匙在新表 `daemon_backend_access_keys` 里，原来的 `daemon_backend_keys` 不变，所以可以降级：旧版本照常打开库、读写钥匙照常，只是不认识只读钥匙（凭它连不上）。**降级之前先作废只读钥匙**（`aio backend revoke <id> --read`）：旧版本不知道那张表，降级期间不删也不作废只读钥匙，在旧版本下从配置里删掉的后端，同名加回来、再升级之后，早先那把只读钥匙又能旁观它；已经降级过的，升级回来后对那期间删过的后端作废只读钥匙。限额：凭只读钥匙的 `host.hello` 与带 `waitMs` 的 `inbound.read` 可能答 `busy`（每个后端至多 32 条只读连接、每条连接至多 4 个在等的长轮询，§4.12“旁观”）；读写钥匙与宿主 token 不受影响。新客户端对旧守护进程：旧守护进程忽略 `access`，会签发或轮换读写钥匙，先看 `features` 里有 `backends.access`，或核对应答的 `access`。嵌入方的类型变化见 `packages/daemon/README.md`（“What changed for embedders with backend key levels”）。
 
 ### 4.6 模型生成的话题标题（模块 `topic-title`）
 
@@ -429,7 +430,7 @@ await agent.runAgent({ runId: 'r1' }, { onEvent: ({ event }) => console.log(even
 
 **对严格校验的宿主可见的协议变化**（2026-11-25）：客户端帧多了 `module.connect`（旧守护进程答 `invalid_frame`）；`external` 回调的 `args` 多了可选的 `endpoint`；`features` 可能多 `acp.server`、`ag-ui`；`input.cancelled` 的 `reason` 可能是 `withdrawn`；输入的 `origin.adapter` 可能是 `acp-server` 或 `ag-ui`；会话列表里可能出现 `acp-server:<名>:<id>`、`ag-ui:<名>:<id>` 这样的会话。
 
-### 4.12 后端与后端钥匙（feature `backends`；INVARIANTS PB-1 到 PB-3、PB-6）
+### 4.12 后端与后端钥匙（feature `backends`；INVARIANTS PB-1 到 PB-3、PB-6、PB-7）
 
 守护进程可以同时接几个**后端**：各自凭自己的钥匙连接，只收到路由给它的输入，只能往它收到过输入的会话和管理员为它登记的目的地发。方案见 `docs/design/persona-backend/`。没有配置 `backends` 时这一节的东西都不存在，行为与之前相同。
 
@@ -451,46 +452,75 @@ await agent.runAgent({ runId: 'r1' }, { onEvent: ({ event }) => console.log(even
 - `history`（缺省 `false`）：这个后端能不能用 `history.read`。
 - `note`：给人看的说明。别的键（包括设计稿里的 `callback`）加载时报未知键。
 
-**钥匙**。钥匙由守护进程生成（`aiob_` 开头），只在签发或轮换的应答里出现一次；守护进程只存它的 SHA-256，日志里只写 key id（摘要的前 12 位）。用宿主 token：
+**钥匙**。钥匙由守护进程生成，只在签发或轮换的应答里出现一次；守护进程只存它的 SHA-256，日志里只写 key id（摘要的前 12 位）。钥匙分两级（feature `backends.access`，PB-7），一个后端每级至多一把，各自签发、轮换、作废：
+
+- **读写钥匙**（`aiob_` 开头，缺省）：这个后端本身。消费队列、发送、改消息、标记、读写 blob。不写级别时处处指它，这一级的行为与分级之前相同。
+- **只读钥匙**（`aiobr_` 开头）：这个后端的旁观者。看得到路由给这个后端的条目和它读得到的媒体，什么都改不了（下面“旁观”）。给只需要看的一方：监控、审计、另一处的只读界面。
+
+前缀只是给人看的记号（两把钥匙要交给不同的人），级别以守护进程存下的为准。用宿主 token：
 
 | 命令 | 控制台 | 作用 |
 |---|---|---|
-| `aio backend list` | `GET /api/backends` | 每个后端：是否还在配置里、钥匙 id 与签发时间、连接数、是否有推送连接、游标与积压、登记与获得的会话许可数 |
-| `aio backend key <id>` | `POST /api/backends/:id/key`，体 `{ "op": "issue" }` | 第一把钥匙；已有答 `key_exists`（409） |
-| `aio backend rotate <id>` | 同上，`{ "op": "rotate" }` | 换一把：旧的立即作废，凭它在线的连接被关 |
-| `aio backend revoke <id>` | 同上，`{ "op": "revoke" }` | 作废：这个后端没有钥匙能用，在线的连接被关 |
-| `aio backend forget <id>` | `POST /api/backends/:id/forget` | 清掉它的队列条目、游标、发送许可、媒体许可与暂存的上传（§4.13），关它的连接；不动钥匙 |
+| `aio backend list` | `GET /api/backends` | 每个后端：是否还在配置里、读写钥匙的 id 与签发时间（`key`）、读写连接数（`connections`）、是否有推送连接、游标与积压、登记与获得的会话许可数；有只读钥匙时多一项 `read { key { id, createdAt }, connections }`。从不列钥匙 |
+| `aio backend key <id> [--read]` | `POST /api/backends/:id/key`，体 `{ "op": "issue" }`（只读：加 `"access": "read"`） | 这一级的第一把钥匙；这一级已有答 `key_exists`（409） |
+| `aio backend rotate <id> [--read]` | 同上，`{ "op": "rotate" }`（只读同样加 `access`） | 换一把：这一级旧的立即作废，凭它在线的连接被关；另一级的钥匙与连接不动 |
+| `aio backend revoke <id> [--read]` | 同上，`{ "op": "revoke" }`（只读同样加 `access`） | 作废：这一级没有钥匙能用，凭它在线的连接被关；另一级不动 |
+| `aio backend forget <id>` | `POST /api/backends/:id/forget` | 清掉它的队列条目、游标、发送许可、媒体许可与暂存的上传（§4.13），关它两级的连接；两把钥匙都不动 |
+
+帧是 `backends.key { backend, op, access? }`。`access` 是 `"read"` 或 `"readwrite"`，不写就是 `"readwrite"`；别的值被拒（帧 `invalid_frame`，HTTP 400），不会落回读写钥匙。应答里回显 `access`。**没有 `backends.access` 这个 feature 的守护进程不认识级别**：它忽略 `access`，照样签发或轮换读写钥匙。`aio backend … --read` 在发帧之前先看 hello 的 `features`，没有就报错退出（什么都没改）；自己发帧或调 HTTP 的要核对应答里的 `access` 是不是要的那一级。
 
 `aio backend key` / `rotate` 把钥匙单独一行打到 stdout，说明打到 stderr。没有配置的 id 答 `unknown_backend`（404，命令行退出码 2）。没有并存窗口：轮换之后、新钥匙部署到后端之前，这个后端不在线，条目留在队列里等它。从配置里删掉一个后端要重启才生效（下次启动删掉它的钥匙），要立即切断用 `revoke`。
 
 **连接**。后端与宿主说同一套协议，`host.hello` 的 `token` 填钥匙。钥匙决定身份：连接的名字是 `backend:<id>`，帧里自报的 `name` 不起作用；`consumer` 可以不写（只拉取），写了必须是 `<id>` 或 `backend:<id>`，表示推送消费；`callouts`、`optIn` 一律不给。应答：
 
 ```jsonc
-{ "name": "backend:beta", "protocol": 1, "host": false, "backend": { "id": "beta" },
+{ "name": "backend:beta", "protocol": 1, "host": false, "backend": { "id": "beta", "access": "readwrite" },
   "bindings": { "version": null, "active": false },
   "inbound": { "consumer": "backend:beta", "acked": 12, "head": 15 },   // 写了 consumer 才有；head 是它自己条目的最大游标
   "features": ["backends", "deliver.update", "message.ack", "host.takeover", "binding.tag", "blobs", "history"],   // history 只在配置放开时有
   "callouts": [], "optIn": [] }                                          // 帧里写了才回，总是空的
 ```
 
-几个后端可以同时在线，与凭宿主 token 的宿主互不影响：后端不占宿主位，不改变宿主表是否生效，每个后端至多一条推送连接（第二条答 `host_connected`，`takeover: true` 只顶替它自己的旧连接）。
+`backend.access` 说明这把钥匙的级别，客户端不用试就知道；应答里没有这个字段的守护进程是分级之前的版本，钥匙就是读写的。凭只读钥匙 hello 时**不能写 `consumer`**（写了答 `forbidden`，带不带 `takeover` 都一样），应答是：
+
+```jsonc
+{ "name": "backend:beta", "protocol": 1, "host": false, "backend": { "id": "beta", "access": "read" },
+  "bindings": { "version": null, "active": false },
+  "features": ["backends", "binding.tag", "blobs.read", "history"] }     // 只列它用得了的；没有 inbound
+```
+
+`blobs.read` 表示 `blob.stat` / `blob.get`（没有 `blob.put`，所以不叫 `blobs`）；`history` 同样只在配置放开时有。
+
+几个后端可以同时在线，与凭宿主 token 的宿主互不影响：后端不占宿主位，不改变宿主表是否生效，每个后端至多一条推送连接（第二条答 `host_connected`，`takeover: true` 只顶替它自己的旧连接）。只读连接不算在这一条里：可以有多条（每个后端至多 32 条，见下“旁观”），与推送连接同时在线，顶不掉它。配置了后端时，宿主 token 的 hello 在 `features` 里多 `backends` 和 `backends.access`。
 
 **能用的帧**（白名单，缺省拒绝：以后新加的帧不列进来就不给后端）：
 
-| 能 | 限制 |
-|---|---|
-| `host.hello` | 见上 |
-| `inbound.read` / `inbound.ack` | 只限自己的游标（别的消费者名答 `forbidden`）；`head` 与 ack 的上限是自己条目的最大游标 |
-| `deliver` | 会话在许可内；`route.replyToMessageId` 有值时是它收到过的或自己发的、同一会话的消息；附件至多 32 个（否则 `too_many_attachments`），每个 `ref` 是它被给过的或自己上传的（§4.13，否则 `unknown_blob`） |
-| `deliver.update` | 同上，且 `providerMessageId` 是它自己 `deliver` 的、同一会话的消息 |
-| `message.ack` | 会话在许可内，`messageId` 是它收到过的或自己发的、同一会话的消息 |
-| `blob.stat` / `blob.get` | 只限路由给它的条目里的媒体，和它自己上传、还没过期的引用；别的引用答得和不存在的一样（§4.13） |
-| `blob.put` | 进它自己的暂存区，有配额，24 小时过期（§4.13） |
-| `history.read` | 只在 `backends.<id>.history: true` 时；只限 `to` 是自己的条目（别的游标答 `unknown_cursor`） |
+| 帧 | 读写钥匙 | 只读钥匙 | 限制 |
+|---|---|---|---|
+| `host.hello` | 能 | 能，不带 `consumer` | 见上 |
+| `inbound.read` | 能 | 能（旁观，见下） | 只限这个后端的游标（别的消费者名答 `forbidden`）；`head` 是它条目的最大游标 |
+| `inbound.ack` | 能 | 不能 | 只限自己的游标；上限是自己条目的最大游标 |
+| `deliver` | 能 | 不能 | 会话在许可内；`route.replyToMessageId` 有值时是它收到过的或自己发的、同一会话的消息；附件至多 32 个（否则 `too_many_attachments`），每个 `ref` 是它被给过的或自己上传的（§4.13，否则 `unknown_blob`） |
+| `deliver.update` | 能 | 不能 | 同上，且 `providerMessageId` 是它自己 `deliver` 的、同一会话的消息 |
+| `message.ack` | 能 | 不能 | 会话在许可内，`messageId` 是它收到过的或自己发的、同一会话的消息 |
+| `blob.stat` / `blob.get` | 能 | 能 | 只限路由给这个后端的条目里的媒体，和这个后端自己上传、还没过期的引用；别的引用答得和不存在的一样（§4.13） |
+| `blob.put` | 能 | 不能 | 进它自己的暂存区，有配额，24 小时过期（§4.13） |
+| `history.read` | 放开时能 | 放开时能 | 只在 `backends.<id>.history: true` 时（一个开关管两级）；只限 `to` 是这个后端的条目（别的游标答 `unknown_cursor`） |
 
-其余的宿主帧（`bindings.put` / `bindings.get`、`explain`、`run.*`、`session.*`、`schedule.*`、`inbound.redispatch`、`conversation.create`、`input.verify`、`test.*`、`host.outboundScope`、`backends.*`）和全部客户端帧（`input`、`subscribe`、`sessions`、监听、话题、`tui.attach`）答 `forbidden`。钥匙被轮换或作废后，连接被关；万一还开着，下一帧答 `unauthorized`。
+只读钥匙“不能”的那些，连同下面列的其余宿主帧，一律答 `forbidden`，文字固定是 `this key is read-only`：不说这个帧本来会遇到什么。
+
+其余的宿主帧（`bindings.put` / `bindings.get`、`explain`、`run.*`、`session.*`、`schedule.*`、`inbound.redispatch`、`conversation.create`、`input.verify`、`test.*`、`host.outboundScope`、`backends.*`）和全部客户端帧（`input`、`subscribe`、`sessions`、监听、话题、`tui.attach`）答 `forbidden`。钥匙被轮换或作废后，凭这一级钥匙的连接被关；万一还开着，下一帧答 `unauthorized`。
 
 **队列视图**。后端的游标是消费者 `backend:<id>`，只走 `to` 是它的条目（§2.1）。管理员用宿主 token 看和清某个后端的积压：`aio tail --consumer backend:<id>`、`aio ack --consumer backend:<id> <cursor>`，补投（`inbound.redispatch`）也只有宿主 token 能做。id 打错时（`backend:` 开头、又不是哪个后端的游标）这两个命令和 `host.hello` 的 `consumer` 都答 `unknown_backend`，不会把它登记成一个读宿主自己积压的消费者；从配置里删掉、但还留着条目的后端照旧能读（`aio backend list` 列得出）。`history.read` 放开后读到的是那个会话更早的全部消息（通道给得出的），包括路由给别的后端或本地 agent 的：隔离的是队列条目，不是会话历史。同一个群分给两个后端时想清楚再开。
+
+**旁观（只读钥匙）**。只读连接用同一个 `inbound.read { consumer: "<id>" | "backend:<id>", after?, limit?, waitMs? }`，应答形状不变（`{ items, acked, head }`，`acked` 是后端自己确认到哪里）。`after` 不写时从后端已确认的游标起，也就是“后端还没处理的”；写了就从那里起。旁观者自己记位置：拿到条目后用最后一条的 `cursor` 作下一次的 `after`，带 `waitMs`（至多 300 秒）长轮询，新条目入队时立刻返回。它**不是消费者**：
+
+- 不移动后端的游标，不能 ack，不会被推送，也不会让读写连接少收一条：至少一次的投递（§2.1）只由读写连接的 ack 决定。
+- 不登记、不算进清理：后端确认过、又过了保留期（缺省 24 小时）的条目照常删掉，旁观者看没看过都一样。所以旁观是一个视图，**没有投递保证**：断线期间被清掉的条目补不回来。要保证每条都拿到，用读写钥匙。
+- 只看得到 `to` 是这个后端的条目；别的后端的、宿主自己的一条都没有。
+- 可以有多条，与那一条读写推送连接同时在线，互不相干。守护进程不主动给只读连接推条目。
+- 有界，超出的答 `busy`：一个后端同时至多 32 条说过 hello 的只读连接（第 33 条的 `host.hello` 答 `busy`，有一条断开就空出位置）；一条只读连接同时至多 4 个在等的长轮询（带 `waitMs` 的 `inbound.read`），第 5 个答 `busy`，有一个答了就空出位置；不带 `waitMs` 的读不计数。一条连接上同时只该挂一个长轮询（4 是给超时后重发留的余量）：被答 `busy` 就等一个答复回来再问，不要立刻重发。每个在等的长轮询在每次入队时都被唤醒，这两个上限让一把只读钥匙拖不慢读写连接的推送。读写钥匙与宿主 token 的连接没有这两个上限。
+- `backends.<id>.history` 开着时只读钥匙也能 `history.read`，读到的范围与读写钥匙相同（见上：那个会话更早的全部消息）。
 
 **发送范围**。后端的 `deliver` 只能发往 (a) 路由给过它的输入的回复路由所在的会话（按 `channel`、`account`、`conversationId`，任何话题；入队时记下，跨重启，不过期），(b) `backends.<id>.routes` 登记的目的地。回复目标（`replyToMessageId`）、被标记的消息（`message.ack` 的 `messageId`）必须是它收到过的输入的消息（记 30 天）或它自己发的消息，且在同一个会话；被改的消息（`deliver.update`）必须是它自己发的。不满足一律答 `route_not_allowed`，文字是固定的一句，通道或账号解析不到也答这个（不列出有哪些通道）；这次请求不发、不占用 operationId。回复一条 30 天前收到的消息会被拒，去掉 `replyToMessageId` 可以照发到那个会话。operationId 按后端分开（内部是 `backend:<id>:<operationId>`，与宿主的互不重叠），两个后端用同一个 id 互不影响；`aio explain backend:<id>:<operationId>` 查得到，结果带 `backend`。宿主的 `outbound` 回调与出口检查（§4.1、§4.1a）不看后端的发送，与宿主自己的 `deliver` 一样：靠出口检查把关所有外发的部署，加了后端以后要知道这条路不经过它。只检查会话和消息 id，不检查 `threadId`。附件另有检查（§4.13）：每个引用必须是路由给它的条目里的媒体或它自己上传的，否则答 `unknown_blob`；`channelData`（通道原生内容）不检查。
 
@@ -498,9 +528,9 @@ await agent.runAgent({ runId: 'r1' }, { onEvent: ({ event }) => console.log(even
 
 **id 就是身份**。状态都记在 id 下：后端从配置里删掉再加回来（要重新签发钥匙），它的积压、游标、会话许可、operationId 的结果、消息的归属都延续。指向它的规则要一起删掉或改指，否则配置加载失败；宿主推送并持久化的表里有这样的规则时，启动时整张宿主表被忽略，直到宿主推一张不含它的表。`aio backend forget <id>` 清掉条目、游标与许可，连同媒体许可和暂存的上传（会话许可不过期，规则改道以后原来的后端仍能往那个会话发，直到 forget；没有按会话撤销的办法；forget 之后只有规则再路由给它一条输入才重新授予）；它不清 operationId 的结果和消息归属，所以同一个 id 交给另一方用，会继承旧的 operationId 结果、旧消息的编辑权和旧卡片的点击。换人就换 id。
 
-**经 `/ws` 接入**。本地 unix socket 不是后端的隔离边界：能打开它的进程在 `hello` 之前就是主人。后端走控制台端口的 `/ws`：升级请求带 `Authorization: Bearer <钥匙>`（浏览器式的客户端不能设头：子协议列表里放 `agents-io.v1` 和 `agents-io.bearer.<钥匙>`），连上后发 `host.hello { token: <同一把钥匙>, name, consumer? }`。凭钥匙升级的连接在 `hello` 前后都不收客户端帧，`hello` 只认同一个后端的钥匙（宿主 token 或别的后端的钥匙答 `unauthorized`），钥匙被轮换、作废或后端被 forget 时连还没 `hello` 的连接一起关。钥匙只能开 `/ws`：控制台的 `/api/*` 对它一律答 403，换不到登录链接。远程后端要求控制台听非回环地址（`console.allowRemote`，通配地址还要 `console.allowedHosts`），同一个端口上也有管理 API；控制台只说 http，钥匙以明文 bearer 过网，前面要有 TLS 终结或只在可信网络里。
+**经 `/ws` 接入**。本地 unix socket 不是后端的隔离边界：能打开它的进程在 `hello` 之前就是主人。后端走控制台端口的 `/ws`：升级请求带 `Authorization: Bearer <钥匙>`（浏览器式的客户端不能设头：子协议列表里放 `agents-io.v1` 和 `agents-io.bearer.<钥匙>`），连上后发 `host.hello { token: <同一把钥匙>, name, consumer? }`。凭钥匙升级的连接在 `hello` 前后都不收客户端帧，`hello` 只认同一个后端、同一级的钥匙（宿主 token、别的后端的钥匙、同一个后端另一级的钥匙都答 `unauthorized`：凭只读钥匙升级的连接不会变成读写的），这一级的钥匙被轮换、作废或后端被 forget 时连还没 `hello` 的连接一起关。两级钥匙都这样接入。钥匙只能开 `/ws`：控制台的 `/api/*` 对它一律答 403，换不到登录链接。远程后端要求控制台听非回环地址（`console.allowRemote`，通配地址还要 `console.allowedHosts`），同一个端口上也有管理 API；控制台只说 http，钥匙以明文 bearer 过网，前面要有 TLS 终结或只在可信网络里。
 
-**这一轮没有的**：回调推送（守护进程主动把条目推到后端的地址）、轮换的并存窗口、后端用 `schedule.*` / `run.start` / `conversation.create` / `explain`、后端之间转信、不重启就增删后端、按会话撤销许可、按 HTTP 传很大的文件（媒体走 §4.13 的帧，一个 blob 至多 `blobs.maxBytes`）。
+**这一轮没有的**：回调推送（守护进程主动把条目推到后端的地址）、给旁观者的推送与旁观者自己的持久游标、同一级的多把钥匙（每个旁观方一把、单独作废）、`history` 按级别分开的开关、只读连接的数量上限、轮换的并存窗口、后端用 `schedule.*` / `run.start` / `conversation.create` / `explain`、后端之间转信、不重启就增删后端、按会话撤销许可、按 HTTP 传很大的文件（媒体走 §4.13 的帧，一个 blob 至多 `blobs.maxBytes`）。
 
 ### 4.13 blob：取条目里的媒体，上传附件（feature `blobs`；INVARIANTS PB-6）
 
@@ -520,7 +550,9 @@ await agent.runAgent({ runId: 'r1' }, { onEvent: ({ event }) => console.log(even
 
 **凭宿主 token**：`blob.stat` / `blob.get` 读共用 blob 库里的任何引用；`blob.put` 直接存进共用库（`mime` 缺省 `application/octet-stream`，决定存储的扩展名；同样的字节已经在库里时保留原来的 mime 与名字），没有配额、不过期。它的 `deliver` 不变：附件引用不检查。
 
-**凭后端钥匙**（PB-6）：
+**凭只读钥匙**（PB-7）：`blob.stat` / `blob.get` 与下面读写钥匙读得到的两类引用完全相同（这个后端的条目里的媒体、这个后端自己上传还没过期的），别的同样答得和不存在的一样；`blob.put` 答 `forbidden`（`this key is read-only`），什么都不暂存。它的 hello 里是 feature `blobs.read`，没有 `blobs`。
+
+**凭后端钥匙**（读写钥匙，PB-6）：
 
 - **读得到的只有两类引用**：(a) 路由给过它的条目（`to` 是它）里 `image` / `file` / `audio` 块的 `ref`，入队时记下，记 30 天，跨重启，`aio backend forget` 收回；(b) 它自己上传、还没过期的。别的一律答得和不存在的一样（`blob.stat` 答 `null`，`blob.get` 答 `not_found`、同一句话）：别的后端的条目或上传里的、只进了某个会话的、文字或 `quote` 或事件数据里提到的、凭内容哈希算出来的。`history.read` 放开后看得到更早消息的引用，但读不到字节；同一份字节后来出现在路由给它的条目里才读得到。条目里不是 `sha256:` 形式的平台引用（通道没有下载的）没有字节可读。30 天之后才打开的旧条目取不到媒体：要留就在收到时取。
 - **上传进它自己的暂存区**（`<blobs.dir>/uploads/<后端>/`），不进共用库：引用是内容哈希，进了共用库别的后端就能凭哈希读到、或试出库里有没有某份字节。别的后端拿同一个引用读不到也发不出，除非它自己也上传了同样的字节。`mime` / `name` 不记，发的时候写在附件上。
@@ -543,7 +575,7 @@ await agent.runAgent({ runId: 'r1' }, { onEvent: ({ event }) => console.log(even
 | `aio explain <operationId>` | 某次投递（`delivery.settled` 里的 operationId）：会话、轮次与该轮的触发输入；系统回复给出它回应的输入，宿主 `deliver` 给出宿主 |
 | `aio explain --chain <inputId>` | 一条 agent 输入沿 cause 链走回根：每一级的 inputId、跳数、会话地址、主体、触发的轮次、是否截停；链断（另一部署、不认识的机器人）处注明 |
 | `aio verify <channelRef>` | `input.verify` |
-| `aio backend list` / `key <id>` / `rotate <id>` / `revoke <id>` / `forget <id>` | `backends.list` / `backends.key`（`issue`、`rotate`、`revoke`）/ `backends.forget`（§4.12）。钥匙单独一行打到 stdout，只出现这一次 |
+| `aio backend list` / `key <id> [--read]` / `rotate <id> [--read]` / `revoke <id> [--read]` / `forget <id>` | `backends.list` / `backends.key`（`issue`、`rotate`、`revoke`；`--read` 是 `access: "read"`，只读钥匙）/ `backends.forget`（§4.12）。钥匙单独一行打到 stdout，只出现这一次 |
 | `aio replay --input <inputId> [--times N]` | `test.replay`（测试入口，§4.3；只在 `AIO_TEST_HOOKS=1` 时可用） |
 | `aio fault [list] \| drop-response --channel <id> [--account <a>] [--conversation <c>] --next <N> \| clear` | `test.fault`（同上） |
 | `aio acp --client <名> [--token-file <路径>] [--session <键>]` | 不是宿主命令：编辑器或 t3code 起它当 ACP agent（§4.11），以 `acpServer` 的一个客户端的身份经 `module.connect` 连 socket |

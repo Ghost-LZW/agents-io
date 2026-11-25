@@ -1,9 +1,9 @@
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { FakeTurnScript } from '@agents-io/testkit';
 import { exitCodeFor, main } from '../src/cli.js';
-import { CommandError, ConfigError, configTable, DaemonUnavailable, TokenError, tokenPath } from '@agents-io/kernel';
+import { CommandError, ConfigError, configTable, DaemonUnavailable, LocalClient, TokenError, tokenPath } from '@agents-io/kernel';
 import { resolveConfig } from '../src/defaults.js';
 import { cli } from './cli-helpers.js';
 import { daemon, tmp, until } from './helpers.js';
@@ -92,7 +92,7 @@ describe('cli against a daemon', () => {
     expect(key.out).toMatch(/^aiob_[\w-]{43}\n$/);
     const k1 = key.out.trim();
     const id1 = w.gw.backends.verify(k1)!.keyId;
-    expect(w.gw.backends.verify(k1)).toEqual({ id: 'alpha', keyId: id1 });
+    expect(w.gw.backends.verify(k1)).toEqual({ id: 'alpha', keyId: id1, access: 'readwrite' });
     expect(key.err).toContain(`key id ${id1}`);
     expect(key.err).not.toContain(k1);
     // A second `key` is refused (exit 2) and prints no key.
@@ -136,6 +136,92 @@ describe('cli against a daemon', () => {
     for (const argv of [['backend'], ['backend', 'key'], ['backend', 'list', 'alpha'], ['backend', 'show', 'alpha'], ['backend', 'key', 'alpha', 'beta']]) {
       await expect(main([...argv, ...s])).rejects.toBeInstanceOf(ConfigError);
     }
+  });
+
+  it('aio backend key --read prints a read key once; rotate --read and revoke --read act on the read key and leave the read-write key; list shows both levels, never a key; --read with list or forget is a usage error; a daemon that does not advertise backends.access is refused before any key is touched #PB-3 #PB-7', async () => {
+    const w = await daemon({ raw: { backends: { alpha: {}, beta: {} } } });
+    const s = ['--socket', w.config.socketPath];
+    const kw = (await cli(['backend', 'key', 'alpha', ...s])).out.trim();
+    const key = await cli(['backend', 'key', 'alpha', '--read', ...s]);
+    expect(key.code).toBe(0);
+    // stdout: the read key alone on one line; stderr says what it is and does not repeat it.
+    expect(key.out).toMatch(/^aiobr_[\w-]{43}\n$/);
+    const k1 = key.out.trim();
+    const id1 = w.gw.backends.verify(k1)!.keyId;
+    expect(w.gw.backends.verify(k1)).toEqual({ id: 'alpha', keyId: id1, access: 'read' });
+    expect(key.err).toContain(`read key of backend alpha (key id ${id1})`);
+    expect(key.err).toMatch(/only observes/);
+    expect(key.err).not.toContain(k1);
+    const rwId = w.gw.backends.verify(kw)!.keyId;
+    // A second read key is refused; the flag may come before the id too.
+    const twice = await main(['backend', 'key', '--read', 'alpha', ...s]).catch((e: Error) => e);
+    expect(twice).toMatchObject({ code: 'key_exists' });
+    expect(exitCodeFor(twice)).toBe(2);
+
+    // list: both levels by key id, never a key.
+    const list = await cli(['backend', 'list', ...s]);
+    expect((JSON.parse(list.out) as { backends: { id: string; key?: { id: string }; read?: { key: { id: string }; connections: number } }[] }).backends.map((b) => [b.id, b.key?.id, b.read?.key.id, b.read?.connections])).toEqual([['alpha', rwId, id1, 0], ['beta', undefined, undefined, undefined]]);
+    for (const k of [k1, kw]) expect(list.out + list.err).not.toContain(k);
+
+    // rotate --read: a new read key; the read-write key is the one it was.
+    const rot = await cli(['backend', 'rotate', 'alpha', '--read', ...s]);
+    expect(rot.out).toMatch(/^aiobr_[\w-]{43}\n$/);
+    const k2 = rot.out.trim();
+    expect(rot.err).not.toContain(k2);
+    expect([w.gw.backends.verify(k1), w.gw.backends.verify(k2)?.access, w.gw.backends.verify(kw)]).toEqual([undefined, 'read', { id: 'alpha', keyId: rwId, access: 'readwrite' }]);
+    // Without the flag everything means the read-write key, as it always did.
+    const rotW = await cli(['backend', 'rotate', 'alpha', ...s]);
+    expect(rotW.out).toMatch(/^aiob_[\w-]{43}\n$/);
+    const kw2 = rotW.out.trim();
+    expect([w.gw.backends.verify(kw), w.gw.backends.verify(kw2)?.access, w.gw.backends.verify(k2)?.access]).toEqual([undefined, 'readwrite', 'read']);
+
+    // revoke --read: only the read key goes.
+    const rev = await cli(['backend', 'revoke', 'alpha', '--read', ...s]);
+    expect(rev).toMatchObject({ code: 0, out: '' });
+    expect(rev.err).toMatch(/backend alpha has no read key now/);
+    expect(w.gw.backends.verify(k2)).toBeUndefined();
+    expect(w.gw.backends.list()).toEqual([{ backend: 'alpha', access: 'readwrite', keyId: w.gw.backends.verify(kw2)!.keyId, createdAt: expect.any(Number) }]);
+    for (const sub of ['key', 'rotate', 'revoke']) expect(await main(['backend', sub, 'gamma', '--read', ...s]).catch((x: Error) => x)).toMatchObject({ code: 'unknown_backend' });
+
+    // A level belongs to a key: with list or forget the flag is a usage error, and the daemon is not asked.
+    const before = w.gw.backends.list();
+    for (const argv of [['backend', 'list', '--read'], ['backend', 'ls', '--read'], ['backend', 'forget', 'alpha', '--read'], ['backend', '--read']]) {
+      await expect(main([...argv, ...s])).rejects.toBeInstanceOf(ConfigError);
+    }
+
+    // A daemon from before read keys ignores the level and would hand out or replace the read-write key:
+    // without `backends.access` in its hello, nothing is asked of it.
+    const hello = LocalClient.prototype.hello;
+    const asked = vi.spyOn(LocalClient.prototype, 'backendsKey');
+    const older = vi.spyOn(LocalClient.prototype, 'hello').mockImplementation(async function (this: LocalClient, o) {
+      const r = await hello.call(this, o);
+      return { ...r, features: (r.features ?? []).filter((f) => f !== 'backends.access') };
+    });
+    try {
+      for (const sub of ['key', 'rotate', 'revoke']) {
+        const e = await main(['backend', sub, 'alpha', '--read', ...s]).catch((x: Error) => x);
+        expect(e).toBeInstanceOf(ConfigError);
+        expect((e as Error).message).toMatch(/does not know read keys/);
+        expect(exitCodeFor(e)).toBe(2);
+      }
+      expect(asked).not.toHaveBeenCalled();
+      expect(w.gw.backends.list()).toEqual(before);
+      // The same daemon still does what it always did without the flag.
+      expect((await cli(['backend', 'list', ...s])).code).toBe(0);
+    } finally {
+      older.mockRestore();
+    }
+    // And should a daemon answer about another level all the same, no key is printed.
+    asked.mockImplementation(async () => ({ backend: 'alpha', op: 'rotate', key: 'aiob_test_key_not_real', keyId: '0123456789ab', createdAt: 1, closed: 0 }));
+    try {
+      const wrong = await cli(['backend', 'rotate', 'alpha', '--read', ...s]).catch((x: Error) => x);
+      expect(wrong).toBeInstanceOf(Error);
+      expect((wrong as Error).message).not.toContain('aiob_test_key_not_real');
+      expect((wrong as Error).message).toMatch(/did not answer about a read key/);
+    } finally {
+      asked.mockRestore();
+    }
+    expect(w.gw.backends.list()).toEqual(before);
   });
 
   it('a wrong token is refused (exit 77) #SE-3', async () => {

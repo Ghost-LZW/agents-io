@@ -9,6 +9,7 @@ import { mediaBlocks, type InboundEnvelope, type InboundItem } from '@agents-io/
  * the idempotency key: a channel redelivering a message gets the cursor of the
  * first copy. Two ways to consume, same semantics: pull (`read`, with long-poll)
  * and push (`subscribe`, which redelivers whatever is unacked after a reconnect).
+ * `peek` is neither: a look at a target's items by someone who is no consumer (PB-7).
  *
  * Items and consumers may carry a target (a backend id; `InboundItem.to`). A
  * consumer registered with a target walks only that target's items, one without
@@ -312,6 +313,40 @@ export class HostQueue {
     const deadline = this.now() + (o.waitMs ?? 0);
     for (;;) {
       const items = this.load(after, limit, target);
+      const left = deadline - this.now();
+      if (items.length || left <= 0 || this.closed || o.signal?.aborted) return items;
+      await this.waitAppend(left, o.signal);
+    }
+  }
+
+  /**
+   * What a known consumer acked, 0 for a name that is no consumer. Reads only: unlike `cursor`
+   * it registers nothing and does not touch `seen` (PB-7).
+   */
+  ackedOf(consumer: string): number {
+    const r = this.q.consumerGet.get(consumer) as { acked: number } | undefined;
+    return r?.acked ?? 0;
+  }
+
+  /** The last cursor among `target`'s items (0 when it has none). Reads only. */
+  targetHead(target: string): number {
+    const r = this.q.headTarget.get(target) as { head: number | null };
+    return r.head ?? 0;
+  }
+
+  /**
+   * Look at `target`'s items after `after` without being a consumer (PB-7): the same rows and the
+   * same long-poll as `read`, and nothing is written. No consumer is registered or touched, no
+   * cursor moves, and retention ignores whoever peeks (an item its consumers acked is pruned
+   * whether or not it was peeked). An empty target is refused: it would name the items without a
+   * target, the host's own backlog.
+   */
+  async peek(target: string, o: { after: number; limit?: number; waitMs?: number; signal?: AbortSignal }): Promise<InboundItem[]> {
+    if (!target) throw new Error('target is empty');
+    const limit = o.limit ?? 100;
+    const deadline = this.now() + (o.waitMs ?? 0);
+    for (;;) {
+      const items = this.load(o.after, limit, target);
       const left = deadline - this.now();
       if (items.length || left <= 0 || this.closed || o.signal?.aborted) return items;
       await this.waitAppend(left, o.signal);
