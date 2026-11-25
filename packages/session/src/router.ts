@@ -39,7 +39,9 @@ import { contentText } from './watch.js';
  *
  * A `host` rule may name a backend (`to`): the input is then queued for that
  * backend alone, once per backend named. A click on a message a backend sent
- * belongs to that backend: only its own rules can take it (PB-1).
+ * belongs to that backend: only its own rules can take it (PB-1). A message a
+ * backend sent that a channel hands back is the deployment's own: no rule naming
+ * that backend takes it, and for every other rule it is a self input (PB-8).
  */
 
 export class RouterError extends Error {
@@ -472,8 +474,18 @@ export class Router {
    * only rules `to` that backend take it, and only into its queue; without it no rule
    * naming a backend takes a click. Skipped rules are explained (`rejected.code:
    * "click_sender"`) and asked no callout. Inputs that are not clicks are not filtered.
+   *
+   * `o.echoOf`: the backends that delivered the message this input is (PB-8; never a click). It is
+   * the deployment's own message handed back, not somebody speaking: it is routed as a self input
+   * whatever `origin` says (rules need `includeSelf`, a dispatch is context), and no rule `to` one of
+   * those backends takes it. Such a rule that matches apart from `includeSelf` is explained
+   * (`rejected.code: "own_echo"`) and asked no callout; the explanation carries `echoOf`.
    */
-  async route(env: InboundEnvelope, origin: Origin, input: InputRecord, o: { clickOf?: string } = {}): Promise<RouteDecision> {
+  async route(env: InboundEnvelope, origin: Origin, input: InputRecord, o: { clickOf?: string; echoOf?: readonly string[] } = {}): Promise<RouteDecision> {
+    const isClick = actionIdOf(env) !== undefined;
+    const echoOf = new Set(isClick ? [] : (o.echoOf ?? []));
+    // The echo is routed as what it is, also when the caller did not stamp it.
+    if (echoOf.size && !origin.self) origin = { ...origin, self: true };
     const explanation: Explanation = {
       inputId: input.inputId,
       tableVersions: this.versions(),
@@ -482,25 +494,30 @@ export class Router {
       evidence: origin.evidence,
       at: this.now(),
     };
+    if (echoOf.size) explanation.echoOf = { backends: [...echoOf] };
     // Auto-replies, bounces, bulk mail: not a message for anyone, not even a watch.
     if (env.admission === 'drop') return { deliveries: [], hosts: [], explanation: { ...explanation, dropped: 'adapter' } };
 
-    const clickOf = actionIdOf(env) !== undefined ? o.clickOf : undefined;
+    const clickOf = isClick ? o.clickOf : undefined;
     // Why a rule does not get this click; undefined: it does (always, for an input that is not a click).
     const notForClick = (to: string | undefined): string | undefined => {
-      if (actionIdOf(env) === undefined) return undefined;
+      if (!isClick) return undefined;
       if (clickOf !== undefined) return to === clickOf ? undefined : `the clicked message was sent by backend ${JSON.stringify(clickOf)}: only rules to it take the click`;
       return to !== undefined ? `the clicked message was not sent by backend ${JSON.stringify(to)}` : undefined;
     };
-    const skipped = (r: Rule, on: BindingAction, message: string, callout?: Resolved['callout']): Skipped => ({
-      skipped: { bindingId: r.binding.id, source: r.source, on, ...(r.binding.to !== undefined ? { to: r.binding.to } : {}), ...tagOf(r.binding), ...(callout ? { callout } : {}), rejected: { code: 'click_sender', message } },
+    const skipped = (r: Rule, on: BindingAction, message: string, callout?: Resolved['callout'], code = 'click_sender'): Skipped => ({
+      skipped: { bindingId: r.binding.id, source: r.source, on, ...(r.binding.to !== undefined ? { to: r.binding.to } : {}), ...tagOf(r.binding), ...(callout ? { callout } : {}), rejected: { code, message } },
     });
+    // PB-8: a rule naming the backend that delivered this message never gets its echo.
+    const ownEcho = (r: Rule): boolean => r.binding.to !== undefined && echoOf.has(r.binding.to);
 
     const rules = this.rules();
-    const hits = rules.filter((r) => matches(r.binding.match, env, origin, this.selfAccounts));
-    // Callouts run in parallel so one slow host does not add up per rule. A rule the click is not for is never asked.
+    // Such a rule is skipped whether or not it asks for self inputs: it is listed when the rest of its match holds.
+    const hits = rules.filter((r) => matches(ownEcho(r) ? { ...r.binding.match, includeSelf: true } : r.binding.match, env, origin, this.selfAccounts));
+    // Callouts run in parallel so one slow host does not add up per rule. A rule the click or the echo is not for is never asked.
     const resolved: (Resolved | Skipped)[] = await Promise.all(
       hits.map((r) => {
+        if (ownEcho(r)) return skipped(r, r.binding.on, `the message is one backend ${JSON.stringify(r.binding.to)} delivered itself: its echo is not queued for it`, undefined, 'own_echo');
         const why = notForClick(r.binding.to);
         return why !== undefined ? skipped(r, r.binding.on, why) : this.resolve(r, env, input);
       }),

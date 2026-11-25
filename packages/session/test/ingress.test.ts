@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FakeHarness, fakeEnvelope } from '@agents-io/testkit';
-import { HostQueue, Hub, Ingress, Lane, MemorySessionLog, Router, SOURCE_MISMATCH, SqliteSessionLog, actionId, defaultPolicy, interruptActionId, ownersTable, parseActionId, questionActionId, type EmitSource, type IngressResult, type SessionPolicy } from '../src/index.js';
+import { HostQueue, Hub, Ingress, Lane, MemorySessionLog, Router, SOURCE_MISMATCH, SqliteSessionLog, actionId, defaultPolicy, interruptActionId, mayBeEcho, ownersTable, parseActionId, questionActionId, type EmitSource, type IngressResult, type SessionPolicy } from '../src/index.js';
 import type { InputRecord } from '@agents-io/protocol';
 import { RUN, bodies, until } from './helpers.js';
 
@@ -317,6 +317,276 @@ describe('Ingress: clicks on a backend\'s message (PB-1)', () => {
     expect(plain.hosts).toEqual([{ cursor: 3, duplicate: false, bindingId: 'host-clicks' }]);
     expect(plain.deliveries?.map((d) => d.sessionKey)).toContain('clicks');
     queue.close();
+  });
+});
+
+describe("Ingress: the echo of a backend's own deliver (PB-8)", () => {
+  it("an envelope whose id, or whose revisionOf, is a message a backend delivered is stamped self without a principal, even the owner's, and is not queued for that backend; the same id without platform evidence, a click, another message with the same text and a message a turn sent are stamped as before #PB-8 #ID-5 #ID-8", async () => {
+    const hub = new Hub(new MemorySessionLog());
+    const policy: SessionPolicy = defaultPolicy({ owners: ['fake:alice'], run: RUN });
+    const lanes = new Map<string, Lane>();
+    const turns: string[] = [];
+    const harness = new FakeHarness(async (t) => void turns.push(...t.inputs.map((i) => i.inputId)));
+    const config = ownersTable({ owners: ['fake:alice'], agent: 'default', ownerSessionKey: 'main' });
+    config.bindings.unshift(
+      { id: 'to-alpha', match: { conversation: 'room' }, on: 'host', to: 'alpha' },
+      // beta asks for what the deployment's own account says in the room.
+      { id: 'beta-sees', match: { conversation: 'room', includeSelf: true }, on: 'host', to: 'beta' },
+    );
+    const router = new Router({ agents: [{ name: 'default', sessionPrefix: '' }], config, backends: ['alpha', 'beta'] });
+    const queue = new HostQueue();
+    queue.register('backend:alpha', 'alpha');
+    queue.register('backend:beta', 'beta');
+    const looked: string[] = [];
+    const ingress = new Ingress({
+      policy,
+      router,
+      hub,
+      hostQueue: queue,
+      lanes: (k) => {
+        let l = lanes.get(k);
+        if (!l) lanes.set(k, (l = new Lane({ sessionKey: k, harness, hub, policy, thinkingHeadline: null })));
+        return l;
+      },
+      // As the daemon answers from its outbound records: alpha delivered `om_alpha` on this channel.
+      deliveredBy: (channel, id) => {
+        looked.push(id);
+        return channel === 'fake' && id === 'om_alpha' ? ['alpha'] : [];
+      },
+      recover: (_channel, id) => (id === 'om_turn' ? { from: { agent: 'default', sessionKey: 'main' }, turnId: 't1' } : undefined),
+      clickOwner: (env) => (env.content.some((b) => b.type === 'event' && b.data.messageId === 'om_alpha') ? 'alpha' : undefined),
+    });
+    const room = { id: 'room', kind: 'group' as const };
+    const view = async (consumer: string) => (await queue.read(consumer)).map((x) => [x.bindingId, x.envelope.id, x.input.origin.self === true, x.input.origin.principal?.id]);
+    const rules = (r: IngressResult) => r.explanation!.matched.map((m) => [m.bindingId, m.rejected?.code]);
+
+    // The account is the owner's own: its message would be the owner speaking. Known by id, it is nobody speaking.
+    const echo = await ingress.accept(fakeEnvelope({ id: 'om_alpha', sender: alice, conversation: room, text: 'see you at five' }));
+    expect(echo.origin).toEqual({ kind: 'agent', principal: null, self: true, evidence: 'platform_signed', via: 'fake:default:room', adapter: 'fake' });
+    expect(echo).toMatchObject({ accepted: true, action: 'host', deliveries: [], hosts: [{ cursor: 1, duplicate: false, bindingId: 'beta-sees', to: 'beta' }] });
+    expect(echo.hosts).toHaveLength(1);
+    expect(rules(echo)).toEqual([['to-alpha', 'own_echo'], ['beta-sees', undefined]]);
+    expect(echo.explanation).toMatchObject({ echoOf: { backends: ['alpha'] }, principal: null, cause: { peer: 'fake:alice', basis: 'none' } });
+    expect(router.explain(echo.inputId!)).toMatchObject({ echoOf: { backends: ['alpha'] } });
+    expect(await view('backend:alpha')).toEqual([]);
+    expect(await view('backend:beta')).toEqual([['beta-sees', 'om_alpha', true, undefined]]);
+
+    // The channel reports the edit of that message as a revision of it: the same.
+    const edit = await ingress.accept(fakeEnvelope({ id: 'om_alpha~2', revisionOf: 'om_alpha', sender: alice, conversation: room, text: 'see you at six' }));
+    expect(edit.origin).toMatchObject({ kind: 'agent', principal: null, self: true });
+    expect(rules(edit)).toEqual([['to-alpha', 'own_echo'], ['beta-sees', undefined]]);
+    expect(await view('backend:alpha')).toEqual([]);
+    expect(lanes.size).toBe(0);
+
+    // Without platform evidence the id proves nothing (a forged copy): a stranger's message, routed by the rules.
+    const forged = await ingress.accept(fakeEnvelope({ id: 'om_alpha', account: 'second', sender: { channelUserId: 'alice', evidence: 'none' }, conversation: room, text: 'see you at five' }));
+    expect(forged.origin).toMatchObject({ kind: 'human', principal: null });
+    expect(forged.origin!.self).toBeUndefined();
+    expect(forged.hosts?.map((h) => [h.bindingId, h.to])).toEqual([['to-alpha', 'alpha'], ['beta-sees', 'beta']]);
+    expect('echoOf' in forged.explanation!).toBe(false);
+
+    // A click is its message's sender's input (PB-1), not an echo, even if the envelope carried that id.
+    const click = await ingress.accept(fakeEnvelope({ id: 'om_alpha', account: 'third', sender: alice, conversation: room, content: [{ type: 'event', name: 'action', data: { actionId: 'pick:yes', messageId: 'om_alpha' } }] }));
+    expect(click.origin).toMatchObject({ kind: 'human', principal: { id: 'fake:alice' } });
+    expect(click.origin!.self).toBeUndefined();
+    expect(click.hosts?.map((h) => [h.bindingId, h.to])).toEqual([['to-alpha', 'alpha']]);
+
+    // The same words under another id are somebody's message: the owner's here, a turn and alpha's item.
+    const said = await ingress.accept(fakeEnvelope({ id: 'om_typed', sender: alice, conversation: room, text: 'see you at five' }));
+    expect(said.origin).toMatchObject({ kind: 'human', principal: { id: 'fake:alice', labels: ['owner'] } });
+    expect(said.origin!.self).toBeUndefined();
+    expect(said).toMatchObject({ action: 'dispatch', hosts: [{ bindingId: 'to-alpha', to: 'alpha' }, { bindingId: 'beta-sees', to: 'beta' }] });
+    expect(rules(said).some((x) => x[1] !== undefined)).toBe(false);
+    expect('echoOf' in said.explanation!).toBe(false);
+    await until(() => turns.includes(said.inputId!));
+    expect(turns).toEqual([said.inputId]);
+
+    // A message a turn of this deployment sent is the outbound index's (ID-8), as before: from its agent, with its chain.
+    const own = await ingress.accept(fakeEnvelope({ id: 'om_turn', sender: stranger, conversation: room, text: 'done' }));
+    expect(own.origin).toMatchObject({ kind: 'agent', principal: { id: 'agent:default' }, self: true });
+    expect(own.explanation).toMatchObject({ cause: { basis: 'recovered', from: { sessionKey: 'main', turnId: 't1' } } });
+    expect('echoOf' in own.explanation!).toBe(false);
+    expect(rules(own)).toEqual([['beta-sees', undefined]]);
+    // The records are asked by message id only, and never for an envelope without platform evidence or a click.
+    expect(looked).toEqual(['om_alpha', 'om_alpha~2', 'om_alpha', 'om_typed']);
+    await lanes.get('fake:default:room')?.whenIdle();
+    queue.close();
+  });
+});
+
+describe("Ingress: an inbound message while a backend's deliver is in flight (PB-8)", () => {
+  const room = { id: 'room', kind: 'group' as const };
+  const bob = { channelUserId: 'bob', evidence: 'platform_signed' as const };
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  /** alpha and beta each get the room's messages, the host's own queue too, and the local agent a turn. */
+  function world(queue: HostQueue, router?: Router) {
+    const hub = new Hub(new MemorySessionLog());
+    const policy: SessionPolicy = defaultPolicy({ owners: ['fake:alice'], run: RUN });
+    const lanes = new Map<string, Lane>();
+    const turns: string[] = [];
+    const harness = new FakeHarness(async (t) => void turns.push(...t.inputs.map((i) => i.inputId)));
+    const config = {
+      version: 'v1',
+      identities: [],
+      bindings: [
+        { id: 'to-alpha', match: { conversation: 'room' }, on: 'host' as const, to: 'alpha' },
+        { id: 'to-beta', match: { conversation: 'room' }, on: 'host' as const, to: 'beta' },
+        { id: 'to-host', match: { conversation: 'room' }, on: 'host' as const },
+        { id: 'room-agent', match: { conversation: 'room' }, on: 'dispatch' as const, agent: 'default' },
+      ],
+    };
+    router ??= new Router({ agents: [{ name: 'default', sessionPrefix: '' }], config, backends: ['alpha', 'beta'] });
+    /** What the daemon's records say alpha delivered, and the delivers of alpha in flight (resolved by `settle`). */
+    const delivered = new Set<string>();
+    let inFlight: { settled: Promise<void>; settle: () => void } | undefined;
+    const asked: string[] = [];
+    const settledAs: string[] = [];
+    const ingress = new Ingress({
+      policy,
+      router,
+      hub,
+      hostQueue: queue,
+      lanes: (k) => {
+        let l = lanes.get(k);
+        if (!l) lanes.set(k, (l = new Lane({ sessionKey: k, harness, hub, policy, thinkingHeadline: null })));
+        return l;
+      },
+      deliveredBy: (_channel, id) => (delivered.has(id) ? ['alpha'] : []),
+      echoPending: (env) => {
+        asked.push(env.id);
+        return inFlight && env.conversation.id === 'room' ? [{ backend: 'alpha', settled: inFlight.settled }] : [];
+      },
+      onEchoSettled: (a) => settledAs.push(`${a.messageId}:${a.to}:${a.outcome}`),
+      clickOwner: () => undefined,
+    });
+    const send = () => {
+      let settle!: () => void;
+      const settled = new Promise<void>((r) => (settle = r));
+      inFlight = { settled, settle: () => (inFlight = undefined, settle()) };
+      return inFlight;
+    };
+    const view = async (consumer: string) => (await queue.read(consumer, { after: 0 })).map((x) => x.envelope.id);
+    return { ingress, router, lanes, turns, delivered, send, view, asked, settledAs };
+  }
+  const rules = (e: { matched: { bindingId: string; rejected?: { code: string } }[] }) => e.matched.map((m) => [m.bindingId, m.rejected?.code]);
+
+  it("the queue entry for a backend that is sending into the conversation is set aside until its delivery has settled: dropped when the message is then on record as its own (explain: echoOf late, own_echo), queued otherwise, behind what came meanwhile; every other rule takes the input at once; a click, an envelope without platform evidence and a message already known as an echo are never set aside #PB-8 #EX-1", async () => {
+    const queue = new HostQueue();
+    for (const b of ['alpha', 'beta']) queue.register(`backend:${b}`, b);
+    const w = world(queue);
+
+    // Nothing in flight: queued for everybody at once, nothing set aside.
+    const before = await w.ingress.accept(fakeEnvelope({ id: 'in-1', sender: bob, conversation: room, text: 'anyone?' }));
+    expect(before.hosts?.map((h) => h.to)).toEqual(['alpha', 'beta', undefined]);
+    expect([before.deferred, before.explanation!.deferred]).toEqual([undefined, undefined]);
+
+    // alpha's deliver is in flight: its message is on the platform (om_1), not on record yet.
+    const sending = w.send();
+    // The channel hands it back, from the account's own user; and somebody answers.
+    const echo = await w.ingress.accept(fakeEnvelope({ id: 'om_1', sender: alice, conversation: room, text: 'I am here' }));
+    const reply = await w.ingress.accept(fakeEnvelope({ id: 'in-2', sender: bob, conversation: room, text: 'good' }));
+    for (const r of [echo, reply]) {
+      // Everybody else has it now, as the ordinary message it is as far as anyone knows: beta, the host's queue, a turn.
+      expect(r).toMatchObject({ accepted: true, action: 'dispatch', deferred: [{ bindingId: 'to-alpha', to: 'alpha' }] });
+      expect(r.hosts?.map((h) => h.to)).toEqual(['beta', undefined]);
+      expect(r.origin!.self).toBeUndefined();
+      expect(r.explanation).toMatchObject({ deferred: { backends: ['alpha'] } });
+      expect('echoOf' in r.explanation!).toBe(false);
+      expect(rules(w.router.explain(r.inputId!)!)).toEqual([['to-alpha', undefined], ['to-beta', undefined], ['to-host', undefined], ['room-agent', undefined]]);
+    }
+    await until(() => w.turns.includes(echo.inputId!) && w.turns.includes(reply.inputId!));
+    // alpha has neither, and was given nothing of them to answer.
+    expect(await w.view('backend:alpha')).toEqual(['in-1']);
+    expect(queue.deferred().map((d) => [d.item.to, d.item.envelope.id])).toEqual([['alpha', 'om_1'], ['alpha', 'in-2']]);
+    expect(queue.grantedMessage('alpha', { channel: 'fake', account: 'default', conversationId: 'room', messageId: 'om_1' })).toBe(false);
+    // Never set aside: a click, and an envelope whose id proves nothing (no platform evidence). alpha is not asked about them.
+    const click = await w.ingress.accept(fakeEnvelope({ id: 'in-3', sender: bob, conversation: room, content: [{ type: 'event', name: 'action', data: { actionId: 'pick:yes', messageId: 'other' } }] }));
+    const unsigned = await w.ingress.accept(fakeEnvelope({ id: 'in-4', sender: { channelUserId: 'bob', evidence: 'none' }, conversation: room, text: 'psst' }));
+    expect([click.deferred, unsigned.deferred]).toEqual([undefined, undefined]);
+    expect(unsigned.hosts?.map((h) => h.to)).toEqual(['alpha', 'beta', undefined]);
+    expect(w.asked).toEqual(['in-1', 'om_1', 'in-2']);
+    expect(await w.view('backend:alpha')).toEqual(['in-1', 'in-4']);
+
+    // The delivery settles: om_1 is on record as alpha's.
+    w.delivered.add('om_1');
+    sending.settle();
+    await until(() => queue.deferred().length === 0);
+    // The echo never reaches alpha; the reply does, behind what was queued meanwhile.
+    expect(await w.view('backend:alpha')).toEqual(['in-1', 'in-4', 'in-2']);
+    expect(w.settledAs).toEqual(['om_1:alpha:own_echo', 'in-2:alpha:queued']);
+    const late = w.router.explain(echo.inputId!)!;
+    expect(late.echoOf).toEqual({ backends: ['alpha'], late: true });
+    expect('deferred' in late).toBe(false);
+    expect(rules(late)).toEqual([['to-alpha', 'own_echo'], ['to-beta', undefined], ['to-host', undefined], ['room-agent', undefined]]);
+    const queued = w.router.explain(reply.inputId!)!;
+    expect(['echoOf' in queued, 'deferred' in queued, rules(queued)[0]]).toEqual([false, false, ['to-alpha', undefined]]);
+
+    // On record now: the same message handed in again (another account's copy) is the plain echo, and nothing is set aside
+    // for it although alpha is sending again.
+    w.send();
+    const known = await w.ingress.accept(fakeEnvelope({ id: 'om_1', account: 'second', sender: alice, conversation: room, text: 'I am here' }));
+    expect(known.origin).toMatchObject({ self: true, principal: null });
+    expect([known.deferred, known.explanation!.echoOf, queue.deferred().length]).toEqual([undefined, { backends: ['alpha'] }, 0]);
+    expect(w.asked).toEqual(['in-1', 'om_1', 'in-2']);
+    for (const l of w.lanes.values()) await l.whenIdle();
+    queue.close();
+  });
+
+  it('entries a previous process left set aside are settled at the next start by what is on record then: the echo of a delivery that got recorded is dropped, the rest is queued #PB-8 #RS-1', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'aio-echo-'));
+    dirs.push(dir);
+    const path = join(dir, 'q.sqlite');
+    const routerPath = join(dir, 'r.sqlite');
+    // The room is alpha's alone here: no other rule matches what is said in it.
+    const table = () =>
+      new Router({ agents: [{ name: 'default', sessionPrefix: '' }], config: { version: 'v1', bindings: [{ id: 'to-alpha', match: { conversation: 'room' }, on: 'host', to: 'alpha' }], identities: [] }, backends: ['alpha'], path: routerPath });
+    const queue = new HostQueue({ path });
+    queue.register('backend:alpha', 'alpha');
+    const first = world(queue, table());
+    // alpha is sending two messages; the process ends before either delivery settles (nothing resolves `settled`).
+    first.send();
+    const a = await first.ingress.accept(fakeEnvelope({ id: 'om_1', sender: bob, conversation: room, text: 'recorded before the stop' }));
+    const b = await first.ingress.accept(fakeEnvelope({ id: 'om_2', sender: bob, conversation: room, text: 'unknown at the stop' }));
+    const c = await first.ingress.accept(fakeEnvelope({ id: 'in-1', sender: bob, conversation: room, text: 'a person' }));
+    expect(queue.deferred()).toHaveLength(3);
+    expect(await first.view('backend:alpha')).toEqual([]);
+    queue.close();
+    first.router.close();
+
+    // The next process: om_1's delivery got on record; om_2's was settled unknown (no id on record).
+    const queue2 = new HostQueue({ path });
+    const second = world(queue2, table());
+    second.delivered.add('om_1');
+    expect(second.ingress.resolveDeferred()).toEqual({ dropped: 1, queued: 2 });
+    expect(queue2.deferred()).toEqual([]);
+    expect(await second.view('backend:alpha')).toEqual(['om_2', 'in-1']);
+    expect(second.router.explain(a.inputId!)).toMatchObject({ echoOf: { backends: ['alpha'], late: true }, dropped: 'no_match' });
+    expect(rules(second.router.explain(a.inputId!)!)).toEqual([['to-alpha', 'own_echo']]);
+    for (const r of [b, c]) {
+      const e = second.router.explain(r.inputId!)!;
+      expect(['echoOf' in e, 'deferred' in e, 'dropped' in e, rules(e)]).toEqual([false, false, false, [['to-alpha', undefined]]]);
+    }
+    // Once: nothing is left to settle.
+    expect(second.ingress.resolveDeferred()).toEqual({ dropped: 0, queued: 0 });
+    queue2.close();
+    second.router.close();
+  });
+
+  it("mayBeEcho: an envelope can be our message handed back only with evidence that lets its id be trusted, as its source caps it, and never when it is a click #PB-8", () => {
+    const src = (evidence: EmitSource['evidence']) => ({ evidence });
+    const signed = fakeEnvelope({ id: 'm', sender: alice });
+    expect(mayBeEcho(signed)).toBe(true);
+    expect(mayBeEcho(signed, src(['platform_signed', 'none']))).toBe(true);
+    expect(mayBeEcho(fakeEnvelope({ id: 'm', sender: { channelUserId: 'a@example.test', evidence: 'dkim_pass' } }), src(['dkim_pass', 'none']))).toBe(true);
+    // The source may not give that evidence (a bridge without the grant): capped to none, so the id proves nothing.
+    expect(mayBeEcho(signed, src(['none']))).toBe(false);
+    expect(mayBeEcho(fakeEnvelope({ id: 'm', sender: { channelUserId: 'alice', evidence: 'none' } }))).toBe(false);
+    expect(mayBeEcho(fakeEnvelope({ id: 'm', sender: { channelUserId: 'alice', evidence: 'device_only' } }), src(['device_only', 'none']))).toBe(false);
+    expect(mayBeEcho(fakeEnvelope({ id: 'm', sender: alice, content: [{ type: 'event', name: 'action', data: { actionId: 'pick:yes' } }] }))).toBe(false);
   });
 });
 

@@ -852,7 +852,8 @@ describe('backends', () => {
     expect(second.chat.sent).toEqual([]);
 
     // A conversation it got by an input routed to it: taken away with backends.forget, a click on its old card there gives nothing back.
-    await second.chat.inject({ id: 'm1', sender: alice, text: 'for alpha', conversation: { id: 'c1', kind: 'group' } });
+    // (Named apart from what the fake channel numbered alpha's sends, m1 and m2: an input carrying one of those ids would be that message's echo, PB-8.)
+    await second.chat.inject({ id: 'in-1', sender: alice, text: 'for alpha', conversation: { id: 'c1', kind: 'group' } });
     await until(async () => (await mine(a2.c)).length === 3);
     const oldCard = await sendCard(a2.c, 'card-c1', 'c1');
     expect(second.gw.hostQueue.grantCount('alpha')).toBe(1);
@@ -867,7 +868,7 @@ describe('backends', () => {
     expect(second.gw.hostQueue.grantCount('alpha')).toBe(0);
     expect(second.chat.sent).toHaveLength(1);
     // What gives a conversation is an input a rule routed to it: after one, the click's card is its to answer again.
-    await second.chat.inject({ id: 'm2', sender: alice, text: 'alpha once more', conversation: { id: 'c1', kind: 'group' } });
+    await second.chat.inject({ id: 'in-2', sender: alice, text: 'alpha once more', conversation: { id: 'c1', kind: 'group' } });
     await until(async () => (await mine(a3.c)).length === 2);
     expect((await say(a3.c, 'r3', at('c1', { replyToMessageId: oldCard }))).value).toMatchObject({ status: 'delivered', duplicate: false });
     expect(second.gw.hostQueue.grantCount('alpha')).toBe(1);

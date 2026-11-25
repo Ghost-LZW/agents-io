@@ -88,10 +88,12 @@ export async function daemon(
     channelRegistry?: ChannelRegistry;
     /** The feature modules the config is resolved with and the daemon runs (default the built-in ones). */
     moduleRegistry?: ModuleRegistry;
-    /** GatewayOptions.testHooks, outboxAttemptTimeoutMs, logger and hostBlobs. */
-    gateway?: Pick<GatewayOptions, 'testHooks' | 'outboxAttemptTimeoutMs' | 'logger' | 'hostBlobs'>;
+    /** GatewayOptions.testHooks, outboxAttemptTimeoutMs, backendEchoWaitMs, logger and hostBlobs. */
+    gateway?: Pick<GatewayOptions, 'testHooks' | 'outboxAttemptTimeoutMs' | 'backendEchoWaitMs' | 'logger' | 'hostBlobs'>;
     /** The channel `fake` (default a plain FakeChannel): a subclass adds what a test needs (`openLive`). */
     chat?: FakeChannel;
+    /** In-process channels besides `fake`, each under its adapter's id. */
+    moreChannels?: FakeChannel[];
   } = {},
 ): Promise<World> {
   const dir = o.dir ?? tmp();
@@ -116,7 +118,7 @@ export async function daemon(
         return new InstanceHarness(i, harness);
       },
     }),
-    channels: [{ adapter: chat }],
+    channels: [{ adapter: chat }, ...(o.moreChannels ?? []).map((adapter) => ({ adapter }))],
     ...(o.policy ? { policy: o.policy } : {}),
     hostPush: { timeoutMs: 300, retryMs: 20 },
     logger: () => {},

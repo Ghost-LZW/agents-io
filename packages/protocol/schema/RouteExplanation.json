@@ -307,6 +307,37 @@
         }
       ]
     },
+    "echoOf": {
+      "type": "object",
+      "required": [
+        "backends"
+      ],
+      "properties": {
+        "backends": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "late": {
+          "type": "boolean"
+        }
+      }
+    },
+    "deferred": {
+      "type": "object",
+      "required": [
+        "backends"
+      ],
+      "properties": {
+        "backends": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
     "cause": {
       "type": "object",
       "required": [

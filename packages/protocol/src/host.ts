@@ -210,6 +210,10 @@ export const RouteExplanation = Type.Object({
        * no longer configured (or no longer interactive). `click_sender`: the input is a
        * click on a message a backend sent and this rule is not that backend's (or the rule
        * names a backend and the clicked message is not one it sent), so the rule was skipped (PB-1).
+       * `own_echo`: the input is the echo of a message the backend this rule names (`to`) delivered
+       * itself, so the rule was skipped, whether or not it asks for self inputs (PB-8). Also set
+       * afterwards on a rule that matched, when its queue entry was held back and then dropped
+       * (`echoOf.late`).
        */
       rejected: Type.Optional(Type.Object({ code: Type.String(), message: Type.Optional(Type.String()) })),
     }),
@@ -231,6 +235,24 @@ export const RouteExplanation = Type.Object({
   ),
   /** Why nothing was delivered, when nothing was. */
   dropped: Type.Optional(Type.Union([Type.Literal('adapter'), Type.Literal('no_match'), Type.Literal('drop_rule')])),
+  /**
+   * The input is a message a backend's `deliver` sent, handed back by a channel (PB-8): which
+   * backend (more than one only if a platform id was delivered by several). It was stamped as the
+   * deployment's own (`self`, no principal) and routed as such: rules need `includeSelf`, a
+   * `dispatch` is `context`, and rules `to` such a backend skipped it (`rejected.code: "own_echo"`).
+   * `late`: its delivery was recorded only after the input was routed (the send outlasted the
+   * wait): the input was routed as an ordinary message from that account, except that the queue
+   * entry for the backend that sent it was held back (`deferred`) and then dropped.
+   */
+  echoOf: Type.Optional(Type.Object({ backends: Type.Array(Type.String()), late: Type.Optional(Type.Boolean()) })),
+  /**
+   * The input arrived while these backends had a `deliver` in flight into its conversation, so it
+   * could not be told yet whether it is that message handed back (PB-8): the queue entries for
+   * them (the matched rules `to` them) are held back until the delivery has settled. Then each is
+   * either queued (the backend is taken out of this list) or dropped as its own echo (`echoOf`
+   * with `late`). Absent once none is held back.
+   */
+  deferred: Type.Optional(Type.Object({ backends: Type.Array(Type.String()) })),
   /** An agent-originated input: the chain it is part of (`InputRecord.cause`). */
   cause: Type.Optional(InputCause),
   /** The loop guard stopped it from starting a turn (it was recorded as context). */
