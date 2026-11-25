@@ -17,6 +17,11 @@ import { mediaBlocks, type InboundEnvelope, type InboundItem } from '@agents-io/
  * else. Appending a targeted item also records, in the same transaction, the
  * conversation and the messages it came from (what that target may later answer)
  * and the blob refs of its media blocks (what that target may read and attach, PB-6).
+ *
+ * An item for a target may also be set aside before it is appended (`defer`, PB-8):
+ * it is in no queue and has no cursor until it is released (`release`: appended then,
+ * behind everything queued meanwhile) or thrown away (`discard`). Set-aside items
+ * survive a restart like queued ones.
  */
 
 export interface HostQueueOptions {
@@ -44,6 +49,14 @@ export interface AppendResult {
   cursor: number;
   /** The channel reference was already queued: nothing was added. */
   duplicate: boolean;
+}
+
+/** An item set aside for its target (`HostQueue.defer`): not queued, no cursor yet. */
+export interface DeferredItem {
+  id: number;
+  item: Omit<InboundItem, 'cursor'> & { to: string };
+  /** `append`'s option, kept for the release. */
+  grantConversation?: boolean;
 }
 
 export interface ReadOptions {
@@ -78,7 +91,7 @@ export class HostQueue {
   private readonly ownsDb: boolean;
   private readonly now: () => number;
   private q: Record<
-    'refGet' | 'refPut' | 'trefGet' | 'trefPut' | 'pruneTrefs' | 'pruneTargeted' | 'headTarget' | 'consumerRegister' | 'consumerTarget' | 'consumersOf' | 'routePut' | 'routeGet' | 'routeCount' | 'msgPut' | 'msgGet' | 'pruneMsgs' | 'blobPut' | 'blobGet' | 'pruneBlobs' | 'forgetBlobs' | 'forgetItems' | 'forgetTrefs' | 'forgetConsumers' | 'forgetRoutes' | 'forgetMsgs' | 'insert' | 'after' | 'one' | 'consumerGet' | 'consumerPut' | 'consumerAck' | 'consumers' | 'consumerDel' | 'head' | 'prune' | 'pruneRefs' | 'pending' | 'redispatchGet' | 'redispatchPut' | 'redispatchSet' | 'redispatchDel' | 'pruneRedispatch',
+    'refGet' | 'refPut' | 'trefGet' | 'trefPut' | 'pruneTrefs' | 'pruneTargeted' | 'headTarget' | 'consumerRegister' | 'consumerTarget' | 'consumersOf' | 'routePut' | 'routeGet' | 'routeCount' | 'msgPut' | 'msgGet' | 'pruneMsgs' | 'blobPut' | 'blobGet' | 'pruneBlobs' | 'forgetBlobs' | 'forgetItems' | 'forgetTrefs' | 'forgetConsumers' | 'forgetRoutes' | 'forgetMsgs' | 'insert' | 'after' | 'one' | 'consumerGet' | 'consumerPut' | 'consumerAck' | 'consumers' | 'consumerDel' | 'head' | 'prune' | 'pruneRefs' | 'pending' | 'deferPut' | 'deferGet' | 'deferAll' | 'deferDel' | 'forgetDeferred' | 'redispatchGet' | 'redispatchPut' | 'redispatchSet' | 'redispatchDel' | 'pruneRedispatch',
     StatementSync
   >;
   private waiters = new Set<() => void>();
@@ -98,6 +111,7 @@ export class HostQueue {
       CREATE TABLE IF NOT EXISTS host_routes (target TEXT NOT NULL, channel TEXT NOT NULL, account TEXT NOT NULL, conversation TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (target, channel, account, conversation)) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS host_route_msgs (target TEXT NOT NULL, channel TEXT NOT NULL, account TEXT NOT NULL, message_id TEXT NOT NULL, conversation TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (target, channel, account, message_id)) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS host_blob_grants (target TEXT NOT NULL, ref TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (target, ref)) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS host_deferred (id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, at INTEGER NOT NULL, json TEXT NOT NULL);
     `);
     // `target` came later: a database from before gains the column, NULL (no target) on every row it has.
     for (const table of ['host_inbound', 'host_consumers']) {
@@ -150,6 +164,11 @@ export class HostQueue {
       forgetMsgs: p('DELETE FROM host_route_msgs WHERE target = ?'),
       pruneRefs: p('DELETE FROM host_inbound_refs WHERE at < ? AND cursor NOT IN (SELECT cursor FROM host_inbound)'),
       pending: p('SELECT COUNT(*) AS n, MIN(at) AS oldest FROM host_inbound WHERE cursor > ? AND target IS ?'),
+      deferPut: p('INSERT INTO host_deferred (target, at, json) VALUES (?, ?, ?)'),
+      deferGet: p('SELECT id, json FROM host_deferred WHERE id = ?'),
+      deferAll: p('SELECT id, json FROM host_deferred ORDER BY id'),
+      deferDel: p('DELETE FROM host_deferred WHERE id = ?'),
+      forgetDeferred: p('DELETE FROM host_deferred WHERE target = ?'),
     };
   }
 
@@ -198,6 +217,41 @@ export class HostQueue {
     }
     for (const w of [...this.waiters]) w();
     return { cursor, duplicate: false };
+  }
+
+  /**
+   * PB-8: set an item for a target aside instead of appending it: it is in no queue, has no cursor
+   * and grants nothing until `release` appends it (as `append` would now, with `o`) or `discard`
+   * throws it away. Durable like the queue. Returns the id to release or discard it by.
+   */
+  defer(item: Omit<InboundItem, 'cursor'> & { to: string }, o: { grantConversation?: boolean } = {}): number {
+    const { raw: _raw, ...envelope } = item.envelope;
+    const stored = { item: { ...item, envelope }, ...(o.grantConversation === false ? { grantConversation: false } : {}) };
+    return Number(this.q.deferPut.run(item.to, this.now(), JSON.stringify(stored)).lastInsertRowid);
+  }
+
+  /** The items set aside and neither released nor discarded yet, oldest first. */
+  deferred(): DeferredItem[] {
+    return (this.q.deferAll.all() as { id: number; json: string }[]).map((r) => ({ id: r.id, ...(JSON.parse(r.json) as Omit<DeferredItem, 'id'>) }));
+  }
+
+  /**
+   * Append an item set aside (`defer`): it gets its cursor now, behind what was queued meanwhile.
+   * Undefined when there is no such item (released, discarded, or its target was forgotten).
+   * Appended before its row goes: a stop in between appends it again next time, as a duplicate.
+   */
+  release(id: number): AppendResult | undefined {
+    const row = this.q.deferGet.get(id) as { id: number; json: string } | undefined;
+    if (!row) return undefined;
+    const d = JSON.parse(row.json) as Omit<DeferredItem, 'id'>;
+    const r = this.append(d.item, d.grantConversation === false ? { grantConversation: false } : {});
+    this.q.deferDel.run(id);
+    return r;
+  }
+
+  /** Throw an item set aside away: it is never queued. False when there is no such item. */
+  discard(id: number): boolean {
+    return Number(this.q.deferDel.run(id).changes) > 0;
   }
 
   /** Highest cursor ever assigned (0 when empty). */
@@ -415,7 +469,7 @@ export class HostQueue {
   }
 
   /**
-   * Remove everything kept for `target`: its items, their idempotency keys, its
+   * Remove everything kept for `target`: its items (those set aside too), their idempotency keys, its
    * consumers (their pushes are closed first) and its grants (media grants too). Others are untouched.
    * `o.consumer`: a consumer name to remove as well, whatever it walks (the name a
    * target's consumer goes by, registered without the target before targets existed:
@@ -433,6 +487,7 @@ export class HostQueue {
       const routes = Number(this.q.forgetRoutes.run(target).changes);
       this.q.forgetMsgs.run(target);
       this.q.forgetBlobs.run(target);
+      this.q.forgetDeferred.run(target);
       this.db.exec('COMMIT');
       return { items, routes };
     } catch (e) {

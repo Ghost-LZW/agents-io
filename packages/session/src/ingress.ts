@@ -195,6 +195,41 @@ export interface IngressOptions {
    * can take it (`Router.route`'s `clickOf`). Without this no rule naming a backend takes a click.
    */
   clickOwner?: (env: InboundEnvelope) => string | undefined;
+  /**
+   * The backends whose `deliver` sent the platform message `(channel, messageId)`, if any did (the
+   * daemon's outbound records; empty: nobody's). An authenticated envelope (`platform_signed` /
+   * `dkim_pass`) that is not a click and whose id, or whose `revisionOf`, is such a message is that
+   * message handed back by the channel (PB-8), not somebody speaking: it is stamped `self` with no
+   * principal, whatever the identity map says of the account, and routed as a self input that no
+   * rule `to` one of those backends takes (`Router.route`'s `echoOf`). Asked after `recover` (a
+   * message a turn sent is that turn's, ID-8), by message id only: never by what the message says.
+   */
+  deliveredBy?: (channel: string, messageId: string) => readonly string[];
+  /**
+   * PB-8, the echo whose delivery is not on record yet: the backends that have a `deliver` in
+   * flight into the conversation `env` is of (so `deliveredBy` cannot answer for that message yet),
+   * each with a promise that resolves once those delivers have settled. Asked in the same step as
+   * `deliveredBy`, for an envelope that could be an echo and is not known as one. The queue entry
+   * of a rule `to` such a backend is then not appended but set aside (`HostQueue.defer`); once
+   * `settled` it is dropped if `deliveredBy` now names that backend for the message, else appended.
+   * Every other rule takes the input at once, as the ordinary message it is as far as anyone knows.
+   */
+  echoPending?: (env: InboundEnvelope) => readonly { backend: string; settled: Promise<void> }[];
+  /** A queue entry set aside for `echoPending` was dropped as its backend's own echo, or queued after all (logging). */
+  onEchoSettled?: (a: { inputId: string; channel: string; messageId: string; to: string; outcome: 'own_echo' | 'queued' }) => void;
+  /** Settling a set-aside queue entry failed (the queue is closed): it stays set aside for `resolveDeferred`. */
+  onEchoError?: (err: unknown) => void;
+}
+
+/**
+ * PB-8: whether `env` could be recognised as a message of ours handed back, were its id on record:
+ * its sender's evidence (as `source` caps it, when given) is enough to trust the id, and it is not
+ * a click. An envelope that fails this is never an echo, whatever is delivered meanwhile.
+ */
+export function mayBeEcho(env: InboundEnvelope, source?: Pick<EmitSource, 'evidence'>): boolean {
+  const evidence = env.sender.evidence;
+  if (!RECOVERABLE.includes(evidence) || (source && !source.evidence.includes(evidence))) return false;
+  return routedActionIdOf(env) === undefined;
 }
 
 /** Evidence an envelope needs before its message id is trusted to name our own message (a forged copy of a mail Message-ID is not). */
@@ -247,6 +282,9 @@ export interface EmitSource {
  */
 export const SOURCE_MISMATCH = 'source_mismatch:';
 
+/** PB-8: the backends with a deliver in flight into an envelope's conversation (`IngressOptions.echoPending`). */
+type EchoPending = readonly { backend: string; settled: Promise<void> }[];
+
 export interface IngressResult {
   /** The host durably took the envelope (also true for a deliberate drop). */
   accepted: boolean;
@@ -265,6 +303,8 @@ export interface IngressResult {
   host?: { cursor: number; duplicate: boolean; bindingId: string };
   /** Every queue entry made (one per backend a matching rule names, one for the untargeted queue); absent when none. */
   hosts?: { cursor: number; duplicate: boolean; bindingId: string; to?: string }[];
+  /** Queue entries set aside, not appended yet (PB-8, `IngressOptions.echoPending`): the rule and the backend; absent when none. */
+  deferred?: { bindingId: string; to: string }[];
   /** Why (also persisted: `Router.explain(inputId)`). */
   explanation?: Explanation;
   /** A command (topic or embedder) was answered instead of delivering the input. */
@@ -364,9 +404,10 @@ export class Ingress {
 
   /**
    * Who sent `env`, as the gateway concludes it: `Policy.identify`, then the outbound index
-   * (this deployment's own message back is `self`, from the agent whose turn sent it).
+   * (this deployment's own message back is `self`, from the agent whose turn sent it), then the
+   * backends' deliveries (a backend's own message back is `self` and nobody's, PB-8: `echoOf`).
    */
-  private async stamp(env: InboundEnvelope): Promise<{ origin: Origin; cause?: InputCause; sent?: ProducingTurn }> {
+  private async stamp(env: InboundEnvelope): Promise<{ origin: Origin; cause?: InputCause; sent?: ProducingTurn; echoOf?: string[]; pending?: EchoPending }> {
     const identity = await this.policy.identify({
       channel: env.channel,
       account: env.account,
@@ -385,23 +426,83 @@ export class Ingress {
       adapter: env.channel,
     };
     // Our own message back through a channel: found in the outbound index, never by what the envelope says.
-    const sent = RECOVERABLE.includes(env.sender.evidence) ? this.o.recover?.(env.channel, env.id) : undefined;
+    const authentic = RECOVERABLE.includes(env.sender.evidence);
+    const sent = authentic ? this.o.recover?.(env.channel, env.id) : undefined;
+    // PB-8: or a message a backend delivered (no turn made it, so it is not in that index). A click is never one:
+    // it belongs to the sender of the clicked message (PB-1), whatever id its envelope carries.
+    const echoable = !sent && this.o.deliveredBy !== undefined && mayBeEcho(env);
+    const echoOf = echoable ? this.deliverers(env) : [];
+    // Not on record: it may still be the message of a deliver in flight. Asked in this same step, so a
+    // delivery is always either on record above or in flight here.
+    const pending = echoable && !echoOf.length ? (this.o.echoPending?.(env) ?? []) : [];
     let cause: InputCause | undefined;
     if (sent) {
       const { declared: _d, ...rest } = origin;
       origin = { ...rest, kind: 'agent', principal: this.router.agentPrincipal(sent.from.agent), self: true };
       cause = causeFrom(sent, 'recovered');
+    } else if (echoOf.length) {
+      // The account's own message, as `selfAccounts` would have it: nobody's principal (not the owner's
+      // either, when the account is the owner's own), and no chain: no turn of ours produced it.
+      const { declared: _d, ...rest } = origin;
+      origin = { ...rest, kind: 'agent', principal: null, self: true };
+      cause = { peer: `${env.channel}:${env.sender.channelUserId}`, basis: 'none' };
     } else if (origin.kind === 'agent') {
       // Another agent: the chain does not come along a channel, unless a trusted agent account declared its hop.
       const peer = `${env.channel}:${env.sender.channelUserId}`;
-      const claim = identity.trustedAgent && RECOVERABLE.includes(env.sender.evidence) ? env.sender.cause : undefined;
+      const claim = identity.trustedAgent && authentic ? env.sender.cause : undefined;
       cause = claim ? { peer, basis: 'declared', hop: claim.hop, ...(claim.chain !== undefined ? { chain: claim.chain } : {}) } : { peer, basis: 'none' };
     }
-    return { origin, ...(cause ? { cause } : {}), ...(sent ? { sent } : {}) };
+    return { origin, ...(cause ? { cause } : {}), ...(sent ? { sent } : {}), ...(echoOf.length ? { echoOf } : {}), ...(pending.length ? { pending } : {}) };
+  }
+
+  /** PB-8: the backends that delivered the message `env` is, or the message it revises (an edit the channel reports). */
+  private deliverers(env: Pick<InboundEnvelope, 'channel' | 'id' | 'revisionOf'>): string[] {
+    const ids = env.revisionOf !== undefined && env.revisionOf !== env.id ? [env.id, env.revisionOf] : [env.id];
+    return [...new Set(ids.flatMap((id) => this.o.deliveredBy?.(env.channel, id) ?? []))];
+  }
+
+  /**
+   * PB-8: settle the queue entries set aside for a deliver that was in flight (`echoPending`): each
+   * is dropped when the message is now on record as one its backend delivered (its own echo, late),
+   * else appended to that backend's queue. `ids`: only those; default every entry set aside, which
+   * is what a start does with the ones a previous process left (the delivers they waited for are
+   * settled by then, delivered or unknown). The input's explanation says what became of each.
+   * Returns how many were dropped and how many queued.
+   */
+  resolveDeferred(ids?: readonly number[]): { dropped: number; queued: number } {
+    const out = { dropped: 0, queued: 0 };
+    const queue = this.o.hostQueue;
+    if (!queue) return out;
+    for (const d of queue.deferred()) {
+      if (ids && !ids.includes(d.id)) continue;
+      const { to, envelope, input } = d.item;
+      const own = this.deliverers(envelope).includes(to);
+      if (own) queue.discard(d.id);
+      else queue.release(d.id);
+      out[own ? 'dropped' : 'queued']++;
+      const e = this.router.explain(input.inputId);
+      // Still this input's routing (a later revision under the same input id replaces it).
+      if (e?.deferred?.backends.includes(to)) {
+        const left = e.deferred.backends.filter((b) => b !== to);
+        if (left.length) e.deferred = { backends: left };
+        else delete e.deferred;
+        if (own) {
+          e.echoOf = { backends: [...new Set([...(e.echoOf?.backends ?? []), to])], late: true };
+          for (const m of e.matched) {
+            if (m.to === to && m.on === 'host' && !m.rejected) m.rejected = { code: 'own_echo', message: `the message is one backend ${JSON.stringify(to)} delivered itself, on record only after it was routed: its echo is not queued for it` };
+          }
+          // Rules skipped decided nothing: with no other match the input went nowhere.
+          if (!e.dropped && e.matched.every((m) => m.rejected)) e.dropped = 'no_match';
+        }
+        this.router.record(e);
+      }
+      this.o.onEchoSettled?.({ inputId: input.inputId, channel: envelope.channel, messageId: envelope.id, to, outcome: own ? 'own_echo' : 'queued' });
+    }
+    return out;
   }
 
   private async process(env: InboundEnvelope, claimedEvidence?: Evidence): Promise<IngressResult> {
-    const { origin, cause } = await this.stamp(env);
+    const { origin, cause, echoOf, pending } = await this.stamp(env);
 
     // A click on an approval or stop button acts on a request or turn: it goes to the session that
     // owns it (Hub index), which re-checks who may act (resolver eligibility, Policy.control, still
@@ -461,13 +562,19 @@ export class Ingress {
       ...(cause ? { cause } : {}),
       channelContext: channelContext(env, this.replyOf(env)),
     };
-    const decision = await this.router.route(env, origin, input, clickOf !== undefined ? { clickOf } : {});
+    // PB-8: the echo of a backend's own deliver is no rule's that names that backend.
+    const decision = await this.router.route(env, origin, input, { ...(clickOf !== undefined ? { clickOf } : {}), ...(echoOf ? { echoOf } : {}) });
     const own = decision.deliveries.filter((d) => d.source !== 'watch');
     // Latest-wins revisions keep the original input id, but only for context-only inputs:
     // a dispatched input may already be running, so its revision is a new input.
     if (revisionOf && own.some((d) => d.on === 'dispatch')) input = { ...input, inputId: this.inputIdOf(env) };
     this.inputIds.set(envKey(env.channel, env.account, env.id), input.inputId);
     const explanation: Explanation = { ...decision.explanation, inputId: input.inputId, ...(claimedEvidence !== undefined ? { claimedEvidence } : {}), ...(cause ? { cause } : {}) };
+    // PB-8: a backend that is sending into this conversation right now does not get the input until its
+    // delivery has settled and says whether this is that message handed back (never for a click: `mayBeEcho`).
+    const waitFor = (to: string | undefined) => (to !== undefined && this.o.hostQueue ? pending?.find((p) => p.backend === to) : undefined);
+    const held = decision.hosts.flatMap((h) => (waitFor(h.to) ? [h.to!] : []));
+    if (held.length) explanation.deferred = { backends: held };
     this.router.record(explanation);
 
     // The strongest table delivery is the input's own place (where a click on a choice is rewritten to).
@@ -506,15 +613,22 @@ export class Ingress {
     }
     // One queue entry per backend a matching rule names, and one for the untargeted queue.
     const hosts: NonNullable<IngressResult['hosts']> = [];
+    const deferred: NonNullable<IngressResult['deferred']> = [];
     for (const h of decision.hosts) {
       if (this.o.hostQueue) {
         const { raw: _raw, ...envelope } = env;
+        const item = { channelRef: channelRefOf(env), account: env.account, bindingId: h.bindingId, ...(h.to !== undefined ? { to: h.to } : {}), ...(h.tag !== undefined ? { tag: h.tag } : {}), input, envelope, receivedAt: Date.now() };
+        const wait = waitFor(h.to);
+        if (wait) {
+          // Set aside, durably: appended or dropped once the delivery it may be the echo of has settled.
+          const id = this.o.hostQueue.defer({ ...item, to: h.to! });
+          deferred.push({ bindingId: h.bindingId, to: h.to! });
+          void wait.settled.then(() => this.resolveDeferred([id])).catch((err: unknown) => this.o.onEchoError?.(err));
+          continue;
+        }
         // PB-2: a click on a backend's own message is its input, but does not grant it the conversation
         // (sending the message took one; the admin taking it away is not undone by a click on an old card).
-        const r = this.o.hostQueue.append(
-          { channelRef: channelRefOf(env), account: env.account, bindingId: h.bindingId, ...(h.to !== undefined ? { to: h.to } : {}), ...(h.tag !== undefined ? { tag: h.tag } : {}), input, envelope, receivedAt: Date.now() },
-          clickOf !== undefined ? { grantConversation: false } : {},
-        );
+        const r = this.o.hostQueue.append(item, clickOf !== undefined ? { grantConversation: false } : {});
         hosts.push({ ...r, bindingId: h.bindingId, ...(h.to !== undefined ? { to: h.to } : {}) });
       } else this.o.onHostUnavailable?.({ inputId: input.inputId, bindingId: h.bindingId });
     }
@@ -548,7 +662,7 @@ export class Ingress {
       this.router.record(explanation);
     }
 
-    if (this.o.onUndispatched && !hosts.length && clickOf === undefined && !outcomes.some((x) => x.on === 'dispatch')) {
+    if (this.o.onUndispatched && !hosts.length && !deferred.length && clickOf === undefined && !outcomes.some((x) => x.on === 'dispatch')) {
       try {
         await this.o.onUndispatched({ env, origin, input });
       } catch (err) {
@@ -557,7 +671,7 @@ export class Ingress {
     }
 
     const first = outcomes.find((x) => x.source !== 'watch' && x.on === 'dispatch') ?? outcomes.find((x) => x.source !== 'watch');
-    const action: IngressResult['action'] = first ? (first.on === 'dispatch' ? 'dispatch' : 'observe') : host ? 'host' : 'drop';
+    const action: IngressResult['action'] = first ? (first.on === 'dispatch' ? 'dispatch' : 'observe') : host || deferred.length ? 'host' : 'drop';
     return {
       accepted: true,
       action,
@@ -569,6 +683,7 @@ export class Ingress {
       deliveries: outcomes,
       ...(host ? { host } : {}),
       ...(hosts.length ? { hosts } : {}),
+      ...(deferred.length ? { deferred } : {}),
       explanation,
     };
   }

@@ -2,7 +2,9 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, rmSync } from 'node:fs';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import {
+  InboundEnvelope,
   PROTOCOL_VERSION,
+  errors,
   formatAddress,
   routeKey,
   type AdminQueue,
@@ -33,7 +35,6 @@ import {
   type ModuleConnection,
   type HostRequestFrame,
   type IdentityEntry,
-  type InboundEnvelope,
   type InputRecord,
   type ScheduleDraft,
   type LiveEndpoint,
@@ -123,6 +124,7 @@ import {
   type RemoveWatchResult,
   addressesSelf,
   channelRefOf,
+  mayBeEcho,
   type SessionLog,
   type TopicChange,
   type TopicRecord,
@@ -281,6 +283,14 @@ export interface GatewayOptions {
   /** One outbox attempt's upper bound (default 60 s; tests). */
   outboxAttemptTimeoutMs?: number;
   /**
+   * PB-8: how long one backend deliver in flight can make the inbound messages of its conversation
+   * wait for it to settle, so that an echo arriving before its send returned is still known by its
+   * message id (default 2 s, counted from the first inbound that waits for it; 0: no wait). Past it
+   * a message goes on as an ordinary one for everybody but the backend that is still sending, whose
+   * queue entry waits for the delivery to settle.
+   */
+  backendEchoWaitMs?: number;
+  /**
    * The CLI a terminal UI's helpers run as, a script for `node` (`TakeoverServices.cli`: the
    * commands a harness kind adds, `HarnessModule.cli`, such as Claude Code's `tui-bridge`): the
    * composition root's (`@agents-io/daemon` gives its `aio`). Without it a takeover is refused.
@@ -356,6 +366,28 @@ const DAEMON_VERSION: string = (() => {
 /** Local ends post to this route; no adapter renders it, they read the stream instead. */
 /** `Gateway.accept`'s refusal while stopping: "not now", never `permanent` (IN-7). */
 const GATEWAY_STOPPING = 'gateway stopping';
+
+/**
+ * PB-8: `GatewayOptions.backendEchoWaitMs` when not given. A send is usually one platform request, well
+ * under this; and it is under the time a channel adapter can keep a message before it has to confirm
+ * it to its platform (seconds), so a waiting inbound is still unconfirmed if the daemon stops (IN-7).
+ */
+const BACKEND_ECHO_WAIT_MS = 2000;
+
+/** PB-8: one backend deliver handed to the outbox and not settled yet. */
+interface BackendSend {
+  backend: string;
+  channel: string;
+  conversationId: string;
+  /** Resolves once it has settled: its message id, if it got one, is then on record. */
+  settled: Promise<void>;
+  /** What inbound messages of its conversation wait on (`Gateway.holdOf`), once one does. */
+  hold?: Promise<void>;
+  /** Ends `hold` now (settled, window run out, stopping). */
+  release?: () => void;
+  /** No inbound waits for it (any more): its window ran out, or it has settled. */
+  expired: boolean;
+}
 /** U20: why a scoped send was held when the host could not answer. */
 const HOST_UNAVAILABLE = 'host_unavailable';
 /** `Schedule.createdBy` of a schedule a session's agent set: `session:<key>` (`agentIdentity`). */
@@ -443,6 +475,17 @@ export class Gateway {
   private readonly externalSends = new Map<string, ExternalSender>();
   /** Deliveries made with a backend's key while in flight (PB-2): which backend, taken into the in-flight mark like `externalSends`. */
   private readonly backendSends = new Map<string, string>();
+  /**
+   * PB-8: the backend delivers handed to the outbox and not settled yet (`BackendSend`). A channel may
+   * hand the echo of such a message in before its send returns: `settling` makes that inbound wait a
+   * bounded time, and `echoPending` keeps it from the sending backend until the delivery has settled.
+   */
+  private readonly delivering = new Set<BackendSend>();
+  /**
+   * PB-8: per `(channel, conversation id)` with an inbound waiting in `settling`, the promise the
+   * next inbound of that conversation goes behind: arrival order is kept through the wait.
+   */
+  private readonly inboundTail = new Map<string, Promise<void>>();
   /**
    * An agent's scheduled messages while they are sent (`sendScheduled`): the firing as the turn they
    * come from, for the exit check only (`exitCheck`), as the agent's send_message's turn is for its.
@@ -828,6 +871,15 @@ export class Gateway {
       hostQueue: this.hostQueue,
       // PB-1: a click on a message a backend delivered is that backend's, whatever the config says now.
       clickOwner: (env) => this.clickOwner(env),
+      // PB-8: a message a backend delivered, handed back by its channel, is that backend's own echo.
+      deliveredBy: (channel, id) => this.deliveredBy(channel, id),
+      // And one whose delivery is still in flight is kept from that backend until it has settled.
+      echoPending: (env) => this.echoPending(env),
+      onEchoSettled: (a) => {
+        if (a.outcome === 'queued') this.log('debug', `input ${a.inputId} (${a.channel}/${logText(a.messageId)}) was not backend ${a.to}'s own message: queued for it now that its delivery has settled`);
+        else this.log('warn', `input ${a.inputId} (${a.channel}/${logText(a.messageId)}) is the echo of a message backend ${a.to} delivered, on record only after the input was routed (the send outlasted the wait): dropped for ${a.to}; other rules took it as an ordinary message (PB-8)`);
+      },
+      onEchoError: (err) => this.log('warn', `a queue entry held back for a backend deliver in flight was not settled (it is at the next start): ${(err as Error).message}`),
       replyCaps: (ch, account) => this.replyCaps(ch, account),
       // Clicks on ask_choice buttons (and numbered replies) go back to the session that asked.
       ...(tools ? { rewrite: (a) => tools.rewriteInbound(a) } : {}),
@@ -1078,6 +1130,9 @@ export class Gateway {
       gw.runs.settleAllDangling();
       // Sends an earlier process left in flight: unknown, never resent (decision 13).
       for (const r of gw.outbox.recover()) gw.log('warn', `delivery ${r.operationId} was in flight when the previous daemon stopped; settled unknown, not resent`);
+      // PB-8: queue entries a previous process held back for a backend deliver in flight: that deliver is settled now, one way or the other.
+      const left = gw.ingress.resolveDeferred();
+      if (left.dropped + left.queued) gw.log('info', `${left.dropped + left.queued} queue entr${left.dropped + left.queued === 1 ? 'y' : 'ies'} held back for a backend deliver when the previous daemon stopped: ${left.queued} queued, ${left.dropped} dropped as the backend's own echo`);
       gw.settleLeftoverInputs();
       await gw.loadConfigWatches();
       gw.loadConfigSchedules();
@@ -1412,6 +1467,14 @@ export class Gateway {
    */
   async accept(env: InboundEnvelope, source?: EmitSource): Promise<IngressResult> {
     if (this.refusingInbound) return { accepted: false, action: 'invalid', error: GATEWAY_STOPPING };
+    // PB-8: it may be the echo of a backend deliver whose send has not returned yet. Nothing in flight
+    // and nothing of its conversation waiting: no wait, no tick.
+    const settling = this.delivering.size || this.inboundTail.size ? this.settling(env, source) : undefined;
+    if (settling) {
+      await settling;
+      // Not taken now: the channel does not confirm it, and the next process gets it (IN-7).
+      if (this.refusingInbound) return { accepted: false, action: 'invalid', error: GATEWAY_STOPPING };
+    }
     const r = await this.ingress.accept(env, source);
     // The owner's own chat with the deployment (where strangers and approvals are asked), when no fixed session names it.
     if (r.accepted && env.conversation.kind === 'dm' && env.replyRoute && (r.origin?.principal?.labels ?? []).includes('owner')) {
@@ -2490,13 +2553,117 @@ export class Gateway {
     // A single-entry fallback sends as that entry's account (the adapter refuses routes of other accounts).
     // Not agent-authored (the host speaks): no `as`.
     // The host's own message: it checked it itself; the settlement says what it is (U20).
-    if (backend !== undefined) this.backendSends.set(operationId, backend);
+    if (backend === undefined) {
+      const rec = await this.outbox.send(ch.adapter, { operationId, sessionKey: `host:${hostName}`, route: { ...f.route, account: ch.account }, msg, kind: 'host', exitChecked: true });
+      return { ok: true, value: { ...rec, operationId: f.operationId, duplicate: false } };
+    }
+    this.backendSends.set(operationId, backend);
+    // PB-8: from here until it has settled, an inbound message of this conversation waits (`settling`):
+    // the channel may hand the echo in before the send returns and its message id is on record.
+    let done!: () => void;
+    const sending: BackendSend = { backend, channel: ch.adapter.id, conversationId: f.route.conversationId, settled: new Promise<void>((r) => (done = r)), expired: false };
+    this.delivering.add(sending);
     try {
       const rec = await this.outbox.send(ch.adapter, { operationId, sessionKey: `host:${hostName}`, route: { ...f.route, account: ch.account }, msg, kind: 'host', exitChecked: true });
       return { ok: true, value: { ...rec, operationId: f.operationId, duplicate: false } };
     } finally {
-      if (backend !== undefined) this.backendSends.delete(operationId);
+      this.backendSends.delete(operationId);
+      this.delivering.delete(sending);
+      // Its message id, if it got one, is on record now: whoever waited goes on (`settling`, `echoPending`).
+      sending.release?.();
+      done();
     }
+  }
+
+  /** PB-8: the backends whose `deliver` (or final `deliver.update`) sent platform message `id` on `channel`, each once. */
+  private deliveredBy(channel: string, id: string): string[] {
+    return [...new Set(this.records.backendSent(channel, id).map((x) => x.backend))];
+  }
+
+  /**
+   * PB-8, the echo that arrives before its delivery is recorded: when a backend deliver into the
+   * conversation `env` is of is in flight, a promise that resolves once those delivers have settled
+   * (their message ids are then on record), or their windows have run out (`holdOf`), or stopping
+   * begins to refuse inbound. An inbound waits only where waiting can tell anything: not a click, not
+   * a message this daemon is already known to have delivered, not an envelope whose evidence (as the
+   * source caps it) would not let its id name our message (`mayBeEcho`), not one `Ingress` refuses
+   * anyway, and not for a deliver whose window has run out. Past the window the message goes on as an
+   * ordinary one: somebody's message is never swallowed because a send is slow (the backend still
+   * sending is the exception, `echoPending`).
+   *
+   * Arrival order: while an inbound of a conversation waits, every later inbound of that conversation
+   * goes behind it, also one that would not wait itself (a click). Undefined: nothing to wait for.
+   */
+  private settling(env: InboundEnvelope, source?: EmitSource): Promise<void> | undefined {
+    // Not validated yet: an envelope without these is refused by `Ingress`.
+    const loose = env as { channel?: unknown; conversation?: { id?: unknown } } | undefined;
+    const channel = source?.channel ?? loose?.channel;
+    const conversationId = loose?.conversation?.id;
+    if (typeof channel !== 'string' || typeof conversationId !== 'string') return undefined;
+    const key = `${channel}\0${conversationId}`;
+    const tail = this.inboundTail.get(key);
+    const waits = this.echoWaitMs > 0 ? [...this.delivering].filter((d) => !d.expired && d.channel === channel && d.conversationId === conversationId) : [];
+    const own = waits.length && this.couldBeEcho(env, channel, source) ? Promise.all(waits.map((d) => this.holdOf(d))) : undefined;
+    if (!tail && !own) return undefined;
+    const p = Promise.all([tail, own]).then(() => undefined);
+    this.inboundTail.set(key, p);
+    // First of what follows `p`: the entry is gone before the inbound goes on, unless a later one took its place.
+    void p.then(() => {
+      if (this.inboundTail.get(key) === p) this.inboundTail.delete(key);
+    });
+    return p;
+  }
+
+  private get echoWaitMs(): number {
+    return this.o.backendEchoWaitMs ?? BACKEND_ECHO_WAIT_MS;
+  }
+
+  /** PB-8: whether waiting for a deliver in flight can tell anything about `env` (`settling`). */
+  private couldBeEcho(env: InboundEnvelope, channel: string, source?: EmitSource): boolean {
+    if (errors(InboundEnvelope, env).length || !mayBeEcho(env, source)) return false;
+    const known = (id: string | undefined) => id !== undefined && this.records.sentByUs(channel, id);
+    return !known(env.id) && !known(env.revisionOf);
+  }
+
+  /**
+   * PB-8: the promise an inbound waits on for one backend deliver in flight: resolved when it has
+   * settled, when its window has run out (`backendEchoWaitMs`, counted from the first inbound that
+   * waits for it; no inbound waits for it after that), or when stopping begins. One timer per
+   * delivery, however many inbound messages wait.
+   */
+  private holdOf(d: BackendSend): Promise<void> {
+    if (d.hold) return d.hold;
+    const ms = this.echoWaitMs;
+    let t: ReturnType<typeof setTimeout> | undefined;
+    d.hold = new Promise<void>((resolve) => {
+      d.release = () => {
+        clearTimeout(t);
+        d.expired = true;
+        resolve();
+      };
+      t = setTimeout(() => {
+        // Seen by an admin: from here an echo of this delivery is an ordinary message to everybody but the sender.
+        if (this.delivering.has(d)) this.log('warn', `backend ${d.backend}'s deliver into ${d.channel} ${logText(d.conversationId)} has not settled after ${ms} ms: inbound messages of that conversation no longer wait for it; until it settles they are kept from ${d.backend} only (PB-8)`);
+        d.release?.();
+      }, ms);
+    });
+    return d.hold;
+  }
+
+  /**
+   * PB-8: the backends with a deliver in flight into the conversation `env` is of, each with the
+   * promise of those delivers having settled (`IngressOptions.echoPending`): `env`'s queue entry for
+   * such a backend waits for it. None for a message this daemon is already known to have delivered.
+   */
+  private echoPending(env: InboundEnvelope): { backend: string; settled: Promise<void> }[] {
+    if (!this.delivering.size) return [];
+    const by = new Map<string, Promise<void>[]>();
+    for (const d of this.delivering) {
+      if (d.channel !== env.channel || d.conversationId !== env.conversation.id) continue;
+      by.set(d.backend, [...(by.get(d.backend) ?? []), d.settled]);
+    }
+    if (!by.size || this.records.sentByUs(env.channel, env.id) || (env.revisionOf !== undefined && this.records.sentByUs(env.channel, env.revisionOf))) return [];
+    return [...by].map(([backend, all]) => ({ backend, settled: Promise.all(all).then(() => undefined) }));
   }
 
   /** PB-1: the backend that delivered the message a click is on (the click's `messageId`, on the account it came in by), if one did. */
@@ -4596,6 +4763,8 @@ ${a.summary}` }],
     // Inbound is refused from here; channels stay connected until the last sends (rejection
     // notices, finals) are out: a bridge's start() closes its peer as soon as it is aborted.
     this.refusingInbound = true;
+    // An inbound waiting for a backend deliver (`settling`) stops waiting, and is not taken.
+    for (const d of this.delivering) d.release?.();
     // A launched session's own app-server (stdio) ends with it: its lane is closed, not detached.
     const own = new Set([...this.launched].filter(([, x]) => x.owns()).map(([k]) => k));
     const detaches = (a: HarnessAdapter | undefined) => typeof a?.detach === 'function';

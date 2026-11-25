@@ -693,4 +693,66 @@ describe('HostQueue', () => {
     expect(q.consumers().map((c) => c.name)).toEqual(['backend:alpha', 'backend:beta', 'host']);
     q.close();
   });
+
+  it("an item set aside for a target is in no queue, has no cursor and grants nothing; released it is appended behind what came meanwhile, with its grants; discarded it is never queued; it survives a restart and goes with its target #PB-8 #RS-1", async () => {
+    const path = tmpDb();
+    const q = new HostQueue({ path });
+    q.register('backend:alpha', 'alpha');
+    q.register('backend:beta', 'beta');
+    const at = (conv: string) => ({ channel: 'fake', account: 'default', conversationId: conv });
+    const view = async (queue: HostQueue, consumer: string) => (await queue.read(consumer, { after: 0 })).map((x) => [x.cursor, x.envelope.id]);
+
+    const first = q.defer({ ...targeted('alpha', 'held-1', 'room'), to: 'alpha' });
+    const second = q.defer({ ...targeted('alpha', 'held-2', 'room'), to: 'alpha' });
+    const click = q.defer({ ...targeted('alpha', 'held-3', 'second'), to: 'alpha' }, { grantConversation: false });
+    const others = q.defer({ ...targeted('beta', 'held-4', 'room'), to: 'beta' });
+    // Nothing is queued, no cursor was taken, and the conversation is not alpha's to answer yet.
+    expect(q.head()).toBe(0);
+    expect(await view(q, 'backend:alpha')).toEqual([]);
+    expect(q.pending(0, 'alpha').count).toBe(0);
+    expect(q.granted('alpha', at('room'))).toBe(false);
+    expect(q.grantedMessage('alpha', { ...at('room'), messageId: 'held-1' })).toBe(false);
+    expect(q.deferred().map((d) => [d.id, d.item.to, d.item.envelope.id, d.grantConversation])).toEqual([
+      [first, 'alpha', 'held-1', undefined],
+      [second, 'alpha', 'held-2', undefined],
+      [click, 'alpha', 'held-3', false],
+      [others, 'beta', 'held-4', undefined],
+    ]);
+    // The envelope's raw payload is not kept, as in the queue.
+    expect('raw' in q.deferred()[0]!.item.envelope).toBe(false);
+
+    // Something is queued meanwhile; the daemon restarts.
+    q.append(targeted('alpha', 'a1', 'room')); // 1
+    q.close();
+    const again = new HostQueue({ path });
+    expect(again.deferred().map((d) => d.id)).toEqual([first, second, click, others]);
+
+    // Discarded: never queued, and it cannot be released afterwards.
+    expect(again.discard(first)).toBe(true);
+    expect(again.discard(first)).toBe(false);
+    expect(again.release(first)).toBeUndefined();
+    // Released: appended now, behind what was queued meanwhile, with the grants an append gives.
+    expect(again.release(second)).toEqual({ cursor: 2, duplicate: false });
+    expect(again.release(second)).toBeUndefined();
+    expect(await view(again, 'backend:alpha')).toEqual([[1, 'a1'], [2, 'held-2']]);
+    expect(again.grantedMessage('alpha', { ...at('room'), messageId: 'held-2' })).toBe(true);
+    expect(again.grantedMessage('alpha', { ...at('room'), messageId: 'held-1' })).toBe(false);
+    // The option it was set aside with is the one it is appended with (a click grants no conversation).
+    expect(again.release(click)).toEqual({ cursor: 3, duplicate: false });
+    expect(again.granted('alpha', at('second'))).toBe(false);
+    expect(again.grantedMessage('alpha', { ...at('second'), messageId: 'held-3' })).toBe(true);
+    // A message that was queued for the target in the meantime is not queued twice.
+    const twice = again.defer({ ...targeted('alpha', 'a1', 'room'), to: 'alpha' });
+    expect(again.release(twice)).toEqual({ cursor: 1, duplicate: true });
+    expect(again.deferred().map((d) => d.id)).toEqual([others]);
+
+    // Forgetting a target takes what was set aside for it, and nothing of another's.
+    const gone = again.defer({ ...targeted('alpha', 'held-5', 'room'), to: 'alpha' });
+    again.forgetTarget('alpha');
+    expect(again.release(gone)).toBeUndefined();
+    expect(again.deferred().map((d) => [d.id, d.item.to])).toEqual([[others, 'beta']]);
+    expect(again.release(others)).toMatchObject({ duplicate: false });
+    expect((await view(again, 'backend:beta')).map((x) => x[1])).toEqual(['held-4']);
+    again.close();
+  });
 });

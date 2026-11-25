@@ -44,7 +44,7 @@
 ```
 
 - **agents**：配置里命名的运行默认值（harness 实例、model、profile、cwd、工具），不含人设。部署方可以在 agent 上写 `sessionParams`，允许宿主按会话指定工作目录和环境变量（决定 7，§2.3）。`mode: "task"` 的 agent 只能由 `run.start` 启动，任何规则指向它都在加载时报错。
-- **来源**：本地配置，以及宿主推送的整表 `bindings.put { version, bindings, identities, expiresAt?, onHostDown: "keep" | "suspend" }`（宿主推送的默认 `suspend`）。`version` 都是十进制整数（计数器、毫秒时间戳）时有先后：比当前表小的推送答 `stale_version`、不替换（迟到的旧推送不覆盖新表）；其他形式的版本是不透明标签，任何一个都替换。同一输入命中多条规则时全部生效；同一 (agent, session) 取最强的动作。唯一的例外是卡片点击：被点的消息是某个后端 `deliver` 的，只有 `to` 是它的规则接这次点击；带 `to` 的规则也只接它那个后端发的消息上的点击（§4.12）。
+- **来源**：本地配置，以及宿主推送的整表 `bindings.put { version, bindings, identities, expiresAt?, onHostDown: "keep" | "suspend" }`（宿主推送的默认 `suspend`）。`version` 都是十进制整数（计数器、毫秒时间戳）时有先后：比当前表小的推送答 `stale_version`、不替换（迟到的旧推送不覆盖新表）；其他形式的版本是不透明标签，任何一个都替换。同一输入命中多条规则时全部生效；同一 (agent, session) 取最强的动作。例外有两个，都只在配置了后端时出现。卡片点击：被点的消息是某个后端 `deliver` 的，只有 `to` 是它的规则接这次点击；带 `to` 的规则也只接它那个后端发的消息上的点击（§4.12）。后端自己发的消息被通道交回来（回声）：带 `to` 指向发它的后端的规则不接它，别的规则把它当本部署的回流（要 `includeSelf` 才命中，`dispatch` 降为 `context`；§4.12“自己发的消息回来”）。
 - **`to`（feature `backends`）**：规则把输入交给配置里的一个后端（`backends.<id>`）。只能写在 `on: "host"` 或带 `callout` 的规则上（别的规则到不了宿主队列），写在别处答 `invalid`；指向没有配置的后端，配置表加载失败，`bindings.put` 答 `unknown_backend`。推带 `to` 的表之前先看 `host.hello` 结果的 `features` 里有 `backends`：没有它的守护进程（旧版本，或没有配置任何后端）不认识这个字段或这个后端。宿主推送的表里带 `to` 的规则随宿主表一起挂起（`onHostDown`）；给后端的规则写在配置表里，或者推送时用 `onHostDown: "keep"`。
 - **`tag`（feature `binding.tag`）**：规则给它入队的条目贴的标签，1 到 128 个字符，不含控制字符，内容随管理员定（例如 `inbox` / `chat` / `guest`，告诉后端这条条目该怎么处理）。它在 `on: "host"` 或带 `callout` 的规则上才是标签：在那里不是字符串、为空、超长或带控制字符都答 `invalid`，文字指出是哪条规则（配置表加载失败，`bindings.put` 不替换当前表；类型与长度也是 `invalid`，不是 `invalid_frame`）。写在别的规则上（`dispatch`、`context`、`digest`、`drop` 且不带 `callout`）的 `tag` 键不归守护进程管：写什么都不报错，不抄到条目，`explain` 里也不出现，与有这个功能之前一样，所以原来自己在规则上带着 `tag` 键的表照样能推、能加载。守护进程不解读标签：匹配、fan-out、按 `to` 去重、点击归属都不看。它原样出现在条目的 `tag` 上（§2.1）和 `aio explain` 里这两种规则的每条命中上。推带 `tag` 的表之前先看 `features` 里有 `binding.tag`：没有它的守护进程不校验、也不抄这个字段。
 - **watch** 就是 agent 在运行时通过输出工具新增的一条规则，仍受 `Policy.watch` 约束。
@@ -273,6 +273,7 @@
 - **2026-11-25（后端的媒体与规则标签，§4.13、§2）对严格校验的宿主可见的协议变化**：都是新增的可选字段、帧与错误码。字段：`Binding.tag`、`InboundItem.tag`、`RouteExplanation.matched[].tag`。帧：`blob.stat`、`blob.get`、`blob.put`（`HostRequestFrame` 多三种；结果 `HostBlobStatResult`、`HostBlobGetResult`、`HostBlobPutResult`；常量 `BLOB_FRAME_MAX_BYTES`），这三种 `type` 原来答 `invalid_frame`。错误码：`blob.*` 的 `not_found`、`too_large`、`bad_offset`、`busy`、`quota_exceeded`、`blob_error`、`unsupported`，后端的 `deliver` / `deliver.update` 多 `unknown_blob`、`too_many_attachments`。`host.hello` 的 `features` 多 `binding.tag` 与 `blobs`（宿主 token 的连接，排在 `attention` 之后）；后端钥匙的 `features` 多 `blobs`。行为变化只有两处：(1) `Binding` 的 schema 是开放的，原来表里自己带着 `tag` 键的宿主（守护进程以前忽略它）：键写在 `on: "host"` 或带 `callout` 的规则上时，现在它是标签，值是 1 到 128 个字符、不含控制字符的字符串就被抄到条目与 `explain` 上，不是的话整张表答 `invalid`（这样一张旧守护进程持久化的宿主表，升级后启动时被整张忽略并记一条 warn，直到宿主推一张合法的）；写在别的规则上的照旧忽略，不校验、不抄；(2) 后端钥匙的 `deliver` / `deliver.update` 的附件原来不检查，现在必须是它被给过的或它自己上传的引用，且一条消息至多 32 个（§4.13）。宿主 token 的 `deliver`、不带 `tag` 的表、不用这三个帧的宿主都不变。`@agents-io/protocol` 新导出 `mediaBlocks`、`MediaBlock`；`@agents-io/daemon` 的 `LocalClient` 多 `blobStat` / `blobGet` / `blobPut` / `readBlob` / `writeBlob`，`Peer` 多可选的 `flushed()`，`FrameTransport` 多可选的 `flushed()`，`GatewayOptions` 多 `hostBlobs`（测试用）；`@agents-io/session` 的 `FsBlobStore.put` 多第三个可选参数 `{ provisional }`。
 - **2026-11-25（后端分支与 origin/main 合并）**：两边的帧、字段、错误码与文字都不变。本文里后端的两节是 §4.12（后端与钥匙）、§4.13（blob），§4.10、§4.11 是 ACP harness 与北向投影。线上可见的只有顺序：配置了后端时宿主 token 的 `host.hello` 的 `features` 里，`backends` 排在内核的之后、功能模块的（`external.mcp`、`acp.server`、`ag-ui`）之前。功能模块不能声明 feature `backends`（注册时拒绝，与内核别的 feature 一样）。凭后端钥匙的连接发客户端帧 `module.connect`（`aio acp` 用的那一帧）同别的客户端帧一样答 `forbidden`；后端钥匙开不了 ACP 服务端与 AG-UI 端点，它们各有自己的客户端令牌。嵌入方：`BackendKeys`、`HostBlobs` 随内核在 `@agents-io/kernel`（`packages/kernel/src/backends.ts`、`host-blobs.ts`），`ConsoleHost` 的 `backendOf`、`backends` 在它的 `console-host.ts`；`@agents-io/daemon` 照旧转出 `LocalClient`（`readBlob`、`writeBlob`、`backends*`）与 `Gateway`。
 - **2026-11-25（后端钥匙分两级，§4.12；INVARIANTS PB-7）对严格校验的宿主可见的协议变化**：都是新增的可选字段和一个新的 feature；没有配置 `backends` 的守护进程发出的帧不变，只签发过缺省钥匙的部署除下面这些新增字段之外也不变。字段：`backends.key` 请求与 `POST /api/backends/:id/key` 的体多可选的 `access`（`"read"` / `"readwrite"`，缺省 `"readwrite"`）；`BackendsKeyResult` / `AdminBackendKeyResult` 多 `access`（现在总是有）；凭后端钥匙的 `HostHelloResult.backend` 多 `access`（现在总是有）；`BackendInfo`（`backends.list`、`GET /api/backends`）多可选的 `read { key { id, createdAt }, connections }`，只在这个后端有只读钥匙时出现，`key`、`connections`、`push` 仍是读写一级的。配置了至少一个后端时，宿主 token 的 `host.hello` 的 `features` 在 `backends` 之后多一项 `backends.access`（功能模块的 feature 仍排在它们之后）；凭只读钥匙的 hello 里有一个新名字 `blobs.read`。功能模块不能声明 `backends.access`、`blobs.read`。只读钥匙以 `aiobr_` 开头：按 `aiob_` 前缀认钥匙的客户端要知道有第二种。错误：只读钥匙做不了的事答 `forbidden`，文字固定是 `this key is read-only`。存储：只读钥匙在新表 `daemon_backend_access_keys` 里，原来的 `daemon_backend_keys` 不变，所以可以降级：旧版本照常打开库、读写钥匙照常，只是不认识只读钥匙（凭它连不上）。**降级之前先作废只读钥匙**（`aio backend revoke <id> --read`）：旧版本不知道那张表，降级期间不删也不作废只读钥匙，在旧版本下从配置里删掉的后端，同名加回来、再升级之后，早先那把只读钥匙又能旁观它；已经降级过的，升级回来后对那期间删过的后端作废只读钥匙。限额：凭只读钥匙的 `host.hello` 与带 `waitMs` 的 `inbound.read` 可能答 `busy`（每个后端至多 32 条只读连接、每条连接至多 4 个在等的长轮询，§4.12“旁观”）；读写钥匙与宿主 token 不受影响。新客户端对旧守护进程：旧守护进程忽略 `access`，会签发或轮换读写钥匙，先看 `features` 里有 `backends.access`，或核对应答的 `access`。嵌入方的类型变化见 `packages/daemon/README.md`（“What changed for embedders with backend key levels”）。
+- **2026-11-25（后端自己发的消息的回声，§4.12；INVARIANTS PB-8）对宿主可见的变化**：协议只多两个可选字段 `RouteExplanation.echoOf { backends, late? }`、`RouteExplanation.deferred { backends }`（`explain` 的应答）和 `matched[].rejected.code` 的一个值 `own_echo`；没有新帧、新错误码、新 feature。行为：后端 `deliver` 的消息被通道交回来时，不再按那个账号发的普通消息路由（§4.12“自己发的消息回来”）。不带 `includeSelf` 的规则不再命中它，包括不带 `to` 的宿主规则和本地 agent 的规则：宿主原来能在自己的队列里看到这类条目的，现在要在规则上写 `includeSelf: true` 才看到，条目的 `input.origin` 是 `self`、`kind: "agent"`、没有主体。后端的一次发送进行期间，同一会话里可能是它回声的入站合计至多晚 2 秒（通常是一次发送的时间）；发送比这更久时，给正在发送的那个后端的队列条目晚到它的发送结算为止，别的消费者不再等。没有配置后端、或没有后端发过消息的部署不变；宿主 token 的 `deliver`、turn 的发送（它们的回声）不变。嵌入方：`IngressOptions.deliveredBy` / `echoPending`、`Ingress.resolveDeferred`、`HostQueue.defer` / `release` / `discard`、`Router.route` 的 `echoOf`、`GatewayOptions.backendEchoWaitMs`。
 
 ### 4.6 模型生成的话题标题（模块 `topic-title`）
 
@@ -430,7 +431,7 @@ await agent.runAgent({ runId: 'r1' }, { onEvent: ({ event }) => console.log(even
 
 **对严格校验的宿主可见的协议变化**（2026-11-25）：客户端帧多了 `module.connect`（旧守护进程答 `invalid_frame`）；`external` 回调的 `args` 多了可选的 `endpoint`；`features` 可能多 `acp.server`、`ag-ui`；`input.cancelled` 的 `reason` 可能是 `withdrawn`；输入的 `origin.adapter` 可能是 `acp-server` 或 `ag-ui`；会话列表里可能出现 `acp-server:<名>:<id>`、`ag-ui:<名>:<id>` 这样的会话。
 
-### 4.12 后端与后端钥匙（feature `backends`；INVARIANTS PB-1 到 PB-3、PB-6、PB-7）
+### 4.12 后端与后端钥匙（feature `backends`；INVARIANTS PB-1 到 PB-3、PB-6 到 PB-8）
 
 守护进程可以同时接几个**后端**：各自凭自己的钥匙连接，只收到路由给它的输入，只能往它收到过输入的会话和管理员为它登记的目的地发。方案见 `docs/design/persona-backend/`。没有配置 `backends` 时这一节的东西都不存在，行为与之前相同。
 
@@ -525,6 +526,46 @@ await agent.runAgent({ runId: 'r1' }, { onEvent: ({ event }) => console.log(even
 **发送范围**。后端的 `deliver` 只能发往 (a) 路由给过它的输入的回复路由所在的会话（按 `channel`、`account`、`conversationId`，任何话题；入队时记下，跨重启，不过期），(b) `backends.<id>.routes` 登记的目的地。回复目标（`replyToMessageId`）、被标记的消息（`message.ack` 的 `messageId`）必须是它收到过的输入的消息（记 30 天）或它自己发的消息，且在同一个会话；被改的消息（`deliver.update`）必须是它自己发的。不满足一律答 `route_not_allowed`，文字是固定的一句，通道或账号解析不到也答这个（不列出有哪些通道）；这次请求不发、不占用 operationId。回复一条 30 天前收到的消息会被拒，去掉 `replyToMessageId` 可以照发到那个会话。operationId 按后端分开（内部是 `backend:<id>:<operationId>`，与宿主的互不重叠），两个后端用同一个 id 互不影响；`aio explain backend:<id>:<operationId>` 查得到，结果带 `backend`。宿主的 `outbound` 回调与出口检查（§4.1、§4.1a）不看后端的发送，与宿主自己的 `deliver` 一样：靠出口检查把关所有外发的部署，加了后端以后要知道这条路不经过它。只检查会话和消息 id，不检查 `threadId`。附件另有检查（§4.13）：每个引用必须是路由给它的条目里的媒体或它自己上传的，否则答 `unknown_blob`；`channelData`（通道原生内容）不检查。
 
 **卡片点击**。点击跟着发卡片的后端走：被点的消息是后端 X `deliver` 的，这次点击只可能由 `to: X` 的规则接、进 X 的队列（仍要有这样一条规则命中，通常按 `actionPrefix`），不按内核的审批、停止、提问按钮解析，也不交给模块；带 `to` 的规则只接它那个后端发的消息上的点击，所以别人（宿主、本地 agent）发的卡片上的点击到不了后端。条目的 `input.origin` 是点击者的盖章身份（§3），谁有资格点由后端自己核对。归属靠通道报回发出的消息 id 和点击事件里的 `messageId`；通道不给时点击归不了属，进不了任何后端的队列，按普通输入走不带 `to` 的规则。点击不授予会话许可（只记下点击和被点的消息，供回复用）：后端能回这次点击，是因为它本来就能往那个会话发；许可被收回以后（`aio backend forget`、登记的目的地被删），旧卡片上的点击照样进它的队列，但不把许可写回来。
+
+**自己发的消息回来（回声）**（INVARIANTS PB-8）。有的通道把账号自己发出的消息也当入站消息交上来（个人账号类的通道会，机器人通常不会）。后端 `deliver` 的消息这样回来时，守护进程按 `(channel, 平台消息 id)` 在出站记录里认出它：不用配置，不看文字，也不看是哪个账号收到的；拆成多条的投递每一条都认，`deliver.update` 之后通道报上来的修订（信封的 `revisionOf` 是那条消息）也认；记录跨重启、不过期。认出之后：
+
+- **不交给发它的后端**。带 `to` 指向那个后端的规则一律跳过，规则写了 `includeSelf` 也一样，带 `callout` 的不问回调。后端不会收到自己说的话再去回它。
+- **不当成有人说话**。输入盖章为本部署自己的：`origin.self: true`、`kind: "agent"`、`principal: null`（账号是主人自己的，也不带主人的主体），与 `policy.selfAccounts` 认出的回流同一个形状，之后按回流的规则走：只有 `match.includeSelf: true` 的规则命中它，`dispatch` 降为 `context`，不开轮；没有这样的规则就丢弃。`input.verify` 答它是 `self`。
+- **别的后端要看，得写明**。两个后端共用一个会话时，缺省互相看不到对方发的。哪一方要把“这个账号说了一句”当旁观收下，就在自己的规则上写 `includeSelf: true`：收到的条目 `input.origin.self` 是 `true`、没有主体，怎么用由它自己定（不该当成有人对它说话）。不带 `to` 的宿主规则、本地 agent 的规则同样。写了 `includeSelf` 的规则还会收到别的回流（`selfAccounts` 里的账号手工发的、本地 agent 的 turn 发的、别的后端发的），唯独收不到它自己那个后端发的。
+- **看得出为什么**。`aio explain <inputId>` 的结果带 `echoOf`；被跳过的规则列在 `matched` 里，`rejected.code` 是 `own_echo`：
+
+```jsonc
+// 后端 beta 往 oc_family 发了一条，通道把它交回来；规则 family-to-beta 本来会命中（`tableVersions`、`at`、`cause` 略）：
+{ "inputId": "in_…", "principal": null, "evidence": "platform_signed", "echoOf": { "backends": ["beta"] }, "dropped": "no_match",
+  "matched": [{ "bindingId": "family-to-beta", "source": "config", "on": "host", "to": "beta", "tag": "chat",
+                "rejected": { "code": "own_echo", "message": "the message is one backend \"beta\" delivered itself: its echo is not queued for it" } }] }
+```
+
+回声可以比发送的应答先到：通道在发送调用返回之前就把它交上来，那时投递还没记下。某个后端的 `deliver` 进行期间（交给通道到结算之间），同一通道、同一会话 id 来的入站消息分两步对待：
+
+1. **短等。** 先等这次投递结算、再认。一次投递让它的会话的入站合计至多等 2 秒（从第一条等它的入站算起；过了之后这次投递不再让谁等）。只在等了能认出来的地方等：带 `platform_signed` / `dkim_pass` 证据、不是点击、不是已认得是守护进程自己发的消息；别的会话、别的通道不等，没有后端在发送时也不等。别人此刻在那个会话发来的消息也晚到这一会儿，结算后照常路由；一条消息在等的时候，同一会话后到的（点击也算）排在它后面，先后不乱。
+2. **发送比短等更久（拆成多条、带附件、在重试）：只对正在发送的后端留住。** 这条消息对别的规则按普通消息放行（宁可放过，不吞别人的话，也不让别人一直等）；给正在往这个会话发送的那个后端的队列条目先搁置，等它的发送结算：是它自己发的那条，条目丢弃；不是，条目这时入队。所以后端成功投递的消息无论先后都不进它自己的队列，别人的消息对它只是晚到它那次发送结算为止，不会丢（搁置是持久的，重启后按出站记录处理）。
+
+搁置中 `explain` 带 `deferred`，结算后看得出结果：
+
+```jsonc
+// beta 的发送用了 8 秒；第一条的回声 0.3 秒就到了，短等过后放行，给 beta 的条目搁置：
+{ "inputId": "in_…", "principal": "demo-chat:ou_example", "deferred": { "backends": ["beta"] },
+  "matched": [{ "bindingId": "family-to-beta", "source": "config", "on": "host", "to": "beta", "tag": "chat" }] }
+// 发送结算之后：认出是 beta 自己发的，条目丢弃（`late`：对别的规则它已经按普通消息走过了）：
+{ "inputId": "in_…", "principal": "demo-chat:ou_example", "echoOf": { "backends": ["beta"], "late": true }, "dropped": "no_match",
+  "matched": [{ "bindingId": "family-to-beta", "source": "config", "on": "host", "to": "beta", "tag": "chat",
+                "rejected": { "code": "own_echo", "message": "the message is one backend \"beta\" delivered itself, on record only after it was routed: its echo is not queued for it" } }] }
+```
+
+认不出的落回身份规则：
+
+- 结果不明（`unknown`）的投递，没有记下平台消息 id：它的回声是普通消息，发它的后端也收到。
+- 发送比短等更久时已经放行的回声：发它的后端收不到（上面第 2 步），但别的规则已经把它当那个账号发的普通消息收下（别的后端、宿主队列多一条普通条目，本地 agent 的 `dispatch` 规则可能开一轮）；守护进程日志有 warn。
+- 信封证据不够的通道（没被授予证据的 bridge）；只报主消息 id 的适配器拆出来的其余各条；通道给回声的 id 与发送应答里的不一样。
+- 宿主 token 的 `deliver`：它不是后端，回声照旧按那个账号发的消息路由。
+
+要全部兜住，把账号写进 `policy.selfAccounts`（`<channel>:<账号在这个通道上的用户 id>`）；那样这个账号的每条消息都算回流，包括主人用它手工发的。后端自己再认一次可以兜住第一类的一部分，对这次改动之前的守护进程也有效（`persona-plugin` 这样做：按消息 id 认，结果不明的按会话和文字猜，见它的 README）。
 
 **id 就是身份**。状态都记在 id 下：后端从配置里删掉再加回来（要重新签发钥匙），它的积压、游标、会话许可、operationId 的结果、消息的归属都延续。指向它的规则要一起删掉或改指，否则配置加载失败；宿主推送并持久化的表里有这样的规则时，启动时整张宿主表被忽略，直到宿主推一张不含它的表。`aio backend forget <id>` 清掉条目、游标与许可，连同媒体许可和暂存的上传（会话许可不过期，规则改道以后原来的后端仍能往那个会话发，直到 forget；没有按会话撤销的办法；forget 之后只有规则再路由给它一条输入才重新授予）；它不清 operationId 的结果和消息归属，所以同一个 id 交给另一方用，会继承旧的 operationId 结果、旧消息的编辑权和旧卡片的点击。换人就换 id。
 

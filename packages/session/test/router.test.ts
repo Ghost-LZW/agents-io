@@ -839,4 +839,89 @@ describe('backends: host rules that name one (to)', () => {
     expect(t.explanation.matched.some((m) => m.rejected)).toBe(false);
     expect(asked.sort()).toEqual(['alpha-asks', 'alpha-session', 'beta-asks', 'plain-asks']);
   });
+
+  it('the echo of a message backend alpha delivered is skipped by every rule to alpha (own_echo), whether or not the rule asks for self inputs, and its callout is not asked; every other rule sees a self input: only rules with includeSelf match, a dispatch is context, a host rule to beta queues it for beta; the explanation names echoOf; a click is never an echo #PB-8 #EX-1 #ID-5', async () => {
+    const asked: string[] = [];
+    const r = router({
+      ...B,
+      hostConnected: true,
+      routeCallout: async (id) => {
+        asked.push(id);
+        return { on: 'dispatch' };
+      },
+      config: table([
+        { id: 'alpha-all', match: { conversationKind: 'group' }, on: 'host', to: 'alpha', tag: 'chat' },
+        { id: 'alpha-self', match: { includeSelf: true }, on: 'host', to: 'alpha' },
+        { id: 'alpha-asks', match: {}, on: 'context', callout: {}, to: 'alpha' },
+        { id: 'alpha-other', match: { conversation: 'elsewhere' }, on: 'host', to: 'alpha' },
+        { id: 'beta-all', match: { conversationKind: 'group' }, on: 'host', to: 'beta' },
+        { id: 'beta-self', match: { includeSelf: true }, on: 'host', to: 'beta', tag: 'seen' },
+        { id: 'beta-asks', match: { includeSelf: true }, on: 'host', callout: { onFailure: 'drop' }, to: 'beta' },
+        { id: 'plain', match: {}, on: 'host' },
+        { id: 'plain-self', match: { includeSelf: true }, on: 'host' },
+        { id: 'agent', match: {}, on: 'dispatch' },
+        { id: 'agent-self', match: { includeSelf: true }, on: 'dispatch', session: { key: 'seen' } },
+      ]),
+    });
+    const echo = fakeEnvelope({ id: 'om_sent', conversation: group, text: 'see you at five' });
+    const view = (d: Awaited<ReturnType<Router['route']>>) => d.explanation.matched.map((m) => [m.bindingId, m.on, m.rejected?.code]);
+
+    // As the daemon stamps it: its own, nobody's principal.
+    const d = await r.route(echo, SELF, inputOf(echo, SELF), { echoOf: ['alpha'] });
+    // Not for alpha, by any of its rules; beta and the untargeted queue only through the rules that ask for self inputs.
+    expect(d.hosts).toEqual([{ bindingId: 'beta-self', source: 'config', to: 'beta', tag: 'seen' }, { bindingId: 'plain-self', source: 'config' }]);
+    // Never a turn: the dispatch rule that asks for it records it, the answered callout's dispatch too.
+    expect(d.deliveries.map((x) => [x.bindingId, x.on, x.sessionKey])).toEqual([['beta-asks', 'context', 'assistant:fake:default:g1'], ['agent-self', 'context', 'seen']]);
+    expect(view(d)).toEqual([
+      ['alpha-all', 'host', 'own_echo'], // matched but for self: said, so the admin sees why alpha got nothing
+      ['alpha-self', 'host', 'own_echo'],
+      ['alpha-asks', 'context', 'own_echo'], // not asked
+      ['beta-self', 'host', undefined],
+      ['beta-asks', 'context', undefined],
+      ['plain-self', 'host', undefined],
+      ['agent-self', 'context', undefined],
+    ]);
+    expect(d.explanation.matched[0]).toEqual({ bindingId: 'alpha-all', source: 'config', on: 'host', to: 'alpha', tag: 'chat', rejected: { code: 'own_echo', message: expect.stringContaining('"alpha"') } });
+    expect(d.explanation).toMatchObject({ echoOf: { backends: ['alpha'] }, principal: null });
+    expect(d.explanation.dropped).toBeUndefined();
+    expect(asked).toEqual(['beta-asks']);
+
+    // The router does not rely on the caller's stamp: an origin that says a person wrote it is still routed as the echo.
+    asked.length = 0;
+    const unstamped = await r.route(echo, OWNER, inputOf(echo, OWNER), { echoOf: ['alpha'] });
+    expect(unstamped.hosts).toEqual(d.hosts);
+    expect(unstamped.deliveries.map((x) => [x.bindingId, x.on])).toEqual([['beta-asks', 'context'], ['agent-self', 'context']]);
+    expect(view(unstamped)).toEqual(view(d));
+
+    // Only alpha's rules match: nothing is delivered, and it counts as matching nothing.
+    const lone = router({ ...B, config: table([{ id: 'alpha-all', match: {}, on: 'host', to: 'alpha' }, { id: 'beta-all', match: {}, on: 'host', to: 'beta' }, { id: 'agent', match: {}, on: 'dispatch' }]) });
+    const none = await lone.route(echo, SELF, inputOf(echo, SELF), { echoOf: ['alpha'] });
+    expect(none).toMatchObject({ deliveries: [], hosts: [], explanation: { dropped: 'no_match', echoOf: { backends: ['alpha'] } } });
+    expect(none.host).toBeUndefined();
+    expect(view(none)).toEqual([['alpha-all', 'host', 'own_echo']]);
+
+    // Sent by both (the same id on two accounts): neither gets it.
+    const both = await r.route(echo, SELF, inputOf(echo, SELF), { echoOf: ['beta', 'alpha'] });
+    expect(both.hosts).toEqual([{ bindingId: 'plain-self', source: 'config' }]);
+    expect(both.explanation.echoOf).toEqual({ backends: ['beta', 'alpha'] });
+    expect(view(both).filter((x) => x[2] === 'own_echo').map((x) => x[0])).toEqual(['alpha-all', 'alpha-self', 'alpha-asks', 'beta-all', 'beta-self', 'beta-asks']);
+
+    // The same message from a person, nobody's echo: every rule as before, and no echoOf in the explanation.
+    asked.length = 0;
+    const person = await r.route(echo, OWNER, inputOf(echo, OWNER));
+    expect(person.hosts.map((h) => h.bindingId)).toEqual(['alpha-all', 'beta-all', 'plain']);
+    expect(person.deliveries.map((x) => [x.bindingId, x.on])).toEqual([['alpha-asks', 'dispatch'], ['agent-self', 'dispatch']]);
+    expect(person.explanation.matched.some((m) => m.rejected)).toBe(false);
+    expect('echoOf' in person.explanation).toBe(false);
+    expect(asked.sort()).toEqual(['alpha-asks', 'beta-asks']);
+    // An empty list is nobody's echo too.
+    expect((await r.route(echo, OWNER, inputOf(echo, OWNER), { echoOf: [] })).hosts.map((h) => h.bindingId)).toEqual(['alpha-all', 'beta-all', 'plain']);
+
+    // A click is never an echo: it belongs to the sender of the clicked message (PB-1), whatever the caller passes.
+    const click = fakeEnvelope({ id: 'om_sent', conversation: group, content: [{ type: 'event', name: 'action', data: { actionId: 'x:1', messageId: 'om_card' } }] });
+    const c = await r.route(click, OWNER, inputOf(click, OWNER), { clickOf: 'alpha', echoOf: ['alpha'] });
+    expect(c.hosts).toEqual([{ bindingId: 'alpha-all', source: 'config', to: 'alpha', tag: 'chat' }]);
+    expect(c.explanation.matched.some((m) => m.rejected?.code === 'own_echo')).toBe(false);
+    expect('echoOf' in c.explanation).toBe(false);
+  });
 });

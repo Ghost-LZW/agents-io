@@ -85,6 +85,9 @@ describe('lifecycle', () => {
     const ch = await rawChild('fatal', { backoff: { minMs: 5, maxMs: 10 } }, { PIDS_FILE: file });
     const r = run(ch);
     await waitFor(() => pids().length >= 2);
+    // The child's log line and its pid file are written by different processes: on a loaded runner the
+    // second pid can be seen before the first child's line has been read. Wait for the line, then assert it.
+    await waitFor(() => r.logs.some((l) => l.includes('cannot log in'))).catch(() => undefined);
     expect(r.logs.some((l) => l.includes('cannot log in'))).toBe(true);
     await r.stop();
   });
