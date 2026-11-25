@@ -296,8 +296,8 @@ describe('console: backend keys', () => {
     const issued = await post('/api/backends/alpha/key', { op: 'issue' });
     expect(issued.status).toBe(200);
     expect(errors(AdminBackendKeyResult, issued.body)).toEqual([]);
-    expect(issued.body).toEqual({ backend: 'alpha', op: 'issue', key: expect.stringMatching(/^aiob_[\w-]{43}$/), keyId: expect.any(String), createdAt: expect.any(Number), closed: 0 });
-    expect(w.gw.backends.verify(issued.body.key)).toEqual({ id: 'alpha', keyId: issued.body.keyId });
+    expect(issued.body).toEqual({ backend: 'alpha', op: 'issue', access: 'readwrite', key: expect.stringMatching(/^aiob_[\w-]{43}$/), keyId: expect.any(String), createdAt: expect.any(Number), closed: 0 });
+    expect(w.gw.backends.verify(issued.body.key)).toEqual({ id: 'alpha', keyId: issued.body.keyId, access: 'readwrite' });
     expect(await post('/api/backends/alpha/key', { op: 'issue' })).toMatchObject({ status: 409, body: { error: { code: 'key_exists' } } });
     for (const op of ['issue', 'rotate', 'revoke']) expect(await post('/api/backends/gamma/key', { op })).toMatchObject({ status: 404, body: { error: { code: 'unknown_backend' } } });
     expect((await post('/api/backends/alpha/key', { op: 'print' })).status).toBe(400);
@@ -320,7 +320,7 @@ describe('console: backend keys', () => {
     expect(rotated).toMatchObject({ status: 200, body: { backend: 'alpha', op: 'rotate', closed: 0 } });
     expect(rotated.body.key).not.toBe(issued.body.key);
     expect(w.gw.backends.verify(issued.body.key)).toBeUndefined();
-    expect(w.gw.backends.verify(rotated.body.key)).toEqual({ id: 'alpha', keyId: rotated.body.keyId });
+    expect(w.gw.backends.verify(rotated.body.key)).toEqual({ id: 'alpha', keyId: rotated.body.keyId, access: 'readwrite' });
     // Forget: its queue items and grants go, its key stays.
     await w.chat.inject({ id: 'm1', sender: alice, text: 'for alpha' });
     await until(() => w.gw.hostQueue.head() === 1);
@@ -516,7 +516,7 @@ describe('console /ws', () => {
     expect(w.gw.host.backendConnections('alpha')).toEqual({ connections: 2, push: false });
     const gone = (x: WebSocket) => new Promise<void>((r) => x.once('close', () => r()));
     const [wsGone, idleGone] = [gone(ws), gone(idle)];
-    expect((await w.api('/api/backends/alpha/key', { method: 'POST', json: { op: 'revoke' } })).body).toEqual({ backend: 'alpha', op: 'revoke', closed: 2 });
+    expect((await w.api('/api/backends/alpha/key', { method: 'POST', json: { op: 'revoke' } })).body).toEqual({ backend: 'alpha', op: 'revoke', access: 'readwrite', closed: 2 });
     await Promise.all([wsGone, idleGone]);
     expect(w.gw.host.backendConnections('alpha')).toEqual({ connections: 0, push: false });
     expect(other.readyState).toBe(WebSocket.OPEN);
@@ -531,6 +531,146 @@ describe('console /ws', () => {
     expect(refused).toBe(401);
     expect((await w.api('/api/status', { token: alphaKey })).status).toBe(401);
     other.close();
+  });
+
+  it('a read key is issued, rotated and revoked through the console with access read (an unknown level is 400) and listed with its own connections; it opens /ws only: every /api route answers 403, hello on its socket takes that backend\'s read key only, and revoking it closes its sockets even before hello while a socket of the read-write key stays #PB-7 #PB-3 #SE-3 #PR-1', async () => {
+    const turns: unknown[] = [];
+    const w = await consoleDaemon({
+      script: async (t) => void turns.push(t.inputs),
+      raw: { backends: { alpha: {}, beta: {} }, bindings: [{ id: 'to-alpha', match: { channel: 'fake', keywords: ['alpha'] }, on: 'host', to: 'alpha' }] },
+    });
+    const post = (path: string, json?: unknown, token?: string | null) => w.api(path, { method: 'POST', ...(json !== undefined ? { json } : {}), ...(token !== undefined ? { token } : {}) });
+    const READ = /^aiobr_[\w-]{43}$/;
+    // Issued with the admin credential, as the read-write key is; `access` picks the level and comes back in the answer.
+    const alphaKey = (await post('/api/backends/alpha/key', { op: 'issue' })).body.key as string;
+    const betaKey = (await post('/api/backends/beta/key', { op: 'issue' })).body.key as string;
+    const issued = await post('/api/backends/alpha/key', { op: 'issue', access: 'read' });
+    expect(issued.status).toBe(200);
+    expect(errors(AdminBackendKeyResult, issued.body)).toEqual([]);
+    expect(issued.body).toEqual({ backend: 'alpha', op: 'issue', access: 'read', key: expect.stringMatching(READ), keyId: expect.any(String), createdAt: expect.any(Number), closed: 0 });
+    expect(w.gw.backends.verify(issued.body.key)).toEqual({ id: 'alpha', keyId: issued.body.keyId, access: 'read' });
+    expect(w.gw.backends.verify(alphaKey)).toMatchObject({ id: 'alpha', access: 'readwrite' });
+    expect(await post('/api/backends/alpha/key', { op: 'issue', access: 'read' })).toMatchObject({ status: 409, body: { error: { code: 'key_exists' } } });
+    expect(await post('/api/backends/gamma/key', { op: 'issue', access: 'read' })).toMatchObject({ status: 404, body: { error: { code: 'unknown_backend' } } });
+    // A level that is not one is a bad request: it does not act on the read-write key instead.
+    for (const access of ['admin', 'write', '', 1, null]) expect([access, (await post('/api/backends/alpha/key', { op: 'rotate', access })).status]).toEqual([access, 400]);
+    expect(w.gw.backends.verify(alphaKey)).toMatchObject({ id: 'alpha', access: 'readwrite' });
+    expect(w.gw.backends.verify(issued.body.key)).toMatchObject({ id: 'alpha', access: 'read' });
+    // Rotated through the console too; the read-write key is not touched by it.
+    const rotated = await post('/api/backends/alpha/key', { op: 'rotate', access: 'read' });
+    expect(rotated.body).toEqual({ backend: 'alpha', op: 'rotate', access: 'read', key: expect.stringMatching(READ), keyId: expect.any(String), createdAt: expect.any(Number), closed: 0 });
+    expect(w.gw.backends.verify(issued.body.key)).toBeUndefined();
+    expect(w.gw.backends.verify(alphaKey)).toMatchObject({ id: 'alpha', access: 'readwrite' });
+    const readKey = rotated.body.key as string;
+    // Listed per level; a backend without a read key has no `read` at all.
+    const list = await w.api('/api/backends');
+    expect(errors(AdminBackends, list.body)).toEqual([]);
+    expect(list.body.backends.map((b: any) => [b.id, b.key?.id !== undefined, b.connections, b.read])).toEqual([['alpha', true, 0, { key: { id: rotated.body.keyId, createdAt: rotated.body.createdAt }, connections: 0 }], ['beta', true, 0, undefined]]);
+    expect('read' in list.body.backends[1]).toBe(false);
+    expect(JSON.stringify(list.body)).not.toContain(readKey);
+
+    // The console API with the read key: 403 on every route, as for the read-write key; no session comes out of it.
+    const FORBIDDEN = { status: 403, body: { error: { code: 'forbidden' } } };
+    const calls: [string, string, unknown?][] = [
+      ['GET', '/api/status'],
+      ['GET', '/api/queue'],
+      ['GET', '/api/sessions'],
+      ['GET', '/api/explain/m1'],
+      ['GET', '/api/backends'],
+      ['POST', '/api/backends/alpha/key', { op: 'rotate' }],
+      ['POST', '/api/backends/alpha/key', { op: 'rotate', access: 'read' }],
+      ['POST', '/api/backends/alpha/key', { op: 'issue', access: 'readwrite' }],
+      ['POST', '/api/backends/beta/key', { op: 'revoke' }],
+      ['POST', '/api/backends/alpha/forget'],
+      ['GET', '/api/config'],
+      ['PUT', '/api/config', { config: {}, ifRevision: 'x' }],
+      ['POST', '/api/config/validate', { config: {} }],
+      ['POST', '/api/login-link', {}],
+      ['GET', '/api/nope'],
+    ];
+    for (const [method, path, json] of calls) expect([path, await w.api(path, { method, token: readKey, ...(json !== undefined ? { json } : {}) })]).toMatchObject([path, FORBIDDEN]);
+    expect(await w.api('/api/status', { token: null, headers: { Cookie: `${w.gw.console!.cookieName}=${readKey}` } })).toMatchObject(FORBIDDEN);
+    const login = await w.api('/api/login', { method: 'POST', token: null, json: { loginToken: readKey } });
+    expect(login).toMatchObject({ status: 401, body: { error: { code: 'unauthorized' } } });
+    expect(login.headers.get('set-cookie')).toBeNull();
+    // Nothing above acted.
+    expect([w.gw.backends.verify(alphaKey)?.access, w.gw.backends.verify(readKey)?.access, w.gw.backends.verify(betaKey)?.access]).toEqual(['readwrite', 'read', 'readwrite']);
+
+    // /ws with the read key: admitted as an observer of alpha from the upgrade on, and counted as one.
+    const base = `${w.url.replace('http', 'ws')}/ws`;
+    const ws = new WebSocket(base, [ADMIN_WS_SUBPROTOCOL], { headers: { Authorization: `Bearer ${readKey}` } });
+    await opened(ws);
+    const c = wsClient(ws);
+    expect(w.gw.host.backendReadConnections('alpha')).toBe(1);
+    expect(w.gw.host.backendConnections('alpha')).toEqual({ connections: 0, push: false });
+    const NO_CLIENT = { ok: false, error: { code: 'forbidden' } };
+    const clientFrames = [{ type: 'sessions' }, { type: 'command', command: { type: 'input', sessionKey: 'local:main', mode: 'queue', input: { content: [{ type: 'text', text: 'as the owner?' }] } } }, { type: 'watch.list' }, { type: 'tui.attach' }];
+    for (const f of clientFrames) expect([f.type, await c.ask(f)]).toMatchObject([f.type, NO_CLIENT]);
+    expect(await c.ask({ type: 'inbound.read', consumer: 'alpha' })).toMatchObject({ ok: false, error: { code: 'unauthorized' } });
+    // hello on this socket: not the host token, not another backend's key, and not alpha's read-write key
+    // either. Admitted to observe, the connection never becomes the backend.
+    const UNAUTHORIZED = { ok: false, error: { code: 'unauthorized' } };
+    expect(await c.ask({ type: 'host.hello', token: w.gw.token, name: 'admin' })).toMatchObject(UNAUTHORIZED);
+    expect(await c.ask({ type: 'host.hello', token: betaKey, name: 'beta' })).toMatchObject(UNAUTHORIZED);
+    expect(await c.ask({ type: 'host.hello', token: alphaKey, name: 'alpha' })).toMatchObject(UNAUTHORIZED);
+    expect(await c.ask({ type: 'host.hello', token: alphaKey, name: 'alpha', consumer: 'alpha', takeover: true })).toMatchObject(UNAUTHORIZED);
+    expect(await c.ask({ type: 'host.hello', token: 'aiobr_test_key_not_real', name: 'x' })).toMatchObject(UNAUTHORIZED);
+    expect(w.gw.host.info()).toBeUndefined();
+    expect(w.gw.host.backendConnections('alpha')).toEqual({ connections: 0, push: false });
+    // Its own key: the observer of alpha, told so.
+    expect(await c.ask({ type: 'host.hello', token: readKey, name: 'whoever' })).toMatchObject({ ok: true, value: { name: 'backend:alpha', host: false, backend: { id: 'alpha', access: 'read' }, features: ['backends', 'binding.tag', 'blobs.read'] } });
+    for (const f of clientFrames) expect([f.type, await c.ask(f)]).toMatchObject([f.type, NO_CLIENT]);
+    await w.chat.inject({ id: 'm1', sender: alice, text: 'for alpha' });
+    expect(await c.ask({ type: 'inbound.read', consumer: 'alpha', waitMs: 2000 })).toMatchObject({ ok: true, value: { items: [{ to: 'alpha', envelope: { id: 'm1' } }], acked: 0 } });
+    expect((await c.ask({ type: 'inbound.ack', consumer: 'alpha', cursor: 1 })).error).toEqual({ code: 'forbidden', message: 'this key is read-only' });
+    expect(w.gw.hostQueue.ackedOf('backend:alpha')).toBe(0);
+    expect(w.gw.sessions()).toEqual([]);
+    expect(turns).toEqual([]);
+    // The reverse: a socket admitted with the read-write key does not take the read key at hello.
+    const rw = new WebSocket(base, [ADMIN_WS_SUBPROTOCOL], { headers: { Authorization: `Bearer ${alphaKey}` } });
+    await opened(rw);
+    const rwc = wsClient(rw);
+    expect(await rwc.ask({ type: 'host.hello', token: readKey, name: 'alpha' })).toMatchObject(UNAUTHORIZED);
+    expect(await rwc.ask({ type: 'host.hello', token: alphaKey, name: 'alpha' })).toMatchObject({ ok: true, value: { backend: { id: 'alpha', access: 'readwrite' } } });
+
+    // A second read socket that never says hello, and one of the read-write key that never does.
+    const idle = new WebSocket(base, [ADMIN_WS_SUBPROTOCOL, ADMIN_WS_BEARER_PREFIX + readKey]);
+    const idleRw = new WebSocket(base, [ADMIN_WS_SUBPROTOCOL, ADMIN_WS_BEARER_PREFIX + alphaKey]);
+    await Promise.all([opened(idle), opened(idleRw)]);
+    expect(w.gw.host.backendReadConnections('alpha')).toBe(2);
+    expect(w.gw.host.backendConnections('alpha')).toEqual({ connections: 2, push: false });
+    expect(((await w.api('/api/backends')).body as AdminBackends).backends.map((b) => [b.id, b.connections, b.read?.connections])).toEqual([['alpha', 2, 2], ['beta', 0, undefined]]);
+    const gone = (x: WebSocket) => new Promise<void>((r) => x.once('close', () => r()));
+    const [wsGone, idleGone] = [gone(ws), gone(idle)];
+    // Revoking the read key closes the read sockets, the one before hello too, and none of the read-write key's.
+    expect((await post('/api/backends/alpha/key', { op: 'revoke', access: 'read' })).body).toEqual({ backend: 'alpha', op: 'revoke', access: 'read', closed: 2 });
+    await Promise.all([wsGone, idleGone]);
+    expect(w.gw.host.backendReadConnections('alpha')).toBe(0);
+    expect(w.gw.host.backendConnections('alpha')).toEqual({ connections: 2, push: false });
+    expect([rw.readyState, idleRw.readyState]).toEqual([WebSocket.OPEN, WebSocket.OPEN]);
+    expect(await rwc.ask({ type: 'inbound.read', consumer: 'alpha' })).toMatchObject({ ok: true, value: { items: [{ envelope: { id: 'm1' } }] } });
+    // The revoked read key opens nothing: the upgrade is refused, the API answers 401 (a wrong token).
+    const status = (key: string) =>
+      new Promise<number>((resolve) => {
+        const x = new WebSocket(base, [ADMIN_WS_SUBPROTOCOL], { headers: { Authorization: `Bearer ${key}` } });
+        x.on('unexpected-response', (_req, res) => resolve(res.statusCode!));
+        x.on('open', () => resolve(101));
+        x.on('error', () => undefined);
+      });
+    expect(await status(readKey)).toBe(401);
+    expect((await w.api('/api/status', { token: readKey })).status).toBe(401);
+
+    // And the other way round: revoking the read-write key closes its sockets and leaves a read socket open.
+    const again = (await post('/api/backends/alpha/key', { op: 'issue', access: 'read' })).body.key as string;
+    const watcher = new WebSocket(base, [ADMIN_WS_SUBPROTOCOL], { headers: { Authorization: `Bearer ${again}` } });
+    await opened(watcher);
+    const [rwGone, idleRwGone] = [gone(rw), gone(idleRw)];
+    expect((await post('/api/backends/alpha/key', { op: 'revoke' })).body).toEqual({ backend: 'alpha', op: 'revoke', access: 'readwrite', closed: 2 });
+    await Promise.all([rwGone, idleRwGone]);
+    expect(watcher.readyState).toBe(WebSocket.OPEN);
+    expect(w.gw.host.backendReadConnections('alpha')).toBe(1);
+    expect(await wsClient(watcher).ask({ type: 'host.hello', token: again, name: 'x' })).toMatchObject({ ok: true, value: { backend: { id: 'alpha', access: 'read' } } });
+    watcher.close();
   });
 });
 

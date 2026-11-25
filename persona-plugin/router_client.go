@@ -24,6 +24,7 @@ const (
 	phaseRefused     = "refused"
 	phaseKeyRefused  = "key_refused"
 	phaseNotBackend  = "not_backend"
+	phaseReadKey     = "read_key"
 	phaseNoBackends  = "no_backends"
 	phaseLost        = "disconnected"
 )
@@ -47,6 +48,8 @@ func wordsOfPhase(phase string) string {
 		return wordsKeyRefused
 	case phaseNotBackend:
 		return wordsNotBackend
+	case phaseReadKey:
+		return wordsReadKey
 	case phaseNoBackends:
 		return wordsNoBackends
 	case phaseRefused:
@@ -317,6 +320,12 @@ func (r *router) hello(ctx context.Context, l *link, backend string) (helloResul
 	if res.Backend == nil || res.Backend.ID == "" {
 		return res, &phaseError{phaseNotBackend}
 	}
+	// A read key only observes: the router would refuse the consuming hello, every accept and every reply. Said by
+	// the probe, so no consuming hello is ever sent with it. A router from before key levels says no access: its
+	// keys are all read-write.
+	if res.Backend.Access == accessRead {
+		return res, &phaseError{phaseReadKey}
+	}
 	return res, nil
 }
 
@@ -357,7 +366,7 @@ func (r *router) run(ctx context.Context) {
 		r.mu.Unlock()
 		r.setPhase(phase)
 		pause := jitter(wait)
-		if phase == phaseKeyRefused || phase == phaseNotBackend || phase == phaseNoBackends {
+		if phase == phaseKeyRefused || phase == phaseNotBackend || phase == phaseReadKey || phase == phaseNoBackends {
 			pause = max(pause, r.tm.refusedRetry)
 		}
 		wait = min(wait*2, r.tm.backoffMax)

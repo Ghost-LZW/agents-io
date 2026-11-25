@@ -89,7 +89,7 @@ describe('backends', () => {
     const w = await daemon({ raw: two() });
     // A name, callouts and opt-ins as a host would claim them: none of them counts.
     const a = await w.backend('alpha', { name: 'the-host', callouts: ['route', 'outbound', 'external'], optIn: ['attention', 'item.tool'] });
-    expect(a.hello).toEqual({ name: 'backend:alpha', protocol: 1, host: false, backend: { id: 'alpha' }, bindings: { version: null, active: false }, features: ['backends', 'deliver.update', 'message.ack', 'host.takeover', 'binding.tag', 'blobs'], callouts: [], optIn: [] });
+    expect(a.hello).toEqual({ name: 'backend:alpha', protocol: 1, host: false, backend: { id: 'alpha', access: 'readwrite' }, bindings: { version: null, active: false }, features: ['backends', 'deliver.update', 'message.ack', 'host.takeover', 'binding.tag', 'blobs'], callouts: [], optIn: [] });
     expect(w.gw.host.info()).toBeUndefined();
     expect(w.gw.router.hostConnected).toBe(false);
     expect(w.gw.host.outboundHeldBy()).toBeUndefined();
@@ -110,7 +110,7 @@ describe('backends', () => {
     expect(w.gw.router.hostConnected).toBe(true);
     const b = await w.backend('beta', { name: 'legacy', consumer: 'beta', takeover: true, callouts: true });
     expect(b.hello).toEqual({
-      name: 'backend:beta', protocol: 1, host: false, backend: { id: 'beta' }, bindings: { version: null, active: false },
+      name: 'backend:beta', protocol: 1, host: false, backend: { id: 'beta', access: 'readwrite' }, bindings: { version: null, active: false },
       inbound: { consumer: 'backend:beta', acked: 0, head: 0 }, features: ['backends', 'deliver.update', 'message.ack', 'host.takeover', 'binding.tag', 'blobs'], callouts: [],
     });
     expect(w.gw.host.info()).toEqual({ name: 'legacy', consumer: 'legacy', callouts: true, hooks: ['outbound'] });
@@ -126,10 +126,11 @@ describe('backends', () => {
     // The host token's hello says backends are on, after everything it said before.
     const admin = await w.client();
     const withBackends = (await admin.hello({ token: w.gw.token, name: 'admin' })).features;
-    expect(withBackends.at(-1)).toBe('backends');
+    // (`backends.access`, PB-7: this daemon knows the two key levels.)
+    expect(withBackends.slice(-2)).toEqual(['backends', 'backends.access']);
     const plain = await daemon();
     const before = (await (await plain.client()).hello({ token: plain.gw.token, name: 'admin' })).features;
-    expect(before).toEqual(withBackends.slice(0, -1));
+    expect(before).toEqual(withBackends.slice(0, -2));
     expect(before).not.toContain('backends');
   });
 
@@ -373,7 +374,7 @@ describe('backends', () => {
 
     // Revocation: the connection is closed, and no key of alpha says hello any more.
     const nextGone = closed(next);
-    expect(await h.backendsKey('alpha', 'revoke')).toEqual({ backend: 'alpha', op: 'revoke', closed: 1 });
+    expect(await h.backendsKey('alpha', 'revoke')).toEqual({ backend: 'alpha', op: 'revoke', access: 'readwrite', closed: 1 });
     await until(() => nextGone() !== undefined);
     for (const token of [a.key, rotated.key!]) await expect((await w.client()).hello({ token, name: 'alpha' })).rejects.toMatchObject({ code: 'unauthorized' });
     expect((await h.backendsList()).backends.find((x) => x.id === 'alpha')).toMatchObject({ connections: 0, push: false });

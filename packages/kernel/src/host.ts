@@ -1,6 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import {
   type Attention,
+  type BackendAccess,
   type AttentionChanged,
   ContactCalloutAnswer,
   ExternalCalloutAnswer,
@@ -95,7 +96,7 @@ export interface HostServiceDeps {
    */
   backendsAdmin?: {
     list(): Outcome;
-    key(id: string, op: 'issue' | 'rotate' | 'revoke'): Outcome;
+    key(id: string, op: 'issue' | 'rotate' | 'revoke', access?: BackendAccess): Outcome;
     forget(id: string): Outcome;
   };
   /**
@@ -104,10 +105,10 @@ export interface HostServiceDeps {
    */
   backends?: {
     ids(): readonly string[];
-    /** The backend whose key this token is. */
-    verify(token: string): { id: string; keyId: string } | undefined;
-    /** `keyId` is still that backend's key. */
-    current(id: string, keyId: string): boolean;
+    /** The backend whose key this token is, and the key's level (PB-7). */
+    verify(token: string): { id: string; keyId: string; access: BackendAccess } | undefined;
+    /** `keyId` is still that backend's key of that level. */
+    current(id: string, keyId: string, access: BackendAccess): boolean;
     /** `backends.<id>.history`: the backend may use `history.read`. */
     history(id: string): boolean;
   };
@@ -149,13 +150,15 @@ export class HostService implements HostFrames {
   /**
    * PB-1: a backend's connections (by connection: `peer.auth` is gone when `gone` runs). One that said
    * hello with its key, or (`admitted`) one the console let in on `/ws` with its key and that may not
-   * have said hello yet.
+   * have said hello yet. `access`: the level of that key (PB-7).
    */
-  private readonly backendPeers = new Map<Peer, { id: string; admitted?: true }>();
-  /** PB-1: per backend, the one connection its items are pushed to. */
+  private readonly backendPeers = new Map<Peer, { id: string; access: BackendAccess; admitted?: true }>();
+  /** PB-1: per backend, the one connection its items are pushed to. Always a read-write one. */
   private readonly backendPush = new Map<string, { peer: Peer; push: PushSubscription }>();
   /** PR-2: per connection, the last `blob.get` and its answer being written out: the next one waits for it. */
   private readonly blobGets = new WeakMap<Peer, Promise<void>>();
+  /** PB-7: per read connection, how many of its `inbound.read` long-polls are waiting now (at most `MAX_OBSERVER_WAITS`). */
+  private readonly observerWaits = new WeakMap<Peer, number>();
 
   constructor(private readonly d: HostServiceDeps) {
     this.token = Buffer.from(d.token);
@@ -273,14 +276,19 @@ export class HostService implements HostFrames {
     const backend = peer.auth?.backend;
     if (backend) {
       // PB-3: the key is checked on every frame (rotate / revoke close the connection; this is the second lock).
-      if (!this.d.backends?.current(backend.id, backend.keyId)) {
+      if (!this.d.backends?.current(backend.id, backend.keyId, backend.access)) {
         // After end() nothing is written: the answer goes first, the close after it.
         setImmediate(() => this.endBackendPeer(peer, 'its key is no longer valid'));
         return fail('unauthorized', 'this key is no longer valid');
       }
-      // PB-1: default deny. A frame added later is not a backend's until it is listed here.
-      const allowed = BACKEND_FRAMES.has(f.type) || (f.type === 'history.read' && this.d.backends.history(backend.id));
-      if (!allowed) return fail('forbidden', `${f.type} is not open to a backend key`);
+      if (backend.access === 'read') {
+        // PB-7: a read key observes. Default deny, and one answer for everything it may not do.
+        if (!(READ_FRAMES.has(f.type) || (f.type === 'history.read' && this.d.backends.history(backend.id)))) return READ_ONLY;
+      } else {
+        // PB-1: default deny. A frame added later is not a backend's until it is listed here.
+        const allowed = BACKEND_FRAMES.has(f.type) || (f.type === 'history.read' && this.d.backends.history(backend.id));
+        if (!allowed) return fail('forbidden', `${f.type} is not open to a backend key`);
+      }
     }
     const own = backend ? `backend:${backend.id}` : undefined;
     switch (f.type) {
@@ -321,6 +329,8 @@ export class HostService implements HostFrames {
       case 'inbound.read': {
         if (!f.consumer) return fail('invalid_frame', 'consumer is empty');
         if (own !== undefined && !isOwnConsumer(backend!.id, f.consumer)) return fail('forbidden', 'a backend key reads only its own cursor');
+        // PB-7: a read key looks, it does not read as the consumer (that would touch the consumer's row).
+        if (backend?.access === 'read') return this.observe(peer, backend.id, f);
         const consumer = own ?? f.consumer;
         const stray = own === undefined ? this.strayBackendConsumer(consumer) : undefined;
         if (stray) return stray;
@@ -367,7 +377,7 @@ export class HostService implements HostFrames {
       case 'backends.list':
         return this.d.backendsAdmin?.list() ?? ok({ backends: [] });
       case 'backends.key':
-        return this.d.backendsAdmin?.key(f.backend, f.op) ?? fail('unknown_backend', `no backend ${JSON.stringify(f.backend)} in the config (backends)`);
+        return this.d.backendsAdmin?.key(f.backend, f.op, f.access) ?? fail('unknown_backend', `no backend ${JSON.stringify(f.backend)} in the config (backends)`);
       case 'backends.forget':
         return this.d.backendsAdmin?.forget(f.backend) ?? ok({ backend: f.backend, items: 0, routes: 0, closed: 0 });
       // PB-6: with a backend's key, only its own blobs (`backend.id`); with the host token, the shared store.
@@ -401,13 +411,47 @@ export class HostService implements HostFrames {
   }
 
   /**
-   * Close every connection authenticated with backend `id`'s key (its key was rotated or revoked,
-   * or the backend forgotten); how many were closed.
+   * `inbound.read` with a read key (PB-7): the backend's items after `after` (default: after what
+   * the backend acked, so what it has not handled yet), with the same long-poll. Nothing is
+   * written: no consumer is registered or touched, no cursor moves, retention does not know of it.
+   * The observer keeps its own place and asks again with `after`.
+   *
+   * Bounded: every long-poll that waits is woken by every append, whoever the item is for, so one
+   * connection holds at most `MAX_OBSERVER_WAITS` of them and a further one is `busy`. A read
+   * without `waitMs` never waits and is not counted.
    */
-  dropBackend(id: string, reason: string): number {
+  private async observe(peer: Peer, id: string, f: Extract<HostRequestFrame, { type: 'inbound.read' }>): Promise<Outcome> {
+    const own = `backend:${id}`;
+    const waitMs = Math.min(Math.max(0, f.waitMs ?? 0), 300_000);
+    if (waitMs > 0) {
+      const waiting = this.observerWaits.get(peer) ?? 0;
+      if (waiting >= MAX_OBSERVER_WAITS) return OBSERVER_BUSY;
+      this.observerWaits.set(peer, waiting + 1);
+    }
+    try {
+      const acked = this.d.queue.ackedOf(own);
+      const items = await this.d.queue.peek(id, {
+        after: f.after ?? acked,
+        ...(f.limit !== undefined ? { limit: f.limit } : {}),
+        waitMs,
+        signal: peer.signal,
+      });
+      const now = this.d.queue.ackedOf(own);
+      return ok<InboundReadResult>({ items, acked: now, head: Math.max(now, this.d.queue.targetHead(id)) });
+    } finally {
+      if (waitMs > 0) this.observerWaits.set(peer, (this.observerWaits.get(peer) ?? 1) - 1);
+    }
+  }
+
+  /**
+   * Close every connection authenticated with backend `id`'s key (its key was rotated or revoked,
+   * or the backend forgotten); how many were closed. `access`: only those made with the key of
+   * that level (PB-7: each level's key closes its own connections).
+   */
+  dropBackend(id: string, reason: string, access?: BackendAccess): number {
     let n = 0;
     for (const [peer, b] of [...this.backendPeers]) {
-      if (b.id !== id) continue;
+      if (b.id !== id || (access !== undefined && b.access !== access)) continue;
       this.endBackendPeer(peer, reason);
       n++;
     }
@@ -416,11 +460,12 @@ export class HostService implements HostFrames {
 
   /**
    * A connection the console admitted on `/ws` with backend `id`'s key, before any hello (PB-3):
-   * `dropBackend` closes it like one that said hello, and its `host.hello` must be that backend's key.
+   * `dropBackend` closes it like one that said hello, and its `host.hello` must be that backend's key
+   * of the same level (`access`, PB-7).
    */
-  attachBackend(peer: Peer, id: string): void {
+  attachBackend(peer: Peer, id: string, access: BackendAccess = 'readwrite'): void {
     if (peer.signal.aborted || this.backendPeers.has(peer)) return;
-    this.backendPeers.set(peer, { id, admitted: true });
+    this.backendPeers.set(peer, { id, access, admitted: true });
   }
 
   private endBackendPeer(peer: Peer, reason: string): void {
@@ -436,11 +481,54 @@ export class HostService implements HostFrames {
     return !!p && !p.peer.signal.aborted;
   }
 
-  /** Backend `id`'s connections now, and whether one of them is pushed its items. */
+  /** Backend `id`'s read-write connections now, and whether one of them is pushed its items. */
   backendConnections(id: string): { connections: number; push: boolean } {
     let connections = 0;
-    for (const b of this.backendPeers.values()) if (b.id === id) connections++;
+    for (const b of this.backendPeers.values()) if (b.id === id && b.access === 'readwrite') connections++;
     return { connections, push: this.backendPushing(id) };
+  }
+
+  /** How many connections made with backend `id`'s read key there are now (PB-7). */
+  backendReadConnections(id: string): number {
+    let n = 0;
+    for (const b of this.backendPeers.values()) if (b.id === id && b.access === 'read') n++;
+    return n;
+  }
+
+  /**
+   * `host.hello` with a backend's read key (PB-7): an observer of that backend. It is named like
+   * the backend and is neither the host nor the backend's consumer: asking to consume, with or
+   * without `takeover`, is refused before anything is looked at, so the push connection is never
+   * weighed against it; nothing is registered in the queue and no push starts. Several of them at
+   * once, at most `MAX_OBSERVERS` per backend that said hello (a further hello is `busy`): each may
+   * hold long-polls, and those are woken by every append.
+   */
+  private observerHello(peer: Peer, f: Extract<HostRequestFrame, { type: 'host.hello' }>, b: { id: string; keyId: string }): Outcome {
+    if (f.consumer !== undefined) return READ_ONLY;
+    let observers = 0;
+    for (const [p, x] of this.backendPeers) if (p !== peer && x.id === b.id && x.access === 'read' && p.auth?.backend !== undefined) observers++;
+    if (observers >= MAX_OBSERVERS) return OBSERVERS_FULL;
+    const name = `backend:${b.id}`;
+    peer.auth = {
+      name,
+      origin: () => {
+        throw new Error('a backend connection sends no client frames');
+      },
+      backend: { id: b.id, keyId: b.keyId, access: 'read' },
+    };
+    this.backendPeers.set(peer, { id: b.id, access: 'read', ...(this.backendPeers.get(peer)?.admitted ? { admitted: true as const } : {}) });
+    this.d.log('info', `backend ${b.id}: a read-only connection (key id ${b.keyId})`);
+    return ok<HelloResult>({
+      name,
+      protocol: PROTOCOL_VERSION,
+      host: false,
+      backend: { id: b.id, access: 'read' },
+      bindings: { version: null, active: false },
+      // Only what a read key can use (READ_FRAMES): not `blobs`, which says blob.put too.
+      features: [BACKENDS_FEATURE, 'binding.tag', ...(this.d.blobs ? [BLOBS_READ_FEATURE] : []), ...(this.d.backends?.history(b.id) ? ['history'] : [])],
+      ...(f.callouts !== undefined ? { callouts: [] } : {}),
+      ...(f.optIn !== undefined ? { optIn: [] } : {}),
+    });
   }
 
   /**
@@ -449,7 +537,8 @@ export class HostService implements HostFrames {
    * host: the host slot, `router.hostConnected` and the host's flags are untouched (HQ-5, HQ-6).
    * With `consumer` its own items are pushed to it; one push connection per backend.
    */
-  private backendHello(peer: Peer, f: Extract<HostRequestFrame, { type: 'host.hello' }>, b: { id: string; keyId: string }): Outcome {
+  private backendHello(peer: Peer, f: Extract<HostRequestFrame, { type: 'host.hello' }>, b: { id: string; keyId: string; access: BackendAccess }): Outcome {
+    if (b.access === 'read') return this.observerHello(peer, f, b);
     const name = `backend:${b.id}`;
     if (f.consumer !== undefined && !isOwnConsumer(b.id, f.consumer)) return fail('forbidden', 'a backend key consumes only its own cursor');
     let replaced: string | undefined;
@@ -468,9 +557,9 @@ export class HostService implements HostFrames {
       origin: () => {
         throw new Error('a backend connection sends no client frames');
       },
-      backend: { id: b.id, keyId: b.keyId },
+      backend: { id: b.id, keyId: b.keyId, access: 'readwrite' },
     };
-    this.backendPeers.set(peer, { id: b.id, ...(this.backendPeers.get(peer)?.admitted ? { admitted: true as const } : {}) });
+    this.backendPeers.set(peer, { id: b.id, access: 'readwrite', ...(this.backendPeers.get(peer)?.admitted ? { admitted: true as const } : {}) });
     // The backend's consumer walks its own items only (known since the daemon started; again here in case it was forgotten).
     this.d.queue.register(name, b.id);
     if (f.consumer !== undefined) this.backendPush.set(b.id, { peer, push: this.startPush(peer, name) });
@@ -479,7 +568,7 @@ export class HostService implements HostFrames {
       name,
       protocol: PROTOCOL_VERSION,
       host: false,
-      backend: { id: b.id },
+      backend: { id: b.id, access: 'readwrite' },
       bindings: { version: null, active: false },
       ...(f.consumer !== undefined ? { inbound: { consumer: name, acked: this.d.queue.cursor(name), head: this.d.queue.headOf(name) } } : {}),
       ...(replaced !== undefined ? { replaced: { name: replaced } } : {}),
@@ -508,12 +597,13 @@ export class HostService implements HostFrames {
     const given = Buffer.from(f.token);
     const isHost = given.length === this.token.length && timingSafeEqual(given, this.token);
     // PB-1: a connection the console admitted with a backend's key is that backend's and nobody else's:
-    // not the host (whoever holds the host token as well), not another backend.
+    // not the host (whoever holds the host token as well), not another backend, and (PB-7) not the same
+    // backend's key of the other level: admitted to observe, it never becomes the backend.
     const admitted = this.backendPeers.get(peer);
     if (admitted) {
       const b = isHost ? undefined : this.d.backends?.verify(f.token);
-      if (b?.id === admitted.id) return this.backendHello(peer, f, b);
-      this.d.log('warn', `host.hello on a connection admitted with backend ${admitted.id}'s key, with ${isHost ? 'the host token' : b ? `backend ${b.id}'s key` : 'a wrong token'}`);
+      if (b && b.id === admitted.id && b.access === admitted.access) return this.backendHello(peer, f, b);
+      this.d.log('warn', `host.hello on a connection admitted with backend ${admitted.id}'s ${admitted.access === 'read' ? 'read key' : 'key'}, with ${isHost ? 'the host token' : b ? `backend ${b.id}'s ${b.access === 'read' ? 'read key' : 'key'}` : 'a wrong token'}`);
       return fail('unauthorized', `this connection was opened with backend ${admitted.id}'s key: host.hello takes that key only`);
     }
     if (!isHost) {
@@ -581,7 +671,7 @@ export class HostService implements HostFrames {
       bindings: { version: st?.table.version ?? null, active: st?.active ?? false, ...(st?.suspended ? { suspended: st.suspended } : {}) },
       ...(f.consumer !== undefined ? { inbound: { consumer: f.consumer, acked: this.d.queue.cursor(f.consumer), head: this.d.queue.head() } } : {}),
       ...(replaced !== undefined ? { replaced: { name: replaced } } : {}),
-      features: [...FEATURES.filter((x) => (x !== 'resolve.onBehalfOf' || this.d.answerOnBehalf) && (x !== 'test.hooks' || this.d.testHooks?.() === true) && (x !== 'blobs' || this.d.blobs !== undefined)), ...(backends ? [BACKENDS_FEATURE] : []), ...(this.d.moduleFeatures?.() ?? [])],
+      features: [...FEATURES.filter((x) => (x !== 'resolve.onBehalfOf' || this.d.answerOnBehalf) && (x !== 'test.hooks' || this.d.testHooks?.() === true) && (x !== 'blobs' || this.d.blobs !== undefined)), ...(backends ? [BACKENDS_FEATURE, BACKEND_ACCESS_FEATURE] : []), ...(this.d.moduleFeatures?.() ?? [])],
       ...(f.callouts !== undefined ? { callouts: role ? [...hooks] : [] } : {}),
       ...(role && hooks.has('outbound.scoped') ? { outboundScope: { revision: this.outboundScope()!.revision, routes: this.outboundScope()!.routes.length } } : {}),
       ...(f.optIn !== undefined ? { optIn: role ? [...optIn] : [] } : {}),
@@ -621,7 +711,7 @@ export class HostService implements HostFrames {
         p.push.close();
         this.backendPush.delete(b.id);
       }
-      this.d.log('info', `backend ${b.id} disconnected`);
+      this.d.log('info', b.access === 'read' ? `backend ${b.id}: a read-only connection closed` : `backend ${b.id} disconnected`);
       return;
     }
     if (this.host?.peer !== peer) return;
@@ -762,7 +852,10 @@ export class HostService implements HostFrames {
  * `SessionInfo` (the `sessions` answer, the console's sessions) and the snapshot carry `attention`, what is pending in the
  * session now; a host asking `optIn: ["attention"]` gets an `attention.changed` frame on each change. `binding.tag` (RT-1):
  * a host rule's `tag` is checked, copied to the items it queues (`InboundItem.tag`) and shown by `explain`. `blobs` (PB-6):
- * the `blob.stat`, `blob.get` and `blob.put` requests (only with a blob store). These are the
+ * the `blob.stat`, `blob.get` and `blob.put` requests (only with a blob store). `backends` and, after it,
+ * `backends.access` (PB-1, PB-7; only while a backend is configured): backend keys, and their two levels
+ * (`backends.key` takes `access`, key answers and `host.hello` say it). `blobs.read` is never in this
+ * list: it is what a read key's hello says instead of `blobs` (`blob.stat` and `blob.get`, no `blob.put`). These are the
  * kernel's own; `host.hello` adds the features of the modules that run (`ModuleManifest.features`) after them.
  */
 export const FEATURES = [
@@ -803,6 +896,38 @@ export const FEATURES = [
 
 /** The kernel's too, advertised after `FEATURES` while a backend is configured (PB-1): no module's feature may be it. */
 export const BACKENDS_FEATURE = 'backends';
+
+/**
+ * The kernel's too, after `backends` (PB-7): this daemon knows the two key levels. `backends.key`
+ * takes `access` and answers it, `host.hello` with a key says `backend.access`. A daemon without it
+ * ignores `access` and acts on the read-write key, so a client asks for a read key only when it is here.
+ */
+export const BACKEND_ACCESS_FEATURE = 'backends.access';
+
+/** In a read key's hello where a read-write key's says `blobs` (PB-7): `blob.stat` and `blob.get`, no `blob.put`. No module's feature may be it. */
+export const BLOBS_READ_FEATURE = 'blobs.read';
+
+/**
+ * PB-7: the host frames a backend's READ key may use, besides `history.read` when
+ * `backends.<id>.history` is on. Default deny: a frame added later is not a read key's until it is
+ * listed here, and nothing that changes anything ever is.
+ */
+const READ_FRAMES: ReadonlySet<HostRequestFrame['type']> = new Set(['host.hello', 'inbound.read', 'blob.stat', 'blob.get']);
+
+/** PB-7: the one answer to everything a read key may not do. It says nothing but that. */
+const READ_ONLY: Outcome = { ok: false, code: 'forbidden', message: 'this key is read-only' };
+
+/**
+ * PB-7: how many `inbound.read` long-polls one read connection may have waiting, and how many read
+ * connections that said hello a backend may have. Each waiting long-poll is woken, and reads the
+ * queue again, on every append (any backend's item, the host's): without a bound a read key could
+ * make every append as slow as it liked for everybody. A push connection waits once.
+ */
+export const MAX_OBSERVER_WAITS = 4;
+export const MAX_OBSERVERS = 32;
+
+const OBSERVER_BUSY: Outcome = { ok: false, code: 'busy', message: `at most ${MAX_OBSERVER_WAITS} inbound.read may wait on one read-only connection: wait for one to answer` };
+const OBSERVERS_FULL: Outcome = { ok: false, code: 'busy', message: `at most ${MAX_OBSERVERS} read-only connections per backend: close one first` };
 
 /**
  * PB-1: the host frames a backend's key may use, besides `history.read` when `backends.<id>.history`

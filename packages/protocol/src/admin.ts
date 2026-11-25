@@ -1,6 +1,6 @@
 import { Type, type Static, type TSchema } from '@sinclair/typebox';
 import { SessionInfo } from './client.js';
-import { BackendsForgetResult, BackendsKeyResult, BackendsListResult, RouteExplanation } from './host.js';
+import { BackendAccess, BackendsForgetResult, BackendsKeyResult, BackendsListResult, RouteExplanation } from './host.js';
 import { Topic } from './topic.js';
 
 /*
@@ -303,8 +303,8 @@ export type AdminSessions = Static<typeof AdminSessions>;
 export const AdminBackends = BackendsListResult;
 export type AdminBackends = Static<typeof AdminBackends>;
 
-/** `POST /api/backends/:id/key`: as `backends.key`. 404 `unknown_backend`, 409 `key_exists`. */
-export const AdminBackendKeyRequest = Type.Object({ op: Type.Union([Type.Literal('issue'), Type.Literal('rotate'), Type.Literal('revoke')]) });
+/** `POST /api/backends/:id/key`: as `backends.key` (`access` default `readwrite`). 404 `unknown_backend`, 409 `key_exists`. */
+export const AdminBackendKeyRequest = Type.Object({ op: Type.Union([Type.Literal('issue'), Type.Literal('rotate'), Type.Literal('revoke')]), access: Type.Optional(BackendAccess) });
 export type AdminBackendKeyRequest = Static<typeof AdminBackendKeyRequest>;
 
 /** The key is in the answer of `issue` and `rotate` only, this once. */

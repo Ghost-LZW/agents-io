@@ -10,6 +10,7 @@ import type {
   AdminRoute,
   AdminSessions,
   AdminStatus,
+  BackendAccess,
   ConfigAccess,
   Origin,
 } from '@agents-io/protocol';
@@ -43,15 +44,16 @@ export interface ConsoleHost {
   readonly local: LocalHost;
   /** The daemon's host token. */
   readonly token: string;
-  /** The backend whose key this token is (PB-1). Such a token opens `/ws` only: every `/api/*` answers 403. */
-  backendOf?(token: string): string | undefined;
+  /** The backend whose key this token is, and the key's level (PB-1, PB-7). Such a token opens `/ws` only: every `/api/*` answers 403. */
+  backendOf?(token: string): { id: string; access: BackendAccess } | undefined;
   status(): AdminStatus;
   queue(): AdminQueue;
   sessions(): AdminSessions;
   /** Backend keys and state (PB-3). Absent: `/api/backends*` answer 404. */
   readonly backends?: {
     list(): AdminBackends;
-    key(id: string, op: 'issue' | 'rotate' | 'revoke'): Outcome;
+    /** `access`: which of the backend's keys (default `readwrite`). */
+    key(id: string, op: 'issue' | 'rotate' | 'revoke', access?: BackendAccess): Outcome;
     forget(id: string): Outcome;
   };
   explain(inputId: string): AdminExplain | undefined;

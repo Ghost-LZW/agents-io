@@ -79,6 +79,28 @@ func TestHostTokenIsRefusedLocally(t *testing.T) {
 	}
 }
 
+// A read key (the router's `aio backend key <id> --read`) only observes. The probe's hello says so, and the program
+// says so in turn instead of asking to consume and being refused for a reason it could not name.
+func TestReadKeyIsSaidAndNeverConsumes(t *testing.T) {
+	fr := newFakeRouter(t)
+	fr.set(func(f *fakeRouter) { f.access = "read" })
+	r := startRig(t, fr, newFakeHub(t))
+	var st wire.ConnectorStatus
+	eventually(t, "the read key is said", func() bool { st = r.status(); return st.Error == wordsReadKey })
+	if st.State != wire.ConnectorStateError || len(st.Guide) == 0 || !strings.Contains(st.Error, "--read") {
+		t.Errorf("status = %+v", st)
+	}
+	time.Sleep(100 * time.Millisecond) // several retries
+	for _, h := range fr.helloList() {
+		if _, has := h["consumer"]; has {
+			t.Fatalf("a consuming hello was sent with a read key: %v", h)
+		}
+	}
+	// The read-write key is put in its place (here: the router answers the other level): the next attempt connects.
+	fr.set(func(f *fakeRouter) { f.access = "readwrite" })
+	r.waitState(wire.ConnectorStateOk)
+}
+
 func TestKeyRefusedAtUpgrade(t *testing.T) {
 	fr := newFakeRouter(t)
 	fr.set(func(f *fakeRouter) { f.key = "aiob_another_key_not_real" })
@@ -225,6 +247,15 @@ func TestSettingsCheck(t *testing.T) {
 	fr.set(func(f *fakeRouter) { f.features, f.noBackend = []string{"backends"}, true })
 	if res := check(fr.url(), fakeKey); res.Ok || res.Error != wordsNotBackend {
 		t.Errorf("host token: %+v", res)
+	}
+	// A read key is refused before it is saved; the level a router of today says for the usual key is not.
+	fr.set(func(f *fakeRouter) { f.noBackend, f.access = false, "read" })
+	if res := check(fr.url(), fakeKey); res.Ok || res.Error != wordsReadKey {
+		t.Errorf("read key: %+v", res)
+	}
+	fr.set(func(f *fakeRouter) { f.access = "readwrite" })
+	if res := check(fr.url(), fakeKey); !res.Ok {
+		t.Errorf("read-write key of a router with key levels refused: %+v", res)
 	}
 	fr.set(func(f *fakeRouter) { f.noBackend, f.upgradeStatus = false, 403 })
 	if res := check(fr.url(), fakeKey); res.Ok || res.Error != wordsRefused {

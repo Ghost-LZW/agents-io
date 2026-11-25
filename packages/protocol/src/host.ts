@@ -283,7 +283,8 @@ export const HostHello = Type.Object({
   ...Req('host.hello'),
   /**
    * The host token (daemon-generated, read from a 0600 file next to the socket), or a backend
-   * key (feature `backends`): the key decides which backend the connection is.
+   * key of either level (feature `backends`): the key decides which backend the connection is and
+   * what it may do (`BackendAccess`; the answer's `backend.access` says which).
    */
   token: Type.String(),
   name: Type.String(),
@@ -574,14 +575,31 @@ export const BackendsList = Type.Object({ ...Req('backends.list') });
 export type BackendsList = Static<typeof BackendsList>;
 
 /**
- * A backend's key. `issue`: a first key (`key_exists` when it has one). `rotate`: a new key; the
- * old one stops working at once and connections made with it are closed. `revoke`: no key at all.
- * `unknown_backend`: the id is not in the config.
+ * What a backend key lets its connection do (PB-7). `readwrite`: the backend itself. It consumes its
+ * queue (pull, ack, push), delivers, edits, marks messages, reads and uploads its blobs. `read`: an
+ * observer of that backend. It looks at the backend's queue items without consuming them
+ * (`inbound.read`), reads the blobs the backend may read (`blob.stat`, `blob.get`) and, where the
+ * backend may, `history.read`; everything else answers `forbidden`. A backend holds at most one key
+ * of each level.
+ */
+export const BackendAccess = Type.Union([Type.Literal('read'), Type.Literal('readwrite')]);
+export type BackendAccess = Static<typeof BackendAccess>;
+
+/**
+ * A backend's key of one level (`access`, default `readwrite`). `issue`: a first key of that level
+ * (`key_exists` when it has one). `rotate`: a new key; the old one stops working at once and
+ * connections made with it are closed. `revoke`: no key of that level. The other level's key and
+ * connections are untouched. `unknown_backend`: the id is not in the config.
  */
 export const BackendsKey = Type.Object({
   ...Req('backends.key'),
   backend: Type.String(),
   op: Type.Union([Type.Literal('issue'), Type.Literal('rotate'), Type.Literal('revoke')]),
+  /**
+   * Which of the backend's keys (feature `backends.access`). Default `readwrite`. A daemon without
+   * the feature ignores this field and acts on the read-write key: check the answer's `access`.
+   */
+  access: Type.Optional(BackendAccess),
 });
 export type BackendsKey = Static<typeof BackendsKey>;
 
@@ -916,8 +934,11 @@ export const HostHelloResult = Type.Object({
   outboundScope: Type.Optional(Type.Object({ revision: Type.Number(), routes: Type.Number() })),
   /** The hello's `optIn` this connection was granted (empty unless it is the host). */
   optIn: Type.Optional(Type.Array(Type.String())),
-  /** The hello's token was a backend key: the backend this connection is (it is not the host). */
-  backend: Type.Optional(Type.Object({ id: Type.String() })),
+  /**
+   * The hello's token was a backend key: the backend this connection is (it is not the host), and
+   * the key's level. A daemon that does not send `access` has read-write keys only.
+   */
+  backend: Type.Optional(Type.Object({ id: Type.String(), access: Type.Optional(BackendAccess) })),
 });
 export type HostHelloResult = Static<typeof HostHelloResult>;
 
@@ -1269,10 +1290,12 @@ export const BackendInfo = Type.Object({
   note: Type.Optional(Type.String()),
   /** `backends.<id>.history`: it may use `history.read`. */
   history: Type.Boolean(),
-  /** Its key, if it has one: `id` is the first 12 hex digits of the key's SHA-256. Never the key. */
+  /** Its read-write key, if it has one: `id` is the first 12 hex digits of the key's SHA-256. Never the key. */
   key: Type.Optional(Type.Object({ id: Type.String(), createdAt: Type.Number() })),
-  /** Connections authenticated with its key now. */
+  /** Connections authenticated with its read-write key now. */
   connections: Type.Number(),
+  /** Its read key (PB-7), only while it has one: the key's id and age, and the connections made with it now. */
+  read: Type.Optional(Type.Object({ key: Type.Object({ id: Type.String(), createdAt: Type.Number() }), connections: Type.Number() })),
   /** One of them is pushed its items. */
   push: Type.Boolean(),
   /** Its queue consumer: `backend:<id>`. */
@@ -1297,8 +1320,10 @@ export const BackendsKeyResult = Type.Object({
   key: Type.Optional(Type.String()),
   keyId: Type.Optional(Type.String()),
   createdAt: Type.Optional(Type.Number()),
-  /** Connections of this backend that were closed. */
+  /** Connections of this backend that were closed (those made with a key of this level). */
   closed: Type.Number(),
+  /** The level of the key this acted on. A daemon that does not send it knows read-write keys only. */
+  access: Type.Optional(BackendAccess),
 });
 export type BackendsKeyResult = Static<typeof BackendsKeyResult>;
 

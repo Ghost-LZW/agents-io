@@ -19,6 +19,7 @@ import {
   errors,
   type AdminError,
   type AdminLoginResult,
+  type BackendAccess,
 } from '@agents-io/protocol';
 import {
   FrameConn,
@@ -115,7 +116,7 @@ function compileRoute(r: ContributedRoute): CompiledRoute {
 }
 
 type Role = 'host' | 'session' | 'backend';
-type Checked = { ok: true; role: 'host' | 'session' } | { ok: true; role: 'backend'; backend: string } | { ok: false; why: string };
+type Checked = { ok: true; role: 'host' | 'session' } | { ok: true; role: 'backend'; backend: string; access: BackendAccess } | { ok: false; why: string };
 
 /** One-time login tokens and console sessions, in memory (gone at restart). Stored hashed. */
 export class ConsoleAuth {
@@ -127,8 +128,8 @@ export class ConsoleAuth {
     hostToken: string,
     private readonly sessionTtlMs: number,
     private readonly now: () => number = Date.now,
-    /** The backend whose key a token is (PB-1); absent: no token is a backend's. */
-    private readonly backendOf?: (token: string) => string | undefined,
+    /** The backend whose key a token is, and the key's level (PB-1, PB-7); absent: no token is a backend's. */
+    private readonly backendOf?: (token: string) => { id: string; access: BackendAccess } | undefined,
   ) {
     this.host = Buffer.from(hostToken);
   }
@@ -160,7 +161,7 @@ export class ConsoleAuth {
     const given = Buffer.from(token);
     if (given.length === this.host.length && timingSafeEqual(given, this.host)) return { ok: true, role: 'host' };
     const backend = this.backendOf?.(token);
-    if (backend !== undefined) return { ok: true, role: 'backend', backend };
+    if (backend !== undefined) return { ok: true, role: 'backend', backend: backend.id, access: backend.access };
     const k = hash(token);
     const s = this.sessions.get(k);
     if (s === undefined) return { ok: false, why: 'wrong token' };
@@ -362,7 +363,9 @@ export class ConsoleServer {
     const backend = h.backends && m === 'POST' ? /^\/api\/backends\/([^/]+)\/(key|forget)$/.exec(p) : null;
     if (h.backends && backend) {
       const id = decode(backend[1]!);
-      const r = backend[2] === 'key' ? h.backends.key(id, (await readJson(req, AdminBackendKeyRequest)).op) : h.backends.forget(id);
+      // `access` (PB-7): which of its keys; absent, the read-write one. A level the schema does not name is 400.
+      const body = backend[2] === 'key' ? await readJson(req, AdminBackendKeyRequest) : undefined;
+      const r = body ? h.backends.key(id, body.op, body.access) : h.backends.forget(id);
       if (r.ok) return { status: 200, body: r.value };
       throw new HttpError(r.code === 'unknown_backend' ? 404 : r.code === 'key_exists' ? 409 : r.code === 'invalid_frame' ? 400 : 500, r.code === 'invalid_frame' ? 'invalid_request' : r.code, r.message);
     }
@@ -411,12 +414,15 @@ export class ConsoleServer {
     if (protocols.length && !protocols.includes(ADMIN_WS_SUBPROTOCOL)) return refuse(400, 'invalid_request', `subprotocol ${ADMIN_WS_SUBPROTOCOL} is required`);
     const r = this.auth.check(this.credentials(req, bearer), req.headers.host);
     if (!r.ok) return refuse(401, 'unauthorized', r.why);
-    const backend = r.role === 'backend' ? r.backend : undefined;
+    const backend = r.role === 'backend' ? { id: r.backend, access: r.access } : undefined;
     this.wss.handleUpgrade(req, socket, head, (ws) => this.onSocket(ws, backend));
   }
 
-  /** `backend`: the connection was admitted with that backend's key; it speaks host frames only, as that backend (PB-1). */
-  private onSocket(ws: WebSocket, backend?: string): void {
+  /**
+   * `backend`: the connection was admitted with that backend's key; it speaks host frames only, as
+   * that backend (PB-1), and at the level of the key it was admitted with (PB-7).
+   */
+  private onSocket(ws: WebSocket, backend?: { id: string; access: BackendAccess }): void {
     // Frames handed to the socket and not yet written out by it; who waits for that (PR-2: `blob.get`).
     let unwritten = 0;
     const waiting: (() => void)[] = [];
@@ -452,12 +458,12 @@ export class ConsoleServer {
         ws.once('close', () => clearTimeout(t));
       },
     };
-    const c = new FrameConn(transport, this.o.host.local, () => this.conns.delete(c), { origin: (key) => this.o.host.consoleOrigin(key), ...(backend !== undefined ? { backend } : {}) });
+    const c = new FrameConn(transport, this.o.host.local, () => this.conns.delete(c), { origin: (key) => this.o.host.consoleOrigin(key), ...(backend !== undefined ? { backend: backend.id } : {}) });
     this.conns.add(c);
     if (backend !== undefined) {
       const hf = this.o.host.local.hostFrames;
       // Known to the host service before any hello, so a rotated or revoked key closes this connection too (PB-3).
-      if (hf?.attachBackend) hf.attachBackend(c, backend);
+      if (hf?.attachBackend) hf.attachBackend(c, backend.id, backend.access);
       // Without it nothing would hold the connection to its backend: do not keep it.
       else c.end('this server has no backends');
     }

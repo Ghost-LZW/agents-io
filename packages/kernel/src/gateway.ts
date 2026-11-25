@@ -6,6 +6,7 @@ import {
   formatAddress,
   routeKey,
   type AdminQueue,
+  type BackendAccess,
   type BackendsForgetResult,
   type BackendsKeyResult,
   type BackendsListResult,
@@ -575,7 +576,7 @@ export class Gateway {
     });
     // Uploads that expired while the daemon was down go now; the rest on the hourly sweep.
     void this.hostBlobs.sweep();
-    for (const id of this.backends.pruneUnconfigured()) this.log('warn', `backend ${id} is no longer in the config: its key is revoked (its queue items, cursor and send grants are kept; aio backend forget ${id} removes them)`);
+    for (const id of this.backends.pruneUnconfigured()) this.log('warn', `backend ${id} is no longer in the config: its keys are revoked (its queue items, cursor and send grants are kept; aio backend forget ${id} removes them)`);
     // Every topic change is recorded (topic.changed) in the session left and the one now current.
     this.topics = new TopicRegistry({ ...db, hub: this.hub, onChange: (ch) => this.topicChanged(ch) });
     // Agents: the configured ones, or `default` on the default instance with sessions keyed by bare route keys as before.
@@ -737,7 +738,7 @@ export class Gateway {
       backends: {
         ids: () => Object.keys(this.o.config.backends ?? {}),
         verify: (token) => this.backends.verify(token),
-        current: (id, keyId) => this.backends.current(id, keyId),
+        current: (id, keyId, access) => this.backends.current(id, keyId, access),
         history: (id) => this.o.config.backends?.[id]?.history === true,
       },
       blobs: {
@@ -745,7 +746,7 @@ export class Gateway {
         get: (f, backend) => this.hostBlobs.get(f, backend),
         put: (f, backend) => this.hostBlobs.put(f, backend),
       },
-      backendsAdmin: { list: () => ({ ok: true, value: this.backendsList() }), key: (id, op) => this.backendKey(id, op), forget: (id) => this.backendForget(id) },
+      backendsAdmin: { list: () => ({ ok: true, value: this.backendsList() }), key: (id, op, access) => this.backendKey(id, op, access), forget: (id) => this.backendForget(id) },
       answerOnBehalf: c.policy.answerOnBehalf,
       log: (level, msg, data) => this.log(level, msg, data),
       onScope: () => this.leaveScopedLives(),
@@ -1118,10 +1119,13 @@ export class Gateway {
       host: {
         local: this,
         token: this.token,
-        backendOf: (token) => this.backends.verify(token)?.id,
+        backendOf: (token) => {
+          const b = this.backends.verify(token);
+          return b ? { id: b.id, access: b.access } : undefined;
+        },
         status: () => this.adminStatus(),
         queue: () => this.adminQueue(),
-        backends: { list: () => this.backendsList(), key: (id, op) => this.backendKey(id, op), forget: (id) => this.backendForget(id) },
+        backends: { list: () => this.backendsList(), key: (id, op, access) => this.backendKey(id, op, access), forget: (id) => this.backendForget(id) },
         sessions: () => this.adminSessions(),
         explain: (id) => this.router.explain(id),
         consoleOrigin: (key) => this.consoleOrigin(key),
@@ -1293,7 +1297,10 @@ export class Gateway {
   backendsList(): BackendsListResult {
     const configured = this.o.config.backends ?? {};
     const consumers = new Map(this.hostQueue.consumers().flatMap((x) => (x.target !== undefined && x.name === `backend:${x.target}` ? [[x.target, x] as const] : [])));
-    const keys = new Map(this.backends.list().map((k) => [k.backend, k]));
+    // `key`, `connections` and `push` are the read-write level's; `read` (PB-7) is there only while a read key is.
+    const all = this.backends.list();
+    const keys = new Map(all.filter((k) => k.access === 'readwrite').map((k) => [k.backend, k]));
+    const readKeys = new Map(all.filter((k) => k.access === 'read').map((k) => [k.backend, k]));
     const ids = [...Object.keys(configured), ...[...consumers.keys()].filter((id) => !(id in configured)).sort()];
     return {
       backends: ids.map((id) => {
@@ -1301,6 +1308,7 @@ export class Gateway {
         const acked = consumers.get(id)?.acked ?? 0;
         const p = this.hostQueue.pending(acked, id);
         const k = b ? keys.get(id) : undefined;
+        const rk = b ? readKeys.get(id) : undefined;
         return {
           id,
           configured: b !== undefined,
@@ -1308,6 +1316,7 @@ export class Gateway {
           history: b?.history ?? false,
           ...(k ? { key: { id: k.keyId, createdAt: k.createdAt } } : {}),
           ...this.host.backendConnections(id),
+          ...(rk ? { read: { key: { id: rk.keyId, createdAt: rk.createdAt }, connections: this.host.backendReadConnections(id) } } : {}),
           consumer: `backend:${id}`,
           acked,
           pending: p.count,
@@ -1319,25 +1328,29 @@ export class Gateway {
   }
 
   /**
-   * `backends.key` (PB-3): issue, rotate or revoke a configured backend's key. The key is in the
-   * answer of `issue` / `rotate` and nowhere else: the log names it by its id. Connections made
-   * with the key it replaces or removes are closed.
+   * `backends.key` (PB-3, PB-7): issue, rotate or revoke a configured backend's key of one level
+   * (`access`, default the read-write key). The key is in the answer of `issue` / `rotate` and
+   * nowhere else: the log names it by its id. Connections made with the key it replaces or removes
+   * are closed; the other level's key and connections are untouched.
    */
-  backendKey(id: string, op: 'issue' | 'rotate' | 'revoke'): Outcome {
+  backendKey(id: string, op: 'issue' | 'rotate' | 'revoke', access: BackendAccess = 'readwrite'): Outcome {
+    // The read-write key is "key" as it always was in the log; the read key says so.
+    const what = access === 'read' ? 'read key' : 'key';
     try {
       if (op === 'revoke') {
-        const had = this.backends.revoke(id);
-        const closed = this.host.dropBackend(id, 'its key was revoked');
-        this.hostBlobs.dropParts(id);
-        this.log('info', `backend ${id}: ${had ? 'key revoked' : 'revoke: it had no key'}${closed ? `; ${closed} connection(s) closed` : ''}`);
-        return { ok: true, value: { backend: id, op, closed } satisfies BackendsKeyResult };
+        const had = this.backends.revoke(id, access);
+        const closed = this.host.dropBackend(id, `its ${what} was revoked`, access);
+        // PB-6: unfinished uploads are the read-write connections'; a read key going away leaves them.
+        if (access === 'readwrite') this.hostBlobs.dropParts(id);
+        this.log('info', `backend ${id}: ${had ? `${what} revoked` : `revoke: it had no ${what}`}${closed ? `; ${closed} connection(s) closed` : ''}`);
+        return { ok: true, value: { backend: id, op, access, closed } satisfies BackendsKeyResult };
       }
-      const k = op === 'issue' ? this.backends.issue(id) : this.backends.rotate(id);
-      const closed = this.host.dropBackend(id, 'its key was replaced');
+      const k = op === 'issue' ? this.backends.issue(id, access) : this.backends.rotate(id, access);
+      const closed = this.host.dropBackend(id, `its ${what} was replaced`, access);
       // PB-6: an upload the old key left unfinished is not the new key's to continue.
-      this.hostBlobs.dropParts(id);
-      this.log('info', `backend ${id}: key ${op === 'issue' ? 'issued' : 'rotated'} (key id ${k.keyId})${closed ? `; ${closed} connection(s) closed` : ''}`);
-      return { ok: true, value: { backend: id, op, key: k.key, keyId: k.keyId, createdAt: k.createdAt, closed } satisfies BackendsKeyResult };
+      if (access === 'readwrite') this.hostBlobs.dropParts(id);
+      this.log('info', `backend ${id}: ${what} ${op === 'issue' ? 'issued' : 'rotated'} (key id ${k.keyId})${closed ? `; ${closed} connection(s) closed` : ''}`);
+      return { ok: true, value: { backend: id, op, access, key: k.key, keyId: k.keyId, createdAt: k.createdAt, closed } satisfies BackendsKeyResult };
     } catch (e) {
       if (e instanceof BackendKeyError) return fail(e.code, e.message);
       throw e;

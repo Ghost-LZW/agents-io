@@ -35,7 +35,7 @@ func (x *app) statusNow() wire.ConnectorStatus {
 	case phaseOK:
 	case phaseKeyRefused:
 		return wire.ConnectorStatus{State: wire.ConnectorStateNotSignedIn, Error: wordsKeyRefused, Guide: setupGuide}
-	case phaseNotBackend, phaseNoBackends:
+	case phaseNotBackend, phaseReadKey, phaseNoBackends:
 		return wire.ConnectorStatus{State: wire.ConnectorStateError, Error: wordsOfPhase(s.phase), Guide: setupGuide}
 	default:
 		words := wordsOfPhase(s.phase)
