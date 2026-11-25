@@ -293,16 +293,47 @@ func (x *app) reply(ctx context.Context, p wire.ConnectorInboxReply) (ext.Empty,
 // asks once more for the same operation without the reply target (the router allows sending to the conversation; a
 // refused request does not use up the operation id).
 func (x *app) deliverOnce(ctx context.Context, op string, route replyRoute, text string) (deliverResult, error) {
+	res, _, err := x.deliverOnceWithin(ctx, op, route, text, x.tm.deliver)
+	return res, err
+}
+
+// deliverOnceWithin is the one way out for every message this program sends: an answer, an Inbox reply, a send the
+// assistant asked for. wait is how long each request waits for its answer; droppedReply says the result is that of
+// the request without the reply target. While it runs the conversation is known to have a send under way, and what
+// was delivered is remembered by its platform ids, so the message coming back through the router as an item is known
+// for our own (intake).
+func (x *app) deliverOnceWithin(ctx context.Context, op string, route replyRoute, text string, wait time.Duration) (res deliverResult, droppedReply bool, err error) {
 	rt := x.router()
 	if rt == nil {
-		return deliverResult{}, errDisconnected
+		return deliverResult{}, false, errDisconnected
 	}
-	res, err := rt.deliver(ctx, op, route, text)
+	key := destKey(route.Channel, route.Account, route.ConversationID)
+	x.mu.Lock()
+	x.sending[key]++
+	x.mu.Unlock()
+	defer func() {
+		x.mu.Lock()
+		if x.sending[key]--; x.sending[key] <= 0 {
+			delete(x.sending, key)
+		}
+		x.mu.Unlock()
+	}()
+	res, err = rt.deliver(ctx, op, route, text, wait)
 	if routerCode(err) == codeRouteNotAllowed && route.ReplyToMessageID != "" {
 		route.ReplyToMessageID = ""
-		res, err = rt.deliver(ctx, op, route, text)
+		droppedReply = true
+		res, err = rt.deliver(ctx, op, route, text, wait)
 	}
-	return res, err
+	if st := x.store(); err == nil && res.Status == deliverDelivered && st != nil {
+		ids := res.messageIDs()
+		// Before the conversation stops counting as sending: an echo that waited for this answer finds the id.
+		st.noteSent(route.Channel, ids, time.Now())
+		if n := st.skipEchoes(route.Channel, ids); n > 0 {
+			log.Printf("echo: %d item(s) taken before the send was answered are our own message", n)
+			x.inboxChanged()
+		}
+	}
+	return res, droppedReply, err
 }
 
 // errKind is an error's kind for the log: never its words.

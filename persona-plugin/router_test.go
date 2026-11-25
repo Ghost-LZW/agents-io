@@ -286,6 +286,39 @@ func TestSettingsCheckThroughTheHub(t *testing.T) {
 	}
 }
 
+// TestSettingsCheckRefusesBadDestinations: a line of the destinations that cannot be read is refused before anything
+// is saved, with its number, whether or not an address is filled in; lines that read well go on to the handshake.
+func TestSettingsCheckRefusesBadDestinations(t *testing.T) {
+	fr := newFakeRouter(t)
+	r := startRig(t, fr, newFakeHub(t))
+	check := func(config map[string]any) wire.SettingsCheckResult {
+		t.Helper()
+		cfg, _ := json.Marshal(config)
+		var res wire.SettingsCheckResult
+		if err := r.h.Call("settings.check", wire.SettingsCheckParams{Config: cfg, Secrets: map[string]string{"backend_key": fakeKey}}, &res); err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	bad := []string{"alpha = demo-chat:default:oc_alpha", "beta = demo-chat:default:" + fakeKey}
+	for _, config := range []map[string]any{
+		{"router_url": fr.url(), "destinations": bad},
+		{"destinations": bad}, // no address yet: still refused
+	} {
+		res := check(config)
+		if res.Ok || !strings.Contains(res.Error, "第 2 行") || !strings.Contains(res.Error, wordsDestSecret) || strings.Contains(res.Error, fakeKey) {
+			t.Errorf("bad destinations: %+v", res)
+		}
+	}
+	before := fr.connectCount()
+	if res := check(map[string]any{"router_url": fr.url(), "destinations": bad[:1]}); !res.Ok {
+		t.Errorf("good destinations: %+v", res)
+	}
+	if fr.connectCount() == before {
+		t.Errorf("good destinations did not go on to the handshake")
+	}
+}
+
 func TestStatusWhenNotConfiguredOrOff(t *testing.T) {
 	fr := newFakeRouter(t)
 	r := startRig(t, fr, newFakeHub(t), withConfig("router_url", ""))

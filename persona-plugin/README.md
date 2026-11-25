@@ -1,12 +1,12 @@
 # agents-io (message router backend)
 
-A [Persona](https://github.com/nwverse/persona) extension that connects one Persona assistant (one manager) to an [agents-io](#what-it-is) message router as one of the router's **backends**. Messages the router routes to this backend go to the Inbox, or to an assistant conversation whose final answer is delivered back to the channel conversation the message came from.
+A [Persona](https://github.com/nwverse/persona) extension that connects one Persona assistant (one manager) to an [agents-io](#what-it-is) message router as one of the router's **backends**. Messages the router routes to this backend go to the Inbox, or to an assistant conversation whose final answer is delivered back to the channel conversation the message came from. The assistant can also send a message on its own initiative, through the router, once the owner confirms it.
 
 - [Extension guide](GUIDE.md)
 - [The router side: backends, keys, frames](../docs/HOSTS.md)
 - [Manifest](persona-extension.json)
 
-This page describes version 0.1.0.
+This page describes version 0.2.0.
 
 ## Build and install
 
@@ -33,7 +33,7 @@ channels ── agents-io router ──(WebSocket /ws, backend key)── this e
 
 It connects to the router console's `/ws` with the backend's key, says `host.hello`, checks that the router advertises the `backends` feature, and consumes the items the router pushes. What happens to an item is chosen by the **tag** the router's rule gives it.
 
-The extension contributes one connector, `agentsio` (connector ids allow no hyphen), with the capabilities `status`, `tools`, `events`, `inbox`, `settle` and `fallback`.
+The extension contributes one connector, `agentsio` (connector ids allow no hyphen), with the capabilities `status`, `tools`, `actions`, `events`, `inbox`, `settle` and `fallback`.
 
 ## Configuration
 
@@ -43,6 +43,7 @@ The extension contributes one connector, `agentsio` (connector ids allow no hyph
 | `backend_key` | secret | The key the router issued for this backend (`aio backend key <backend id>` on the router's machine; it looks like `aiob_example_key_not_real`). Stored through the hub's encrypted secret flow, handed to the program at start, never logged. It must be the backend's read-write key (the command without `--read`): the extension consumes, accepts and answers. A read key (`aiobr_…`, `aio backend key <backend id> --read`) only observes: the router says which level a key is when it answers `host.hello`, so the extension refuses a read key when the settings are saved, never asks to consume with one, and the status says it is a read-only key. Do not put the router's host token here: the extension refuses a key that is not a backend's before taking any role on the router. |
 | `chat_rules` | list of rule names | Router rule ids whose items are handled as `chat` when the item carries no tag. |
 | `guest_rules` | list of rule names | Router rule ids whose items are handled as `guest` when the item carries no tag. |
+| `destinations` | list of lines, at most 32 | Named destinations the assistant may send to before the router ever routed a message from them, one per line: `<name> = <channel>:<account>:<conversation id>`, for example `Project room = demo-chat:default:oc_example`. See [Named destinations](#named-destinations). No secrets belong here, and a line that looks like a key or an address is refused. |
 | `working_mark` | on/off, default on | Ask the router to mark the channel message as working, done or failed (the channel decides how; a channel without marks is skipped quietly). |
 | `chat_wait_minutes` | 5–480, default 240 | How long an item waits for the assistant's answer before it falls back to the Inbox. |
 | `keep_days` | 7–90, default 30 | How long finished records stay in the extension's journal (the dedupe memory). |
@@ -69,7 +70,7 @@ The router's rule that routes an item to this backend may carry a `tag`; the rou
 
 When an item has no tag (an older router, or a rule without one), the rule id carried on the item is looked up in `chat_rules` and `guest_rules`; a rule in neither list is `inbox`. A tag on the item always wins over the lists: a tag this version does not know (`archive`, or `Chat` with a capital) is `inbox` even when the rule's id is in one of the lists, so a rule whose tag changes never keeps sending into an owner's conversation by its name.
 
-**Who should be routed where.** Persona has no sender field: everything this extension sends into a `chat` conversation is treated as the owner speaking, with the owner's tools and data. The only statement of who actually wrote the message is the first line of the text (below). So route to `chat` only the owner, or people the manager is meant to act for; route other people to `guest` or `inbox`. That decision is made in the router's rule table, not here. Message text can still try to instruct the assistant (prompt injection); guest conversations limit what that can reach.
+**Who should be routed where.** Persona has no sender field: everything this extension sends into a `chat` conversation is treated as the owner speaking, with the owner's tools and data (the send tool included: a person routed to `chat` can ask the assistant to message another conversation, and the owner's confirmation on their phone is what stands between that request and a message). The only statement of who actually wrote the message is the first line of the text (below). So route to `chat` only the owner, or people the manager is meant to act for; route other people to `guest` or `inbox`. That decision is made in the router's rule table, not here. Message text can still try to instruct the assistant (prompt injection); guest conversations limit what that can reach.
 
 Some items never go to a conversation whatever their tag, and are filed in the Inbox with the reason: an item without a reply route, a message from a bot or from another deployment's agent (a loop guard), a message with nothing readable, a `guest` item on a hub without guest conversations (it is never opened as an ordinary conversation instead). An echo of the deployment's own message and a card click are recorded and skipped.
 
@@ -93,7 +94,98 @@ The verdict is the router's stamp (owner, known labels, or unknown), not anythin
 - A new item sends `connector.changed {scope: "inbox"}` (at most once a second).
 - `inbox.reply` sends the reply through the router's `deliver` with the operation id `inbox-reply-<client_id>`: the same reply asked twice is sent once. An unknown outcome (no answer, the router's `internal`, a settled status of `unknown`) is an error and is not resent; asking again with the same `client_id` asks the router for the settled record. A refusal of the router (`stopped`, `unauthorized`, `route_not_allowed`, `forbidden` and the like) says nothing was sent and is reported as not sent. A reply while the router is unreachable fails at once; nothing is queued for later.
 - `inbox.settle` is the hub asking which of its open threads are over. The extension answers for threads it replied to or no longer keeps, and puts the done mark on their messages through `message.ack`. The protocol never says "the owner marked this done"; the extension infers it for a thread the hub listed as open before and no longer lists, and marks that one done too. The mark is cosmetic and can arrive late.
-- One read-only tool, `agentsio_about`, says where a conversation's messages come from. It returns no message content. It exists because a guest conversation must name one to eight connector tools.
+- Two read-only tools. `agentsio_about` says where a conversation's messages come from; it returns no message content, and exists because a guest conversation must name one to eight connector tools (it is the only one a guest conversation gets). `agentsio_destinations` lists where the assistant can send (below).
+
+## Sending on the assistant's own initiative
+
+Besides answering what was routed to it, the assistant can send a text message to a channel conversation by itself: to reach a person or another assistant through a channel. Two connector tools do it.
+
+| Tool | Kind | What it does |
+| --- | --- | --- |
+| `agentsio_destinations` | read (`tools.list` / `tools.call`) | Lists the destinations, the last sends and their outcomes, and the limits. No arguments. |
+| `agentsio_send` | write (`actions.list` / `actions.describe` / `actions.do`) | Sends `text` to the destination `to`, optionally as a reply to the message `reply_to`. |
+
+**The owner confirms every send.** The product's connector protocol lets a write happen only in answer to `actions.do`, which the hub calls after its write gate let the call through. The manifest lists `agentsio_send` under `confirm_always`, so no allow rule can turn the gate into "always allow": each send is confirmed on the owner's phone, on a card that shows where the message really goes (from the extension's own table, not from what the model wrote), who the router takes the person there for, who will see it, and the whole text ([the card](#the-confirmation-card)). The tools are not offered to coding agents (`agent_tools` is not declared) and a guest conversation cannot name them.
+
+**Destinations.** A destination is a channel conversation: channel, account and conversation id, the grain of the router's send scope. The assistant never sees or types those. `agentsio_destinations` gives each destination an opaque id (`d-` and twelve hex digits, derived from the coordinates), and `agentsio_send` accepts only an id that is in the list at that moment; any other argument (a channel, a conversation id, attachments) is refused. The list has:
+
+- the conversations the router routed a message from, with a reply route (`source: "seen"`): the channel, the kind of conversation, `label` (the chat's own name; for a direct message without one, the display name of the person in it), `last_from` (the display name of the last person who wrote there, when that is not the label), `sender_verdict` (the router's verdict on that last person, in the sender line's words: owner, known labels or unknown, and the evidence), `same_label`, when a message was last seen, and `last_ref`, the reference of the newest message that can be replied to. These are remembered in the extension's own storage for 180 days after the last message, longer than the journal keeps the messages, because the router's permission to send there does not expire;
+- the named destinations of the settings (`source: "named"`, or `"seen+named"` when the conversation is both).
+
+It returns no account, no conversation id and no message text. Names other people chose are stripped as in the sender line. At most 100 destinations are listed: the named ones, then the conversations seen most recently.
+
+**A name is not an identity.** A label or `last_from` is whatever the other side typed as its display name, and every conversation the router routed a message from is in the list, a stranger's direct message tagged `inbox` included. So:
+
+- a group or thread without a name has no label. It is never called by whoever spoke there last: that person is `last_from`, and the list and the card say "a group without a name";
+- every seen destination carries the router's verdict on the last person who wrote there (for a direct message: on the person it is with). The verdict is the router's stamp, kept with the conversation in the extension's storage, so it outlives the journal like the label does. A stranger who takes the display name of somebody the owner knows is still listed as unknown;
+- destinations of one channel that go by the same name (the owner's name for one, a chat's name, a person's display name, compared without case) are marked `same_label: true`, and the tool's note tells the assistant to ask the owner which one is meant when it cannot tell.
+
+### The confirmation card
+
+`actions.describe` answers the card the owner confirms. Its first lines come from the extension's own records, never from the model's arguments:
+
+```text
+发到：<the owner's name for it, the chat's name, or the person>（<channel> <kind>）；回复 <who> <time> 的消息
+路由对这个人的认定：<verdict>                     a direct message labeled by its person
+最近发言：<display name>（路由认定：<verdict>）     any other conversation
+注意：这个渠道里还有 N 个显示名相同的目的地；这一个最近一次来消息是 <time>
+
+<the whole text>
+```
+
+The reply clause, the verdict line and the warning appear only when they apply; a named destination nothing was received from has no verdict, and its warning says it has not been heard from. The card's `visible` field says who will see the message: the other person of a direct message, everybody in the named group, or "everybody in this group" for a group without a name.
+
+### Named destinations
+
+A conversation the backend was never routed a message from can be named in the `destinations` setting. **Naming it here is not enough: the router's admin must also register the same conversation for this backend, under `backends.<backend id>.routes` in the router's configuration** (channel, account and conversation id, compared field by field). Until then the router answers `route_not_allowed` and the send says so.
+
+A line is `<name> = <channel>:<account>:<conversation id>`, split at the first `=` and the first two `:` after it, so a conversation id may contain colons; a channel or account name with a colon or a space cannot be written this way. The name is one to 40 characters and unique whatever its case; channel and account are at most 64 characters, the conversation id at most 256, none with spaces; a conversation has one name; a line containing `aiob_` or `://` is refused, so a key or an address pasted here never gets saved. `settings.check` refuses the first line that does not read, with its number, before anything is saved (whether or not an address is filled in). A configuration saved without the check (an older hub) starts anyway: the lines that do not read are skipped and the connector's status counts them.
+
+The assistant can propose changes to this list like to any other plain setting; a conversation the router's admin did not register still cannot be sent to.
+
+### What a send does
+
+`reply_to` takes the reference from a sender line (`ref=<16 hex digits>`, or the digits alone) or a destination's `last_ref`. It must name a message the extension received in that destination's conversation and still has in its journal; the message then goes out on that message's reply route (its thread included). Without `reply_to` the message goes to the conversation itself, outside any thread.
+
+The message goes out with the router's `deliver`. Its operation id is `send-<hash of the hub's request id>`, and the router sends at most once per operation id:
+
+- the same call repeated (the hub's `request_id` is the same) is answered from the extension's own record with the first call's result, and the router is not asked at all; a repeat that arrives while the first is under way waits for it. This holds across a restart, and if the record is gone the router itself answers the settled operation;
+- the record is written before the request, so a send found mid-request after a restart is an unknown outcome, not an unsent message;
+- a call without a request id is refused: nothing would make it happen once.
+
+The answer says plainly which of three things happened:
+
+| Outcome | Meaning | What the assistant is told |
+| --- | --- | --- |
+| delivered | The router settled the operation as delivered. | Success, with the destination's label; the platform's message id goes to the hub's sent-as-user ledger as `message_ref`. |
+| refused (not sent) | The router refused the request (nothing was sent, the operation id is not used up), the channel rejected the message, or the connection was gone before anything was written. | An error in one sentence. `route_not_allowed`: the router's admin has not allowed this backend to send there (or the reply target is no longer accepted, or the channel is not running): it names `backends.<id>.routes`. `stopped`, `unauthorized`: the router cannot be reached now. Any other code is quoted. |
+| unknown | No answer within 45 seconds, the router's `internal`, or a settled status of `unknown`: the message may be out. | An error saying so, that nothing is resent, and to check in the channel. |
+
+A reply target the router refuses with `route_not_allowed` is asked once more, under the same operation id, without the reply target (as for answers); the result then says the message did not go out as a reply. Nothing else is retried: two requests of 45 seconds end before the hub's two-minute wait for a connector call does, so the extension is the one that says "unknown". Everything but a delivered send is reported as an error, so the hub's ledger has only what was really sent; the extension's own records show the rest, in `agentsio_destinations` (`recent_sends`: destination id, label, time, outcome, code; never the text) and in the connector's status (sends, not sent and unknown outcomes of the last 24 hours).
+
+**After an unknown outcome.** The outcome is never asked for again by itself. When the owner confirms the same text to the same destination (and the same reply target) again within an hour of the first call, that new call asks the router under the first call's operation id: the router answers the record it settled ("it had gone out; not sent again", or the channel's rejection, which then is the first call's outcome too) or sends for the first time. So "unknown, try again" cannot produce two messages. The hour is counted from the first call; a call that continued it and stayed unknown does not start it again. After the hour, or with another text, it is a new message.
+
+One case ends the continuation early. When the router itself answers that the operation is settled as `unknown` (it sent, or tried to, and could not record or learn what happened), it will never send under that operation again, so asking under it could only repeat "unknown" and the text could never go out. The answer then says so: the router cannot tell either and will not send again; the owner should look in the channel first; a next send of the same text is a new message, and if the first one did go out the other side gets two. From then on the same text confirmed again goes out under its own operation id. The decision to send again is the owner's, on the card, after that warning.
+
+**Limits.**
+
+- Text only, at most 2000 characters after control characters are removed. A backend key cannot read a channel's own limit from the router, so this is a constant; a longer text is refused, never cut. A channel with a lower limit splits or rejects the message itself, and the outcome says what happened.
+- At most 3 sends a minute to one destination and 10 a minute in all, counted from the extension's records (a restart does not reset it; refused and unknown attempts count). Beyond that the call is refused with the code `rate_limited` and `retry_after`, before the owner is asked. Counting and recording a send are one step, so calls the hub runs at the same moment cannot all find room.
+- While the connection to the router is down a send is refused at once, also before the owner is asked. Nothing is queued: no send goes out later by itself, not after a reconnect and not after a restart.
+- The extension cannot ask the router where it may send. A destination in the list can have lost its permission (the admin removed the route or forgot the backend's conversations) or its channel may not be running; the send finds out and says so.
+
+**Guidance for the assistant** is in the two tools' descriptions, which travel with the tools: use them to reach a person or another assistant through a channel; say whose assistant is writing and for whom; never claim in a message that the owner approved or agreed to something; do not use the tool to repeat an answer in a routed conversation, whose final answer is delivered anyway; report `route_not_allowed` honestly; never rephrase and resend after an unknown outcome. The answer of `agentsio_destinations` carries a note of its own: names are what the other side chose, `sender_verdict` is the router's word, somebody whose verdict is unknown is not to be taken for a person the owner knows by the name alone, a group without a label is not to be called by `last_from`, and with `same_label` the owner is asked which one is meant.
+
+### Own messages coming back
+
+A channel may report the account's own messages as inbound ones, so a message the extension sent can come back through the router as a queue item.
+
+- The router stamps the inputs it knows for its own (`origin.self`) and routes them only to rules that ask for them. It knows them by `policy.selfAccounts` and, for a turn of its own host, by its outbound index. **A backend's `deliver` is not in that index**, so list the account in the router's `policy.selfAccounts`: that is the first line of defense, and such items never reach the backend's queue unless a rule includes them. An entry there is `<channel>:<channel user id>`, the id the account's own messages carry as their sender on that channel (for example `demo-chat:ou_example`). It is **not** the `account` of a destinations line or of a route (`demo-chat:default` names the router's channel entry and matches no sender). One that does arrive stamped is recorded and skipped, as before.
+- For what remains, the extension remembers the platform ids of every message it delivered (an answer, an Inbox reply, a send; for seven days), the same evidence the router uses. An item whose channel and message id match is recorded and skipped: it is not filed in the Inbox, not handed to a conversation, and does not become a destination's label or reply target.
+- A channel may hand the echo to the router before the router answers the send. An item of a conversation that has a deliver under way waits up to three seconds for the answer before it is judged; one taken earlier than that (still in the Inbox, or waiting for its turn) is turned into a skipped one when the answer arrives. Having been taken as somebody's message, it may have named the conversation and become its newest message; the conversation then takes its label, verdict and reply target again from the messages of other people the journal still has (none of the three when there is none: no name rather than the account's own).
+- A send the assistant asked for whose answer never came (the outcome is unknown, or the request is still open) has no id to be known by. Its echo is known by the conversation and the text instead: an item of the same conversation with exactly the text that was sent, arriving within ten minutes of the send, is recorded and skipped, and its message id is remembered like a delivered one's. One send explains one item, and an item from somebody the journal has another message from in that conversation is never taken for an echo, whatever it says. The send's own outcome stays unknown: this is a guess about an item, not the router's word about the send. It can be wrong one way: a person who never wrote in that conversation (or whose messages the journal no longer has) and sends exactly the same text within those minutes is skipped. The item is in the journal as skipped; it is not in the Inbox.
+
+Not recognized: an echo whose text the channel shows differently from what was sent when the send's outcome is unknown or the channel gives the echo another id than the one the send was answered with; the echo of an answer or an Inbox reply (not a send the assistant asked for) whose outcome stayed unknown; and an echo whose round trip had already started by the time the send was answered. If a rule tags those `chat`, the assistant may answer its own message once; the answer's echo is then known. Without `policy.selfAccounts` on the router that is the remaining gap; the router stamping a backend's own delivers as `origin.self` would close it, and is not part of this extension.
 
 ## Chat round trip
 
@@ -118,6 +210,7 @@ A message into a conversation whose computer is away is kept by the manager (`20
 - **A capabilities request that fails says nothing about guest conversations.** Only an answer does (`false`, or 404 from an older hub). A `guest` item waits out the failure like a start that was not sent, and is never opened as an ordinary conversation meanwhile.
 - **Replies are idempotent.** The operation id of a delivery comes from the item (or from the hub's `client_id`), so asking again after a reconnect or restart never sends twice. A new id is never used for the same answer.
 - **An answer waits out refusals that are temporary.** The router's `stopped` (it is shutting down) and `unauthorized` (the key was refused) say nothing was sent and do not use up the operation id: the same operation is asked again on the next connection, for up to an hour. `route_not_allowed` is answered for a conversation outside the backend's scope, for a reply target the router no longer accepts, and also while the channel is not running (a router that just came back): it is asked again without the reply target, then again for up to two minutes, always with the same operation id. Other refusals fail at once.
+- **A send the assistant asks for goes out at most once.** Its operation id comes from the hub's request id; a repeat is answered from the extension's record; an unknown outcome is not retried, and the same text confirmed again within an hour continues the first operation instead of starting a second ([above](#what-a-send-does)).
 - **Nothing is lost silently.** Every failed or unknown round trip marks the message failed and turns the item into an Inbox thing that needs you, with the reason. Nothing extra is posted to the channel.
 
 ## Hub scopes
@@ -138,22 +231,28 @@ Without them the extension still connects and files everything in the Inbox, and
 
 ## Storage
 
-Two JSON files in the extension's data directory, mode 0600, replaced atomically: `journal.json` (one record per item: who, where, the text capped at 16 KiB, and where its handling stands) and `conversations.json` (channel conversation to assistant conversation). Finished records are dropped after `keep_days`; a running round trip is never dropped, nor an Inbox item the hub holds open. An Inbox item past the hub's seven-day window that the hub does not hold open is closed, then dropped like any finished record. The journal is capped at 5000 records (the oldest finished ones go first, then the oldest Inbox items), and the mapping of a channel conversation nobody wrote in for 180 days is dropped, so the next message there opens a new assistant conversation. This runs at start and every hour. Media is never stored: an image, file or voice message is named in the text as a placeholder. The log has states, counts, short hashes and error codes only: no key, no token, no message text, no names, no addresses.
+Three JSON files in the extension's data directory, mode 0600, replaced atomically: `journal.json` (one record per item: who, where, the text capped at 16 KiB, and where its handling stands), `conversations.json` (channel conversation to assistant conversation) and `outbound.json` (below). Finished records are dropped after `keep_days`; a running round trip is never dropped, nor an Inbox item the hub holds open. An Inbox item past the hub's seven-day window that the hub does not hold open is closed, then dropped like any finished record. The journal is capped at 5000 records (the oldest finished ones go first, then the oldest Inbox items), and the mapping of a channel conversation nobody wrote in for 180 days is dropped, so the next message there opens a new assistant conversation. This runs at start and every hour.
+
+`outbound.json` has what sending needs: the conversations seen (coordinates, kind, chat name, the last sender's display name and the router's verdict on them, the newest message's reference, when last seen; written for a new conversation or a changed label or verdict and otherwise at most once an hour, and rebuilt from the journal at start, which is also how a data directory of 0.1.0 gets them), one record per send (destination id, operation id, outcome, refusal code, the platform's message id, times, the text's length, a digest of destination, reply target and text and a digest of the text alone, and the id of the item taken for its echo; **never the text**), and the platform ids of the messages the extension delivered. Settled sends are dropped after `keep_days` and capped at 500, conversations after 180 days without a message and capped at 500, message ids after seven days and capped at 2000. A file that cannot be read is set aside as `.corrupt` like the others, and the status says so.
+
+Media is never stored: an image, file or voice message is named in the text as a placeholder. The log has states, counts, short hashes and error codes only: no key, no token, no message text, no names, no addresses.
 
 ## One receiver per channel account
 
 If another extension (for example Open Lark) still receives the same channel account, every message is handled twice. The extension cannot detect that. When the router takes over an account, make sure nothing else in Persona consumes it.
 
-## Not implemented in 0.1.0
+## Not implemented in 0.2.0
 
 - Approvals in the channel: a pending permission or question of a conversation is not shown as a card, and a card click is recorded and skipped. A turn that waits for an approval is answered in the Persona app; the run waits meanwhile.
-- Media: attachments are named, not fetched, and none are sent.
+- Media: attachments are named, not fetched, and none are sent (not by `agentsio_send` either).
 - Progress cards and streaming: only the final answer is delivered, plus the working / done / failed mark.
 - Earlier channel messages as context for a new conversation (`history.read`), pull consumption (`inbound.read` / `inbound.ack`).
 - Folding several messages of one conversation into one turn, and a second answer after background work.
 - Channel commands (a fresh conversation, stop, status) and a notice in the channel when a round trip fails.
 - An age limit for answering: a backlog item is answered however old it is (only the number of round trips at a time is bounded).
-- The `inbox_item` UI slot, a tool for the assistant to send messages on its own, backend-to-backend relay, HTTP callbacks from the router.
+- Sending: editing or taking back a sent message (`deliver.update`, the connector's `recall`), a send into a named thread that is not a reply, addressing a person rather than a conversation, a channel's real text limit, asking the router afterwards what became of an unknown send, the two tools for coding agents. A person's identity beyond the router's verdict on the last sender of a conversation: the extension does not verify who is in a conversation, and a group's members are not listed.
+- An instructions or skill contribution for the assistant: the guidance is in the tool descriptions only.
+- The `inbox_item` UI slot, backend-to-backend relay, HTTP callbacks from the router.
 - More than one router or key per installed copy; translations.
 
 ## Tests
@@ -161,6 +260,7 @@ If another extension (for example Open Lark) still receives the same channel acc
 Run in this directory; it is a Go module of its own and needs nothing outside it:
 
 ```sh
+gofmt -l .
 go vet ./...
 go test -count=1 ./...
 ```

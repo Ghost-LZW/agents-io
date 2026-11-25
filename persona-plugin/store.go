@@ -11,10 +11,11 @@ import (
 	"time"
 )
 
-// The extension's own storage: two JSON files in its data directory. journal.json has one record per queue item the
-// router pushed (the dedupe key of the at-least-once contract, and the state of its handling); conversations.json
-// maps a channel conversation to the assistant conversation that answers it. Files are 0600 and replaced atomically
-// (temporary file, fsync, rename, directory fsync).
+// The extension's own storage: three JSON files in its data directory. journal.json has one record per queue item
+// the router pushed (the dedupe key of the at-least-once contract, and the state of its handling); conversations.json
+// maps a channel conversation to the assistant conversation that answers it; outbound.json has what sending on the
+// assistant's own initiative needs (the conversations seen, the sends made, the platform ids of the messages this
+// program sent). Files are 0600 and replaced atomically (temporary file, fsync, rename, directory fsync).
 
 const (
 	journalFile = "journal.json"
@@ -29,7 +30,99 @@ const (
 	listedEvery = 6 * time.Hour
 	// convKeep is how long the mapping of a channel conversation nobody wrote in is kept.
 	convKeep = 180 * 24 * time.Hour
+
+	outboundFile = "outbound.json"
+	// sendsMost, placesMost and sentMost bound outbound.json whatever the retention says.
+	sendsMost  = 500
+	placesMost = 500
+	sentMost   = 2000
+	// placeKeep is how long a conversation nobody wrote in stays a destination (the router's permission to send
+	// there does not expire; the list must still end somewhere).
+	placeKeep = 180 * 24 * time.Hour
+	// sentKeep is how long the platform id of a message this program sent is remembered, to know its echo.
+	sentKeep = 7 * 24 * time.Hour
+	// placeTouchEvery is how often a known conversation's last-seen time is written again: not once per message.
+	placeTouchEvery = time.Hour
 )
+
+// Outcomes of a send the assistant asked for.
+const (
+	sendSending   = "sending"   // written before the request; found after a restart it is unknown
+	sendDelivered = "delivered" // the router settled it as delivered
+	sendRefused   = "refused"   // nothing was sent: Code says who refused
+	sendUnknown   = "unknown"   // the message may be out; never sent again by itself
+
+	sendCodeRestart      = "restart"      // the program stopped while the request was under way
+	sendCodeRejected     = "rejected"     // the channel rejected the message
+	sendCodeDisconnected = "disconnected" // the connection went before anything was written
+)
+
+// placeRec is a channel conversation the router routed a message from: somewhere this backend may send to. The key
+// is channel:account:conversation, the grain of the router's send scope (no thread).
+type placeRec struct {
+	Channel  string    `json:"channel"`
+	Account  string    `json:"account"`
+	ConvID   string    `json:"conv_id"`
+	Kind     string    `json:"kind,omitempty"`
+	ChatName string    `json:"chat_name,omitempty"`
+	Sender   string    `json:"sender,omitempty"`    // display name of the last person who wrote there
+	Verdict  string    `json:"verdict,omitempty"`   // the router's verdict on that person, in words (stamp)
+	LastItem string    `json:"last_item,omitempty"` // the newest item with a message id: what a reply can name
+	LastSeen time.Time `json:"last_seen,omitzero"`
+}
+
+// sendRec is one send the assistant asked for, keyed by the operation its request id gives. The text is never kept:
+// only its length and a digest of destination, reply target and text.
+type sendRec struct {
+	Op        string `json:"op"`
+	Dest      string `json:"dest"`
+	ConvKey   string `json:"conv_key"`
+	Label     string `json:"label,omitempty"`
+	Named     string `json:"named,omitempty"`
+	ReplyTo   string `json:"reply_to,omitempty"`
+	Digest    string `json:"digest"`
+	Chars     int    `json:"chars"`
+	Outcome   string `json:"outcome"`
+	Code      string `json:"code,omitempty"`
+	MessageID string `json:"message_id,omitempty"`
+	NoReply   bool   `json:"no_reply,omitempty"`  // the router refused the reply target; sent as a plain message
+	Duplicate bool   `json:"duplicate,omitempty"` // the router answered a record it had already settled
+	// SameAs: the operation the router was asked under, when that is an earlier send of the same text whose outcome
+	// was unknown (the router then answers its settled record, or sends for the first time: never twice).
+	SameAs string `json:"same_as,omitempty"`
+	// Spent: the router itself settled the operation as unknown. Asking again under it only answers that, so the
+	// same text confirmed again is a new operation.
+	Spent bool `json:"spent,omitempty"`
+	// TextDigest is a digest of the text alone, and Echo the platform id of the item taken for this send's echo:
+	// how the message is known when it comes back after an answer that never said which message it became.
+	TextDigest string    `json:"text_digest,omitempty"`
+	Echo       string    `json:"echo,omitempty"`
+	At         time.Time `json:"at"`
+	SettledAt  time.Time `json:"settled_at,omitzero"`
+}
+
+// routerOp is the operation id the router was asked under.
+func (r sendRec) routerOp() string {
+	if r.SameAs != "" {
+		return r.SameAs
+	}
+	return r.Op
+}
+
+// sentMsg is a message this program sent, by its id on the platform: the same message coming back through the
+// router as an item is its echo.
+type sentMsg struct {
+	Channel string    `json:"channel"`
+	ID      string    `json:"id"`
+	At      time.Time `json:"at"`
+}
+
+type outboundDoc struct {
+	Version int                  `json:"version"`
+	Places  map[string]*placeRec `json:"places"`
+	Sends   map[string]*sendRec  `json:"sends"`
+	Sent    []sentMsg            `json:"sent"`
+}
 
 // Item states.
 const (
@@ -220,9 +313,16 @@ type store struct {
 	convs   map[string]convRec
 	corrupt bool  // a file was unreadable at start and set aside
 	broken  error // the last write failed
+
+	places     map[string]*placeRec
+	sends      map[string]*sendRec
+	sent       []sentMsg
+	sentIdx    map[string]bool      // channel NUL id
+	placeSaved map[string]time.Time // when a place was last written
+	outWrites  int                  // how often outbound.json was written
 }
 
-// openStore reads the two files. An unreadable one is moved aside (.corrupt) and the store starts empty for it; that
+// openStore reads the three files. An unreadable one is moved aside (.corrupt) and the store starts empty for it; that
 // is reported in the status, since items handled before may then be handled once more.
 func openStore(dir string) (*store, error) {
 	if dir == "" {
@@ -231,7 +331,8 @@ func openStore(dir string) (*store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	s := &store{dir: dir, items: map[string]*itemRec{}, convs: map[string]convRec{}}
+	s := &store{dir: dir, items: map[string]*itemRec{}, convs: map[string]convRec{}, places: map[string]*placeRec{},
+		sends: map[string]*sendRec{}, sentIdx: map[string]bool{}, placeSaved: map[string]time.Time{}}
 	var j journalDoc
 	switch err := readState(filepath.Join(dir, journalFile), &j); {
 	case err == errCorrupt:
@@ -254,6 +355,52 @@ func openStore(dir string) (*store, error) {
 	}
 	for k, v := range c.Convs {
 		s.convs[k] = v
+	}
+	var o outboundDoc
+	switch err := readState(filepath.Join(dir, outboundFile), &o); {
+	case err == errCorrupt:
+		s.corrupt = true
+	case err != nil:
+		return nil, err
+	}
+	dirty := false
+	for k, p := range o.Places {
+		if p != nil && k != "" {
+			s.places[k] = p
+		}
+	}
+	for op, r := range o.Sends {
+		if r == nil || op == "" {
+			continue
+		}
+		r.Op = op
+		// A send found mid-request: the message may be out. The same rule as a chat run found mid-request.
+		if r.Outcome == sendSending {
+			r.Outcome, r.Code, r.SettledAt = sendUnknown, sendCodeRestart, time.Now().UTC()
+			dirty = true
+		}
+		s.sends[op] = r
+	}
+	for _, m := range o.Sent {
+		if m.Channel != "" && m.ID != "" && !s.sentIdx[sentKey(m.Channel, m.ID)] {
+			s.sent = append(s.sent, m)
+			s.sentIdx[sentKey(m.Channel, m.ID)] = true
+		}
+	}
+	// The journal's conversations are destinations too: a data directory of a version without outbound.json, or
+	// messages taken since the places were last written.
+	journal := make([]*itemRec, 0, len(s.items))
+	for _, rec := range s.items {
+		journal = append(journal, rec)
+	}
+	sort.Slice(journal, func(i, j int) bool { return seenAt(*journal[i]).Before(seenAt(*journal[j])) })
+	for _, rec := range journal {
+		if _, changed, _ := s.foldPlace(*rec); changed {
+			dirty = true
+		}
+	}
+	if dirty {
+		_ = s.saveOutbound()
 	}
 	return s, nil
 }
@@ -507,5 +654,388 @@ func (s *store) prune(now time.Time, keep time.Duration) (dropped, expired int) 
 	if convs > 0 {
 		_ = s.saveConvs()
 	}
+	s.pruneOutbound(now, keep)
 	return dropped, expired
+}
+
+func sentKey(channel, id string) string { return channel + "\x00" + id }
+
+// saveOutbound writes outbound.json; the caller holds mu.
+func (s *store) saveOutbound() error {
+	err := writeState(filepath.Join(s.dir, outboundFile), outboundDoc{Version: 1, Places: s.places, Sends: s.sends, Sent: s.sent})
+	s.broken = err
+	if err == nil {
+		s.outWrites++
+	}
+	return err
+}
+
+// seenAt is when this program took an item, for a place's last-seen time.
+func seenAt(rec itemRec) time.Time {
+	at := rec.TakenAt
+	if at.IsZero() {
+		at = rec.ReceivedAt
+	}
+	return at.UTC().Round(0)
+}
+
+// foldPlace takes an item into the places; the caller holds mu (or nobody else has the store yet). Only an item with
+// a reply route counts: that is what gives the backend the router's permission to send there. An item that was
+// skipped (an echo of our own message, a card click) moves the last-seen time and nothing else, so our own name never
+// becomes the conversation's label. An item older than what the place already has changes nothing. It answers the
+// place's key, whether anything changed, and whether what changed is more than the time and the newest item.
+func (s *store) foldPlace(rec itemRec) (key string, changed, significant bool) {
+	r := rec.Route
+	if r == nil || r.Channel == "" || r.ConversationID == "" || rec.TagSource == tagSourceUnreadable {
+		return "", false, false
+	}
+	key = destKey(r.Channel, r.Account, r.ConversationID)
+	at := seenAt(rec)
+	p := s.places[key]
+	fresh := p == nil
+	switch {
+	case fresh:
+		p = &placeRec{Channel: r.Channel, Account: r.Account, ConvID: r.ConversationID}
+		s.places[key] = p
+	case at.Before(p.LastSeen):
+		return key, false, false
+	}
+	old := *p
+	p.LastSeen = at
+	if rec.ConvKind != "" {
+		p.Kind = rec.ConvKind
+	}
+	if rec.ChatName != "" {
+		p.ChatName = rec.ChatName
+	}
+	if rec.State != stateSkipped {
+		if rec.SenderName != "" {
+			p.Sender, p.Verdict = rec.SenderName, stamp(rec)
+		}
+		if rec.MessageID != "" {
+			p.LastItem = rec.ID
+		}
+	}
+	return key, fresh || *p != old, fresh || p.Kind != old.Kind || p.ChatName != old.ChatName || p.Sender != old.Sender || p.Verdict != old.Verdict
+}
+
+// placeKeyOf is the place an item belongs to: its reply route's conversation, else the envelope's.
+func placeKeyOf(rec itemRec) string {
+	if r := rec.Route; r != nil {
+		return destKey(r.Channel, r.Account, r.ConversationID)
+	}
+	return destKey(rec.Channel, rec.Account, rec.ConvID)
+}
+
+// relabelPlace takes again from the journal what a place has from its messages: the last sender, the router's
+// verdict on them, and the newest message a reply can name. It is for when an item that gave them turned out to be
+// our own message (skipEchoes). With no message of somebody else left in the journal the place has none of the
+// three: no name is better than our own. The caller holds mu; it answers whether the place changed.
+func (s *store) relabelPlace(key string) bool {
+	p := s.places[key]
+	if p == nil {
+		return false
+	}
+	newer := func(a, b *itemRec) bool {
+		if at, bt := seenAt(*a), seenAt(*b); !at.Equal(bt) {
+			return at.After(bt)
+		}
+		return before(*b, *a)
+	}
+	var from, last *itemRec
+	for _, r := range s.items {
+		if r.Route == nil || r.State == stateSkipped || r.TagSource == tagSourceUnreadable || placeKeyOf(*r) != key {
+			continue
+		}
+		if r.SenderName != "" && (from == nil || newer(r, from)) {
+			from = r
+		}
+		if r.MessageID != "" && (last == nil || newer(r, last)) {
+			last = r
+		}
+	}
+	old := *p
+	p.Sender, p.Verdict, p.LastItem = "", "", ""
+	if from != nil {
+		p.Sender, p.Verdict = from.SenderName, stamp(*from)
+	}
+	if last != nil {
+		p.LastItem = last.ID
+	}
+	return *p != old
+}
+
+// sawPlace remembers the conversation of an item just taken. Memory always has it; the file is written for a new
+// conversation, a changed label, or once in placeTouchEvery (an inbound message must not cost a second fsync). A
+// write that fails loses nothing that matters: the journal has the item, and the next start folds it in again.
+func (s *store) sawPlace(rec itemRec) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key, changed, significant := s.foldPlace(rec)
+	if !changed {
+		return
+	}
+	now := time.Now()
+	if !significant && now.Sub(s.placeSaved[key]) < placeTouchEvery {
+		return
+	}
+	if s.saveOutbound() == nil {
+		s.placeSaved[key] = now
+	}
+}
+
+func (s *store) placesAll() []placeRec {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]placeRec, 0, len(s.places))
+	for _, p := range s.places {
+		out = append(out, *p)
+	}
+	return out
+}
+
+func (s *store) place(key string) (placeRec, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.places[key]
+	if p == nil {
+		return placeRec{}, false
+	}
+	return *p, true
+}
+
+// putSend keeps a new send durably, before the request that must not be repeated. When it cannot be written it is
+// not kept in memory either, and the caller does not send.
+func (s *store) putSend(rec sendRec) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sends[rec.Op] != nil {
+		return errors.New("the send is already recorded")
+	}
+	r := rec
+	s.sends[rec.Op] = &r
+	if err := s.saveOutbound(); err != nil {
+		delete(s.sends, rec.Op)
+		return err
+	}
+	return nil
+}
+
+// updateSends changes every send change says it changed, with one write. Like update, a change stays in memory when
+// the write fails.
+func (s *store) updateSends(change func(*sendRec) bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := false
+	for _, r := range s.sends {
+		if change(r) {
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return s.saveOutbound()
+}
+
+func (s *store) send(op string) (sendRec, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.sends[op]
+	if r == nil {
+		return sendRec{}, false
+	}
+	return *r, true
+}
+
+// sendsSince are the sends asked at or after t, newest first.
+func (s *store) sendsSince(t time.Time) []sendRec {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []sendRec
+	for _, r := range s.sends {
+		if !r.At.Before(t) {
+			out = append(out, *r)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].At.Equal(out[j].At) {
+			return out[i].At.After(out[j].At)
+		}
+		return out[i].Op < out[j].Op
+	})
+	return out
+}
+
+// recentSends are the newest n sends.
+func (s *store) recentSends(n int) []sendRec {
+	all := s.sendsSince(time.Time{})
+	return all[:min(n, len(all))]
+}
+
+// reusable is the send whose operation the same destination, reply target and text is asked under again: the newest
+// one first asked at or after since (under its own operation id, so a call that continued it does not move the
+// window) whose outcome is unknown and whose operation the router has not settled as unknown.
+func (s *store) reusable(digest string, since time.Time) (sendRec, bool) {
+	for _, r := range s.sendsSince(since) {
+		if r.Digest == digest && r.Outcome == sendUnknown && r.SameAs == "" && !r.Spent {
+			return r, true
+		}
+	}
+	return sendRec{}, false
+}
+
+// claimEcho says whether an item is the echo of a send whose answer never said which message it became, and takes
+// it for that send: a send into the item's conversation, of exactly the item's text, asked at or after since, whose
+// outcome is unknown (or still open) and that no item was taken for yet. One send explains one item. An item of
+// somebody the journal has another message from in that conversation is theirs, whatever it says.
+func (s *store) claimEcho(convKey, textDigest, senderID, messageID string, since time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var send *sendRec
+	for _, r := range s.sends {
+		if r.ConvKey != convKey || r.TextDigest == "" || r.TextDigest != textDigest || r.Echo != "" || r.At.Before(since) ||
+			r.Outcome != sendUnknown && r.Outcome != sendSending {
+			continue
+		}
+		if send == nil || r.At.Before(send.At) {
+			send = r
+		}
+	}
+	if send == nil {
+		return false
+	}
+	if senderID != "" {
+		for _, r := range s.items {
+			if r.SenderID == senderID && r.State != stateSkipped && placeKeyOf(*r) == convKey {
+				return false
+			}
+		}
+	}
+	send.Echo = messageID
+	_ = s.saveOutbound()
+	return true
+}
+
+// noteSent remembers the platform ids of a message this program sent.
+func (s *store) noteSent(channel string, ids []string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	added := false
+	for _, id := range ids {
+		if channel == "" || id == "" || s.sentIdx[sentKey(channel, id)] {
+			continue
+		}
+		s.sent = append(s.sent, sentMsg{Channel: channel, ID: id, At: at.UTC()})
+		s.sentIdx[sentKey(channel, id)] = true
+		added = true
+	}
+	if added {
+		_ = s.saveOutbound()
+	}
+}
+
+// sentByUs says whether a channel message is one this program sent.
+func (s *store) sentByUs(channel, id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return id != "" && s.sentIdx[sentKey(channel, id)]
+}
+
+// skipEchoes turns items that are the echo of a message this program sent, and were taken before the send's answer
+// said so, into skipped ones: only those nothing has been done with yet (in the Inbox, or waiting for a turn). Such
+// an item was taken as somebody's message, so its conversation may be called by our own name and offer our own
+// message as a reply target: the place takes both again from the messages that are left.
+func (s *store) skipEchoes(channel string, ids []string) (changed int) {
+	if len(ids) == 0 {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var places []string
+	for _, r := range s.items {
+		if r.Channel == channel && r.MessageID != "" && slices.Contains(ids, r.MessageID) &&
+			(r.State == stateQueued || r.State == stateInbox && r.TagSource != tagSourceUnreadable) {
+			r.State, r.Why = stateSkipped, whySelf
+			changed++
+			if key := placeKeyOf(*r); r.Route != nil && !slices.Contains(places, key) {
+				places = append(places, key)
+			}
+		}
+	}
+	if changed == 0 {
+		return 0
+	}
+	_ = s.saveItems()
+	relabeled := false
+	for _, key := range places {
+		if s.relabelPlace(key) {
+			relabeled = true
+		}
+	}
+	if relabeled {
+		_ = s.saveOutbound()
+	}
+	return changed
+}
+
+// pruneOutbound bounds outbound.json; the caller holds mu. A settled send older than keep goes (one under way never
+// does), a conversation not seen for placeKeep, a sent message's id after sentKeep; beyond the caps the oldest go.
+func (s *store) pruneOutbound(now time.Time, keep time.Duration) {
+	changed := false
+	var settled []*sendRec
+	for op, r := range s.sends {
+		switch {
+		case r.Outcome == sendSending:
+		case now.Sub(r.At) > keep:
+			delete(s.sends, op)
+			changed = true
+		default:
+			settled = append(settled, r)
+		}
+	}
+	if over := len(s.sends) - sendsMost; over > 0 {
+		sort.Slice(settled, func(i, j int) bool { return settled[i].At.Before(settled[j].At) })
+		for _, r := range settled[:min(over, len(settled))] {
+			delete(s.sends, r.Op)
+			changed = true
+		}
+	}
+	var places []string
+	for key, p := range s.places {
+		if now.Sub(p.LastSeen) > placeKeep {
+			delete(s.places, key)
+			delete(s.placeSaved, key)
+			changed = true
+			continue
+		}
+		places = append(places, key)
+	}
+	if over := len(places) - placesMost; over > 0 {
+		sort.Slice(places, func(i, j int) bool { return s.places[places[i]].LastSeen.Before(s.places[places[j]].LastSeen) })
+		for _, key := range places[:over] {
+			delete(s.places, key)
+			delete(s.placeSaved, key)
+			changed = true
+		}
+	}
+	kept := s.sent[:0:0]
+	for _, m := range s.sent {
+		if now.Sub(m.At) <= sentKeep {
+			kept = append(kept, m)
+		}
+	}
+	if over := len(kept) - sentMost; over > 0 {
+		kept = kept[over:]
+	}
+	if len(kept) != len(s.sent) {
+		s.sent, changed = kept, true
+		s.sentIdx = map[string]bool{}
+		for _, m := range kept {
+			s.sentIdx[sentKey(m.Channel, m.ID)] = true
+		}
+	}
+	if changed {
+		_ = s.saveOutbound()
+	}
 }

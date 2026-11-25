@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -90,5 +92,77 @@ func TestSettingsDefaultsAndLimits(t *testing.T) {
 		if got := tc.s.missing(); got != tc.want {
 			t.Errorf("missing(%+v) = %q", tc.s, got)
 		}
+	}
+}
+
+func TestParseDestinations(t *testing.T) {
+	good, bad := parseDestinations([]string{
+		"  Project room = demo-chat:default:oc_example ",
+		"",
+		"mail = demo-mail:work:thread:2026:11@example.test", // the conversation id keeps its colons
+		"beta=demo-chat:second:oc_beta",
+	})
+	want := []destination{
+		{"Project room", "demo-chat", "default", "oc_example"},
+		{"mail", "demo-mail", "work", "thread:2026:11@example.test"},
+		{"beta", "demo-chat", "second", "oc_beta"},
+	}
+	if len(bad) != 0 || len(good) != len(want) {
+		t.Fatalf("good = %+v, bad = %+v", good, bad)
+	}
+	for i, d := range good {
+		if d != want[i] {
+			t.Errorf("line %d = %+v, want %+v", i+1, d, want[i])
+		}
+		if id := d.id(); !strings.HasPrefix(id, "d-") || len(id) != 14 || strings.Contains(id, d.ConvID) {
+			t.Errorf("id = %q", id)
+		}
+	}
+	if good[0].id() == good[2].id() || good[0].id() != destID("demo-chat", "default", "oc_example") {
+		t.Errorf("ids are not a function of the coordinates")
+	}
+	for line, why := range map[string]string{
+		"no equals sign demo-chat:default:oc_x":                 wordsDestForm,
+		"alpha ＝ demo-chat:default:oc_x":                        wordsDestForm, // a full-width sign is not read: the words say half-width
+		"alpha = demo-chat:default":                             wordsDestForm,
+		"alpha = demo-chat::oc_x":                               wordsDestForm,
+		" = demo-chat:default:oc_x":                             wordsDestForm,
+		"alpha = :default:oc_x":                                 wordsDestForm,
+		strings.Repeat("n", 41) + " = demo-chat:default:x":      wordsDestName,
+		"alpha = demo chat:default:oc_x":                        wordsDestPart,
+		"alpha = demo-chat:de fault:oc_x":                       wordsDestPart,
+		"alpha = " + strings.Repeat("c", 65) + ":default:x":     wordsDestPart,
+		"alpha = demo-chat:default:oc x":                        wordsDestConv,
+		"alpha = demo-chat:default:" + strings.Repeat("c", 257): wordsDestConv,
+		"alpha = demo-chat:default:" + fakeKey:                  wordsDestSecret,
+		"AIOB_x = demo-chat:default:oc_x":                       wordsDestSecret,
+		"alpha = https://router.example.test:default:oc_x":      wordsDestSecret,
+	} {
+		good, bad := parseDestinations([]string{"ok = demo-chat:default:oc_ok", line})
+		if len(good) != 1 || len(bad) != 1 || bad[0].Line != 2 || bad[0].Why != why {
+			t.Errorf("%q: good %d, bad %+v, want %q", line, len(good), bad, why)
+		}
+		for _, p := range bad {
+			if strings.Contains(p.Why, fakeKey) {
+				t.Errorf("the reason repeats the line")
+			}
+		}
+	}
+	// A name is unique whatever its case, and a conversation has one name.
+	_, bad = parseDestinations([]string{"Alpha = demo-chat:default:oc_a", "alpha = demo-chat:default:oc_b", "beta = demo-chat:default:oc_a"})
+	if len(bad) != 2 || bad[0] != (destProblem{2, wordsDestNameTwice}) || bad[1] != (destProblem{3, wordsDestConvTwice}) {
+		t.Errorf("duplicates: %+v", bad)
+	}
+	var many []string
+	for i := 0; i < destsMost+3; i++ {
+		many = append(many, fmt.Sprintf("n%d = demo-chat:default:oc_%d", i, i))
+	}
+	good, bad = parseDestinations(many)
+	if len(good) != destsMost || len(bad) != 1 || bad[0] != (destProblem{destsMost + 1, wordsDestTooMany}) {
+		t.Errorf("too many: %d good, bad %+v", len(good), bad)
+	}
+	s := settingsOf(json.RawMessage(`{"destinations":["alpha = demo-chat:default:oc_a","nonsense"]}`), nil)
+	if len(s.dests) != 1 || len(s.badDests) != 1 || s.badDests[0].Line != 2 {
+		t.Errorf("settings: %+v %+v", s.dests, s.badDests)
 	}
 }

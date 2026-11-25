@@ -465,11 +465,11 @@ func (r *router) request(ctx context.Context, typ string, fields map[string]any,
 }
 
 // deliver sends words to a conversation. The router sends at most once per operation id: asking again with the same
-// id answers the settled record.
-func (r *router) deliver(ctx context.Context, opID string, route replyRoute, text string) (deliverResult, error) {
+// id answers the settled record. wait is how long the answer is waited for.
+func (r *router) deliver(ctx context.Context, opID string, route replyRoute, text string, wait time.Duration) (deliverResult, error) {
 	var res deliverResult
 	err := r.request(ctx, frameDeliver, map[string]any{"operationId": opID, "route": route,
-		"message": renderedMessage{Text: text}}, r.tm.deliver, &res)
+		"message": renderedMessage{Text: text}}, wait, &res)
 	return res, err
 }
 

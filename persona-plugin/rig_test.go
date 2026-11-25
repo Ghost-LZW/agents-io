@@ -71,6 +71,8 @@ func fastTimings() timings {
 		deliverWaitMost: 2 * time.Second, unsureRetry: 20 * ms, scopeRetryMost: 200 * ms,
 		changedDebounce: 10 * ms, capsEvery: time.Hour, hubTimeout: 2 * time.Second,
 		runsMost: 4,
+		send:     300 * ms, echoWait: 300 * ms, echoKeep: 10 * time.Minute, sendWindow: time.Minute, sendReuse: time.Hour,
+		sendPerDest: 3, sendPerWindow: 10,
 	}
 }
 

@@ -103,7 +103,7 @@ R1–R3 是第一条链路的前提。
 
 ## 5. persona 扩展 `agents-io`
 
-Go 写的一个 persona 扩展，在本仓库的 `persona-plugin/`（自成一个 Go 模块，不在 pnpm 工作区里；0.1.0 做了哪些、没做哪些见它的 README）。**每个 manager 装一份，每份配一把后端钥匙。** 通用于所有渠道。它用 persona 发给扩展的受限令牌（`pext_`，范围 `assistant.ask`、`agents.read`、`agents.control`，可选 `agents.permission_mode`）调 hub，只能碰自己那个 manager。
+Go 写的一个 persona 扩展，在本仓库的 `persona-plugin/`（自成一个 Go 模块，不在 pnpm 工作区里；做了哪些、没做哪些见它的 README）。**每个 manager 装一份，每份配一把后端钥匙。** 通用于所有渠道。它用 persona 发给扩展的受限令牌（`pext_`，范围 `assistant.ask`、`agents.read`、`agents.control`，可选 `agents.permission_mode`）调 hub，只能碰自己那个 manager。
 
 ### 5.1 收到一条输入
 
@@ -156,6 +156,8 @@ persona 没有"这条消息的回答是什么"的接口。它自己的通道管�
 ### 5.5 给助手的发消息工具
 
 助手要主动往某个渠道、某个人、或另一个助手发消息时调它（`mcp_servers` 或 skill），扩展转成 agents-io 的 `deliver` 或后端之间的转信（R6）。助手之间：`Policy.contact` 缺省拒绝，配置里放行这一对；跳数与成对上限防循环；`aio explain --chain` 能查。
+
+文字版已在 `persona-plugin` 0.2.0 实现：连接器的写操作 `agentsio_send`（每条都要主人在手机上确认）加只读的 `agentsio_destinations`，经 agents-io 的 `deliver` 发出，见它的 README。后端之间的转信（R6）未做。
 
 ## 6. 谁的话进谁的助手
 
