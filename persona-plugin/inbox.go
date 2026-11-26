@@ -64,7 +64,8 @@ func thingKind(convKind string) string {
 // ruleTier is the tier the extension's own rules give an item, used when no model sorts it.
 func ruleTier(rec itemRec) (inboxTier, string) {
 	switch {
-	case rec.State == stateFailed, rec.TagSource == tagSourceUnreadable:
+	case rec.State == stateFailed, rec.TagSource == tagSourceUnreadable, rec.Why == whyAgentUnknown:
+		// The last: a message a rule meant for an Agent session that the settings do not name was handled by nobody.
 		return tierAction, rec.Why
 	case rec.IsBot:
 		return tierFYI, whyBot

@@ -20,7 +20,13 @@ func notConfigured(why string) wire.ConnectorStatus {
 func (x *app) statusNow() wire.ConnectorStatus {
 	x.mu.Lock()
 	off, missing, storeErr, st, rt, unreadable := x.off, x.missing, x.storeErr, x.st, x.rt, x.unreadable
-	badDests := len(x.set.badDests)
+	badDests, agents, badAgents := len(x.set.badDests), len(x.set.agents), len(x.set.badAgents)
+	agentMiss := 0
+	for _, a := range x.set.agents {
+		if x.agentMiss[a.Name] {
+			agentMiss++
+		}
+	}
 	lacking := slices.Clone(x.lacking)
 	hubOK := x.api != nil
 	x.mu.Unlock()
@@ -68,6 +74,16 @@ func (x *app) statusNow() wire.ConnectorStatus {
 	}
 	if badDests > 0 {
 		notes = append(notes, fmt.Sprintf(wordsBadDestsVia, badDests))
+	}
+	if badAgents > 0 {
+		notes = append(notes, fmt.Sprintf(wordsBadAgentsVia, badAgents))
+	}
+	// The targets, and how many of their sessions were not there when a message was last meant for them.
+	switch {
+	case agentMiss > 0:
+		notes = append(notes, fmt.Sprintf(wordsAgentsMissVia, agents, agentMiss))
+	case agents > 0:
+		notes = append(notes, fmt.Sprintf(wordsAgentsVia, agents))
 	}
 	var sent, notSent, unsure int
 	for _, r := range st.sendsSince(time.Now().Add(-24 * time.Hour)) {

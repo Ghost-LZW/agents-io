@@ -199,6 +199,7 @@ type itemRec struct {
 	Rule       string    `json:"rule,omitempty"`
 	Tag        string    `json:"tag"`
 	TagSource  string    `json:"tag_source,omitempty"`
+	Target     string    `json:"target,omitempty"`     // the agent target's name, for the tag agent
 	ReceivedAt time.Time `json:"received_at,omitzero"` // when the router received it (the router's clock)
 	SentAt     time.Time `json:"sent_at,omitzero"`
 	TakenAt    time.Time `json:"taken_at,omitzero"` // when this program journaled it
@@ -256,6 +257,15 @@ func (r itemRec) clone() itemRec {
 	return r
 }
 
+// seqKey is the key of the mapping the item's round trip keeps its transcript bookkeeping under: the channel
+// conversation's for chat and guest, the target's for agent (two channel conversations may share one target).
+func (r itemRec) seqKey() string {
+	if r.Tag == tagAgent {
+		return agentKey(r.Target)
+	}
+	return r.ConvKey
+}
+
 // open says whether the item is, or should be, an open Inbox thing.
 func (r itemRec) open() bool {
 	return (r.State == stateInbox || r.State == stateFailed) && r.Inbox.Done == "" && !r.Inbox.Closed
@@ -285,7 +295,9 @@ func (r itemRec) finished() bool {
 	return false
 }
 
-// convRec is the assistant conversation that answers one channel conversation.
+// convRec is the assistant conversation that answers one channel conversation. An agent target has one too, under
+// agentKey(name): the session its line named when it was last used and how far that session's transcript was read
+// (nothing is ever opened for it).
 type convRec struct {
 	MachineID  string    `json:"machine_id"`
 	SessionID  string    `json:"session_id"`
@@ -590,7 +602,7 @@ func (s *store) dropConv(key string) error {
 // busyLocked says whether a channel conversation has an item waiting for, or in, a round trip; the caller holds mu.
 func (s *store) busyLocked(key string) bool {
 	for _, r := range s.items {
-		if r.ConvKey == key && (r.State == stateQueued || r.State == stateRunning) {
+		if (r.ConvKey == key || r.seqKey() == key) && (r.State == stateQueued || r.State == stateRunning) {
 			return true
 		}
 	}

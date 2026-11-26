@@ -173,6 +173,15 @@ func (f *fakeHub) set(change func(f *fakeHub)) {
 	change(f)
 }
 
+// agentSession puts an Agent session that is already there on a paired computer: nothing opened it.
+func (f *fakeHub) agentSession(mid, sid string) *fakeSession {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s := &fakeSession{mid: mid, sid: sid, row: sessionRow{MachineID: mid, SessionID: sid, Status: "idle"}}
+	f.sessions[mid+"/"+sid] = s
+	return s
+}
+
 // session is the nth conversation opened (from 1).
 func (f *fakeHub) session(n int) *fakeSession {
 	return f.sessions[fmt.Sprintf("m1/s%d", n)]

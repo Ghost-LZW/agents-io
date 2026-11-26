@@ -49,6 +49,9 @@ func TestRouterAddressForms(t *testing.T) {
 
 func TestTagFor(t *testing.T) {
 	s := settingsOf(json.RawMessage(`{"chat_rules":["owner-dm"," both "],"guest_rules":["visitors","both"]}`), nil)
+	if _, target, _ := s.tagFor("chat", "owner-dm"); target != "" {
+		t.Errorf("a chat tag has a target %q", target)
+	}
 	for _, tc := range []struct{ tag, rule, want, source string }{
 		{"inbox", "owner-dm", "inbox", "tag"}, // the item's tag wins over the rule lists
 		{"chat", "", "chat", "tag"},
@@ -64,7 +67,7 @@ func TestTagFor(t *testing.T) {
 		{"", "other", "inbox", "default"},
 		{"", "", "inbox", "default"},
 	} {
-		if got, source := s.tagFor(tc.tag, tc.rule); got != tc.want || source != tc.source {
+		if got, _, source := s.tagFor(tc.tag, tc.rule); got != tc.want || source != tc.source {
 			t.Errorf("tagFor(%q, %q) = %s (%s), want %s (%s)", tc.tag, tc.rule, got, source, tc.want, tc.source)
 		}
 	}

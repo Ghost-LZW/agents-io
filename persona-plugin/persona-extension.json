@@ -2,8 +2,8 @@
   "manifest_version": 1,
   "id": "agents-io",
   "name": "消息路由（agents-io）",
-  "version": "0.2.0",
-  "description": "把助手接到你自己的 agents-io 消息路由上：路由分给它的消息进收件箱，或交给助手对话并把回答发回原渠道；助手也能在你确认后主动发消息。",
+  "version": "0.3.0",
+  "description": "把助手接到你自己的 agents-io 消息路由上：路由分给它的消息进收件箱，或交给助手对话、指定的 Agent 会话并把回答发回原渠道；助手也能在你确认后主动发消息。",
   "publisher": "Ghost-LZW",
   "icon": "assets/icon.png",
   "tags": [
@@ -98,6 +98,16 @@
         "uniqueItems": true,
         "maxItems": 32,
         "description": "助手可以主动发消息去的会话，一行一个，写法「名字 = 渠道:账号:会话」，比如「项目群 = demo-chat:default:oc_example」。路由转来过消息的会话不用写，助手自己看得到；这里写的是还没有收到过消息的地方。路由的管理员还要在路由配置的 backends.<后端名>.routes 里登记同一个会话，否则发不出去。每条消息发出前都要你在手机上确认。只写名字和会话，不要写钥匙或地址"
+      },
+      "agent_targets": {
+        "type": "array",
+        "title": "可以直接转入的 Agent 会话",
+        "items": {
+          "type": "string"
+        },
+        "uniqueItems": true,
+        "maxItems": 32,
+        "description": "路由规则可以把消息直接打进某台电脑上的一个 Agent 会话，一行一个，写法「名字 = 电脑编号/会话编号」，比如「reviewer = mac-1/s-123」。名字只用小写字母、数字、- 和 _，最长 32 个字符；路由规则的 tag 写成 agent:名字 才会转进去，回答发回原渠道。注意：消息会原样打进那个 Agent，它可能有那台电脑的全部权限，只把你信得过的发送者路由到这里，路由认定为身份未知的人不要用。同一个会话一次只处理一条。只写名字和会话，不要写钥匙或地址"
       },
       "working_mark": {
         "type": "boolean",

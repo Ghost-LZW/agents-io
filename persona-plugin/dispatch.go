@@ -208,12 +208,16 @@ func normalize(it inboundItem) itemRec {
 // decide says what is done with a new item: the Inbox, an assistant conversation, or nothing. Anything that cannot
 // safely go to a conversation falls back to the Inbox with the reason.
 func decide(rec *itemRec, set settings, itemTag string, hubOK bool) {
-	rec.Tag, rec.TagSource = set.tagFor(itemTag, rec.Rule)
+	rec.Tag, rec.Target, rec.TagSource = set.tagFor(itemTag, rec.Rule)
 	if rec.State == stateSkipped {
 		return
 	}
 	rec.State = stateInbox
 	if rec.Tag == tagInbox {
+		if rec.TagSource == tagSourceUnknownAgent {
+			// Meant for an Agent session this extension cannot name: said, so the owner sees why it is here.
+			rec.Why = whyAgentUnknown
+		}
 		return
 	}
 	switch {
