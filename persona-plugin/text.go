@@ -22,7 +22,7 @@ const (
 	wordsStoreBroken    = "扩展的数据目录读写不了，消息暂时收不进来。"
 	wordsStoreCorrupt   = "扩展的处理记录读不出来，已另存为 .corrupt 并从空记录开始；之前处理过的消息可能会再出现一次。"
 	wordsOff            = "这个连接器已关闭。"
-	wordsHubMissing     = "扩展没有拿到访问助手的授权：标了 chat 或 guest 的消息只会进收件箱。请在扩展设置里重新授权。"
+	wordsHubMissing     = "扩展没有拿到访问助手的授权：标了 chat、guest 或 agent:<名字> 的消息只会进收件箱。请在扩展设置里重新授权。"
 
 	wordsReplyEmpty    = "回复是空的。"
 	wordsReplyChanges  = "路由消息的回复只能发文字，不能同时改状态。"
@@ -69,6 +69,8 @@ const (
 	whyUnreadable     = "读不懂助手对话的记录（hub 和扩展的版本对不上），没有往渠道发回答"
 	whyAnswerCut      = "助手的回答太长，取不到全文，没有往渠道发截断的回答"
 	whyUnreadableItem = "路由转来的消息读不出来"
+	whyAgentUnknown   = "标签指定的 Agent 会话目标不在扩展设置里（或名字写法不对），只进收件箱"
+	whyAgentGone      = "指定的 Agent 会话现在用不了（不存在、已隐藏或拒收），消息没有交给它"
 
 	toolAboutName = "agentsio_about"
 	toolAboutDesc = "说明这段对话是怎么来的：消息由 agents-io 路由从外部渠道转来，你的最终回答会由扩展自动发回原会话。不需要参数，也不会返回任何消息内容。"
@@ -138,10 +140,22 @@ const (
 	wordsDestTooMany   = "目的地最多 32 行。"
 	wordsBadDestsVia   = "设置里有 %d 行目的地读不出来，已跳过"
 	wordsSendsVia      = "近 24 小时主动发出 %d 条，%d 条没发出，%d 条结果不明"
+
+	wordsAgentLine         = "Agent 会话目标第 %d 行：%s"
+	wordsAgentForm         = "写法是「名字 = 电脑编号/会话编号」，用半角的等号和斜杠，三部分都要有。"
+	wordsAgentName         = "名字只能用小写字母、数字、- 和 _，最长 32 个字符。"
+	wordsAgentPart         = "电脑编号和会话编号最长 128 个字符，不能有空白、斜杠、问号、# 或 %。"
+	wordsAgentNameTwice    = "这个名字已经用过了。"
+	wordsAgentSessionTwice = "这个会话已经起过名字了。"
+	wordsAgentSecret       = "这一行像是带了钥匙或地址；这里只写名字和会话，不要写钥匙。"
+	wordsAgentTooMany      = "Agent 会话目标最多 32 行。"
+	wordsBadAgentsVia      = "设置里有 %d 行 Agent 会话目标读不出来，已跳过"
+	wordsAgentsVia         = "Agent 会话目标 %d 个"
+	wordsAgentsMissVia     = "Agent 会话目标 %d 个，其中 %d 个上次用时找不到"
 )
 
 var setupGuide = []string{
-	"在 agents-io 的配置里加一个后端（backends），并给要转给它的规则写上 to 和 tag（inbox、chat 或 guest）。",
+	"在 agents-io 的配置里加一个后端（backends），并给要转给它的规则写上 to 和 tag（inbox、chat、guest 或 agent:<名字>）。",
 	"在路由的机器上运行 aio backend key <后端名>，得到一把以 aiob_ 开头的钥匙。",
 	"到 设置 › 扩展 › 消息路由（agents-io） 填路由地址和这把钥匙，保存时会先试连一次。",
 }

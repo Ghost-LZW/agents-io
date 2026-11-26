@@ -87,7 +87,7 @@ type timings struct {
 	send, echoWait, echoKeep time.Duration
 	sendWindow, sendReuse    time.Duration
 
-	// runsMost is not a wait: how many channel conversations may have a round trip under way at once.
+	// runsMost is not a wait: how many round trips may be under way at once.
 	runsMost int
 	// sendPerDest and sendPerWindow are the rate limit: sends per destination, and in all, per sendWindow.
 	sendPerDest, sendPerWindow int
@@ -124,8 +124,10 @@ type app struct {
 	api       *hubClient
 	lacking   []string // hub scopes not granted
 	hubNotify *ext.Hub
-	active    map[string]bool // channel conversations with a run under way
+	active    map[string]bool // channel conversations, and target Agent sessions, with a run under way
 	markQuiet map[string]bool // channels whose marks the router refused: said once
+	running   int             // round trips under way (a run may hold more than one key of active)
+	agentMiss map[string]bool // agent targets whose session was not available when last used
 	changed   *time.Timer
 	// unreadable counts the pushed items this run could not read and filed as placeholders (status says so).
 	unreadable int
@@ -143,7 +145,7 @@ type app struct {
 }
 
 func newApp(tm timings) *app {
-	return &app{tm: tm, missing: wordsNotConfigured, active: map[string]bool{}, markQuiet: map[string]bool{},
+	return &app{tm: tm, missing: wordsNotConfigured, active: map[string]bool{}, markQuiet: map[string]bool{}, agentMiss: map[string]bool{},
 		sending: map[string]int{}, sendFlight: map[string]chan struct{}{}, wakeCh: make(chan struct{}, 1)}
 }
 
@@ -237,8 +239,8 @@ func (x *app) init(ctx context.Context, in *ext.Init, hub *ext.Hub) (map[string]
 	x.rt = newRouter(ws, set.key, &http.Client{}, x.tm)
 	x.rt.onInbound = x.intake
 	x.rt.onUp = x.wake
-	log.Printf("start: chat=%v rules(chat=%d guest=%d) journal=%d dests=%d bad=%d", x.api != nil, len(set.chatRules),
-		len(set.guestRules), len(st.items), len(set.dests), len(set.badDests))
+	log.Printf("start: chat=%v rules(chat=%d guest=%d) journal=%d dests=%d bad=%d agents=%d bad=%d", x.api != nil,
+		len(set.chatRules), len(set.guestRules), len(st.items), len(set.dests), len(set.badDests), len(set.agents), len(set.badAgents))
 	go x.rt.run(ctx)
 	x.bg.Add(1)
 	go x.worker(ctx)

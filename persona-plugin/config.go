@@ -29,9 +29,14 @@ const (
 	tagInbox = "inbox"
 	tagChat  = "chat"
 	tagGuest = "guest"
+	// tagAgent is the tag of an item routed straight to a named Agent session: the router writes "agent:<name>".
+	tagAgent       = "agent"
+	tagAgentPrefix = tagAgent + ":"
 
 	// tagSourceUnreadable marks the placeholder of an item that could not be read (intakeUnreadable).
 	tagSourceUnreadable = "unreadable"
+	// tagSourceUnknownAgent marks an item tagged "agent:<name>" whose name is malformed or not in the settings.
+	tagSourceUnknownAgent = "unknown_agent"
 )
 
 // settings are the extension's settings and secret as initialize and settings.check give them.
@@ -48,6 +53,10 @@ type settings struct {
 	// them, a start with them skips them and the status counts them).
 	dests    []destination
 	badDests []destProblem
+	// agents are the named Agent sessions an "agent:<name>" item is typed into; badAgents are the lines that do not
+	// read (treated like badDests).
+	agents    []agentTarget
+	badAgents []destProblem
 }
 
 func settingsOf(config json.RawMessage, secrets map[string]string) settings {
@@ -60,6 +69,7 @@ func settingsOf(config json.RawMessage, secrets map[string]string) settings {
 		KeepDays    *int     `json:"keep_days"`
 		TriageRules string   `json:"triage_rules"`
 		Dests       []string `json:"destinations"`
+		Agents      []string `json:"agent_targets"`
 	}{}
 	if len(config) > 0 {
 		_ = json.Unmarshal(config, &c)
@@ -75,7 +85,113 @@ func settingsOf(config json.RawMessage, secrets map[string]string) settings {
 		triageRules: triageRulesOf(c.TriageRules),
 	}
 	s.dests, s.badDests = parseDestinations(c.Dests)
+	s.agents, s.badAgents = parseAgentTargets(c.Agents)
 	return s
+}
+
+// Agent targets: Agent sessions on a paired computer that a router rule may route a message straight into, with the
+// tag "agent:<name>". One line each, "<name> = <machine id>/<session id>". The name is what the router's admin
+// writes in the tag, so its alphabet is small; the ids are the hub's and are only ever compared and put in a path.
+const (
+	agentTargetsMost = 32
+	agentNameMost    = 32
+	agentPartMost    = 128
+	agentTargetsKey  = "agent_targets"
+)
+
+type agentTarget struct{ Name, MachineID, SessionID string }
+
+// agentKey is the key an agent target's transcript bookkeeping is kept under in the conversation mapping. A channel
+// conversation's key always has colons and a target name never does, so the two cannot meet.
+func agentKey(name string) string { return tagAgent + "/" + name }
+
+// agentLane is what serializes runs into one Agent session, whatever channel conversation they come from.
+func (a agentTarget) lane() string { return "session/" + a.MachineID + "/" + a.SessionID }
+
+// agentName says whether s is a target name: lowercase letters, digits, "-" and "_", 1 to agentNameMost characters.
+func agentName(s string) bool {
+	if s == "" || len(s) > agentNameMost {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// agentTarget is the target of that name.
+func (s settings) agentTarget(name string) (agentTarget, bool) {
+	for _, a := range s.agents {
+		if a.Name == name {
+			return a, true
+		}
+	}
+	return agentTarget{}, false
+}
+
+// parseAgentTargets reads the setting's lines, like parseDestinations: empty lines are skipped and the reasons
+// never repeat the line's text.
+func parseAgentTargets(lines []string) (good []agentTarget, bad []destProblem) {
+	names, sessions := map[string]bool{}, map[string]bool{}
+	for i, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		n := i + 1
+		if len(good) >= agentTargetsMost {
+			bad = append(bad, destProblem{n, wordsAgentTooMany})
+			break
+		}
+		a, why := parseAgentTarget(line)
+		switch {
+		case why != "":
+		case names[a.Name]:
+			why = wordsAgentNameTwice
+		case sessions[a.lane()]:
+			why = wordsAgentSessionTwice
+		}
+		if why != "" {
+			bad = append(bad, destProblem{n, why})
+			continue
+		}
+		names[a.Name], sessions[a.lane()] = true, true
+		good = append(good, a)
+	}
+	return good, bad
+}
+
+func parseAgentTarget(line string) (agentTarget, string) {
+	if lower := strings.ToLower(line); strings.Contains(lower, keyPrefix) || strings.Contains(line, "://") {
+		return agentTarget{}, wordsAgentSecret
+	}
+	name, rest, ok := strings.Cut(line, "=")
+	if !ok {
+		return agentTarget{}, wordsAgentForm
+	}
+	mid, sid, ok := strings.Cut(strings.TrimSpace(rest), "/")
+	if !ok {
+		return agentTarget{}, wordsAgentForm
+	}
+	a := agentTarget{Name: strings.TrimSpace(name), MachineID: strings.TrimSpace(mid), SessionID: strings.TrimSpace(sid)}
+	// An id is put into a request path as one segment: no slash, no space, no control character, and not a segment
+	// a path would resolve away.
+	part := func(s string) bool {
+		return len(s) <= agentPartMost && s != "." && s != ".." && !strings.ContainsFunc(s, func(r rune) bool {
+			return unicode.IsControl(r) || unicode.IsSpace(r) || r == utf8.RuneError || r == '/' || r == '\\' || r == '?' || r == '#' || r == '%'
+		})
+	}
+	switch {
+	case a.Name == "" || a.MachineID == "" || a.SessionID == "":
+		return agentTarget{}, wordsAgentForm
+	case !agentName(a.Name):
+		return agentTarget{}, wordsAgentName
+	case !part(a.MachineID) || !part(a.SessionID):
+		return agentTarget{}, wordsAgentPart
+	}
+	return a, ""
 }
 
 // Named destinations: places the assistant may send to before the router ever routed a message from them. One line
@@ -251,23 +367,33 @@ func loopback(host string) bool {
 // is followed, any other is the Inbox (a rule whose tag was changed to something new must never keep sending its
 // messages into an owner's conversation because its name is still in a list). Only an item without a tag is looked
 // up in the rule-name lists of the settings; a rule in neither is the Inbox. source says which of them decided.
-func (s settings) tagFor(itemTag, ruleID string) (tag, source string) {
+//
+// "agent:<name>" is the tag agent with the target of that name, when the settings have one. A name that is malformed
+// or not in the settings is the Inbox, with a source of its own so the item says why; "agent" alone names nothing and
+// is an unknown tag. No rule list stands in for an agent tag: only the router's rule can name a target.
+func (s settings) tagFor(itemTag, ruleID string) (tag, target, source string) {
+	if name, ok := strings.CutPrefix(itemTag, tagAgentPrefix); ok {
+		if _, known := s.agentTarget(name); known && agentName(name) {
+			return tagAgent, name, "tag"
+		}
+		return tagInbox, "", tagSourceUnknownAgent
+	}
 	switch itemTag {
 	case tagInbox, tagChat, tagGuest:
-		return itemTag, "tag"
+		return itemTag, "", "tag"
 	case "":
 	default:
-		return tagInbox, "unknown_tag"
+		return tagInbox, "", "unknown_tag"
 	}
 	if ruleID != "" {
 		if slices.Contains(s.chatRules, ruleID) {
-			return tagChat, "rule"
+			return tagChat, "", "rule"
 		}
 		if slices.Contains(s.guestRules, ruleID) {
-			return tagGuest, "rule"
+			return tagGuest, "", "rule"
 		}
 	}
-	return tagInbox, "default"
+	return tagInbox, "", "default"
 }
 
 // settingsHandler answers settings.check: the address and key about to be saved work, before the hub saves them. The
@@ -293,10 +419,14 @@ func (x *app) settingsHandler(ctx context.Context, method string, params json.Ra
 // part of them (the address before the key) is fine; what is filled in must work. A key without the usual prefix is
 // not refused on its form: the handshake decides.
 func (x *app) checkSettings(ctx context.Context, s settings, params wire.SettingsCheckParams) (string, string) {
-	// The destinations first, whatever else is filled in: they need no connection to be read.
+	// The destinations and the agent targets first, whatever else is filled in: they need no connection to be read.
 	if len(s.badDests) > 0 {
 		p := s.badDests[0]
 		return fmt.Sprintf(wordsDestLine, p.Line, p.Why), destinationsKey
+	}
+	if len(s.badAgents) > 0 {
+		p := s.badAgents[0]
+		return fmt.Sprintf(wordsAgentLine, p.Line, p.Why), agentTargetsKey
 	}
 	if s.routerURL == "" {
 		return "", ""

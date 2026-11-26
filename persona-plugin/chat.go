@@ -28,7 +28,8 @@ const (
 )
 
 // worker starts a run for every conversation that has an item waiting and none under way: one run at a time per
-// channel conversation, in arrival order. Nothing is started once the program is stopping.
+// channel conversation and per target Agent session, in arrival order. Nothing is started once the program is
+// stopping.
 func (x *app) worker(ctx context.Context) {
 	defer x.bg.Done()
 	tick := time.NewTicker(x.tm.tick)
@@ -76,44 +77,85 @@ func (x *app) schedule(ctx context.Context) {
 	if st == nil {
 		return
 	}
-	heads := map[string]string{}
-	var order []string
+	// An item runs when it is the oldest waiting one of every lane it is in: its channel conversation, and for an
+	// agent item the target's session too (two channel conversations may point at one session, and the answer is read
+	// from that session's transcript). An item that waits holds its lanes for the ones behind it, so the order of
+	// arrival is kept in each.
+	set := x.settings()
+	type head struct {
+		id    string
+		lanes []string
+	}
+	var heads []head
+	taken := map[string]bool{}
 	for _, rec := range st.all() {
 		if rec.State != stateQueued && rec.State != stateRunning {
 			continue
 		}
-		if _, ok := heads[rec.ConvKey]; !ok {
-			heads[rec.ConvKey] = rec.ID
-			order = append(order, rec.ConvKey)
+		lanes := lanesOf(rec, set)
+		first := true
+		for _, l := range lanes {
+			if taken[l] {
+				first = false
+			}
+			taken[l] = true
+		}
+		if first {
+			heads = append(heads, head{rec.ID, lanes})
 		}
 	}
-	for _, key := range order {
+	for _, h := range heads {
 		if ctx.Err() != nil {
 			return
 		}
-		// At most runsMost conversations at a time: a backlog pushed after a long outage must not start an assistant
+		// At most runsMost round trips at a time: a backlog pushed after a long outage must not start an assistant
 		// process per conversation at once. The rest stay queued; every tick looks again.
 		x.mu.Lock()
-		busy := x.active[key] || len(x.active) >= max(1, x.tm.runsMost)
+		busy := x.running >= max(1, x.tm.runsMost)
+		for _, l := range h.lanes {
+			busy = busy || x.active[l]
+		}
 		if !busy {
-			x.active[key] = true
+			x.running++
+			for _, l := range h.lanes {
+				x.active[l] = true
+			}
 		}
 		x.mu.Unlock()
 		if busy {
 			continue
 		}
 		x.runs.Add(1)
-		go func(key, id string) {
+		go func(h head) {
 			defer x.runs.Done()
-			x.runItem(ctx, id)
+			x.runItem(ctx, h.id)
 			x.mu.Lock()
-			delete(x.active, key)
+			x.running--
+			for _, l := range h.lanes {
+				delete(x.active, l)
+			}
 			x.mu.Unlock()
 			if ctx.Err() == nil {
 				x.wake()
 			}
-		}(key, heads[key])
+		}(h)
 	}
+}
+
+// lanesOf are the things an item's round trip must have to itself: the channel conversation, and for an agent item
+// the session it is typed into. A run found under way after a restart is in the session its journal names; a target
+// the settings no longer have is in a lane of its name (the run ends at once, in the Inbox).
+func lanesOf(rec itemRec, set settings) []string {
+	if rec.Tag != tagAgent {
+		return []string{rec.ConvKey}
+	}
+	lane := agentKey(rec.Target)
+	if run := rec.Run; run != nil && run.SessionID != "" {
+		lane = agentTarget{MachineID: run.MachineID, SessionID: run.SessionID}.lane()
+	} else if a, ok := set.agentTarget(rec.Target); ok {
+		lane = a.lane()
+	}
+	return []string{rec.ConvKey, lane}
 }
 
 // runItem takes one item through its round trip, from wherever the journal says it stands.
@@ -146,7 +188,11 @@ func (x *app) runItem(ctx context.Context, id string) {
 		})
 	}
 	if rec.Run.State == "" {
-		if rec, ok = x.start(ctx, rec); !ok {
+		start := x.start
+		if rec.Tag == tagAgent {
+			start = x.startAgent
+		}
+		if rec, ok = start(ctx, rec); !ok {
 			return
 		}
 		x.mark(ctx, rec, markWorking)
@@ -184,7 +230,8 @@ func failKind(why string) string {
 		"not_found": whyNotFound, "missing": whyMissing, "timeout": whyTimeout, "no_answer": whyNoAnswer,
 		"took_over": whyTookOver, "deliver_rejected": whyDeliverReject, "deliver_scope": whyDeliverScope,
 		"deliver_unknown": whyDeliverUnsure, "restart_unknown": whyRestartUnsure, "deliver_offline": whyDeliverOffline,
-		"unreadable": whyUnreadable, "answer_cut": whyAnswerCut,
+		"unreadable": whyUnreadable, "answer_cut": whyAnswerCut, "agent_unavailable": whyAgentGone,
+		"agent_unknown": whyAgentUnknown,
 	} {
 		if v == why {
 			return k
@@ -199,12 +246,13 @@ func (x *app) keepSeq(rec itemRec) {
 		return
 	}
 	st := x.store()
-	if c, ok := st.conv(rec.ConvKey); ok && c.SessionID == rec.Run.SessionID {
+	key := rec.seqKey()
+	if c, ok := st.conv(key); ok && c.SessionID == rec.Run.SessionID && c.MachineID == rec.Run.MachineID {
 		if rec.Run.LastSeq > c.LastSeq {
 			c.LastSeq = rec.Run.LastSeq
 		}
 		c.LastUsedAt = time.Now().UTC()
-		_ = st.setConv(rec.ConvKey, c)
+		_ = st.setConv(key, c)
 	}
 }
 
@@ -349,6 +397,125 @@ func (x *app) start(ctx context.Context, rec itemRec) (itemRec, bool) {
 	}
 }
 
+// startAgent types the item into the Agent session its target names. Nothing is ever opened, and a session that is
+// not there is never replaced by another: the item then needs the owner, with the reason. It answers false when the
+// run ended here.
+//
+// Before the message goes in, the session's transcript is read up to its end: that is the run's base, so the answer
+// is looked for only after it however much the session did since this program last read it, and a session this token
+// cannot read (gone, hidden) is known before anything is typed. A read is repeated freely; the send is not, and its
+// state is written before it like any other.
+//
+// A session that is working is treated as a conversation of the assistant's that is: the message is sent anyway.
+// The hub either takes it (the agent reads it mid-turn or after it, and watch finds the answer after the message) or
+// refuses it for now, which is tried again like a send that was not made.
+func (x *app) startAgent(ctx context.Context, rec itemRec) (itemRec, bool) {
+	st, hub := x.store(), x.hub()
+	if hub == nil {
+		x.toInbox(rec, whyNoHub)
+		return rec, false
+	}
+	target, ok := x.settings().agentTarget(rec.Target)
+	if !ok {
+		// The settings changed while the item waited: nothing was tried.
+		x.toInbox(rec, whyAgentUnknown)
+		return rec, false
+	}
+	gone := func() (itemRec, bool) {
+		x.agentSeen(target.Name, false)
+		x.fail(ctx, rec, whyAgentGone)
+		return rec, false
+	}
+	key := agentKey(target.Name)
+	conv, mapped := st.conv(key)
+	if !mapped || conv.MachineID != target.MachineID || conv.SessionID != target.SessionID {
+		// A first use, or the line now names another session: nothing known of the old one applies.
+		conv = convRec{MachineID: target.MachineID, SessionID: target.SessionID, OpenedAt: time.Now().UTC()}
+	}
+	text := prompt(rec)
+	deadline := time.Now().Add(x.tm.notSentMost)
+	wait := x.tm.notSentRetry
+	undecodable := 0
+	for {
+		if ctx.Err() != nil {
+			return rec, false
+		}
+		out := outRetry
+		page, complete, err := hub.items(ctx, target.MachineID, target.SessionID, conv.LastSeq)
+		if ctx.Err() != nil {
+			return rec, false
+		}
+		for _, it := range page {
+			conv.LastSeq = max(conv.LastSeq, it.Seq)
+		}
+		var he *hubError
+		switch {
+		case errors.As(err, &he) && (he.status == http.StatusNotFound || he.status == http.StatusGone ||
+			he.status == http.StatusForbidden || he.status == http.StatusUnauthorized):
+			return gone()
+		case errors.Is(err, errUndecodable):
+			if undecodable++; undecodable >= undecodableMost {
+				x.fail(ctx, rec, whyUnreadable)
+				return rec, false
+			}
+		case err != nil:
+		case !complete:
+			continue // more of the transcript to read before its end is known
+		default:
+			conv.LastUsedAt = time.Now().UTC()
+			var werr error
+			if werr = st.setConv(key, conv); werr == nil {
+				// The state is written before the request: a crash between the two is an unknown outcome, not a retry.
+				rec, werr = st.update(rec.ID, func(r *itemRec) {
+					r.Run.State, r.Run.MachineID, r.Run.SessionID = runSending, target.MachineID, target.SessionID
+					r.Run.Head, r.Run.BaseSeq = false, conv.LastSeq
+				})
+			}
+			if werr == nil {
+				var kept bool
+				out, _, kept = hub.send(ctx, target.MachineID, target.SessionID, text, rec.Run.MsgID)
+				if ctx.Err() != nil {
+					return rec, false
+				}
+				switch out {
+				case outSent, outUnknown:
+					now := time.Now().UTC()
+					rec, _ = st.update(rec.ID, func(r *itemRec) {
+						r.Run.State, r.Run.SentAt, r.Run.Unsure, r.Run.Kept = runSent, now, out == outUnknown, kept
+					})
+					x.agentSeen(target.Name, true)
+					log.Printf("chat: item %s sent into its agent session (outcome %s)", short(rec.ID)[:12], out)
+					return rec, true
+				case outGone, outRefused:
+					// Certainly not sent, and asking again would be answered the same: never another session instead.
+					return gone()
+				}
+			}
+			rec, _ = st.update(rec.ID, func(r *itemRec) { r.Run.State = "" })
+		}
+		// Certainly not sent: try again for a while.
+		if time.Now().After(deadline) {
+			x.fail(ctx, rec, whyNotSent)
+			return rec, false
+		}
+		if sleep(ctx, wait) != nil {
+			return rec, false
+		}
+		wait = min(wait*2, time.Minute)
+	}
+}
+
+// agentSeen remembers whether a target's session was there when a message was last meant for it (the status says).
+func (x *app) agentSeen(name string, found bool) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if found {
+		delete(x.agentMiss, name)
+	} else {
+		x.agentMiss[name] = true
+	}
+}
+
 // findMine is where the run's message is in the transcript: by its client_msg_id; else by the reference in its
 // sender line (a node that ties no id to an item, and a conversation's first message, which never carries one);
 // else, for a conversation this run opened, the first words of a person's when they come before any answer and carry
@@ -465,8 +632,13 @@ func (x *app) watch(ctx context.Context, rec itemRec) (itemRec, bool) {
 					missingSince = now
 				}
 				if now.Sub(missingSince) > x.tm.missingAfter {
-					_ = st.dropConv(rec.ConvKey)
-					x.fail(ctx, rec, whyMissing)
+					_ = st.dropConv(rec.seqKey())
+					why := whyMissing
+					if rec.Tag == tagAgent {
+						why = whyAgentGone
+						x.agentSeen(rec.Target, false)
+					}
+					x.fail(ctx, rec, why)
 					return rec, false
 				}
 			case errors.Is(err, errUndecodable):
