@@ -18,8 +18,8 @@ import (
 )
 
 // The hub's HTTP API, with the extension's scoped token (permissions.hub: assistant.ask, agents.read,
-// agents.control). The token is never logged. Requests go through the default transport, so the sandbox's proxy
-// applies.
+// agents.control; starting an Agent session is agents.control too). The token is never logged. Requests go through
+// the default transport, so the sandbox's proxy applies.
 
 const hubReadMost = 32 << 20
 
@@ -251,6 +251,91 @@ func (h *hubClient) open(ctx context.Context, text string, guest bool, opID stri
 	return res.Session.MachineID, res.Session.SessionID, outSent, false
 }
 
+// classifyStart reads the outcome of starting an Agent session (POST /api/v1/sessions). It is stricter than classify:
+// a start the hub accepted runs to its end even when the answer is lost, so only an answer that says nothing started
+// is "not sent". The hub keeps a receipt of every start it answered and replays it to the same operation id, so a
+// start tried again always needs a new one (renew).
+//   - 200 with the session: started;
+//   - 202 (the receipt is pending or unknown), delivered "unknown", any other 5xx, no answer: unknown;
+//   - 503 with assistant_offline, node_unreachable or terminal_not_ready, delivered "none", 429, or no connection at
+//     all: not started, worth trying again;
+//   - any other 4xx (unknown computer, a launcher, model or field the hub refuses, another manager's computer, a
+//     computer not confirmed yet, the node refusing the start): not started, and asking again is refused again.
+func classifyStart(ans hubAnswer, err error) string {
+	if err != nil {
+		var op *net.OpError
+		var dns *net.DNSError
+		if errors.As(err, &op) && op.Op == "dial" || errors.As(err, &dns) {
+			return outRetry
+		}
+		return outUnknown
+	}
+	b := ans.body
+	switch {
+	case b.Delivered == "unknown":
+		return outUnknown
+	case ans.status == http.StatusOK:
+		return outSent
+	case ans.status/100 == 2:
+		return outUnknown
+	case ans.status == http.StatusTooManyRequests:
+		return outRetry
+	case ans.status/100 == 4:
+		return outRefused
+	case ans.status == http.StatusServiceUnavailable &&
+		(b.Code == "assistant_offline" || b.Code == "node_unreachable" || b.Code == "terminal_not_ready"),
+		b.Delivered == "none":
+		return outRetry
+	}
+	return outUnknown
+}
+
+// launch starts a new Agent session with the launcher's line and the first prompt. msgID ties the first message to
+// the transcript (the node puts it on the first matching user item); opID makes the start happen once.
+func (h *hubClient) launch(ctx context.Context, l launcher, text, msgID, opID string) (mid, sid, outcome string, renew bool) {
+	body := map[string]any{"machine_id": l.MachineID, "launcher": l.Launcher, "prompt": text, "client_msg_id": msgID}
+	for k, v := range map[string]string{"host": l.Host, "cwd": l.Cwd, "model": l.Model, "effort": l.Effort,
+		"permission_mode": l.PermissionMode, "speed": l.Speed} {
+		if v != "" {
+			body[k] = v
+		}
+	}
+	ans, err := h.do(ctx, http.MethodPost, "/api/v1/sessions", nil, map[string]string{"X-Persona-Op-Id": opID}, body)
+	outcome = classifyStart(ans, err)
+	if outcome != outSent {
+		return "", "", outcome, outcome == outRetry
+	}
+	var res struct {
+		Session struct {
+			MachineID string `json:"machine_id"`
+			SessionID string `json:"session_id"`
+		} `json:"session"`
+	}
+	_ = json.Unmarshal(ans.raw, &res)
+	if res.Session.SessionID == "" {
+		return "", "", outUnknown, false // started, and it did not say where
+	}
+	if res.Session.MachineID == "" {
+		res.Session.MachineID = l.MachineID
+	}
+	return res.Session.MachineID, res.Session.SessionID, outSent, false
+}
+
+// codeAgentStopped is the hub's refusal of a message to an Agent that has stopped: nothing was typed, and it takes
+// none until somebody resumes it.
+const codeAgentStopped = "agent_stopped"
+
+// sendTo is send for a session this program started: it also says when the session has stopped (nothing typed).
+func (h *hubClient) sendTo(ctx context.Context, mid, sid, text, msgID string) (outcome string, kept, stopped bool) {
+	ans, err := h.do(ctx, http.MethodPost, sessionPath(mid, sid)+"/messages", nil, nil,
+		map[string]any{"text": text, "client_msg_id": msgID})
+	if err == nil && ans.status/100 == 4 && ans.body.Code == codeAgentStopped && ans.body.Delivered != "yes" && ans.body.Delivered != "unknown" {
+		return outRefused, false, true
+	}
+	outcome = classify(ans, err)
+	return outcome, outcome == outSent && ans.status == http.StatusAccepted && ans.body.Delivered == "later", false
+}
+
 func sessionPath(mid, sid string) string {
 	return "/api/v1/sessions/" + url.PathEscape(mid) + "/" + url.PathEscape(sid)
 }
@@ -277,6 +362,12 @@ type sessionRow struct {
 // busy: the turn is under way or waits for an answer (a permission card, a question).
 func (s sessionRow) busy() bool {
 	return s.Status == "working" || s.Status == "blocked" || s.Starting || s.PendingInteractions > 0
+}
+
+// stopped: no live agent, only a transcript (offline), or one a restart of its computer cut off (interrupted). Either
+// takes no message until somebody resumes it.
+func (s sessionRow) stopped() bool {
+	return !s.Starting && (s.Status == "offline" || s.Status == "interrupted")
 }
 
 // look reads the conversation's row. found is false when the list does not have it (not visible to this token, or

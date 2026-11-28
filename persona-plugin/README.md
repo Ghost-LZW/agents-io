@@ -1,12 +1,12 @@
 # agents-io (message router backend)
 
-A [Persona](https://github.com/nwverse/persona) extension that connects one Persona assistant (one manager) to an [agents-io](#what-it-is) message router as one of the router's **backends**. Messages the router routes to this backend go to the Inbox, or to an assistant conversation (or a specific Agent session the owner named) whose final answer is delivered back to the channel conversation the message came from. The assistant can also send a message on its own initiative, through the router, once the owner confirms it.
+A [Persona](https://github.com/nwverse/persona) extension that connects one Persona assistant (one manager) to an [agents-io](#what-it-is) message router as one of the router's **backends**. Messages the router routes to this backend go to the Inbox, are recorded and ignored, or go to an assistant conversation, to a specific Agent session the owner named, or to a new Agent session the owner's own message starts; the final answer is delivered back to the channel conversation the message came from. What is done with a message is decided by the extension's own [routes](#routes), edited in Persona, and else by the router rule's tag. The assistant can also send a message on its own initiative, through the router, once the owner confirms it.
 
 - [Extension guide](GUIDE.md)
 - [The router side: backends, keys, frames](../docs/HOSTS.md)
 - [Manifest](persona-extension.json)
 
-This page describes version 0.3.0.
+This page describes version 0.4.0.
 
 ## Build and install
 
@@ -31,7 +31,7 @@ channels ── agents-io router ──(WebSocket /ws, backend key)── this e
              rules: to + tag                                   Inbox connector
 ```
 
-It connects to the router console's `/ws` with the backend's key, says `host.hello`, checks that the router advertises the `backends` feature, and consumes the items the router pushes. What happens to an item is chosen by the **tag** the router's rule gives it.
+It connects to the router console's `/ws` with the backend's key, says `host.hello`, checks that the router advertises the `backends` feature, and consumes the items the router pushes. The router's admin decides what reaches this backend. What happens to an item is chosen by the extension's own **routes** (first match), and when none matches by the **tag** the router's rule gives it.
 
 The extension contributes one connector, `agentsio` (connector ids allow no hyphen), with the capabilities `status`, `tools`, `actions`, `events`, `inbox`, `settle` and `fallback`.
 
@@ -45,6 +45,8 @@ The extension contributes one connector, `agentsio` (connector ids allow no hyph
 | `guest_rules` | list of rule names | Router rule ids whose items are handled as `guest` when the item carries no tag. |
 | `destinations` | list of lines, at most 32 | Named destinations the assistant may send to before the router ever routed a message from them, one per line: `<name> = <channel>:<account>:<conversation id>`, for example `Project room = demo-chat:default:oc_example`. See [Named destinations](#named-destinations). No secrets belong here, and a line that looks like a key or an address is refused. |
 | `agent_targets` | list of lines, at most 32 | Agent sessions a rule may route a message straight into, one per line: `<name> = <machine id>/<session id>`, for example `reviewer = mac-1/s-123`. A rule's tag `agent:<name>` picks one. See [Routing to a specific Agent session](#routing-to-a-specific-agent-session), and read its security note first. No secrets belong here, and a line that looks like a key or an address is refused. |
+| `launchers` | list of lines, at most 32 | What `launch:<name>` starts, one per line: `<name> = <machine id>/<launcher> [field=value …]`, for example `coder = mac-1/claude host=herdr cwd=~/repos/demo model=sonnet effort=high`. See [Starting an Agent session](#starting-an-agent-session-launch), and read its security note first. No secrets belong here, and a line that looks like a key or an address is refused. |
+| `routes` | list of lines, at most 32 | The extension's own rules, tried in order on every routed item before its tag: `<rule name>: <conditions> -> <action>`, for example `mine: from=owner -> ignore`. See [Routes](#routes). A line that looks like a key or an address is refused. |
 | `working_mark` | on/off, default on | Ask the router to mark the channel message as working, done or failed (the channel decides how; a channel without marks is skipped quietly). |
 | `chat_wait_minutes` | 5–480, default 240 | How long an item waits for the assistant's answer before it falls back to the Inbox. |
 | `keep_days` | 7–90, default 30 | How long finished records stay in the extension's journal (the dedupe memory). |
@@ -68,11 +70,12 @@ The router's rule that routes an item to this backend may carry a `tag`; the rou
 | `chat` | An assistant conversation: the message is sent to the assistant **as if the owner said it**, and the final answer is delivered to the channel conversation. |
 | `guest` | A guest assistant conversation (the product's guest mode: no built-in tools, none of the owner's data), with the answer delivered the same way. |
 | `agent:<name>` | A specific Agent session: the message is typed into the session the `agent_targets` setting names `<name>`, and the final answer of that turn is delivered to the channel conversation. A name the settings do not have, or one that is not written as a name, is Inbox only, with the reason. See [Routing to a specific Agent session](#routing-to-a-specific-agent-session). |
-| anything else, or none | Inbox only. `agent` alone names no session and is one of these. |
+| `launch:<name>` | A new Agent session, started on the computer and with the launcher the `launchers` setting names `<name>`, the message as its first prompt; the final answer of that turn is delivered to the channel conversation, and later `launch` messages of that conversation go into the same session while it runs. **Only for the owner's own message**: any other is Inbox only, with the reason. A name the settings do not have is Inbox only, with the reason. See [Starting an Agent session](#starting-an-agent-session-launch). |
+| anything else, or none | Inbox only. `agent` and `launch` alone name nothing and are among these. |
 
-When an item has no tag (an older router, or a rule without one), the rule id carried on the item is looked up in `chat_rules` and `guest_rules`; a rule in neither list is `inbox`. No list stands in for `agent:<name>`: only a rule's tag can name a target. A tag on the item always wins over the lists: a tag this version does not know (`archive`, or `Chat` with a capital) is `inbox` even when the rule's id is in one of the lists, so a rule whose tag changes never keeps sending into an owner's conversation by its name.
+The extension's [routes](#routes) come first: when one matches, its action is followed and the tag is not looked at. When an item has no tag (an older router, or a rule without one) and no route matches, the rule id carried on the item is looked up in `chat_rules` and `guest_rules`; a rule in neither list is `inbox`. No list stands in for `agent:<name>` or `launch:<name>`: only a route or a rule's tag can name a target or a launcher. A tag on the item always wins over the lists: a tag this version does not know (`archive`, or `Chat` with a capital) is `inbox` even when the rule's id is in one of the lists, so a rule whose tag changes never keeps sending into an owner's conversation by its name.
 
-**Who should be routed where.** Persona has no sender field: everything this extension sends into a `chat` conversation is treated as the owner speaking, with the owner's tools and data (the send tool included: a person routed to `chat` can ask the assistant to message another conversation, and the owner's confirmation on their phone is what stands between that request and a message). The only statement of who actually wrote the message is the first line of the text (below). So route to `chat` only the owner, or people the manager is meant to act for; route other people to `guest` or `inbox`. That decision is made in the router's rule table, not here. Message text can still try to instruct the assistant (prompt injection); guest conversations limit what that can reach.
+**Who should be routed where.** Persona has no sender field: everything this extension sends into a `chat` conversation is treated as the owner speaking, with the owner's tools and data (the send tool included: a person routed to `chat` can ask the assistant to message another conversation, and the owner's confirmation on their phone is what stands between that request and a message). The only statement of who actually wrote the message is the first line of the text (below). So route to `chat` only the owner, or people the manager is meant to act for; route other people to `guest` or `inbox`. That decision is made in the router's rule table, or in the extension's routes with a `from=` condition, which reads the router's verdict, never a display name. Message text can still try to instruct the assistant (prompt injection); guest conversations limit what that can reach.
 
 Some items never go to a conversation whatever their tag, and are filed in the Inbox with the reason: an item without a reply route, a message from a bot or from another deployment's agent (a loop guard), a message with nothing readable, a `guest` item on a hub without guest conversations (it is never opened as an ordinary conversation instead). An echo of the deployment's own message and a card click are recorded and skipped.
 
@@ -87,6 +90,58 @@ The text given to the assistant starts with exactly one line, then a blank line,
 ```
 
 The verdict is the router's stamp (owner, known labels, or unknown), not anything the sender wrote. Names are stripped of line breaks, control characters and the line's own punctuation, so a display name cannot start a second line or write a verdict of its own.
+
+## Routes
+
+The router's admin decides what reaches this backend (its rules' `to`). The `routes` setting decides what the extension does with it, and is edited in Persona, in the extension's settings. Each line is a rule; on every item the rules are tried from the top, and the first that matches decides. An item no rule matches is handled as before: by its tag, then by `chat_rules` and `guest_rules`. An item already known as our own echo, or a card click, is recorded and skipped before any rule is tried.
+
+```text
+<rule name>: <condition> <condition> … -> <action>
+```
+
+- The rule name: lowercase letters, digits, `-` and `_`, 1 to 32 characters, unique. The status counts each rule's matches under it.
+- Conditions are separated by spaces and must all hold. Each is `<key>=<value>` (the fact is that value) or `<key>!=<value>` (it is not). Several values, separated by commas, mean any of them: `kind=group,thread` is a group or a topic, `from!=owner,family` is neither. A key appears at most once in a rule. No condition at all, or `*`, matches every item.
+- The colon after the name and the arrow are half-width (`:`, `->`).
+
+| Key | The fact it reads | Values |
+| --- | --- | --- |
+| `channel` | The channel the message came from (the envelope's `channel`). | Channel names, as the router names its channel entries. |
+| `account` | The channel account (the item's `account`). | Account names. |
+| `kind` | The kind of conversation, as the channel reports it. | `dm`, `group`, `thread`, `meeting`, `call`, `mail`, `other`. A channel may report a direct chat that is not with the account itself as `other`: on a personal account the deployment shares with its user, a chat between that user and somebody else. |
+| `conv` | The conversation id (the envelope's conversation, without the thread). | Ids, compared exactly. |
+| `from` | The router's verdict on the sender (its stamp, `origin.principal`), never anything the sender wrote. | `owner` (the principal carries the label `owner`), `known` (any principal), `unknown` (none), or a label of the router's identity map, such as `family`. The three words are verdicts first: a label named `known` or `unknown` cannot be matched by its name. |
+| `mentions` | The platform's @-mentions in the message (the envelope's `mentions`, by the platform's user ids). | User ids, for example the account's own id on its platform: `mentions=ou_example`. |
+| `addressed` | The channel's own hint that the message is addressed to the account (`admission: "dispatch"`): typically a direct message to it, or an @ of it. The channel decides this; on a personal account it may mark only a few messages so. | `yes` or `no`. |
+| `prefix` | The start of the message's own words: its first text block that is not empty, after leading spaces, compared without case. A quote or a picture before it does not count. A prefix that ends in a letter or a digit must not run on into another one: `/ai` matches `/ai fix it` and `/ai修一下`, not `/aim`. **The matched prefix and the spaces after it are taken out of the text that is handed on**; a message that is only the prefix has nothing readable and goes to the Inbox. | One or more prefixes, at most 32 characters each. No `!=`. |
+
+A value has no spaces (a conversation id or a label with a space cannot be written) and no control characters, and is at most 256 characters long.
+
+| Action | What happens |
+| --- | --- |
+| `inbox` | Inbox only. |
+| `chat`, `guest` | As the tags of the same name. |
+| `agent:<name>` | As the tag: typed into the agent target `<name>`. |
+| `launch:<name>` | As the tag: a new Agent session with the launcher `<name>`, for the owner only ([below](#starting-an-agent-session-launch)). The rule must have the condition `from=owner`. |
+| `ignore` | Recorded in the journal, so the item is not taken again, and skipped: not filed in the Inbox, not answered, not marked, and its conversation does not become a destination. Its text and attachments are not kept. Use it, for example, for the owner's own messages on a personal account the deployment shares with its user, which reach the router like anybody's. |
+
+Examples:
+
+```text
+ai: channel=demo-chat account=personal from=owner prefix=/ai -> launch:coder
+mine: channel=demo-chat account=personal from=owner -> ignore
+people: channel=demo-chat account=personal kind=dm,other -> inbox
+at-me: channel=demo-chat account=personal kind=group,thread mentions=ou_example -> inbox
+rest: channel=demo-chat account=personal -> ignore
+family: from=family -> guest
+```
+
+On a personal account `personal` of the channel `demo-chat`, shared with its user, the first five say: the owner's own messages that start with `/ai` start an Agent, and the rest of the text is its first prompt; the owner's other messages are ignored; other people's direct messages, and group or topic messages that @ the account (whose own user id is `ou_example`), go to the Inbox; everything else of that account is ignored. Items of other channels and accounts match none of the five; the last rule sends what the router stamped `family` to a guest conversation, and anything else goes by its tag.
+
+**Validation.** `settings.check` refuses, before anything is saved, the first line that does not read (with its number and why, never repeating the line), a line containing `aiob_` or `://`, a `launch:` rule without `from=owner`, and a rule whose `agent:` or `launch:` action names a target or a launcher the settings do not have. A configuration saved without the check (an older hub) starts anyway: a line that does not read is skipped and the connector's status counts it; a rule whose target or launcher is missing still matches, and what it matches goes to the Inbox with the same reason as such a tag, never on to a later rule.
+
+**Status.** While the connector is fine, its status says how many rules there are and how many items each decided in the last 24 hours, in their order (`路由规则 5 条，近 24 小时命中：ai 2、mine 14、people 1、at-me 0、rest 30`). The Inbox thing of an item a route decided names the rule under `extra.agentsio.extension_rule`.
+
+**Who should be routed where** is the same as for the tags: `chat`, `agent:` and `launch:` hand the text to something that acts with the owner's tools or on the owner's computer. Match on `from=` (the router's verdict), never on a display name, and route people the router marks unknown to `inbox`, `guest` or `ignore`. `launch` runs for the owner only, whatever a rule says.
 
 ## Inbox connector
 
@@ -221,7 +276,7 @@ A rule can route a message past the assistant, straight into one Agent session o
 
 At most 32 lines. A line containing `aiob_` or `://` is refused, so a key or an address pasted here never gets saved. As for destinations, `settings.check` refuses the first line that does not read, with its number, before anything is saved; a configuration saved without the check starts anyway, the lines that do not read are skipped and the connector's status counts them.
 
-**The tag.** The router's rule carries `tag: "agent:<name>"`. The tag decides alone: `chat_rules` and `guest_rules` never turn an item into an agent item, and never rescue one whose target is not there.
+**The tag.** The router's rule carries `tag: "agent:<name>"`, or one of the extension's [routes](#routes) has the action `agent:<name>`. Only these do: `chat_rules` and `guest_rules` never turn an item into an agent item, and never rescue one whose target is not there.
 
 | The item | What happens |
 | --- | --- |
@@ -253,6 +308,44 @@ The text typed is the same as for `chat`: the one sender line, a blank line, the
 
 **Limits.** The extension does not check that a target is an Agent session rather than an assistant conversation; do not name a conversation the extension itself opened for `chat`, whose runs would then not be serialized with the target's. The first use of a target reads the session's whole transcript once to find its end. An Agent that waits for an approval is answered on the computer or in the Persona app, as for `chat`.
 
+## Starting an Agent session (launch)
+
+The owner can start a new coding agent from a channel message. The owner's message (for example `/ai fix the flaky test`, with the route `ai: from=owner prefix=/ai -> launch:coder`) starts a new Agent session on a paired computer with the named launcher; its first prompt is the message, after the sender line; the final answer of that turn is delivered to the channel conversation the message came from.
+
+> **Security: read this before adding a launcher.** A launched Agent runs on that computer with the launcher's access: its files, its shell, its credentials, in the permission mode the line gives it. **Only the owner's own messages start a session or reach one that was started**: an item whose router verdict is not the owner (a principal with the label `owner`) goes to the Inbox with the reason 只有路由认定为主人的消息才能启动 Agent, whatever the routes or the tag say, and a `launch:` route must say `from=owner` in its line. The verdict is the router's: make sure its identity map gives the label `owner` only to the owner's own accounts, on evidence the channel signs. The text can still try to instruct the Agent (prompt injection); a quote of somebody else's message inside the owner's message is part of it.
+
+**The setting.** `launchers` has one line per name, `<name> = <machine id>/<launcher> [field=value …]`, the fields separated by spaces:
+
+| Part | Rules |
+| --- | --- |
+| name | Lowercase letters, digits, `-` and `_`, 1 to 32 characters, unique. It is what `launch:<name>` carries. |
+| machine id | The hub's id of the computer (the first path segment of its sessions' routes, as for an agent target). At most 128 characters; no spaces, `/`, `\`, `?`, `#` or `%`. |
+| launcher | A launcher in that computer's list (`claude`, `codex`, a provider that runs as a launcher), as the New Agent form names it. At most 64 characters, no spaces. |
+| `host=` | The computer's engine host to open it in (`herdr`, `orca`, …). Without it, the computer's default host. |
+| `cwd=` | The directory it starts in (`~/` is the computer's home). Without it, the home. At most 512 characters, no spaces. |
+| `model=`, `effort=`, `speed=` | The model, the effort and the start speed (`standard`, `fast` or `ultrafast`). Without them, what Model Settings › Agents gives that launcher. |
+| `permission_mode=` | The permission mode it starts in, for example `acceptEdits`. Without it, the launcher's own. |
+
+The fields are the hub's own start fields (`POST /api/v1/sessions`) and go to it as written; the hub and the computer check them when a start is made. A name thus binds the computer, the harness and the model in one place. A tier preset of the model profiles cannot be named: the hub's start request takes no tier, so a preset is spelled out here (its launcher, model, effort, speed and permission mode). At most 32 lines. A line containing `aiob_` or `://` is refused; `settings.check` refuses the first line that does not read, with its number; a configuration saved without the check skips such lines and the status counts them. A machine id or a launcher the hub does not know is found when it is first used: the start is refused, and the item goes to the Inbox with the reason.
+
+**The round trip.**
+
+1. A `launch` item of a channel conversation (a thread is a conversation of its own) that has no session from this launcher yet, or whose session has stopped, starts one: `POST /api/v1/sessions` with `machine_id`, `launcher`, the line's fields, `prompt` (the sender line, a blank line, the message) and a `client_msg_id` derived from the item, under an operation id (`X-Persona-Op-Id`) derived from the item. The session is remembered for that conversation and that launcher, under `launch/<name>/<conversation>` in `conversations.json`.
+2. A later `launch` item of the same conversation and launcher goes into that session while it is alive: its transcript is read to its end, then `POST …/messages` with the item's own `client_msg_id`, as for an agent target. A session the list shows as stopped (`offline`, or `interrupted` by a restart of its computer), one the hub refuses a message for because its agent has stopped (`agent_stopped`: nothing was typed), one that is gone or no longer readable with the extension's token (404, 403), and one started with another version of the launcher's line (any field changed since) is followed by a new session, started by that item. A session is replaced only once the new one has started: a start that could not be made leaves it for the next item.
+3. The channel message is marked working; the turn's final answer is found and delivered exactly as for `chat` and `agent:<name>` ([chat round trip](#chat-round-trip)), and the message is marked done. A failure marks it failed, and the item needs the owner in the Inbox, with the reason. A turn somebody takes over on the computer before the Agent said anything ends as failed, as for `chat`.
+
+Items of one channel conversation are handled one after another. A started session is used only by its conversation's `launch` items of that launcher; another conversation starts a session of its own. All of it counts in the same limit of four round trips at a time.
+
+**Started once.** One item never starts two sessions:
+
+- the queue delivers an item again (a reconnect, a router restart, a restart of the extension): the journal knows its id, and it is accepted again and nothing else happens;
+- the run's state is written before the request, and the operation id comes from the item: a start found under way after a restart is an unknown outcome and is not asked for again (the item goes to the Inbox: 扩展重启时正在启动 Agent，结果不明);
+- a start whose answer is lost (none within the request's two minutes, a 5xx other than the ones below, a `202` receipt that is pending or unknown, an answer that does not say which session) is an unknown outcome and is not repeated: the hub runs a start it accepted to its end even when the answer does not arrive. The item goes to the Inbox with 启动 Agent 的结果不明, so the owner can look in Persona;
+- a start the hub answered as not made (`503` with `assistant_offline`, `node_unreachable` or `terminal_not_ready`, `delivered: "none"`, or `429`) is tried again for up to ten minutes, each time under a new operation id: the hub keeps a receipt of every start it answered and would replay the refusal to the same id;
+- any other refusal (`400`, `403`, `404`, `409`: an unknown computer, a launcher it does not have, another manager's computer, one not confirmed yet, the computer refusing the start) fails at once with 拒绝启动这个 Agent: nothing was started, and nothing is tried again.
+
+**Limits.** The extension does not pick a computer or a launcher by itself, does not resume a stopped session (it starts a new one), and does not stop or archive the sessions it started: they stay in Persona like any other. Only the end of the turn the message started is answered in the channel; whatever the Agent does after it, or asks in its terminal, is answered in Persona. A start that takes the hub longer than the request's two minutes (a desktop launcher) reads as an unknown outcome.
+
 ## Delivery guarantees
 
 - **At least once in, handled once.** An item is accepted (the router's queue advances) only after it is written durably to the extension's journal. A push repeated after a reconnect, a router restart or a restart of the extension is accepted again and not handled again: the journal is keyed by the item's id (the router's own idempotency key: account plus channel message reference).
@@ -261,6 +354,7 @@ The text typed is the same as for `chat`: the one sender line, a blank line, the
 - **A capabilities request that fails says nothing about guest conversations.** Only an answer does (`false`, or 404 from an older hub). A `guest` item waits out the failure like a start that was not sent, and is never opened as an ordinary conversation meanwhile.
 - **Replies are idempotent.** The operation id of a delivery comes from the item (or from the hub's `client_id`), so asking again after a reconnect or restart never sends twice. A new id is never used for the same answer.
 - **An answer waits out refusals that are temporary.** The router's `stopped` (it is shutting down) and `unauthorized` (the key was refused) say nothing was sent and do not use up the operation id: the same operation is asked again on the next connection, for up to an hour. `route_not_allowed` is answered for a conversation outside the backend's scope, for a reply target the router no longer accepts, and also while the channel is not running (a router that just came back): it is asked again without the reply target, then again for up to two minutes, always with the same operation id. Other refusals fail at once.
+- **A start is made at most once.** An Agent session a `launch` item starts is started under an operation id derived from the item, its state written before the request; a lost answer is an unknown outcome and is never asked again, and only a start the hub answered as not made is tried again, under a new operation id ([above](#starting-an-agent-session-launch)).
 - **A send the assistant asks for goes out at most once.** Its operation id comes from the hub's request id; a repeat is answered from the extension's record; an unknown outcome is not retried, and the same text confirmed again within an hour continues the first operation instead of starting a second ([above](#what-a-send-does)).
 - **Nothing is lost silently.** Every failed or unknown round trip marks the message failed and turns the item into an Inbox thing that needs you, with the reason. Nothing extra is posted to the channel.
 
@@ -272,9 +366,9 @@ The extension asks for the minimum the chat round trip needs, and uses the hub A
 | --- | --- |
 | `assistant.ask` | `GET /api/v1/assistant/capabilities` (does the hub have guest conversations), `POST /api/v1/assistant/conversations` (open a conversation with the first message) |
 | `agents.read` | `GET /api/v1/sessions` (is the conversation working or awaiting an answer), `GET /api/v1/sessions/{mid}/{sid}/items` (read the turn's result), `GET /api/v1/sessions/{mid}/{sid}/items/{item id}/full` (the whole text of a long answer); the same routes for an agent target's session |
-| `agents.control` | `POST /api/v1/sessions/{mid}/{sid}/messages` (send a message into the mapped conversation, or into an agent target's session) |
+| `agents.control` | `POST /api/v1/sessions/{mid}/{sid}/messages` (send a message into the mapped conversation, an agent target's session, or a session a launcher started), `POST /api/v1/sessions` (start an Agent session for a `launch` item) |
 
-Without them the extension still connects and files everything in the Inbox, and its status names the missing scopes.
+Without them the extension still connects and files everything in the Inbox, and its status names the missing scopes. Starting a session needs no scope beyond these: the hub lets an extension's token start Agents on its own manager's computers, outside the health space.
 
 ## Network
 
@@ -282,7 +376,7 @@ Without them the extension still connects and files everything in the Inbox, and
 
 ## Storage
 
-Three JSON files in the extension's data directory, mode 0600, replaced atomically: `journal.json` (one record per item: who, where, the text capped at 16 KiB, and where its handling stands), `conversations.json` (channel conversation to assistant conversation; and, under `agent/<name>`, the session an agent target named when last used and how far its transcript was read) and `outbound.json` (below). Finished records are dropped after `keep_days`; a running round trip is never dropped, nor an Inbox item the hub holds open. An Inbox item past the hub's seven-day window that the hub does not hold open is closed, then dropped like any finished record. The journal is capped at 5000 records (the oldest finished ones go first, then the oldest Inbox items), and the mapping of a channel conversation nobody wrote in for 180 days is dropped, so the next message there opens a new assistant conversation. This runs at start and every hour.
+Three JSON files in the extension's data directory, mode 0600, replaced atomically: `journal.json` (one record per item: who, where, the text capped at 16 KiB, and where its handling stands), `conversations.json` (channel conversation to assistant conversation; under `agent/<name>`, the session an agent target named when last used and how far its transcript was read; under `launch/<name>/<conversation>`, the session a launcher started for that conversation) and `outbound.json` (below). An item a route ignores is kept without its text and attachments. Finished records are dropped after `keep_days`; a running round trip is never dropped, nor an Inbox item the hub holds open. An Inbox item past the hub's seven-day window that the hub does not hold open is closed, then dropped like any finished record. The journal is capped at 5000 records (the oldest finished ones go first, then the oldest Inbox items), and the mapping of a channel conversation nobody wrote in for 180 days is dropped, so the next message there opens a new assistant conversation. This runs at start and every hour.
 
 `outbound.json` has what sending needs: the conversations seen (coordinates, kind, chat name, the last sender's display name and the router's verdict on them, the newest message's reference, when last seen; written for a new conversation or a changed label or verdict and otherwise at most once an hour, and rebuilt from the journal at start, which is also how a data directory of 0.1.0 gets them), one record per send (destination id, operation id, outcome, refusal code, the platform's message id, times, the text's length, a digest of destination, reply target and text and a digest of the text alone, and the id of the item taken for its echo; **never the text**), and the platform ids of the messages the extension delivered. Settled sends are dropped after `keep_days` and capped at 500, conversations after 180 days without a message and capped at 500, message ids after seven days and capped at 2000. A file that cannot be read is set aside as `.corrupt` like the others, and the status says so.
 
@@ -292,9 +386,10 @@ Media is never stored: an image, file or voice message is named in the text as a
 
 If another extension (for example Open Lark) still receives the same channel account, every message is handled twice. The extension cannot detect that. When the router takes over an account, make sure nothing else in Persona consumes it.
 
-## Not implemented in 0.3.0
+## Not implemented in 0.4.0
 
-- For Agent sessions: listing or choosing sessions from the settings form (the ids are typed), starting a session, a target that follows a session when it is replaced by a new one, more than one name for a session, and anything that limits what the Agent may do for a routed sender.
+- For Agent sessions: listing or choosing sessions, computers or launchers in the settings form (the ids are typed); naming a tier preset of the model profiles (the hub's start request takes none); resuming a stopped session a launcher started; a target that follows a session when it is replaced by a new one; more than one name for a session; anything that limits what the Agent may do for a routed sender; a launch for anybody but the owner.
+- For routes: regular expressions, one condition or another in one rule (write two rules), time windows, conditions on the text other than its start, on attachments or on the thread id.
 
 - Approvals in the channel: a pending permission or question of a conversation is not shown as a card, and a card click is recorded and skipped. A turn that waits for an approval is answered in the Persona app; the run waits meanwhile.
 - Media: attachments are named, not fetched, and none are sent (not by `agentsio_send` either).

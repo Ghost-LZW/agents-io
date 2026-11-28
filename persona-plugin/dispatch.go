@@ -205,22 +205,43 @@ func normalize(it inboundItem) itemRec {
 	return rec
 }
 
-// decide says what is done with a new item: the Inbox, an assistant conversation, or nothing. Anything that cannot
-// safely go to a conversation falls back to the Inbox with the reason.
-func decide(rec *itemRec, set settings, itemTag string, hubOK bool) {
-	rec.Tag, rec.Target, rec.TagSource = set.tagFor(itemTag, rec.Rule)
+// decide says what is done with a new item: the Inbox, an assistant conversation, an Agent session, or nothing.
+// The extension's own routes are tried first (an item already known as our own echo or a click is not matched); the
+// item's tag and the rule-name lists decide when none matches. Anything that cannot safely go to a conversation
+// falls back to the Inbox with the reason.
+func decide(rec *itemRec, set settings, it inboundItem, hubOK bool) {
+	rec.Tag, rec.Target, rec.TagSource = set.tagFor(it.Tag, rec.Rule)
 	if rec.State == stateSkipped {
+		return
+	}
+	if r, content, ok := set.route(routeFactsOf(it, *rec)); ok {
+		rec.Matched = r.Name
+		rec.Tag, rec.Target, rec.TagSource = set.actionFor(r)
+		if r.prefixes() != nil {
+			// The words that chose the rule are not part of the message: what is handed on starts after them.
+			rec.Text, rec.Attachments, _ = renderText(content)
+		}
+	}
+	if rec.Tag == actionIgnore {
+		// Recorded, so the item is not taken again, and skipped: never filed, never answered. Its words are not kept.
+		rec.State, rec.Why, rec.Text, rec.Attachments = stateSkipped, whyIgnored, "", nil
 		return
 	}
 	rec.State = stateInbox
 	if rec.Tag == tagInbox {
-		if rec.TagSource == tagSourceUnknownAgent {
+		switch rec.TagSource {
+		case tagSourceUnknownAgent:
 			// Meant for an Agent session this extension cannot name: said, so the owner sees why it is here.
 			rec.Why = whyAgentUnknown
+		case tagSourceUnknownLauncher:
+			rec.Why = whyLaunchUnknown
 		}
 		return
 	}
 	switch {
+	case rec.Tag == tagLaunch && !launchAllowed(*rec):
+		// The hard rule: only the owner's own message starts anything, whatever the routes or the tag say.
+		rec.Why = whyLaunchNotOwner
 	case rec.Route == nil:
 		rec.Why = whyNoRoute
 	case rec.IsBot:
@@ -273,7 +294,7 @@ func (x *app) intake(ctx context.Context, raw json.RawMessage) bool {
 		}
 	}
 	rec.TakenAt = time.Now().UTC()
-	decide(&rec, x.settings(), it.Tag, x.hubReady())
+	decide(&rec, x.settings(), it, x.hubReady())
 	added, err := st.add(rec)
 	if err != nil {
 		log.Printf("intake: the journal could not be written; item %s is not accepted", short(id)[:12])
@@ -283,7 +304,11 @@ func (x *app) intake(ctx context.Context, raw json.RawMessage) bool {
 		return true
 	}
 	st.sawPlace(rec)
-	log.Printf("intake: item %s tag=%s(%s) state=%s", short(id)[:12], rec.Tag, rec.TagSource, rec.State)
+	if rec.Matched != "" {
+		log.Printf("intake: item %s tag=%s(route %s) state=%s", short(id)[:12], rec.Tag, rec.Matched, rec.State)
+	} else {
+		log.Printf("intake: item %s tag=%s(%s) state=%s", short(id)[:12], rec.Tag, rec.TagSource, rec.State)
+	}
 	switch rec.State {
 	case stateInbox:
 		x.inboxChanged()
