@@ -292,6 +292,41 @@ func TestRoutePrefixIsTakenOut(t *testing.T) {
 	}
 }
 
+// TestRoutePrefixSkipsMediaPlaceholders: a channel's text for media it could not download is not the sender's words,
+// so a quoted message's failed picture before "/ai …" does not hide the prefix (and is kept in what is handed on).
+func TestRoutePrefixSkipsMediaPlaceholders(t *testing.T) {
+	ph := contentBlock{Type: "text", Text: "[file a.mp4 not downloaded: larger than 20971520 bytes]"}
+	img := contentBlock{Type: "text", Text: " [image not downloaded: no url] "}
+	quote := contentBlock{Type: "quote", Text: "earlier"}
+	for _, tc := range []struct {
+		name    string
+		content []contentBlock
+		ok      bool
+		rest    string
+	}{
+		{"quote, placeholder, command", []contentBlock{quote, ph, {Type: "text", Text: "/ai transcribe this"}}, true, "transcribe this"},
+		{"placeholder first", []contentBlock{img, {Type: "text", Text: "/ai look"}}, true, "look"},
+		{"placeholder only", []contentBlock{ph}, false, ""},
+		{"words that look like one", []contentBlock{{Type: "text", Text: "[note not downloaded: see] /ai x"}}, false, ""},
+		{"own words without the prefix", []contentBlock{ph, {Type: "text", Text: "hello /ai"}}, false, ""},
+	} {
+		out, ok := stripPrefix(tc.content, "/ai")
+		if ok != tc.ok {
+			t.Errorf("%s: ok = %v", tc.name, ok)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if got := out[len(out)-1].Text; got != tc.rest {
+			t.Errorf("%s: rest = %q", tc.name, got)
+		}
+		if len(out) != len(tc.content) {
+			t.Errorf("%s: blocks = %d, want %d (placeholders kept)", tc.name, len(out), len(tc.content))
+		}
+	}
+}
+
 // TestSettingsCheckRefusesBadRoutes: a route line that cannot be read, or that names a target or a launcher the
 // settings do not have, is refused before anything is saved, with its number.
 func TestSettingsCheckRefusesBadRoutes(t *testing.T) {

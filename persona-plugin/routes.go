@@ -1,6 +1,7 @@
 package main
 
 import (
+	"regexp"
 	"slices"
 	"strings"
 	"unicode"
@@ -290,13 +291,19 @@ func (r routeRule) match(f routeFacts) ([]contentBlock, bool) {
 	return content, true
 }
 
-// stripPrefix looks for p at the start of the message's own words: its first text block that is not empty (a quote or
-// a picture before it does not count), after leading spaces, compared without case. A prefix that ends in a letter or
-// a digit must not run on into another one ("/ai" is not the start of "/aim", and is of "/ai修一下"). It answers the
-// content with the prefix and the spaces after it taken out; a text block left empty is dropped.
+// mediaPlaceholder is the text a channel puts where a picture, file or recording could not be downloaded
+// ("[image not downloaded: no url]", "[file a.mp4 not downloaded: larger than 20971520 bytes]"). It is not the
+// sender's words: a quoted message's media come right after the quote, before what the sender wrote.
+var mediaPlaceholder = regexp.MustCompile(`^\[[^\[\]\n]+ not downloaded: [^\n]*\]$`)
+
+// stripPrefix looks for p at the start of the message's own words: its first text block that is not empty and not a
+// media placeholder (a quote, a picture or a placeholder before it does not count), after leading spaces, compared
+// without case. A prefix that ends in a letter or a digit must not run on into another one ("/ai" is not the start of
+// "/aim", and is of "/ai修一下"). It answers the content with the prefix and the spaces after it taken out; a text
+// block left empty is dropped.
 func stripPrefix(content []contentBlock, p string) ([]contentBlock, bool) {
 	for i, b := range content {
-		if b.Type != "text" || strings.TrimSpace(b.Text) == "" {
+		if b.Type != "text" || strings.TrimSpace(b.Text) == "" || mediaPlaceholder.MatchString(strings.TrimSpace(b.Text)) {
 			continue
 		}
 		rest, ok := cutFold(strings.TrimLeftFunc(b.Text, unicode.IsSpace), p)

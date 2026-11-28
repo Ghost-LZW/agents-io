@@ -322,9 +322,13 @@ func TestLaunchOutcomes(t *testing.T) {
 		starts int
 		ops    int // distinct operation ids
 	}{
-		{"manager away, then back", func(n int) (int, string, bool) {
+		// the hub answers the same when the manager's connection dropped with the start already out: never again
+		{"manager away", func(n int) (int, string, bool) {
+			return 503, `{"error":"away","code":"assistant_offline"}`, true
+		}, stateFailed, whyLaunchUnsure, 1, 1},
+		{"manager away, and the hub says nothing went out", func(n int) (int, string, bool) {
 			if n == 1 {
-				return 503, `{"error":"away","code":"assistant_offline"}`, false
+				return 503, `{"error":"away","code":"assistant_offline","delivered":"none"}`, false
 			}
 			return 0, "", true
 		}, stateDone, "", 2, 2},
@@ -454,7 +458,8 @@ func TestClassifyStart(t *testing.T) {
 		{202, `{"state":"pending"}`, outUnknown},
 		{202, `{"state":"unknown"}`, outUnknown},
 		{200, `{"delivered":"unknown"}`, outUnknown},
-		{503, `{"code":"assistant_offline"}`, outRetry},
+		{503, `{"code":"assistant_offline"}`, outUnknown},
+		{503, `{"code":"assistant_offline","delivered":"none"}`, outRetry},
 		{503, `{"code":"node_unreachable","retryable":true,"delivered":"none"}`, outRetry},
 		{503, `{"code":"terminal_not_ready"}`, outRetry},
 		{503, `{"code":"no database"}`, outUnknown},

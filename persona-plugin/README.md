@@ -6,7 +6,7 @@ A [Persona](https://github.com/nwverse/persona) extension that connects one Pers
 - [The router side: backends, keys, frames](../docs/HOSTS.md)
 - [Manifest](persona-extension.json)
 
-This page describes version 0.4.0.
+This page describes version 0.4.1.
 
 ## Build and install
 
@@ -112,7 +112,7 @@ The router's admin decides what reaches this backend (its rules' `to`). The `rou
 | `from` | The router's verdict on the sender (its stamp, `origin.principal`), never anything the sender wrote. | `owner` (the principal carries the label `owner`), `known` (any principal), `unknown` (none), or a label of the router's identity map, such as `family`. The three words are verdicts first: a label named `known` or `unknown` cannot be matched by its name. |
 | `mentions` | The platform's @-mentions in the message (the envelope's `mentions`, by the platform's user ids). | User ids, for example the account's own id on its platform: `mentions=ou_example`. |
 | `addressed` | The channel's own hint that the message is addressed to the account (`admission: "dispatch"`): typically a direct message to it, or an @ of it. The channel decides this; on a personal account it may mark only a few messages so. | `yes` or `no`. |
-| `prefix` | The start of the message's own words: its first text block that is not empty, after leading spaces, compared without case. A quote or a picture before it does not count. A prefix that ends in a letter or a digit must not run on into another one: `/ai` matches `/ai fix it` and `/ai修一下`, not `/aim`. **The matched prefix and the spaces after it are taken out of the text that is handed on**; a message that is only the prefix has nothing readable and goes to the Inbox. | One or more prefixes, at most 32 characters each. No `!=`. |
+| `prefix` | The start of the message's own words: its first text block that is not empty, after leading spaces, compared without case. A quote, a picture, or a channel's placeholder for media it could not download (`[image not downloaded: …]`, which a quoted message's media put right after the quote) before it does not count. A prefix that ends in a letter or a digit must not run on into another one: `/ai` matches `/ai fix it` and `/ai修一下`, not `/aim`. **The matched prefix and the spaces after it are taken out of the text that is handed on**; a message that is only the prefix has nothing readable and goes to the Inbox. | One or more prefixes, at most 32 characters each. No `!=`. |
 
 A value has no spaces (a conversation id or a label with a space cannot be written) and no control characters, and is at most 256 characters long.
 
@@ -341,7 +341,8 @@ Items of one channel conversation are handled one after another. A started sessi
 - the queue delivers an item again (a reconnect, a router restart, a restart of the extension): the journal knows its id, and it is accepted again and nothing else happens;
 - the run's state is written before the request, and the operation id comes from the item: a start found under way after a restart is an unknown outcome and is not asked for again (the item goes to the Inbox: 扩展重启时正在启动 Agent，结果不明);
 - a start whose answer is lost (none within the request's two minutes, a 5xx other than the ones below, a `202` receipt that is pending or unknown, an answer that does not say which session) is an unknown outcome and is not repeated: the hub runs a start it accepted to its end even when the answer does not arrive. The item goes to the Inbox with 启动 Agent 的结果不明, so the owner can look in Persona;
-- a start the hub answered as not made (`503` with `assistant_offline`, `node_unreachable` or `terminal_not_ready`, `delivered: "none"`, or `429`) is tried again for up to ten minutes, each time under a new operation id: the hub keeps a receipt of every start it answered and would replay the refusal to the same id;
+- a start the hub answered as not made (`503` with `node_unreachable` or `terminal_not_ready`, `delivered: "none"`, or `429`) is tried again for up to ten minutes, each time under a new operation id: the hub keeps a receipt of every start it answered and would replay the refusal to the same id;
+- `503 assistant_offline` without `delivered: "none"` is an unknown outcome, not a refusal: the hub answers the same when the manager was away before anything was sent and when the manager's connection dropped with the start already on its way to the computer, which may have started the session. The computer recognizes a repeated start only by its operation id, so a try under a new one could start a second session; the item goes to the Inbox with the reason instead, and the owner sends the message again if nothing started;
 - any other refusal (`400`, `403`, `404`, `409`: an unknown computer, a launcher it does not have, another manager's computer, one not confirmed yet, the computer refusing the start) fails at once with 拒绝启动这个 Agent: nothing was started, and nothing is tried again.
 
 **Limits.** The extension does not pick a computer or a launcher by itself, does not resume a stopped session (it starts a new one), and does not stop or archive the sessions it started: they stay in Persona like any other. Only the end of the turn the message started is answered in the channel; whatever the Agent does after it, or asks in its terminal, is answered in Persona. A start that takes the hub longer than the request's two minutes (a desktop launcher) reads as an unknown outcome.
@@ -386,7 +387,7 @@ Media is never stored: an image, file or voice message is named in the text as a
 
 If another extension (for example Open Lark) still receives the same channel account, every message is handled twice. The extension cannot detect that. When the router takes over an account, make sure nothing else in Persona consumes it.
 
-## Not implemented in 0.4.0
+## Not implemented in 0.4.1
 
 - For Agent sessions: listing or choosing sessions, computers or launchers in the settings form (the ids are typed); naming a tier preset of the model profiles (the hub's start request takes none); resuming a stopped session a launcher started; a target that follows a session when it is replaced by a new one; more than one name for a session; anything that limits what the Agent may do for a routed sender; a launch for anybody but the owner.
 - For routes: regular expressions, one condition or another in one rule (write two rules), time windows, conditions on the text other than its start, on attachments or on the thread id.

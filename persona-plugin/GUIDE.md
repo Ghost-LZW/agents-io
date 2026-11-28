@@ -4,7 +4,7 @@
 
 This extension (id `agents-io`) connects one Persona assistant to an agents-io message router as one of the router's backends. The router owns the messaging channels and decides, by its rule table, which messages this assistant gets; the extension's own routes, which you edit here, then decide what it does with each: file it in the Inbox, ignore it, hand it to an assistant conversation or to a specific Agent session you named, or, for your own message, start a new Agent session on one of your computers. The answer goes back through the router. The assistant can also send a message on its own initiative, once you confirm it on your phone. The [README](../../extensions/agents-io/README.md) describes the behavior in full: routes, tags, the sender line, starting Agents, delivery guarantees, hub scopes and what is not implemented.
 
-This page describes version 0.4.0. Where the manifest shown in the install preview disagrees with this page, the manifest wins.
+This page describes version 0.4.1. Where the manifest shown in the install preview disagrees with this page, the manifest wins.
 
 | Extension point | Contribution | Behavior |
 | --- | --- | --- |
