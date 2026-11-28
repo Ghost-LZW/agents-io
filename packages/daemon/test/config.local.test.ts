@@ -156,11 +156,11 @@ describe('config', () => {
     it('an agent takes its harness, model and effort from its preset; its own model / effort win', () => {
       const c = resolve({
         harnesses,
-        presets: { 'codex-high': { harness: 'cx', model: 'gpt-6-sol', effort: 'high', description: 'AsterGate' }, claude: { harness: 'cc' } },
+        presets: { 'codex-high': { harness: 'cx', model: 'gpt-6-sol', effort: 'high', description: 'gateway' }, claude: { harness: 'cc' } },
         agents: { a: { preset: 'codex-high' }, b: { preset: 'claude', effort: 'low' }, c: { harness: 'cx' } },
       });
       expect(Object.keys(c.presets)).toEqual(['codex-high', 'claude']);
-      expect(c.presets['codex-high']).toEqual({ name: 'codex-high', harness: 'cx', model: 'gpt-6-sol', effort: 'high', description: 'AsterGate' });
+      expect(c.presets['codex-high']).toEqual({ name: 'codex-high', harness: 'cx', model: 'gpt-6-sol', effort: 'high', description: 'gateway' });
       expect(c.agents.a).toMatchObject({ harness: 'cx', preset: 'codex-high', model: 'gpt-6-sol', effort: 'high' });
       expect(c.agents.b).toMatchObject({ harness: 'cc', preset: 'claude', effort: 'low' });
       expect(c.agents.b!.model).toBeUndefined(); // the instance's run.model applies when the turn is planned
