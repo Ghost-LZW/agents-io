@@ -72,14 +72,14 @@ alias aio-e2e="node $PWD/packages/daemon-e2e/dist/cli.js"   # §1.1 的自动场
 
 ```jsonc
 "harnesses": {
-  "codex-aster":  { "use": "codex", "home": "~/.config/codex", "transport": { "kind": "unix", "spawn": "own" },
+  "codex-gw":  { "use": "codex", "home": "~/.config/codex", "transport": { "kind": "unix", "spawn": "own" },
                     "profiles": { "bypass": { "approvalPolicy": "never", "sandbox": "danger-full-access" } } },
-  "claude-aster": { "use": "claude-code", "configDir": "~/.config/claude", "settings": "~/.config/claude/setting.json" }
+  "claude-gw": { "use": "claude-code", "configDir": "~/.config/claude", "settings": "~/.config/claude/setting.json" }
 },
 "presets": {
-  "codex":      { "harness": "codex-aster", "model": "gpt-6-sol", "effort": "high", "description": "AsterGate GPT-6 Sol" },
-  "codex-fast": { "harness": "codex-aster", "model": "gpt-6-sol", "effort": "low" },
-  "claude":     { "harness": "claude-aster", "model": "opus", "effort": "xhigh" }
+  "codex":      { "harness": "codex-gw", "model": "gpt-6-sol", "effort": "high", "description": "GPT-6 Sol via a gateway" },
+  "codex-fast": { "harness": "codex-gw", "model": "gpt-6-sol", "effort": "low" },
+  "claude":     { "harness": "claude-gw", "model": "opus", "effort": "xhigh" }
 },
 "agents": {
   "assistant": { "preset": "codex", "cwd": "~/repos", "tools": true },
@@ -87,7 +87,7 @@ alias aio-e2e="node $PWD/packages/daemon-e2e/dist/cli.js"   # §1.1 的自动场
 }
 ```
 
-- 预设 = 一个 harness 实例 + `model` + `effort`（可选 `description`，`/preset` 列表里显示）。没写的 model / effort 用实例的 `run`（claude 默认 `haiku`；codex 不传，用 `CODEX_HOME` 里 config.toml 的设置）。上例的两个实例相当于 shell 里的 `codex-aster`（`CODEX_HOME=~/.config/codex codex --yolo`）和 `claude-aster`（`CLAUDE_CONFIG_DIR=~/.config/claude claude --settings … --dangerously-skip-permissions`）；权限由下面说的 profile 决定，主人的轮次默认就是 `bypass`。codex 内置的 `bypass` 是 `workspace-write` 沙箱，要和 `--yolo` 一样就像上例那样把它设成 `danger-full-access`。
+- 预设 = 一个 harness 实例 + `model` + `effort`（可选 `description`，`/preset` 列表里显示）。没写的 model / effort 用实例的 `run`（claude 默认 `haiku`；codex 不传，用 `CODEX_HOME` 里 config.toml 的设置）。上例的两个实例相当于 shell 里的 `codex-gw`（`CODEX_HOME=~/.config/codex codex --yolo`）和 `claude-gw`（`CLAUDE_CONFIG_DIR=~/.config/claude claude --settings … --dangerously-skip-permissions`）；权限由下面说的 profile 决定，主人的轮次默认就是 `bypass`。codex 内置的 `bypass` 是 `workspace-write` 沙箱，要和 `--yolo` 一样就像上例那样把它设成 `danger-full-access`。
 - agent 写 `preset` 或 `harness`，二选一；写 `preset` 时 agent 自己的 `model` / `effort` 仍然优先于预设的。
 - 对话里，主人发 `/preset` 列出全部预设和本会话当前用的；`/preset <名字>` 让本会话从下一轮起换成该预设，并清掉本会话 `/model`、`/effort` 设过的值；`/preset default` 回到 agent 自己的。只改这一个会话（话题），存在日志库里，重启后还在；新话题仍用 agent 的默认。
 - 换到另一个实例时，lane 关掉旧绑定、在新实例上开会话（`notice runtime_restart`）。新实例看不到在旧实例上聊过的内容（回复里会提示，`/new` 开干净的话题）；以后换回来时，续接那个实例在本会话里的原生会话。cwd、`instructionsFile`、工具仍是 agent 的。权限不跟着预设走，仍由 agent 的 `profile`、策略（只有主人时是 `bypass`）和 `/bypass` 决定。
@@ -263,7 +263,7 @@ export AIO_ACP_COMMAND=/tmp/acp-agents/node_modules/.bin/claude-agent-acp CLAUDE
    - [ ] 让它跑一条长命令（`sleep 30` 之后再回答）时主人发 `/stop`，随即再发一句别的：第一轮记 `interrupted`，第二轮的回答只有它自己的内容（#LN-2、#DL-3）。agent 15 s 内没停时，第一轮是 `cancel_timeout`，`aio tail` 里第二轮之前它还流出的只是 `native`，第二轮等它回答，至多再 15 s，还不回答就有一条 `continuity` 提示（关掉会话再打开）。
    - [ ] 同样让它跑长命令、`/stop`，它 15 s 内没停（第一轮 `cancel_timeout`）之后，主人发 `/preset <用另一个 harness 的预设>`、说一句（切走：ACP 会话关闭），再发 `/preset default`（或等停放话题空闲关闭，`topics.parkedIdleMs`），再说一句：这一轮的回答只有它自己的内容；agent 那时还没回答旧的 prompt 时，续接等它至多 15 s，还不回答就开新会话、有一条 `continuity` 提示（#LN-2、#DL-3）。
    - [ ] Ctrl-C 停 serve：`claude-agent-acp` 进程退出；再 `aio serve` 后发一条，回答接得上前面的对话（`session/load`），`aio tail` 里没有重放的旧消息。
-3. 重新录 transcript（适配器写出的帧有意变了时；同样要真模型）：`node --experimental-transform-types --disable-warning=ExperimentalWarning --import ./scripts/source-loader.mjs harness/acp/scripts/record-transcripts.ts`，写进 `packages/testkit/conformance/transcripts/acp/`，再跑 `harness/acp/test/transcripts.test.ts`。2026-11-25 的录制：claude-agent-acp 0.110.1、模型 `gpt-6-sol`（AsterGate 的 Gemini Flash 当时答 503）。
+3. 重新录 transcript（适配器写出的帧有意变了时；同样要真模型）：`node --experimental-transform-types --disable-warning=ExperimentalWarning --import ./scripts/source-loader.mjs harness/acp/scripts/record-transcripts.ts`，写进 `packages/testkit/conformance/transcripts/acp/`，再跑 `harness/acp/test/transcripts.test.ts`。2026-11-25 的录制：claude-agent-acp 0.110.1、模型 `gpt-6-sol`（模型网关的 Gemini Flash 当时答 503）。
 
 ### 1.7 手动：会话作为 ACP agent（`aio acp`：t3code、Zed）与 AG-UI 事件流
 
