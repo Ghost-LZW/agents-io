@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "agents-io",
   "name": "消息路由（agents-io）",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "把助手接到你自己的 agents-io 消息路由上：路由分给它的消息进收件箱，或交给助手对话、指定的 Agent 会话并把回答发回原渠道；助手也能在你确认后主动发消息。",
   "publisher": "Ghost-LZW",
   "icon": "assets/icon.png",
@@ -108,6 +108,26 @@
         "uniqueItems": true,
         "maxItems": 32,
         "description": "路由规则可以把消息直接打进某台电脑上的一个 Agent 会话，一行一个，写法「名字 = 电脑编号/会话编号」，比如「reviewer = mac-1/s-123」。名字只用小写字母、数字、- 和 _，最长 32 个字符；路由规则的 tag 写成 agent:名字 才会转进去，回答发回原渠道。注意：消息会原样打进那个 Agent，它可能有那台电脑的全部权限，只把你信得过的发送者路由到这里，路由认定为身份未知的人不要用。同一个会话一次只处理一条。只写名字和会话，不要写钥匙或地址"
+      },
+      "launchers": {
+        "type": "array",
+        "title": "可以启动的 Agent",
+        "items": {
+          "type": "string"
+        },
+        "uniqueItems": true,
+        "maxItems": 32,
+        "description": "动作 launch:名字 在哪台电脑上、用什么启动一个新的 Agent 会话，一行一个，写法「名字 = 电脑编号/启动方式 [字段=值 …]」，比如「coder = mac-1/claude host=herdr cwd=~/repos/demo model=sonnet effort=high」。启动方式是那台电脑启动方式列表里的名字；可选字段 host、cwd、model、effort、permission_mode、speed 原样交给 Persona 的启动请求，值里不能有空格。消息（连同发送者那一行）是新会话的第一句话，这一轮的最终回答发回原渠道；同一个会话后面的 launch 消息进同一个 Agent，它停了再来一条就启动新的。只有路由认定为主人的消息才会启动，别人的进收件箱。启动出来的 Agent 有那台电脑的权限。只写名字和电脑，不要写钥匙或地址"
+      },
+      "routes": {
+        "type": "array",
+        "title": "分流规则",
+        "items": {
+          "type": "string"
+        },
+        "uniqueItems": true,
+        "maxItems": 32,
+        "description": "扩展自己的分流规则，一行一条，从上往下第一条对上的说了算，比路由规则上的 tag 先看；一条都对不上就照旧按 tag 处理。写法「规则名: 条件 条件 … -> 动作」，比如「ai: from=owner prefix=/ai -> launch:coder」「mine: from=owner -> ignore」「people: kind=dm -> inbox」「rest: * -> ignore」。条件用空格隔开、都要满足：channel=渠道、account=账号、kind=dm/group/thread/meeting/call/mail/other、conv=会话、from=owner/known/unknown/标签（路由的认定，不看发送者自己写的）、mentions=被 @ 的用户编号、addressed=yes/no（渠道说这条是发给这个账号的）、prefix=前缀（消息开头，对上后从消息里去掉）；!= 表示不是，几个值用逗号隔开。动作：inbox、chat、guest、agent:名字、launch:名字，或 ignore（只记一笔、不进收件箱、不回答）。launch 规则必须写 from=owner，而且无论规则怎么写，只有路由认定为主人的消息才会启动 Agent。chat、agent、launch 只给你信得过的发送者。不要写钥匙或地址"
       },
       "working_mark": {
         "type": "boolean",

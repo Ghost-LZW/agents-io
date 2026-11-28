@@ -22,7 +22,7 @@ const (
 	wordsStoreBroken    = "扩展的数据目录读写不了，消息暂时收不进来。"
 	wordsStoreCorrupt   = "扩展的处理记录读不出来，已另存为 .corrupt 并从空记录开始；之前处理过的消息可能会再出现一次。"
 	wordsOff            = "这个连接器已关闭。"
-	wordsHubMissing     = "扩展没有拿到访问助手的授权：标了 chat、guest 或 agent:<名字> 的消息只会进收件箱。请在扩展设置里重新授权。"
+	wordsHubMissing     = "扩展没有拿到访问助手的授权：标了 chat、guest、agent:<名字> 或 launch:<名字> 的消息只会进收件箱。请在扩展设置里重新授权。"
 
 	wordsReplyEmpty    = "回复是空的。"
 	wordsReplyChanges  = "路由消息的回复只能发文字，不能同时改状态。"
@@ -152,10 +152,51 @@ const (
 	wordsBadAgentsVia      = "设置里有 %d 行 Agent 会话目标读不出来，已跳过"
 	wordsAgentsVia         = "Agent 会话目标 %d 个"
 	wordsAgentsMissVia     = "Agent 会话目标 %d 个，其中 %d 个上次用时找不到"
+
+	wordsRouteLine        = "路由规则第 %d 行：%s"
+	wordsRouteForm        = "写法是「规则名: 条件 条件 … -> 动作」，用半角的冒号和 ->；条件可以不写，或写 *，表示所有消息。"
+	wordsRouteName        = "规则名写在行首、冒号前，只能用小写字母、数字、- 和 _，最长 32 个字符。"
+	wordsRouteAction      = "动作只能是 inbox、chat、guest、ignore、agent:名字 或 launch:名字（名字只用小写字母、数字、- 和 _）。"
+	wordsRouteCond        = "条件写成「键=值」或「键!=值」，几个值用半角逗号隔开，条件之间用空格隔开。"
+	wordsRouteKey         = "条件只能用 channel、account、kind、conv、from、mentions、addressed 和 prefix。"
+	wordsRouteValue       = "条件的值不能是空的、不能有控制字符，最长 256 个字符（from 的标签最长 40 个字）。"
+	wordsRouteKind        = "kind 只能是 dm、group、thread、meeting、call、mail 或 other。"
+	wordsRouteAddressed   = "addressed 只能写 addressed=yes 或 addressed=no。"
+	wordsRoutePrefix      = "prefix 只能写成 prefix=前缀（不能用 !=），每个前缀最长 32 个字符。"
+	wordsRouteCondTwice   = "同一个条件在一行里只能写一次；几个值用逗号写在一起。"
+	wordsRouteNameTwice   = "这个规则名已经用过了。"
+	wordsRouteLaunchOwner = "launch 规则必须带上 from=owner：只有路由认定为主人的消息才能启动 Agent。"
+	wordsRouteNoAgent     = "动作里的 Agent 会话目标不在「可以直接转入的 Agent 会话」里。"
+	wordsRouteNoLauncher  = "动作里的启动方式不在「可以启动的 Agent」里。"
+	wordsRouteSecret      = "这一行像是带了钥匙或地址；路由规则里不要写钥匙或地址。"
+	wordsRouteTooMany     = "路由规则最多 32 行。"
+	wordsBadRoutesVia     = "设置里有 %d 行路由规则读不出来，已跳过"
+	wordsRoutesVia        = "路由规则 %d 条，近 24 小时命中：%s"
+
+	whyIgnored             = "扩展的路由规则设为忽略"
+	whyLaunchUnknown       = "要启动的 Agent 不在扩展设置的启动方式里（或名字写法不对），只进收件箱"
+	whyLaunchNotOwner      = "只有路由认定为主人的消息才能启动 Agent，这条只进收件箱"
+	whyLaunchUnsure        = "启动 Agent 的结果不明，没有再启动一次；请到 Persona 里看看它是不是已经在跑"
+	whyLaunchRefused       = "Persona 拒绝启动这个 Agent（电脑编号、启动方式或参数不对，或那台电脑现在启动不了它），没有启动"
+	whyLaunchRestartUnsure = "扩展重启时正在启动 Agent，结果不明，没有再启动一次；请到 Persona 里看看它是不是已经在跑"
+	whyLaunchGone          = "启动的 Agent 会话不见了，没有往渠道发回答"
+
+	wordsLauncherLine       = "可以启动的 Agent 第 %d 行：%s"
+	wordsLauncherForm       = "写法是「名字 = 电脑编号/启动方式 [字段=值 …]」，用半角的等号和斜杠，前三部分都要有。"
+	wordsLauncherName       = "名字只能用小写字母、数字、- 和 _，最长 32 个字符。"
+	wordsLauncherPart       = "电脑编号最长 128 个字符，不能有空白、斜杠、问号、# 或 %；启动方式最长 64 个字符，不能有空白。"
+	wordsLauncherField      = "可选字段只能是 host、cwd、model、effort、permission_mode 和 speed，写成「字段=值」。"
+	wordsLauncherFieldTwice = "同一个字段在一行里只能写一次。"
+	wordsLauncherValue      = "字段的值不能是空的或带空白；host 和 effort 用小写字母、数字、- 和 _，permission_mode 用字母、数字、- 和 _，speed 只能是 standard、fast 或 ultrafast，cwd 最长 512 个字符。"
+	wordsLauncherNameTwice  = "这个名字已经用过了。"
+	wordsLauncherSecret     = "这一行像是带了钥匙或地址；这里只写名字、电脑和启动方式，不要写钥匙。"
+	wordsLauncherTooMany    = "可以启动的 Agent 最多 32 行。"
+	wordsBadLaunchersVia    = "设置里有 %d 行可以启动的 Agent 读不出来，已跳过"
+	wordsLaunchersVia       = "可以启动的 Agent %d 个"
 )
 
 var setupGuide = []string{
-	"在 agents-io 的配置里加一个后端（backends），并给要转给它的规则写上 to 和 tag（inbox、chat、guest 或 agent:<名字>）。",
+	"在 agents-io 的配置里加一个后端（backends），并给要转给它的规则写上 to 和 tag（inbox、chat、guest、agent:<名字> 或 launch:<名字>）；也可以在扩展设置的分流规则里自己分。",
 	"在路由的机器上运行 aio backend key <后端名>，得到一把以 aiob_ 开头的钥匙。",
 	"到 设置 › 扩展 › 消息路由（agents-io） 填路由地址和这把钥匙，保存时会先试连一次。",
 }

@@ -163,6 +163,7 @@ type inboxRec struct {
 // Run states.
 const (
 	runOpening    = "opening"    // POST /assistant/conversations is about to be, or was, sent
+	runLaunching  = "launching"  // POST /sessions (a new Agent session) is about to be, or was, sent
 	runSending    = "sending"    // POST …/messages is about to be, or was, sent
 	runSent       = "sent"       // the assistant has the message; its answer is awaited
 	runAnswered   = "answered"   // the answer is known and not delivered yet
@@ -199,7 +200,8 @@ type itemRec struct {
 	Rule       string    `json:"rule,omitempty"`
 	Tag        string    `json:"tag"`
 	TagSource  string    `json:"tag_source,omitempty"`
-	Target     string    `json:"target,omitempty"`     // the agent target's name, for the tag agent
+	Target     string    `json:"target,omitempty"`     // the agent target's or the launcher's name, for agent and launch
+	Matched    string    `json:"matched,omitempty"`    // the extension's own route that decided, by its name
 	ReceivedAt time.Time `json:"received_at,omitzero"` // when the router received it (the router's clock)
 	SentAt     time.Time `json:"sent_at,omitzero"`
 	TakenAt    time.Time `json:"taken_at,omitzero"` // when this program journaled it
@@ -258,10 +260,14 @@ func (r itemRec) clone() itemRec {
 }
 
 // seqKey is the key of the mapping the item's round trip keeps its transcript bookkeeping under: the channel
-// conversation's for chat and guest, the target's for agent (two channel conversations may share one target).
+// conversation's for chat and guest, the target's for agent (two channel conversations may share one target), the
+// launcher's and the channel conversation's for launch (each conversation has its own started session).
 func (r itemRec) seqKey() string {
-	if r.Tag == tagAgent {
+	switch r.Tag {
+	case tagAgent:
 		return agentKey(r.Target)
+	case tagLaunch:
+		return launchKey(r.Target, r.ConvKey)
 	}
 	return r.ConvKey
 }
@@ -305,6 +311,8 @@ type convRec struct {
 	OpenedAt   time.Time `json:"opened_at,omitzero"`
 	LastUsedAt time.Time `json:"last_used_at,omitzero"`
 	LastSeq    int64     `json:"last_seq,omitempty"`
+	// Line: for a session a launcher started, a digest of the launcher's line it was started with (launcher.digest).
+	Line string `json:"line,omitempty"`
 }
 
 type journalDoc struct {
@@ -575,6 +583,19 @@ func before(a, b itemRec) bool {
 	return a.ID < b.ID
 }
 
+// matchCounts are how many items each of the extension's routes decided that this program took at or after since.
+func (s *store) matchCounts(since time.Time) map[string]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]int{}
+	for _, r := range s.items {
+		if r.Matched != "" && !r.TakenAt.Before(since) {
+			out[r.Matched]++
+		}
+	}
+	return out
+}
+
 func (s *store) conv(key string) (convRec, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -698,7 +719,8 @@ func seenAt(rec itemRec) time.Time {
 // place's key, whether anything changed, and whether what changed is more than the time and the newest item.
 func (s *store) foldPlace(rec itemRec) (key string, changed, significant bool) {
 	r := rec.Route
-	if r == nil || r.Channel == "" || r.ConversationID == "" || rec.TagSource == tagSourceUnreadable {
+	// An item a route ignores is as if it had not been routed here: its conversation does not become a destination.
+	if r == nil || r.Channel == "" || r.ConversationID == "" || rec.TagSource == tagSourceUnreadable || rec.Tag == actionIgnore {
 		return "", false, false
 	}
 	key = destKey(r.Channel, r.Account, r.ConversationID)

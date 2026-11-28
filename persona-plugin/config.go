@@ -32,11 +32,18 @@ const (
 	// tagAgent is the tag of an item routed straight to a named Agent session: the router writes "agent:<name>".
 	tagAgent       = "agent"
 	tagAgentPrefix = tagAgent + ":"
+	// tagLaunch is the action of an item that starts a new Agent session with a named launcher: "launch:<name>".
+	tagLaunch       = "launch"
+	tagLaunchPrefix = tagLaunch + ":"
 
 	// tagSourceUnreadable marks the placeholder of an item that could not be read (intakeUnreadable).
 	tagSourceUnreadable = "unreadable"
 	// tagSourceUnknownAgent marks an item tagged "agent:<name>" whose name is malformed or not in the settings.
 	tagSourceUnknownAgent = "unknown_agent"
+	// tagSourceUnknownLauncher marks an item tagged "launch:<name>" whose name is malformed or not in the settings.
+	tagSourceUnknownLauncher = "unknown_launcher"
+	// tagSourceRoute: one of the extension's own routes decided (itemRec.Matched names it).
+	tagSourceRoute = "route"
 )
 
 // settings are the extension's settings and secret as initialize and settings.check give them.
@@ -57,6 +64,12 @@ type settings struct {
 	// read (treated like badDests).
 	agents    []agentTarget
 	badAgents []destProblem
+	// routes are the extension's own rules, tried before the item's tag. launchers name what a "launch:<name>" item
+	// starts.
+	routes       []routeRule
+	badRoutes    []destProblem
+	launchers    []launcher
+	badLaunchers []destProblem
 }
 
 func settingsOf(config json.RawMessage, secrets map[string]string) settings {
@@ -70,6 +83,8 @@ func settingsOf(config json.RawMessage, secrets map[string]string) settings {
 		TriageRules string   `json:"triage_rules"`
 		Dests       []string `json:"destinations"`
 		Agents      []string `json:"agent_targets"`
+		Routes      []string `json:"routes"`
+		Launchers   []string `json:"launchers"`
 	}{}
 	if len(config) > 0 {
 		_ = json.Unmarshal(config, &c)
@@ -86,6 +101,8 @@ func settingsOf(config json.RawMessage, secrets map[string]string) settings {
 	}
 	s.dests, s.badDests = parseDestinations(c.Dests)
 	s.agents, s.badAgents = parseAgentTargets(c.Agents)
+	s.routes, s.badRoutes = parseRoutes(c.Routes)
+	s.launchers, s.badLaunchers = parseLaunchers(c.Launchers)
 	return s
 }
 
@@ -176,13 +193,7 @@ func parseAgentTarget(line string) (agentTarget, string) {
 		return agentTarget{}, wordsAgentForm
 	}
 	a := agentTarget{Name: strings.TrimSpace(name), MachineID: strings.TrimSpace(mid), SessionID: strings.TrimSpace(sid)}
-	// An id is put into a request path as one segment: no slash, no space, no control character, and not a segment
-	// a path would resolve away.
-	part := func(s string) bool {
-		return len(s) <= agentPartMost && s != "." && s != ".." && !strings.ContainsFunc(s, func(r rune) bool {
-			return unicode.IsControl(r) || unicode.IsSpace(r) || r == utf8.RuneError || r == '/' || r == '\\' || r == '?' || r == '#' || r == '%'
-		})
-	}
+	part := idPart
 	switch {
 	case a.Name == "" || a.MachineID == "" || a.SessionID == "":
 		return agentTarget{}, wordsAgentForm
@@ -192,6 +203,17 @@ func parseAgentTarget(line string) (agentTarget, string) {
 		return agentTarget{}, wordsAgentPart
 	}
 	return a, ""
+}
+
+// idPart says whether s can be put into a request path as one segment: no slash, no space, no control character,
+// and not a segment a path would resolve away. The ids of agent targets and launchers are.
+func idPart(s string) bool {
+	return len(s) <= agentPartMost && s != "." && s != ".." && plainValue(s) && !strings.ContainsAny(s, `/\?#%`)
+}
+
+// plainValue: no space, no control character, nothing that does not decode.
+func plainValue(s string) bool {
+	return !strings.ContainsFunc(s, func(r rune) bool { return unicode.IsControl(r) || unicode.IsSpace(r) || r == utf8.RuneError })
 }
 
 // Named destinations: places the assistant may send to before the router ever routed a message from them. One line
@@ -378,6 +400,14 @@ func (s settings) tagFor(itemTag, ruleID string) (tag, target, source string) {
 		}
 		return tagInbox, "", tagSourceUnknownAgent
 	}
+	// "launch:<name>" likewise, with the launchers. Whether the item may start anything is decided after (decide):
+	// only the owner's may, whatever the tag.
+	if name, ok := strings.CutPrefix(itemTag, tagLaunchPrefix); ok {
+		if _, known := s.launcher(name); known && agentName(name) {
+			return tagLaunch, name, "tag"
+		}
+		return tagInbox, "", tagSourceUnknownLauncher
+	}
 	switch itemTag {
 	case tagInbox, tagChat, tagGuest:
 		return itemTag, "", "tag"
@@ -394,6 +424,23 @@ func (s settings) tagFor(itemTag, ruleID string) (tag, target, source string) {
 		}
 	}
 	return tagInbox, "", "default"
+}
+
+// actionFor is what a matched route decides, in the terms of tagFor: the action, the target and the source. An agent
+// target or a launcher the settings do not have (a configuration saved without the check) is the Inbox with the same
+// reason as a tag that names one.
+func (s settings) actionFor(r routeRule) (tag, target, source string) {
+	switch r.Action {
+	case tagAgent:
+		if _, ok := s.agentTarget(r.Target); !ok {
+			return tagInbox, "", tagSourceUnknownAgent
+		}
+	case tagLaunch:
+		if _, ok := s.launcher(r.Target); !ok {
+			return tagInbox, "", tagSourceUnknownLauncher
+		}
+	}
+	return r.Action, r.Target, tagSourceRoute
 }
 
 // settingsHandler answers settings.check: the address and key about to be saved work, before the hub saves them. The
@@ -419,7 +466,8 @@ func (x *app) settingsHandler(ctx context.Context, method string, params json.Ra
 // part of them (the address before the key) is fine; what is filled in must work. A key without the usual prefix is
 // not refused on its form: the handshake decides.
 func (x *app) checkSettings(ctx context.Context, s settings, params wire.SettingsCheckParams) (string, string) {
-	// The destinations and the agent targets first, whatever else is filled in: they need no connection to be read.
+	// The destinations, the agent targets, the launchers and the routes first, whatever else is filled in: they need no
+	// connection to be read.
 	if len(s.badDests) > 0 {
 		p := s.badDests[0]
 		return fmt.Sprintf(wordsDestLine, p.Line, p.Why), destinationsKey
@@ -427,6 +475,17 @@ func (x *app) checkSettings(ctx context.Context, s settings, params wire.Setting
 	if len(s.badAgents) > 0 {
 		p := s.badAgents[0]
 		return fmt.Sprintf(wordsAgentLine, p.Line, p.Why), agentTargetsKey
+	}
+	if len(s.badLaunchers) > 0 {
+		p := s.badLaunchers[0]
+		return fmt.Sprintf(wordsLauncherLine, p.Line, p.Why), launchersKey
+	}
+	if len(s.badRoutes) > 0 {
+		p := s.badRoutes[0]
+		return fmt.Sprintf(wordsRouteLine, p.Line, p.Why), routesKey
+	}
+	if n, why := s.checkRouteTargets(); why != "" {
+		return fmt.Sprintf(wordsRouteLine, n, why), routesKey
 	}
 	if s.routerURL == "" {
 		return "", ""

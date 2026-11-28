@@ -21,6 +21,8 @@ func (x *app) statusNow() wire.ConnectorStatus {
 	x.mu.Lock()
 	off, missing, storeErr, st, rt, unreadable := x.off, x.missing, x.storeErr, x.st, x.rt, x.unreadable
 	badDests, agents, badAgents := len(x.set.badDests), len(x.set.agents), len(x.set.badAgents)
+	routes, badRoutes := x.set.routes, len(x.set.badRoutes)
+	launchers, badLaunchers := len(x.set.launchers), len(x.set.badLaunchers)
 	agentMiss := 0
 	for _, a := range x.set.agents {
 		if x.agentMiss[a.Name] {
@@ -84,6 +86,24 @@ func (x *app) statusNow() wire.ConnectorStatus {
 		notes = append(notes, fmt.Sprintf(wordsAgentsMissVia, agents, agentMiss))
 	case agents > 0:
 		notes = append(notes, fmt.Sprintf(wordsAgentsVia, agents))
+	}
+	if badLaunchers > 0 {
+		notes = append(notes, fmt.Sprintf(wordsBadLaunchersVia, badLaunchers))
+	}
+	if launchers > 0 {
+		notes = append(notes, fmt.Sprintf(wordsLaunchersVia, launchers))
+	}
+	// The routes, and how many items each decided in the last day, in their order.
+	if badRoutes > 0 {
+		notes = append(notes, fmt.Sprintf(wordsBadRoutesVia, badRoutes))
+	}
+	if len(routes) > 0 {
+		counts := st.matchCounts(time.Now().Add(-24 * time.Hour))
+		parts := make([]string, 0, len(routes))
+		for _, r := range routes {
+			parts = append(parts, fmt.Sprintf("%s %d", r.Name, counts[r.Name]))
+		}
+		notes = append(notes, fmt.Sprintf(wordsRoutesVia, len(routes), strings.Join(parts, "、")))
 	}
 	var sent, notSent, unsure int
 	for _, r := range st.sendsSince(time.Now().Add(-24 * time.Hour)) {

@@ -90,6 +90,8 @@ type fakeSession struct {
 	row      sessionRow
 	hidden   bool // not in the session list
 	gone     bool // its routes answer 404
+	stopped  bool // a message to it is refused (agent_stopped): its agent is no longer running
+	hiddenTo bool // its routes answer 403 to this token
 	looks    int
 }
 
@@ -118,6 +120,7 @@ type fakeHub struct {
 	fulls     []string
 	reads     []int64 // after_seq of every transcript read
 	opens     []hubOpen
+	starts    []hubOpen // POST /api/v1/sessions: Agent sessions started
 	sends     []hubSend
 	log       []string
 	sessions  map[string]*fakeSession
@@ -126,7 +129,12 @@ type fakeHub struct {
 	// onOpen and onSend script the answer to the nth request (status 0: the default behaviour). taken says whether
 	// the message goes into the conversation anyway (an answer lost on the way).
 	onOpen func(n int) (status int, body string, taken bool)
-	onSend func(n int, msgID string) (status int, body string, taken bool)
+	// onStart scripts the answer to the nth start of an Agent session; taken says whether the session starts anyway.
+	onStart func(n int) (status int, body string, taken bool)
+	// startReceipts are the hub's receipts for starts: every answer is kept and replayed to the same operation id,
+	// a 503 assistant_offline too (the product's hub/clientops.go, clientOpRetry: a start's receipt is never let go).
+	startReceipts map[string]hubReceipt
+	onSend        func(n int, msgID string) (status int, body string, taken bool)
 	// turn scripts what the assistant does with a message that went in; the default answers with one text.
 	turn func(s *fakeSession, text, msgID string)
 }
@@ -158,7 +166,7 @@ func (f *fakeHub) keepReceipt(opID string, status int, body string) {
 func newFakeHub(t testing.TB) *fakeHub {
 	yes := true
 	f := &fakeHub{t: t, guest: &yes, sessions: map[string]*fakeSession{}, seen: map[string]bool{}, pageSize: 100,
-		receipts: map[string]hubReceipt{}}
+		receipts: map[string]hubReceipt{}, startReceipts: map[string]hubReceipt{}}
 	f.turn = func(s *fakeSession, text, msgID string) { s.say("assistant", "text", "answer", "") }
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.srv.Close)
@@ -185,6 +193,16 @@ func (f *fakeHub) agentSession(mid, sid string) *fakeSession {
 // session is the nth conversation opened (from 1).
 func (f *fakeHub) session(n int) *fakeSession {
 	return f.sessions[fmt.Sprintf("m1/s%d", n)]
+}
+
+// started is the nth start of an Agent session (from 0), and how many there were.
+func (f *fakeHub) started(n int) (hubOpen, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if n >= len(f.starts) {
+		return hubOpen{}, len(f.starts)
+	}
+	return f.starts[n], len(f.starts)
 }
 
 func (f *fakeHub) counts() (opens, sends int) {
@@ -269,6 +287,48 @@ func (f *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 		started := fmt.Sprintf(`{"session":{"machine_id":%q,"session_id":%q}}`, s.mid, s.sid)
 		f.keepReceipt(opID, 200, started)
 		reply(200, started)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions":
+		opID := r.Header.Get("X-Persona-Op-Id")
+		f.starts = append(f.starts, hubOpen{opID: opID, body: body})
+		if rc, ok := f.startReceipts[opID]; ok && opID != "" {
+			reply(rc.status, rc.body)
+			return
+		}
+		keep := func(status int, body string) {
+			if opID != "" {
+				f.startReceipts[opID] = hubReceipt{status, body}
+			}
+			reply(status, body)
+		}
+		text, _ := body["prompt"].(string)
+		mid, _ := body["machine_id"].(string)
+		msgID, _ := body["client_msg_id"].(string)
+		switch {
+		case hasControl(text):
+			keep(403, `{"error":"control characters","code":"terminal_control_refused","delivered":"none"}`)
+			return
+		case mid == "":
+			keep(400, `{"error":"no machine","code":"bad_request"}`)
+			return
+		}
+		status, scripted, taken := 0, "", true
+		if f.onStart != nil {
+			status, scripted, taken = f.onStart(len(f.starts))
+		}
+		if status != 0 && !taken {
+			keep(status, scripted)
+			return
+		}
+		s := &fakeSession{mid: mid, sid: fmt.Sprintf("a%d", len(f.starts)), row: sessionRow{Status: "idle"}}
+		s.row.MachineID, s.row.SessionID = s.mid, s.sid
+		f.sessions[s.mid+"/"+s.sid] = s
+		s.say("user", "text", text, msgID) // the node ties the start's client_msg_id to the first message
+		f.turn(s, text, msgID)
+		if status != 0 {
+			keep(status, scripted)
+			return
+		}
+		keep(200, fmt.Sprintf(`{"session":{"machine_id":%q,"session_id":%q,"state":"working"}}`, s.mid, s.sid))
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/sessions":
 		var rows []sessionRow
 		for _, s := range f.sessions {
@@ -287,6 +347,9 @@ func (f *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case s == nil || s.gone:
 			reply(404, `{"error":"no session","code":"no_session","delivered":"none"}`)
+			return
+		case s.stopped:
+			reply(409, `{"error":"the agent has stopped","code":"agent_stopped","delivered":"none"}`)
 			return
 		case hasControl(text):
 			reply(403, `{"error":"control characters","code":"terminal_control_refused","delivered":"none"}`)
@@ -313,6 +376,10 @@ func (f *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 		s := f.sessions[parts[3]+"/"+parts[4]]
 		if s == nil || s.gone {
 			reply(404, `{"error":"no session","code":"no_session"}`)
+			return
+		}
+		if s.hiddenTo {
+			reply(403, `{"error":"not yours","code":"permission_denied"}`)
 			return
 		}
 		if f.badItems {

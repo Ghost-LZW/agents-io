@@ -33,7 +33,7 @@ func TestRuntimeManifestIsTheSourceWithoutCatalogFields(t *testing.T) {
 	if err := json.Unmarshal(manifest, &m); err != nil {
 		t.Fatalf("wire.Manifest: %v", err)
 	}
-	if m.ID != extensionID || m.Version != version || version != "0.3.0" {
+	if m.ID != extensionID || m.Version != version || version != "0.4.0" {
 		t.Errorf("id %q version %q", m.ID, m.Version)
 	}
 }

@@ -181,6 +181,10 @@ func (x *app) runItem(ctx context.Context, id string) {
 		// The program stopped while the new conversation was being asked for.
 		x.fail(ctx, rec, whyRestartUnsure)
 		return
+	case runLaunching:
+		// The program stopped while the Agent session was being started: it may be running. Never started again.
+		x.fail(ctx, rec, whyLaunchRestartUnsure)
+		return
 	case runSending:
 		// The program stopped while the message was being sent: only the transcript can tell.
 		rec, _ = st.update(id, func(r *itemRec) {
@@ -189,8 +193,11 @@ func (x *app) runItem(ctx context.Context, id string) {
 	}
 	if rec.Run.State == "" {
 		start := x.start
-		if rec.Tag == tagAgent {
+		switch rec.Tag {
+		case tagAgent:
 			start = x.startAgent
+		case tagLaunch:
+			start = x.startLaunch
 		}
 		if rec, ok = start(ctx, rec); !ok {
 			return
@@ -231,7 +238,9 @@ func failKind(why string) string {
 		"took_over": whyTookOver, "deliver_rejected": whyDeliverReject, "deliver_scope": whyDeliverScope,
 		"deliver_unknown": whyDeliverUnsure, "restart_unknown": whyRestartUnsure, "deliver_offline": whyDeliverOffline,
 		"unreadable": whyUnreadable, "answer_cut": whyAnswerCut, "agent_unavailable": whyAgentGone,
-		"agent_unknown": whyAgentUnknown,
+		"agent_unknown": whyAgentUnknown, "launch_unknown": whyLaunchUnknown, "launch_not_owner": whyLaunchNotOwner,
+		"launch_unsure": whyLaunchUnsure, "launch_refused": whyLaunchRefused, "launch_restart_unknown": whyLaunchRestartUnsure,
+		"launch_gone": whyLaunchGone,
 	} {
 		if v == why {
 			return k
@@ -634,9 +643,12 @@ func (x *app) watch(ctx context.Context, rec itemRec) (itemRec, bool) {
 				if now.Sub(missingSince) > x.tm.missingAfter {
 					_ = st.dropConv(rec.seqKey())
 					why := whyMissing
-					if rec.Tag == tagAgent {
+					switch rec.Tag {
+					case tagAgent:
 						why = whyAgentGone
 						x.agentSeen(rec.Target, false)
+					case tagLaunch:
+						why = whyLaunchGone
 					}
 					x.fail(ctx, rec, why)
 					return rec, false
