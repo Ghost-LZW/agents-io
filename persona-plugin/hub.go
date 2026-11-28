@@ -257,8 +257,12 @@ func (h *hubClient) open(ctx context.Context, text string, guest bool, opID stri
 // start tried again always needs a new one (renew).
 //   - 200 with the session: started;
 //   - 202 (the receipt is pending or unknown), delivered "unknown", any other 5xx, no answer: unknown;
-//   - 503 with assistant_offline, node_unreachable or terminal_not_ready, delivered "none", 429, or no connection at
-//     all: not started, worth trying again;
+//   - 503 with node_unreachable or terminal_not_ready, delivered "none", 429, or no connection at all: not started,
+//     worth trying again;
+//   - 503 assistant_offline without delivered "none": unknown. The hub gives that same answer when the manager was
+//     away before anything was sent and when the manager's connection dropped with session.start already out (the
+//     node may have started it); the node dedupes a start by its operation id only, so trying again under a new id
+//     could start a second session.
 //   - any other 4xx (unknown computer, a launcher, model or field the hub refuses, another manager's computer, a
 //     computer not confirmed yet, the node refusing the start): not started, and asking again is refused again.
 func classifyStart(ans hubAnswer, err error) string {
@@ -282,8 +286,7 @@ func classifyStart(ans hubAnswer, err error) string {
 		return outRetry
 	case ans.status/100 == 4:
 		return outRefused
-	case ans.status == http.StatusServiceUnavailable &&
-		(b.Code == "assistant_offline" || b.Code == "node_unreachable" || b.Code == "terminal_not_ready"),
+	case ans.status == http.StatusServiceUnavailable && (b.Code == "node_unreachable" || b.Code == "terminal_not_ready"),
 		b.Delivered == "none":
 		return outRetry
 	}
